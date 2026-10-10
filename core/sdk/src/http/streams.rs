@@ -17,6 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
@@ -98,5 +99,5 @@ impl StreamClient for HttpClient {
 }
 
 fn get_details_path(stream_id: &str) -> String {
-    format!("{PATH}/{stream_id}")
+    format!("{PATH}/{}", encode_segment(stream_id))
 }

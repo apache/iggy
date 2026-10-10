@@ -17,6 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::ConsumerGroupClient;
@@ -36,7 +37,7 @@ impl ConsumerGroupClient for HttpClient {
             .get(&format!(
                 "{}/{}",
                 get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-                group_id
+                encode_segment(&group_id.as_cow_str())
             ))
             .await;
         if let Err(error) = response {
@@ -101,7 +102,7 @@ impl ConsumerGroupClient for HttpClient {
         let path = format!(
             "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            group_id.as_cow_str()
+            encode_segment(&group_id.as_cow_str())
         );
         self.delete(&path).await?;
         Ok(())
@@ -127,5 +128,7 @@ impl ConsumerGroupClient for HttpClient {
 }
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/consumer-groups")
+    let encoded_stream = encode_segment(stream_id);
+    let encoded_topic = encode_segment(topic_id);
+    format!("streams/{encoded_stream}/topics/{encoded_topic}/consumer-groups")
 }

@@ -17,9 +17,10 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PollMessages, PolledMessages,
-    PollingStrategy, SendMessages, SendMessagesResponse,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessage, Partitioning, PollMessages,
+    PolledMessages, PollingStrategy, SendMessages, SendMessagesResponse,
 };
 use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
@@ -38,7 +39,10 @@ impl MessageClient for HttpClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
-        crate::http::consumer_offsets::refuse_external_group(consumer)?;
+        if matches!(consumer.kind, ConsumerKind::ExternalGroup) {
+            return Err(IggyError::FeatureUnavailable);
+        }
+
         let response = self
             .get_with_query(
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -145,7 +149,9 @@ async fn decode_send_response(
 }
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/messages")
+    let encoded_stream = encode_segment(stream_id);
+    let encoded_topic = encode_segment(topic_id);
+    format!("streams/{encoded_stream}/topics/{encoded_topic}/messages")
 }
 
 #[cfg(test)]
