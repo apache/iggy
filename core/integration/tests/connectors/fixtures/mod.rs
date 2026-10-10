@@ -20,6 +20,7 @@ use uuid::Uuid;
 mod clickhouse;
 mod delta;
 mod doris;
+mod dynamodb;
 mod elasticsearch;
 mod floci;
 mod http;
@@ -62,6 +63,7 @@ pub use doris::{
     DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
     DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
+pub use dynamodb::{DynamoDbOps, DynamoDbSinkFixture, DynamoDbSinkSortKeyFixture};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
     GITHUB_ENDPOINT_ID, GITHUB_HMAC_HEADER, GITHUB_INSTANCE, HttpSinkIndividualFixture,
