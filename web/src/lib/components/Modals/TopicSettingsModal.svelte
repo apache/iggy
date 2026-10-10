@@ -18,8 +18,8 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
-  import type { TopicDetails } from '$lib/domain/TopicDetails';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
+  import type { TopicDetails } from '#lib/domain/TopicDetails.js';
   import { z } from 'zod';
 
   import Button from '../Button.svelte';
@@ -28,13 +28,13 @@ under the License.
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
-  import type { Pathname } from '$app/types';
+  import type { Path } from '$app/types';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
-  import { browser } from '$app/environment';
+  import { browser } from '$app/env';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { page } from '$app/state';
   import DurationInput from '../DurationInput.svelte';
@@ -42,7 +42,7 @@ under the License.
   interface Props {
     topic: TopicDetails;
     closeModal: CloseModalFn;
-    onDeleteRedirectPath: Pathname;
+    onDeleteRedirectPath: Path;
   }
 
   let { topic, closeModal, onDeleteRedirectPath }: Props = $props();

@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
 
   import ModalBase from './ModalBase.svelte';
 

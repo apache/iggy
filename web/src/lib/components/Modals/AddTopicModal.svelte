@@ -25,11 +25,11 @@ under the License.
   import Select from '../Select.svelte';
   import Button from '../Button.svelte';
   import ModalBase from './ModalBase.svelte';
-  import type { CloseModalFn } from '$lib/types/utilTypes';
-  import type { StreamDetails } from '$lib/domain/StreamDetails';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
+  import type { StreamDetails } from '#lib/domain/StreamDetails.js';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import DurationInput from '../DurationInput.svelte';
-  import { numberSizes } from '$lib/utils/constants/numberSizes';
+  import { numberSizes } from '#lib/utils/constants/numberSizes.js';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 

@@ -15,6 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-export function match(value: any) {
-  return /^-?\d+(\.\d+)?$/.test(value);
-}
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { params } from './params.ts';
+
+test('preserve numeric route parameters as strings', async () => {
+  for (const value of ['0', '01', '42', '-1', '1.5']) {
+    const result = await params.i32['~standard'].validate(value);
+    assert.deepEqual(result, { value }, `Unexpected route parameter: ${value}`);
+  }
+});
+
+test('reject nonnumeric route parameters', async () => {
+  for (const value of ['', 'stream', '1/2', '1e3']) {
+    const result = await params.i32['~standard'].validate(value);
+    assert.ok(result.issues?.length, `Accepted invalid route parameter: ${value}`);
+  }
+});

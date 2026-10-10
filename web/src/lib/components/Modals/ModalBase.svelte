@@ -23,7 +23,7 @@ under the License.
   import type { TransitionConfig } from 'svelte/transition';
   import { quintOut } from 'svelte/easing';
   import Button from '../Button.svelte';
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
 
   interface Props {
     closeModal: CloseModalFn;
