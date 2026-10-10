@@ -193,6 +193,25 @@ describe('VSR consumer-group polling', () => {
     );
   });
 
+  it('resynchronizes an empty assignment on the next poll', async () => {
+    const { client, commands } = stubClient([
+      assignment(1n, []),
+      assignment(4n, [7]),
+      pollResponse(7)
+    ]);
+    const poll = pollMessages(async () => client);
+    assert.equal((await poll(groupRequest)).partitionId, NO_ASSIGNED_PARTITION);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(
+      commands.map(({ command }) => command),
+      [
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.SyncGroup,
+        COMMAND_CODE.PollMessages
+      ]
+    );
+  });
+
   it('caches a cursor and refreshes it after a heartbeat', async () => {
     const responses = [
       assignment(1n, [4, 5]),

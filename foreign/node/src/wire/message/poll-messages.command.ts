@@ -201,7 +201,10 @@ const pollConsumerGroup = async (
   for (let attempt = 0; attempt < GROUP_POLL_MAX_ATTEMPTS; attempt += 1) {
     const cached = state.cursors.get(key);
     const cacheAge = cached ? Date.now() - cached.synchronizedAt : 0;
+    // As in the Rust SDK, an empty assignment is synced again on every poll:
+    // a member gets its partitions only as each one installs the new owner.
     const cursor = cached &&
+      cached.partitions.length > 0 &&
       cacheAge >= 0 &&
       cacheAge < GROUP_ASSIGNMENT_REFRESH_MS
       ? cached
