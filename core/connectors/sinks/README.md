@@ -20,6 +20,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
 | **surrealdb_sink** | Writes messages into SurrealDB with deterministic record IDs for idempotent replay |
 | **rabbitmq_sink** | Publishes messages to RabbitMQ exchanges via AMQP |
+| **sink_template** | Fill-in-the-blank starting point for a new sink; framework/security plumbing done, one `TODO(ConnectorDeveloper)` spot left |
 
 The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 
