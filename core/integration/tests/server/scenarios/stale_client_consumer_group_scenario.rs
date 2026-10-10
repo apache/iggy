@@ -440,7 +440,8 @@ async fn should_handle_stale_client_with_manual_reconnection(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?},              group still reports {} member(s)",
+            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?}, \
+             group still reports {} member(s)",
             group.members_count
         );
         sleep(STALE_EVICTION_RETRY_INTERVAL).await;

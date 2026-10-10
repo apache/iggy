@@ -28,11 +28,9 @@ async fn main() -> Result<(), IggyError> {
     let topic = "test_topic";
 
     let config = IggyConsumerConfig::builder()
-        // Set the stream identifier and name.
-        .stream_id(Identifier::from_str_value(stream)?)
+        // Set the stream name. The consumer binds to the stream by this name.
         .stream_name(stream)
-        // Set the topic identifier and name
-        .topic_id(Identifier::from_str_value(topic)?)
+        // Set the topic name. The consumer binds to the topic by this name.
         .topic_name(topic)
         // The auto-commit configuration for storing the message offset on the server.
         // * Disabled:  The auto-commit is disabled and the offset must be stored manually by the consumer.

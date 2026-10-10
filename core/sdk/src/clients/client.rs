@@ -21,6 +21,7 @@ use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::EncryptorKind;
+use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
@@ -94,8 +95,8 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// - [`SystemClient`]: ping, server statistics, snapshots, and connected-client info.
 /// - [`UserClient`]: create, inspect, update, and delete users and their permissions.
 /// - [`PersonalAccessTokenClient`]: create, list, and delete personal access tokens, log in with one.
-/// - [`StreamClient`]: create, get, update, delete, and purge streams.
-/// - [`TopicClient`]: create, get, update, delete, and purge topics within a stream.
+/// - [`StreamClient`]: create, get, update, and delete streams.
+/// - [`TopicClient`]: create, get, update, and delete topics within a stream.
 /// - [`PartitionClient`]: add and remove partitions on a topic.
 /// - [`SegmentClient`]: delete closed segments from a partition.
 /// - [`ConsumerGroupClient`]: create, get, delete, and join or leave consumer groups.
@@ -653,8 +654,8 @@ impl IggyClient {
             self.client.clone(),
             name.to_owned(),
             Consumer::new(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
             None,
@@ -723,9 +724,9 @@ impl IggyClient {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
-            Consumer::group(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Consumer::group(Identifier::named(name)?),
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
             None,
@@ -784,9 +785,9 @@ impl IggyClient {
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
-            stream.try_into()?,
+            Identifier::named(stream)?,
             stream.to_owned(),
-            topic.try_into()?,
+            Identifier::named(topic)?,
             topic.to_owned(),
             self.encryptor.clone(),
             self.partitioner.clone(),

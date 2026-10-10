@@ -5420,6 +5420,96 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcloud-auth"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b43924e3df02cb3b846ca66a7ee58e8c13eb2556d0308c71f6154083f6980365"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "gcloud-metadata",
+ "home",
+ "jsonwebtoken 10.4.0",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "token-source",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "gcloud-bigquery"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17c9e8ff7894d451cf5b704772326b5fbf112f75b8f229700197c923a763d99f"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "backon",
+ "base64 0.22.1",
+ "bigdecimal",
+ "gcloud-auth",
+ "gcloud-gax",
+ "gcloud-googleapis",
+ "num-bigint",
+ "prost-types",
+ "reqwest 0.13.5",
+ "reqwest-middleware",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "token-source",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gcloud-gax"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "558634081d1cf458d1bc0166f69475a80f445b5b991f162028b293a38307059d"
+dependencies = [
+ "http 1.5.0",
+ "thiserror 2.0.20",
+ "token-source",
+ "tokio",
+ "tokio-retry2",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "gcloud-googleapis"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d79fc4ec36213a21b734a2ce204176eb39c439fa528f9a388c9a1349ca344b0d"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "gcloud-metadata"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3152612316be627be52fe9ca72331eb48425059b3a6a700e7adde223e061d5"
+dependencies = [
+ "reqwest 0.13.5",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7024,12 +7114,14 @@ dependencies = [
  "bytes",
  "crc32c",
  "flate2",
+ "futures",
  "iggy",
  "kafka-protocol",
  "libc",
  "lz4",
  "secrecy",
  "serde",
+ "serde_json",
  "serial_test",
  "snap",
  "socket2 0.6.5",
@@ -7051,6 +7143,7 @@ version = "0.5.1-edge.1"
 dependencies = [
  "axum",
  "axum-server",
+ "clap",
  "configs",
  "configs_derive",
  "dirs 7.0.0",
@@ -7125,6 +7218,37 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "iggy_connector_bigquery_sink"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bigdecimal",
+ "gcloud-bigquery",
+ "gcloud-gax",
+ "gcloud-googleapis",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "prost",
+ "reqwest 0.13.5",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "token-source",
+ "tokio",
+ "tokio-stream",
+ "toml 1.1.6+spec-1.1.0",
+ "tonic",
+ "tonic-prost",
+ "tracing",
 ]
 
 [[package]]
@@ -10143,7 +10267,6 @@ dependencies = [
  "message_bus",
  "nix",
  "papaya",
- "ringbuffer",
  "server_common",
  "smallvec",
  "tempfile",
@@ -11660,6 +11783,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -12704,6 +12828,7 @@ name = "server"
 version = "0.9.1-edge.1"
 dependencies = [
  "ahash",
+ "arc-swap",
  "argon2",
  "assert_cmd",
  "async-channel",
@@ -14090,6 +14215,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
+name = "token-source"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75746ae15bef509f21039a652383104424208fdae172a964a8930858b9a78412"
+dependencies = [
+ "async-trait",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14141,6 +14275,16 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-retry2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e05e40fd65880de11383bbc693d3c636045ed1b5010ef1265a1d2b41d73334a1"
+dependencies = [
+ "pin-project",
+ "tokio",
 ]
 
 [[package]]
@@ -14314,6 +14458,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2 0.4.19",
  "http 1.5.0",
  "http-body 1.1.0",
@@ -14326,11 +14471,13 @@ dependencies = [
  "socket2 0.6.5",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script>
-  import Logo from '$lib/components/Logo/Logo.svelte';
+  import Logo from '#lib/components/Logo/Logo.svelte';
 
   /** @type {{children?: import('svelte').Snippet}} */
   let { children } = $props();

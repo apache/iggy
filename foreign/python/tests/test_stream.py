@@ -17,7 +17,7 @@
 
 import pytest
 
-from apache_iggy import IggyClient, SendMessage
+from apache_iggy import IggyClient
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
@@ -550,98 +550,3 @@ class TestDeleteStream:
         await client.connect()
         with pytest.raises(RuntimeError):
             await client.delete_stream(unique_name())
-
-
-class TestPurgeStream:
-    """Test purging stream messages via purge_stream."""
-
-    @pytest.mark.asyncio
-    async def test_purge_stream_clears_messages_but_keeps_stream(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test purge_stream empties the stream while leaving it in place."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        messages = [SendMessage(f"payload-{index}") for index in range(5)]
-        await iggy_client.send_messages(stream_name, topic_name, 0, messages)
-
-        before = await iggy_client.get_stream(stream_name)
-        assert before is not None
-        assert before.messages_count == 5
-
-        await iggy_client.purge_stream(stream_name)
-
-        after = await iggy_client.get_stream(stream_name)
-        # Purging clears messages only; the stream itself survives (purge is
-        # not delete) and keeps its identity and topics.
-        assert after is not None
-        assert after.messages_count == 0
-        assert after.id == before.id
-        assert after.name == before.name
-        assert after.topics_count == before.topics_count
-
-    @pytest.mark.asyncio
-    async def test_purge_empty_stream_succeeds(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test purge_stream is a no-op on a stream with no messages."""
-        stream_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-
-        await iggy_client.purge_stream(stream_name)
-
-        stream = await iggy_client.get_stream(stream_name)
-        assert stream is not None
-        assert stream.messages_count == 0
-
-    @pytest.mark.asyncio
-    async def test_purge_stream_is_idempotent_when_called_repeatedly(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test purge_stream succeeds when called repeatedly on the same stream."""
-        stream_name = unique_name()
-        topic_name = unique_name()
-
-        await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
-            stream=stream_name, name=topic_name, partitions_count=1
-        )
-
-        messages = [SendMessage(f"payload-{index}") for index in range(5)]
-        await iggy_client.send_messages(stream_name, topic_name, 0, messages)
-
-        await iggy_client.purge_stream(stream_name)
-        await iggy_client.purge_stream(stream_name)
-
-        stream = await iggy_client.get_stream(stream_name)
-        assert stream is not None
-        assert stream.messages_count == 0
-
-    @pytest.mark.asyncio
-    async def test_purge_nonexistent_stream_fails(
-        self, iggy_client: IggyClient, unique_name
-    ):
-        """Test purge_stream raises for a non-existent stream."""
-        with pytest.raises(RuntimeError):
-            await iggy_client.purge_stream(unique_name())
-
-    @pytest.mark.asyncio
-    async def test_purge_stream_requires_connection_and_auth(self, unique_name):
-        """Test purge_stream fails both before connecting and before logging in."""
-        host, port = get_server_config()
-        wait_for_server(host, port)
-
-        client = IggyClient(f"{host}:{port}")
-        with pytest.raises(RuntimeError):
-            await client.purge_stream(unique_name())
-
-        await client.connect()
-        with pytest.raises(RuntimeError):
-            await client.purge_stream(unique_name())

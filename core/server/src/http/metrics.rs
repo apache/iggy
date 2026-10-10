@@ -39,7 +39,7 @@ use tracing::error;
 /// one counter, which carries no scope label -- the `warn!` in `iggy_common`
 /// names the scope and counter that moved it.
 ///
-/// Not "alert on any increase". A delete, a purge, a partition teardown and a
+/// Not "alert on any increase". A delete, a partition teardown and a
 /// snapshot restore each open a window where a retention pass hands back bytes
 /// the parents have already given up, and the clamp is the intended outcome
 /// there -- `given_a_rolled_back_partition_when_a_late_decrement_arrives_should_leave_siblings_alone`

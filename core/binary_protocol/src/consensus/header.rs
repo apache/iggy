@@ -2087,12 +2087,9 @@ pub struct StateTransferTargetHeader {
     /// Set on an `available == 0` refusal that means "not right now" rather than
     /// "this node is broken".
     ///
-    /// PARTITION arm only: it is the only side with a consecutive-failure count
-    /// to charge. The requester then re-arms on a flat interval instead of
-    /// charging that count, whose exponential backoff climbs to 1024x the retry
-    /// interval and is reset only by a completed install. A serving primary
-    /// momentarily behind its own frontier is the common case under produce
-    /// load.
+    /// Partition receivers re-arm without charging exponential failure backoff.
+    /// Metadata receivers awaiting a descriptor retain their session and retry
+    /// on the normal interval while the peer's checkpoint writer is busy.
     ///
     /// This and `commit_max` below claim the HEAD of what used to be the
     /// reserved tail, so every pre-existing field keeps its published offset.
@@ -2106,8 +2103,8 @@ pub struct StateTransferTargetHeader {
     pub reserved_alignment: [u8; 6],
     /// Serving replica's `commit_max` when the descriptor was built.
     ///
-    /// Read by the PARTITION receiver only; the metadata arm branches on
-    /// `available` and falls back to journal repair without a refusal.
+    /// Read by the partition receiver only. Metadata receivers use `available`
+    /// and `unavailable_transient` to select transfer retry or journal repair.
     ///
     /// A partition receiver refuses an offer from a replica that knows LESS
     /// than it does:

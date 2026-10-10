@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bridge::IggyBridge;
 use crate::error::Result;
-use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
 use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
@@ -39,8 +39,8 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
     api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, leave_group, list_offsets, metadata, produce, respond_or_close,
-    sync_group,
+    init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit, offset_fetch,
+    produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -51,6 +51,8 @@ pub const API_KEY_PRODUCE: i16 = 0;
 pub const API_KEY_FETCH: i16 = 1;
 pub const API_KEY_LIST_OFFSETS: i16 = 2;
 pub const API_KEY_METADATA: i16 = 3;
+pub const API_KEY_OFFSET_COMMIT: i16 = 8;
+pub const API_KEY_OFFSET_FETCH: i16 = 9;
 pub const API_KEY_FIND_COORDINATOR: i16 = 10;
 pub const API_KEY_JOIN_GROUP: i16 = 11;
 pub const API_KEY_HEARTBEAT: i16 = 12;
@@ -90,6 +92,8 @@ pub const ERROR_INVALID_TOPIC_EXCEPTION: i16 = ResponseError::InvalidTopicExcept
 /// Produce: `acks` is not 0, 1 or -1. A conformant client never sends one, since `acks` comes
 /// from validated configuration rather than from application input.
 pub const ERROR_INVALID_REQUIRED_ACKS: i16 = ResponseError::InvalidRequiredAcks.code();
+/// Retriable, and the client keeps its coordinator. An offset call to Iggy that may work on retry.
+pub const ERROR_COORDINATOR_LOAD_IN_PROGRESS: i16 = ResponseError::CoordinatorLoadInProgress.code();
 /// Retriable. Sent when this coordinator is at one of its `GroupCoordinatorConfig` capacity
 /// caps: the client should back off and retry rather than treat the group as unusable.
 pub const ERROR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
@@ -270,6 +274,8 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     fetch::RANGE,
     list_offsets::RANGE,
     metadata::RANGE,
+    offset_commit::RANGE,
+    offset_fetch::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
     init_producer_id::RANGE,
@@ -290,9 +296,9 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// `bridge` is `None` until `IGGY_KAFKA_BRIDGE_ENABLED` turns it on. A handler that finds `None`
 /// answers with its stub, so APIs can be wired one at a time.
 ///
-/// Every Iggy call but a Fetch poll goes through one lockstep `IggyClient`, so Kafka connections
-/// serialize behind whichever of those calls is in flight. The `Arc` does not change that. See the
-/// README's "Concurrency ceiling".
+/// Every Iggy call but a Fetch poll, a topic probe and an offset call goes through one lockstep
+/// `IggyClient`, so Kafka connections serialize behind whichever of those calls is in flight. The
+/// `Arc` does not change that. See the README's "Concurrency ceiling".
 pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
@@ -369,6 +375,25 @@ pub struct ConnectionState {
     pub(crate) stuck_offsets: Mutex<fetch::StuckOffsets>,
     /// Offsets this connection's Fetches cannot place, per Kafka topic.
     pub(crate) unplaced: Mutex<fetch::Unplaced>,
+    /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
+    /// session, since its next heartbeat waits behind the call.
+    heartbeat_member: Mutex<Option<GroupMember>>,
+}
+
+impl ConnectionState {
+    pub(crate) fn note_heartbeat(&self, member: GroupMember) {
+        *self
+            .heartbeat_member
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(member);
+    }
+
+    pub(crate) fn heartbeat_member(&self) -> Option<GroupMember> {
+        self.heartbeat_member
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Default `max_frame_size` used by [`handle_request`] - the direct call sites across this

@@ -58,7 +58,11 @@ The configuration file must use TOML. The default path is `core/ai/mcp/config.to
 
 Set `IGGY_MCP_ENV_PATH` to load a particular dotenv file. Otherwise `.env` is searched for in the current directory and its parents. Existing environment variables take precedence over dotenv values.
 
+Run `iggy-mcp --list-config-env-vars` to print the supported configuration environment variables and exit before loading dotenv or configuration files or creating the runtime.
+
 A non-empty `iggy.token` takes precedence over username and password. It accepts a literal PAT or a `file:` reference such as `file:/run/secrets/iggy_pat`; file contents are trimmed and a leading `~/` expands to the home directory.
+
+`iggy-mcp` rejects unknown command-line arguments with exit code 2. Keep the client or container `args` list empty unless it contains a supported flag.
 
 Set `command` to the absolute path of the built executable. This Claude Desktop example uses the development broker credentials:
 
@@ -92,7 +96,7 @@ Each tool checks these MCP permissions before forwarding the request. The broker
 | `read` | `ping`, `get_cluster_metadata`, `get_stream`, `get_streams`, `get_topic`, `get_topics`, `poll_messages`, `get_stats`, `get_me`, `get_client`, `get_clients`, `snapshot`, `get_consumer_group`, `get_consumer_groups`, `get_consumer_offset`, `get_personal_access_tokens`, `get_user`, `get_users` |
 | `create` | `create_stream`, `create_topic`, `create_partitions`, `send_messages`, `create_consumer_group`, `create_personal_access_token`, `create_user` |
 | `update` | `update_stream`, `update_topic`, `store_consumer_offset`, `update_user`, `update_permissions`, `change_password` |
-| `delete` | `delete_stream`, `purge_stream`, `delete_topic`, `purge_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_consumer_offset`, `delete_personal_access_token`, `delete_user` |
+| `delete` | `delete_stream`, `delete_topic`, `delete_partitions`, `delete_segments`, `delete_consumer_group`, `delete_consumer_offset`, `delete_personal_access_token`, `delete_user` |
 
 `poll_messages` additionally requires `update` when `auto_commit = true` or `strategy = "next"`. The `next` strategy enables auto-commit even when `auto_commit` is omitted or false. For read-only polling, use `offset`, `first`, `last`, or `timestamp` with auto-commit disabled.
 

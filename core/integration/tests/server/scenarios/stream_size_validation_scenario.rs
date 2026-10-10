@@ -84,20 +84,6 @@ pub async fn run(harness: &TestHarness) {
     // 13a. System stats must aggregate all streams: 2 streams × 2 topics × MSGS_COUNT*2.
     validate_system_stats(&client, MSGS_SIZE * 8, MSGS_COUNT * 8).await;
 
-    // 13b. Purge T1 from S1 while T2 still has messages — S1's system-level stats
-    // must reflect only T2, not be blindly zeroed.
-    //
-    // Regression: zero_out_all() propagated store(0) up to StreamStats, zeroing the
-    // entire stream counter instead of subtracting only the purged topic's contribution.
-    // get_stats() reads StreamStats atomics directly, so it reports 0 for the stream
-    // while the sibling topic still has MSGS_COUNT*2 messages.
-    purge_topic(&client, S1_NAME, T1_NAME).await;
-    validate_topic(&client, S1_NAME, T1_NAME, 0, 0).await;
-    validate_topic(&client, S1_NAME, T2_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
-    validate_stream(&client, S1_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
-    // S1 lost MSGS_COUNT*2 from the purge; S2 is unchanged.
-    validate_system_stats(&client, MSGS_SIZE * 6, MSGS_COUNT * 6).await;
-
     // 14. Delete first topic on the first stream
     delete_topic(&client, S1_NAME, T1_NAME).await;
 
@@ -105,8 +91,12 @@ pub async fn run(harness: &TestHarness) {
     validate_stream(&client, S1_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
     validate_stream(&client, S2_NAME, MSGS_SIZE * 4, MSGS_COUNT * 4).await;
 
-    // 16. Purge second topic on the first stream
-    purge_topic(&client, S1_NAME, T2_NAME).await;
+    // 15a. System stats lose only the deleted topic's messages. Zeroing T1 must subtract its
+    // share from S1, not zero the whole stream counter.
+    validate_system_stats(&client, MSGS_SIZE * 6, MSGS_COUNT * 6).await;
+
+    // 16. Delete second topic on the first stream
+    delete_topic(&client, S1_NAME, T2_NAME).await;
 
     // 17. Validate both streams, first should be empty, second should be unchanged
     validate_stream(&client, S1_NAME, 0, 0).await;
@@ -118,19 +108,12 @@ pub async fn run(harness: &TestHarness) {
     // 19. Validate second stream, should be unchanged
     validate_stream(&client, S2_NAME, MSGS_SIZE * 4, MSGS_COUNT * 4).await;
 
-    // 20. Purge second stream
-    purge_stream(&client, S2_NAME).await;
-
-    // 21. Validate second stream and its topics, should be empty
-    validate_stream(&client, S2_NAME, 0, 0).await;
-    validate_topic(&client, S2_NAME, T1_NAME, 0, 0).await;
-    validate_topic(&client, S2_NAME, T2_NAME, 0, 0).await;
-
-    // 22. Delete second stream
+    // 20. Delete second stream
     delete_stream(&client, S2_NAME).await;
 
-    // 23. Validate system, should be empty
+    // 21. Validate system, should be empty
     assert_clean_system(&client).await;
+    validate_system_stats(&client, 0, 0).await;
 }
 
 async fn ping_login_and_validate(client: &IggyClient) {
@@ -226,26 +209,9 @@ async fn delete_topic(client: &IggyClient, stream_name: &str, topic_name: &str) 
         .unwrap();
 }
 
-async fn purge_topic(client: &IggyClient, stream_name: &str, topic_name: &str) {
-    client
-        .purge_topic(
-            &Identifier::from_str(stream_name).unwrap(),
-            &Identifier::from_str(topic_name).unwrap(),
-        )
-        .await
-        .unwrap();
-}
-
 async fn delete_stream(client: &IggyClient, stream_name: &str) {
     client
         .delete_stream(&Identifier::from_str(stream_name).unwrap())
-        .await
-        .unwrap();
-}
-
-async fn purge_stream(client: &IggyClient, stream_name: &str) {
-    client
-        .purge_stream(&Identifier::from_str(stream_name).unwrap())
         .await
         .unwrap();
 }

@@ -21,7 +21,7 @@ under the License.
   import Button from '../Button.svelte';
   import Select from '../Select.svelte';
   import { decoderRegistry } from './decoders/utils/decoderRegistry';
-  import { decodeBase64 } from '$lib/utils/base64Utils';
+  import { decodeBase64 } from '#lib/utils/base64Utils.js';
 
   interface Props {
     payload?: string | undefined;

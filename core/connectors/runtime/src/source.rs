@@ -505,12 +505,12 @@ async fn ensure_durable_source_topic(
     stream_name: &str,
     topic_name: &str,
 ) -> Result<(), RuntimeError> {
-    let stream_id = Identifier::try_from(stream_name)?;
+    let stream_id = Identifier::named(stream_name)?;
     if client.get_stream(&stream_id).await?.is_none() {
         client.create_stream(stream_name).await?;
     }
 
-    let topic_id = Identifier::try_from(topic_name)?;
+    let topic_id = Identifier::named(topic_name)?;
     let topic = match client.get_topic(&stream_id, &topic_id).await? {
         Some(topic) => topic,
         None => {
