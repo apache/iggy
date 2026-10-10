@@ -110,7 +110,7 @@ impl ConsumerGroupMember {
         self.partitions
             .iter()
             .copied()
-            .filter(|&partition_id| self.is_pollable(partition_id))
+            .filter(|partition_id| !self.pending_revocations.contains(partition_id))
             .collect()
     }
 
