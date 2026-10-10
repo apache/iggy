@@ -33,17 +33,21 @@ use super::{Crash, SimStorage};
 use configs::server::ServerConfig;
 use consensus::{LocalPipeline, Sequencer, VsrConsensus};
 use futures::executor::block_on;
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_binary_protocol::{Command, Operation, PrepareHeader, RoutedRequestHeader, WireEncode};
 use iggy_common::{
     ConsumerKind, Durability, IggyByteSize, PartitionStats, PollingStrategy, TopicRuntimeOptions,
 };
 use journal::durable_storage::{DurableFile, DurableStorage, OpenMode};
 use journal::{DurableAppend, PartitionPrepareJournal};
-use message_bus::IggyMessageBus;
+use message_bus::{AUTO_COMMIT_CLIENT_ID, IggyMessageBus};
 use partitions::offset_storage::persist_offset_with_storage;
 use partitions::{
     IggyPartition, IggyPartitions, Partition, PartitionPathLayout, PartitionsConfig, PollingArgs,
     PollingConsumer, configure_consumer_offsets_with_storage,
 };
+use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{IggyNamespace, ShardId};
 use std::path::{Path, PathBuf};
@@ -153,7 +157,12 @@ impl BookmarkStorageHarness {
             let operation_number = offset + 1;
             // The helper fills the payload with the operation number, allowing
             // polls to verify message contents as well as their offsets.
-            let prepare = owned_prepare(operation_number, parent_checksum, offset);
+            let prepare = owned_prepare(operation_number, parent_checksum, offset)
+                .transmute_header(|original, header: &mut PrepareHeader| {
+                    *header = original;
+                    header.partition_incarnation = CREATED_REVISION;
+                    header.checksum = header.identity_checksum();
+                });
             parent_checksum = prepare.header().checksum;
             journal.append(prepare.into_frozen()).await.unwrap();
         }
@@ -220,11 +229,7 @@ impl BookmarkStorageHarness {
                 .build_poll_snapshot(
                     &self.namespace,
                     consumer,
-                    &PollingArgs {
-                        strategy: PollingStrategy::next(),
-                        count: 10,
-                        auto_commit: false,
-                    },
+                    &PollingArgs::new(PollingStrategy::next(), 10, false),
                 )
                 .unwrap();
             assert!(!plan.needs_off_pump_io());
@@ -277,6 +282,47 @@ impl BookmarkStorageHarness {
             ..TopicRuntimeOptions::default()
         });
         partition
+    }
+
+    /// A group read completes only under the group's installed owner.
+    async fn install_group_owner(&self, partition: &mut TestPartition) {
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: CREATED_REVISION,
+            group_id: u64::try_from(GROUP_ID).unwrap(),
+            owner: ConsumerGroupOwner {
+                client_id: 1,
+                session: 1,
+                generation: 1,
+            },
+            metadata_op: 1,
+        };
+        let body = installation.to_bytes();
+        let size = size_of::<RoutedRequestHeader>() + body.len();
+        let mut request = Message::<RoutedRequestHeader>::new(size);
+        request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+        let request = request.transmute_header(|_, header: &mut RoutedRequestHeader| {
+            *header = RoutedRequestHeader {
+                command: Command::Request,
+                operation: Operation::InstallConsumerGroupOwner,
+                size: u32::try_from(size).unwrap(),
+                client: AUTO_COMMIT_CLIENT_ID,
+                session: 1,
+                request: installation.metadata_op,
+                group: self.namespace.inner(),
+                partition_incarnation: installation.incarnation,
+                metadata_watermark: installation.metadata_op,
+                ..Default::default()
+            };
+        });
+        partition.on_request(request, None).await;
+        let op = partition.consensus().sequencer().current_sequence();
+        partition.consensus().advance_commit_max(op);
+        partition.commit_journal(&partition_config()).await;
+        assert!(
+            partition
+                .installed_consumer_group_owner(&installation)
+                .is_some()
+        );
     }
 
     fn partition_directory(&self) -> String {
@@ -348,9 +394,10 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
             harness.persist_fresh_history().await;
 
             harness.storage.crash(Crash::PowerLoss);
-            let recovered = harness.recover_partition().await;
+            let mut recovered = harness.recover_partition().await;
 
             assert_bookmarks(&recovered);
+            harness.install_group_owner(&mut recovered).await;
             // Bookmark 2 means the first three messages were already consumed.
             harness
                 .poll_next_and_assert_messages(recovered, &[3, 4])

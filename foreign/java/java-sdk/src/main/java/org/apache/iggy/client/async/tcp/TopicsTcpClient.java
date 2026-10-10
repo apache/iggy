@@ -54,9 +54,19 @@ public class TopicsTcpClient implements TopicsClient {
     private static final String MAX_TOPIC_SIZE_OPTION = "max_topic_size";
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final Runnable topologyChanged;
 
     public TopicsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, () -> {});
+    }
+
+    /**
+     * @param topologyChanged runs after this client deletes a topic, when the
+     *     partition contexts cached for it no longer hold
+     */
+    TopicsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, Runnable topologyChanged) {
         this.connectionSupplier = connectionSupplier;
+        this.topologyChanged = topologyChanged;
     }
 
     private AsyncTcpConnection connection() {
@@ -205,8 +215,9 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection()
-                .send(CommandCode.Topic.DELETE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection().send(CommandCode.Topic.DELETE.getValue(), payload).thenAccept(response -> {
+            response.release();
+            topologyChanged.run();
+        });
     }
 }

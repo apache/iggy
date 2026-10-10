@@ -1112,6 +1112,7 @@ mod tests {
         for error in [
             IggyError::Disconnected,
             IggyError::TransientNotCommitted,
+            IggyError::HistoryUnavailable,
             IggyError::EmptyResponse,
             IggyError::Unauthenticated,
             IggyError::Unauthorized,
@@ -1141,9 +1142,35 @@ mod tests {
                 let request =
                     bytemuck::checked::try_pod_read_unaligned::<RequestHeader>(&header_bytes)
                         .unwrap();
-                assert_eq!(request.operation, Operation::SendMessages);
                 let mut body = vec![0u8; usize::try_from(request.size).unwrap() - HEADER_SIZE];
                 stream.read_exact(&mut body).await.unwrap();
+                if request.operation == Operation::NonReplicated {
+                    assert_eq!(
+                        u32::from_le_bytes(request.reserved),
+                        iggy_binary_protocol::codes::GET_SEND_CONTEXT_CODE
+                    );
+                    let response =
+                        iggy_binary_protocol::primitives::partition_history::PartitionContext {
+                            incarnation: 7,
+                            owner_generation: 0,
+                            metadata_op: 11,
+                        };
+                    let body = iggy_binary_protocol::WireEncode::to_bytes(&response);
+                    let reply = ReplyHeader {
+                        command: Command::Reply,
+                        operation: request.operation,
+                        size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
+                        ..Default::default()
+                    };
+                    stream.write_all(bytemuck::bytes_of(&reply)).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                    continue;
+                }
+                assert_eq!(request.operation, Operation::SendMessages);
+                assert_eq!(
+                    (request.partition_incarnation, request.minimum_metadata_op),
+                    (7, 11)
+                );
                 requests.push(request.request);
                 let reply = ReplyHeader {
                     command: Command::Reply,
@@ -1177,24 +1204,39 @@ mod tests {
     #[tokio::test]
     async fn test_aged_out_request_over_http_stops_producer_retries() {
         const SEND_REQUEST_LINE: &str = "POST /streams/1/topics/1/messages ";
+        const TOPIC_REQUEST_LINE: &str = "GET /streams/1/topics/1 ";
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api_url = format!("http://{}", listener.local_addr().unwrap());
         let request_lines = Arc::new(Mutex::new(Vec::new()));
         let server_request_lines = Arc::clone(&request_lines);
         let server = tokio::spawn(async move {
-            let body = format!(
+            let too_old = format!(
                 r#"{{"id":{},"code":"request_too_old","reason":"Request too old","field":null}}"#,
                 IggyError::RequestTooOld.as_code()
             );
-            let response = format!(
-                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
-                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            // The send to an explicit partition first reads its context from the topic details.
+            let topic = crate::http::scripted_server::topic_details_json(&[(
+                0,
+                iggy_common::PartitionContext {
+                    incarnation: 7,
+                    owner_generation: 0,
+                    metadata_op: 11,
+                },
+            )]);
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_line = read_http_request(&mut stream).await;
+                let (status, body) = if request_line.starts_with(TOPIC_REQUEST_LINE) {
+                    ("200 OK", &topic)
+                } else {
+                    ("400 Bad Request", &too_old)
+                };
                 server_request_lines.lock().unwrap().push(request_line);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
         });
@@ -1208,11 +1250,15 @@ mod tests {
         server.abort();
         let request_lines = request_lines.lock().unwrap();
         assert_eq!(
-            request_lines.len(),
+            request_lines
+                .iter()
+                .filter(|line| line.starts_with(SEND_REQUEST_LINE))
+                .count(),
             1,
             "unknown outcome must not be sent again: {request_lines:?}"
         );
-        assert!(request_lines[0].starts_with(SEND_REQUEST_LINE));
+        assert_eq!(request_lines.len(), 2, "{request_lines:?}");
+        assert!(request_lines[0].starts_with(TOPIC_REQUEST_LINE));
     }
 
     /// Sends one message through a producer allowed to retry and asserts the

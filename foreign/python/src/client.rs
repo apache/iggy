@@ -43,7 +43,7 @@ use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
 use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
-use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::receive_message::{PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
@@ -708,6 +708,8 @@ impl IggyClient {
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so a newer server key can be set from this build.
+    ///         `{"partition_resize_policy": "fixed"}` makes the server reject
+    ///         later partition creation and deletion on this topic.
     ///
     /// Every option left as `None` resolves against the server default at
     /// admission.
@@ -776,6 +778,7 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             raw: options.unwrap_or_default(),
+            partition_resize_policy: None,
         };
 
         let stream = Identifier::try_from(stream)?;
@@ -1420,9 +1423,17 @@ impl IggyClient {
     /// Polls for messages from the specified topic on behalf of the given consumer.
     /// Omitting `partition_id` reads partition 0 for a regular consumer, and
     /// polls the member's assigned partitions for a consumer group.
+    /// `context` continues from a message received earlier, usually with
+    /// `PollingStrategy.Offset`: pass that message's `context()` and `partition_id()`.
+    /// The poll is then refused if the partition was deleted and created again, or if its
+    /// consumer group owner changed, instead of reading the new partition at that offset.
+    /// Without `context`, the poll takes the context its route reports. After another
+    /// client deleted and created the partition again, one such poll can fail with
+    /// `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
+    /// consumer group member. The failed route is dropped, and the next call routes again.
     /// Returns a list of received messages or a RuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (stream, topic, *, consumer, polling_strategy, count, auto_commit, partition_id = None))]
+    #[pyo3(signature = (stream, topic, *, consumer, polling_strategy, count, auto_commit, partition_id = None, context = None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(
         &self,
@@ -1434,11 +1445,18 @@ impl IggyClient {
         count: u32,
         auto_commit: bool,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "PartitionContext | None"))] context: Option<
+            &PartitionContext,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::try_from(consumer)?;
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
-        let strategy: RustPollingStrategy = polling_strategy.into();
+        let strategy = RustPollingStrategy::from(polling_strategy);
+        let strategy = match context {
+            Some(context) => strategy.with_context((*context).into()),
+            None => strategy,
+        };
 
         let inner = self.inner.clone();
 
@@ -1456,12 +1474,14 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             let partition_id = polled_messages.partition_id;
+            let context = PartitionContext::from(polled_messages.context);
             let messages = polled_messages
                 .messages
                 .into_iter()
                 .map(|m| ReceiveMessage {
                     inner: m,
                     partition_id,
+                    context,
                 })
                 .collect::<Vec<_>>();
             Ok(messages)

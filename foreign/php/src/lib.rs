@@ -36,7 +36,7 @@ use crate::error::{
     TransientException,
 };
 use crate::message_iterator::MessageIterator;
-use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
@@ -57,6 +57,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<MessageIterator>()
         .class::<AutoCommit>()
         .class::<AutoCommitWhen>()
+        .class::<PartitionContext>()
+        .class::<ConsumerPosition>()
         .class::<PollingStrategy>()
         .class::<ReceiveMessage>()
         .class::<SendMessage>()

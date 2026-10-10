@@ -17,8 +17,9 @@
 
 use crate::types::message::polling_kind::PollingKind;
 use crate::utils::timestamp::IggyTimestamp;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::{DisplayFromStr, json::JsonString, serde_as};
 use std::fmt::Display;
 
 /// Default value for the polling strategy.
@@ -42,11 +43,17 @@ pub struct PollingStrategy {
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default = "PollingStrategy::default_value")]
     pub value: u64,
+    /// Partition incarnation and owner captured with a continuation offset. A stale
+    /// context rejects the poll instead of interpreting that offset in another incarnation.
+    #[serde_as(as = "Option<JsonString>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<PartitionContext>,
 }
 
 impl Default for PollingStrategy {
     fn default() -> Self {
         Self {
+            context: None,
             kind: PollingKind::Offset,
             value: 0,
         }
@@ -63,14 +70,23 @@ impl PollingStrategy {
     /// Poll messages from the specified offset.
     pub fn offset(value: u64) -> Self {
         Self {
+            context: None,
             kind: PollingKind::Offset,
             value,
         }
     }
 
+    /// Continue at an offset under the incarnation and owner that produced it.
+    #[must_use]
+    pub fn with_context(mut self, context: PartitionContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
     /// Poll messages from the specified timestamp.
     pub fn timestamp(value: IggyTimestamp) -> Self {
         Self {
+            context: None,
             kind: PollingKind::Timestamp,
             value: value.into(),
         }
@@ -79,6 +95,7 @@ impl PollingStrategy {
     /// Poll messages from the first message in the partition.
     pub fn first() -> Self {
         Self {
+            context: None,
             kind: PollingKind::First,
             value: 0,
         }
@@ -87,6 +104,7 @@ impl PollingStrategy {
     /// Poll messages from the last message in the partition.
     pub fn last() -> Self {
         Self {
+            context: None,
             kind: PollingKind::Last,
             value: 0,
         }
@@ -100,6 +118,7 @@ impl PollingStrategy {
     /// [poll recovery contract](crate::MessageClient::poll_messages) before retrying.
     pub fn next() -> Self {
         Self {
+            context: None,
             kind: PollingKind::Next,
             value: 0,
         }

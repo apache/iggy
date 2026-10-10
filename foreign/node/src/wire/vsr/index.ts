@@ -19,7 +19,7 @@ import { createRequire } from 'node:module';
 import type { CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
-import { HEADER_SIZE, encodeRequestHeader } from './header.js';
+import { HEADER_SIZE, encodeRequestHeader, type PartitionContext } from './header.js';
 import { Operation, operationForCode } from './operation.js';
 import {
   deserializeLoginRegister,
@@ -82,7 +82,7 @@ export class VsrSession {
     return this.bindPayload(identity);
   }
 
-  encode(command: number, payload: Buffer): Buffer {
+  encode(command: number, payload: Buffer, context?: PartitionContext): Buffer {
     const operation = registerCommand(command)
       ? Operation.Register
       : operationForCode(command);
@@ -110,6 +110,7 @@ export class VsrSession {
 
     const header = encodeRequestHeader({
       size,
+      context,
       client: this.state.clientId,
       request,
       operation,

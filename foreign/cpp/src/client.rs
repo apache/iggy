@@ -19,13 +19,14 @@ use crate::{RUNTIME, ffi, type_conversion::ffi_options_to_raw};
 use bytes::Bytes;
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient, Consumer,
-    ConsumerGroupClient, ConsumerOffsetClient, Identifier as RustIdentifier,
+    ConsumerGroupClient, ConsumerOffsetClient, ConsumerPosition, Identifier as RustIdentifier,
     IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder,
     IggyDuration as RustIggyDuration, IggyMessage, IggyTimestamp, MessageClient,
     NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
-    PartitionClient, Partitioning, Permissions as RustPermissions, PollingStrategy, SegmentClient,
-    SnapshotCompression as RustSnapshotCompression, StreamClient, StreamUpdateOptions,
-    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
+    PartitionClient, PartitionContext, Partitioning, Permissions as RustPermissions,
+    PollingStrategy, SegmentClient, SnapshotCompression as RustSnapshotCompression, StreamClient,
+    StreamUpdateOptions, SystemClient as RustSystemClient,
+    SystemSnapshotType as RustSystemSnapshotType, TopicClient,
     TopicCreateOptions as RustTopicCreateOptions, TopicUpdateOptions as RustTopicUpdateOptions,
     UserClient, UserStatus as RustUserStatus, UserUpdateOptions,
 };
@@ -54,6 +55,25 @@ fn opt_partition(partition_id: u32) -> Option<u32> {
     } else {
         Some(partition_id)
     }
+}
+
+fn polling_strategy(
+    kind: &str,
+    value: u64,
+    context: Option<PartitionContext>,
+) -> Result<PollingStrategy, String> {
+    let strategy = match kind {
+        "offset" => PollingStrategy::offset(value),
+        "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(value)),
+        "first" => PollingStrategy::first(),
+        "last" => PollingStrategy::last(),
+        "next" => PollingStrategy::next(),
+        _ => return Err(format!("invalid polling strategy: {kind}")),
+    };
+    Ok(match context {
+        Some(context) => strategy.with_context(context),
+        None => strategy,
+    })
 }
 
 pub struct Client {
@@ -359,6 +379,62 @@ impl Client {
         count: u32,
         auto_commit: bool,
     ) -> Result<ffi::PolledMessages, String> {
+        self.poll(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer_kind,
+            consumer_id,
+            polling_strategy_kind,
+            polling_strategy_value,
+            count,
+            auto_commit,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_messages_with_context(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        polling_strategy_kind: String,
+        polling_strategy_value: u64,
+        count: u32,
+        auto_commit: bool,
+        context: ffi::PartitionContext,
+    ) -> Result<ffi::PolledMessages, String> {
+        self.poll(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer_kind,
+            consumer_id,
+            polling_strategy_kind,
+            polling_strategy_value,
+            count,
+            auto_commit,
+            Some(context.into()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        polling_strategy_kind: String,
+        polling_strategy_value: u64,
+        count: u32,
+        auto_commit: bool,
+        context: Option<PartitionContext>,
+    ) -> Result<ffi::PolledMessages, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not poll messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -367,19 +443,8 @@ impl Client {
             .map_err(|error| format!("Could not poll messages: {error}"))?;
         let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
             .map_err(|error| format!("Could not poll messages: {error}"))?;
-
-        let strategy = match polling_strategy_kind.as_str() {
-            "offset" => PollingStrategy::offset(polling_strategy_value),
-            "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(polling_strategy_value)),
-            "first" => PollingStrategy::first(),
-            "last" => PollingStrategy::last(),
-            "next" => PollingStrategy::next(),
-            _ => {
-                return Err(format!(
-                    "Could not poll messages: invalid polling strategy: {polling_strategy_kind}"
-                ));
-            }
-        };
+        let strategy = polling_strategy(&polling_strategy_kind, polling_strategy_value, context)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
 
         RUNTIME.block_on(async {
             let polled = self
@@ -780,6 +845,43 @@ impl Client {
                     )
                 })?;
             Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_consumer_position(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        offset: u64,
+        context: ffi::PartitionContext,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not store consumer position: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not store consumer position: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not store consumer position: {error}"))?;
+        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+            .map_err(|error| format!("Could not store consumer position: {error}"))?;
+        let position = ConsumerPosition {
+            partition_id,
+            offset,
+            context: context.into(),
+        };
+
+        RUNTIME.block_on(async {
+            self.inner
+                .store_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, position)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not store consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
+                    )
+                })
         })
     }
 
@@ -1193,5 +1295,49 @@ pub unsafe fn delete_connection(client: *mut Client) {
         unsafe {
             drop(Box::from_raw(client));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POLLING_STRATEGY_KINDS: [&str; 5] = ["offset", "timestamp", "first", "last", "next"];
+    const CONTEXT: PartitionContext = PartitionContext {
+        incarnation: 3,
+        owner_generation: 5,
+        metadata_op: 7,
+    };
+
+    #[test]
+    fn should_leave_the_context_unset_on_a_poll_without_one() {
+        for kind in POLLING_STRATEGY_KINDS {
+            assert_eq!(
+                polling_strategy(kind, 9, None).map(|strategy| strategy.context),
+                Ok(None),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_carry_the_caller_context_on_a_poll_with_one() {
+        for kind in POLLING_STRATEGY_KINDS {
+            assert_eq!(
+                polling_strategy(kind, 9, Some(CONTEXT)).map(|strategy| strategy.context),
+                Ok(Some(CONTEXT)),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_an_unknown_polling_strategy() {
+        assert_eq!(
+            polling_strategy("latest", 0, Some(CONTEXT))
+                .err()
+                .as_deref(),
+            Some("invalid polling strategy: latest")
+        );
     }
 }

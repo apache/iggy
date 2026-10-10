@@ -21,6 +21,7 @@ using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -100,6 +101,8 @@ public class OffsetTests
         {
             await client.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
+            await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName),
+                Identifier.String(topicName), Identifier.String("test_consumer_group"), 1);
         }
         else
         {
@@ -126,6 +129,8 @@ public class OffsetTests
         {
             await client.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
+            await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName),
+                Identifier.String(topicName), Identifier.String("test_consumer_group"), 1);
         }
         else
         {
@@ -159,6 +164,8 @@ public class OffsetTests
         {
             await client.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(topicName), Identifier.String("test_consumer_group"));
+            await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName),
+                Identifier.String(topicName), Identifier.String("test_consumer_group"), 1);
         }
         else
         {
@@ -191,6 +198,8 @@ public class OffsetTests
 
         await client.JoinConsumerGroupAsync(Identifier.String(streamName),
             Identifier.String(topicName), Identifier.String("test_consumer_group"));
+        await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName),
+            Identifier.String(topicName), Identifier.String("test_consumer_group"), 1);
 
         await client.StoreOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.String(streamName),
             Identifier.String(topicName), SetOffset, 0);

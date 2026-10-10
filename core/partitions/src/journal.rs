@@ -199,6 +199,12 @@ where
     /// replicated auto-commit per poll, grows the journal for as long as it
     /// runs. Rebuilt by every drain-and-re-append.
     resident_control_ops: Cell<usize>,
+    /// Highest op an eviction removed. With the commit point it bounds where
+    /// the next flush prefix may start.
+    evicted_through: Cell<u64>,
+    /// A resident op follows a higher one, so the next op to flush can sit
+    /// behind the front. Flushes wait for `sort_by_op`.
+    out_of_order: Cell<bool>,
 }
 
 /// How many evicted entries each partition retains for repair. Sized to
@@ -231,6 +237,8 @@ where
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
             resident_control_ops: Cell::new(0),
+            evicted_through: Cell::new(0),
+            out_of_order: Cell::new(false),
         }
     }
 }
@@ -321,14 +329,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let inner = unsafe { &*self.inner.get() };
             let _ = inner.storage.drain();
         }
-        unsafe { &mut *self.op_to_storage_offset.get() }.clear();
-        unsafe { &mut *self.offset_to_op.get() }.clear();
-        unsafe { &mut *self.timestamp_to_op.get() }.clear();
-        unsafe { &mut *self.headers.get() }.clear();
-        self.first_header_by_op.borrow_mut().clear();
+        self.clear_resident_indexes();
         unsafe { &mut *self.evicted_ring.get() }.clear();
         self.evicted_ring_bytes.set(0);
-        self.resident_control_ops.set(0);
+        self.evicted_through.set(0);
     }
 
     /// Disable repair retention (single-replica groups: nobody to repair).
@@ -525,18 +529,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let inner = unsafe { &*self.inner.get() };
             inner.storage.drain()
         };
-
-        let headers = unsafe { &mut *self.headers.get() };
-        headers.clear();
-        self.first_header_by_op.borrow_mut().clear();
-        let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
-        op_to_storage_offset.clear();
-        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
-        offset_to_op.clear();
-        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-        timestamp_to_op.clear();
-        self.resident_control_ops.set(0);
-
+        self.clear_resident_indexes();
         entries
     }
 
@@ -544,7 +537,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     /// Entries remain resident until their physical writes have been accepted.
     #[cfg(test)]
     pub(crate) fn committed_prefix(&self, commit_max: u64) -> Vec<JournalBuffer> {
-        let count = self.committed_prefix_len(commit_max);
+        // No local commit point, so only evictions bound the start.
+        let count = self.committed_prefix_len(0, commit_max);
         let inner = unsafe { &*self.inner.get() };
         let entries = unsafe { &*inner.storage.entries.get() };
         entries.iter().take(count).cloned().collect()
@@ -558,21 +552,60 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         inspect(entries)
     }
 
-    pub(crate) fn committed_prefix_len(&self, commit_max: u64) -> usize {
+    /// Front entries a flush through `through` can write in op order. Every op
+    /// up to `commit_min` and up to the highest evicted op is flushed or
+    /// resident, so the first entry may sit at most one op above them. A higher
+    /// first op sits above a hole. An out-of-order journal can hide the next op
+    /// behind the front, so it yields nothing until `sort_by_op` runs.
+    pub(crate) fn committed_prefix_len(&self, commit_min: u64, through: u64) -> usize {
+        if self.out_of_order.get() {
+            return 0;
+        }
         let headers = unsafe { &*self.headers.get() };
+        let first_max = commit_min.max(self.evicted_through.get()).saturating_add(1);
         let mut previous: Option<u64> = None;
         headers
             .iter()
             .take_while(|header| {
-                if header.op > commit_max
-                    || previous.is_some_and(|op| op.checked_add(1) != Some(header.op))
-                {
+                let connected = previous.map_or(header.op <= first_max, |op| {
+                    op.checked_add(1) == Some(header.op)
+                });
+                if header.op > through || !connected {
                     return false;
                 }
                 previous = Some(header.op);
                 true
             })
             .count()
+    }
+
+    /// Restore op order after an out-of-order append. Stable, so the first copy
+    /// of a duplicated op stays first. Every resident entry can move, so a
+    /// position taken before the call can name another entry after it. Returns
+    /// whether the journal was rebuilt.
+    pub(crate) fn sort_by_op(&self) -> bool {
+        if !self.out_of_order.get() {
+            return false;
+        }
+        let entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.drain()
+        };
+        // Positional against `headers` until the clear below.
+        let mut ordered: Vec<(u64, JournalBuffer)> = {
+            let headers = unsafe { &*self.headers.get() };
+            headers
+                .iter()
+                .map(|header| header.op)
+                .zip(entries)
+                .collect()
+        };
+        ordered.sort_by_key(|(op, _)| *op);
+        self.clear_resident_indexes();
+        for (_, entry) in ordered {
+            self.append_with_meta_sync(entry);
+        }
+        true
     }
 
     /// Remove the persisted prefix and return the retained entries with their batch metadata.
@@ -587,19 +620,11 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().take(count).map(|header| header.op).collect()
         };
-
-        {
-            let headers = unsafe { &mut *self.headers.get() };
-            headers.clear();
-            self.first_header_by_op.borrow_mut().clear();
-            let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
-            op_to_storage_offset.clear();
-            let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
-            offset_to_op.clear();
-            let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-            timestamp_to_op.clear();
-            self.resident_control_ops.set(0);
+        if let Some(&highest) = evicted_ops.iter().max() {
+            self.evicted_through
+                .set(self.evicted_through.get().max(highest));
         }
+        self.clear_resident_indexes();
 
         let mut all_entries = all_entries.into_iter();
         if self.repair_retention.get() {
@@ -689,6 +714,9 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
         {
             let headers = unsafe { &mut *self.headers.get() };
+            if headers.last().is_some_and(|last| last.op > op) {
+                self.out_of_order.set(true);
+            }
             if !headers.is_empty() {
                 self.first_header_by_op
                     .borrow_mut()
@@ -784,7 +812,20 @@ where
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
             resident_control_ops: Cell::new(0),
+            evicted_through: Cell::new(0),
+            out_of_order: Cell::new(false),
         }
+    }
+
+    /// Forget every resident header and index. The caller drained the entries.
+    fn clear_resident_indexes(&self) {
+        unsafe { &mut *self.headers.get() }.clear();
+        self.first_header_by_op.borrow_mut().clear();
+        unsafe { &mut *self.op_to_storage_offset.get() }.clear();
+        unsafe { &mut *self.offset_to_op.get() }.clear();
+        unsafe { &mut *self.timestamp_to_op.get() }.clear();
+        self.resident_control_ops.set(0);
+        self.out_of_order.set(false);
     }
 
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
@@ -1072,11 +1113,11 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         self.bytes_by_op(header.op).await
     }
 
-    /// Appends are in op order and every rewrite preserves it, so the tail header
-    /// carries the highest op.
+    /// Read off the op index, not the tail header: repair backfills append below
+    /// higher ops and stay there until `sort_by_op` runs.
     fn last_op(&self) -> Option<u64> {
-        let headers = unsafe { &*self.headers.get() };
-        headers.last().map(|header| header.op)
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        op_to_storage_offset.last_key_value().map(|(op, _)| *op)
     }
 
     /// Drop every entry at or above `from_op`, rebuilding the indexes. Same
@@ -1104,14 +1145,7 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().map(|header| header.op).collect()
         };
-        {
-            unsafe { &mut *self.headers.get() }.clear();
-            self.first_header_by_op.borrow_mut().clear();
-            unsafe { &mut *self.op_to_storage_offset.get() }.clear();
-            unsafe { &mut *self.offset_to_op.get() }.clear();
-            unsafe { &mut *self.timestamp_to_op.get() }.clear();
-            self.resident_control_ops.set(0);
-        }
+        self.clear_resident_indexes();
 
         let mut removed = 0usize;
         for (op, entry) in ops.into_iter().zip(all_entries) {
@@ -1543,6 +1577,19 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_backfill_below_the_tail_when_reading_last_op_should_report_the_highest_op() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 3, 2] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE).into_frozen())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
     async fn repaired_window_shape_rejects_unbounded_sparse_window_before_allocation() {
         let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
         journal
@@ -1777,6 +1824,64 @@ mod tests {
         let retained = journal.evict_prefix(committed.len());
         assert_eq!(retained.len(), 1, "op 4 stays retained past the gap");
         assert!(journal.header_by_op(4).is_some(), "op 4 still resident");
+    }
+
+    #[compio::test]
+    async fn given_backfill_below_the_front_when_reading_the_prefix_should_wait_for_op_order() {
+        // Once ops 1 and 2 leave, op 4 sits above the op 3 hole and must not
+        // start a prefix. Op 3 then lands behind op 4, where only a sort can
+        // bring it to the front.
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1u64, 2, 4] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+        journal.evict_prefix(journal.committed_prefix_len(0, 4));
+        assert_eq!(journal.committed_prefix_len(0, 4), 0, "op 3 is missing");
+
+        journal
+            .append(build_prepare(3, HEADER_SIZE + 16).into_frozen())
+            .await
+            .expect("append");
+        // Applying op 3 puts the bound at op 4, so only the order check stops
+        // op 4 from going first.
+        assert_eq!(
+            journal.committed_prefix_len(3, 4),
+            0,
+            "op 3 is resident but behind op 4"
+        );
+        assert!(journal.sort_by_op());
+        assert!(!journal.sort_by_op(), "a sorted journal stays put");
+        assert_eq!(journal.committed_prefix_len(3, 4), 2);
+
+        // An install supersedes evicted ops, so only its commit point bounds
+        // the start afterwards.
+        journal.evict_prefix(2);
+        journal.clear_all();
+        journal
+            .append(build_prepare(4, HEADER_SIZE + 16).into_frozen())
+            .await
+            .expect("append");
+        assert_eq!(journal.committed_prefix_len(2, 4), 0, "op 3 is missing");
+        assert_eq!(journal.committed_prefix_len(3, 4), 1);
+    }
+
+    #[compio::test]
+    async fn given_duplicated_op_when_sorting_should_keep_the_first_copy_first() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for (op, checksum) in [(2, 20), (1, 10), (2, 21)] {
+            let entry = build_prepare(op, HEADER_SIZE).transmute_header(
+                |mut old, header: &mut PrepareHeader| {
+                    old.checksum = checksum;
+                    *header = old;
+                },
+            );
+            journal.append(entry.into_frozen()).await.unwrap();
+        }
+        assert!(journal.sort_by_op());
+        assert_eq!(journal.header_by_op(2).unwrap().checksum, 20);
     }
 
     #[compio::test]

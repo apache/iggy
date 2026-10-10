@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-NO-PURGE-1\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-OWNERSHIP-HISTORY-4\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -583,13 +583,17 @@ async fn shard_main(
                 },
                 |mux_stm, header| {
                     if header.operation == iggy_binary_protocol::Operation::Register {
-                        mux_stm
-                            .streams()
-                            .refresh_consumer_group_session(header.client, header.op);
+                        mux_stm.streams().refresh_consumer_group_session(
+                            header.client,
+                            header.op,
+                            header.op,
+                            iggy_common::IggyTimestamp::from(header.timestamp),
+                        );
                     } else {
                         mux_stm.streams().remove_consumer_group_member(
                             header.client,
                             iggy_common::IggyTimestamp::from(header.timestamp),
+                            header.op,
                         );
                     }
                 },
@@ -1157,6 +1161,8 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
             | Operation::DeleteStream
             | Operation::DeletePartitions
             | Operation::TruncatePartition
+            | Operation::CompleteLifecycle
+            | Operation::DeleteConsumerGroup
     )
 }
 
@@ -1201,8 +1207,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn incompatible_storage_is_refused_without_changing_existing_files() {
+    #[compio::test]
+    async fn incompatible_storage_is_refused_without_changing_existing_files() {
         let directory = tempfile::tempdir().unwrap();
         let wal = directory.path().join("journal");
         let marker = directory.path().join(STORAGE_FORMAT_FILE);
@@ -1216,6 +1222,8 @@ mod tests {
         assert!(!marker.exists());
         for format in [
             b"old format\n".as_slice(),
+            b"IGGY-NO-PURGE-1\n",
+            b"IGGY-OWNERSHIP-HISTORY-3\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
@@ -1224,6 +1232,19 @@ mod tests {
                 validate_storage_format(directory.path()),
                 Err(ServerError::UnsupportedStorage { .. })
             ));
+            let config = ServerConfig {
+                path: directory.path().to_string_lossy().into_owned(),
+                ..ServerConfig::default()
+            };
+            let mut logging = Logging::new(crate::VERSION);
+            let error = prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ServerError::UnsupportedStorage { .. }));
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("startup refused without modifying data"));
+            assert!(diagnostic.contains("No in-place upgrade is supported"));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
             assert_eq!(std::fs::read(&marker).unwrap(), format);
             assert_eq!(std::fs::read(&wal).unwrap(), bytes);
         }

@@ -33,7 +33,8 @@ describe('VSR request header', () => {
       request: 0x0102030405060708n,
       operation: 2,
       session: 0x1020304050607080n,
-      nonReplicatedCode: 60_001
+      nonReplicatedCode: 60_001,
+      context: { incarnation: 17n, ownerGeneration: 9n, metadataOp: 52n }
     });
 
     assert.equal(header.length, HEADER_SIZE);
@@ -57,6 +58,9 @@ describe('VSR request header', () => {
       0x1020304050607080n
     );
     assert.equal(header.readUInt32LE(REQUEST_OFFSET.reserved), 60_001);
+    assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation), 17n);
+    assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.ownerGeneration), 9n);
+    assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp), 52n);
     assert.equal(header.readBigUInt64LE(REQUEST_OFFSET.timestamp), 0n);
   });
 

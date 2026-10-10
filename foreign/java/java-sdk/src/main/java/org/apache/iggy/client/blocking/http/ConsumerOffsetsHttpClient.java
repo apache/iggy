@@ -25,6 +25,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.Optional;
@@ -41,9 +42,25 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
     @Override
     public void storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
-        var request = httpClient.preparePutRequest(
-                path(streamId, topicId), new StoreConsumerOffset(consumer.id().toString(), partitionId, offset));
-        httpClient.execute(request);
+        store(
+                streamId,
+                topicId,
+                new StoreConsumerOffset(consumer.id().toString(), partitionId, offset, Optional.empty()));
+    }
+
+    @Override
+    public void storeConsumerOffset(
+            StreamId streamId,
+            TopicId topicId,
+            Long partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            PartitionContext context) {
+        store(
+                streamId,
+                topicId,
+                new StoreConsumerOffset(
+                        consumer.id().toString(), Optional.of(partitionId), offset, Optional.of(context)));
     }
 
     @Override
@@ -57,9 +74,14 @@ class ConsumerOffsetsHttpClient implements ConsumerOffsetsClient {
         return httpClient.executeWithOptionalResponse(request, ConsumerOffsetInfo.class);
     }
 
+    private void store(StreamId streamId, TopicId topicId, StoreConsumerOffset command) {
+        httpClient.execute(httpClient.preparePutRequest(path(streamId, topicId), command));
+    }
+
     private static String path(StreamId streamId, TopicId topicId) {
         return "/streams/" + streamId + "/topics/" + topicId + "/consumer-offsets";
     }
 
-    private record StoreConsumerOffset(String consumerId, Optional<Long> partitionId, BigInteger offset) {}
+    private record StoreConsumerOffset(
+            String consumerId, Optional<Long> partitionId, BigInteger offset, Optional<PartitionContext> context) {}
 }

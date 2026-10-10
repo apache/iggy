@@ -23,10 +23,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
+use metadata::impls::metadata::StreamsFrontend;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
@@ -242,14 +245,18 @@ async fn submit_gated(
         // Retry the same rewritten body: a newly minted PAT token could differ
         // from the token hash protected by the first receipt.
         let retry_request = request.clone();
-        let Some(reply) = submit_client_request_on_owner(shard, request).await else {
-            return Err(WriteError::Unavailable);
-        };
-        let transient = (reply.header().command == Command::Reply)
-            .then(|| transient_code(&reply))
-            .flatten();
-        let Some(transient) = transient else {
-            break reply;
+        // A missing verdict leaves the outcome unknown, as a canceled prepare does.
+        let transient = match submit_client_request_on_owner(shard, request).await {
+            Some(reply) => {
+                let transient = (reply.header().command == Command::Reply)
+                    .then(|| transient_code(&reply))
+                    .flatten();
+                let Some(transient) = transient else {
+                    break reply;
+                };
+                transient
+            }
+            None => IggyError::TransientNotCommitted,
         };
         saw_not_committed |= matches!(transient, IggyError::TransientNotCommitted);
         // Pre-consensus transient frame: replay the SAME request id, mirroring
@@ -354,8 +361,9 @@ pub(in crate::http) async fn partition_write_replicated(
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
+    context: Option<PartitionContext>,
 ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
-    partition_write(state, session, operation, body, &mut None).await
+    partition_write(state, session, operation, body, context, &mut None).await
 }
 
 async fn partition_write(
@@ -363,6 +371,7 @@ async fn partition_write(
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
+    context: Option<PartitionContext>,
     dispatched: &mut Option<oneshot::Sender<Result<(), PartitionWriteError>>>,
 ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
     let deadline = Instant::now() + PARTITION_WRITE_REPLY_TIMEOUT;
@@ -373,6 +382,21 @@ async fn partition_write(
         session.client_id,
     )
     .map_err(PartitionWriteError::Rejected)?;
+    let attachment = session.attachment.borrow().clone();
+    let captured = crate::dispatch::partition::capture_offset_attachment(
+        state.shard.plane.metadata().mux_stm.streams(),
+        server_common::sharding::IggyNamespace::from_raw(namespace),
+        body,
+        session.client_id,
+        attachment,
+        operation,
+    )
+    .map_err(PartitionWriteError::Rejected)?;
+    let context = context.unwrap_or_else(|| {
+        captured
+            .metadata
+            .context(state.shard.plane.metadata().applied_frontier().get())
+    });
     let gate = session.partition_gate(namespace);
     // The group retains one receipt per session. Keep its lane occupied through
     // the reply wait, including when NoAck has already returned after dispatch.
@@ -399,6 +423,12 @@ async fn partition_write(
         request_id,
         body,
     );
+    let message = message.transmute_header(|header, routed: &mut RoutedRequestHeader| {
+        *routed = header;
+        routed.partition_incarnation = context.incarnation;
+        routed.owner_generation = context.owner_generation;
+        routed.minimum_metadata_op = context.metadata_op;
+    });
     let (guard, receiver) = state
         .shard
         .bus
@@ -448,14 +478,22 @@ pub(in crate::http) async fn produce_unacked(
     state: &Rc<HttpInner>,
     session: &Rc<HttpSession>,
     body: Bytes,
+    context: Option<PartitionContext>,
 ) -> Result<(), PartitionWriteError> {
     let state = Rc::clone(state);
     let session = Rc::clone(session);
     let (sent, dispatched) = oneshot::channel();
     compio::runtime::spawn(async move {
         let mut sent = Some(sent);
-        let result =
-            partition_write(&state, &session, Operation::SendMessages, &body, &mut sent).await;
+        let result = partition_write(
+            &state,
+            &session,
+            Operation::SendMessages,
+            &body,
+            context,
+            &mut sent,
+        )
+        .await;
         if let Some(sent) = sent {
             let _ = sent.send(result.map(|_| ()));
         } else if let Err(error) = result {

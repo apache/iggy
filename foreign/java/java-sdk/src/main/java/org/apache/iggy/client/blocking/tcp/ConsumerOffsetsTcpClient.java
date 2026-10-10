@@ -24,6 +24,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.Optional;
@@ -40,6 +41,17 @@ final class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     public void storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
         FutureUtil.resolve(delegate.storeConsumerOffset(streamId, topicId, partitionId, consumer, offset));
+    }
+
+    @Override
+    public void storeConsumerOffset(
+            StreamId streamId,
+            TopicId topicId,
+            Long partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            PartitionContext context) {
+        FutureUtil.resolve(delegate.storeConsumerOffset(streamId, topicId, partitionId, consumer, offset, context));
     }
 
     @Override

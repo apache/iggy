@@ -21,12 +21,14 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
@@ -501,9 +503,14 @@ public sealed class EndpointFailoverTests
                 advanced.Set();
                 return Reply(request.Operation, new byte[4]);
             }
-            return request.Code == GET_CLUSTER_METADATA_CODE
-                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
-                : Answer(request);
+            return request.Code switch
+            {
+                GET_CLUSTER_METADATA_CODE => Reply(OPERATION_NON_REPLICATED,
+                    ClusterMetadata(node.Port, node.Port, node.Port)),
+                CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE => RouteReply(request, new PartitionContext(17, 0, 1),
+                    node.Port, true),
+                _ => Answer(request)
+            };
         });
         var configuration = new IggyClientConfigurator
         {

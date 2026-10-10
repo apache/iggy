@@ -48,6 +48,7 @@ public final class ConsensusSession {
     private long generation;
     private long metadataWatermark;
     private boolean shared;
+    private ConsensusSession parent;
 
     public ConsensusSession() {
         regenerateClientId();
@@ -86,16 +87,26 @@ public final class ConsensusSession {
      * deliberately carries the counter across a re-login to keep pending-reply
      * correlation keys unique, so reconnecting cannot rewind it; only a new
      * client instance starts a fresh sequence.
+     *
+     * <p>A shared session draws the id from its parent, see {@link #bindShared}.
      */
-    synchronized long nextRequestId() {
-        if (session == null) {
-            throw new IggyNotConnectedException("Not authenticated, call login first");
+    long nextRequestId() {
+        ConsensusSession numbering;
+        synchronized (this) {
+            if (session == null) {
+                throw new IggyNotConnectedException("Not authenticated, call login first");
+            }
+            numbering = parent;
+            if (numbering == null) {
+                if (requestCounter == Long.MAX_VALUE) {
+                    throw new IllegalStateException(
+                            "VSR request counter exhausted, create a fresh client instance (reconnecting preserves the counter)");
+                }
+                return requestCounter++;
+            }
         }
-        if (requestCounter == Long.MAX_VALUE) {
-            throw new IllegalStateException(
-                    "VSR request counter exhausted, create a fresh client instance (reconnecting preserves the counter)");
-        }
-        return requestCounter++;
+        // Outside this monitor, so the monitors of two sessions never nest.
+        return numbering.nextRequestId();
     }
 
     /**
@@ -144,16 +155,28 @@ public final class ConsensusSession {
         return bindSecret.clone();
     }
 
-    /** Uses a parent identity for BindSession and non-replicated requests only. */
-    public synchronized void bindShared(long clientLow, long clientHigh, long epoch, byte[] secret) {
-        if ((clientLow == 0 && clientHigh == 0) || epoch == 0 || secret == null || secret.length != BIND_SECRET_BYTES) {
-            throw new IggyInvalidArgumentException("Shared session requires a nonzero client, a nonzero epoch and a "
-                    + BIND_SECRET_BYTES + "-byte bind secret");
+    /**
+     * Binds another connection to the identity of {@code parent}. Replicated requests
+     * take their ids from the parent's counter: the partition deduplicates by client
+     * and request id whichever connection carries them, so a counter of this
+     * connection would reuse ids the server already answered.
+     */
+    public synchronized void bindShared(
+            ConsensusSession parent, long clientLow, long clientHigh, long epoch, byte[] secret) {
+        if (parent == null
+                || parent == this
+                || (clientLow == 0 && clientHigh == 0)
+                || epoch == 0
+                || secret == null
+                || secret.length != BIND_SECRET_BYTES) {
+            throw new IggyInvalidArgumentException("Shared session requires another parent session, a nonzero client,"
+                    + " a nonzero epoch and a " + BIND_SECRET_BYTES + "-byte bind secret");
         }
         bind(epoch);
         clientIdLow = clientLow;
         clientIdHigh = clientHigh;
         System.arraycopy(secret, 0, bindSecret, 0, BIND_SECRET_BYTES);
+        this.parent = parent;
         shared = true;
     }
 

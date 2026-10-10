@@ -318,7 +318,14 @@ pub struct RequestHeader {
     /// On `Register` it carries the freshly authenticated user.
     /// The submitter's wire value is never trusted.
     pub user_id: u32,
-    pub reserved: [u8; 60],
+    /// Little-endian command code in `reserved[0..4]` for `NonReplicated`.
+    pub reserved: [u8; 4],
+    /// Captured with the request and retained across retries and route refreshes.
+    pub partition_incarnation: u64,
+    pub owner_generation: u64,
+    /// Minimum committed metadata operation needed to interpret this request.
+    pub minimum_metadata_op: u64,
+    pub reserved_tail: [u8; 32],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -329,7 +336,10 @@ const _: () = {
     assert!(
         offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 60]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestHeader, partition_incarnation) == 200);
+    assert!(offset_of!(RequestHeader, owner_generation) == 208);
+    assert!(offset_of!(RequestHeader, minimum_metadata_op) == 216);
+    assert!(offset_of!(RequestHeader, reserved_tail) + size_of::<[u8; 32]>() == HEADER_SIZE);
 };
 
 /// A [`RequestHeader`] AFTER the receiving node resolved its target.
@@ -342,7 +352,7 @@ const _: () = {
 /// so this is where the derivation result lives for the internal hop.
 ///
 /// Layout: identical to [`RequestHeader`] with server routing fields claiming
-/// bytes 240..256; the leading 44 reserved bytes keep their client-wire meaning.
+/// bytes 240..256; captured incarnation and ownership retain their client-wire offsets.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RoutedRequestHeader {
@@ -364,10 +374,14 @@ pub struct RoutedRequestHeader {
     pub operation_padding: [u8; 7],
     pub session: u64,
     pub user_id: u32,
-    /// Same offset and meaning as the leading 44 bytes of
-    /// `RequestHeader::reserved` -- this region CARRIES DATA (the
-    /// non-replicated op code range), so `group` must not displace it.
-    pub reserved: [u8; 44],
+    /// Little-endian command code in `reserved[0..4]` for `NonReplicated`.
+    pub reserved: [u8; 4],
+    /// Captured with the request and retained across retries and route refreshes.
+    pub partition_incarnation: u64,
+    pub owner_generation: u64,
+    /// Minimum committed metadata operation needed to interpret this request.
+    pub minimum_metadata_op: u64,
+    pub reserved_tail: [u8; 16],
     /// Server-observed metadata frontier at partition admission.
     pub metadata_watermark: u64,
     /// The resolved consensus group id (see `binary_protocol::namespace`),
@@ -383,6 +397,18 @@ const _: () = {
     assert!(offset_of!(RoutedRequestHeader, session) == offset_of!(RequestHeader, session));
     assert!(offset_of!(RoutedRequestHeader, user_id) == offset_of!(RequestHeader, user_id));
     assert!(offset_of!(RoutedRequestHeader, reserved) == offset_of!(RequestHeader, reserved));
+    assert!(
+        offset_of!(RoutedRequestHeader, partition_incarnation)
+            == offset_of!(RequestHeader, partition_incarnation)
+    );
+    assert!(
+        offset_of!(RoutedRequestHeader, owner_generation)
+            == offset_of!(RequestHeader, owner_generation)
+    );
+    assert!(
+        offset_of!(RoutedRequestHeader, minimum_metadata_op)
+            == offset_of!(RequestHeader, minimum_metadata_op)
+    );
     assert!(offset_of!(RoutedRequestHeader, group) + size_of::<u64>() == HEADER_SIZE);
 };
 
@@ -406,7 +432,11 @@ impl Default for RoutedRequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 44],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            owner_generation: 0,
+            minimum_metadata_op: 0,
+            reserved_tail: [0; 16],
             metadata_watermark: 0,
             group: 0,
         }
@@ -433,7 +463,11 @@ impl Default for RequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 60],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            owner_generation: 0,
+            minimum_metadata_op: 0,
+            reserved_tail: [0; 32],
         }
     }
 }
@@ -605,7 +639,9 @@ pub struct ReplyHeader {
     /// Carved from `reserved` like `user_id` in `RequestHeader` / `PrepareHeader`;
     /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
-    pub reserved: [u8; 36],
+    pub reserved: [u8; 4],
+    pub partition_incarnation: u64,
+    pub reserved_tail: [u8; 24],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -613,7 +649,13 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ReplyHeader, reserved) + size_of::<[u8; 4]>()
+            == offset_of!(ReplyHeader, partition_incarnation)
+    );
+    assert!(offset_of!(ReplyHeader, partition_incarnation) == 224);
+    assert!(offset_of!(ReplyHeader, reserved_tail) == 232);
+    assert!(offset_of!(ReplyHeader, reserved_tail) + size_of::<[u8; 24]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -638,7 +680,9 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             status: 0,
-            reserved: [0; 36],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            reserved_tail: [0; 24],
         }
     }
 }
@@ -668,14 +712,16 @@ impl ReplyHeader {
             timestamp: prepare_header.timestamp,
             request: prepare_header.request,
             operation: prepare_header.operation,
+            partition_incarnation: prepare_header.partition_incarnation,
             ..Self::default()
         }
     }
 
     /// The base of a reply that answers `request_header` without a prepare
     /// (rejections, denials, non-replicated reads): `cluster`, `view`,
-    /// `release`, `replica`, `request_checksum`, `timestamp`, `request` and
-    /// `operation` echo the request, `command` is `Reply`, `size` is the
+    /// `release`, `replica`, `request_checksum`, `timestamp`, `request`,
+    /// `operation` and `partition_incarnation` echo the
+    /// request, `command` is `Reply`, `size` is the
     /// caller's frame length, and every other field is zero.
     ///
     /// `client`, `op`, `commit` and `status` stay zero. Callers stamp two
@@ -696,6 +742,7 @@ impl ReplyHeader {
             timestamp: request_header.timestamp,
             request: request_header.request,
             operation: request_header.operation,
+            partition_incarnation: request_header.partition_incarnation,
             ..Self::default()
         }
     }
@@ -1012,7 +1059,8 @@ pub struct PrepareHeader {
     pub user_id: u32,
     /// Immutable capacity nominated by the first committed prepare in this group.
     pub retry_capacity: u32,
-    pub reserved: [u8; 16],
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 8],
     /// Metadata Register commit identifying the authenticated session.
     /// Zero is reserved for registration and server-originated operations.
     pub session: u64,
@@ -1027,7 +1075,8 @@ const _: () = {
         offset_of!(PrepareHeader, user_id) == offset_of!(PrepareHeader, group) + size_of::<u64>()
     );
     assert!(offset_of!(PrepareHeader, retry_capacity) == 228);
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 16]>() == 248);
+    assert!(offset_of!(PrepareHeader, partition_incarnation) == 232);
+    assert!(offset_of!(PrepareHeader, reserved) == 240);
     assert!(offset_of!(PrepareHeader, session) == 248);
     assert!(offset_of!(PrepareHeader, session) + size_of::<u64>() == HEADER_SIZE);
 };
@@ -1056,7 +1105,8 @@ impl Default for PrepareHeader {
             group: 0,
             user_id: 0,
             retry_capacity: 0,
-            reserved: [0; 16],
+            partition_incarnation: 0,
+            reserved: [0; 8],
             session: 0,
         }
     }
@@ -3137,10 +3187,8 @@ mod tests {
         );
     }
 
-    // `group` claims the TAIL of the client header's reserved area; the
-    // leading 52 reserved bytes carry data (the non-replicated op code lives
-    // in `reserved[0..4]`), so a reshuffle of the carve must trip here rather
-    // than silently move the code range.
+    // Routing must preserve the client prefix, including the command code
+    // in `reserved[0..4]` and the captured partition context.
     #[test]
     fn routed_request_group_claims_reserved_tail() {
         use std::mem::offset_of;
@@ -3242,7 +3290,8 @@ mod tests {
             group: 17,
             user_id: 18,
             retry_capacity: 31,
-            reserved: [19; 16],
+            partition_incarnation: 19,
+            reserved: [23; 8],
             session: 37,
         };
         let reply = ReplyHeader::from_prepare(&prepare, 20);
@@ -3265,7 +3314,9 @@ mod tests {
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
         assert_eq!(reply.status, 0);
-        assert_eq!(reply.reserved, [0; 36]);
+        assert_eq!(reply.reserved, [0; 4]);
+        assert_eq!(reply.reserved_tail, [0; 24]);
+        assert_eq!(reply.partition_incarnation, 19);
     }
 
     #[test]
@@ -3288,7 +3339,11 @@ mod tests {
             operation_padding: [13; 7],
             session: 14,
             user_id: 15,
-            reserved: [16; 44],
+            reserved: [16; 4],
+            partition_incarnation: 19,
+            owner_generation: 29,
+            minimum_metadata_op: 31,
+            reserved_tail: [0; 16],
             metadata_watermark: 17,
             group: 17,
         };
@@ -3313,7 +3368,9 @@ mod tests {
         assert_eq!(reply.reserved_frame, [0; 66]);
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
-        assert_eq!(reply.reserved, [0; 36]);
+        assert_eq!(reply.reserved, [0; 4]);
+        assert_eq!(reply.reserved_tail, [0; 24]);
+        assert_eq!(reply.partition_incarnation, 19);
     }
 
     // Wire-discriminant pin: any change breaks SDK decoders.

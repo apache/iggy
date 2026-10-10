@@ -286,7 +286,7 @@ func TestTopicCache_ClearCountsKeepsTheBalancedCursors(t *testing.T) {
 
 func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationSendMessages {
 			return statusReplyFrame(vsr.OperationSendMessages,
 				uint32(ierror.PartitionNotFoundCode), nil)
@@ -306,6 +306,32 @@ func TestSendMessages_InvalidatesTheCountWhenThePartitionVanished(t *testing.T) 
 	_, cached := client.topics.partitionsCount(newTopicKey(streamId, topicId))
 	assert.False(t, cached,
 		"the topic was likely recreated smaller; the count must be reread")
+}
+
+func TestSendMessages_KeepsTheContextAfterAFailureThatIsNotARefusal(t *testing.T) {
+	client, serverConn := newPipeClient(t)
+	sends := 0
+	server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+		sends++
+		if sends == 1 {
+			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.PartitionNotFoundCode), nil)
+		}
+		return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
+	})
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	send := func() error {
+		_, err := client.SendMessages(context.Background(),
+			numericIdentifier(t, 1), numericIdentifier(t, 1),
+			iggcon.PartitionId(1), []iggcon.IggyMessage{message})
+		return err
+	}
+
+	require.ErrorIs(t, send(), ierror.ErrPartitionNotFound)
+	require.NoError(t, send())
+
+	assert.Equal(t, 1, requestCount(server.recorded(), command.GetSendContextCode),
+		"only a refusal of the context itself drops it")
 }
 
 func TestGetDefaultOptions_DisablesNagle(t *testing.T) {

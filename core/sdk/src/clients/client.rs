@@ -840,6 +840,17 @@ impl IggyClient {
     /// The HTTP counterpart is
     /// [`send_http_request`](IggyClient::send_http_request).
     ///
+    /// Partition commands carry the partition context the typed API would send.
+    /// `SendMessages` with an explicit partition id captures one with
+    /// `GetSendContext` and caches it. `PollMessages`, `StoreConsumerOffset` and
+    /// `DeleteConsumerOffset` are routed like their typed calls and take the
+    /// context their route reports, so after another client deleted and
+    /// recreated the partition, one call can fail with
+    /// [`IggyError::HistoryUnavailable`]
+    /// ([`IggyError::ConsumerGroupPartitionNotOwned`] for a consumer group).
+    /// The failed route is dropped and the next call routes again. See
+    /// [`BinaryTransport::send_raw_with_response`].
+    ///
     /// # Examples
     ///
     /// Ping the server over the raw binary path. `PING_CODE` takes an empty
@@ -866,8 +877,13 @@ impl IggyClient {
     /// [`IggyError::InvalidCommand`] if `code` is one of the session-control
     /// codes (login, logout, and register). Use the typed `login_user` /
     /// `logout_user` methods so the SDK's session state stays correct.
+    /// The same error, before anything is sent, if the payload of a partition
+    /// command does not decode.
     /// [`IggyError::FeatureUnavailable`] on the HTTP transport, which has no
-    /// binary path.
+    /// binary path, and before anything is sent for `SendMessages` with
+    /// `Balanced` or `MessagesKey` partitioning. Use
+    /// [`send_messages`](crate::prelude::MessageClient::send_messages) or an
+    /// explicit partition id.
     ///
     /// [`iggy_binary_protocol`]: iggy_binary_protocol
     /// [`iggy_binary_protocol::codes`]: iggy_binary_protocol::codes

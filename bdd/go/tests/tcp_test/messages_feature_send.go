@@ -93,9 +93,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 				iggcon.PartitionId(createRandomUInt32()),
 				messages,
 			)
-			// The send is routed by its packed namespace, so the shard that
-			// owns no such partition reports a missing resource.
-			itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrPartitionNotFound)
 		})
 
 		ginkgo.Context("and tries to send messages to valid topic but with 0 messages in payload", func() {

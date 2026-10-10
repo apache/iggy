@@ -21,7 +21,10 @@
 // The layout is a port of core/binary_protocol/src/consensus/header.rs.
 package vsr
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
 // HeaderSize is the length of every consensus frame header, both directions.
 // A frame is this header followed by size-HeaderSize body bytes.
@@ -48,6 +51,7 @@ const (
 	requestOffsetOperation = 176
 	requestOffsetSession   = 184
 	requestOffsetReserved  = 196
+	requestOffsetContext   = 200
 )
 
 // Reply header field offsets the client reads.
@@ -219,4 +223,11 @@ func ReadEviction(header *[HeaderSize]byte) Eviction {
 		ServerProtocolVersion:    binary.LittleEndian.Uint32(header[evictionOffsetServerProtocolVersion:]),
 		ServerProtocolVersionMin: binary.LittleEndian.Uint32(header[evictionOffsetServerProtocolVersionMin:]),
 	}
+}
+
+// StampPartitionContext preserves the captured incarnation through request retries.
+func StampPartitionContext(dst *[HeaderSize]byte, captured iggcon.PartitionContext) {
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext:], captured.Incarnation)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+8:], captured.OwnerGeneration)
+	binary.LittleEndian.PutUint64(dst[requestOffsetContext+16:], captured.MetadataOp)
 }

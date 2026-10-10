@@ -32,8 +32,10 @@ public class RentedTypedConsumerTests
     {
         var owner = new RentedConsumerTests.TrackingMemoryOwner(1024);
         IReadOnlyList<RentedMessageResponse> messages = RentedConsumerTests.BuildMessages(owner, 3);
+        var context = new PartitionContext(17, 9, 52);
         var rental = new PolledMessagesRental(owner)
         {
+            Context = context,
             PartitionId = 1,
             CurrentOffset = 2,
             Messages = messages
@@ -65,6 +67,7 @@ public class RentedTypedConsumerTests
             Assert.Equal($"msg-{i}", got[i].Data);
             Assert.Equal((ulong)i, got[i].CurrentOffset);
             Assert.Equal(1u, got[i].PartitionId);
+            Assert.Equal(context, got[i].Context);
             Assert.Null(got[i].Error);
         }
 

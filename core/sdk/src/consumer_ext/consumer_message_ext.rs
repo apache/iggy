@@ -85,6 +85,7 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                 message = self.next() => {
                     match message {
                         Some(Ok(received_message)) => {
+                            let position = received_message.position();
                             let partition_id = received_message.partition_id;
                             let current_offset = received_message.current_offset;
                             let message_offset = received_message.message.header.offset;
@@ -99,15 +100,15 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                             if store_offset_after_each_message {
                                 trace!("Storing offset: {message_offset}/{current_offset}, partition: {partition_id}, after each message for consumer: {name} on topic: {topic} and stream: {stream}",
                                     name = self.name(), topic = self.topic(), stream = self.stream());
-                                self.send_store_offset(partition_id, message_offset);
+                                self.send_store_offset(position);
                             } else if store_after_every_nth_message > 0  && message_offset % store_after_every_nth_message == 0 {
                                 trace!("Storing offset: {message_offset}/{current_offset}, partition: {partition_id}, after every {store_after_every_nth_message} message for consumer: {name} on topic: {topic} and stream: {stream}",
                                     store_after_every_nth_message = store_after_every_nth_message, name = self.name(), topic = self.topic(), stream = self.stream());
-                                self.send_store_offset(partition_id, message_offset);
+                                self.send_store_offset(position);
                             } else if store_offset_after_all_messages && message_offset == current_offset {
                                 trace!("Storing offset: {message_offset}/{current_offset}, partition: {partition_id}, after all messages for consumer: {name} on topic: {topic} and stream: {stream}",
                                     name = self.name(), topic = self.topic(), stream = self.stream());
-                                self.send_store_offset(partition_id, message_offset);
+                                self.send_store_offset(position);
                             }
                         }
                         Some(Err(err)) => {

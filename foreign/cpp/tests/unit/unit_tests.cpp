@@ -89,6 +89,13 @@ TEST(PollingStrategyTest, ReturnsExpectedKindAndValue) {
     EXPECT_EQ(next.Value(), 0u);
 }
 
+TEST(PartitionContextTest, ReturnsConstructedValues) {
+    const iggy::PartitionContext context(3, 5, 7);
+    EXPECT_EQ(context.Incarnation(), 3u);
+    EXPECT_EQ(context.OwnerGeneration(), 5u);
+    EXPECT_EQ(context.MetadataOp(), 7u);
+}
+
 TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     const auto server_default = iggy::Expiry::ServerDefault();
     EXPECT_EQ(server_default.Kind(), "server_default");
@@ -388,6 +395,8 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.JoinConsumerGroup(stream, topic, group), iggy::IggyException);
     EXPECT_THROW(client.LeaveConsumerGroup(stream, topic, group), iggy::IggyException);
     EXPECT_THROW(client.StoreConsumerOffset(consumer, stream, topic, 0, 0), iggy::IggyException);
+    EXPECT_THROW(client.StoreConsumerPosition(consumer, stream, topic, 0, 0, iggy::PartitionContext(1, 0, 0)),
+                 iggy::IggyException);
     EXPECT_THROW(client.GetConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
     EXPECT_THROW(client.DeleteConsumerOffset(consumer, stream, topic, 0), iggy::IggyException);
     EXPECT_THROW((void)client.GetStats(), iggy::IggyException);

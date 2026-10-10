@@ -17,7 +17,7 @@
 
 //! Decoder for the `PollMessages` response.
 //!
-//! The body after the 16-byte prefix is a stream of canonical batch records
+//! The body after the 40-byte prefix is a stream of canonical batch records
 //! (see [`crate::batch`]) served as stored: each record's header carries the
 //! stamped `base_offset` / `base_timestamp`, and each frame's deltas resolve
 //! against them. A record may be a server-sliced view of a larger stored
@@ -27,19 +27,35 @@
 use crate::batch::{BatchHeader, BatchIntegrity, BatchIterator, decode_batch_slice_with};
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::error::WireError;
+use crate::primitives::partition_history::PartitionContext;
 use bytes::{BufMut, BytesMut};
 
-/// Size of the `PollMessages` response header: `partition_id(4) + current_offset(8) + count(4)`.
-const POLL_RESPONSE_HEADER_SIZE: usize = 16;
+/// Size of the `PollMessages` response header: `partition_id(4) + current_offset(8) + count(4) + context(24)`.
+pub const POLL_RESPONSE_HEADER_SIZE: usize = 16 + PartitionContext::ENCODED_SIZE;
 
-/// The 16-byte metadata prefix of a `PollMessages` response.
+/// The 40-byte metadata prefix of a `PollMessages` response.
 ///
-/// Layout: `partition_id(4) + current_offset(8) + messages_count(4)`.
+/// Layout: `partition_id(4) + current_offset(8) + messages_count(4) + context(24)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollMessagesResponseHeader {
     pub partition_id: u32,
     pub current_offset: u64,
     pub messages_count: u32,
+    pub context: PartitionContext,
+}
+
+impl PollMessagesResponseHeader {
+    /// The header bytes, for reply frames that place them without allocating.
+    #[must_use]
+    pub fn to_le_bytes(&self) -> [u8; POLL_RESPONSE_HEADER_SIZE] {
+        let mut bytes = [0; POLL_RESPONSE_HEADER_SIZE];
+        let mut head = &mut bytes[..];
+        head.put_u32_le(self.partition_id);
+        head.put_u64_le(self.current_offset);
+        head.put_u32_le(self.messages_count);
+        head.put_slice(&self.context.to_le_bytes());
+        bytes
+    }
 }
 
 impl WireEncode for PollMessagesResponseHeader {
@@ -48,9 +64,7 @@ impl WireEncode for PollMessagesResponseHeader {
     }
 
     fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u32_le(self.partition_id);
-        buf.put_u64_le(self.current_offset);
-        buf.put_u32_le(self.messages_count);
+        buf.extend_from_slice(&self.to_le_bytes());
     }
 }
 
@@ -59,11 +73,13 @@ impl WireDecode for PollMessagesResponseHeader {
         let partition_id = read_u32_le(buf, 0)?;
         let current_offset = read_u64_le(buf, 4)?;
         let messages_count = read_u32_le(buf, 12)?;
+        let (context, _) = PartitionContext::decode(&buf[16..])?;
         Ok((
             Self {
                 partition_id,
                 current_offset,
                 messages_count,
+                context,
             },
             POLL_RESPONSE_HEADER_SIZE,
         ))
@@ -176,7 +192,7 @@ pub struct PollMessagesResponse<'a> {
 impl<'a> PollMessagesResponse<'a> {
     /// Decode from a response payload buffer. Borrows the buffer.
     ///
-    /// Reads the 16-byte header then creates an iterator over the batch
+    /// Reads the 40-byte header then creates an iterator over the batch
     /// records that follow. Records are validated lazily during iteration.
     ///
     /// # Errors
@@ -235,6 +251,7 @@ mod tests {
         body.extend_from_slice(&7u32.to_le_bytes());
         body.extend_from_slice(&current_offset.to_le_bytes());
         body.extend_from_slice(&count.to_le_bytes());
+        body.extend_from_slice(&PartitionContext::default().to_le_bytes());
         for batch in batches {
             body.extend_from_slice(batch);
         }
@@ -247,6 +264,7 @@ mod tests {
             partition_id: 3,
             current_offset: 42,
             messages_count: 7,
+            context: PartitionContext::default(),
         };
         let bytes = header.to_bytes();
         let (decoded, consumed) = PollMessagesResponseHeader::decode(&bytes).unwrap();

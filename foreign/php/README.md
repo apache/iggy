@@ -159,14 +159,14 @@ $consumer = $client->consumerGroup(
 $consumer->consumeMessages(
     function (\Iggy\ReceiveMessage $message) use ($consumer): void {
         echo $message->payload(), PHP_EOL;
-        $consumer->storeOffset($message->offset(), $message->partitionId());
+        $consumer->storePosition($message->position());
     },
     1,
 );
 
 foreach ($consumer->iterMessages() as $message) {
     echo $message->payload(), PHP_EOL;
-    $consumer->storeOffset($message->offset(), $message->partitionId());
+    $consumer->storePosition($message->position());
 
     break;
 }
@@ -220,7 +220,24 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/p
   Break out of the loop when the caller's processing limit or shutdown signal is reached.
 - `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
   If callback success must control commits, use `AutoCommit::disabled()` and call
-  `storeOffset()` after the callback work succeeds.
+  `storePosition($message->position())` after the callback work succeeds.
+- Every received message keeps the partition context of the poll that delivered it:
+  the partition incarnation, which changes when the partition is deleted and recreated,
+  and the consumer group owner generation. `Iggy\Consumer::storePosition()` commits a
+  message's `position()` under that context, so a commit after a recreation or an owner
+  change is refused instead of landing on the newer partition. `storeOffset()` commits
+  under the context of the latest message consumed from that partition.
+- `Iggy\PollingStrategy::withContext()` continues a poll at an offset under the context
+  that produced it, for example
+  `PollingStrategy::offset($message->offset() + 1)->withContext($message->context())`.
+  A stale context fails the poll. To continue in another process, save the context's
+  `incarnation`, `owner_generation` and `metadata_op` with the offset and rebuild it with
+  `new Iggy\PartitionContext(...)`.
+- A poll or offset write without a caller context uses the context of its route. It can
+  fail once with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009)
+  for a consumer group, after another client deleted and recreated the partition. The
+  failed route is dropped, and the next call routes again. Both errors surface as
+  `Iggy\Exception\IggyException`.
 - `Iggy\PollingStrategy::timestamp()` and `Iggy\PollingStrategy::timestampMicros()`
   expect microseconds since the Unix epoch. Use
   `Iggy\PollingStrategy::timestampSeconds()` for PHP `time()` values.

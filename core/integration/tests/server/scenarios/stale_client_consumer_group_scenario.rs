@@ -130,11 +130,15 @@ async fn given_live_member_when_backup_restarts_should_preserve_membership(
         .join_consumer_group(&stream, &topic, &group_id)
         .await
         .unwrap();
-    let before = consumer_client
-        .get_consumer_group(&stream, &topic, &group_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let before = integration::harness::wait_for_consumer_group_assignment(
+        &consumer_client,
+        &stream,
+        &topic,
+        &group_id,
+        1,
+        STALE_EVICTION_TIMEOUT,
+    )
+    .await;
     assert_eq!(before.members_count, 1);
 
     harness.kill_node(2).unwrap();
@@ -171,6 +175,15 @@ async fn verify_replacement_after_restart(
         .join_consumer_group(&stream, &topic, &group_id)
         .await
         .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        &original,
+        &stream,
+        &topic,
+        &group_id,
+        1,
+        STALE_EVICTION_TIMEOUT,
+    )
+    .await;
     let before = original
         .poll_messages(
             &stream,
@@ -184,6 +197,17 @@ async fn verify_replacement_after_restart(
         .await
         .unwrap();
     assert_eq!(before.messages.len(), 1);
+    // A poll reply does not acknowledge durable AUTO completion.
+    original
+        .store_consumer_offset(
+            &consumer,
+            &stream,
+            &topic,
+            Some(before.partition_id),
+            before.messages[0].header.offset,
+        )
+        .await
+        .expect("persist the restart cursor before stopping the original member");
     match restart {
         Restart::Client => {}
         Restart::ServerShutdown => harness.stop_node(0).unwrap(),

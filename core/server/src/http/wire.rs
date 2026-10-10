@@ -185,6 +185,11 @@ pub(in crate::http) fn delete_offset_wire_request(
 /// it, so an SDK re-syncs its assignment instead of reading end-of-partition.
 pub(in crate::http) const fn resync_required_polled_messages() -> PolledMessages {
     PolledMessages {
+        context: iggy_binary_protocol::primitives::partition_history::PartitionContext {
+            incarnation: 0,
+            owner_generation: 0,
+            metadata_op: 0,
+        },
         partition_id: RESYNC_REQUIRED_PARTITION_SENTINEL,
         current_offset: 0,
         count: 0,
@@ -442,6 +447,7 @@ mod tests {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::named("orders").expect("valid topic id");
         let command = StoreConsumerOffset {
+            context: None,
             consumer: Consumer::new(Identifier::named("c1").expect("valid id")),
             partition_id: Some(1),
             offset: 42,
@@ -464,6 +470,7 @@ mod tests {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::numeric(2).expect("valid topic id");
         let command = StoreConsumerOffset {
+            context: None,
             consumer: Consumer::new(Identifier::numeric(7).expect("valid id")),
             partition_id: None,
             offset: u64::MAX,
@@ -560,6 +567,7 @@ mod tests {
         let body = build_polled_messages_body(
             3,
             42,
+            iggy_common::PartitionContext::default(),
             fragment_from_stored_batch(&header, &stored.blob),
             None,
         )

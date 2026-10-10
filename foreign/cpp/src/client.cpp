@@ -363,6 +363,18 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
     });
 }
 
+void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
+                                               const Identifier &stream,
+                                               const Identifier &topic,
+                                               const std::uint32_t partition_id,
+                                               const std::uint64_t offset,
+                                               const PartitionContext &context) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id, offset, &context] {
+        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
+                                          consumer.Id().ToFfi(), offset, context.ToFfi());
+    });
+}
+
 ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consumer,
                                                          const Identifier &stream,
                                                          const Identifier &topic,

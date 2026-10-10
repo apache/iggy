@@ -394,16 +394,13 @@ where
                     // offers live on every shard that hosts a serving group --
                     // parked behind the shard-0 gate they would never expire.
                     self.expire_idle_state_transfer_offers();
-                    // While a cooperative revocation is pending, wake the
-                    // reconciler each tick so the handoff completes within ~one
-                    // tick of the partition draining, not the periodic pass.
-                    if self
-                        .plane
-                        .metadata()
-                        .mux_stm
-                        .streams()
-                        .has_pending_revocations()
-                    {
+                    // A drain completes without an event, so a pending
+                    // revocation wakes the reconciler each tick. A published
+                    // fence wakes it once, and retries of an unpublished one
+                    // stay on its periodic pass.
+                    let fence_published = self.plane.partitions().take_fence_published();
+                    let streams = self.plane.metadata().mux_stm.streams();
+                    if fence_published || streams.has_pending_revocations() {
                         self.dispatch_metadata_commit_tick();
                     }
                     // A dropped `ReconcileApply` marker (full inbox at

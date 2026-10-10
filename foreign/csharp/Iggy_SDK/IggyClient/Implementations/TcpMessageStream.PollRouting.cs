@@ -20,6 +20,7 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Mappers;
@@ -31,24 +32,31 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public sealed partial class TcpMessageStream
 {
     private const int MaxCachedPollRoutes = 4096;
+    private const int MaxCachedPartitionContexts = 4096;
     internal const int MAX_POLL_CONNECTIONS = 256;
     private const int PollRoutingRetryIntervalMs = 50;
     private const int ConsumerSessionSize = 32;
     private const int ConsumerSessionEpochOffset = 16;
     private const int ConsumerSessionWatermarkOffset = 24;
+    private const int PollOptionsSize = 1 + sizeof(ulong) + sizeof(uint) + 1;
+    private const int IdentifierPrefixSize = 2;
+    private const int StoreOffsetSuffixSize = sizeof(ulong) + 1;
+    private const int DeleteOffsetSuffixSize = 1;
 
     private readonly object _pollRoutingGate = new();
     private readonly Dictionary<PollRouteKey, PollRoute> _pollRoutes = [];
     private readonly Dictionary<string, PollConnectionSlot> _pollConnections = [];
+    private readonly Dictionary<(int QueryCode, string Route), CachedContext> _partitionContexts = [];
     private ulong _metadataWatermark;
     private int _clusterNodeCount;
     private uint? _rememberedUserId;
     private AutoLoginSettings? _configuredLoginOverride;
 
-    private readonly record struct PollRouteKey(Identifier StreamId, Identifier TopicId, ConsumerType ConsumerType,
-        Identifier ConsumerId, uint? PartitionId);
+    /// <summary>Polls route through GetPollRouting and offset writes through GetConsumerOffsetRouting.</summary>
+    private readonly record struct PollRouteKey(int RoutingCode, Identifier StreamId, Identifier TopicId,
+        ConsumerType ConsumerType, Identifier ConsumerId, uint? PartitionId);
 
-    private sealed record PollRoute(string Endpoint, byte[] Attachment, ulong Generation, ulong Watermark);
+    private sealed record PollRoute(string Endpoint, byte[] Attachment, ulong Generation, ulong Watermark, PartitionContext Context);
 
     private sealed class PollConnectionSlot
     {
@@ -58,12 +66,181 @@ public sealed partial class TcpMessageStream
         internal volatile bool Retired;
     }
 
-    private async Task<IMemoryOwner<byte>> PollAutoCommitAsync(PollRouteKey key, ReadOnlyMemory<byte> payload,
+    /// <summary>
+    ///     The routing request whose reply carries the context of a poll or an offset write. Requests with the same
+    ///     <c>Route</c> share the context, so polls of a partition share it whatever their options.
+    /// </summary>
+    private sealed record ContextQuery(int Code, byte[] Body, int ContextOffset, string Route);
+
+    private readonly record struct CachedContext(PartitionContext Context, ulong Generation, ulong Watermark);
+
+    /// <summary>The partition a send targets and the GetSendContext body that captures its context.</summary>
+    private readonly record struct SendTarget(TopicKey Topic, uint PartitionId, byte[] Query);
+
+    private async Task<PartitionContext> CapturePartitionContextAsync(int code, ReadOnlyMemory<byte> body,
         CancellationToken token)
+    {
+        var query = TryBuildContextQuery(code, body.Span);
+        return query is null ? default : await GetPartitionContextAsync(query, token);
+    }
+
+    /// <summary>
+    ///     A cached context is reused until a request carrying it fails, the session changes, or this client
+    ///     commits a metadata operation, such as a delete that ends the partition's incarnation.
+    /// </summary>
+    private async Task<PartitionContext> GetPartitionContextAsync(ContextQuery query, CancellationToken token)
+    {
+        ulong generation;
+        ulong watermark;
+        lock (_pollRoutingGate)
+        {
+            generation = _consensusSession.Generation;
+            watermark = _metadataWatermark;
+            if (_partitionContexts.TryGetValue((query.Code, query.Route), out var cached)
+                && cached.Generation == generation && cached.Watermark >= watermark)
+            {
+                return cached.Context;
+            }
+        }
+
+        using var response = await SendWithResponseAsync(query.Code, query.Body, token: token);
+        var context = BinaryMapper.MapPartitionContext(response.Memory.Span[query.ContextOffset..]);
+        lock (_pollRoutingGate)
+        {
+            if (_partitionContexts.Count >= MaxCachedPartitionContexts)
+            {
+                _partitionContexts.Clear();
+            }
+
+            _partitionContexts[(query.Code, query.Route)] = new CachedContext(context, generation, watermark);
+        }
+
+        return context;
+    }
+
+    private void ForgetPartitionContext(ContextQuery query)
+    {
+        lock (_pollRoutingGate)
+        {
+            _partitionContexts.Remove((query.Code, query.Route));
+        }
+    }
+
+    /// <summary>
+    ///     The context of a send is cached per partition until a send to its topic is refused with status 87, or
+    ///     this client deletes a stream or a topic, or creates or deletes partitions. Other failures keep it.
+    /// </summary>
+    private async Task<PartitionContext> GetSendContextAsync(SendTarget target, CancellationToken token)
+    {
+        if (_groupState.SendContext(target.Topic, target.PartitionId) is { } cached)
+        {
+            return cached;
+        }
+
+        using var response = await SendWithResponseAsync(CommandCodes.GET_SEND_CONTEXT_CODE, target.Query,
+            token: token);
+        var context = BinaryMapper.MapPartitionContext(response.Memory.Span);
+        _groupState.SetSendContext(target.Topic, target.PartitionId, context);
+        return context;
+    }
+
+    /// <summary>
+    ///     Reads the partition a SendMessages body targets. Only an explicit partition id names one: balanced and
+    ///     message-key partitioning leave no partition to capture a context for, and a send without a context
+    ///     would land on whatever incarnation the partition has when it arrives.
+    /// </summary>
+    private static SendTarget ParseSendTarget(ReadOnlySpan<byte> body)
+    {
+        var position = sizeof(uint);
+        var streamId = ReadIdentifier(body, ref position);
+        var topicId = ReadIdentifier(body, ref position);
+        if (position + IdentifierPrefixSize > body.Length)
+        {
+            throw TruncatedSend();
+        }
+
+        if (body[position] != (byte)Apache.Iggy.Enums.Partitioning.PartitionId)
+        {
+            throw VsrError.Exception(VsrError.FEATURE_UNAVAILABLE,
+                "A raw SendMessages request has to name an explicit partition id, so the client can capture the " +
+                "partition context. Use SendMessagesAsync, which resolves balanced and message-key partitioning, " +
+                "or send to an explicit partition id.");
+        }
+
+        if (body[position + 1] != sizeof(uint) || position + IdentifierPrefixSize + sizeof(uint) > body.Length)
+        {
+            throw TruncatedSend();
+        }
+
+        var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(body[(position + IdentifierPrefixSize)..]);
+        var query = new byte[position];
+        body[sizeof(uint)..position].CopyTo(query);
+        BinaryPrimitives.WriteUInt32LittleEndian(query.AsSpan(position - sizeof(uint)), partitionId);
+        return new SendTarget(new TopicKey(streamId, topicId), partitionId, query);
+    }
+
+    private static Identifier ReadIdentifier(ReadOnlySpan<byte> body, ref int position)
+    {
+        if (position + IdentifierPrefixSize > body.Length
+            || position + IdentifierPrefixSize + body[position + 1] > body.Length)
+        {
+            throw TruncatedSend();
+        }
+
+        var identifier = new Identifier
+        {
+            Kind = (IdKind)body[position],
+            Value = body.Slice(position + IdentifierPrefixSize, body[position + 1]).ToArray()
+        };
+        position += IdentifierPrefixSize + body[position + 1];
+        return identifier;
+    }
+
+    private static IggyInvalidStatusCodeException TruncatedSend()
+    {
+        return VsrError.Exception(VsrError.INVALID_COMMAND, "The SendMessages body is truncated.");
+    }
+
+    private static ContextQuery? TryBuildContextQuery(int code, ReadOnlySpan<byte> body)
+    {
+        if (code is CommandCodes.STORE_CONSUMER_OFFSET_CODE or CommandCodes.DELETE_CONSUMER_OFFSET_CODE)
+        {
+            var suffixSize = code == CommandCodes.STORE_CONSUMER_OFFSET_CODE
+                ? StoreOffsetSuffixSize : DeleteOffsetSuffixSize;
+            if (body.Length <= suffixSize)
+            {
+                return null;
+            }
+            var query = body[..^suffixSize].ToArray();
+            return new ContextQuery(CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE, query, ConsumerSessionSize,
+                Convert.ToBase64String(query));
+        }
+        if (code != CommandCodes.POLL_MESSAGES_CODE || body.Length <= PollOptionsSize)
+        {
+            return null;
+        }
+        return new ContextQuery(CommandCodes.GET_POLL_ROUTING_CODE, body.ToArray(), ConsumerSessionSize,
+            Convert.ToBase64String(body[..^PollOptionsSize]));
+    }
+
+    /// <summary>
+    ///     Sends a poll or an offset write to the partition primary, over a data connection that leaves the
+    ///     membership connection where it is. A caller context, or else the first context a route reports, is
+    ///     retained across every retry, so a retry never moves the request onto a newer incarnation or owner.
+    /// </summary>
+    /// <param name="code">The poll or offset write command code.</param>
+    /// <param name="key">The cached route of the request.</param>
+    /// <param name="routing">The body of the routing request.</param>
+    /// <param name="payload">The body of the request.</param>
+    /// <param name="context">The caller context, or null to take the context the route reports.</param>
+    /// <param name="token">The cancellation token.</param>
+    private async Task<IMemoryOwner<byte>> SendRoutedAsync(int code, PollRouteKey key, ReadOnlyMemory<byte> routing,
+        ReadOnlyMemory<byte> payload, PartitionContext? context, CancellationToken token)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         cancellation.CancelAfter(VsrRequestTimeoutMs);
         var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        var captured = context;
         try
         {
             while (true)
@@ -82,10 +259,17 @@ public sealed partial class TcpMessageStream
                         RememberRoster(BinaryMapper.MapClusterMetadata(metadata.Memory.Span));
                     }
 
-                    return Volatile.Read(ref _clusterNodeCount) > 1
-                        ? await PollPrimaryOnceAsync(key, payload, deadline, cancellation.Token)
-                        : await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE, payload,
-                            token: cancellation.Token);
+                    if (Volatile.Read(ref _clusterNodeCount) <= 1)
+                    {
+                        captured ??= await CapturePartitionContextAsync(code, payload, cancellation.Token);
+                        return await SendWithResponseAsync(code, payload, token: cancellation.Token,
+                            capturedContext: captured);
+                    }
+                    var route = await GetPollRouteAsync(key, routing, deadline, cancellation.Token);
+                    captured ??= route.Context;
+                    return await SendPrimaryOnceAsync(key,
+                        code == CommandCodes.POLL_MESSAGES_CODE ? CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE : code,
+                        payload, route, captured.Value, deadline, cancellation.Token);
                 }
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.TRANSIENT_NOT_ACCEPTED)
                 {
@@ -113,10 +297,10 @@ public sealed partial class TcpMessageStream
         }
     }
 
-    private async Task<IMemoryOwner<byte>> PollPrimaryOnceAsync(PollRouteKey key, ReadOnlyMemory<byte> payload,
-        long deadline, CancellationToken token)
+    private async Task<IMemoryOwner<byte>> SendPrimaryOnceAsync(PollRouteKey key, int code,
+        ReadOnlyMemory<byte> payload, PollRoute route, PartitionContext captured, long deadline,
+        CancellationToken token)
     {
-        var route = await GetPollRouteAsync(key, payload, deadline, token);
         PollConnectionSlot slot;
         lock (_pollRoutingGate)
         {
@@ -170,8 +354,7 @@ public sealed partial class TcpMessageStream
 
             ValidatePollRoute(route, slot);
             polling = true;
-            return await SendPollExchangeAsync(slot.Connection, CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE,
-                payload, deadline, token);
+            return await SendPollExchangeAsync(slot.Connection, code, payload, deadline, token, captured);
         }
         catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.TRANSIENT_NOT_ACCEPTED)
         {
@@ -184,9 +367,11 @@ public sealed partial class TcpMessageStream
             slot.Connection = null;
             slot.Attachment = null;
             RemovePollRoute(key);
+            // A poll that commits no offset changes nothing on the server, so it goes out again on a fresh route.
+            var uncertain = polling && !VsrOperations.IsReplaySafeRead(code, false, payload.Span);
             if (IsPollConnectionFailure(error))
             {
-                if (!polling)
+                if (!uncertain)
                 {
                     throw PollNotAccepted();
                 }
@@ -198,7 +383,7 @@ public sealed partial class TcpMessageStream
 
             if (polling && error is IggyInvalidStatusCodeException { StatusCode: VsrError.TRANSIENT_NOT_COMMITTED })
             {
-                throw new VsrRequestOutcomeUnknownException(error);
+                throw uncertain ? new VsrRequestOutcomeUnknownException(error) : PollNotAccepted();
             }
 
             throw;
@@ -248,7 +433,7 @@ public sealed partial class TcpMessageStream
         throw PollNotAccepted();
     }
 
-    private async Task<PollRoute> GetPollRouteAsync(PollRouteKey key, ReadOnlyMemory<byte> payload,
+    private async Task<PollRoute> GetPollRouteAsync(PollRouteKey key, ReadOnlyMemory<byte> routing,
         long deadline, CancellationToken token)
     {
         lock (_pollRoutingGate)
@@ -260,14 +445,15 @@ public sealed partial class TcpMessageStream
             }
         }
 
-        using var response = await SendPollControlAsync(CommandCodes.GET_POLL_ROUTING_CODE, payload, deadline, token);
-        if (response.Memory.Length < ConsumerSessionSize)
+        using var response = await SendPollControlAsync(key.RoutingCode, routing, deadline, token);
+        if (response.Memory.Length < ConsumerSessionSize + PartitionContext.ENCODED_SIZE)
         {
             throw new MalformedResponseException("Poll routing reply has a truncated consumer session.");
         }
 
         var attachment = response.Memory[..ConsumerSessionSize].ToArray();
-        var position = ConsumerSessionSize;
+        var context = BinaryMapper.MapPartitionContext(response.Memory.Span[ConsumerSessionSize..]);
+        var position = ConsumerSessionSize + PartitionContext.ENCODED_SIZE;
         var primary = BinaryMapper.MapClusterNode(response.Memory.Span, ref position);
         if (position != response.Memory.Length)
         {
@@ -299,7 +485,7 @@ public sealed partial class TcpMessageStream
                 BinaryPrimitives.ReadUInt64LittleEndian(attachment.AsSpan(ConsumerSessionWatermarkOffset)));
             BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(ConsumerSessionWatermarkOffset), watermark);
             var route = new PollRoute(ServerAddress.HostPort(primary.Ip, primary.Endpoints.Tcp), attachment,
-                generation, watermark);
+                generation, watermark, context);
             if (_pollRoutes.Count >= MaxCachedPollRoutes)
             {
                 _pollRoutes.Clear();
@@ -360,10 +546,9 @@ public sealed partial class TcpMessageStream
                 ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, dialCancellation.Token)
                 : new NetworkStream(socket, true);
             socket = null;
-            var session = new ConsensusSession(BinaryPrimitives.ReadUInt128LittleEndian(route.Attachment),
-                BinaryPrimitives.ReadUInt64LittleEndian(route.Attachment.AsSpan(ConsumerSessionEpochOffset)),
-                _consensusSession.BindSecret);
-            connection = new VsrConnection(stream, session, _configuration.MaxResponseFrameSize,
+            // An offset write on this connection is a replicated request of the bound session, so its request id
+            // comes from the same counter as the membership connection's, or the two would reuse ids.
+            connection = new VsrConnection(stream, _consensusSession, _configuration.MaxResponseFrameSize,
                 VsrRequestTimeoutMs, dropped => dropped.Dispose(), _logger);
             return connection;
         }
@@ -384,10 +569,10 @@ public sealed partial class TcpMessageStream
     }
 
     private static async Task<IMemoryOwner<byte>> SendPollExchangeAsync(VsrConnection connection, int code,
-        ReadOnlyMemory<byte> payload, long deadline, CancellationToken token)
+        ReadOnlyMemory<byte> payload, long deadline, CancellationToken token, PartitionContext context = default)
     {
         var attempt = await connection.SendAttemptAsync(code, payload, deadline, deadline,
-            HasSensitiveReply(code), token, retryTransient: false);
+            HasSensitiveReply(code), token, retryTransient: false, context: context);
         if (attempt.Error is not null)
         {
             ExceptionDispatchInfo.Throw(attempt.Error);

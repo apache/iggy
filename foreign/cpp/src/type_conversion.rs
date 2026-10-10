@@ -23,7 +23,8 @@ use iggy::prelude::{
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
     Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
     IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
-    Partition as RustPartition, PolledMessages as RustPolledMessages,
+    Partition as RustPartition, PartitionContext as RustPartitionContext,
+    PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
     StreamDetails as RustStreamDetails, Topic as RustTopic,
@@ -461,6 +462,26 @@ impl TryFrom<ffi::Permissions> for RustPermissions {
     }
 }
 
+impl From<RustPartitionContext> for ffi::PartitionContext {
+    fn from(context: RustPartitionContext) -> Self {
+        ffi::PartitionContext {
+            incarnation: context.incarnation,
+            owner_generation: context.owner_generation,
+            metadata_op: context.metadata_op,
+        }
+    }
+}
+
+impl From<ffi::PartitionContext> for RustPartitionContext {
+    fn from(context: ffi::PartitionContext) -> Self {
+        RustPartitionContext {
+            incarnation: context.incarnation,
+            owner_generation: context.owner_generation,
+            metadata_op: context.metadata_op,
+        }
+    }
+}
+
 impl From<RustPartition> for ffi::Partition {
     fn from(partition: RustPartition) -> Self {
         ffi::Partition {
@@ -470,6 +491,7 @@ impl From<RustPartition> for ffi::Partition {
             current_offset: partition.current_offset,
             size_bytes: partition.size.as_bytes_u64(),
             messages_count: partition.messages_count,
+            context: partition.context.into(),
         }
     }
 }
@@ -619,6 +641,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             },
             durability,
             consumer_offset_durability,
+            partition_resize_policy: None,
             messages_required_to_save: if options.has_messages_required_to_save {
                 Some(options.messages_required_to_save)
             } else {
@@ -997,6 +1020,7 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
                 .into_iter()
                 .map(ffi::IggyMessagePolled::from)
                 .collect(),
+            context: messages.context.into(),
         }
     }
 }
@@ -1027,12 +1051,67 @@ impl From<RustSendMessagesResponse> for ffi::SendMessagesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy::prelude::IggyTimestamp;
+
+    // Distinct values so a swapped field fails the comparison.
+    const CONTEXT: RustPartitionContext = RustPartitionContext {
+        incarnation: 3,
+        owner_generation: 5,
+        metadata_op: 7,
+    };
+
+    fn fields(context: &ffi::PartitionContext) -> (u64, u64, u64) {
+        (
+            context.incarnation,
+            context.owner_generation,
+            context.metadata_op,
+        )
+    }
 
     #[test]
     fn should_reject_zero_message_expiry_duration() {
         assert_eq!(
             parse_message_expiry("duration", 0).err().as_deref(),
             Some("message expiry duration must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn should_keep_every_partition_context_field_across_the_bridge() {
+        let bridged = ffi::PartitionContext::from(CONTEXT);
+
+        assert_eq!(fields(&bridged), (3, 5, 7));
+        assert_eq!(RustPartitionContext::from(bridged), CONTEXT);
+    }
+
+    #[test]
+    fn should_keep_the_partition_context_of_a_topic_partition() {
+        let partition = RustPartition {
+            id: 1,
+            created_at: IggyTimestamp::from(11),
+            segments_count: 1,
+            current_offset: 2,
+            size: RustIggyByteSize::from(13),
+            messages_count: 3,
+            context: CONTEXT,
+        };
+
+        assert_eq!(fields(&ffi::Partition::from(partition).context), (3, 5, 7));
+    }
+
+    #[test]
+    fn should_keep_the_partition_context_of_polled_messages() {
+        let polled = RustPolledMessages {
+            context: CONTEXT,
+            partition_id: 1,
+            current_offset: 2,
+            count: 0,
+            messages: Vec::new(),
+        };
+
+        assert_eq!(
+            fields(&ffi::PolledMessages::from(polled).context),
+            (3, 5, 7)
         );
     }
 }

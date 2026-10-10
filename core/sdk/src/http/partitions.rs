@@ -40,6 +40,7 @@ impl PartitionClient for HttpClient {
             },
         )
         .await?;
+        self.send_contexts.invalidate_topic_discovery();
         Ok(())
     }
 
@@ -58,6 +59,7 @@ impl PartitionClient for HttpClient {
             },
         )
         .await?;
+        self.send_contexts.invalidate_topic_discovery();
         Ok(())
     }
 }

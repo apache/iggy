@@ -19,6 +19,8 @@ use crate::utils::byte_size::IggyByteSize;
 use crate::utils::timestamp::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 
+pub use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+
 /// `Partition` represents the information about a partition.
 /// It consists of the following fields:
 /// - `id`: unique identifier of the partition.
@@ -27,6 +29,7 @@ use serde::{Deserialize, Serialize};
 /// - `current_offset`: the current offset of the partition.
 /// - `size_bytes`: the size of the partition in bytes.
 /// - `messages_count`: the number of messages in the partition.
+/// - `context`: the partition incarnation and the metadata operation the details were read at.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partition {
     /// Unique identifier of the partition.
@@ -41,4 +44,7 @@ pub struct Partition {
     pub size: IggyByteSize,
     /// The number of messages in the partition.
     pub messages_count: u64,
+    /// The partition incarnation and the metadata operation the details were read at. The
+    /// owner generation is zero because the details belong to no consumer group.
+    pub context: PartitionContext,
 }

@@ -29,6 +29,12 @@ public interface IIggyOffset
     /// <summary>
     ///     Stores the current offset for a consumer at a specific position in a topic partition.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP, the write goes to the partition primary under the context the partition's route reports. After
+    ///     another client deleted and recreated the partition, it can fail once with status 87, or 5009 for a
+    ///     consumer group, from a route this client cached before. The client does not retry it: the failed route
+    ///     is dropped and the next call routes again.
+    /// </remarks>
     /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
@@ -41,6 +47,22 @@ public interface IIggyOffset
     /// <returns>A task representing the asynchronous operation.</returns>
     Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset, uint? partitionId,
         CancellationToken token = default);
+
+    /// <summary>
+    ///     Stores an offset under the context of the poll that delivered it. The server refuses the store with
+    ///     status 87 when the partition was deleted and recreated since that poll, and with status 5009 when the
+    ///     partition moved to another member of the consumer group.
+    /// </summary>
+    /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
+    /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
+    /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>
+    /// <param name="offset">The offset value to store (message index position).</param>
+    /// <param name="partitionId">The partition that delivered the offset.</param>
+    /// <param name="context">The <see cref="PolledMessages.Context" /> of the poll that delivered the offset.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task representing the asynchronous operation.</returns>
+    Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset, uint partitionId,
+        PartitionContext context, CancellationToken token = default);
 
     /// <summary>
     ///     Retrieves the current offset for a consumer in a specified topic.
@@ -60,6 +82,12 @@ public interface IIggyOffset
     /// <summary>
     ///     Deletes the stored offset for a consumer in a specified topic.
     /// </summary>
+    /// <remarks>
+    ///     Over TCP, the write goes to the partition primary under the context the partition's route reports. After
+    ///     another client deleted and recreated the partition, it can fail once with status 87, or 5009 for a
+    ///     consumer group, from a route this client cached before. The client does not retry it: the failed route
+    ///     is dropped and the next call routes again.
+    /// </remarks>
     /// <param name="consumer">The consumer identifier (group ID or member ID).</param>
     /// <param name="streamId">The identifier of the stream containing the topic (numeric ID or name).</param>
     /// <param name="topicId">The identifier of the topic (numeric ID or name).</param>

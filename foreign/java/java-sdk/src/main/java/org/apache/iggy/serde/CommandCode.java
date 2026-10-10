@@ -96,7 +96,8 @@ public interface CommandCode {
         POLL(100),
         SEND(101),
         GET_POLL_ROUTING(103),
-        POLL_ON_PRIMARY(104);
+        POLL_ON_PRIMARY(104),
+        GET_SEND_CONTEXT(105);
 
         private final int value;
 
@@ -112,7 +113,9 @@ public interface CommandCode {
 
     enum ConsumerOffset implements CommandCode {
         GET(120),
-        STORE(121);
+        STORE(121),
+        DELETE(122),
+        GET_ROUTING(123);
 
         private final int value;
 

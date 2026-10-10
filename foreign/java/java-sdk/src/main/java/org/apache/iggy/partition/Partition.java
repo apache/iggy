@@ -27,4 +27,5 @@ public record Partition(
         Long segmentsCount,
         BigInteger currentOffset,
         String size,
-        BigInteger messagesCount) {}
+        BigInteger messagesCount,
+        PartitionContext context) {}

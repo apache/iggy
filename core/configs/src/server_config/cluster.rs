@@ -308,7 +308,8 @@ pub struct ClusterConfig {
     /// Applies per plane: the metadata superblock, and each PARTITION's own. While
     /// wedged the group is already fenced quorum-invisible and peers elect around
     /// it; this converts the log-only limp into a distinct exit status a
-    /// supervisor can act on. Zero (and the `0` /
+    /// supervisor can act on. It is also the deadline of each running
+    /// partition file job (`sharding.partition_io_capacity`). Zero (and the `0` /
     /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
     /// the fail-stop; nonzero values below
     /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.

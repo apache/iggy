@@ -56,6 +56,15 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     private const int VsrTransientFailoverCheckMs = 2_000;
 
     /// <summary>
+    ///     First pause before a <see cref="VsrError.LIFECYCLE_BUSY" /> request goes out again. Every retry is a
+    ///     new request that commits another refusal, so the pause doubles up to
+    ///     <see cref="LifecycleRetryMaxIntervalMs" />.
+    /// </summary>
+    private const int LifecycleRetryIntervalMs = 50;
+
+    private const int LifecycleRetryMaxIntervalMs = 1_000;
+
+    /// <summary>
     ///     How long a transiently leaderless roster is polled before the connection proceeds on the current
     ///     node anyway. A restarted node cedes the primaryship its stale view assigns it, and the peers need
     ///     about one heartbeat timeout to elect.
@@ -316,11 +325,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Polls one of the group member's assigned partitions, round-robin. A fence rejection - either the typed
-    ///     error or the sentinel partition id an empty poll carries - re-syncs the assignment and retries once.
+    ///     Polls one of the group member's assigned partitions, round-robin, with the strategy
+    ///     <paramref name="pollingStrategyFor" /> gives for it. A fence rejection - either the typed error or the
+    ///     sentinel partition id an empty poll carries - re-syncs the assignment and retries once.
     /// </summary>
     private async Task<PolledMessagesRental> PollGroupMessagesRentedAsync(Identifier streamId, Identifier topicId,
-        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token)
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        CancellationToken token)
     {
         var key = new GroupKey(streamId, topicId, consumer.ConsumerId);
         if (!_groupState.HasAssignment(key))
@@ -341,6 +352,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 return NoAssignedPartitionPolledMessages;
             }
 
+            // Asked per attempt: a fence retry can land on another partition.
+            var pollingStrategy = pollingStrategyFor(partitionId);
             PolledMessagesRental? rental = null;
             try
             {
@@ -354,7 +367,14 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             })
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
-                // re-sync below.
+                // re-sync below. A caller context names the owner the poll was meant for, so the caller gets the
+                // fence instead of a poll of another partition.
+                if (pollingStrategy.Context is not null)
+                {
+                    _groupState.InvalidateAssignment(key);
+                    await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
+                    throw;
+                }
             }
 
             if (rental is not null)
@@ -582,7 +602,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     redirection for the handshake, and reconnecting from underneath it would recurse.
     /// </remarks>
     private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
-        CancellationToken token, bool allowRedirect = true)
+        CancellationToken token, bool allowRedirect = true, PartitionContext context = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -610,7 +630,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
                 var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
-                    clearSensitiveReply, token);
+                    clearSensitiveReply, token, context);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
 
@@ -783,7 +803,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
+        PartitionContext context = default)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -795,7 +816,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                clearSensitiveReply, token);
+                clearSensitiveReply, token, context: context);
         }
         finally
         {

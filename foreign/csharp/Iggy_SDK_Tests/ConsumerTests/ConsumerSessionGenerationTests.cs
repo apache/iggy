@@ -210,7 +210,7 @@ public sealed class ConsumerSessionGenerationTests
                 })
                 .Returns(Task.CompletedTask);
             mock.Setup(c => c.PollMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(), It.IsAny<uint?>(),
-                    It.IsAny<Consumer>(), It.IsAny<PollingStrategy>(), It.IsAny<uint>(), It.IsAny<bool>(),
+                    It.IsAny<Consumer>(), It.IsAny<Func<uint, PollingStrategy>>(), It.IsAny<uint>(), It.IsAny<bool>(),
                     It.IsAny<CancellationToken>()))
                 .ReturnsAsync(() => new PolledMessages
                 {

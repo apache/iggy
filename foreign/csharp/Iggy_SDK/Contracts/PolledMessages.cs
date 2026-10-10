@@ -22,6 +22,9 @@ namespace Apache.Iggy.Contracts;
 /// </summary>
 public sealed class PolledMessages
 {
+    /// <summary>Captured incarnation and ownership authority for these offsets.</summary>
+    public PartitionContext Context { get; init; }
+
     /// <summary>
     ///     Partition id an empty group poll reports when the member currently owns no partition of the group,
     ///     for example mid-rebalance or when the group has more members than partitions. Matches the Go and

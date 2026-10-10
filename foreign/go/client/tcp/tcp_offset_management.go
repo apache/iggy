@@ -22,6 +22,7 @@ import (
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
@@ -40,31 +41,62 @@ func (c *IggyTcpClient) GetConsumerOffset(ctx context.Context, consumer iggcon.C
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
-	// TODO(#4292): a group commit for a partition whose primary is not the
-	// coordinator goes out on the coordinator session, is refused as not
-	// admitted, and sendFrame walks the roster to the primary. That reconnect
-	// registers a new client identity, which is not a member of the group, so
-	// the replayed commit fails with ConsumerGroupPartitionNotOwned and the
-	// membership is gone. Route clustered group commits (and deletes) to the
-	// partition primary through the attached consumer session, as pollPrimary
-	// does for auto-commit polls and the Rust SDK's PollRouter::write_offset
-	// does for offset writes.
-	_, err := c.do(ctx, &command.StoreConsumerOffsetRequest{
+	return c.writeOffset(ctx, &command.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
 		Consumer:    consumer,
 		PartitionId: partitionId,
-	})
-	return err
+	}, nil)
+}
+
+func (c *IggyTcpClient) StoreConsumerPosition(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, position iggcon.ConsumerPosition) error {
+	return c.writeOffset(ctx, &command.StoreConsumerOffsetRequest{
+		StreamId:    streamId,
+		TopicId:     topicId,
+		Offset:      position.Offset,
+		Consumer:    consumer,
+		PartitionId: &position.PartitionId,
+	}, &position.Context)
 }
 
 func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
-	_, err := c.do(ctx, &command.DeleteConsumerOffset{
+	return c.writeOffset(ctx, &command.DeleteConsumerOffset{
 		Consumer:    consumer,
 		StreamId:    streamId,
 		TopicId:     topicId,
 		PartitionId: partitionId,
-	})
+	}, nil)
+}
+
+// writeOffset sends an offset write to the partition primary over a data
+// connection, as the Rust SDK's PollRouter::write_offset does. A replay on the
+// coordinator would walk the roster to the primary under a new client identity,
+// which is no member of the group. A captured context is stamped on every
+// attempt; without one, the write takes the context its route reports.
+func (c *IggyTcpClient) writeOffset(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) error {
+	if ctx == nil {
+		return ierror.ErrNilContext
+	}
+	if err := c.ensureTopology(ctx); err != nil {
+		return err
+	}
+	if !c.clustered.Load() {
+		if captured != nil {
+			ctx = context.WithValue(ctx, capturedPartitionContext{}, *captured)
+		}
+		_, err := c.do(ctx, cmd)
+		return err
+	}
+	payload, err := cmd.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	routePayload, err := offsetRoutePayload(cmd.Code(), payload)
+	if err != nil {
+		return err
+	}
+	_, err = c.sendRouted(ctx, cmd.Code(), routeKey(command.GetOffsetRoutingCode, routePayload),
+		command.GetOffsetRoutingCode, routePayload, payload, captured)
 	return err
 }

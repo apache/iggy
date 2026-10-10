@@ -212,6 +212,11 @@ func (c *IggyTcpClient) pollGroup(
 				return nil, err
 			}
 			c.groups.drop(key)
+			if strategy.Context != nil {
+				// The caller's context names the owner its offset was polled
+				// under, so a retry with it would only be refused again.
+				return nil, err
+			}
 			continue
 		}
 
@@ -248,7 +253,9 @@ func (c *IggyTcpClient) ensureAssignment(
 	key groupKey,
 	streamId, topicId, groupId iggcon.Identifier,
 ) (groupAssignment, error) {
-	if cached, ok := c.groups.get(key); ok &&
+	// As in Rust, an empty assignment is synced again on every poll: a member
+	// gets its partitions only as each one installs it as the owner.
+	if cached, ok := c.groups.get(key); ok && len(cached.partitions) > 0 &&
 		time.Since(cached.fetchedAt) < assignmentRefreshInterval {
 		return cached, nil
 	}

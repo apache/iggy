@@ -23,6 +23,25 @@ pub use delete_consumer_offset::DeleteConsumerOffsetRequest;
 pub use get_consumer_offset::GetConsumerOffsetRequest;
 pub use store_consumer_offset::StoreConsumerOffsetRequest;
 
+/// Server projection appends this immutable owner token to replicated offset bodies.
+pub const PREPARED_OWNER_GENERATION_SIZE: usize = size_of::<u64>();
+
+/// Split a partition-log body from its owner generation without accepting a truncated token.
+///
+/// # Errors
+/// Returns an error when the prepared offset context is incomplete.
+pub fn split_prepared_offset(body: &[u8]) -> Result<(&[u8], u64), crate::WireError> {
+    let offset = body
+        .len()
+        .checked_sub(PREPARED_OWNER_GENERATION_SIZE)
+        .ok_or(crate::WireError::UnexpectedEof {
+            offset: 0,
+            need: PREPARED_OWNER_GENERATION_SIZE,
+            have: body.len(),
+        })?;
+    Ok((&body[..offset], crate::codec::read_u64_le(body, offset)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

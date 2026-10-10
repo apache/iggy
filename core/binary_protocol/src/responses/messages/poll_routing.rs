@@ -17,6 +17,7 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode};
+use crate::primitives::partition_history::PartitionContext;
 use crate::requests::system::SessionIdentity;
 use crate::responses::system::get_cluster_metadata::ClusterNodeResponse;
 use bytes::BytesMut;
@@ -29,16 +30,20 @@ use bytes::BytesMut;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollRoutingResponse {
     pub consumer_session: SessionIdentity,
+    pub context: PartitionContext,
     pub primary: ClusterNodeResponse,
 }
 
 impl WireEncode for PollRoutingResponse {
     fn encoded_size(&self) -> usize {
-        self.consumer_session.encoded_size() + self.primary.encoded_size()
+        self.consumer_session.encoded_size()
+            + self.context.encoded_size()
+            + self.primary.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.consumer_session.encode(buf);
+        self.context.encode(buf);
         self.primary.encode(buf);
     }
 }
@@ -46,13 +51,15 @@ impl WireEncode for PollRoutingResponse {
 impl WireDecode for PollRoutingResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (consumer_session, consumed) = SessionIdentity::decode(buf)?;
-        let (primary, node_size) = ClusterNodeResponse::decode(&buf[consumed..])?;
+        let (context, context_size) = PartitionContext::decode(&buf[consumed..])?;
+        let (primary, node_size) = ClusterNodeResponse::decode(&buf[consumed + context_size..])?;
         Ok((
             Self {
                 consumer_session,
+                context,
                 primary,
             },
-            consumed + node_size,
+            consumed + context_size + node_size,
         ))
     }
 }
@@ -69,6 +76,7 @@ mod tests {
                 session: 7,
                 metadata_watermark: 11,
             },
+            context: PartitionContext::default(),
             primary: ClusterNodeResponse {
                 name: "node-1".to_owned(),
                 ip: "::1".to_owned(),

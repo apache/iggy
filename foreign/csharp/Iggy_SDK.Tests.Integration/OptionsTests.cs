@@ -34,6 +34,7 @@ public class OptionsTests
         "segment_size",
         "durability",
         "consumer_offset_durability",
+        "partition_resize_policy",
         "messages_required_to_save",
         "size_of_messages_required_to_save",
         "preallocate_segments"

@@ -31,7 +31,12 @@ from apache_iggy import (
 )
 from apache_iggy import SendMessage as Message
 
-from .utils import get_server_config, wait_for_ping, wait_for_server
+from .utils import (
+    get_server_config,
+    wait_for_consumer_group_assignment,
+    wait_for_ping,
+    wait_for_server,
+)
 
 
 async def _create_consumer_group_with_numeric_ids(
@@ -294,6 +299,9 @@ class TestGetConsumerGroup:
             partition_id,
             PollingStrategy.Next(),
             10,
+        )
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, consumer_name, members_count=1
         )
 
         group = await iggy_client.get_consumer_group(
@@ -616,6 +624,9 @@ class TestJoinConsumerGroup:
 
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
 
         group = await iggy_client.get_consumer_group(
             stream_name,
@@ -644,6 +655,9 @@ class TestJoinConsumerGroup:
         )
 
         await iggy_client.join_consumer_group(stream_id, topic_id, group_id)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_id, topic_id, group_id, members_count=1
+        )
 
         joined_group = await iggy_client.get_consumer_group(
             stream_id,
@@ -911,7 +925,7 @@ class TestConsumerGroup:
                 consumer.get_last_consumed_offset(current_partition_id)
                 == received_messages[-1].offset()
             )
-            assert consumer.get_last_stored_offset(current_partition_id) == 0
+            assert consumer.get_last_stored_offset(current_partition_id) is None
         finally:
             shutdown_event.set()
             await consume
@@ -1152,6 +1166,9 @@ class TestConsumerGroup:
             10,
             auto_commit=AutoCommit.Disabled(),
             poll_interval=timedelta(milliseconds=25),
+        )
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, consumer_name, members_count=1
         )
 
         with pytest.raises(

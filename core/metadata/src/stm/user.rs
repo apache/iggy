@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::permissioner::Permissioner;
-use crate::stm::StateHandler;
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
     DeletePersonalAccessTokenResult, DeleteUserResult, UpdatePermissionsResult, UpdateUserResult,
 };
 use crate::stm::snapshot::Snapshotable;
+use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -318,6 +318,7 @@ impl Users {
                     options: WireOptions::empty(),
                 },
                 IggyTimestamp::from(1),
+                ApplyContext::default(),
             ))
             .expect("root user bootstrap must run on the metadata writer");
     }
@@ -964,6 +965,7 @@ impl UsersInner {
             personal_access_token_expiry_index,
             permissioner,
             last_result: None,
+            apply_context: ApplyContext::default(),
         }
     }
 }

@@ -25,9 +25,13 @@
 
 use crate::shell::{ShellBus, ShellShard};
 use bytes::{Bytes, BytesMut};
-use consensus::{MetadataHandle, VsrConsensus};
+use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+use iggy_binary_protocol::responses::messages::poll_messages::{
+    POLL_RESPONSE_HEADER_SIZE, PollMessagesResponseHeader,
+};
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
@@ -319,17 +323,8 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    shard
-        .plane
-        .metadata()
-        .consensus
-        .as_ref()
-        .map_or(0, VsrConsensus::commit_max)
+    shard.plane.metadata().applied_frontier().get()
 }
-
-/// Body head of a `PolledMessages` reply:
-/// `[partition_id:4][current_offset:8][count:4]`, before the batch records.
-const POLLED_HEAD_LEN: usize = 16;
 
 /// Build the `PolledMessages` reply for the wire as a vectored frame: one
 /// buffer holding the reply header and the body head, then the poll
@@ -343,13 +338,24 @@ pub fn build_polled_messages_reply(
     commit: u64,
     partition_id: u32,
     current_offset: u64,
+    context: PartitionContext,
     fragments: PollFragments,
     encryptor: Option<&EncryptorKind>,
 ) -> Result<BusMessage, IggyError> {
+    let context = PartitionContext {
+        metadata_op: context.metadata_op.max(commit),
+        ..context
+    };
     let client_id = request_header.client;
     let session = request_header.session;
     if encryptor.is_some() {
-        let body = build_polled_messages_body(partition_id, current_offset, fragments, encryptor)?;
+        let body = build_polled_messages_body(
+            partition_id,
+            current_offset,
+            context,
+            fragments,
+            encryptor,
+        )?;
         let reply = build_reply_from_bytes(request_header, client_id, session, commit, &body);
         return Ok(reply.into_generic().into_frozen().into());
     }
@@ -360,15 +366,22 @@ pub fn build_polled_messages_reply(
     let records_len: usize = frames.iter().map(Frozen::len).sum();
 
     let header_len = std::mem::size_of::<ReplyHeader>();
-    let size = u32::try_from(header_len + POLLED_HEAD_LEN + records_len)
+    let size = u32::try_from(header_len + POLL_RESPONSE_HEADER_SIZE + records_len)
         .map_err(|_| IggyError::InvalidCommand)?;
-    let header = reply_header(request_header, client_id, session, commit, size);
-    let mut head = Owned::<MESSAGE_ALIGN>::zeroed(header_len + POLLED_HEAD_LEN);
+    let mut header = reply_header(request_header, client_id, session, commit, size);
+    header.partition_incarnation = context.incarnation;
+    let mut head = Owned::<MESSAGE_ALIGN>::zeroed(header_len + POLL_RESPONSE_HEADER_SIZE);
     let (header_bytes, body_head) = head.as_mut_slice().split_at_mut(header_len);
     header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
-    body_head[..4].copy_from_slice(&partition_id.to_le_bytes());
-    body_head[4..12].copy_from_slice(&current_offset.to_le_bytes());
-    body_head[12..].copy_from_slice(&count.to_le_bytes());
+    body_head.copy_from_slice(
+        &PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        }
+        .to_le_bytes(),
+    );
     frames.insert(0, head.into());
 
     // Re-checks the header and that the fragments cover `size`.
@@ -481,17 +494,15 @@ impl<'a> FragmentCursor<'a> {
 /// ships the fragments without gathering them; this builder serves the
 /// decrypt path and the HTTP handler, which decodes the body into JSON.
 ///
-/// Body layout: `[partition_id:4][current_offset:8][count:4][batch records...]`.
+/// Body layout: the 40-byte [`PollMessagesResponseHeader`], then the batch
+/// records.
 pub fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
+    context: PartitionContext,
     fragments: PollFragments,
     encryptor: Option<&EncryptorKind>,
 ) -> Result<Bytes, IggyError> {
-    // Body head: [partition_id:4][current_offset:8][count:4]. `count` sits at
-    // COUNT_OFFSET and is backpatched once the walk below knows it.
-    const HEAD_LEN: usize = 16;
-    const COUNT_OFFSET: usize = 12;
     // Batches may arrive split across fragments (rewritten batch header +
     // sliced blob); concatenate into one stream before walking records.
     let mut stream: Vec<u8> = Vec::new();
@@ -500,10 +511,9 @@ pub fn build_polled_messages_body(
         stream.extend_from_slice(frozen.as_slice());
     }
 
-    let mut body: Vec<u8> = Vec::with_capacity(HEAD_LEN + stream.len());
-    body.extend_from_slice(&partition_id.to_le_bytes());
-    body.extend_from_slice(&current_offset.to_le_bytes());
-    body.extend_from_slice(&[0u8; 4]); // count placeholder, backpatched below
+    // The head is written after the walk, which is what counts the messages.
+    let mut body: Vec<u8> = Vec::with_capacity(POLL_RESPONSE_HEADER_SIZE + stream.len());
+    body.resize(POLL_RESPONSE_HEADER_SIZE, 0);
     let mut count: u32 = 0;
     let mut position = 0usize;
     while position < stream.len() {
@@ -528,7 +538,15 @@ pub fn build_polled_messages_body(
         position = batch_end;
     }
 
-    body[COUNT_OFFSET..HEAD_LEN].copy_from_slice(&count.to_le_bytes());
+    body[..POLL_RESPONSE_HEADER_SIZE].copy_from_slice(
+        &PollMessagesResponseHeader {
+            partition_id,
+            current_offset,
+            messages_count: count,
+            context,
+        }
+        .to_le_bytes(),
+    );
     Ok(Bytes::from(body))
 }
 
@@ -682,6 +700,10 @@ mod tests {
         let body = build_polled_messages_body(
             POLL_PARTITION_ID,
             POLL_CURRENT_OFFSET,
+            PartitionContext {
+                metadata_op: POLL_COMMIT,
+                ..Default::default()
+            },
             fragments,
             encryptor,
         )
@@ -702,6 +724,7 @@ mod tests {
             POLL_COMMIT,
             POLL_PARTITION_ID,
             POLL_CURRENT_OFFSET,
+            PartitionContext::default(),
             fragments,
             encryptor,
         )
@@ -795,7 +818,7 @@ mod tests {
             .into_contiguous();
         assert_eq!(
             reply.len(),
-            std::mem::size_of::<ReplyHeader>() + POLLED_HEAD_LEN
+            std::mem::size_of::<ReplyHeader>() + POLL_RESPONSE_HEADER_SIZE
         );
         assert_eq!(polled_count(reply.as_slice()), 0);
     }
@@ -809,6 +832,7 @@ mod tests {
             build_polled_messages_body(
                 POLL_PARTITION_ID,
                 POLL_CURRENT_OFFSET,
+                PartitionContext::default(),
                 truncated.clone(),
                 None
             ),

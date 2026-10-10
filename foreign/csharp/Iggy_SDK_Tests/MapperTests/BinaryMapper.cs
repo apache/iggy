@@ -86,9 +86,9 @@ public sealed class BinaryMapper
         var msgTwoFrame = BinaryFactory.CreateMessageFrame(checkSum2, guid1, 1, 5, [], payload1);
         var record = BinaryFactory.CreateBatchRecord(offset, timestamp, timestamp, msgOneFrame, msgTwoFrame);
 
-        var combinedPayload = new byte[16 + record.Length];
+        var combinedPayload = new byte[40 + record.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(combinedPayload.AsSpan(12, 4), 2);
-        record.CopyTo(combinedPayload.AsSpan(16));
+        record.CopyTo(combinedPayload.AsSpan(40));
 
         // Act
         var responses
@@ -265,6 +265,31 @@ public sealed class BinaryMapper
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
         Assert.Equal(CompressionAlgorithm.None, response.CompressionAlgorithm);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsAPartitionRecordWithItsContext()
+    {
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var context = new PartitionContext(17, 9, 52);
+        byte[] payload =
+        [
+            ..BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName, sizeBytes,
+                messagesCount, createdAt, maxTopicSize, 1),
+            ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context)
+        ];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.NotNull(response.Partitions);
+        var partition = Assert.Single(response.Partitions);
+        Assert.Equal(3u, partition.Id);
+        Assert.Equal(7u, partition.SegmentsCount);
+        Assert.Equal(101ul, partition.CurrentOffset);
+        Assert.Equal(2048ul, partition.Size);
+        Assert.Equal(102ul, partition.MessagesCount);
+        Assert.Equal(context, partition.Context);
     }
 
     [Fact]
@@ -544,11 +569,11 @@ public sealed class BinaryMapper
         var frame2 = BuildEncryptedFrame(encryptor, 1, payload2, ReadOnlySpan<byte>.Empty);
         var record = BinaryFactory.CreateBatchRecord(100, 12345, 12345, frame1, frame2);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
         BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 101);
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 2);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         using var rental = Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance,
             encryptor);
@@ -585,11 +610,11 @@ public sealed class BinaryMapper
         BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(36, 4), -48); // payloadLength
         var record = BinaryFactory.CreateBatchRecord(1, 12345, 12345, frame);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
         BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         Assert.Throws<MalformedResponseException>(() =>
             Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance, encryptor));
@@ -602,9 +627,9 @@ public sealed class BinaryMapper
         BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(40, 8), 1);
         var record = BinaryFactory.CreateBatchRecord(1, 12345, 12345, frame);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         Assert.Throws<MalformedResponseException>(() =>
             Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance));
@@ -619,11 +644,11 @@ public sealed class BinaryMapper
         frame[48 + 12] ^= 0xFF;
         var record = BinaryFactory.CreateBatchRecord(42, 12345, 12345, frame);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
         BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 42);
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         var ex = Assert.Throws<MessageDecryptionException>(() =>
             Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance, encryptor));

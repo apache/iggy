@@ -35,6 +35,8 @@ use server_common::poll::PollHistoryId;
 use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
@@ -177,6 +179,10 @@ pub struct PollContext {
     /// For nonempty results, whether to advance the stored offset locally.
     /// Group `last_polled` progress also advances when this is false.
     pub(crate) auto_commit: bool,
+    pub(crate) owner:
+        Option<iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner>,
+    /// Keeps drain evidence incomplete until this read is accepted or dropped.
+    pub(crate) _group_poll: Option<Arc<AtomicBool>>,
 }
 
 /// An owned read result awaiting validation by the partition owner.
@@ -1364,6 +1370,8 @@ mod tests {
         let resident_plan = PollPlan {
             commit_offset: partition_commit_offset,
             context: PollContext {
+                owner: None,
+                _group_poll: None,
                 history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -1391,6 +1399,8 @@ mod tests {
         let empty_plan = PollPlan {
             commit_offset: 9,
             context: PollContext {
+                owner: None,
+                _group_poll: None,
                 history: PollHistoryId::default(),
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,

@@ -23,6 +23,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.partition.PartitionContext;
 
 import java.math.BigInteger;
 import java.util.Optional;
@@ -52,6 +53,18 @@ public interface ConsumerOffsetsClient {
     /**
      * Stores a consumer offset asynchronously.
      *
+     * <p>A store without a caller context takes the partition context from the client's
+     * route to the partition, and the client caches that route. After another client
+     * deletes and recreates the partition, such a store can fail once with error 87
+     * (history unavailable), or 5009 (partition not owned) for a group consumer. The
+     * client returns that error and does not retry it. It drops the failed route, so the
+     * next call routes again.
+     *
+     * <p>To store an offset of polled messages, pass the
+     * {@link org.apache.iggy.message.PolledMessages#context()} of that poll to the overload
+     * that takes a context. Then a store into a recreated partition is refused instead of
+     * saving an offset from the old incarnation.
+     *
      * @param streamId The stream identifier
      * @param topicId The topic identifier
      * @param partitionId The partition identifier (optional)
@@ -61,6 +74,28 @@ public interface ConsumerOffsetsClient {
      */
     CompletableFuture<Void> storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset);
+
+    /**
+     * Stores a consumer offset fenced by the context its messages were polled with.
+     * The server refuses the store once the partition incarnation or its owner has
+     * changed, so an offset from an older incarnation never lands in a newer one.
+     * The client returns that refusal, 87 or 5009, and does not retry it.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param partitionId The partition the messages were polled from
+     * @param consumer The consumer
+     * @param offset The offset to store
+     * @param context The {@link org.apache.iggy.message.PolledMessages#context()} of that poll
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    CompletableFuture<Void> storeConsumerOffset(
+            StreamId streamId,
+            TopicId topicId,
+            Long partitionId,
+            Consumer consumer,
+            BigInteger offset,
+            PartitionContext context);
 
     /**
      * Gets a consumer offset asynchronously.

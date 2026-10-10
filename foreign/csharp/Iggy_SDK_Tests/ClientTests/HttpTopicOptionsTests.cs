@@ -210,7 +210,7 @@ public sealed class HttpTopicOptionsTests
         Assert.True(refusal.FromServer);
     }
 
-    private sealed class StubHandler(string json) : HttpMessageHandler
+    internal sealed class StubHandler(string json) : HttpMessageHandler
     {
         internal HttpStatusCode StatusCode { get; init; } = HttpStatusCode.OK;
 

@@ -25,6 +25,7 @@ use consensus::{
 };
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
+use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
 use iggy_common::IggyError;
 use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
@@ -660,13 +661,12 @@ where
                     "committed finalization is missing from WAL",
                 ))
             })?;
-            let identity = iggy_binary_protocol::requests::system::SessionIdentity::decode_from(
-                prepare.body(),
-            )
-            .map_err(|_| {
+            let request = FinalizeSessionRequest::decode_from(prepare.body()).map_err(|_| {
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
-            client_table.finalize_session(identity);
+            if mux_stm.namespace_revision() == request.namespace_revision {
+                client_table.finalize_session(request.identity);
+            }
             last_applied_op = Some(header.op);
             continue;
         }
@@ -694,7 +694,10 @@ where
         }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
-            && header.operation != Operation::CompleteConsumerGroupRevocation
+            && !matches!(
+                header.operation,
+                Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
+            )
         {
             let cached = build_reply_message_with(header, reply.reply_body_len(), |dst| {
                 reply.write_reply_body(dst);
@@ -854,8 +857,8 @@ fn verify_checkpoint_pairing(
 mod tests {
     use super::*;
     use crate::impls::metadata::{StreamsFrontend, checkpoint_checksum};
-    use crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION;
-    use crate::stm::stream::Streams;
+    use crate::stm::snapshot::{SNAPSHOT_FORMAT_VERSION, Snapshotable};
+    use crate::stm::stream::{Streams, StreamsSnapshot};
     use crate::stm::user::Users;
     use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command, Operation};
@@ -1465,6 +1468,91 @@ mod tests {
             Some(USER),
             "the folded entry carries the acting user, so no metadata lookup is needed"
         );
+    }
+
+    #[compio::test]
+    async fn given_retirement_evidence_when_replaying_after_namespace_change_should_keep_the_session()
+     {
+        const CLIENT: u128 = 7;
+        const USER: u32 = 0;
+        const SNAPSHOT_OP: u64 = 2;
+        const CURRENT_REVISION: u64 = 2;
+        type SessionStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+
+        for reported_revision in [CURRENT_REVISION - 1, CURRENT_REVISION] {
+            let dir = tempdir().unwrap();
+            let metadata_dir = dir.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let register = make_client_prepare(1, Operation::Register, CLIENT, USER, 0);
+            table
+                .commit_register(
+                    CLIENT,
+                    USER,
+                    [0x5a; 32],
+                    build_reply_message(register.header(), &bytes::Bytes::new()),
+                )
+                .unwrap();
+            let logout = make_client_prepare(SNAPSHOT_OP, Operation::Logout, CLIENT, USER, 1);
+            table
+                .commit_logout(
+                    CLIENT,
+                    USER,
+                    1,
+                    build_reply_message(logout.header(), &bytes::Bytes::new()),
+                )
+                .unwrap();
+            let identity = table.ended_sessions().next().unwrap();
+            let mut snapshot = protected_snapshot(SNAPSHOT_OP);
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            snapshot.snapshot_mut().users = Some(Users::default().to_snapshot());
+            snapshot.snapshot_mut().streams = Some(StreamsSnapshot {
+                lifecycle_intents: std::collections::BTreeMap::default(),
+                items: Vec::new(),
+                revision: CURRENT_REVISION,
+                namespace_revision: CURRENT_REVISION,
+            });
+            snapshot
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+
+            let body = FinalizeSessionRequest {
+                identity,
+                namespace_revision: reported_revision,
+            }
+            .to_bytes();
+            let mut prepare = make_prepare(SNAPSHOT_OP + 1, body.len());
+            prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+            let prepare = prepare.transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.operation = Operation::FinalizeSession;
+                header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+            });
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), SNAPSHOT_OP)
+                    .await
+                    .unwrap();
+                journal.append(prepare).await.unwrap();
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let recovered = recover::<SessionStm>(
+                dir.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.last_applied_op, Some(SNAPSHOT_OP + 1));
+            assert_eq!(
+                recovered.client_table.ended_sessions().next(),
+                (reported_revision != CURRENT_REVISION).then_some(identity),
+                "WAL replay must preserve protection when the report covered an older partition set"
+            );
+        }
     }
 
     // The IGGY-137 restart contract: a rebooted node must remember where
