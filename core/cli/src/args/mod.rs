@@ -30,6 +30,7 @@ use system::SnapshotArgs;
 use crate::args::{
     client::ClientAction,
     cluster::ClusterAction,
+    connector::ConnectorAction,
     consumer_group::ConsumerGroupAction,
     consumer_offset::ConsumerOffsetAction,
     context::ContextAction,
@@ -53,6 +54,7 @@ use self::user::UserAction;
 pub(crate) mod client;
 pub(crate) mod cluster;
 pub(crate) mod common;
+pub(crate) mod connector;
 pub(crate) mod consumer_group;
 pub(crate) mod consumer_offset;
 pub(crate) mod context;
@@ -148,6 +150,25 @@ pub(crate) struct CliOptions {
     #[clap(verbatim_doc_comment)]
     #[clap(long = "generate", value_enum)]
     pub(crate) generator: Option<Shell>,
+
+    /// Connectors runtime HTTP API base URL
+    ///
+    /// Used by the connector commands. Falls back to the active context,
+    /// defaulting to http://localhost:8081.
+    #[clap(long, verbatim_doc_comment)]
+    pub(crate) connectors_api_url: Option<String>,
+
+    /// Connectors runtime HTTP API key
+    ///
+    /// Sent as the api-key header. Falls back to IGGY_CONNECTORS_API_KEY,
+    /// then to the active context. When the runtime answers 401 and stdin
+    /// is a terminal, the key is prompted for and the request retried once.
+    #[clap(long, verbatim_doc_comment)]
+    pub(crate) connectors_api_key: Option<String>,
+
+    /// CA certificate file for a connectors runtime that uses TLS
+    #[clap(long)]
+    pub(crate) connectors_tls_ca_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -220,6 +241,9 @@ pub(crate) enum Command {
     /// context operations
     #[command(subcommand, visible_alias = "ctx")]
     Context(ContextAction),
+    /// connectors runtime operations
+    #[command(subcommand, visible_alias = "conn")]
+    Connector(ConnectorAction),
     #[cfg(feature = "login-session")]
     /// login to Iggy server
     ///
@@ -293,6 +317,12 @@ impl IggyMergedConsoleArgs {
             #[cfg(feature = "login-session")]
             token_name: args.cli.token_name.or(context.token_name),
             generator: args.cli.generator,
+            connectors_api_url: args.cli.connectors_api_url.or(context.connectors_api_url),
+            connectors_api_key: args.cli.connectors_api_key.or(context.connectors_api_key),
+            connectors_tls_ca_file: args
+                .cli
+                .connectors_tls_ca_file
+                .or(context.connectors_tls_ca_file.map(PathBuf::from)),
         };
 
         Self {

@@ -50,6 +50,7 @@ Commands:
   consumer-offset  consumer offset operations [alias: o]
   message          message operations [alias: m]
   context          context operations [alias: ctx]
+  connector        connectors runtime operations [alias: conn]
   login            login to Iggy server [alias: li]
   logout           logout from Iggy server [alias: lo]
   session          login session operations [alias: sess]
@@ -244,6 +245,22 @@ Options:
            source iggy_completion.bash
 {CLAP_INDENT}
           [possible values: bash, elvish, fish, powershell, zsh]
+
+      --connectors-api-url <CONNECTORS_API_URL>
+          Connectors runtime HTTP API base URL
+{CLAP_INDENT}
+          Used by the connector commands. Falls back to the active context,
+          defaulting to http://localhost:8081.
+
+      --connectors-api-key <CONNECTORS_API_KEY>
+          Connectors runtime HTTP API key
+{CLAP_INDENT}
+          Sent as the api-key header. Falls back to IGGY_CONNECTORS_API_KEY,
+          then to the active context. When the runtime answers 401 and stdin
+          is a terminal, the key is prompted for and the request retried once.
+
+      --connectors-tls-ca-file <CONNECTORS_TLS_CA_FILE>
+          CA certificate file for a connectors runtime that uses TLS
 
   -h, --help
           Print help (see a summary with '-h')

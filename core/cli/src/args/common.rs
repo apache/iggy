@@ -19,6 +19,7 @@ use clap::ValueEnum;
 use iggy::prelude::OptionKey;
 use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
 use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
+use iggy_cli::commands::binary_connectors::get_connectors::GetConnectorsOutput;
 use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
 use iggy_cli::commands::binary_context::get_contexts::GetContextsOutput;
 use iggy_cli::commands::binary_personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensOutput;
@@ -84,6 +85,15 @@ impl From<ListMode> for GetClientsOutput {
         match mode {
             ListMode::Table => GetClientsOutput::Table,
             ListMode::List => GetClientsOutput::List,
+        }
+    }
+}
+
+impl From<ListMode> for GetConnectorsOutput {
+    fn from(mode: ListMode) -> Self {
+        match mode {
+            ListMode::Table => GetConnectorsOutput::Table,
+            ListMode::List => GetConnectorsOutput::List,
         }
     }
 }
