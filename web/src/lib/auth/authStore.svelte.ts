@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { typedRoute } from '$lib/types/appRoutes';
-import { tokens } from '$lib/utils/constants/tokens';
+import { typedRoute } from '#lib/types/appRoutes.js';
+import { tokens } from '#lib/utils/constants/tokens.js';
 import { jwtDecode } from 'jwt-decode';
 
 export interface AuthState {
@@ -88,7 +88,7 @@ function createAuthStore() {
   function logout(): void {
     clearTokenCookie();
     state = { isAuthenticated: false, accessToken: null, userId: null };
-    goto(resolve(typedRoute('/auth/sign-in')));
+    goto(resolve(typedRoute('auth/sign-in')));
   }
 
   function getAccessToken(): string | null {

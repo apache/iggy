@@ -15,17 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { clientApi } from '#lib/api/clientApi.js';
-import { streamMapper, type Stream } from '#lib/domain/Stream.js';
-import type { LayoutLoad } from './$types';
+import { defineParams } from '@sveltejs/kit/params';
 
-export const load: LayoutLoad = async () => {
-  const data = await clientApi<any[]>({
-    method: 'GET',
-    path: '/streams'
-  });
-
-  return {
-    streams: (data.map(streamMapper) as Stream[]).sort((a, b) => b.createdAt - a.createdAt)
-  };
-};
+export const params = defineParams({
+  i32: (value) => (/^-?\d+(\.\d+)?$/.test(value) ? value : undefined)
+});

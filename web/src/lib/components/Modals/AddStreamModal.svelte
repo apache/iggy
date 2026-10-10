@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
   import { z } from 'zod';
@@ -26,7 +26,7 @@ under the License.
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
   import { showToast } from '../AppToasts.svelte';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 
   interface Props {
