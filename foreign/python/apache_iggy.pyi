@@ -35,6 +35,10 @@ __all__ = [
     "BackpressureMode",
     "CacheMetrics",
     "CacheMetricsKey",
+    "ClusterMetadata",
+    "ClusterNode",
+    "ClusterNodeRole",
+    "ClusterNodeStatus",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
@@ -71,6 +75,7 @@ __all__ = [
     "Topic",
     "TopicDetails",
     "TopicPermissions",
+    "TransportEndpoints",
     "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
@@ -458,6 +463,57 @@ class CacheMetricsKey:
     def __new__(
         cls, stream_id: builtins.int, topic_id: builtins.int, partition_id: builtins.int
     ) -> CacheMetricsKey: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ClusterMetadata:
+    r"""
+    Metadata of all nodes in the cluster.
+
+    A server running without clustering reports itself as the only node.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The name of the cluster.
+        """
+    @property
+    def nodes(self) -> builtins.list[ClusterNode]:
+        r"""
+        The list of all nodes in the cluster.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ClusterNode:
+    r"""
+    A node in the cluster with its transport endpoints, role, and status.
+    """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        The name of the node.
+        """
+    @property
+    def ip(self) -> builtins.str:
+        r"""
+        The address clients should use to reach the node.
+        """
+    @property
+    def endpoints(self) -> TransportEndpoints:
+        r"""
+        The transport endpoints of the node.
+        """
+    @property
+    def role(self) -> ClusterNodeRole:
+        r"""
+        The role of the node in the cluster.
+        """
+    @property
+    def status(self) -> ClusterNodeStatus:
+        r"""
+        The current status of the node.
+        """
     def __repr__(self) -> builtins.str: ...
 
 class Consumer:
@@ -1163,6 +1219,20 @@ class IggyClient:
             RuntimeError: If the client is not connected, the session is not
                 authenticated, the user lacks the permission, or the request
                 fails.
+        """
+    def get_cluster_metadata(self) -> collections.abc.Awaitable[ClusterMetadata]:
+        r"""
+        Get the metadata of all nodes in the cluster.
+
+        Any authenticated user may call this; no global permission is needed.
+        A server running without clustering reports itself as the only node.
+
+        Returns:
+            An awaitable that resolves to `ClusterMetadata`.
+
+        Raises:
+            RuntimeError: If the client is not connected, the session is not
+                authenticated, or the request fails.
         """
     def describe_options(
         self, scope: builtins.str
@@ -3237,6 +3307,35 @@ class TopicPermissions:
         """
 
 @typing.final
+class TransportEndpoints:
+    r"""
+    Transport endpoints exposed by a cluster node.
+
+    A port of 0 means the node does not advertise that transport.
+    """
+    @property
+    def tcp(self) -> builtins.int:
+        r"""
+        TCP port.
+        """
+    @property
+    def quic(self) -> builtins.int:
+        r"""
+        QUIC port.
+        """
+    @property
+    def http(self) -> builtins.int:
+        r"""
+        HTTP port.
+        """
+    @property
+    def websocket(self) -> builtins.int:
+        r"""
+        WebSocket port.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class UserHeaders(dict):
     r"""
     User headers dictionary returned by `ReceiveMessage.user_headers`.
@@ -3496,6 +3595,52 @@ class WebSocketReconnectionConfig:
                 raised by the underlying conversion before this constructor runs.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class ClusterNodeRole(enum.Enum):
+    r"""
+    The role of a node within the cluster.
+    """
+
+    Leader = ...
+    r"""
+    Primary/Leader node - handles all writes.
+    """
+    Follower = ...
+    r"""
+    Follower/Secondary node - read replica.
+    """
+
+@typing.final
+class ClusterNodeStatus(enum.Enum):
+    r"""
+    The current status of a node.
+    """
+
+    Healthy = ...
+    r"""
+    Node is healthy and responsive.
+    """
+    Starting = ...
+    r"""
+    Node is starting up.
+    """
+    Stopping = ...
+    r"""
+    Node is shutting down.
+    """
+    Unreachable = ...
+    r"""
+    Node is unreachable.
+    """
+    Maintenance = ...
+    r"""
+    Node is in maintenance mode.
+    """
+    Unknown = ...
+    r"""
+    Node is unknown.
+    """
 
 @typing.final
 class ProducerSharding(enum.Enum):
