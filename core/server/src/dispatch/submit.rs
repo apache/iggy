@@ -215,7 +215,9 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
 /// the committed reply back here so the caller can write it to the
 /// originating socket -- shard 0 cannot route the reply by the consensus
 /// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
-/// `None` = transient submit failure (SDK read-timeout replays).
+/// `None` = no verdict, for example after shard 0 refused the forward. The
+/// outcome is unknown, so callers answer `TransientNotCommitted`, which
+/// licenses only a replay of the same request id.
 #[allow(clippy::future_not_send)]
 pub async fn submit_client_request_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,

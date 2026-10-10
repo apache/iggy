@@ -1172,14 +1172,21 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
     // Acking unconditionally here would swallow a not-primary rejection and
     // drop the delete on the floor while the client believes it succeeded.
     let Some(reply) = submit_client_request_on_owner(shard, truncate).await else {
-        // Transient submit failure (not primary / view change). Stay silent;
-        // the SDK read-timeout replays the same request id, which re-resolves
-        // and commits. Acking here would advance the client past an
-        // unrecorded request and gap the next metadata op.
+        // No verdict came back, so the outcome is unknown. The transient deny
+        // makes the SDK replay the same request id, which re-resolves and
+        // commits. An ack here advances the client past an unrecorded request
+        // and gaps the next metadata op.
         warn!(
             transport_client_id,
-            "delete_segments: transient submit; client will replay"
+            "delete_segments: no metadata verdict; client replays"
         );
+        send_deny_reply(
+            shard,
+            transport_client_id,
+            &header,
+            IggyError::TransientNotCommitted.as_code(),
+        )
+        .await;
         return;
     };
     send_host_frame(

@@ -3134,9 +3134,9 @@ where
         // consensus `client_id` (its top bits are random, not home-shard
         // routing), so a Replay/Evict/NotReady is returned to the home shard as
         // the reply -- `handle_client_request` writes it to the originating
-        // socket by transport id, exactly like a fresh commit. Drop (client-bug
-        // already-applied / future-epoch) surfaces as Canceled so the home
-        // shard stays silent.
+        // socket by transport id, exactly like a fresh commit. A cached reply
+        // that does not decode surfaces as Canceled, and the home shard answers
+        // it with `TransientNotCommitted`.
         let outcome = request_preflight(
             consensus,
             &self.client_table,

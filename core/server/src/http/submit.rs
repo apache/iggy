@@ -245,14 +245,18 @@ async fn submit_gated(
         // Retry the same rewritten body: a newly minted PAT token could differ
         // from the token hash protected by the first receipt.
         let retry_request = request.clone();
-        let Some(reply) = submit_client_request_on_owner(shard, request).await else {
-            return Err(WriteError::Unavailable);
-        };
-        let transient = (reply.header().command == Command::Reply)
-            .then(|| transient_code(&reply))
-            .flatten();
-        let Some(transient) = transient else {
-            break reply;
+        // A missing verdict leaves the outcome unknown, as a canceled prepare does.
+        let transient = match submit_client_request_on_owner(shard, request).await {
+            Some(reply) => {
+                let transient = (reply.header().command == Command::Reply)
+                    .then(|| transient_code(&reply))
+                    .flatten();
+                let Some(transient) = transient else {
+                    break reply;
+                };
+                transient
+            }
+            None => IggyError::TransientNotCommitted,
         };
         saw_not_committed |= matches!(transient, IggyError::TransientNotCommitted);
         // Pre-consensus transient frame: replay the SAME request id, mirroring
