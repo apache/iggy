@@ -24,7 +24,7 @@ use crate::journal::{
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::persistence::{
-    CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
+    FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
     DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
@@ -86,10 +86,11 @@ use server_common::{
     sharding::IggyNamespace,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1412,7 +1413,10 @@ where
                 });
                 return;
             }
-            barriers.push(CheckpointBarrier::already_synced(writer.path()));
+            // [`IggyIndexWriter::fsync`] used the original descriptor above.
+            // The marker tells [`PartitionPersistence::checkpoint_files`] not
+            // to replace that proof with a fresh-handle sync.
+            barriers.push(FileSyncBarrier::already_synced(writer.path()));
         }
         if let Err(error) = self.persist_retry_checkpoint(through_op).await {
             error!(%error, namespace_raw = self.namespace().inner(), "partition receipt checkpoint failed");
@@ -1428,6 +1432,30 @@ where
         persistence.checkpoint_files(through_op, files, directories, barriers);
         self.pending_retry_checkpoint = Some(through_op);
         self.start_persistence();
+    }
+
+    /// Queue original-writer syncs before the install backup is published.
+    /// This runs even when the checkpoint frontier cannot advance.
+    pub(crate) fn barrier_install_files_locked(&self) -> BTreeSet<PathBuf> {
+        let Some(persistence) = &self.persistence else {
+            return BTreeSet::new();
+        };
+        let mut barriers = Vec::with_capacity(2);
+        if let Some(writer) = self.log.messages_writers().last().and_then(Option::as_ref) {
+            let path = writer.path();
+            let writer = Rc::clone(writer);
+            barriers.push(FileSyncBarrier::from_future(path, async move {
+                writer.fsync().await.map_err(std::io::Error::other)
+            }));
+        }
+        if let Some(writer) = self.log.index_writers().last().and_then(Option::as_ref) {
+            let path = writer.path().to_owned();
+            let writer = Rc::clone(writer);
+            barriers.push(FileSyncBarrier::from_future(path, async move {
+                writer.fsync().await.map_err(std::io::Error::other)
+            }));
+        }
+        persistence.barrier_files(barriers)
     }
 
     fn persistence_checkpoint_files(
@@ -1544,7 +1572,7 @@ where
             PendingCheckpoint::Enqueue(through, ref synced_index) => {
                 let barriers = synced_index
                     .iter()
-                    .map(CheckpointBarrier::already_synced)
+                    .map(FileSyncBarrier::already_synced)
                     .collect();
                 let (files, directories) = self.persistence_checkpoint_files(config);
                 if let Some(persistence) = &self.persistence {
@@ -12012,6 +12040,70 @@ mod tests {
                 "checkpoint failure must fence before transfer-flush recovery; fail_capture: {fail_capture}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_an_index_sync_failure_when_installing_state_transfer_should_refuse_backup_publication()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        partition.set_partition_dir(partition_dir.clone());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        for kind in ["consumers", "groups"] {
+            std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
+        }
+        partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
+        partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let prepare = checksummed_segment_prepare(1, 0, 0, b"durable");
+        persistence
+            .append(prepare.clone().into_frozen(), true)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition.consensus.restore_commit_state(1, 1);
+        persistence.checkpoint(1);
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert_eq!(persistence.checkpoint_op(), 1);
+
+        let writer = IggyIndexWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer
+                .save_indexes_buffered_at(vec![1; 32], 0)
+                .await
+                .unwrap(),
+            32
+        );
+        let active = partition.log.index_writers().len() - 1;
+        partition.log.index_writers_mut()[active] = Some(Rc::new(writer));
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: partition.dedup().capacity(),
+            required_metadata_frontier: 0,
+            prepare_checksum: Some(prepare.header().checksum),
+            checkpoint_prepare: prepare.as_slice().to_vec(),
+            next_offset: 1,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            external_groups: Vec::new(),
+            dedup: Vec::new(),
+        };
+
+        let result = partition
+            .install_state_transfer(&repair_config(), 1, Vec::new(), &offsets.encode())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::state_transfer::PartitionInstallError::SwapIo { .. })
+        ));
+        assert!(partition.fatal().is_some());
+        assert!(!directory.path().join(".install-backup").exists());
     }
 
     #[compio::test]
@@ -23219,6 +23311,40 @@ mod tests {
     /// without any production-side plumbing.
     #[cfg(target_os = "linux")]
     const DEV_FULL: &str = "/dev/full";
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_an_unsyncable_messages_writer_when_installing_should_refuse_the_barrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("wal");
+        let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+        let messages_writer =
+            MessagesWriter::new("/dev/null", Rc::new(AtomicU64::new(0)), false, false, None)
+                .await
+                .unwrap();
+        let index_path = directory.path().join("segment.index");
+        let index_writer = IggyIndexWriter::new(
+            index_path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(0)),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut partition = test_partition();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+            SegmentStorage::default(),
+            Some(Rc::new(messages_writer)),
+            Some(Rc::new(index_writer)),
+        );
+        partition.persistence = Some(Rc::clone(&persistence));
+
+        partition.barrier_install_files_locked();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.failure().is_some());
+    }
 
     const FIRST_PAYLOAD: &[u8] = b"first-chunk";
     const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";
