@@ -85,6 +85,7 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final int HISTORY_UNAVAILABLE = 87;
     private static final int LIFECYCLE_BUSY = IggyErrorCode.LIFECYCLE_BUSY.getCode();
     private static final int PARTITION_NOT_OWNED = 5009;
+    private static final int ASSIGNED_PARTITION = 7;
     // An offset write status of the fake primary: the write is stored.
     private static final int STORED = 0;
     private static final long ROUTE_INCARNATION = 1;
@@ -518,6 +519,60 @@ class AsyncIggyTcpClientPartitionContextTest {
                 assertThat(stamped)
                         .containsExactly(
                                 CALLER_CONTEXT, routeContext(ROUTE_INCARNATION), routeContext(ROUTE_INCARNATION));
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldSyncAnEmptyGroupAssignmentAgainOnTheNextPoll() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger syncs = new AtomicInteger();
+            AtomicInteger polls = new AtomicInteger();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GROUP_SYNC_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            syncs.incrementAndGet() == 1
+                                    ? Unpooled.buffer().writeLongLE(1).writeIntLE(0)
+                                    : Unpooled.buffer()
+                                            .writeLongLE(1)
+                                            .writeIntLE(1)
+                                            .writeIntLE(ASSIGNED_PARTITION));
+                }
+                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            pollRoute(request, 1, 1, coordinatorSocket.getLocalPort(), ROUTE_INCARNATION));
+                }
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                    polls.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, emptyPoll(ASSIGNED_PARTITION));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                pollGroup(client, PollingStrategy.next()).get(5, TimeUnit.SECONDS);
+                assertThat(polls).hasValue(0);
+                assertThat(pollGroup(client, PollingStrategy.next())
+                                .get(5, TimeUnit.SECONDS)
+                                .partitionId())
+                        .isEqualTo(ASSIGNED_PARTITION);
+                assertThat(syncs).hasValue(2);
+                assertThat(polls).hasValue(1);
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }

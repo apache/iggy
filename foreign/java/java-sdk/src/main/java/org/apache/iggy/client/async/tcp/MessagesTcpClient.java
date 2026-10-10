@@ -399,7 +399,11 @@ public class MessagesTcpClient implements MessagesClient {
     private CompletableFuture<Void> ensureFreshAssignment(
             StreamId streamId, TopicId topicId, Consumer consumer, ClientRoutingState.GroupKey groupKey) {
         var cached = routingState.assignment(groupKey);
-        if (cached.isPresent() && System.nanoTime() - cached.get().syncedAtNanos() < ROUTING_CACHE_REFRESH.toNanos()) {
+        // As in the Rust SDK, an empty assignment is synced again on every poll:
+        // a member gets its partitions only as each one installs the new owner.
+        if (cached.isPresent()
+                && !cached.get().partitions().isEmpty()
+                && System.nanoTime() - cached.get().syncedAtNanos() < ROUTING_CACHE_REFRESH.toNanos()) {
             return CompletableFuture.completedFuture(null);
         }
         return consumerGroupsClient
