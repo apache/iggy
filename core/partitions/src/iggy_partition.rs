@@ -16652,6 +16652,89 @@ mod tests {
         assert!(partition.pending_owner_install.get().is_none());
     }
 
+    /// Repair can journal an install ahead of a lower op, so the tail header is
+    /// not the highest op. The first scan of the next view must still find the
+    /// install, or a store under the replaced owner lands behind it and fails at
+    /// apply on every replica.
+    #[compio::test]
+    async fn given_install_repaired_ahead_of_lower_op_when_view_starts_should_refuse_replaced_owner_store()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const CONSUMER_ID: u32 = 9;
+        let mut origin = test_partition();
+        let mut partition = test_partition();
+        install_test_owner(&mut origin, GROUP_ID, CLIENT_ID).await;
+        let installed_op = install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let replaced = partition.consumer_group_owner(GROUP_ID).unwrap();
+        for replica in [&origin, &partition] {
+            replica.stats.increment_messages_count(1);
+        }
+        let consumer_store = store_offset_request(
+            CLIENT_ID + 2,
+            1,
+            ConsumerKind::Consumer,
+            CONSUMER_ID,
+            0,
+            AckLevel::Quorum,
+        )
+        .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+            header.metadata_watermark = origin.required_metadata_frontier;
+            *next = header;
+        });
+        origin.on_request(consumer_store, None).await;
+        let successor = next_test_installation(&origin, GROUP_ID, CLIENT_ID + 1);
+        origin
+            .on_request(owner_install_request(&origin, &successor), None)
+            .await;
+        let head = origin.consensus.sequencer().current_sequence();
+        assert_eq!(head, installed_op + 2);
+
+        partition.repair = Some(armed_session(head, installed_op, None));
+        for op in [head, head - 1] {
+            partition
+                .apply_repaired_prepare(retained_prepare(&origin, op))
+                .await;
+        }
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+        // A view start keeps the journal order and rebuilds the pipeline from it.
+        partition.consensus.set_view(1);
+        partition.consensus.with_pipeline_mut(|pipeline| {
+            for op in installed_op + 1..=head {
+                let header = partition.log.journal().inner.header_by_op(op).unwrap();
+                pipeline.push(PipelineEntry::new(header));
+            }
+        });
+
+        let store = store_offset_request(
+            replaced.client_id,
+            1,
+            ConsumerKind::ConsumerGroup,
+            u32::try_from(GROUP_ID).unwrap(),
+            0,
+            AckLevel::Quorum,
+        )
+        .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+            header.metadata_watermark = partition.required_metadata_frontier;
+            header.owner_generation = replaced.generation;
+            *next = header;
+        });
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition.on_request(store, Some(sender)).await;
+        commit_log(&mut partition).await;
+
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+        assert_eq!(
+            partition.consumer_group_owner(GROUP_ID),
+            Some(successor.owner)
+        );
+    }
+
     #[compio::test]
     async fn given_pending_install_when_the_same_install_arrives_should_refuse_the_copy() {
         const GROUP_ID: u64 = 7;

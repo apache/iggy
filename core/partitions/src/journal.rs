@@ -1113,11 +1113,11 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         self.bytes_by_op(header.op).await
     }
 
-    /// Appends are in op order and every rewrite preserves it, so the tail header
-    /// carries the highest op.
+    /// Read off the op index, not the tail header: repair backfills append below
+    /// higher ops and stay there until `sort_by_op` runs.
     fn last_op(&self) -> Option<u64> {
-        let headers = unsafe { &*self.headers.get() };
-        headers.last().map(|header| header.op)
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        op_to_storage_offset.last_key_value().map(|(op, _)| *op)
     }
 
     /// Drop every entry at or above `from_op`, rebuilding the indexes. Same
@@ -1574,6 +1574,19 @@ mod tests {
             Some((3, 3)),
             "repair must pair the frontier op with its own checksum"
         );
+    }
+
+    #[compio::test]
+    async fn given_backfill_below_the_tail_when_reading_last_op_should_report_the_highest_op() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 3, 2] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE).into_frozen())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(journal.last_op(), Some(3));
     }
 
     #[compio::test]
