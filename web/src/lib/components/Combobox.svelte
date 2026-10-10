@@ -20,7 +20,7 @@ under the License.
 <script lang="ts">
   import { run } from 'svelte/legacy';
 
-  import { noTypeCheck } from '$lib/utils/noTypeCheck';
+  import { noTypeCheck } from '#lib/utils/noTypeCheck.js';
   import Icon from './Icon.svelte';
   import { createEventDispatcher, onMount, tick } from 'svelte';
   import { createCombobox } from 'svelte-headlessui';

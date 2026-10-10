@@ -18,12 +18,16 @@ under the License.
 -->
 
 <script lang="ts">
-  import { base } from '$app/paths';
+  import { asset } from '$app/paths';
+
   let className = '';
+
   export { className as class };
-  const lightLogo = `${base}/iggy-apache-lightbg.svg`;
-  const darkLogo = `${base}/iggy-apache-darkbg.svg`;
+
+  const lightLogo = asset('iggy-apache-lightbg.svg');
+  const darkLogo = asset('iggy-apache-darkbg.svg');
 </script>
 
 <img src={lightLogo} class="{className} block dark:hidden" alt="Apache Iggy" />
+
 <img src={darkLogo} class="{className} hidden dark:block" alt="Apache Iggy" />

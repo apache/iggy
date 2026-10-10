@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script lang="ts">
-  import Input from '$lib/components/Input.svelte';
+  import Input from '#lib/components/Input.svelte';
   import Icon from './Icon.svelte';
   import Button from './Button.svelte';
 
