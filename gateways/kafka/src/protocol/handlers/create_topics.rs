@@ -18,7 +18,6 @@
 //! `CreateTopics` (API key 19).
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use bytes::Bytes;
 use iggy::prelude::IggyError;
@@ -39,8 +38,8 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, handle_versioned_request, is_supported_version,
-    respond_or_close, unsupported_version_response,
+    clamp_request_timeout, decode_guarded, encode_message, handle_versioned_request,
+    is_supported_version, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -74,21 +73,6 @@ const MAX_PARTITIONS_COUNT: u32 = 1000;
 /// real admin batch. Duplicate names never count against this cap - they're rejected by
 /// [`find_duplicate_names`] before ever reaching the bridge.
 const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
-
-/// Bounds imposed on the request's own `timeout_ms` before it becomes the aggregate bridge-work
-/// deadline. That value is client-supplied and otherwise unchecked: `0` or negative would abort
-/// every topic on arrival, and an oversized one would tie up the shared `IggyClient` past any
-/// reasonable request.
-const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_000);
-const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Clamps the wire's own `timeout_ms` (KIP-4's field for exactly this) into
-/// `[MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT]` - unlike `ListOffsets`/`Metadata`, `CreateTopics`
-/// carries a real client-supplied deadline to honor, not just a fixed internal ceiling.
-fn clamp_request_timeout(timeout_ms: i32) -> Duration {
-    let requested = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
-    requested.clamp(MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
-}
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
@@ -184,9 +168,13 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// `deadline` bounds each topic's own bridge work individually (`timeout_at`), not the whole
 /// loop: a single `timeout` around the entire call would discard every already-resolved result
 /// the moment one topic's call ran long, answering `REQUEST_TIMED_OUT` even for topics that had
-/// already committed. Once `deadline` passes, every remaining topic's own `timeout_at` elapses
-/// immediately rather than making a fresh bridge call, so a stuck topic near the front of a large
-/// batch does not turn into one slow round trip per topic behind it.
+/// already committed.
+///
+/// `tokio::time::timeout_at` polls the inner future before it ever checks the deadline (see
+/// `Timeout::poll`), so once `deadline` has already passed, wrapping a fresh bridge call in it
+/// still starts that call - a topic past the deadline would both answer `REQUEST_TIMED_OUT` *and*
+/// actually get created. The `Instant::now() >= deadline` check below must run and must skip the
+/// call itself, the same pattern `list_offsets.rs` uses, not rely on `timeout_at` to skip it.
 async fn create_all_topics(
     bridge: &IggyBridge,
     api_version: i16,
@@ -196,31 +184,52 @@ async fn create_all_topics(
     deadline: Instant,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
+    let mut deadline_exceeded = false;
     for topic in topics {
-        let result = if duplicate_names.contains(&topic.name) {
-            CreatableTopicResult::default()
-                .with_name(topic.name.clone())
-                .with_error_code(ERROR_INVALID_REQUEST)
-                .with_error_message(None)
-        } else {
-            match tokio::time::timeout_at(
-                deadline,
-                create_one_topic(bridge, api_version, topic, validate_only),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        kafka_topic = topic.name.as_str(),
-                        "CreateTopics: this topic's bridge work exceeded the request deadline; \
-                         answering retriable instead of blocking further"
-                    );
-                    CreatableTopicResult::default()
-                        .with_name(topic.name.clone())
-                        .with_error_code(ERROR_REQUEST_TIMED_OUT)
-                        .with_error_message(None)
-                }
+        if duplicate_names.contains(&topic.name) {
+            results.push(
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_INVALID_REQUEST)
+                    .with_error_message(None),
+            );
+            continue;
+        }
+        if deadline_exceeded || Instant::now() >= deadline {
+            if !deadline_exceeded {
+                deadline_exceeded = true;
+                tracing::warn!(
+                    "CreateTopics deadline passed; answering remaining topics retriable \
+                     instead of starting new Iggy calls"
+                );
+            }
+            results.push(
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_REQUEST_TIMED_OUT)
+                    .with_error_message(None),
+            );
+            continue;
+        }
+
+        let result = match tokio::time::timeout_at(
+            deadline,
+            create_one_topic(bridge, api_version, topic, validate_only),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                deadline_exceeded = true;
+                tracing::warn!(
+                    kafka_topic = topic.name.as_str(),
+                    "CreateTopics: this topic's bridge work exceeded the request deadline; \
+                     answering retriable instead of blocking further"
+                );
+                CreatableTopicResult::default()
+                    .with_name(topic.name.clone())
+                    .with_error_code(ERROR_REQUEST_TIMED_OUT)
+                    .with_error_message(None)
             }
         };
         results.push(result);
@@ -789,22 +798,5 @@ mod tests {
                 .with_replication_factor(1),
         ];
         assert!(find_duplicate_names(&topics).is_empty());
-    }
-
-    #[test]
-    fn clamp_request_timeout_rejects_a_zero_or_negative_value_up_to_the_floor() {
-        assert_eq!(clamp_request_timeout(0), MIN_REQUEST_TIMEOUT);
-        assert_eq!(clamp_request_timeout(-1), MIN_REQUEST_TIMEOUT);
-        assert_eq!(clamp_request_timeout(i32::MIN), MIN_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn clamp_request_timeout_caps_an_oversized_value_at_the_ceiling() {
-        assert_eq!(clamp_request_timeout(i32::MAX), MAX_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn clamp_request_timeout_passes_through_a_reasonable_value_unchanged() {
-        assert_eq!(clamp_request_timeout(5_000), Duration::from_secs(5));
     }
 }

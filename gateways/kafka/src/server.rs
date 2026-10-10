@@ -550,6 +550,7 @@ async fn route_frame(
             handle_connection_request(
                 ctx.state,
                 ctx.connection,
+                principal.as_ref(),
                 req.request_api_key,
                 req.request_api_version,
                 body,
@@ -563,9 +564,11 @@ async fn route_frame(
             // peer repeat a rejected version forever, resetting the pre-authentication read budget
             // on every frame and holding a `max_connections` permit with it.
             sasl_state.count_api_versions_answer();
+            // Pre-authentication by construction: no principal exists yet at this point.
             handle_connection_request(
                 ctx.state,
                 ctx.connection,
+                None,
                 req.request_api_key,
                 req.request_api_version,
                 body,

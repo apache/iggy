@@ -39,6 +39,7 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (14, "SyncGroup", 0, 5),
     (18, "ApiVersions", 0, 3),
     (19, "CreateTopics", 2, 5),
+    (20, "DeleteTopics", 1, 5),
     (22, "InitProducerId", 0, 5),
 ];
 

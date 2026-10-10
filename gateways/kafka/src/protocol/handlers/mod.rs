@@ -26,6 +26,7 @@
 
 pub mod api_versions;
 pub mod create_topics;
+pub mod delete_topics;
 pub mod fetch;
 pub mod find_coordinator;
 pub mod heartbeat;
@@ -39,6 +40,8 @@ pub mod offset_fetch;
 pub mod produce;
 pub mod sync_group;
 
+use std::time::Duration;
+
 use bytes::{Buf, Bytes, BytesMut};
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::TransactionalId;
@@ -46,21 +49,36 @@ use kafka_protocol::protocol::{Decodable, Encodable};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::time::Instant;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::BridgeError;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
-    API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH,
-    API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, is_supported_version,
-    supported_max_version,
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS, API_KEY_FETCH,
+    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP,
+    API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
+    API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState,
+    ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    is_supported_version, supported_max_version,
 };
 
 /// Record encodes and decodes of this many bytes or more run off the async worker.
 pub(crate) const CODEC_OFF_WORKER_BYTES: usize = 64 * 1024;
 /// A plain copy costs less per byte, so the handoff pays off only from this size.
 pub(crate) const COPY_OFF_WORKER_BYTES: usize = 1024 * 1024;
+
+/// Client-supplied `timeout_ms` floor. `0` or negative would abort every topic on arrival.
+pub(crate) const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(1_000);
+/// Client-supplied `timeout_ms` ceiling. Above this the shared `IggyClient` stays busy too long.
+pub(crate) const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Clamps KIP-4 `timeout_ms` into `[MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT]`.
+///
+/// `CreateTopics` and `DeleteTopics` honor the request's own deadline. `ListOffsets` and
+/// `Metadata` do not: they have no such field.
+pub(crate) fn clamp_request_timeout(timeout_ms: i32) -> Duration {
+    let requested = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
+    requested.clamp(MIN_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT)
+}
 
 /// Runs `work`. When `heavy`, other tasks move to another worker first, so they keep running. A
 /// current-thread runtime runs it in place.
@@ -81,6 +99,7 @@ pub(crate) fn off_worker<T>(heavy: bool, work: impl FnOnce() -> T) -> T {
 pub async fn dispatch(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
@@ -94,6 +113,7 @@ pub async fn dispatch(
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(state, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
+        API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
         API_KEY_FIND_COORDINATOR => find_coordinator::handle(state, api_version, body).await,
         API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
@@ -281,5 +301,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn given_a_multi_thread_runtime_when_work_is_large_should_run_it() {
         assert_eq!(off_worker(true, || 7), 7);
+    }
+
+    #[test]
+    fn clamp_request_timeout_rejects_a_zero_or_negative_value_up_to_the_floor() {
+        assert_eq!(clamp_request_timeout(0), MIN_REQUEST_TIMEOUT);
+        assert_eq!(clamp_request_timeout(-1), MIN_REQUEST_TIMEOUT);
+        assert_eq!(clamp_request_timeout(i32::MIN), MIN_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn clamp_request_timeout_caps_an_oversized_value_at_the_ceiling() {
+        assert_eq!(clamp_request_timeout(i32::MAX), MAX_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn clamp_request_timeout_passes_through_a_reasonable_value_unchanged() {
+        assert_eq!(clamp_request_timeout(5_000), Duration::from_secs(5));
     }
 }

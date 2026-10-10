@@ -1010,6 +1010,77 @@ fn list_acls(gateway: SocketAddr, username: &str, password: &str) -> String {
     .expect_ran(&format!("listing ACLs as {username}"))
 }
 
+/// Runs `kafka-topics.sh` with `args` against `gateway`. No `--command-config`: the bridged
+/// stack this test uses runs with SASL off, same as the kcat calls against it above.
+fn kafka_topics(gateway: SocketAddr, args: &[&str]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut full_args: Vec<&str> = vec![
+        "/opt/kafka/bin/kafka-topics.sh",
+        "--bootstrap-server",
+        &bootstrap,
+    ];
+    full_args.extend_from_slice(args);
+    run_client(KAFKA_IMAGE, &full_args, &[])
+}
+
+/// #3546's own acceptance criterion: `kafka-topics.sh` must work against the gateway for create
+/// and delete. (`--describe` needs `DescribeConfigs`, not yet implemented, so it is not covered
+/// here.) Runs against the bridged stack, since this exercises the real `CreateTopics`/
+/// `DeleteTopics` bridge path, not authentication - the other Java-client tests above already
+/// cover SASL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_creating_then_deleting_a_topic_should_round_trip_through_the_bridge()
+ {
+    const NEW_TOPIC: &str = "kafka-topics-roundtrip";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            NEW_TOPIC,
+            "--partitions",
+            "3",
+            "--replication-factor",
+            "1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create");
+    assert!(
+        created.contains(&format!("Created topic {NEW_TOPIC}")),
+        "kafka-topics.sh must report the topic created, got: {created}"
+    );
+
+    let listed =
+        kafka_topics(gateway, &["--list"]).expect_ran("kafka-topics.sh --list after create");
+    assert!(
+        listed.lines().any(|line| line.trim() == NEW_TOPIC),
+        "the created topic must appear in the listing, got: {listed}"
+    );
+
+    let deleted = kafka_topics(gateway, &["--delete", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --delete");
+    assert!(
+        !deleted.to_lowercase().contains("error"),
+        "kafka-topics.sh --delete must succeed, got: {deleted}"
+    );
+
+    let listed_after =
+        kafka_topics(gateway, &["--list"]).expect_ran("kafka-topics.sh --list after delete");
+    assert!(
+        !listed_after.lines().any(|line| line.trim() == NEW_TOPIC),
+        "the deleted topic must no longer appear in the listing, got: {listed_after}"
+    );
+    assert!(
+        listed_after.lines().any(|line| line.trim() == TOPIC),
+        "deleting one topic must not take the shared default stream, and `{TOPIC}`, with it, got: \
+         {listed_after}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back_in_order() {
     let Some((_server, gateway)) = bridged_stack().await else {

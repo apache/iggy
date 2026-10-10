@@ -1,18 +1,21 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, OffsetCommit and OffsetFetch use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics and DeleteTopics use Iggy. InitProducerId and consumer group coordination work with or without one.
 
 > **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
-> CreateTopics, OffsetCommit and OffsetFetch use Iggy. With the bridge off (the default), those
-> seven are stubs: Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6),
-> CreateTopics answers `NOT_CONTROLLER` (41), OffsetCommit and OffsetFetch answer retriable
+> CreateTopics, DeleteTopics,OffsetCommit and OffsetFetch use Iggy. With the bridge off (the default), those six are stubs:
+> Produce, Fetch and ListOffsets answer retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics and
+> DeleteTopics answer `NOT_CONTROLLER` (41),  OffsetCommit and OffsetFetch answer retriable
 > `COORDINATOR_LOAD_IN_PROGRESS` (14), and Metadata reports every requested topic unknown.
-> **CreateTopics runs as the bridge's own
-> Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that
-> can reach this port can create topics (up to 1000 partitions each). OffsetCommit creates Iggy
+> **CreateTopics and DeleteTopics run as the bridge's own Iggy user**: with the bridge on and
+> `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port can create
+> topics (up to 1000 partitions each) and can delete topics and their data.OffsetCommit creates Iggy
 > resources too: a consumer group `kafka.cg.<group>` per group id and topic, which nothing deletes
-> ([cleanup](docs/OFFSET_STORAGE.md#limits)). Every client reads and writes as the bridge's Iggy
-> user. See [docs/SCOPE.md](docs/SCOPE.md).
+> ([cleanup](docs/OFFSET_STORAGE.md#limits)). Every client reads and
+> writes as the bridge's Iggy user. With SASL on, `DeleteTopics` additionally requires the
+> authenticated principal to hold `manage_topics`; without it every name in the request fails
+> `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is deleted. `CreateTopics` has no such gate yet -
+> SASL on does not protect it. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >

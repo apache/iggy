@@ -347,6 +347,27 @@ to group members the way Kafka does, in the client, and polls every partition by
 Iggy's group registry is used as an offset key and for nothing else, which
 [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md) covers.
 
+## Topic deletion and the shared default stream
+
+`TopicMapping::resolve` sends every Kafka topic with no configured override to the same
+`default_stream` - one Iggy stream holding many Iggy topics, one per Kafka topic name. An
+override can point a specific Kafka topic at a different stream, but nothing stops two different
+overrides, or an override and the default, from naming the same stream for two different Kafka
+topics.
+
+`DeleteTopics` ([#3546](https://github.com/apache/iggy/issues/3546)) therefore deletes the Iggy
+*topic* only, never the Iggy *stream* it lives in - even when that delete leaves the stream with
+no topics left in it. A stream `DeleteTopics` happens to empty out is not the same thing as a
+stream nothing will ever use again: the next `CreateTopics` for an unrelated Kafka topic sharing
+that same default stream recreates exactly the state the delete just left, and this bridge has no
+way to tell "abandoned" apart from "temporarily empty" from here. Real Kafka has no analogous
+container object a topic delete would need to clean up either, so leaving the stream alone also
+matches what a Kafka client actually expects to observe.
+
+`ensure_stream_and_topic`'s own doc comment (`src/bridge/iggy_bridge/topics.rs`) flags the
+identical sharing risk from the create side: it never rolls back a stream it just created on a
+failed topic create, for the same reason.
+
 ## Reserved header namespace
 
 `kafka.` is reserved on messages the gateway writes. Nothing in the server enforces it, so the

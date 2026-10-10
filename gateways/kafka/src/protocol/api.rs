@@ -26,6 +26,7 @@ use kafka_protocol::messages::{
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
@@ -38,9 +39,9 @@ use crate::protocol::bounds_guard::{
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit, offset_fetch,
-    produce, respond_or_close, sync_group,
+    api_versions, create_topics, decode_guarded, delete_topics, dispatch, fetch, find_coordinator,
+    heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit,
+    offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -61,6 +62,7 @@ pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_DELETE_TOPICS: i16 = 20;
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
@@ -278,6 +280,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     offset_fetch::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    delete_topics::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,
@@ -430,18 +433,22 @@ pub async fn handle_request_bounded(
     body: Bytes,
 ) -> HandleOutcome {
     let connection = ConnectionState::default();
-    handle_connection_request(state, &connection, api_key, api_version, body).await
+    handle_connection_request(state, &connection, None, api_key, api_version, body).await
 }
 
 /// [`handle_request_bounded`] for one request of `connection`.
+///
+/// `principal` is `None` when SASL is off, or for a key the connection reached before
+/// authenticating - only `crate::server::route_frame` ever has a principal to pass.
 pub async fn handle_connection_request(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
-    dispatch(state, connection, api_key, api_version, body).await
+    dispatch(state, connection, principal, api_key, api_version, body).await
 }
 
 #[must_use]
