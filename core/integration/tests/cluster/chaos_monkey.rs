@@ -15,83 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Chaos monkey for a five-node cluster.
+//! Runs producers and consumers against five nodes while killing and restarting
+//! one random node at a time. This is an opt-in test that takes several minutes.
 //!
-//! Possible gaps in `iggy-server` that a run can hit, or that limit what it
-//! can check:
+//! # What it checks
 //!
-//! - A restarted node can keep committed messages only in memory. During its
-//!   rejoin, live consumer offset stores land in the journal between repaired
-//!   ops. `PartitionJournal::committed_prefix` walks the journal in append
-//!   order and stops at the first op out of sequence, so on an idle partition
-//!   the rest stays in memory. The shutdown flush runs one pass and reports
-//!   success, and the byte compare then fails on that node. Seen in one of two
-//!   runs with seed 99, 180 s, a 14 s interval and a 10 s downtime, and in
-//!   none of eight runs at the defaults.
-//! - Under `replicated` durability a restarted node repairs every partition
-//!   log from op 1, and a backup with a gap drops live prepares. Until its
-//!   repair ends, the node does not count toward the write quorum, so two
-//!   nodes in repair and one killed node stop a partition from committing.
-//!   Under heavy disk load this stalled partitions for over a minute.
-//! - A poll without auto-commit reads the applied state of the node that the
-//!   client is connected to and does not wait for the commit of the
-//!   consumer's own offset store. A `next` poll right after an acknowledged
-//!   store can start at or below the stored offset. The test cannot tell that
-//!   from a lost stored offset, so it counts such reads as redeliveries and
-//!   checks stored offsets only at the end.
-//! - The HTTP API reads every consumer in an offset call as a standalone one.
-//!   A group offset read over HTTP returns the offset of a standalone consumer
-//!   with the same identifier, usually none, without an error, so the test
-//!   reads group offsets over TCP.
-//! - The server acknowledges a committed send without an offset confirmation
-//!   when it cannot resolve the batch's offsets from its journal, and when it
-//!   absorbs a retried duplicate. The test cannot check where such a batch
-//!   landed, and it fails only when a producer gets no confirmation at all.
-//! - After crashes, restarts and network faults, metadata replicas in the
-//!   simulator commit different ops at one log position, for example with
-//!   `workload-fuzz --seed 62 --plane metadata --faults swarm --crash-prob 0.01
-//!   --restart-prob 0.05 --crash-primary`. One traced path: a recovering
-//!   replica adopts a `StartView` probe answer without canonical headers and
-//!   commits an op from a discarded view. This test has not hit it.
+//! Producers put their identity and sequence number in each message id. The
+//! test checks acknowledged messages against those ids, their payloads and
+//! their order. Consumer group members join and leave during the run, while
+//! standalone consumers also read and commit offsets.
 //!
-//! One random node gets SIGKILL every kill interval and comes back after the
-//! downtime with its data directory intact. Meanwhile producers send,
-//! low-level group members join, poll, commit and leave, and one
-//! `IggyConsumer` stays in the same group. Next to the group, one low-level
-//! consumer per partition and one standalone `IggyConsumer` read with stored
-//! offsets of their own. The downtime is shorter than the interval, so at
-//! most one node is down at a time and the cluster stays inside its fault
-//! budget.
+//! The main topic uses small segments and expires old messages. A second topic
+//! keeps its full history so the final checks can cover sealed segments too.
+//! Both use the default `replicated` durability. After the kills stop, readers
+//! drain their partitions. The test compares each node's messages, stored
+//! offsets and group membership. It then stops every node and, if the online
+//! checks passed, compares the persisted segment files byte for byte.
 //!
-//! Segments are as small as the server allows and expire soon after they
-//! fill, and every node runs its segment cleaner every second, so segments
-//! rotate and get deleted under the kills. The server never deletes past the
-//! lowest stored offset, so every reader must still receive every
-//! acknowledged message. What the readers received, together with what the
-//! nodes retain at the end, forms the observed log that the checks run on.
+//! Missing, corrupt, reordered, phantom or unexplained duplicate messages fail
+//! the test. So do partial batches, incorrect offset confirmations, missed
+//! deliveries, conflicting reads or group assignments, unexpected node exits
+//! or task panics, and replicas that disagree. Expiry must actually delete
+//! segments during the run. A short run that never exercises expiry fails.
 //!
-//! Expiry leaves each partition only its active segment at the end, so a
-//! second topic without expiry keeps the whole history. It has its own
-//! producers and no readers, so only the final read sees it, and the
-//! cross-node checks and the byte compare cover every sealed segment it
-//! holds. Both topics keep the default `replicated` durability for messages
-//! and for consumer offsets.
+//! # Running it
 //!
-//! When the chaos phase ends, the producers stop, and every reader drains and
-//! commits the end of its partitions. Every node is then read over HTTP,
-//! whose default `serializable` reads come from the node's own state, so the
-//! nodes can be compared with each other. The test fails on a lost,
-//! reordered, corrupted, phantom or unexplained duplicate message, a batch
-//! that landed only in part, an acknowledgement that points at the wrong
-//! offset, an acknowledged message a reader never received, two reads of one
-//! offset that disagree, two members holding one partition, a client error
-//! that means lost state, a node that died or panicked on its own, an expired
-//! segment that was not deleted, a run in which expiry deleted nothing, and
-//! nodes that disagree. At the end the cluster stops and every segment file
-//! is compared byte for byte across the nodes.
-//!
-//! The run is opt-in. Build the server first, because the harness runs the
-//! prebuilt binary. `--no-capture` prints each kill and restart live:
+//! Build the server first. The test starts the binary already in `target/`.
 //!
 //! ```text
 //! cargo build --bin iggy-server
@@ -100,31 +49,103 @@
 //!     cargo nextest run -p integration --run-ignored only --no-capture -E 'test(chaos_monkey)'
 //! ```
 //!
-//! The knobs carry the `IGGY_TEST_` prefix. The harness forwards every
-//! `IGGY_*` variable to the servers, and a debug server refuses to boot on an
-//! unknown one unless the server ignores its prefix.
+//! Duration, kill interval and downtime default to 120, 15 and 5 seconds.
+//! Without `IGGY_TEST_CHAOS_SEED`, each run chooses and prints a random seed.
+//! Downtime must be shorter than the kill interval, and the duration must
+//! allow at least one kill and restart. These are chaos-phase durations;
+//! startup, draining and verification take additional time.
+//!
+//! The seed repeats random choices, not thread scheduling, disk latency or
+//! recovery progress. A failure is still a failed invariant, not an expected
+//! consequence of choosing a random workload. To investigate a run-order
+//! effect, repeat the same configurations alone and in both orders, using the
+//! same server binary. Compare actual fault times and retained message ranges.
+//!
+//! # Reports and logs
+//!
+//! The printed artifact directory under `test_logs/` is retained on success
+//! and failure. Remove it when the investigation is done; it includes server
+//! data as well as logs. `chaos.jsonl` contains one JSON object per line:
+//! metadata, phase changes, fault events, node views, retained message ranges,
+//! counters, check results and the final verdict. Metadata includes the server
+//! binary's SHA-256, host details and workload settings. Each node record points
+//! to its saved effective configuration.
+//!
+//! Events are written as they happen. A report without a `finished` event is
+//! incomplete, for example after a timeout or forced termination. A `panicked`
+//! verdict records an interrupted check, not a successful run. The final disk
+//! comparison is explicitly skipped when the online checks fail.
+//!
+//! Current captures are `server_<id>_stdout.log` and `server_<id>_stderr.log`.
+//! Earlier captures are saved in `server_<id>_incarnation_<n>/` before each
+//! restart, including startup retries. This test captures logs even when
+//! `IGGY_TEST_VERBOSE` is set, and prints only short failure excerpts.
+//! Client logs and the test's panic text are saved in `test_stdout.log`.
+//!
+//! # Observed failures and check limitations
+//!
+//! These are investigation notes, not reasons to accept a failing run:
+//!
+//! - Earlier runs found a rejoining node with committed messages still only
+//!   in memory and different segment files after shutdown. The shutdown path
+//!   has since changed, so that diagnosis needs rechecking. The stress case
+//!   used seed 99, 180 seconds, a 14-second kill interval and 10-second downtime.
+//!   That configuration does not fail on every run.
+//! - Under `replicated` durability, a restarted node repairs partition logs
+//!   from op 1. Repairing replicas can stop contributing to the write quorum.
+//!   Heavy disk load has stalled partitions for over a minute.
+//! - A `next` poll can observe a node before an acknowledged offset store has
+//!   been applied there. The test counts these reads as redeliveries and checks
+//!   stored offsets at the end; it cannot distinguish them from a lost store
+//!   during the workload.
+//! - HTTP group-offset reads currently resolve a standalone consumer instead.
+//!   The test reads group offsets over TCP.
+//! - A committed send or retried duplicate can be acknowledged without offset
+//!   confirmation. The test checks the batch's messages but cannot verify its
+//!   acknowledged placement. It fails if a producer gets no confirmations.
+//! - Metadata log divergence has been observed separately in the simulator
+//!   with `workload-fuzz --seed 62 --plane metadata --faults swarm --crash-prob
+//!   0.01 --restart-prob 0.05 --crash-primary`. One traced path adopts a
+//!   `StartView` probe without canonical headers and commits a discarded-view
+//!   operation. This real-process test has not established that failure path.
+//!
+//! The `IGGY_TEST_` variables are test controls. They are forwarded to child
+//! processes, whose environment validation permits that prefix.
 
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::fmt;
+use std::fs::File;
 use std::future::Future;
+use std::io::Read;
 use std::ops::RangeInclusive;
+use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use assert_cmd::cargo::CommandCargoExt;
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
 use integration::harness::{
     TestBinary, TestBinaryError, TestHarness, TestServerConfig, disk, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use ring::digest::{Context, SHA256};
+use serde::Serialize;
+use serde_json::json;
 use serial_test::parallel;
+use sysinfo::System;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
+
+use self::report::Report;
+
+mod report;
 
 const CLUSTER_NODES: usize = 5;
 const STREAM_NAME: &str = "chaos-stream";
@@ -197,6 +218,8 @@ const VERIFIER_CONSUMER_ID: u32 = 1;
 const VERIFY_BATCH: u32 = 1_000;
 const STDERR_TAIL_LINES: usize = 20;
 const REPORTED_EXAMPLES: usize = 5;
+const FAILURE_SUMMARY_CHARS: usize = 240;
+const DIGEST_BUFFER_SIZE: usize = 64 * 1024;
 
 type SharedLog = Arc<Mutex<ObservedLog>>;
 
@@ -204,38 +227,144 @@ type SharedLog = Arc<Mutex<ObservedLog>>;
 #[parallel]
 #[ignore = "runs for minutes against a five-node cluster; run with --run-ignored only"]
 async fn given_five_nodes_when_one_is_killed_every_interval_should_keep_acked_messages() {
+    crate::use_saved_logs_on_failure();
     let config = ChaosConfig::from_env();
-    // Printed first, so even a hung run says how to replay its schedule.
-    println!("{config}");
+    let mut harness = build_cluster();
+    let mut report =
+        Report::create(harness.test_dir(), Instant::now()).expect("create chaos report");
+    println!("{config}\nartifacts: {}", harness.test_dir().display());
+    report
+        .record("started", json!({"command_env": config.to_string()}))
+        .expect("write run start");
 
-    let mut harness = start_cluster().await;
-    create_topic_and_group(&harness).await;
+    let result = AssertUnwindSafe(run_chaos(&mut harness, &config, &mut report))
+        .catch_unwind()
+        .await;
+    let violations = match result {
+        Ok(violations) => violations,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            if let Err(error) =
+                report.record("finished", json!({"outcome": "panicked", "error": message}))
+            {
+                eprintln!(
+                    "cannot record panic in {}: {error}",
+                    report.path().display()
+                );
+            }
+            resume_unwind(payload);
+        }
+    };
+    report
+        .record(
+            "finished",
+            json!({
+                "outcome": if violations.is_empty() { "passed" } else { "failed" },
+                "violations": violations,
+            }),
+        )
+        .expect("write final verdict");
+    let examples = violations
+        .iter()
+        .take(REPORTED_EXAMPLES)
+        .map(|violation| {
+            violation
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(FAILURE_SUMMARY_CHARS)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        violations.is_empty(),
+        "{} violations:\n{examples}\nreport: {}",
+        violations.len(),
+        report.path().display()
+    );
+    println!("all checks passed; report: {}", report.path().display());
+}
+
+async fn run_chaos(
+    harness: &mut TestHarness,
+    config: &ChaosConfig,
+    report: &mut Report,
+) -> Vec<String> {
+    report
+        .record("metadata", run_metadata(config))
+        .expect("write run metadata");
+    harness.start().await.expect("start the cluster");
+    report_nodes(harness, report, "cluster_started");
+    create_topic_and_group(harness).await;
 
     let started = Instant::now();
-    let workload = Workload::spawn(&harness, config.seed, started).await;
+    report
+        .record("phase", json!({"name": "chaos"}))
+        .expect("write chaos phase");
+    let workload = Workload::spawn(harness, config.seed, started).await;
     let mut violations = Vec::new();
     // Kill and restart block the calling thread for seconds. The multi-thread
     // runtime keeps the workload running on its worker threads meanwhile.
-    let kills = run_monkey(&mut harness, &config, started, &mut violations).await;
+    let kills = run_monkey(harness, config, started, &mut violations, report).await;
+    report
+        .record("phase", json!({"name": "drain"}))
+        .expect("write drain phase");
     let mut outcomes = workload.finish().await;
     outcomes.check(&mut violations);
+    report
+        .record(
+            "check",
+            json!({
+                "name": "workload",
+                "outcome": if violations.is_empty() { "passed" } else { "failed" },
+                "violations": violations,
+            }),
+        )
+        .expect("write workload check");
 
-    let verifiers = connect_verifiers(&harness, &mut violations).await;
-    let view = wait_for_convergence(&verifiers, &outcomes.readers, started, &mut violations).await;
-    let stats = verify_logs(&verifiers, view.as_ref(), &mut outcomes, &mut violations).await;
+    report
+        .record("phase", json!({"name": "verify"}))
+        .expect("write verification phase");
+    let verifiers = connect_verifiers(harness, &mut violations).await;
+    let view = wait_for_convergence(
+        &verifiers,
+        &outcomes.readers,
+        started,
+        &mut violations,
+        report,
+    )
+    .await;
+    let stats = verify_logs(
+        &verifiers,
+        view.as_ref(),
+        &mut outcomes,
+        &mut violations,
+        report,
+    )
+    .await;
     for node in 0..CLUSTER_NODES {
-        if let Some(stderr) = panic_report(&harness, node) {
+        if let Some(stderr) = panic_report(harness, node) {
             violations.push(format!("node {node} panicked:\n{stderr}"));
         }
     }
 
-    print_report(&config, &kills, &outcomes, view.as_ref(), &stats);
-    assert!(
-        violations.is_empty(),
-        "{} violations, replay with {config}:\n{}",
-        violations.len(),
-        violations.join("\n")
-    );
+    record_summary(report, &kills, &outcomes, view.as_ref(), &stats);
+    report
+        .record(
+            "check",
+            json!({
+                "name": "online",
+                "outcome": if violations.is_empty() { "passed" } else { "failed" },
+                "violations": violations,
+            }),
+        )
+        .expect("write online checks");
 
     // A graceful stop flushes what each node still holds in memory, so the
     // segment files can be compared byte for byte at rest.
@@ -244,11 +373,52 @@ async fn given_five_nodes_when_one_is_killed_every_interval_should_keep_acked_me
         .iter()
         .map(|server| server.data_path())
         .collect();
+    report
+        .record("phase", json!({"name": "stop"}))
+        .expect("write stop phase");
     harness
         .stop()
         .await
         .expect("stop the cluster for the at-rest comparison");
-    disk::assert_replica_data_identical(&data_paths, false);
+    report_nodes(harness, report, "cluster_stopped");
+    for node in 0..CLUSTER_NODES {
+        if let Some(stderr) = panic_report(harness, node) {
+            let violation = format!("node {node} panicked:\n{stderr}");
+            if !violations.contains(&violation) {
+                violations.push(violation);
+            }
+        }
+    }
+    if !violations.is_empty() {
+        report
+            .record(
+                "check",
+                json!({
+                    "name": "replica_files",
+                    "outcome": "skipped",
+                    "reason": "online or shutdown checks failed",
+                }),
+            )
+            .expect("write skipped disk check");
+        return violations;
+    }
+    report
+        .record("phase", json!({"name": "replica_files"}))
+        .expect("write disk comparison phase");
+    let comparison = disk::compare_replica_data(&data_paths, false);
+    report
+        .record(
+            "check",
+            json!({
+                "name": "replica_files",
+                "outcome": if comparison.problems.is_empty() { "passed" } else { "failed" },
+                "files": comparison.files,
+                "violations": comparison.problems,
+            }),
+        )
+        .expect("write disk comparison result");
+    violations.extend(comparison.problems);
+    violations
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -306,7 +476,7 @@ where
     )
 }
 
-async fn start_cluster() -> TestHarness {
+fn build_cluster() -> TestHarness {
     let overrides = HashMap::from([
         (
             "consumer_group.heartbeat_interval".to_owned(),
@@ -322,13 +492,18 @@ async fn start_cluster() -> TestHarness {
         ),
     ]);
     let extra_envs = resolve_config_paths(&overrides).expect("valid server config paths");
-    let mut harness = TestHarness::builder()
-        .server(TestServerConfig::builder().extra_envs(extra_envs).build())
+    TestHarness::builder()
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(extra_envs)
+                .preserve_logs_on_restart(true)
+                .dump_logs_on_failure(false)
+                .build(),
+        )
         .cluster_nodes(CLUSTER_NODES)
+        .cleanup(false)
         .build()
-        .expect("build the harness");
-    harness.start().await.expect("start the cluster");
-    harness
+        .expect("build the harness")
 }
 
 async fn create_topic_and_group(harness: &TestHarness) {
@@ -1379,18 +1554,34 @@ async fn run_monkey(
     config: &ChaosConfig,
     started: Instant,
     violations: &mut Vec<String>,
+    report: &mut Report,
 ) -> KillStats {
     let mut rng = StdRng::seed_from_u64(config.seed);
     let chaos_end = started + config.duration;
     let mut stats = KillStats::default();
     let mut next_kill = started + config.kill_interval;
     while next_kill + config.downtime <= chaos_end {
-        if !watch_nodes(harness, next_kill, None, started, violations).await {
+        if !watch_nodes(harness, next_kill, None, started, violations, report).await {
             return stats;
         }
         let victim = rng.random_range(0..CLUSTER_NODES);
         let leader = leader_seen_by(harness, victim).await;
+        let pid = harness.node(victim).pid();
+        report
+            .record(
+                "kill_requested",
+                json!({
+                    "node": victim, "pid": pid,
+                    "scheduled_elapsed_ms": next_kill.duration_since(started).as_millis(),
+                    "chaos_elapsed_ms": started.elapsed().as_millis(),
+                    "leader": leader.as_ref().ok(), "leader_error": leader.as_ref().err(),
+                }),
+            )
+            .expect("write kill request");
         harness.kill_node(victim).expect("SIGKILL a node");
+        report
+            .record("killed", json!({"node": victim, "pid": pid}))
+            .expect("write kill result");
         stats.kills += 1;
         if leader == Ok(victim) {
             stats.leader_kills += 1;
@@ -1401,7 +1592,7 @@ async fn run_monkey(
             describe_leader(victim, &leader)
         );
         let back_at = Instant::now() + config.downtime;
-        if !watch_nodes(harness, back_at, Some(victim), started, violations).await {
+        if !watch_nodes(harness, back_at, Some(victim), started, violations, report).await {
             return stats;
         }
         // A panic before the kill shows only in this incarnation's stderr,
@@ -1413,7 +1604,7 @@ async fn run_monkey(
             ));
         }
         let restarting = Instant::now();
-        if !restart(harness, victim, started, violations) {
+        if !restart(harness, victim, started, violations, report) {
             return stats;
         }
         println!(
@@ -1423,7 +1614,7 @@ async fn run_monkey(
         );
         next_kill += config.kill_interval;
     }
-    watch_nodes(harness, chaos_end, None, started, violations).await;
+    watch_nodes(harness, chaos_end, None, started, violations, report).await;
     stats
 }
 
@@ -1436,6 +1627,7 @@ async fn watch_nodes(
     down: Option<usize>,
     started: Instant,
     violations: &mut Vec<String>,
+    report: &mut Report,
 ) -> bool {
     loop {
         for node in (0..CLUSTER_NODES).filter(|&node| Some(node) != down) {
@@ -1443,12 +1635,22 @@ async fn watch_nodes(
                 continue;
             }
             let (_, stderr) = harness.node(node).collect_logs();
+            report
+                .record(
+                    "unexpected_exit",
+                    json!({
+                        "node": node,
+                        "pid": harness.node(node).pid(),
+                        "stderr_tail": tail(&stderr),
+                    }),
+                )
+                .expect("write unexpected exit");
             violations.push(format!(
                 "{} node {node} exited without being killed:\n{}",
                 stamp(started),
                 tail(&stderr)
             ));
-            if !restart(harness, node, started, violations) {
+            if !restart(harness, node, started, violations, report) {
                 return false;
             }
         }
@@ -1465,10 +1667,28 @@ fn restart(
     node: usize,
     started: Instant,
     violations: &mut Vec<String>,
+    report: &mut Report,
 ) -> bool {
+    report
+        .record("restart_requested", json!({"node": node}))
+        .expect("write restart request");
     match harness.restart_node(node) {
-        Ok(()) => true,
+        Ok(()) => {
+            report
+                .record(
+                    "restarted",
+                    json!({"node": node, "pid": harness.node(node).pid()}),
+                )
+                .expect("write restart result");
+            true
+        }
         Err(error) => {
+            report
+                .record(
+                    "restart_failed",
+                    json!({"node": node, "error": error.to_string()}),
+                )
+                .expect("write restart failure");
             violations.push(format!(
                 "{} node {node} failed to restart: {error}",
                 stamp(started)
@@ -1548,7 +1768,7 @@ async fn connect_http(harness: &TestHarness, node: usize) -> Result<IggyClient, 
 }
 
 /// A node's own answer about the topic, the stored offsets and the group.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct NodeView {
     /// `None` when the node does not know the topic.
     partitions: Option<Vec<PartitionView>>,
@@ -1559,7 +1779,7 @@ struct NodeView {
     members: Option<Vec<(u32, Vec<u32>)>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct PartitionView {
     current_offset: u64,
     messages_count: u64,
@@ -1642,6 +1862,7 @@ async fn wait_for_convergence(
     readers: &[Arc<Reader>],
     started: Instant,
     violations: &mut Vec<String>,
+    report: &mut Report,
 ) -> Option<NodeView> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
@@ -1649,9 +1870,11 @@ async fn wait_for_convergence(
         for (node, verifier) in verifiers {
             views.push((*node, node_view(verifier, readers).await));
         }
-        let problems = end_state_problems(&views, readers);
+        let mut problems = end_state_problems(&views, readers);
         if problems.is_empty() {
-            println!("{} nodes converged", stamp(started));
+            if verifiers.len() == CLUSTER_NODES {
+                println!("{} nodes converged", stamp(started));
+            }
         } else if Instant::now() >= deadline {
             violations.push(format!(
                 "nodes did not reach the end state within {CONVERGENCE_TIMEOUT:?}:\n{}",
@@ -1661,6 +1884,36 @@ async fn wait_for_convergence(
             sleep(CONVERGENCE_RETRY).await;
             continue;
         }
+        if verifiers.len() != CLUSTER_NODES {
+            problems.push(format!(
+                "only {} of {CLUSTER_NODES} nodes have HTTP verifiers",
+                verifiers.len()
+            ));
+        }
+        for (node, view) in &views {
+            report
+                .record(
+                    "node_view",
+                    json!({
+                        "node": node,
+                        "view": view.as_ref().ok(),
+                        "error": view.as_ref().err().map(ToString::to_string),
+                    }),
+                )
+                .expect("write node view");
+        }
+        report
+            .record(
+                "check",
+                json!({
+                    "name": "convergence",
+                    "outcome": if problems.is_empty() { "passed" } else { "failed" },
+                    "nodes": verifiers.len(),
+                    "expected_nodes": CLUSTER_NODES,
+                    "violations": problems,
+                }),
+            )
+            .expect("write convergence result");
         return views.into_iter().find_map(|(_, view)| view.ok());
     }
 }
@@ -1785,6 +2038,7 @@ async fn verify_logs(
     view: Option<&NodeView>,
     outcomes: &mut Outcomes,
     violations: &mut Vec<String>,
+    report: &mut Report,
 ) -> [LogStats; 2] {
     let partitions = view.and_then(|view| view.partitions.as_deref());
     let history = view.and_then(|view| view.history.as_deref());
@@ -1794,6 +2048,7 @@ async fn verify_logs(
         partitions,
         &mut outcomes.log,
         violations,
+        report,
     )
     .await;
     read_retained(
@@ -1802,6 +2057,7 @@ async fn verify_logs(
         history,
         &mut outcomes.history_log,
         violations,
+        report,
     )
     .await;
     if let Some(partitions) = partitions
@@ -1841,6 +2097,7 @@ async fn read_retained(
     partitions: Option<&[PartitionView]>,
     log: &mut ObservedLog,
     violations: &mut Vec<String>,
+    report: &mut Report,
 ) {
     let topic = target.name;
     let mut reference = None;
@@ -1852,6 +2109,19 @@ async fn read_retained(
                 continue;
             }
         };
+        for (partition, entries) in retained.iter().enumerate() {
+            report
+                .record(
+                    "retained_range",
+                    json!({
+                        "node": node, "topic": topic, "partition": partition,
+                        "messages_count": entries.len(),
+                        "first_offset": entries.first().map(|entry| entry.offset),
+                        "last_offset": entries.last().map(|entry| entry.offset),
+                    }),
+                )
+                .expect("write retained range");
+        }
         match &reference {
             None => reference = Some(retained),
             Some(reference) => compare_logs(topic, *node, reference, &retained, violations),
@@ -2176,87 +2446,169 @@ fn stamp(started: Instant) -> String {
     format!("[{:>6.1}s]", started.elapsed().as_secs_f64())
 }
 
-fn print_report(
-    config: &ChaosConfig,
+fn record_summary(
+    report: &mut Report,
     kills: &KillStats,
     outcomes: &Outcomes,
     view: Option<&NodeView>,
     stats: &[LogStats],
 ) {
-    println!("{config}");
-    println!(
-        "{} kills, {} of them the leader",
-        kills.kills, kills.leader_kills
-    );
     let producers = [
         (TOPIC_NAME, &outcomes.producers),
         (HISTORY_TOPIC_NAME, &outcomes.history_producers),
     ];
     for (topic, producers) in producers {
         for producer in producers {
-            println!(
-                "producer {} -> {topic} partition {}: {} batches acked, {} retried, {} without \
-                 confirmation, longest wait {:.1}s, errors {:?}",
-                producer.producer,
-                producer.partition,
-                producer.acked_batches,
-                producer
-                    .attempts
-                    .iter()
-                    .filter(|&&batch_attempts| batch_attempts > 1)
-                    .count(),
-                producer
-                    .acked_batches
-                    .saturating_sub(producer.confirmations.len() as u64),
-                producer.longest_wait.as_secs_f64(),
-                producer.errors.counts
-            );
+            report
+                .record(
+                    "producer",
+                    json!({
+                        "topic": topic,
+                        "producer": producer.producer,
+                        "partition": producer.partition,
+                        "acked_batches": producer.acked_batches,
+                        "retried_batches": producer
+                            .attempts
+                            .iter()
+                            .filter(|&&batch_attempts| batch_attempts > 1)
+                            .count(),
+                        "unconfirmed_batches": producer
+                            .acked_batches
+                            .saturating_sub(producer.confirmations.len() as u64),
+                        "longest_wait_secs": producer.longest_wait.as_secs_f64(),
+                        "errors": producer.errors.counts,
+                    }),
+                )
+                .expect("write producer outcome");
         }
     }
     for consumer in &outcomes.consumers {
-        let churn = consumer.churn.as_ref().map_or_else(String::new, |churn| {
-            format!(", {} joins, {} leaves", churn.joins, churn.leaves)
-        });
-        println!(
-            "{}: {} deliveries{churn}, errors {:?}",
-            consumer.name, consumer.deliveries, consumer.errors.counts
-        );
+        report
+            .record(
+                "consumer",
+                json!({
+                    "name": consumer.name,
+                    "deliveries": consumer.deliveries,
+                    "joins": consumer.churn.as_ref().map(|churn| churn.joins),
+                    "leaves": consumer.churn.as_ref().map(|churn| churn.leaves),
+                    "errors": consumer.errors.counts,
+                }),
+            )
+            .expect("write consumer outcome");
     }
-    println!(
-        "group samples: {} read, errors {:?}",
-        outcomes.sampler.samples, outcomes.sampler.errors.counts
-    );
     for reader in &outcomes.readers {
         let received = reader.received.lock().expect("received ids lock");
-        println!(
-            "{}: {} messages received, {} redelivered",
-            reader.name,
-            received.ids.len(),
-            received.deliveries - received.ids.len()
-        );
+        report
+            .record(
+                "reader",
+                json!({
+                    "name": reader.name,
+                    "received": received.ids.len(),
+                    "redelivered": received.deliveries - received.ids.len(),
+                }),
+            )
+            .expect("write reader outcome");
     }
     for stats in stats {
-        println!(
-            "{} log: {} messages, {} duplicates",
-            stats.topic, stats.messages, stats.duplicates
-        );
+        report
+            .record(
+                "log",
+                json!({
+                    "topic": stats.topic,
+                    "messages": stats.messages,
+                    "duplicates": stats.duplicates,
+                }),
+            )
+            .expect("write log outcome");
     }
-    let partitions = view
-        .and_then(|view| view.partitions.as_deref())
-        .unwrap_or_default();
-    let history = view
-        .and_then(|view| view.history.as_deref())
-        .unwrap_or_default();
-    for (partition, view) in (0u32..).zip(partitions) {
-        println!(
-            "{TOPIC_NAME} partition {partition}: {} messages left after expiry, up to offset {}",
-            view.messages_count, view.current_offset
-        );
+    report
+        .record(
+            "summary",
+            json!({
+                "kills": kills.kills, "leader_kills": kills.leader_kills,
+                "group_samples": outcomes.sampler.samples,
+                "group_sample_errors": outcomes.sampler.errors.counts,
+                "view": view,
+            }),
+        )
+        .expect("write run summary");
+}
+
+fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
+    let mut system = System::new();
+    system.refresh_all();
+    let recorded_unix_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis();
+    json!({
+        "recorded_unix_ms": recorded_unix_ms,
+        "seed": config.seed,
+        "duration_secs": config.duration.as_secs(),
+        "kill_interval_secs": config.kill_interval.as_secs(),
+        "downtime_secs": config.downtime.as_secs(),
+        "command_env": config.to_string(),
+        "workload": {
+            "nodes": CLUSTER_NODES, "partitions": PARTITIONS,
+            "producers": PRODUCERS, "history_producers": HISTORY_PRODUCERS,
+            "group_members": GROUP_MEMBERS,
+            "segment_size_bytes": SEGMENT_SIZE_BYTES,
+            "message_expiry_secs": MESSAGE_EXPIRY.as_secs(),
+            "producer_batch": PRODUCER_BATCH,
+            "producer_pause_ms": PRODUCER_PAUSE.as_millis(),
+            "heartbeat_interval": GROUP_HEARTBEAT_INTERVAL,
+            "session_timeout": GROUP_SESSION_TIMEOUT,
+            "cleaner_interval": CLEANER_INTERVAL,
+        },
+        "host": {
+            "os": System::name(), "os_version": System::os_version(),
+            "kernel": System::kernel_version(), "arch": std::env::consts::ARCH,
+            "cpu": system.cpus().first().map(|cpu| cpu.brand()),
+            "logical_cpus": system.cpus().len(),
+            "available_parallelism": std::thread::available_parallelism().ok().map(|count| count.get()),
+            "total_memory_bytes": system.total_memory(),
+            "available_memory_bytes": system.available_memory(),
+        },
+        "server_binary": server_binary_metadata(),
+    })
+}
+
+fn server_binary_metadata() -> serde_json::Value {
+    let command = Command::cargo_bin("iggy-server").expect("locate the prebuilt server");
+    let path = PathBuf::from(command.get_program());
+    let fingerprint = || -> std::io::Result<String> {
+        let mut file = File::open(&path)?;
+        let mut digest = Context::new(&SHA256);
+        let mut buffer = [0; DIGEST_BUFFER_SIZE];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(hex::encode(digest.finish().as_ref()))
+    };
+    match fingerprint() {
+        Ok(sha256) => json!({"path": path, "sha256": sha256}),
+        Err(error) => json!({"path": path, "error": error.to_string()}),
     }
-    for (partition, view) in (0u32..).zip(history) {
-        println!(
-            "{HISTORY_TOPIC_NAME} partition {partition}: {} messages in {} segments",
-            view.messages_count, view.segments_count
-        );
+}
+
+fn report_nodes(harness: &TestHarness, report: &mut Report, event: &str) {
+    for (node, server) in harness.all_servers().iter().enumerate() {
+        let data_path = server.data_path();
+        report
+            .record(
+                event,
+                json!({
+                    "node": node, "pid": server.pid(), "running": server.is_running(),
+                    "data_path": data_path,
+                    "effective_config_path": data_path.join("runtime/current_config.toml"),
+                    "tcp_addr": server.tcp_addr().map(|address| address.to_string()),
+                    "http_addr": server.http_addr().map(|address| address.to_string()),
+                }),
+            )
+            .expect("write node state");
     }
 }
