@@ -34,6 +34,7 @@ pub struct DurableOffsetState {
 pub struct DurableConsumerOffsets {
     consumers: RefCell<HashMap<u32, DurableOffsetState>>,
     groups: RefCell<HashMap<u32, DurableOffsetState>>,
+    external_groups: RefCell<HashMap<u32, DurableOffsetState>>,
     membership_epoch: Cell<u64>,
 }
 
@@ -116,6 +117,7 @@ impl DurableConsumerOffsets {
     pub(crate) fn clear(&self) {
         self.consumers.borrow_mut().clear();
         self.groups.borrow_mut().clear();
+        self.external_groups.borrow_mut().clear();
         self.bump_membership_epoch();
     }
 
@@ -140,6 +142,7 @@ impl DurableConsumerOffsets {
         match kind {
             ConsumerKind::Consumer => &self.consumers,
             ConsumerKind::ConsumerGroup => &self.groups,
+            ConsumerKind::ExternalGroup => &self.external_groups,
         }
     }
 
@@ -306,10 +309,8 @@ impl ConsumerOffsetCapacity {
                 .is_some_and(|token| token.active_count() > 0)
     }
 
-    /// Assigns the pending count outright while [`Self::release_reservation`]
-    /// decrements it. Both take `&self` and neither locks: they are serialized
-    /// by their call sites, which all run under the partition's `&mut self` on
-    /// its own shard thread.
+    /// Assign the pending count under the partition's exclusive shard-local
+    /// ownership. Callers derive it from the remaining admitted operations.
     pub(crate) fn set_pending_count(&self, id: u32, count: usize) {
         if count == 0 {
             if self.pending.borrow_mut().remove(&id).is_some() {
@@ -320,18 +321,8 @@ impl ConsumerOffsetCapacity {
         }
     }
 
-    /// See [`Self::set_pending_count`] for the serialization contract.
-    pub(crate) fn release_reservation(&self, id: u32) {
-        let mut pending = self.pending.borrow_mut();
-        let Some(count) = pending.get_mut(&id) else {
-            return;
-        };
-        if *count == 1 {
-            pending.remove(&id);
-            self.note_local_key_change();
-        } else {
-            *count -= 1;
-        }
+    pub(crate) fn has_pending(&self, id: u32) -> bool {
+        self.pending.borrow().contains_key(&id)
     }
 
     pub(crate) const fn is_uncertain(&self) -> bool {
@@ -378,6 +369,10 @@ impl ConsumerOffsetCapacity {
     /// zero. Exported as a gauge so that refusal has a signal.
     pub(crate) fn stranded_count(&self) -> usize {
         self.stranded.borrow().len()
+    }
+
+    pub(crate) fn extend_stranded_ids(&self, ids: &mut HashSet<u32>) {
+        ids.extend(self.stranded.borrow().iter().copied());
     }
 
     pub(crate) fn rearm_if_below_limit(&self, durable: &DurableConsumerOffsets) {
@@ -608,12 +603,12 @@ mod tests {
         assert_eq!(capacity.try_reserve(7, &durable), Ok(()));
         assert_eq!(capacity.try_reserve(7, &durable), Ok(()));
         assert!(capacity.try_reserve(8, &durable).is_err());
-        capacity.release_reservation(7);
+        capacity.set_pending_count(7, 1);
         assert!(
             capacity.try_reserve(8, &durable).is_err(),
             "one of two reservations still owns the slot"
         );
-        capacity.release_reservation(7);
+        capacity.set_pending_count(7, 0);
         assert!(
             capacity.try_reserve(8, &durable).is_ok(),
             "the slot is released after the last reservation"

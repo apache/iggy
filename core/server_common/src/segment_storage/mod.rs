@@ -79,7 +79,7 @@ impl SegmentStorage {
                     .len()
                     == 0
             {
-                preallocate_file(&messages_file, Path::new(messages_path), size);
+                preallocate_file(&messages_file, Path::new(messages_path), size).await;
                 changed = true;
             }
             if changed {

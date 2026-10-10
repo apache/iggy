@@ -72,10 +72,12 @@ async fn apply_benchmark(
                     target_benchmark,
                 ))));
         }
-        Err(error) => log!(format!(
-            "AppContent: fetch benchmark {} failed: {}",
-            uuid, error
-        )),
+        Err(error) => {
+            log!(format!(
+                "AppContent: fetch benchmark {} failed: {}",
+                uuid, error
+            ));
+        }
     }
 }
 
@@ -185,10 +187,12 @@ pub fn app_content() -> Html {
                                     ))));
                                 }
                             }
-                            Err(error) => log!(format!(
-                                "AppContent: fetch right benchmark {} failed: {}",
-                                right_uuid, error
-                            )),
+                            Err(error) => {
+                                log!(format!(
+                                    "AppContent: fetch right benchmark {} failed: {}",
+                                    right_uuid, error
+                                ));
+                            }
                         }
                         if is_current() {
                             is_loading_handle.set(false);
@@ -308,7 +312,9 @@ fn use_init_hardware(
                             }
                         }
                     }
-                    Err(error) => log!(format!("Error fetching hardware: {}", error)),
+                    Err(error) => {
+                        log!(format!("Error fetching hardware: {}", error));
+                    }
                 }
             });
             || ()
@@ -371,7 +377,9 @@ fn use_load_gitrefs(
                                     .emit(GitrefAction::SetSelectedGitref(Some(final_gitref)));
                             }
                         }
-                        Err(error) => log!(format!("Error fetching gitrefs: {}", error)),
+                        Err(error) => {
+                            log!(format!("Error fetching gitrefs: {}", error));
+                        }
                     }
                 });
             }

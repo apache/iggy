@@ -53,9 +53,9 @@ use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
-    UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
 };
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::*;
 use iggy_binary_protocol::responses::clients::{
     ClientDetailsResponse, ClientResponse, ConsumerGroupInfoResponse, GetClientsResponse,
@@ -404,13 +404,6 @@ fn main() {
     add(&mut vectors, "request.get_streams", &GetStreamsRequest);
     add(
         &mut vectors,
-        "request.purge_stream",
-        &PurgeStreamRequest {
-            stream_id: numeric(1),
-        },
-    );
-    add(
-        &mut vectors,
         "request.update_stream",
         &UpdateStreamRequest {
             stream_id: named("old-name"),
@@ -449,14 +442,6 @@ fn main() {
         "request.get_topics",
         &GetTopicsRequest {
             stream_id: numeric(42),
-        },
-    );
-    add(
-        &mut vectors,
-        "request.purge_topic",
-        &PurgeTopicRequest {
-            stream_id: numeric(1),
-            topic_id: numeric(3),
         },
     );
     add(
@@ -720,6 +705,7 @@ fn main() {
             username: name("iggy"),
             password: SecretString::from("iggy"),
             client_context: None,
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );
     add(
@@ -729,6 +715,20 @@ fn main() {
             version_info: version_info(),
             token: SecretString::from("pat-abc123def456"),
             client_context: None,
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
+        },
+    );
+    add(
+        &mut vectors,
+        "request.bind_session",
+        &BindSessionRequest {
+            version_info: version_info(),
+            identity: SessionIdentity {
+                client_id: 1,
+                session: 100,
+                metadata_watermark: 120,
+            },
+            bind_secret: BindSecret::new(Box::new([0x5a; 32])),
         },
     );
     add(&mut vectors, "request.logout_user", &LogoutUserRequest);

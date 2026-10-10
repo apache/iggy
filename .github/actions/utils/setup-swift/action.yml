@@ -18,10 +18,6 @@
 name: setup-swift
 description: Install the Swift toolchain and cache the SwiftPM dependency checkouts and build products
 inputs:
-  swift-version:
-    description: "Swift toolchain version to install"
-    required: false
-    default: "6.1"
   cache-key:
     description: "Cache key segment naming the package that builds in the job; one constant per package so every lane shares one cache"
     required: false
@@ -30,10 +26,51 @@ inputs:
 runs:
   using: "composite"
   steps:
+    # swift-actions/setup-swift rejects Ubuntu 26.04, so the toolchain comes
+    # straight from swift.org. The checksum belongs to a tarball whose .sig
+    # verified against the Swift 6.x release key 52BB7E3DE28A71BE22EC05FFEF80A866B47A981F.
+    # Bump the version, platform and checksum together.
     - name: Install Swift
-      uses: swift-actions/setup-swift@v2
-      with:
-        swift-version: ${{ inputs.swift-version }}
+      id: swift
+      shell: bash
+      env:
+        SWIFT_VERSION: "6.4.0"
+        SWIFT_PLATFORM: ubuntu26.04
+        SWIFT_SHA256: c966d52a195724238fcc082afefac8f274dff1f30cf2ace5f93ec684c17b0026
+      run: |
+        # Same packages as the official swift:6.4 Ubuntu 26.04 image.
+        ./scripts/ci/apt-install.sh \
+          binutils \
+          binutils-gold \
+          git \
+          unzip \
+          gnupg2 \
+          libc6-dev \
+          libcurl4-openssl-dev \
+          libedit2 \
+          libgcc-15-dev \
+          libpython3-dev \
+          libsqlite3-0 \
+          libstdc++-15-dev \
+          libxml2-dev \
+          libncurses5-dev \
+          libz3-dev \
+          pkg-config \
+          tzdata \
+          zlib1g-dev
+
+        release="swift-${SWIFT_VERSION}-RELEASE"
+        tarball="${RUNNER_TEMP}/${release}.tar.gz"
+        curl -fsSL --retry 5 --retry-all-errors -o "${tarball}" \
+          "https://download.swift.org/swift-${SWIFT_VERSION}-release/${SWIFT_PLATFORM//./}/${release}/${release}-${SWIFT_PLATFORM}.tar.gz"
+        echo "${SWIFT_SHA256}  ${tarball}" | sha256sum -c -
+
+        install_dir="${RUNNER_TEMP}/swift"
+        mkdir -p "${install_dir}"
+        tar -xzf "${tarball}" -C "${install_dir}" --strip-components=1
+        rm -f "${tarball}"
+        echo "${install_dir}/usr/bin" >> "$GITHUB_PATH"
+        echo "version=${SWIFT_VERSION}" >> "$GITHUB_OUTPUT"
 
     - name: Print Swift version
       shell: bash
@@ -51,6 +88,6 @@ runs:
           foreign/swift/.build/artifacts
           foreign/swift/.build/debug
           foreign/swift/.build/release
-        key: swiftpm-${{ runner.os }}-${{ inputs.swift-version }}-${{ inputs.cache-key }}-${{ hashFiles('foreign/swift/Package.resolved') }}
+        key: swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-${{ hashFiles('foreign/swift/Package.resolved') }}
         restore-keys: |
-          swiftpm-${{ runner.os }}-${{ inputs.swift-version }}-${{ inputs.cache-key }}-
+          swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-

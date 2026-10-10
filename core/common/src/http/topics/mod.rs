@@ -17,7 +17,6 @@
 
 pub mod create_topic;
 pub mod delete_topic;
-pub mod purge_topic;
 pub mod update_topic;
 
 use crate::{MAX_NAME_LENGTH, MAX_PARTITIONS_COUNT};

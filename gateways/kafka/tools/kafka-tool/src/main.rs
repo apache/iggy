@@ -29,6 +29,7 @@ use kafka_protocol::messages::join_group_request::*;
 use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
 use kafka_protocol::messages::offset_commit_request::*;
+use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestGroup;
 use kafka_protocol::messages::produce_request::*;
 use kafka_protocol::messages::txn_offset_commit_request::*;
 use kafka_protocol::messages::*;
@@ -360,10 +361,16 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("OffsetCommit")?;
         }
         9 => {
-            OffsetFetchRequest::default()
-                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
-                .encode(&mut buf, version)
-                .context("OffsetFetch")?;
+            let group = GroupId::from(StrBytes::from_static_str("test-group"));
+            // v8 moved the group into `groups`, and the encoder refuses the top-level id there.
+            let request = if version >= 8 {
+                OffsetFetchRequest::default().with_groups(vec![
+                    OffsetFetchRequestGroup::default().with_group_id(group),
+                ])
+            } else {
+                OffsetFetchRequest::default().with_group_id(group)
+            };
+            request.encode(&mut buf, version).context("OffsetFetch")?;
         }
         10 => {
             let key = StrBytes::from_static_str("test-group");

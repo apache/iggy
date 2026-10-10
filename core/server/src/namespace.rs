@@ -33,7 +33,8 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{
-    KIND_CONSUMER_GROUP, Operation, WireDecode, WireIdentifier, WirePartitioning,
+    KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, WireDecode, WireIdentifier,
+    WirePartitioning,
 };
 use iggy_common::{Identifier, IggyError};
 use journal::superblock::SuperblockStore;
@@ -234,7 +235,8 @@ where
 /// Fence a consumer-group offset commit/delete: a group consumer may only
 /// touch the offset of a partition it currently owns. `Ok` for individual
 /// consumers (no fence) and for owned group partitions; `Err` otherwise so a
-/// stale client re-syncs instead of corrupting the shared group offset.
+/// stale client re-syncs instead of corrupting the shared group offset. An
+/// external group has no members here, so it needs only an existing group.
 #[allow(clippy::cast_possible_truncation)]
 fn fence_group_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -251,11 +253,17 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if consumer.kind != KIND_CONSUMER_GROUP {
-        return Ok(());
+    let streams = shard.plane.metadata().mux_stm.streams();
+    match consumer.kind {
+        KIND_CONSUMER_GROUP => {}
+        KIND_EXTERNAL_GROUP => {
+            partition_id.ok_or(IggyError::InvalidIdentifier)?;
+            resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     }
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
-    let streams = shard.plane.metadata().mux_stm.streams();
     let Some(_) = streams
         // Commit fence: allow a pending-revoked partition (the source commits it
         // to drain the cooperative handoff), so `require_pollable = false`.

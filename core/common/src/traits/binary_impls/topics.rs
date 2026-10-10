@@ -24,12 +24,10 @@ use crate::{
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
-    CREATE_TOPIC_CODE, DELETE_TOPIC_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, PURGE_TOPIC_CODE,
-    UPDATE_TOPIC_CODE,
+    CREATE_TOPIC_CODE, DELETE_TOPIC_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, UPDATE_TOPIC_CODE,
 };
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
-    UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
@@ -141,26 +139,6 @@ impl<B: BinaryClient> TopicClient for B {
         self.send_raw_with_response(
             DELETE_TOPIC_CODE,
             DeleteTopicRequest {
-                stream_id: wire_stream_id,
-                topic_id: wire_topic_id,
-            }
-            .to_bytes(),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn purge_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        fail_if_not_authenticated(self).await?;
-        let wire_stream_id = identifier_to_wire(stream_id)?;
-        let wire_topic_id = identifier_to_wire(topic_id)?;
-        self.send_raw_with_response(
-            PURGE_TOPIC_CODE,
-            PurgeTopicRequest {
                 stream_id: wire_stream_id,
                 topic_id: wire_topic_id,
             }

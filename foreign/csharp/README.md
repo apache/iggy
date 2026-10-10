@@ -24,10 +24,22 @@ Install the NuGet package:
 dotnet add package Apache.Iggy --version 0.9.0
 ```
 
-The examples target server 0.9.0. For source builds, use the server and SDK from the same checkout.
-The SDK targets .NET 8 and .NET 10; repository examples require .NET 10. `0.9.0`
-includes the independent message and consumer-offset durability options.
+The package installation and API examples target server/SDK 0.9.0. For source builds, use the server and SDK
+from the same checkout. The SDK targets .NET 8 and .NET 10; repository examples require .NET 10.
+`0.9.0` includes the independent message and consumer-offset durability options.
 
+This checkout uses binary protocol 0.11.1. Servers and applicable SDKs must deploy together; mixed versions and
+rolling upgrades are unsupported. Existing old-format data requires a separately verified migration or restore;
+a binary replacement cannot upgrade it. See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
+Register creates a shared logical session; other TCP connections authenticate with BindSession (15), using the
+parent's identity and proof. A disconnect removes its binding without ending the session. Logout or committed expiry
+ends it; a new session must not replay an unresolved mutation from the old one. Command 14 is retired.
+Ordinary SDK sends and explicit offset mutations support the configured durability, including the Replicated default.
+Crash-safe send retries require Persisted message durability; crash-safe explicit offset retries require Persisted
+offset durability and Quorum acknowledgement. Weaker policies can lose data and receipts on a crash. HTTP NoAck's
+202 confirms dispatch, not partition admission or commit, and supplies no recoverable caller receipt.
+
+The following upgrade guidance describes the 0.9.0 protocol, not source builds of this checkout.
 Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
 and uses separate connections to partition primaries. It requires server support
 for binary commands 14, 103 and 104. Pause binary auto-commit consumers for the
@@ -132,9 +144,8 @@ using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         BackoffMultiplier = 2.0
     },
 
-    // Auto-login after connection. Optional for reconnection: a client that signs in with
-    // LoginUserAsync has that sign-in replayed on a reconnect too. Without either, a reconnect
-    // cannot restore the session and a lost connection fails the request
+    // Auto-login after connection. Reconnect first binds the retained session; configured or
+    // remembered LoginUserAsync credentials allow a fresh login after that session ends
     AutoLoginSettings = AutoLoginSettings.For("iggy", "iggy"),
     // or AutoLoginSettings.ForPersonalAccessToken("your_token")
 
@@ -218,9 +229,13 @@ await client.ConnectAsync();
 
 ### What changes under VSR
 
-- **Login binds a session.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync` run the register handshake
-  at login, and the session lives for as long as the connection. Logging out, being evicted
-  or losing the connection ends it, and the next login registers a fresh one.
+- **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
+  authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
+  Disconnecting removes only that binding; Logout, committed lease expiry or user deactivation ends the session.
+  Password changes and PAT changes or expiry do not end an established session.
+  A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
+  retains the identity and surfaces to the caller, allowing a later reconnect to retry the bind. An unresolved mutation
+  cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.
 - **Leader redirection is automatic.** The client reads the cluster roster, follows the current leader and
   re-checks it when a request is refused because the node stopped being primary.
 - **The client picks partitions.** Balanced and message-key partitioning are resolved
@@ -244,9 +259,9 @@ Replay-safe operations can also be retried after a lost connection. Two cases su
 
 - `IggyInvalidStatusCodeException` carries the server status code, with `FromServer` telling apart a verdict the
   cluster reported from a failure the client raised itself.
-- `VsrRequestOutcomeUnknownException` means no server verdict arrived after the request was written - the
-  connection was lost, the call was cancelled, or the server evicted the session while the request was in
-  flight - so the cluster may or may not have committed it. The SDK will not replay it on a new session,
+- `VsrRequestOutcomeUnknownException` means the result is unresolved after the request was written - the
+  connection was lost, the call was cancelled, or the session ended while the request was in flight - so the
+  cluster may or may not have committed it. The SDK will not replay it on a new session,
   because that would bypass server-side deduplication - re-issuing it is the caller's decision.
   Background `IggyPublisher` sends report it through the message-batch-failed event without retrying;
   direct sends throw it to the caller, and

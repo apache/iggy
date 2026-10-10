@@ -18,6 +18,11 @@
 name: _common
 on:
   workflow_call:
+    inputs:
+      validate-third-party-licenses:
+        description: "Whether to validate bundled third-party licenses"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -26,7 +31,7 @@ permissions:
 jobs:
   rust-versions:
     name: Check Rust versions sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -35,7 +40,7 @@ jobs:
 
   python-versions:
     name: Check Python SDK versions sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -44,7 +49,7 @@ jobs:
 
   python-interpreter-versions:
     name: Check Python interpreter versions sync
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -53,7 +58,7 @@ jobs:
 
   python-lockfiles:
     name: Check Python lockfiles
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -65,7 +70,7 @@ jobs:
 
   version-consistency:
     name: Check version consistency
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -82,9 +87,28 @@ jobs:
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
 
+  edge-image-catalog:
+    name: Check edge image catalog
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -fsSL --retry 5 --retry-all-errors -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Check edge image catalog matches publish.yml
+        run: ./scripts/ci/edge-image-catalog.sh --check
+
   license-headers:
     name: Check license headers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -93,7 +117,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.18
+        uses: taiki-e/install-action@v2.87.22
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -102,14 +126,15 @@ jobs:
 
   third-party-licenses:
     name: Validate third-party licenses
-    runs-on: ubuntu-latest
+    if: inputs.validate-third-party-licenses
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/utils/validate-third-party-licenses
 
   markdown:
     name: Markdown lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -129,7 +154,7 @@ jobs:
 
   shellcheck:
     name: Shell scripts lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -145,7 +170,7 @@ jobs:
 
   trailing-whitespace:
     name: Check trailing whitespace
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -157,7 +182,7 @@ jobs:
 
   trailing-newline:
     name: Check trailing newline
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -169,7 +194,7 @@ jobs:
 
   toml-format:
     name: Check TOML formatting
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -192,7 +217,7 @@ jobs:
 
   binary-artifacts:
     name: Check binary artifacts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -204,7 +229,7 @@ jobs:
 
   typos:
     name: Check typos
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     env:
       FORCE_COLOR: 1
@@ -214,7 +239,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.50.2
+        uses: crate-ci/typos@v1.50.3
 
   summary:
     name: Common checks summary
@@ -225,6 +250,7 @@ jobs:
         python-interpreter-versions,
         python-lockfiles,
         version-consistency,
+        edge-image-catalog,
         license-headers,
         third-party-licenses,
         markdown,
@@ -236,7 +262,7 @@ jobs:
         typos,
       ]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - name: Summary
         run: |
@@ -293,6 +319,15 @@ jobs:
             echo "| ❌ Version Consistency | failure | Version mismatch detected |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          EDGE_IMAGE_CATALOG="${{ needs.edge-image-catalog.result }}"
+          if [ "$EDGE_IMAGE_CATALOG" = "success" ]; then
+            echo "| ✅ Edge Image Catalog | success | Every Docker image has an :edge catalog row |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$EDGE_IMAGE_CATALOG" = "failure" ]; then
+            echo "| ❌ Edge Image Catalog | failure | Catalog drifted from publish.yml (see job log) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ Edge Image Catalog | $EDGE_IMAGE_CATALOG | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "$LICENSE_HEADERS" = "success" ]; then
