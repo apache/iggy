@@ -189,6 +189,15 @@ impl IggyConsumerState {
         if let Some(position) = position {
             return self.store_position(position).await;
         }
+        // Nothing was consumed from this partition, so there is no captured context to keep.
+        let position = ConsumerPosition {
+            partition_id,
+            offset,
+            context: PartitionContext::default(),
+        };
+        if !self.allow_replay && self.stored_offset_covers(position) {
+            return Ok(());
+        }
         self.client
             .read()
             .await
@@ -200,15 +209,7 @@ impl IggyConsumerState {
                 offset,
             )
             .await?;
-        // Nothing was consumed from this partition, so there is no captured context to keep.
-        self.last_stored_offsets.insert(
-            partition_id,
-            ConsumerPosition {
-                partition_id,
-                offset,
-                context: PartitionContext::default(),
-            },
-        );
+        self.last_stored_offsets.insert(partition_id, position);
         Ok(())
     }
 
@@ -241,15 +242,7 @@ impl IggyConsumerState {
         position: ConsumerPosition,
         allow_replay: bool,
     ) -> Result<(), IggyError> {
-        if !allow_replay
-            && self
-                .last_stored_offsets
-                .get(&position.partition_id)
-                .is_some_and(|stored| {
-                    same_incarnation_and_owner(stored.context, position.context)
-                        && position.offset <= stored.offset
-                })
-        {
+        if !allow_replay && self.stored_offset_covers(position) {
             return Ok(());
         }
         self.client
@@ -260,6 +253,21 @@ impl IggyConsumerState {
         self.last_stored_offsets
             .insert(position.partition_id, position);
         Ok(())
+    }
+
+    /// Whether the offset last stored for the partition is at or ahead of `position`. A store made
+    /// before anything was consumed from the partition has no captured context, so it is compared
+    /// with stores of every context rather than only within one incarnation and owner.
+    fn stored_offset_covers(&self, position: ConsumerPosition) -> bool {
+        let uncaptured = PartitionContext::default();
+        self.last_stored_offsets
+            .get(&position.partition_id)
+            .is_some_and(|stored| {
+                (stored.context == uncaptured
+                    || position.context == uncaptured
+                    || same_incarnation_and_owner(stored.context, position.context))
+                    && position.offset <= stored.offset
+            })
     }
 
     /// The commit tasks have no caller to hand a failure to, so it is logged here. Replay governs
@@ -867,7 +875,8 @@ impl IggyConsumer {
     ///
     /// An offset that is not ahead of the last one stored in the same captured context is
     /// skipped and `Ok(())` is returned without a request, unless the consumer was built with
-    /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay).
+    /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay). When either of the two
+    /// has no captured context, see below, they are compared regardless of context.
     ///
     /// The offset is committed under the context of the latest message consumed from that
     /// partition, or without a captured context when nothing was consumed from it. An offset taken
@@ -986,10 +995,11 @@ impl IggyConsumer {
     ///   stays idle under [`AutoCommit::Disabled`].
     ///
     /// Both skip an offset that is not ahead of this consumer's own record of what it stored
-    /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)) in the same captured context.
-    /// Under auto-commit-on-poll (the default) that record trails the server by one batch, so every
-    /// tick re-sends the reading position and the server, which takes an explicit store as is,
-    /// moves its offset back to it until the next poll.
+    /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)) in the same captured context,
+    /// or by a [`store_offset()`](Self::store_offset) made before anything was consumed from that
+    /// partition. Under auto-commit-on-poll (the default) that record trails the server by one
+    /// batch, so every tick re-sends the reading position and the server, which takes an explicit
+    /// store as is, moves its offset back to it until the next poll.
     ///
     /// # Errors
     ///
@@ -2292,6 +2302,113 @@ mod tests {
 
         assert_eq!(served.lock().unwrap().stored_offsets, [OFFSET]);
         assert_eq!(consumer.get_last_stored_offset(1), Some(OFFSET));
+    }
+
+    /// The offset the first store leaves on the server.
+    const STORED_OFFSET: u64 = 100;
+    /// An offset behind [`STORED_OFFSET`] that a second store asks for.
+    const LOWER_OFFSET: u64 = 10;
+
+    /// A position delivered at `offset` under a real partition incarnation. Metadata revisions
+    /// start at 1, so no real partition has the incarnation 0 of an uncaptured context.
+    fn captured_position_at(offset: u64) -> ConsumerPosition {
+        ConsumerPosition {
+            partition_id: 1,
+            offset,
+            context: PartitionContext {
+                incarnation: 1,
+                owner_generation: 0,
+                metadata_op: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn store_offset_without_a_consumed_position_should_skip_a_lower_offset() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+
+        consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
+        consumer.store_offset(LOWER_OFFSET, Some(1)).await.unwrap();
+
+        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn store_offset_without_a_consumed_position_should_store_a_lower_offset_under_replay() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .allow_replay()
+            .build();
+
+        consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
+        consumer.store_offset(LOWER_OFFSET, Some(1)).await.unwrap();
+
+        assert_eq!(
+            served.lock().unwrap().stored_offsets,
+            [STORED_OFFSET, LOWER_OFFSET]
+        );
+        assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn store_position_should_skip_an_offset_behind_one_stored_without_a_consumed_position() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+
+        consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
+        consumer
+            .store_position(captured_position_at(LOWER_OFFSET))
+            .await
+            .unwrap();
+
+        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn store_offset_without_a_consumed_position_should_not_move_a_stored_position_back() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+
+        consumer
+            .store_position(captured_position_at(STORED_OFFSET))
+            .await
+            .unwrap();
+        consumer.store_offset(LOWER_OFFSET, Some(1)).await.unwrap();
+
+        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn shutdown_should_not_move_back_an_offset_stored_without_a_consumed_position() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let mut consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .build();
+        consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
+        consumer
+            .state
+            .last_consumed_offsets
+            .insert(1, captured_position_at(LOWER_OFFSET));
+
+        consumer.shutdown().await.unwrap();
+
+        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
     }
 
     /// Records the error events emitted on the test thread. The current-thread runtime of
