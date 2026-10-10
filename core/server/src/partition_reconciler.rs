@@ -176,7 +176,7 @@ use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::lifecycle::{
     CompleteLifecycleRequest, LIFECYCLE_COMPLETIONS_MAX, LifecycleCompletion, LifecycleFence,
-    LifecycleIntent, RETIRED_PARTITION_OP,
+    RETIRED_PARTITION_OP,
 };
 use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::{delete_partitions_from_disk, read_created_revision};
@@ -1598,52 +1598,66 @@ pub fn reconcile_partition_lifecycles<B, MJ, S, SB>(
     let partitions = shard.plane.partitions();
     let previous_sends = reports.fence_sends.take();
     let mut fence_sends = AHashMap::with_capacity(previous_sends.len());
-    let mut batch = None;
-    for intent in streams.pending_lifecycles() {
-        let mut completions = Vec::new();
-        for target in intent
-            .partitions
-            .iter()
-            .filter(|target| target.partition_op.is_none())
-        {
-            let namespace = IggyNamespace::new(
-                intent.stream_id as usize,
-                target.topic_id as usize,
-                target.partition_id as usize,
-            );
-            let Some(partition) = partitions.get_by_ns(&namespace) else {
-                continue;
-            };
-            let installed = match target.fence {
-                LifecycleFence::History(transition) => {
-                    partition.installed_history_transition(&transition)
+    let mut due_fences = Vec::new();
+    // Every wake of every shard runs this pass, so it borrows the intents and
+    // copies out only the due fences and one bounded batch.
+    let batch = streams.read(|state| {
+        let mut batch = None;
+        for intent in state.lifecycle_intents.values() {
+            let mut completions = Vec::new();
+            for target in intent
+                .partitions
+                .iter()
+                .filter(|target| target.partition_op.is_none())
+            {
+                let namespace = IggyNamespace::new(
+                    intent.stream_id as usize,
+                    target.topic_id as usize,
+                    target.partition_id as usize,
+                );
+                let Some(partition) = partitions.get_by_ns(&namespace) else {
+                    continue;
+                };
+                let installed = match target.fence {
+                    LifecycleFence::History(transition) => {
+                        partition.installed_history_transition(&transition)
+                    }
+                    LifecycleFence::Owner(installation) => {
+                        partition.installed_consumer_group_owner(&installation)
+                    }
+                };
+                if let Some(partition_op) = installed {
+                    if batch.is_none() {
+                        completions.push(LifecycleCompletion {
+                            topic_id: target.topic_id,
+                            partition_id: target.partition_id,
+                            partition_op,
+                        });
+                    }
+                    continue;
                 }
-                LifecycleFence::Owner(installation) => {
-                    partition.installed_consumer_group_owner(&installation)
-                }
-            };
-            if let Some(partition_op) = installed {
-                completions.push(LifecycleCompletion {
-                    topic_id: target.topic_id,
-                    partition_id: target.partition_id,
-                    partition_op,
+                let key = (intent.context.metadata_op, namespace);
+                // A clock that went back counts as due.
+                let recent = previous_sends.get(&key).copied().filter(|&sent_at| {
+                    now.checked_sub(sent_at)
+                        .is_some_and(|elapsed| elapsed < LIFECYCLE_FENCE_RETRY_MICROS)
                 });
-                continue;
+                match recent {
+                    Some(sent_at) => {
+                        fence_sends.insert(key, sent_at);
+                    }
+                    None => due_fences.push((key, target.fence)),
+                }
             }
-            let key = (intent.context.metadata_op, namespace);
-            // A clock that went back counts as due.
-            let recent = previous_sends.get(&key).copied().filter(|&sent_at| {
-                now.checked_sub(sent_at)
-                    .is_some_and(|elapsed| elapsed < LIFECYCLE_FENCE_RETRY_MICROS)
-            });
-            let sent_at = recent
-                .or_else(|| submit_partition_fence(shard, namespace, target.fence).then_some(now));
-            if let Some(sent_at) = sent_at {
-                fence_sends.insert(key, sent_at);
+            if batch.is_none() {
+                batch = lifecycle_batch(intent.context.metadata_op, intent.stream_id, completions);
             }
         }
-        if batch.is_none() {
-            batch = lifecycle_batch(&intent, completions);
+        batch
+    });
+    for ((metadata_op, namespace), fence) in due_fences {
+        if submit_partition_fence(shard, namespace, fence) {
+            fence_sends.insert((metadata_op, namespace), now);
         }
     }
     *reports.fence_sends.borrow_mut() = fence_sends;
@@ -1663,29 +1677,42 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
     }
     let partitions = ctx.shard.plane.partitions();
     let system_path = ctx.config.get_system_path();
-    for intent in ctx
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .pending_lifecycles()
-    {
+    // The fence writes below await, so only the targets that failed recovery
+    // leave the borrow.
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    let failed = streams.read(|state| {
+        let mut failed = Vec::new();
+        for intent in state.lifecycle_intents.values() {
+            let mut targets = Vec::new();
+            for target in intent
+                .partitions
+                .iter()
+                .filter(|target| target.partition_op.is_none())
+            {
+                let namespace = IggyNamespace::new(
+                    intent.stream_id as usize,
+                    target.topic_id as usize,
+                    target.partition_id as usize,
+                );
+                let incarnation = match target.fence {
+                    LifecycleFence::History(transition) => transition.incarnation,
+                    LifecycleFence::Owner(installation) => installation.incarnation,
+                };
+                if partitions.failed_revision(&namespace) == Some(incarnation) {
+                    targets.push((target.topic_id, target.partition_id, namespace, incarnation));
+                }
+            }
+            if !targets.is_empty() {
+                failed.push((intent.context.metadata_op, intent.stream_id, targets));
+            }
+        }
+        failed
+    });
+    for (metadata_op, stream_id, targets) in failed {
         let mut completions = Vec::new();
-        for target in intent
-            .partitions
-            .iter()
-            .filter(|target| target.partition_op.is_none())
-        {
-            let namespace = IggyNamespace::new(
-                intent.stream_id as usize,
-                target.topic_id as usize,
-                target.partition_id as usize,
-            );
-            let incarnation = match target.fence {
-                LifecycleFence::History(transition) => transition.incarnation,
-                LifecycleFence::Owner(installation) => installation.incarnation,
-            };
+        for (topic_id, partition_id, namespace, incarnation) in targets {
+            // Other tasks run during the awaits, so each target is checked
+            // again right before its durable write.
             if partitions.failed_revision(&namespace) != Some(incarnation) {
                 continue;
             }
@@ -1697,27 +1724,28 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
                 continue;
             }
             completions.push(LifecycleCompletion {
-                topic_id: target.topic_id,
-                partition_id: target.partition_id,
+                topic_id,
+                partition_id,
                 partition_op: RETIRED_PARTITION_OP,
             });
         }
-        if let Some(request) = lifecycle_batch(&intent, completions) {
+        if let Some(request) = lifecycle_batch(metadata_op, stream_id, completions) {
             send_lifecycle_batch(&ctx.shard, &ctx.lifecycle_reports, request);
             return;
         }
     }
 }
 
-/// The ready completions of `intent` in batch order, at most
-/// [`LIFECYCLE_COMPLETIONS_MAX`] of them. The next batch takes the rest.
+/// The ready completions of the intent at `metadata_op` in batch order, at
+/// most [`LIFECYCLE_COMPLETIONS_MAX`] of them. The next batch takes the rest.
 fn lifecycle_batch(
-    intent: &LifecycleIntent,
+    metadata_op: u64,
+    stream_id: u32,
     mut completions: Vec<LifecycleCompletion>,
 ) -> Option<CompleteLifecycleRequest> {
     completions.sort_unstable_by_key(|completion| (completion.topic_id, completion.partition_id));
     completions.truncate(LIFECYCLE_COMPLETIONS_MAX);
-    CompleteLifecycleRequest::new(intent.context.metadata_op, intent.stream_id, completions)
+    CompleteLifecycleRequest::new(metadata_op, stream_id, completions)
 }
 
 /// Relays `request` unless an earlier batch of this shard still waits for its
