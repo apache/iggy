@@ -154,6 +154,12 @@ impl ConsumerGroup {
     /// Metadata chooses successors; only a durable partition installation activates them.
     pub fn rebalance_members(&mut self, partitions: &[Partition], metadata_op: u64, now: u64) {
         self.generation += 1;
+        // Without members every new row stays ownerless, so a group with no
+        // rows keeps none until its first join. A group with rows keeps one
+        // per partition: snapshot validation rejects partial coverage.
+        if self.members.is_empty() && self.assignments.is_empty() {
+            return;
+        }
         let members: Vec<(u128, u64)> = self
             .members
             .iter()
@@ -1024,7 +1030,10 @@ mod tests {
     use crate::stm::snapshot::Snapshotable;
     use crate::stm::stream::Streams;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
-    use iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest;
+    use iggy_binary_protocol::requests::partitions::{
+        CreatePartitionsRequest, CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
+        RetireConsumerGroupOwnersRequest,
+    };
     use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
@@ -1399,6 +1408,73 @@ mod tests {
     }
 
     #[test]
+    fn given_groups_without_members_when_partitions_resize_should_allocate_no_owner_rows() {
+        const CLIENT: u128 = 7;
+        let owner_rows = |state: &StreamsInner| -> usize {
+            state.items[0].topics[0]
+                .consumer_groups
+                .values()
+                .map(|group| group.assignments.len())
+                .sum()
+        };
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "first").code, 0);
+        assert_eq!(create_group(&mut state, "second").code, 0);
+
+        assert_eq!(create_partitions(&mut state, 2).code, 0);
+        assert_eq!(state.items[0].topics[0].partitions.len(), 3);
+        assert_eq!(owner_rows(&state), 0, "growth allocated owner rows");
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &DeletePartitionsRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                },
+                &mut state,
+                IggyTimestamp::now(),
+            )
+            .code,
+            0
+        );
+        assert_eq!(state.items[0].topics[0].partitions.len(), 2);
+        assert_eq!(owner_rows(&state), 0, "shrink allocated owner rows");
+        Streams::from_snapshot(Streams::from(state.clone()).to_snapshot()).unwrap();
+
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        assert_eq!(state.pending_revocations.len(), 2);
+        complete_pending_revocations(&mut state);
+        let topic = &state.items[0].topics[0];
+        assert_eq!(topic.consumer_groups[&0].members[0].partitions, [0, 1]);
+        assert!(topic.consumer_groups[&1].assignments.is_empty());
+        Streams::from_snapshot(Streams::from(state.clone()).to_snapshot()).unwrap();
+    }
+
+    #[test]
+    fn given_group_with_rows_and_no_members_when_partitions_grow_should_cover_every_partition() {
+        const CLIENT: u128 = 7;
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        complete_pending_revocations(&mut state);
+        assert_eq!(leave(&mut state, 0, 0, 0, CLIENT).code, 0);
+        complete_pending_revocations(&mut state);
+
+        assert_eq!(create_partitions(&mut state, 2).code, 0);
+        let topic = &state.items[0].topics[0];
+        let group = &topic.consumer_groups[&0];
+        assert!(group.members.is_empty());
+        assert_eq!(group.assignments.len(), topic.partitions.len());
+        assert!(
+            group
+                .assignments
+                .values()
+                .all(|assignment| assignment.owner.is_none() && assignment.pending.is_none())
+        );
+        Streams::from_snapshot(Streams::from(state.clone()).to_snapshot()).unwrap();
+    }
+
+    #[test]
     fn replicated_join_requires_exact_live_session_identity() {
         let join = JoinConsumerGroupRequest {
             stream_id: WireIdentifier::numeric(0),
@@ -1502,6 +1578,46 @@ mod tests {
             state,
             IggyTimestamp::now(),
         )
+    }
+
+    fn create_partitions(state: &mut StreamsInner, count: u32) -> ApplyReply {
+        state.apply_context.metadata_op += 1;
+        StateHandler::apply(
+            &CreatePartitionsWithAssignmentsRequest {
+                created_view: 0,
+                request: CreatePartitionsRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partitions_count: count,
+                },
+                partitions: (0..count)
+                    .map(|partition_id| CreatedPartitionAssignment {
+                        partition_id,
+                        consensus_group_id: u64::from(partition_id) + 2,
+                    })
+                    .collect(),
+            },
+            state,
+            IggyTimestamp::now(),
+        )
+    }
+
+    fn complete_pending_revocations(state: &mut StreamsInner) {
+        let transitions: Vec<_> = state.pending_revocations.values().copied().collect();
+        for transition in transitions {
+            let completion = CompleteConsumerGroupRevocationRequest {
+                stream_id: WireIdentifier::numeric(transition.stream_id),
+                topic_id: WireIdentifier::numeric(transition.topic_id),
+                partition_id: transition.partition_id,
+                installation: transition.installation,
+                partition_op: 1,
+            };
+            assert_eq!(
+                StateHandler::apply(&completion, state, IggyTimestamp::now()).code,
+                0
+            );
+        }
+        assert!(state.pending_revocations.is_empty());
     }
 
     #[test]
