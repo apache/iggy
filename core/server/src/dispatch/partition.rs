@@ -41,6 +41,7 @@ use consensus::client_table::SessionAttachment;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
@@ -593,26 +594,18 @@ where
             .ok_or(ReadPolledMessagesError::Rejected(
                 IggyError::TransientNotAccepted,
             ))?;
-        let context = metadata.context(current_metadata_commit(shard));
         let header = request.header();
-        if header.partition_incarnation != context.incarnation {
-            return Err(ReadPolledMessagesError::Rejected(
-                IggyError::HistoryUnavailable,
-            ));
-        }
-        if header.owner_generation != context.owner_generation {
-            return Err(ReadPolledMessagesError::Rejected(
-                IggyError::ConsumerGroupPartitionNotOwned(
-                    u32::try_from(group_id.unwrap_or(0)).unwrap_or(u32::MAX),
-                    partition_id,
-                ),
-            ));
-        }
-        if header.minimum_metadata_op > context.metadata_op {
-            return Err(ReadPolledMessagesError::Rejected(
-                IggyError::TransientNotAccepted,
-            ));
-        }
+        fence_poll_context(
+            PartitionContext {
+                incarnation: header.partition_incarnation,
+                owner_generation: header.owner_generation,
+                metadata_op: header.minimum_metadata_op,
+            },
+            metadata.context(current_metadata_commit(shard)),
+            u32::try_from(group_id.unwrap_or(0)).unwrap_or(u32::MAX),
+            partition_id,
+        )
+        .map_err(ReadPolledMessagesError::Rejected)?;
         PartitionRead::PollOnPrimary {
             consumer,
             args,
@@ -676,6 +669,32 @@ where
             )))
         }
     }
+}
+
+/// The poll gate shared by TCP and HTTP. A caller context from a node ahead of
+/// this one can name an incarnation or owner this node has not applied yet, so
+/// a mismatch is final only once this node has applied the caller's metadata.
+/// Until then the poll is not accepted, which keeps the consumer's position,
+/// where `HistoryUnavailable` would drop it.
+pub const fn fence_poll_context(
+    requested: PartitionContext,
+    local: PartitionContext,
+    group_id: u32,
+    partition_id: u32,
+) -> Result<(), IggyError> {
+    if requested.metadata_op > local.metadata_op {
+        return Err(IggyError::TransientNotAccepted);
+    }
+    if requested.incarnation != local.incarnation {
+        return Err(IggyError::HistoryUnavailable);
+    }
+    if requested.owner_generation != local.owner_generation {
+        return Err(IggyError::ConsumerGroupPartitionNotOwned(
+            group_id,
+            partition_id,
+        ));
+    }
+    Ok(())
 }
 
 enum ReadPolledMessagesError {
@@ -1314,7 +1333,7 @@ where
 mod tests {
     use super::*;
     use crate::dispatch::test_support::{
-        SpyBus, TestMux, TestShard, prepare_message, request_message, test_shard,
+        SpyBus, TestMux, TestShard, prepare_message, register_reply, request_message, test_shard,
     };
     #[cfg(target_os = "linux")]
     use consensus::Sequencer;
@@ -2212,6 +2231,146 @@ mod tests {
             "the timeout must have dropped the caller's reply receiver"
         );
         assert_eq!(bus.client_replies.borrow().len(), 1);
+    }
+
+    /// A consumer drops its position on `HistoryUnavailable`. A caller context
+    /// from a node ahead of this one can name an incarnation this node has not
+    /// applied yet, so only metadata this node has applied can prove it gone.
+    #[compio::test]
+    async fn given_context_ahead_of_local_metadata_when_polling_should_report_not_accepted() {
+        const TRANSPORT_CLIENT_ID: u128 = 91;
+        const VSR_CLIENT_ID: u128 = 1;
+        const SESSION: u64 = 1;
+        const LOCAL_FRONTIER: u64 = 10;
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+        let bus = SpyBus::default();
+        // A poll the gate wrongly admits fails on the owner reply timeout
+        // instead of hanging the test.
+        bus.instant_timers.set(true);
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        route_one_partition(&shard);
+        let metadata = shard.plane.metadata();
+        metadata.applied_frontier().advance(LOCAL_FRONTIER);
+        let attachment = {
+            let mut table = metadata.client_table.borrow_mut();
+            table
+                .commit_register(
+                    VSR_CLIENT_ID,
+                    DEFAULT_ROOT_USER_ID,
+                    [0x5a; 32],
+                    register_reply(VSR_CLIENT_ID, SESSION),
+                )
+                .unwrap();
+            table
+                .attach_session(VSR_CLIENT_ID, SESSION, DEFAULT_ROOT_USER_ID)
+                .unwrap()
+        };
+        let streams = metadata.mux_stm.streams();
+        let namespace = streams
+            .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
+            .unwrap();
+        let incarnation = streams.created_revision_for_namespace(namespace).unwrap();
+        let poll_body = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::offset(0),
+            count: 10,
+            auto_commit: false,
+        }
+        .to_bytes();
+
+        for (minimum_metadata_op, expected) in [
+            (LOCAL_FRONTIER + 1, IggyError::TransientNotAccepted),
+            (LOCAL_FRONTIER, IggyError::HistoryUnavailable),
+        ] {
+            let request = request_message(
+                Operation::NonReplicated,
+                VSR_CLIENT_ID,
+                SESSION,
+                1,
+                &poll_body,
+            )
+            .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                *header = old;
+                header.partition_incarnation = incarnation + 1;
+                header.minimum_metadata_op = minimum_metadata_op;
+            });
+            handle_poll_messages(
+                &shard,
+                TRANSPORT_CLIENT_ID,
+                &request,
+                Some(DEFAULT_ROOT_USER_ID),
+                VSR_CLIENT_ID,
+                Some(attachment.clone()),
+            )
+            .await;
+
+            let (client_id, frame) = bus.client_replies.borrow_mut().pop().unwrap();
+            assert_eq!(client_id, TRANSPORT_CLIENT_ID);
+            let status =
+                u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap());
+            assert_eq!(
+                IggyError::from_code(status),
+                expected,
+                "a context requiring metadata op {minimum_metadata_op} at local frontier {LOCAL_FRONTIER}"
+            );
+        }
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "a refused poll must never reach the owner"
+        );
+    }
+
+    /// HTTP polls share this gate with TCP. A context from a node ahead of this
+    /// one is refused only as not accepted, whatever incarnation or owner it
+    /// names. Once this node has applied that metadata, each mismatch keeps its
+    /// own refusal.
+    #[test]
+    fn given_context_ahead_of_local_metadata_when_fencing_poll_should_report_not_accepted() {
+        const GROUP_ID: u32 = 3;
+        const PARTITION_ID: u32 = 0;
+        let local = PartitionContext {
+            incarnation: 7,
+            owner_generation: 2,
+            metadata_op: 10,
+        };
+        let another_incarnation = PartitionContext {
+            incarnation: 8,
+            ..local
+        };
+        let another_owner = PartitionContext {
+            owner_generation: 3,
+            ..local
+        };
+        for requested in [another_incarnation, another_owner] {
+            let ahead = PartitionContext {
+                metadata_op: local.metadata_op + 1,
+                ..requested
+            };
+            let refusal = fence_poll_context(ahead, local, GROUP_ID, PARTITION_ID);
+            assert!(
+                matches!(refusal, Err(IggyError::TransientNotAccepted)),
+                "{ahead:?} against {local:?} answered {refusal:?}"
+            );
+        }
+
+        assert!(matches!(
+            fence_poll_context(another_incarnation, local, GROUP_ID, PARTITION_ID),
+            Err(IggyError::HistoryUnavailable)
+        ));
+        assert!(matches!(
+            fence_poll_context(another_owner, local, GROUP_ID, PARTITION_ID),
+            Err(IggyError::ConsumerGroupPartitionNotOwned(
+                GROUP_ID,
+                PARTITION_ID
+            ))
+        ));
+        assert!(fence_poll_context(local, local, GROUP_ID, PARTITION_ID).is_ok());
     }
 
     /// An empty body reads as "no stored offset", and a consumer that reads it

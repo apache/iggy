@@ -118,7 +118,9 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
-use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::partition::{
+    fence_poll_context, resolve_consumer_offset_request, resolve_poll_request,
+};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
@@ -1257,19 +1259,9 @@ pub(in crate::http) async fn poll_messages(
         .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?;
     let context = metadata.context(state.shard.plane.metadata().applied_frontier().get());
     if let Some(requested) = query.strategy.context {
-        if requested.incarnation != context.incarnation {
-            return Err(ReadError::Rejected(IggyError::HistoryUnavailable));
-        }
         // TCP parity: a group poll already got the re-sync sentinel at resolve
         // above, so this poll has no group and names group 0, as TCP does.
-        if requested.owner_generation != context.owner_generation {
-            return Err(ReadError::Rejected(
-                IggyError::ConsumerGroupPartitionNotOwned(0, partition_id),
-            ));
-        }
-        if requested.metadata_op > context.metadata_op {
-            return Err(ReadError::Rejected(IggyError::TransientNotAccepted));
-        }
+        fence_poll_context(requested, context, 0, partition_id).map_err(ReadError::Rejected)?;
     }
     let reply = SendWrapper::new(state.shard.partition_read(
         namespace,

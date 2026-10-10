@@ -6598,23 +6598,26 @@ where
             }
 
             let frame_bytes = Self::prepared_request_size(&message);
-            if !self.request_history_available(message.header()) {
-                Self::send_partition_deny_or_log(
-                    consensus,
-                    message.header(),
-                    IggyError::HistoryUnavailable.as_code(),
-                    "request history is no longer available",
-                    reply.take(),
-                )
-                .await;
-                return;
-            }
+            // A caller context from a node ahead of the dispatching one can name
+            // an incarnation this replica has not materialized yet, so only a
+            // dispatch that applied the caller's metadata may refuse its history.
             if message.header().minimum_metadata_op > message.header().metadata_watermark {
                 Self::send_partition_deny_or_log(
                     consensus,
                     message.header(),
                     IggyError::TransientNotAccepted.as_code(),
                     "request requires newer metadata",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            if !self.request_history_available(message.header()) {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::HistoryUnavailable.as_code(),
+                    "request history is no longer available",
                     reply.take(),
                 )
                 .await;
@@ -14961,6 +14964,50 @@ mod tests {
 
         partition.on_request(send_at(INCARNATION), None).await;
         assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
+    }
+
+    /// A sender drops its context on `HistoryUnavailable`. A caller context from
+    /// a node ahead of the dispatching one can name an incarnation this replica
+    /// has not materialized yet, so only applied metadata can prove it gone.
+    #[compio::test]
+    async fn given_send_ahead_of_dispatch_metadata_when_admitting_should_report_not_accepted() {
+        const INCARNATION: u64 = 7;
+        const NEWER_INCARNATION: u64 = 9;
+        const DISPATCH_WATERMARK: u64 = 10;
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.set_created_revision(INCARNATION);
+        partition.runtime_options.durability = iggy_common::Durability::Replicated;
+        let namespace = partition.namespace();
+        let send_requiring = |minimum_metadata_op: u64| {
+            let mut send = checksumless_send_request(namespace, 1).transmute_header(
+                |header, next: &mut RoutedRequestHeader| {
+                    *next = header;
+                    next.partition_incarnation = NEWER_INCARNATION;
+                    next.minimum_metadata_op = minimum_metadata_op;
+                    next.metadata_watermark = DISPATCH_WATERMARK;
+                },
+            );
+            send.as_mut_slice()[size_of::<RoutedRequestHeader>()..]
+                .copy_from_slice(&build_segment_record(namespace, 0));
+            send
+        };
+
+        for (minimum_metadata_op, expected) in [
+            (DISPATCH_WATERMARK + 1, IggyError::TransientNotAccepted),
+            (DISPATCH_WATERMARK, IggyError::HistoryUnavailable),
+        ] {
+            let (sender, refusal) = consensus::oneshot_channel();
+            partition
+                .on_request(send_requiring(minimum_metadata_op), Some(sender))
+                .await;
+            // Checked before the await: a wrongly admitted send never gets a reply.
+            assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
+            assert_eq!(
+                IggyError::from_code(refusal.await.unwrap().header().status),
+                expected,
+                "a send requiring metadata op {minimum_metadata_op} dispatched at {DISPATCH_WATERMARK}"
+            );
+        }
     }
 
     #[compio::test]
