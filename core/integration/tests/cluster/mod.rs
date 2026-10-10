@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod chaos_monkey;
 mod client_table_adversarial;
 mod client_table_restart;
 mod consumer_offset_quota;

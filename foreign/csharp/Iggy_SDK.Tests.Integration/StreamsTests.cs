@@ -20,7 +20,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -190,37 +189,6 @@ public class StreamsTests
         var result = await client.GetStreamByIdAsync(Identifier.Numeric(streamToUpdate.Id));
         result.ShouldNotBeNull();
         result.Name.ShouldBe(updatedName);
-    }
-
-    [Test]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task PurgeStream_Should_PurgeStream_Successfully(Protocol protocol)
-    {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
-
-        var streamName = $"purge-stream-{Guid.NewGuid():N}";
-        await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "purge-topic", 1);
-
-        await client.SendMessagesAsync(Identifier.String(streamName),
-            Identifier.String("purge-topic"), Partitioning.None(),
-            [
-                new Message(Guid.NewGuid(), "Test message 1"u8.ToArray()),
-                new Message(Guid.NewGuid(), "Test message 2"u8.ToArray())
-            ]);
-
-        var stream = await client.GetStreamByIdAsync(Identifier.String(streamName));
-        stream.ShouldNotBeNull();
-        stream.MessagesCount.ShouldBe(2u);
-
-        await Should.NotThrowAsync(() => client.PurgeStreamAsync(Identifier.String(streamName)));
-
-        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
-        stream = await Eventually.ReadAsync(() => client.GetStreamByIdAsync(Identifier.String(streamName)),
-            purged => purged?.MessagesCount == 0, TimeSpan.FromSeconds(10));
-        stream.ShouldNotBeNull();
-        stream.MessagesCount.ShouldBe(0u);
-        stream.TopicsCount.ShouldBe(1u);
     }
 
     [Test]

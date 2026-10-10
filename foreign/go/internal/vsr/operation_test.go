@@ -44,11 +44,9 @@ func TestOperationForCode_ResolvesTheReplicatedTable(t *testing.T) {
 		{code: command.CreateStreamCode, want: OperationCreateStream},
 		{code: command.DeleteStreamCode, want: OperationDeleteStream},
 		{code: command.UpdateStreamCode, want: OperationUpdateStream},
-		{code: command.PurgeStreamCode, want: OperationPurgeStream},
 		{code: command.CreateTopicCode, want: OperationCreateTopic},
 		{code: command.DeleteTopicCode, want: OperationDeleteTopic},
 		{code: command.UpdateTopicCode, want: OperationUpdateTopic},
-		{code: command.PurgeTopicCode, want: OperationPurgeTopic},
 		{code: command.CreatePartitionsCode, want: OperationCreatePartitions},
 		{code: command.DeletePartitionsCode, want: OperationDeletePartitions},
 		{code: command.DeleteSegmentsCode, want: OperationDeleteSegments},
@@ -112,7 +110,7 @@ func TestIsKnownOperation_RejectsUndeclaredDiscriminants(t *testing.T) {
 		assert.True(t, IsKnownOperation(operation), "operation %d", operation)
 	}
 
-	undeclared := []Operation{4, 63, 69, 127, 150, 159, 163, 164, 165, 255}
+	undeclared := []Operation{4, 63, 69, 127, 131, 135, 150, 159, 163, 164, 165, 255}
 	for _, operation := range undeclared {
 		assert.False(t, IsKnownOperation(operation), "operation %d", operation)
 	}
@@ -134,8 +132,6 @@ func TestIsMetadata_ExcludesDeleteSegments(t *testing.T) {
 		OperationCreateTopicWithAssignments,
 		OperationTruncatePartition,
 		OperationCreateStream,
-		OperationPurgeStream,
-		OperationPurgeTopic,
 		OperationCreateConsumerGroup,
 		OperationCreatePersonalAccessToken,
 		OperationLeaveConsumerGroup,

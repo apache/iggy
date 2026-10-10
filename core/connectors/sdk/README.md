@@ -62,6 +62,8 @@ value.static = "hello"
 
 `retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
 
+`HttpRetryMiddleware` reads a server's `Retry-After` header on every status it retries, which is 429 and any 5xx. The header can lengthen the computed backoff but never shorten it, so a zero or a short value keeps the backoff. `max_delay` bounds only the computed backoff. The header has its own one-hour ceiling, and a value past it is drawn from the jitter window just below it. Only the integer-seconds form is read, so an HTTP-date or unparsable value falls back to the computed backoff.
+
 Two symbols were removed and one field changed meaning, each in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
 
 | Removed | Replacement |

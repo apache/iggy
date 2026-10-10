@@ -93,16 +93,6 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
-    {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/purge", token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
-    }
-
-    /// <inheritdoc />
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}", token);
@@ -215,16 +205,6 @@ public class HttpMessageStream : IIggyClient
         }
 
         _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
-    }
-
-    /// <inheritdoc />
-    public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
-    {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
     }
 
     /// <inheritdoc />

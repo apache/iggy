@@ -240,37 +240,34 @@ pub async fn should_help_match() {
 
     iggy_cmd_test
         .execute_test_for_help_command(TestHelpCmd::new(
-            vec!["user", "create", "--help"],
+            vec!["user", "permissions", "--help"],
             format!(
-                r#"Create user with given username and password
+                r#"Set permissions for user with given ID
 
-Examples
- iggy user create testuser pass#1%X!
- iggy user create guest guess --user-status inactive
+The user ID can be specified as either a username or an ID. Permissions
+are configured based on the options provided with this command. If no
+options are set, the default behavior is to remove permissions for the
+specified user.
 
-{USAGE_PREFIX} user create [OPTIONS] <USERNAME> <PASSWORD>
+The command replaces the full permission set of the user. If only
+--global-permissions is set, stream permissions are removed. If only
+--stream-permissions is set, all global permissions are set to false.
+
+Examples:
+ iggy user permissions 2
+ iggy user permissions client
+
+{USAGE_PREFIX} user permissions [OPTIONS] <USER_ID>
 
 Arguments:
-  <USERNAME>
-          Username
+  <USER_ID>
+          User ID to update
 {CLAP_INDENT}
-          Unique identifier for the user account on iggy server,
-          must be between 3 and 50 characters long.
-
-  <PASSWORD>
-          Password
-{CLAP_INDENT}
-          Password of the user, must be between 3 and 100 characters long.
+          The user ID can be specified as either a username or an ID
 
 Options:
-  -u, --user-status <USER_STATUS>
-          User status
-{CLAP_INDENT}
-          [default: active]
-          [possible values: active, inactive]
-
   -g, --global-permissions <GLOBAL_PERMISSIONS>
-          Set global permissions for created user
+          Set global permissions for the user
 {CLAP_INDENT}
           All global permissions by default are set to false and this command line option
           allows to set each permission individually. Permissions are separated
@@ -284,11 +281,11 @@ Options:
           read_topics / r_top, poll_messages / p_msg, send_messages / s_msg
 {CLAP_INDENT}
           Examples:
-           iggy user create guest guess --global-permissions p_msg,s_msg
-           iggy user create admin pass#1%X! -g m_srv,r_srv,m_usr,r_usr,m_str,r_str,m_top,r_top,p_msg,s_msg
+           iggy user permissions guest --global-permissions p_msg,s_msg
+           iggy user permissions admin -g m_srv,r_srv,m_usr,r_usr,m_str,r_str,m_top,r_top,p_msg,s_msg
 
   -s, --stream-permissions <STREAM_PERMISSIONS>
-          Set stream permissions for created user
+          Set stream permissions for the user
 {CLAP_INDENT}
           Stream permissions are defined by each stream separately. Setting permission for stream
           allows to set each permission individually, by default, if no permission is provided
@@ -314,10 +311,10 @@ Options:
           Permissions format: STREAM_ID\[:STREAM_PERMISSIONS\]\[#TOPIC_ID\[:TOPIC_PERMISSIONS\]\]
 {CLAP_INDENT}
           Examples:
-           iggy user create guest guest -s 1:manage_topics,read_topics
-           iggy user create admin p@Ss! --stream-permissions 2:m_str,r_str,m_top,r_top,p_msg,s_msg
-           iggy user create sender s3n43r -s 3#1:s_msg#2:s_msg
-           iggy user create user1 test12 -s 4:manage_stream,r_top#1:s_msg,p_msg#2:manage_topic
+           iggy user permissions guest -s 1:manage_topics,read_topics
+           iggy user permissions admin --stream-permissions 2:m_str,r_str,m_top,r_top,p_msg,s_msg
+           iggy user permissions sender -s 3#1:s_msg#2:s_msg
+           iggy user permissions user1 -s 4:manage_stream,r_top#1:s_msg,p_msg#2:manage_topic
 
   -h, --help
           Print help (see a summary with '-h')
@@ -344,8 +341,8 @@ Arguments:
   <USER_ID>  User ID to update
 
 Options:
-  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for created user
-  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for created user
+  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for the user
+  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for the user
   -h, --help                                     Print help (see more with '--help')
 "#,
             ),

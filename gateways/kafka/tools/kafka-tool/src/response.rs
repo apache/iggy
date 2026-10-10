@@ -19,8 +19,9 @@
 
 use bytes::Bytes;
 use kafka_protocol::messages::{
-    ApiKey, ApiVersionsResponse, CreateTopicsResponse, FetchResponse, InitProducerIdResponse,
-    ListOffsetsResponse, MetadataResponse, ProduceResponse,
+    AlterConfigsResponse, ApiKey, ApiVersionsResponse, CreateTopicsResponse,
+    DescribeConfigsResponse, FetchResponse, InitProducerIdResponse, ListOffsetsResponse,
+    MetadataResponse, ProduceResponse,
 };
 use kafka_protocol::protocol::Decodable;
 
@@ -106,7 +107,7 @@ fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
     match api_key {
         0..=2 => error_code == 6, // Produce/Fetch/ListOffsets stub: NOT_LEADER_OR_FOLLOWER
         3 => error_code == 3,     // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
-        19 => error_code == 41,   // CreateTopics stub: NOT_CONTROLLER
+        19 | 32 | 33 => error_code == 41, // CreateTopics / DescribeConfigs / AlterConfigs stub
         _ => false,
     }
 }
@@ -352,6 +353,37 @@ fn decode_body(
                     "topics[{i}]: name={name} ec={} ({})",
                     t.error_code,
                     format_error_code(t.error_code)
+                ));
+            }
+        }
+        32 => {
+            let resp = DescribeConfigsResponse::decode(&mut buf, api_version)?;
+            details.push(format!("throttle_time_ms={}", resp.throttle_time_ms));
+            details.push(format!("results={}", resp.results.len()));
+            for (i, result) in resp.results.iter().enumerate().take(4) {
+                codes.push(result.error_code);
+                details.push(format!(
+                    "results[{i}]: type={} name={} ec={} ({}) configs={}",
+                    result.resource_type,
+                    result.resource_name,
+                    result.error_code,
+                    format_error_code(result.error_code),
+                    result.configs.len()
+                ));
+            }
+        }
+        33 => {
+            let resp = AlterConfigsResponse::decode(&mut buf, api_version)?;
+            details.push(format!("throttle_time_ms={}", resp.throttle_time_ms));
+            details.push(format!("responses={}", resp.responses.len()));
+            for (i, response) in resp.responses.iter().enumerate().take(4) {
+                codes.push(response.error_code);
+                details.push(format!(
+                    "responses[{i}]: type={} name={} ec={} ({})",
+                    response.resource_type,
+                    response.resource_name,
+                    response.error_code,
+                    format_error_code(response.error_code)
                 ));
             }
         }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { env } from '$env/dynamic/public';
-import type { ApiSchema } from '$lib/api/ApiSchema';
-import { tokens } from '$lib/utils/constants/tokens';
+import { PUBLIC_IGGY_API_URL } from '$app/env/public';
+import type { ApiSchema } from '#lib/api/ApiSchema.js';
+import { tokens } from '#lib/utils/constants/tokens.js';
 import { type Cookies } from '@sveltejs/kit';
 
 export async function fetchIggyApi(
@@ -34,7 +34,7 @@ export async function fetchIggyApi(
       if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
     }
 
-    let fullUrl = `${env.PUBLIC_IGGY_API_URL}${path}`;
+    let fullUrl = `${PUBLIC_IGGY_API_URL}${path}`;
 
     if (queryParams) {
       const query = new URLSearchParams(Object.entries(queryParams));

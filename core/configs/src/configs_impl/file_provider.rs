@@ -26,7 +26,7 @@ use figment::{
 use std::{env, path::Path};
 use tracing::{error, info, warn};
 
-const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
+pub(crate) const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocatedTarget {
@@ -448,7 +448,7 @@ mod tests {
         let unknown = unknown_env_names(
             names(&siblings).into_iter(),
             "IGGY_",
-            crate::server_config::server::SERVER_PROCESS_ENV_VARS,
+            &crate::server_config::server::server_process_env_vars().collect::<Vec<_>>(),
             crate::server_config::server::SERVER_ALLOWED_ENV_PREFIXES,
         );
         assert!(
@@ -483,16 +483,29 @@ mod tests {
     }
 
     /// The server reads these variables outside its config, so the boot check
-    /// must accept them. Without the `SERVER_PROCESS_ENV_VARS` chain in
+    /// must accept them. Without the `server_process_env_vars()` chain in
     /// `ServerConfig::config_provider`, a debug build refuses to boot.
     #[test]
     fn given_the_server_process_variables_when_checking_then_the_server_should_boot() {
-        let unknown =
-            server_unknown_env_names(crate::server_config::server::SERVER_PROCESS_ENV_VARS);
+        let process_env_vars =
+            crate::server_config::server::server_process_env_vars().collect::<Vec<_>>();
+        let unknown = server_unknown_env_names(&process_env_vars);
 
         assert!(
             unknown.is_empty(),
             "the boot check must accept every variable the server reads outside its config, got: {unknown:?}"
+        );
+    }
+
+    /// The integration harness forwards every `IGGY_*` variable to the servers
+    /// it starts, its own `IGGY_TEST_*` knobs included.
+    #[test]
+    fn given_test_harness_variables_when_checking_then_the_server_should_boot() {
+        let unknown = server_unknown_env_names(&["IGGY_TEST_VERBOSE", "IGGY_TEST_CHAOS_SEED"]);
+
+        assert!(
+            unknown.is_empty(),
+            "the boot check must accept the test harness knobs, got: {unknown:?}"
         );
     }
 

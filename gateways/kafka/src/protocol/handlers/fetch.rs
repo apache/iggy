@@ -73,7 +73,7 @@ const MAX_ROUND_TOPICS: usize = 100;
 /// How long Fetch answers 6 for an offset it cannot place before it acts on what it sees: a
 /// partition that reads as loading is polled, and an offset still past the end answers 1.
 ///
-/// A lag between Iggy nodes clears well within it. A purge or a recreated topic does not.
+/// A lag between Iggy nodes clears well within it. A recreated topic does not.
 const UNPLACED_GRACE: Duration = Duration::from_secs(30);
 /// How long the last good probe of a topic stands in while its refreshes fail.
 const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
@@ -1376,8 +1376,7 @@ fn forget_unplaced(unplaced: &Mutex<Unplaced>, topic: &str, partition: u32) {
 /// 6 for the connection's first [`UNPLACED_GRACE`] at that offset, then 1.
 ///
 /// A plain Iggy poll reads the replica of the node it reaches, so a node that lags can put an
-/// offset in range past its end. That clears within the grace. A purge or a recreated topic does
-/// not.
+/// offset in range past its end. That clears within the grace. A recreated topic does not.
 ///
 /// With no offset past 0 it stays 6, and warns once past the grace: Iggy reports that while it
 /// loads, fences or rebuilds a partition, and a 1 there would replay the partition from 0.
@@ -1410,7 +1409,7 @@ fn past_end(
             fetch_offset = offset,
             grace_secs = UNPLACED_GRACE.as_secs(),
             "Fetch cannot place the offset: Iggy reports no offset past 0 for the whole grace. \
-             Seek the consumer to 0 if the partition was purged"
+             Seek the consumer to 0 if the topic was recreated"
         );
     }
     ERROR_NOT_LEADER_OR_FOLLOWER

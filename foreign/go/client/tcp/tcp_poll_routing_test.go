@@ -193,7 +193,7 @@ func TestPrimaryPoll_MetadataReplyRefreshesRouteAndAttachment(t *testing.T) {
 	fixture := newPrimaryPollFixture(t, nil, nil)
 	_, err := pollPrimaryPartition(context.Background(), fixture.client, 0)
 	require.NoError(t, err)
-	_, err = fixture.client.SendBinaryRequest(context.Background(), uint32(command.PurgeTopicCode), nil)
+	_, err = fixture.client.SendBinaryRequest(context.Background(), uint32(command.DeleteTopicCode), nil)
 	require.NoError(t, err)
 	for range 2 {
 		_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
@@ -819,7 +819,7 @@ func TestPrimaryPoll_MetadataAcknowledgedWhileQueuedRefreshesBeforeAdmission(t *
 		_, err := fixture.client.pollOnRoute(context.Background(), key, payload, route)
 		completed <- err
 	}()
-	_, err = fixture.client.SendBinaryRequest(context.Background(), uint32(command.PurgeTopicCode), nil)
+	_, err = fixture.client.SendBinaryRequest(context.Background(), uint32(command.DeleteTopicCode), nil)
 	require.NoError(t, err)
 	<-slot.gate
 	select {

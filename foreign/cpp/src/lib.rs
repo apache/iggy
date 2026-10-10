@@ -490,7 +490,6 @@ mod ffi {
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
@@ -511,7 +510,6 @@ mod ffi {
             options: TopicUpdateOptions,
         ) -> Result<()>;
         fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
-        fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
             stream_id: Identifier,
