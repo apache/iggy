@@ -218,43 +218,64 @@ pub fn collect_comparable_files(root: &Path, include_wal: bool) -> BTreeMap<Stri
     files
 }
 
+/// Comparable file sizes in node order and every detected cross-replica mismatch.
+#[derive(Debug)]
+pub struct ReplicaDataComparison {
+    pub files: Vec<BTreeMap<String, usize>>,
+    pub problems: Vec<String>,
+}
+
 /// Byte-compare every comparable file across the given node data dirs,
 /// panicking with a per-file diff on any divergence.
-///
-/// Guards against a vacuous pass: node 0 must hold at least one produced
-/// segment, otherwise nothing was persisted and the comparison proves nothing.
 pub fn assert_replica_data_identical(data_paths: &[PathBuf], include_wal: bool) {
-    let per_node: Vec<BTreeMap<String, Vec<u8>>> = data_paths
-        .iter()
-        .map(|root| collect_comparable_files(root, include_wal))
-        .collect();
-
-    for (idx, node) in per_node.iter().enumerate() {
+    let comparison = compare_replica_data(data_paths, include_wal);
+    for (idx, node) in comparison.files.iter().enumerate() {
         eprintln!(
             "node {idx}: {} comparable file(s): {:?}",
             node.len(),
             node.iter()
-                .map(|(rel, bytes)| format!("{rel} ({} B)", bytes.len()))
+                .map(|(rel, size)| format!("{rel} ({size} B)"))
                 .collect::<Vec<_>>()
         );
     }
 
-    let node0 = &per_node[0];
     assert!(
-        node0
-            .keys()
-            .any(|k| k.starts_with("streams/") && k.ends_with(".log")),
-        "node 0 holds no segment .log under streams/ - no partition data was persisted, \
-         so the cross-replica comparison would be vacuous. Comparable files: {:?}",
-        node0.keys().collect::<Vec<_>>()
+        comparison.problems.is_empty(),
+        "cross-replica data divergence ({} issue(s)):\n{}",
+        comparison.problems.len(),
+        comparison.problems.join("\n")
     );
+}
+
+/// Byte-compare replica files without printing or asserting on mismatches.
+/// Node 0 must hold a segment; an empty comparison is reported as a problem.
+pub fn compare_replica_data(data_paths: &[PathBuf], include_wal: bool) -> ReplicaDataComparison {
+    let per_node: Vec<BTreeMap<String, Vec<u8>>> = data_paths
+        .iter()
+        .map(|root| collect_comparable_files(root, include_wal))
+        .collect();
+    let mut problems = Vec::new();
+    match per_node.first() {
+        Some(node0)
+            if !node0
+                .keys()
+                .any(|key| key.starts_with("streams/") && key.ends_with(".log")) =>
+        {
+            problems.push(format!(
+                "node 0 holds no segment .log under streams/ - no partition data was persisted, \
+                 so the cross-replica comparison would be vacuous. Comparable files: {:?}",
+                node0.keys().collect::<Vec<_>>()
+            ));
+        }
+        None => problems.push("no replica data paths were provided".to_owned()),
+        Some(_) => {}
+    }
 
     let all_keys: BTreeSet<&str> = per_node
         .iter()
         .flat_map(|node| node.keys().map(String::as_str))
         .collect();
 
-    let mut problems = Vec::new();
     for key in all_keys {
         let mut reference: Option<(usize, &[u8])> = None;
         for (idx, node) in per_node.iter().enumerate() {
@@ -276,12 +297,17 @@ pub fn assert_replica_data_identical(data_paths: &[PathBuf], include_wal: bool) 
         }
     }
 
-    assert!(
-        problems.is_empty(),
-        "cross-replica data divergence ({} issue(s)):\n{}",
-        problems.len(),
-        problems.join("\n")
-    );
+    ReplicaDataComparison {
+        files: per_node
+            .into_iter()
+            .map(|node| {
+                node.into_iter()
+                    .map(|(relative_path, bytes)| (relative_path, bytes.len()))
+                    .collect()
+            })
+            .collect(),
+        problems,
+    }
 }
 
 /// Human-readable first-difference report for one relative path across two nodes.
@@ -527,4 +553,107 @@ pub async fn leader_node_index_via(harness: &TestHarness, via: usize) -> usize {
                 .is_some_and(|address| address.port() == leader_port)
         })
         .expect("the leader must be one of the roster nodes")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use super::{assert_replica_data_identical, compare_replica_data};
+
+    const SEGMENT_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000000.log";
+    const NEXT_SEGMENT_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000010.log";
+    const INDEX_PATH: &str = "streams/1/topics/1/partitions/0/00000000000000000000.index";
+    const WAL_PATH: &str = "metadata/journal.wal";
+
+    #[test]
+    fn given_identical_segments_when_comparing_should_inventory_only_replicated_files() {
+        let directory = tempdir().unwrap();
+        let paths = [
+            directory.path().join("node0"),
+            directory.path().join("node1"),
+        ];
+        let payload = b"replicated messages";
+        for (index, path) in paths.iter().enumerate() {
+            write_file(path, SEGMENT_PATH, payload);
+            write_file(path, INDEX_PATH, &index.to_le_bytes());
+            write_file(path, WAL_PATH, &index.to_le_bytes());
+        }
+
+        let comparison = compare_replica_data(&paths, false);
+        assert!(comparison.problems.is_empty(), "{comparison:?}");
+        let expected = BTreeMap::from([(SEGMENT_PATH.to_owned(), payload.len())]);
+        assert_eq!(comparison.files, vec![expected.clone(), expected]);
+        assert_replica_data_identical(&paths, false);
+
+        let comparison = compare_replica_data(&paths, true);
+        assert_eq!(comparison.problems.len(), 1, "{comparison:?}");
+        assert!(comparison.problems[0].contains(WAL_PATH), "{comparison:?}");
+        assert!(
+            comparison.problems[0].contains("bytes differ"),
+            "{comparison:?}"
+        );
+    }
+
+    #[test]
+    fn given_divergent_and_missing_segments_when_comparing_should_report_both() {
+        let directory = tempdir().unwrap();
+        let paths = [
+            directory.path().join("node0"),
+            directory.path().join("node1"),
+        ];
+        write_file(&paths[0], SEGMENT_PATH, b"original");
+        write_file(&paths[1], SEGMENT_PATH, b"modified");
+        write_file(&paths[1], NEXT_SEGMENT_PATH, b"next segment");
+
+        let comparison = compare_replica_data(&paths, false);
+        assert_eq!(comparison.problems.len(), 2, "{comparison:?}");
+        assert!(
+            comparison.problems.iter().any(|problem| {
+                problem.contains(SEGMENT_PATH) && problem.contains("bytes differ")
+            }),
+            "{comparison:?}"
+        );
+        assert!(
+            comparison.problems.iter().any(|problem| {
+                problem.contains(NEXT_SEGMENT_PATH) && problem.contains("MISSING on node 0")
+            }),
+            "{comparison:?}"
+        );
+        assert!(!comparison.files[0].contains_key(NEXT_SEGMENT_PATH));
+        assert_eq!(
+            comparison.files[1].get(NEXT_SEGMENT_PATH),
+            Some(&b"next segment".len())
+        );
+    }
+
+    #[test]
+    fn given_no_segments_when_comparing_should_reject_vacuous_agreement() {
+        let directory = tempdir().unwrap();
+        let paths = [
+            directory.path().join("node0"),
+            directory.path().join("node1"),
+        ];
+        for path in &paths {
+            write_file(path, WAL_PATH, b"matching metadata");
+        }
+
+        for include_wal in [false, true] {
+            let comparison = compare_replica_data(&paths, include_wal);
+            assert_eq!(comparison.problems.len(), 1, "{comparison:?}");
+            assert!(comparison.problems[0].contains("vacuous"), "{comparison:?}");
+        }
+        let comparison = compare_replica_data(&[], false);
+        assert!(!comparison.problems.is_empty(), "{comparison:?}");
+    }
+
+    fn write_file(root: &Path, relative_path: &str, bytes: &[u8]) {
+        let path = root.join(relative_path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
 }

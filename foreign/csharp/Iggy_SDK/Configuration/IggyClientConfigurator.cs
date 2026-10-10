@@ -27,6 +27,11 @@ namespace Apache.Iggy.Configuration;
 /// </summary>
 public sealed class IggyClientConfigurator
 {
+    // The bounds Task.Delay and PeriodicTimer accept, which the reconnect loop and heartbeat run on. Below the
+    // minimum the delay truncates to zero and redials in a hot loop.
+    internal static readonly TimeSpan MinInterval = TimeSpan.FromMilliseconds(1);
+    internal static readonly TimeSpan MaxInterval = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
     /// <summary>
     ///     The base address of the Iggy server.
     /// </summary>
@@ -100,4 +105,37 @@ public sealed class IggyClientConfigurator
     ///     would silently skip the batch. Does not affect <see cref="Consumers.IggyConsumer" /> commit modes.
     /// </summary>
     public bool AllowAutoCommitWithEncryptor { get; set; }
+
+    /// <summary>
+    ///     Creates a TCP configuration from a connection string in the format shared by every Iggy SDK:
+    ///     <c>iggy://username:password@host:port?options</c>, or <c>iggy://token@host:port</c> to sign in with a
+    ///     personal access token. The <c>iggy+tcp://</c> scheme is accepted as well. The credentials become the
+    ///     <see cref="AutoLoginSettings" />; the remaining settings can still be changed on the returned instance, except
+    ///     <see cref="HeartbeatInterval" />, which is init-only: <c>heartbeat_interval</c> in the string is the only
+    ///     way to set it.
+    /// </summary>
+    /// <remarks>
+    ///     Credentials are taken literally: they are not percent-decoded and must not contain <c>@</c> or <c>:</c>.
+    ///     Supported options: <c>tls</c>, <c>tls_domain</c>, <c>tls_ca_file</c>, <c>reconnection_retries</c>
+    ///     (a count or <c>unlimited</c>), <c>reconnection_interval</c>, <c>heartbeat_interval</c>,
+    ///     <c>reestablish_after</c> and <c>nodelay</c>. Durations look like <c>500ms</c>, <c>5s</c> or <c>1m30s</c>.
+    ///     Reconnection defaults to unlimited retries every second, and after each reconnect the client still waits
+    ///     <see cref="ReconnectionSettings.WaitAfterReconnect" /> (1 second by default). <c>reestablish_after</c> is
+    ///     validated but ignored, since <c>reconnection_interval</c> paces every redial. <c>nodelay</c> is validated
+    ///     but ignored too: sockets are always opened with <c>NoDelay</c>, so <c>nodelay=false</c> does not turn
+    ///     Nagle back on. <c>tls=true</c> requires
+    ///     <c>tls_ca_file</c>, and one <c>tls_domain</c> covers every node the client dials.
+    ///     <c>reconnection_retries=0</c> turns reconnection off entirely, so the client does not reconnect after a
+    ///     lost connection either.
+    /// </remarks>
+    /// <param name="connectionString">The connection string.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="connectionString" /> is null.</exception>
+    /// <exception cref="FormatException">
+    ///     Thrown when the connection string is malformed, names a transport other than TCP or holds an unknown or
+    ///     invalid option. The message never contains the connection string itself.
+    /// </exception>
+    public static IggyClientConfigurator FromConnectionString(string connectionString)
+    {
+        return ConnectionString.Parse(connectionString);
+    }
 }

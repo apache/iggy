@@ -33,6 +33,14 @@ pub struct TestServerConfig {
     pub websocket_tls: Option<TlsConfig>,
     #[builder(default = true)]
     pub cleanup: bool,
+    /// Archive each previous process's captures before restarting. This forces
+    /// file capture even when `IGGY_TEST_VERBOSE` is set.
+    #[builder(default)]
+    pub preserve_logs_on_restart: bool,
+    /// Print complete captures on failure. Disabling this prints paths and
+    /// bounded tails, and forces file capture even with `IGGY_TEST_VERBOSE`.
+    #[builder(default = true)]
+    pub dump_logs_on_failure: bool,
     #[builder(default)]
     pub ip_kind: IpAddrKind,
     #[builder(default)]
@@ -80,5 +88,7 @@ mod tests {
         assert!(config.websocket_enabled);
         assert!(config.http_enabled);
         assert!(config.cleanup);
+        assert!(!config.preserve_logs_on_restart);
+        assert!(config.dump_logs_on_failure);
     }
 }

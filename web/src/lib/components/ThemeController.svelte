@@ -26,8 +26,8 @@ under the License.
 <script lang="ts">
   import { run } from 'svelte/legacy';
 
-  import { browser } from '$app/environment';
-  import { persistedStore } from '$lib/utils/persistedStore';
+  import { browser } from '$app/env';
+  import { persistedStore } from '#lib/utils/persistedStore.js';
 
   const setAppTheme = () => {
     if (!browser) return;
