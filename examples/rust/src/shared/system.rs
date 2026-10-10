@@ -28,8 +28,8 @@ pub async fn init_by_consumer(args: &Args, client: &dyn Client) {
         args.partition_id,
     );
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    let stream_id = stream_id.try_into().unwrap();
-    let topic_id = topic_id.try_into().unwrap();
+    let stream_id = Identifier::named(&stream_id).unwrap();
+    let topic_id = Identifier::named(&topic_id).unwrap();
     loop {
         interval.tick().await;
         info!("Validating if stream: {stream_id} exists..");
@@ -73,7 +73,7 @@ pub async fn init_by_consumer(args: &Args, client: &dyn Client) {
 }
 
 pub async fn init_by_producer(args: &Args, client: &dyn Client) -> Result<(), IggyError> {
-    let stream_id = args.stream_id.clone().try_into()?;
+    let stream_id = Identifier::named(&args.stream_id)?;
     let topic_name = args.topic_id.clone();
     let stream = client.get_stream(&stream_id).await?;
     if stream.is_some() {
@@ -114,8 +114,8 @@ pub async fn consume_messages(
         interval.map_or("none".to_string(), |i| i.as_human_time_string())
     );
 
-    let stream_id = args.stream_id.clone().try_into()?;
-    let topic_id = args.topic_id.clone().try_into()?;
+    let stream_id = Identifier::named(&args.stream_id)?;
+    let topic_id = Identifier::named(&args.topic_id)?;
     let mut interval = interval.map(|interval| tokio::time::interval(interval.get_duration()));
     let mut consumed_batches = 0;
     let consumer = Consumer {
