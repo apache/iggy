@@ -257,16 +257,20 @@ impl IggyConsumerState {
 
     /// Whether the offset last stored for the partition is at or ahead of `position`. A store made
     /// before anything was consumed from the partition has no captured context, so it is compared
-    /// with stores of every context rather than only within one incarnation and owner.
+    /// with stores of every context rather than only within one incarnation and owner. Such a
+    /// comparison never covers offset 0. Every record covers it, so a record from an earlier
+    /// incarnation of a recreated partition otherwise skips the first offset of the new one.
     fn stored_offset_covers(&self, position: ConsumerPosition) -> bool {
         let uncaptured = PartitionContext::default();
         self.last_stored_offsets
             .get(&position.partition_id)
             .is_some_and(|stored| {
-                (stored.context == uncaptured
-                    || position.context == uncaptured
-                    || same_incarnation_and_owner(stored.context, position.context))
-                    && position.offset <= stored.offset
+                let comparable = if stored.context == uncaptured || position.context == uncaptured {
+                    position.offset > 0
+                } else {
+                    same_incarnation_and_owner(stored.context, position.context)
+                };
+                comparable && position.offset <= stored.offset
             })
     }
 
@@ -876,7 +880,8 @@ impl IggyConsumer {
     /// An offset that is not ahead of the last one stored in the same captured context is
     /// skipped and `Ok(())` is returned without a request, unless the consumer was built with
     /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay). When either of the two
-    /// has no captured context, see below, they are compared regardless of context.
+    /// has no captured context, see below, they are compared regardless of context, and offset
+    /// `0` is never skipped.
     ///
     /// The offset is committed under the context of the latest message consumed from that
     /// partition, or without a captured context when nothing was consumed from it. An offset taken
@@ -997,7 +1002,7 @@ impl IggyConsumer {
     /// Both skip an offset that is not ahead of this consumer's own record of what it stored
     /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)) in the same captured context,
     /// or by a [`store_offset()`](Self::store_offset) made before anything was consumed from that
-    /// partition. Under auto-commit-on-poll (the default) that record trails the server by one
+    /// partition, which never covers offset `0`. Under auto-commit-on-poll (the default) that record trails the server by one
     /// batch, so every tick re-sends the reading position and the server, which takes an explicit
     /// store as is, moves its offset back to it until the next poll.
     ///
@@ -2373,6 +2378,26 @@ mod tests {
 
         assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
         assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+    }
+
+    /// A recreated partition starts again at 0, and the offset stored without a consumed position
+    /// can belong to its earlier incarnation, which the record cannot tell apart.
+    #[tokio::test]
+    async fn store_position_should_send_offset_zero_after_one_stored_without_a_consumed_position() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+
+        consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
+        consumer
+            .store_position(captured_position_at(0))
+            .await
+            .unwrap();
+
+        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET, 0]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(0));
     }
 
     #[tokio::test]

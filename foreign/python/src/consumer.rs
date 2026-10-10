@@ -129,7 +129,8 @@ impl IggyConsumer {
     /// A position that is not ahead of the last one stored under the same partition
     /// incarnation and owner is skipped without a request, unless the consumer was
     /// created with `allow_replay=True`. The same holds for an offset that
-    /// `store_offset()` stored before a message was consumed from the partition.
+    /// `store_offset()` stored before a message was consumed from the partition,
+    /// but a position at offset 0 is never skipped in that case.
     /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_position<'a>(
