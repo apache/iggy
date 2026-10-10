@@ -91,7 +91,15 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             let result = runtime.block_on(sink.open());
             self.id = id;
             self.sink = Some(sink);
-            if result.is_ok() { 0 } else { 1 }
+            match result {
+                Ok(()) => 0,
+                Err(_) => {
+                    // Connector errors may contain secrets from external clients.
+                    // Only the status is safe to log at this generic boundary.
+                    error!("Failed to open sink connector with ID: {id}");
+                    1
+                }
+            }
         }
     }
 
