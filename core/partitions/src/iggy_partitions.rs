@@ -734,9 +734,9 @@ where
         })
     }
 
-    /// Read `(end_offset, lagging, created_revision, applied_purge_generation)`
-    /// in one partition access. The caller compares this local history with
-    /// committed metadata before submitting the resolved watermark.
+    /// Read `(end_offset, lagging, created_revision)` in one partition access.
+    /// The caller compares this local history with committed metadata before
+    /// submitting the resolved watermark.
     /// No sealed segment permits a no-op on a converged history; a lagging
     /// replica must retry because it may be missing whole sealed segments.
     /// `None` means no local partition. The caller can record that no-op with
@@ -745,7 +745,7 @@ where
         &self,
         namespace: &IggyNamespace,
         count: u32,
-    ) -> Option<(Option<u64>, bool, u64, u64)> {
+    ) -> Option<(Option<u64>, bool, u64)> {
         self.with_partition(namespace, |partition| {
             let consensus = partition.consensus();
             let lagging = consensus.is_follower()
@@ -756,7 +756,6 @@ where
                 partition.nth_oldest_sealed_end_offset(count),
                 lagging,
                 partition.created_revision(),
-                partition.applied_purge_generation(),
             )
         })
     }

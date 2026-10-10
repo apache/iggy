@@ -51,7 +51,9 @@ use crate::stm::user::UsersSnapshot;
 /// Version 7: session protection no longer stores a payload fingerprint.
 ///
 /// Version 8: streams persist the revision of their partition incarnations.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 8;
+///
+/// Version 10: `PartitionSnapshot` dropped `purge_generation`.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 10;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -576,7 +578,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 8;
+        const PINNED_VERSION: u32 = 10;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -606,8 +608,9 @@ mod tests {
         // keeps version 3 readable, so a further append here needs the same
         // treatment or a bump.
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
-        // Version 5 appended `created_view` the same way.
-        const PARTITION_FIELD_COUNT: u32 = 7;
+        // Version 5 appended `created_view` the same way. Version 10 dropped
+        // `purge_generation` from the middle, which no default can cover.
+        const PARTITION_FIELD_COUNT: u32 = 6;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -651,7 +654,6 @@ mod tests {
             created_at: IggyTimestamp::default(),
             created_revision: 0,
             deleted_up_to_offset: 0,
-            purge_generation: 0,
             created_view: 0,
         };
         let encoded = rmp_serde::to_vec(&partition).unwrap();
@@ -858,7 +860,6 @@ mod tests {
                                 created_at: ts,
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
-                                purge_generation: 0,
                                 created_view: 0,
                             }],
                             consumer_groups: Vec::new(),

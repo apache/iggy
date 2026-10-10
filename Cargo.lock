@@ -7053,6 +7053,7 @@ version = "0.5.1-edge.1"
 dependencies = [
  "axum",
  "axum-server",
+ "clap",
  "configs",
  "configs_derive",
  "dirs 7.0.0",
@@ -10145,7 +10146,6 @@ dependencies = [
  "message_bus",
  "nix",
  "papaya",
- "ringbuffer",
  "server_common",
  "smallvec",
  "tempfile",

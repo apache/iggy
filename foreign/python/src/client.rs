@@ -691,40 +691,6 @@ impl IggyClient {
         })
     }
 
-    /// Delete all messages from every topic in a stream.
-    ///
-    /// The stream, topics, and partitions remain available. Repeated purges of an
-    /// existing empty stream succeed. `stream_id` accepts a stream name as `str`
-    /// or numeric ID as `int`. A decimal-only string is interpreted as a numeric
-    /// ID.
-    ///
-    /// Returns:
-    ///     None.
-    ///
-    /// Raises:
-    ///     TypeError: If `stream_id` is not `str` or an integer in
-    ///         `0..=2**32 - 1`.
-    ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
-    ///     RuntimeError: If the client is not authenticated, the user lacks global
-    ///         `manage_streams` or per-stream `manage_stream` permission, the
-    ///         stream does not exist, or the request fails.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
-    fn purge_stream<'a>(
-        &self,
-        py: Python<'a>,
-        stream_id: PyIdentifier,
-    ) -> PyResult<Bound<'a, PyAny>> {
-        let stream_id = Identifier::try_from(stream_id)?;
-        let inner = self.inner.clone();
-        future_into_py(py, async move {
-            inner
-                .purge_stream(&stream_id)
-                .await
-                .map_err(to_runtime_error)?;
-            Ok(())
-        })
-    }
-
     /// Creates a new topic with the given parameters.
     ///
     /// Args:
@@ -971,37 +937,6 @@ impl IggyClient {
         future_into_py(py, async move {
             inner
                 .delete_topic(&stream_id, &topic_id)
-                .await
-                .map_err(to_runtime_error)?;
-            Ok(())
-        })
-    }
-
-    /// Purge all messages from a topic.
-    ///
-    /// Args:
-    ///     stream_id: Stream identifier as `str | int`.
-    ///     topic_id: Topic identifier as `str | int`.
-    ///
-    /// Returns:
-    ///     An awaitable that resolves to `None` when the topic is purged.
-    ///
-    /// Raises:
-    ///     RuntimeError: If an identifier is invalid or the request fails.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
-    fn purge_topic<'a>(
-        &self,
-        py: Python<'a>,
-        stream_id: PyIdentifier,
-        topic_id: PyIdentifier,
-    ) -> PyResult<Bound<'a, PyAny>> {
-        let stream_id = Identifier::try_from(stream_id)?;
-        let topic_id = Identifier::try_from(topic_id)?;
-        let inner = self.inner.clone();
-
-        future_into_py(py, async move {
-            inner
-                .purge_topic(&stream_id, &topic_id)
                 .await
                 .map_err(to_runtime_error)?;
             Ok(())
