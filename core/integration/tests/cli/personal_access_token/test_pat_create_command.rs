@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, OverWebSocket, TestHelpCmd,
+    USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -114,6 +115,20 @@ pub async fn should_be_successful() {
             String::from("sensor"),
             Some(vec!["3weeks".to_owned()]),
         ))
+        .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_be_successful_using_transport_ws() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestPatCreateCmd::new(
+            String::from("main"),
+            None,
+        )))
         .await;
 }
 
