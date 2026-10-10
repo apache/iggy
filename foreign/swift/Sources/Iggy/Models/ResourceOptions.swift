@@ -157,12 +157,6 @@ enum OptionsBlock {
     /// Reads a `u32`-length-prefixed block; every caller decodes it next,
     /// which validates it.
     static func readPrefixed(from reader: inout ByteReader) throws -> ArraySlice<UInt8> {
-        let declared = try reader.readUInt32()
-        // A length that does not fit the platform's Int cannot be in the
-        // buffer either; report it as truncation rather than trapping.
-        guard let length = Int(exactly: declared) else {
-            throw WireError.truncated(offset: reader.position, need: Int.max, have: reader.remaining)
-        }
-        return try reader.readBytes(length)
+        try reader.readPrefixedBytes()
     }
 }
