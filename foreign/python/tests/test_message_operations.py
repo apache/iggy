@@ -33,6 +33,8 @@ from apache_iggy import (
 )
 from apache_iggy import SendMessage as Message
 
+from .utils import wait_for_consumer_group_assignment
+
 
 class TestPartitioning:
     """Test message partitioning strategy construction."""
@@ -1641,6 +1643,9 @@ class TestMessageOperations:
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
         for partition_id in range(partitions_count):
             await iggy_client.send_messages(
                 stream=stream_name,
@@ -1717,6 +1722,9 @@ class TestMessageOperations:
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
         for partition_id in range(partitions_count):
             await iggy_client.send_messages(
                 stream=stream_name,
@@ -1758,6 +1766,9 @@ class TestMessageOperations:
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
         await iggy_client.send_messages(
             stream=stream_name,
             topic=topic_name,

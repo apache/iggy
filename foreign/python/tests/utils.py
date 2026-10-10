@@ -164,6 +164,61 @@ async def wait_for_ping(
             await asyncio.sleep(interval)
 
 
+async def wait_for_consumer_group_assignment(
+    client: IggyClient,
+    stream: str | int,
+    topic: str | int,
+    group: str | int,
+    members_count: int,
+    timeout: float = 10,
+    interval: float = 0.1,
+) -> None:
+    """
+    Wait until the consumer group has the expected members and they own every partition.
+
+    A join commits the membership at once, but a member's partitions become active
+    only after each partition installs the new owner. Until then, the member owns no
+    partitions, so group polls and offset operations come back empty or fail. The
+    wait also requires a balanced assignment: one owner per partition, and member
+    partition counts that differ by at most one.
+
+    Args:
+        client: Iggy client instance
+        stream: Stream identifier
+        topic: Topic identifier
+        group: Consumer group identifier
+        members_count: Number of members the group must have
+        timeout: Maximum time to wait in seconds
+        interval: Time between checks in seconds
+
+    Raises:
+        AssertionError: If the group does not exist or a partition has two owners
+        TimeoutError: If the assignment does not converge within timeout
+    """
+    deadline = time.monotonic() + timeout
+
+    while True:
+        details = await client.get_consumer_group(stream, topic, group)
+        assert details is not None, f"Consumer group {group!r} does not exist"
+        owners = [(member.id, member.partitions) for member in details.members]
+        owned = [partition for _, partitions in owners for partition in partitions]
+        assert len(owned) == len(set(owned)), f"Duplicate partition owner: {owners}"
+        counts = [len(partitions) for _, partitions in owners]
+        if (
+            details.members_count == members_count
+            and (members_count == 0 or len(owned) == details.partitions_count)
+            and max(counts, default=0) - min(counts, default=0) <= 1
+        ):
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Consumer group {group!r} did not converge to {members_count} "
+                f"member(s) owning its {details.partitions_count} partitions within "
+                f"{timeout}s. Last (member id, partitions): {owners}"
+            )
+        await asyncio.sleep(interval)
+
+
 def unique_credentials(unique_name) -> tuple[str, str]:
     """Return a unique (username, password) pair within the server limits."""
     username = unique_name(max_bytes=MAX_USERNAME_BYTES)
