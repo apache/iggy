@@ -40,4 +40,9 @@ final class PartitionsTcpClient implements PartitionsClient {
     public void deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount) {
         FutureUtil.resolve(delegate.deletePartitions(streamId, topicId, partitionsCount));
     }
+
+    @Override
+    public void deleteSegments(StreamId streamId, TopicId topicId, Long partitionId, Long segmentsCount) {
+        FutureUtil.resolve(delegate.deleteSegments(streamId, topicId, partitionId, segmentsCount));
+    }
 }

@@ -180,6 +180,21 @@ public interface CommandCode {
         }
     }
 
+    enum Segment implements CommandCode {
+        DELETE(503);
+
+        private final int value;
+
+        Segment(int value) {
+            this.value = value;
+        }
+
+        @Override
+        public int getValue() {
+            return value;
+        }
+    }
+
     enum ConsumerGroup implements CommandCode {
         GET(600),
         GET_ALL(601),

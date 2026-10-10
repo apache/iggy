@@ -72,4 +72,33 @@ public interface PartitionsClient {
      * @return A CompletableFuture that completes when the operation is done
      */
     CompletableFuture<Void> deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount);
+
+    /**
+     * Deletes the oldest sealed segments from a partition asynchronously.
+     *
+     * <p>The active segment is never deleted. Deletion stops at the lowest offset any consumer or
+     * consumer group has committed, so fewer than the requested number of segments may be removed.
+     * Requires authentication and the permission to manage segments. The returned future completes
+     * when the metadata commit is done, before the segment files are removed from disk.
+     *
+     * @param streamId The stream identifier (numeric ID)
+     * @param topicId The topic identifier (numeric ID)
+     * @param partitionId The partition identifier
+     * @param segmentsCount The number of segments to delete
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    default CompletableFuture<Void> deleteSegments(Long streamId, Long topicId, Long partitionId, Long segmentsCount) {
+        return deleteSegments(StreamId.of(streamId), TopicId.of(topicId), partitionId, segmentsCount);
+    }
+
+    /**
+     * Deletes the oldest sealed segments from a partition asynchronously.
+     *
+     * @param streamId The stream identifier
+     * @param topicId The topic identifier
+     * @param partitionId The partition identifier
+     * @param segmentsCount The number of segments to delete
+     * @return A CompletableFuture that completes when the operation is done
+     */
+    CompletableFuture<Void> deleteSegments(StreamId streamId, TopicId topicId, Long partitionId, Long segmentsCount);
 }
