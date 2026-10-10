@@ -44,15 +44,15 @@ internal sealed class ConsumerGroupClientState
     /// <summary>
     ///     How long a cached assignment is trusted before the next poll asks the coordinator again. A rebalance
     ///     that took a partition away shows up as a fenced poll long before this expires; the periodic re-sync
-    ///     catches what fencing cannot, such as a member holding zero partitions being handed one, which no poll
-    ///     of its own would ever reveal. Matches the Go SDK's <c>assignmentRefreshInterval</c>.
+    ///     catches what fencing cannot, such as a member being handed one more partition, which no poll of its
+    ///     own would ever reveal. Matches the Go SDK's <c>assignmentRefreshInterval</c>.
     /// </summary>
     internal static readonly long AssignmentRefreshMs = 5_000;
 
     /// <summary>
-    ///     True when a fresh assignment is cached for the group, even one holding zero partitions. Treating an
-    ///     empty assignment as missing would re-sync on every poll of a member that owns nothing; treating it as
-    ///     fresh forever would leave that member polling nothing until an unrelated heartbeat refreshed it.
+    ///     True when a fresh assignment holding at least one partition is cached for the group. As in the Rust SDK,
+    ///     an empty one is synced again on every poll: a join returns before the member owns anything, and it gets
+    ///     each partition only once that partition installs it as the owner.
     /// </summary>
     internal bool HasAssignment(GroupKey key)
     {
@@ -63,7 +63,9 @@ internal sealed class ConsumerGroupClientState
     {
         lock (_gate)
         {
-            return _assignments.TryGetValue(key, out var assignment) && now < assignment.RefreshAt;
+            return _assignments.TryGetValue(key, out var assignment)
+                   && assignment.Partitions.Count > 0
+                   && now < assignment.RefreshAt;
         }
     }
 

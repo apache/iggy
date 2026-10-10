@@ -39,7 +39,7 @@ public sealed class GroupPollingTests
     private const int PollMessagesCode = CommandCodes.POLL_MESSAGES_CODE;
 
     [Fact]
-    public async Task given_member_holding_no_partitions_when_polled_twice_should_report_no_assignment_and_sync_once()
+    public async Task given_member_holding_no_partitions_when_polled_twice_should_report_no_assignment_and_sync_twice()
     {
         using var node = new MockNode();
         node.Serve(request => request.Code == SyncGroupCode
@@ -54,9 +54,33 @@ public sealed class GroupPollingTests
         Assert.Empty(first.Messages);
         Assert.Equal(PolledMessages.NoAssignedPartition, second.PartitionId);
         Assert.Empty(second.Messages);
-        // The empty assignment is cached: a member that owns nothing must not re-sync on every poll.
-        Assert.Equal(1, node.Requests(SyncGroupCode));
+        Assert.Equal(2, node.Requests(SyncGroupCode));
         Assert.Equal(0, node.Requests(PollMessagesCode));
+    }
+
+    [Fact]
+    public async Task given_empty_assignment_when_polled_again_should_resync_and_poll_the_assigned_partition()
+    {
+        using var node = new MockNode();
+        var syncs = 0;
+        node.Serve(request => request.Code switch
+        {
+            // A join returns before any partition installs the new member as its owner.
+            SyncGroupCode => Reply(OPERATION_NON_REPLICATED,
+                ++syncs == 1 ? AssignmentBody(1, []) : AssignmentBody(2, [7])),
+            PollMessagesCode => Reply(request.Operation, EmptyBatchBody(7)),
+            GET_CLUSTER_METADATA_CODE => StandaloneRoster(node.Port),
+            _ => Answer(request)
+        });
+        using var client = await ConnectAsync(node);
+
+        var first = await PollOnceAsync(client);
+        var second = await PollOnceAsync(client);
+
+        Assert.Equal(PolledMessages.NoAssignedPartition, first.PartitionId);
+        Assert.Equal(7u, second.PartitionId);
+        Assert.Equal(2, node.Requests(SyncGroupCode));
+        Assert.Equal(1, node.Requests(PollMessagesCode));
     }
 
     [Fact]
