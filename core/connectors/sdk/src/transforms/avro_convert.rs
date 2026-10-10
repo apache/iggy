@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use super::{Transform, TransformType};
 use crate::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use crate::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
-use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata};
+use crate::{DecodedMessage, Error, Payload, Schema, TopicMetadata, convert::apply_field_mappings};
 use crate::{StreamDecoder, StreamEncoder};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,36 +68,14 @@ impl AvroConvert {
         Self::new(AvroConvertConfig::default())
     }
 
-    fn apply_field_mappings(
+    fn apply_field_transformations(
         &self,
         payload: Payload,
         field_mappings: &HashMap<String, String>,
-    ) -> Result<Payload, Error> {
-        match payload {
-            Payload::Json(json_value) => {
-                if let simd_json::OwnedValue::Object(mut map) = json_value {
-                    let mut new_entries = Vec::new();
-
-                    for (key, value) in map.iter() {
-                        if let Some(new_key) = field_mappings.get(key) {
-                            new_entries.push((new_key.clone(), value.clone()));
-                        } else {
-                            new_entries.push((key.clone(), value.clone()));
-                        }
-                    }
-
-                    map.clear();
-                    for (key, value) in new_entries {
-                        map.insert(key, value);
-                    }
-
-                    Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                } else {
-                    Ok(Payload::Json(json_value))
-                }
-            }
-            other => Ok(other),
-        }
+    ) -> Payload {
+        apply_field_mappings(payload, |key| {
+            field_mappings.get(&key).cloned().unwrap_or(key)
+        })
     }
 }
 
@@ -112,7 +90,7 @@ impl Transform for AvroConvert {
         mut message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
         if let Some(field_mappings) = &self.config.field_mappings {
-            message.payload = self.apply_field_mappings(message.payload, field_mappings)?;
+            message.payload = self.apply_field_transformations(message.payload, field_mappings);
         }
 
         message.payload = match (&self.config.source_format, &self.config.target_format) {

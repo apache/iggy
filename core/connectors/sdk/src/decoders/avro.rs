@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamDecoder};
+use crate::{Error, Payload, Schema, StreamDecoder, convert::apply_field_mappings};
 use apache_avro::Schema as AvroSchema;
 use apache_avro::reader::datum::GenericDatumReader;
 use serde::{Deserialize, Serialize};
@@ -166,43 +166,18 @@ impl AvroStreamDecoder {
             Error::CannotDecode(Schema::Avro)
         })?;
 
-        let transformed = self.apply_field_transformations(Payload::Json(json_value))?;
-        Ok(transformed)
+        Ok(self.apply_field_transformations(Payload::Json(json_value)))
     }
 
     fn decode_as_raw(&self, payload: Vec<u8>) -> Result<Payload, Error> {
         Ok(Payload::Avro(payload))
     }
 
-    fn apply_field_transformations(&self, payload: Payload) -> Result<Payload, Error> {
+    fn apply_field_transformations(&self, payload: Payload) -> Payload {
         if let Some(mappings) = &self.config.field_mappings {
-            match payload {
-                Payload::Json(json_value) => {
-                    if let simd_json::OwnedValue::Object(mut map) = json_value {
-                        let mut new_entries = Vec::new();
-
-                        for (key, value) in map.iter() {
-                            if let Some(new_key) = mappings.get(key) {
-                                new_entries.push((new_key.clone(), value.clone()));
-                            } else {
-                                new_entries.push((key.clone(), value.clone()));
-                            }
-                        }
-
-                        map.clear();
-                        for (key, value) in new_entries {
-                            map.insert(key, value);
-                        }
-
-                        Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                    } else {
-                        Ok(Payload::Json(json_value))
-                    }
-                }
-                other => Ok(other),
-            }
+            apply_field_mappings(payload, |key| mappings.get(&key).cloned().unwrap_or(key))
         } else {
-            Ok(payload)
+            payload
         }
     }
 }
