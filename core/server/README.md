@@ -10,6 +10,16 @@ Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP 
 cargo run --bin iggy-server --release
 ```
 
+Missing or empty storage is initialized automatically. Existing incompatible
+storage is refused without modification. `--fresh` deletes existing data in
+the configured system path and must be an explicit reset, never a restart
+default. A new cluster starts automatically when its metadata WAL and
+superblock are absent. A node with retained metadata rejoins through recovery.
+Loss of a replica's entire metadata directory is outside the automatic recovery
+guarantee, including loss on every replica. Empty metadata cannot distinguish a
+new cluster from a previously used one. Restore a verified consistent backup
+through a validated recovery procedure before restarting erased metadata disks.
+
 The Docker image `apache/iggy:latest` ships the server together with the CLI; the `edge` tag tracks the latest development build.
 
 The image binds every listener to `0.0.0.0` so the container is reachable from outside it. A wildcard bind says which interfaces accept connections, not where a client reaches the server, so the address to publish in cluster metadata has to be supplied and the server refuses to start without it. On a single host with published ports that address is `localhost`:
@@ -27,7 +37,7 @@ To run one node of a cluster, pass its replica ID from the `cluster.nodes` roste
 cargo run --bin iggy-server --release -- --replica-id 0
 ```
 
-`--replica-id` is the only command line argument; everything else is configuration.
+Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
 ## Configuration
 
@@ -41,22 +51,68 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
-During a rolling upgrade from `server-0.9.0`, stop HTTP clients until every
-server runs the new version. A `server-0.9.0` node seeds its HTTP client id
-counter from the ids that newer nodes mint, so it can mint an id that a newer
-node also mints. If two HTTP sessions share a client id, the server can
-acknowledge a write of one session from the deduplication record of the other
-and not append it.
+Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
+share a logical session across connections. Command 14 is retired. Primary
+polling uses commands 103 and 104; offset routing uses 123. Disconnecting a
+connection does not log out its logical session. Server-observed activity renews
+the session lease, and expiry or explicit logout retires it before capacity is
+reused.
 
-For cluster auto-commit consumers, upgrade all servers and binary SDKs together.
-Pause those consumers, upgrade every server, then update their SDKs and restart
-them to rejoin their groups. Primary polling uses binary commands 14, 103 and
-104; routed manual and interval offset writes also use command 123.
-Older SDKs can lose membership when a backup refuses an offset commit,
-and new SDKs require servers supporting those commands. HTTP polling is
-forwarded by the server and keeps its existing client API.
+External group offsets belong to groups managed outside Iggy, such as a Kafka
+gateway. They require no Iggy group membership and can exceed the partition's
+message-offset range.
+
+The bind proof is an independent session credential. Password changes and PAT
+revocation or expiry do not end an established session. Binding checks that the
+owner still exists and is active; current permissions still govern each request.
+Explicit logout, lease expiry and user deactivation end session access.
+
+`clients_table_max` and `dedup_clients_max` nominate immutable limits when the
+first operation commits in each metadata or partition group. Recovery and state
+transfer preserve those committed limits. Configuration changes affect groups
+that have not committed a limit yet; existing groups log a mismatch and retain
+their committed capacity. At capacity, new sessions or writers are refused until
+ordered retirement releases slots. Live retry protection is never evicted.
+
+HTTP writes using one session and partition serialize through the previous
+write's reply or bounded deadline. With `ack=none`, a request returns 202 after
+its dispatch, while the next request to that partition waits for the previous
+write to settle. Waiters acquire the in-flight permit after the partition gate,
+so they do not consume the session's budget for other partitions.
+
+Durability defaults remain `Replicated`, and ordinary SDK sends and explicit
+offset writes support the configured policy. Crash-safe send retries require
+`Persisted`; crash-safe explicit offset retries require `Persisted` and
+`Quorum`. Weaker policies can lose data and receipts on a crash. A retained
+receipt still replays its original result, but a lost receipt cannot prevent
+another execution. NoAck and internal auto-commit polls retain their weaker
+completion contracts.
 
 ## Upgrade recovery
+
+This release changes protocol and storage formats. Servers and compatible
+clients deploy together; mixed versions and rolling upgrades are unsupported.
+Peers verify protocol, release and storage-format identity before admission.
+Executable packaging does not affect that identity, so stripping or rebuilding
+the same compatible release does not by itself prevent a replica from joining.
+
+This checkout uses development protocol 0.11.1. Finalize its version and minimum
+before the next stable release. Released `server-0.9.0` uses protocol 0.11.0 and
+accepts every 0.11.x patch. An incompatible release therefore needs a new minor
+protocol version, such as 0.12.0, for that released server to reject new clients
+before decoding their login.
+
+The protocol number is independent of server and SDK package versions. Its
+current and minimum values are maintained manually for stable releases. The
+client login gate checks the full inclusive range, including patch versions.
+Both bounds stay equal unless compatibility with older released protocols is
+explicitly supported. Edge builds require matching clients and servers, even
+when their protocol numbers match.
+
+An unsupported data directory is refused before WAL scanning or file changes.
+Replacing the binary does not migrate old data. Restore or migrate retained data
+only through a separately verified procedure; copying a format marker is not
+a migration.
 
 Partition recovery refuses a superblock whose nonzero `log_view`
 is below the partition's committed `created_view`. It also refuses a WAL
@@ -110,6 +166,41 @@ In every other case:
 There is no automatic in-place migration for below-floor log certificates. Do not edit
 view numbers or delete superblocks or WAL directories to bypass the refusal:
 an empty history could then replace committed data during a view change.
+
+Before a partition can serve, initialization publishes its incarnation in
+`partition-initialization/<namespace>/created.revision` under the system data
+directory. This atomic record remains outside the partition directory, including
+after that directory is lost. Preserve it with metadata and partition backups.
+Storage format `IGGY-NO-PURGE-1` requires this initialization contract;
+older data directories are refused before mutation.
+
+Retirement also writes `retirement.fence` in that external namespace directory
+before counting a permanently failed partition as retired. The fence names the
+failed incarnation and keeps it offline on subsequent boots, even if its
+partition directory is replaced. Healthy partitions and new logins can continue.
+If the fence cannot be persisted, the session remains retained and retirement
+retries. Temporary teardown tombstones and state transfer do not qualify as
+permanent failures.
+
+Partition retirement barriers batch up to 128 ended sessions per commit. Each
+session still requires retirement reports covering every allocated partition
+from a common replica quorum before metadata releases its registry slot. Segment
+deletion does not invalidate those reports; changes to partition incarnations
+do. Metadata snapshot format 10 persists that separate revision.
+
+A committed partition that has never initialized on this replica can finish
+initialization after a crash, including when all replicas stopped before their
+first WAL frontiers were published. An initialized partition with no durable
+prepare-WAL frontier remains fenced as missing history. A singleton refuses to
+serve it; a replicated partition requires history from a healthy peer. If every
+replica lost initialized history, restarting does not clear the fence.
+
+Preserve the files and restore a verified consistent backup or use a validated
+recovery procedure. If the partition is independently known to be empty, or its
+data may be discarded, delete and recreate it through the metadata API. This
+creates a new partition incarnation and removes the old data. Missing files
+alone are not evidence that discarding that data is safe. Do not create a WAL
+frontier or remove initialization records or recovery fences manually.
 
 ## Systemd integration
 

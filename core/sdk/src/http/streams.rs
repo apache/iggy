@@ -95,15 +95,6 @@ impl StreamClient for HttpClient {
             .await?;
         Ok(())
     }
-
-    async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.delete(&format!(
-            "{}/purge",
-            get_details_path(&stream_id.as_cow_str())
-        ))
-        .await?;
-        Ok(())
-    }
 }
 
 fn get_details_path(stream_id: &str) -> String {

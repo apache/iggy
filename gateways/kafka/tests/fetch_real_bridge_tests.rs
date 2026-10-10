@@ -166,30 +166,39 @@ fn unmappable() -> IggyMessage {
         .expect("valid message")
 }
 
-/// Purges the topic, and waits until every partition reads empty.
-async fn purge(server: &TestServer) {
+/// Deletes the topic, creates it again through the gateway's bridge, and waits until each of its
+/// `partitions` reads empty.
+async fn recreate(server: &TestServer, state: &GatewayState, partitions: u32) {
     let client = raw_client(server).await;
     let stream = Identifier::named(STREAM).expect("valid stream name");
     let topic = Identifier::named(TOPIC).expect("valid topic name");
     client
-        .purge_topic(&stream, &topic)
+        .delete_topic(&stream, &topic)
         .await
-        .expect("purge the topic");
+        .expect("delete the topic");
+    state
+        .bridge
+        .as_ref()
+        .expect("the gateway has a bridge")
+        .ensure_stream_and_topic(TOPIC, partitions)
+        .await
+        .expect("create the topic again");
     let deadline = Instant::now() + PROMPT;
     loop {
-        let details = client
+        let empty = client
             .get_topic(&stream, &topic)
             .await
             .expect("read the topic")
-            .expect("the topic outlives a purge");
-        let empty = details
-            .partitions
-            .iter()
-            .all(|partition| partition.current_offset == 0 && partition.messages_count == 0);
+            .is_some_and(|details| {
+                details.partitions_count == partitions
+                    && details.partitions.iter().all(|partition| {
+                        partition.current_offset == 0 && partition.messages_count == 0
+                    })
+            });
         if empty {
             return;
         }
-        assert!(Instant::now() < deadline, "the purge never showed");
+        assert!(Instant::now() < deadline, "the new topic never read empty");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -296,7 +305,7 @@ fn values(partition: &PartitionData) -> Vec<Option<Bytes>> {
 fn assert_refused(partition: &PartitionData, code: i16) {
     assert_eq!(partition.error_code, code);
     assert_eq!(partition.high_watermark, UNKNOWN_OFFSET);
-    assert!(records(partition).is_empty());
+    assert_eq!(records(partition), []);
 }
 
 #[tokio::test]
@@ -484,7 +493,7 @@ async fn given_offset_at_high_watermark_when_fetching_should_wait_and_return_emp
     let partition = only(&response);
     assert_eq!(partition.error_code, ERROR_NONE);
     assert_eq!(partition.high_watermark, 2);
-    assert!(records(partition).is_empty());
+    assert_eq!(records(partition), []);
 }
 
 #[tokio::test]
@@ -554,7 +563,7 @@ async fn given_minus_one_holds_on_two_connections_when_both_retry_should_keep_ea
     }
 
     // A read of partition 0 now finds nothing, so only a hold answers -1 there.
-    purge(&server).await;
+    recreate(&server, &state, 2).await;
     let at = |offset| request(TOPIC, &[(0, offset)]).with_max_wait_ms(0);
     assert_refused(
         only(&fetch_on(&state, &stuck_at_1, &at(1)).await),
@@ -587,7 +596,7 @@ async fn given_zero_max_wait_when_fetching_should_answer_at_once() {
         let partition = only(&response);
         assert_eq!(partition.error_code, ERROR_NONE);
         assert_eq!(partition.high_watermark, 0);
-        assert!(records(partition).is_empty());
+        assert_eq!(records(partition), []);
     }
 }
 
@@ -631,7 +640,7 @@ async fn given_an_empty_partition_when_fetching_past_it_should_answer_6_after_th
     let response = fetch(&state, &at_start).await;
     let partition = only(&response);
     assert_eq!(partition.error_code, ERROR_NONE, "caught up, not refused");
-    assert!(records(partition).is_empty());
+    assert_eq!(records(partition), []);
 }
 
 #[tokio::test]

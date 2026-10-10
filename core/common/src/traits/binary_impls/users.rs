@@ -186,36 +186,21 @@ impl<B: BinaryClient> UserClient for B {
         super::validate_password(password)?;
         super::logout_before_relogin(self).await?;
         let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
-        let response = match self
+        let response = self
             .send_raw_with_response(
                 LOGIN_REGISTER_CODE,
                 LoginRegisterRequest {
                     version_info: super::rust_sdk_version_info(self.sdk_version())?,
+                    bind_secret: self.session_bind_secret().await?,
                     username: wire_name,
                     password: SecretString::from(password.to_string()),
                     client_context: None,
                 }
                 .to_bytes(),
             )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
-            Ok(wire_resp) => wire_resp,
-            Err(error) => {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-        };
-        if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
-            self.reset_vsr_session().await?;
-            return Err(error);
-        }
+            .await?;
+        let wire_resp = super::decode_response::<LoginRegisterResponse>(&response)?;
+        self.bind_vsr_session(wire_resp.session).await?;
         tracing::debug!(
             server_version = %wire_resp.server_version,
             server_protocol_version = wire_resp.server_protocol_version,

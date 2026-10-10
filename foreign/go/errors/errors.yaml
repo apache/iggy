@@ -791,6 +791,10 @@
   code: 3013
   format: "partition id space exhausted for this topic"
   fields: []
+- name: PartitionHistoryChanged
+  code: 3014
+  format: "partition history changed after the request was resolved"
+  fields: []
 - name: SegmentNotFound
   code: 4000
   format: "segment not found"
@@ -1303,3 +1307,14 @@
       type: uint32
     - name: ServerVersionMax
       type: uint32
+- name: SessionMismatch
+  code: 14004
+  format: "vsr session mismatch: requested %d, server bound %d"
+  fields:
+    - name: Requested
+      type: uint64
+    - name: Bound
+      type: uint64
+- name: RequestIdExhausted
+  code: 14005
+  format: "vsr request id exhausted"
