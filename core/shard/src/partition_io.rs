@@ -1906,8 +1906,8 @@ mod tests {
                     fetch_to_op: 0,
                     floor: None,
                     peer: 1,
-                    first_batch_offset: None,
                     idle_ticks: 0,
+                    floor_pulled_from: 0,
                 });
                 let reply =
                     Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
@@ -1978,8 +1978,8 @@ mod tests {
             fetch_to_op: 0,
             floor: None,
             peer: 0,
-            first_batch_offset: None,
             idle_ticks: 0,
+            floor_pulled_from: 0,
         });
         assert_eq!(
             partition.complete_repair(partitions.config()).await,
