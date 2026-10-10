@@ -31,11 +31,7 @@ use bytes::Bytes;
 use super::codec::Encoder;
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
-    (15, "DescribeGroups"),
-    (16, "ListGroups"),
-    (20, "DeleteTopics"),
-];
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(20, "DeleteTopics")];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
@@ -461,7 +457,49 @@ pub fn build_create_topics_request_with_sections(version: i16, topic: &str) -> B
     enc.freeze()
 }
 
-// ── Consumer group coordination (keys 10, 11, 12, 14) ───────────────────────
+// ── Consumer group coordination (keys 10-16) ────────────────────────────────
+
+/// `DescribeGroups` request naming `groups`. `include_authorized_operations` is written from v3.
+pub fn build_describe_groups_request(
+    version: i16,
+    groups: &[&str],
+    include_authorized_operations: bool,
+) -> Bytes {
+    let flexible = version >= 5;
+    let mut enc = Encoder::with_capacity(64);
+    write_array_count(&mut enc, flexible, groups.len());
+    for group in groups {
+        write_string(&mut enc, flexible, Some(group));
+    }
+    if version >= 3 {
+        enc.write_bool(include_authorized_operations);
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `ListGroups` request. `states` is written from v4 and `group_types` from v5.
+pub fn build_list_groups_request(version: i16, states: &[&str], group_types: &[&str]) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    if version >= 4 {
+        enc.write_varint((states.len() + 1) as u64);
+        for state in states {
+            enc.write_compact_nullable_string(Some(state));
+        }
+    }
+    if version >= 5 {
+        enc.write_varint((group_types.len() + 1) as u64);
+        for group_type in group_types {
+            enc.write_compact_nullable_string(Some(group_type));
+        }
+    }
+    if version >= 3 {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
 
 /// Write a Kafka string, compact or legacy by `flexible`.
 fn write_string(enc: &mut Encoder, flexible: bool, value: Option<&str>) {

@@ -16,7 +16,7 @@
 // under the License.
 
 //! Consumer group coordination: `FindCoordinator`, `JoinGroup`, Heartbeat, `LeaveGroup`,
-//! `SyncGroup`.
+//! `SyncGroup`, `DescribeGroups`, `ListGroups`.
 //!
 //! Requests go through `handle_request_bounded` against one shared `GatewayState`, because
 //! `handle_request` builds a fresh coordinator per call and no two requests would ever see the
@@ -48,20 +48,23 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig, SyncRequest};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_SYNC_GROUP, BrokerAdvertise, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
+    API_KEY_DESCRIBE_GROUPS, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_JOIN_GROUP,
+    API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_SYNC_GROUP, BrokerAdvertise,
+    ERROR_GROUP_ID_NOT_FOUND, ERROR_GROUP_MAX_SIZE_REACHED, ERROR_ILLEGAL_GENERATION,
     ERROR_INCONSISTENT_GROUP_PROTOCOL, ERROR_INVALID_GROUP_ID, ERROR_INVALID_REQUEST,
     ERROR_INVALID_SESSION_TIMEOUT, ERROR_MEMBER_ID_REQUIRED, ERROR_NONE,
     ERROR_REBALANCE_IN_PROGRESS, ERROR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
-    ERROR_UNKNOWN_MEMBER_ID, GatewayState, handle_request_bounded,
+    ERROR_UNKNOWN_MEMBER_ID, ERROR_UNKNOWN_SERVER_ERROR, GatewayState, handle_request_bounded,
 };
+use iggy_gateway_kafka::protocol::header::response_header_version;
 
 use codec::Decoder;
 use server::spawn_test_server_with_config;
 use tcp::{build_request_frame, parse_response_payload, read_response_frame};
 use wire::{
-    JoinGroupParams, SyncGroupParams, build_find_coordinator_request, build_heartbeat_request,
-    build_join_group_request, build_leave_group_request, build_sync_group_request,
+    JoinGroupParams, SyncGroupParams, build_describe_groups_request,
+    build_find_coordinator_request, build_heartbeat_request, build_join_group_request,
+    build_leave_group_request, build_list_groups_request, build_sync_group_request,
 };
 
 const GROUP: &str = "orders";
@@ -75,14 +78,27 @@ const REBALANCE_TIMEOUT_MS: i32 = 20_000;
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
-    Arc::new(GatewayState::new(
+    Arc::new(owned_state(config, 8 * 1024 * 1024))
+}
+
+fn owned_state(config: GroupCoordinatorConfig, max_frame_size: usize) -> GatewayState {
+    GatewayState::new(
         BrokerAdvertise::default(),
         None,
-        8 * 1024 * 1024,
+        max_frame_size,
         false,
         0,
         GroupCoordinator::new(config, CancellationToken::new()),
-    ))
+    )
+}
+
+fn response_frame_len(api_key: i16, version: i16, body: &Bytes) -> usize {
+    let header = if response_header_version(api_key, version) >= 1 {
+        5
+    } else {
+        4
+    };
+    header + body.len()
 }
 
 /// A coordinator that completes a new group's first join immediately, so tests that are not
@@ -1416,6 +1432,563 @@ async fn given_a_transaction_key_type_when_finding_the_coordinator_should_return
     assert_eq!(decoder.remaining(), 0);
 }
 
+// ── DescribeGroups / ListGroups ─────────────────────────────────────────────
+
+async fn describe(state: &GatewayState, version: i16, groups: &[&str]) -> DescribeResponse {
+    let body = build_describe_groups_request(version, groups, false);
+    let response = handle_request_bounded(state, API_KEY_DESCRIBE_GROUPS, version, body)
+        .await
+        .expect_response("DescribeGroups must answer");
+    DescribeResponse::decode(version, response)
+}
+
+async fn list_groups(
+    state: &GatewayState,
+    version: i16,
+    states: &[&str],
+    group_types: &[&str],
+) -> ListResponse {
+    let body = build_list_groups_request(version, states, group_types);
+    let response = handle_request_bounded(state, API_KEY_LIST_GROUPS, version, body)
+        .await
+        .expect_response("ListGroups must answer");
+    ListResponse::decode(version, response)
+}
+
+struct DescribeResponse {
+    groups: Vec<Described>,
+}
+
+struct Described {
+    error: i16,
+    error_message: Option<String>,
+    group_id: String,
+    state: String,
+    protocol_type: String,
+    protocol_data: String,
+    members: Vec<DescribedMember>,
+    authorized_operations: Option<i32>,
+}
+
+struct DescribedMember {
+    metadata: Bytes,
+    assignment: Bytes,
+}
+
+impl DescribeResponse {
+    fn decode(version: i16, body: Bytes) -> Self {
+        let flexible = version >= 5;
+        let mut decoder = Decoder::new(body);
+        if version >= 1 {
+            decoder.read_i32().unwrap();
+        }
+        let count = read_array_count(&mut decoder, flexible);
+        let mut groups = Vec::with_capacity(count);
+        for _ in 0..count {
+            let error = decoder.read_i16().unwrap();
+            let error_message = if version >= 6 {
+                decoder.read_compact_nullable_string().unwrap()
+            } else {
+                None
+            };
+            let group_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
+            let state = read_nullable(&mut decoder, flexible).unwrap_or_default();
+            let protocol_type = read_nullable(&mut decoder, flexible).unwrap_or_default();
+            let protocol_data = read_nullable(&mut decoder, flexible).unwrap_or_default();
+            let member_count = read_array_count(&mut decoder, flexible);
+            let mut members = Vec::with_capacity(member_count);
+            for _ in 0..member_count {
+                let _member_id = read_nullable(&mut decoder, flexible);
+                if version >= 4 {
+                    let _instance_id = read_nullable(&mut decoder, flexible);
+                }
+                let client_id = read_nullable(&mut decoder, flexible);
+                let client_host = read_nullable(&mut decoder, flexible);
+                assert_eq!(client_id.as_deref(), Some(""));
+                assert_eq!(client_host.as_deref(), Some(""));
+                let metadata = read_bytes_field(&mut decoder, flexible);
+                let assignment = read_bytes_field(&mut decoder, flexible);
+                if flexible {
+                    decoder.read_tagged_fields().unwrap();
+                }
+                members.push(DescribedMember {
+                    metadata,
+                    assignment,
+                });
+            }
+            let authorized_operations = if version >= 3 {
+                Some(decoder.read_i32().unwrap())
+            } else {
+                None
+            };
+            if flexible {
+                decoder.read_tagged_fields().unwrap();
+            }
+            groups.push(Described {
+                error,
+                error_message,
+                group_id,
+                state,
+                protocol_type,
+                protocol_data,
+                members,
+                authorized_operations,
+            });
+        }
+        if flexible {
+            decoder.read_tagged_fields().unwrap();
+        }
+        assert_eq!(
+            decoder.remaining(),
+            0,
+            "DescribeGroups v{version} trailing bytes"
+        );
+        Self { groups }
+    }
+}
+
+struct ListResponse {
+    error: i16,
+    groups: Vec<Listed>,
+}
+
+struct Listed {
+    group_id: String,
+    protocol_type: String,
+    state: Option<String>,
+    group_type: Option<String>,
+}
+
+impl ListResponse {
+    fn decode(version: i16, body: Bytes) -> Self {
+        let flexible = version >= 3;
+        let mut decoder = Decoder::new(body);
+        if version >= 1 {
+            decoder.read_i32().unwrap();
+        }
+        let error = decoder.read_i16().unwrap();
+        let count = read_array_count(&mut decoder, flexible);
+        let mut groups = Vec::with_capacity(count);
+        for _ in 0..count {
+            let group_id = read_nullable(&mut decoder, flexible).unwrap_or_default();
+            let protocol_type = read_nullable(&mut decoder, flexible).unwrap_or_default();
+            let state = if version >= 4 {
+                read_nullable(&mut decoder, flexible)
+            } else {
+                None
+            };
+            let group_type = if version >= 5 {
+                read_nullable(&mut decoder, flexible)
+            } else {
+                None
+            };
+            if flexible {
+                decoder.read_tagged_fields().unwrap();
+            }
+            groups.push(Listed {
+                group_id,
+                protocol_type,
+                state,
+                group_type,
+            });
+        }
+        if flexible {
+            decoder.read_tagged_fields().unwrap();
+        }
+        assert_eq!(
+            decoder.remaining(),
+            0,
+            "ListGroups v{version} trailing bytes"
+        );
+        Self { error, groups }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_running_group_when_describing_and_listing_should_report_members_assignment_and_state()
+ {
+    let state = test_state(immediate_config());
+    let (leader, follower) = two_member_group(&state).await;
+
+    let completing = describe(&state, 6, &[GROUP]).await;
+    assert_eq!(completing.groups.len(), 1);
+    let group = &completing.groups[0];
+    assert_eq!(group.error, ERROR_NONE);
+    assert_eq!(group.group_id, GROUP);
+    assert_eq!(group.state, "CompletingRebalance");
+    assert_eq!(group.protocol_type, "consumer");
+    assert_eq!(group.protocol_data, "");
+    assert_eq!(group.authorized_operations, Some(i32::MIN));
+    assert_eq!(group.members.len(), 2);
+    assert!(
+        group
+            .members
+            .iter()
+            .all(|member| member.metadata.is_empty()),
+        "metadata is the previous generation until the group is Stable"
+    );
+    assert!(
+        group
+            .members
+            .iter()
+            .all(|member| member.assignment.is_empty())
+    );
+
+    let listed = list_groups(&state, 5, &[], &[]).await;
+    assert_eq!(listed.error, ERROR_NONE);
+    assert_eq!(listed.groups.len(), 1);
+    assert_eq!(listed.groups[0].group_id, GROUP);
+    assert_eq!(listed.groups[0].protocol_type, "consumer");
+    assert_eq!(
+        listed.groups[0].state.as_deref(),
+        Some("CompletingRebalance")
+    );
+    assert_eq!(listed.groups[0].group_type.as_deref(), Some("classic"));
+
+    let leader_blob: &[u8] = b"partitions-0-1";
+    let follower_blob: &[u8] = b"partitions-2-3";
+    let synced = sync(
+        &state,
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: 2,
+            member_id: &leader,
+            assignments: &[
+                (leader.as_str(), leader_blob),
+                (follower.as_str(), follower_blob),
+            ],
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(synced.error, ERROR_NONE);
+
+    let stable = describe(&state, 0, &[GROUP]).await;
+    let group = &stable.groups[0];
+    assert_eq!(group.error, ERROR_NONE);
+    assert_eq!(group.state, "Stable");
+    assert_eq!(group.protocol_data, "range");
+    assert!(group.authorized_operations.is_none());
+    assert!(
+        group
+            .members
+            .iter()
+            .any(|member| member.metadata.as_ref() == b"leader-subscription")
+    );
+    assert!(
+        group
+            .members
+            .iter()
+            .any(|member| member.assignment.as_ref() == leader_blob)
+    );
+    assert!(
+        group
+            .members
+            .iter()
+            .any(|member| member.assignment.as_ref() == follower_blob)
+    );
+
+    let listed = list_groups(&state, 0, &[], &[]).await;
+    assert_eq!(listed.error, ERROR_NONE);
+    assert_eq!(listed.groups.len(), 1);
+    assert_eq!(listed.groups[0].group_id, GROUP);
+    assert_eq!(listed.groups[0].protocol_type, "consumer");
+    assert_eq!(listed.groups[0].state, None);
+
+    let stable_only = list_groups(&state, 5, &["stable"], &[]).await;
+    assert_eq!(stable_only.groups.len(), 1);
+    let preparing_only = list_groups(&state, 5, &["PreparingRebalance"], &[]).await;
+    assert!(preparing_only.groups.is_empty());
+    let unknown_state = list_groups(&state, 5, &["not-a-state"], &[]).await;
+    assert!(unknown_state.groups.is_empty());
+    let classic = list_groups(&state, 5, &[], &["CLASSIC"]).await;
+    assert_eq!(classic.groups.len(), 1);
+    let consumer_type = list_groups(&state, 5, &[], &["consumer"]).await;
+    assert!(consumer_type.groups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_joining_member_when_describing_should_report_preparing_rebalance() {
+    let state = test_state(GroupCoordinatorConfig::default());
+    let leader = claim_member_id(&state, b"sub").await;
+    let parked = {
+        let state = Arc::clone(&state);
+        let leader = leader.clone();
+        tokio::spawn(async move {
+            let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+            join(&state, JOIN_VERSION, &join_params(&leader, protocols)).await
+        })
+    };
+    yield_to_parked().await;
+
+    let described = describe(&state, 6, &[GROUP]).await;
+    assert_eq!(described.groups[0].state, "PreparingRebalance");
+    assert_eq!(described.groups[0].protocol_data, "");
+    assert_eq!(described.groups[0].members.len(), 1);
+    assert!(described.groups[0].members[0].metadata.is_empty());
+    assert!(described.groups[0].members[0].assignment.is_empty());
+
+    let listed = list_groups(&state, 4, &["preparingrebalance"], &[]).await;
+    assert_eq!(listed.groups.len(), 1);
+    assert_eq!(
+        listed.groups[0].state.as_deref(),
+        Some("PreparingRebalance")
+    );
+
+    advance(Duration::from_secs(3)).await;
+    let joined = parked.await.expect("parked JoinGroup task");
+    assert_eq!(joined.error, ERROR_NONE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_only_a_pending_member_when_listing_should_report_empty() {
+    let state = test_state(immediate_config());
+    let _member = claim_member_id(&state, b"sub").await;
+
+    let described = describe(&state, 6, &[GROUP]).await;
+    assert_eq!(described.groups[0].error, ERROR_NONE);
+    assert_eq!(described.groups[0].state, "Empty");
+    assert!(described.groups[0].members.is_empty());
+
+    let empty_only = list_groups(&state, 5, &["Empty"], &[]).await;
+    assert_eq!(empty_only.groups.len(), 1);
+    assert_eq!(empty_only.groups[0].state.as_deref(), Some("Empty"));
+    let preparing = list_groups(&state, 5, &["PreparingRebalance"], &[]).await;
+    assert!(preparing.groups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_expired_group_when_listing_should_omit_it_and_describing_should_report_dead() {
+    let state = test_state(immediate_config());
+    let (leader, _follower) = two_member_group(&state).await;
+    let synced = sync(
+        &state,
+        SYNC_VERSION,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: 2,
+            member_id: &leader,
+            assignments: &[(&leader, b"partitions-0")],
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(synced.error, ERROR_NONE);
+
+    advance(Duration::from_secs(11)).await;
+    let listed = list_groups(&state, 5, &[], &[]).await;
+    assert!(
+        listed.groups.is_empty(),
+        "a group whose sessions are all past is omitted, and listing does not have to tick"
+    );
+
+    let described = describe(&state, 6, &[GROUP]).await;
+    assert_eq!(described.groups[0].state, "Dead");
+    assert_eq!(described.groups[0].error, ERROR_GROUP_ID_NOT_FOUND);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_an_unknown_group_when_describing_should_report_dead_without_creating_it() {
+    let state = test_state(immediate_config());
+
+    let v6 = describe(&state, 6, &["missing"]).await;
+    assert_eq!(v6.groups[0].error, ERROR_GROUP_ID_NOT_FOUND);
+    assert_eq!(
+        v6.groups[0].error_message.as_deref(),
+        Some("Group missing not found.")
+    );
+    assert_eq!(v6.groups[0].state, "Dead");
+    assert!(v6.groups[0].members.is_empty());
+    assert_eq!(v6.groups[0].authorized_operations, Some(i32::MIN));
+
+    let v0 = describe(&state, 0, &["missing"]).await;
+    assert_eq!(v0.groups[0].error, ERROR_NONE);
+    assert_eq!(v0.groups[0].error_message, None);
+    assert_eq!(v0.groups[0].state, "Dead");
+    assert!(v0.groups[0].authorized_operations.is_none());
+
+    let with_ops = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        3,
+        build_describe_groups_request(3, &["missing"], true),
+    )
+    .await
+    .expect_response("DescribeGroups must answer");
+    let decoded = DescribeResponse::decode(3, with_ops);
+    assert_eq!(decoded.groups[0].authorized_operations, Some(i32::MIN));
+
+    let listed = list_groups(&state, 0, &[], &[]).await;
+    assert_eq!(listed.error, ERROR_NONE);
+    assert!(listed.groups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_repeated_group_ids_when_describing_should_answer_each_distinct_id_once() {
+    let state = test_state(immediate_config());
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    join(&state, 3, &join_params("", protocols)).await;
+
+    let described = describe(&state, 6, &[GROUP, "missing", GROUP, "missing"]).await;
+
+    assert_eq!(described.groups.len(), 2);
+    assert_eq!(described.groups[0].group_id, GROUP);
+    assert_eq!(described.groups[0].error, ERROR_NONE);
+    assert_eq!(described.groups[1].group_id, "missing");
+    assert_eq!(described.groups[1].state, "Dead");
+    assert_eq!(described.groups[1].error, ERROR_GROUP_ID_NOT_FOUND);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_describe_response_one_byte_over_the_frame_when_describing_should_summarize() {
+    let mut state = owned_state(immediate_config(), 8 * 1024 * 1024);
+    let blob = vec![b'x'; 400];
+    let protocols: &[(&str, &[u8])] = &[("range", blob.as_slice())];
+    let joined = join(&state, 3, &join_params("", protocols)).await;
+    assert_eq!(joined.error, ERROR_NONE);
+    let assignment = vec![b'y'; 400];
+    let synced = sync(
+        &state,
+        3,
+        &SyncGroupParams {
+            group_id: GROUP,
+            generation_id: joined.generation_id,
+            member_id: &joined.member_id,
+            assignments: &[(&joined.member_id, assignment.as_slice())],
+            ..SyncGroupParams::default()
+        },
+    )
+    .await;
+    assert_eq!(synced.error, ERROR_NONE);
+
+    let version = 0;
+    let encoded = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        version,
+        build_describe_groups_request(version, &[GROUP], false),
+    )
+    .await
+    .expect_response("DescribeGroups must answer");
+    let frame = response_frame_len(API_KEY_DESCRIBE_GROUPS, version, &encoded);
+    state.max_frame_size = frame;
+    let repeated = describe(&state, version, &[GROUP, GROUP]).await;
+    assert_eq!(
+        repeated.groups.len(),
+        1,
+        "a repeated id is one group, so it still fits the one-group frame"
+    );
+    assert!(!repeated.groups[0].members[0].assignment.is_empty());
+
+    state.max_frame_size = frame - 1;
+    let summarized = describe(&state, version, &[GROUP]).await;
+    assert_eq!(summarized.groups[0].error, ERROR_NONE);
+    assert_eq!(summarized.groups[0].state, "Stable");
+    assert_eq!(summarized.groups[0].protocol_data, "");
+    assert!(summarized.groups[0].members[0].metadata.is_empty());
+    assert!(summarized.groups[0].members[0].assignment.is_empty());
+
+    let summary_body = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        version,
+        build_describe_groups_request(version, &[GROUP], false),
+    )
+    .await
+    .expect_response("a summarized DescribeGroups must answer");
+    let summary_frame = response_frame_len(API_KEY_DESCRIBE_GROUPS, version, &summary_body);
+    state.max_frame_size = summary_frame - 1;
+    let errored = describe(&state, version, &[GROUP]).await;
+    assert_eq!(errored.groups[0].error, ERROR_UNKNOWN_SERVER_ERROR);
+    assert!(errored.groups[0].members.is_empty());
+
+    state.max_frame_size = frame;
+    let again = describe(&state, version, &[GROUP]).await;
+    assert_eq!(again.groups.len(), 1);
+    assert_eq!(again.groups[0].group_id, GROUP);
+    assert_eq!(again.groups[0].state, "Stable");
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_list_response_one_byte_past_the_frame_cap_when_listing_should_truncate() {
+    let mut state = owned_state(immediate_config(), 8 * 1024 * 1024);
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    join(&state, 3, &join_params("", protocols)).await;
+
+    let version = 0;
+    let encoded = handle_request_bounded(
+        &state,
+        API_KEY_LIST_GROUPS,
+        version,
+        build_list_groups_request(version, &[], &[]),
+    )
+    .await
+    .expect_response("ListGroups must answer");
+    let frame = response_frame_len(API_KEY_LIST_GROUPS, version, &encoded);
+
+    // One byte under what the one listed group needs: truncated to zero groups rather than
+    // closing the connection, since this is server-sized state outgrowing a client-chosen
+    // frame size, not a malformed request.
+    state.max_frame_size = frame - 1;
+    let truncated = list_groups(&state, version, &[], &[]).await;
+    assert!(
+        truncated.groups.is_empty(),
+        "ListGroups truncates rather than closing when the encoded frame would pass \
+         max_frame_size"
+    );
+
+    state.max_frame_size = frame;
+    let listed = list_groups(&state, version, &[], &[]).await;
+    assert_eq!(listed.groups.len(), 1);
+    assert_eq!(listed.groups[0].group_id, GROUP);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_truncated_describe_groups_body_when_handled_should_close_the_connection() {
+    let state = test_state(immediate_config());
+    let outcome = handle_request_bounded(
+        &state,
+        API_KEY_DESCRIBE_GROUPS,
+        0,
+        Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one group
+            0x00, 0x02, // string length 2
+            b'g', // truncated
+        ]),
+    )
+    .await;
+
+    assert!(
+        outcome.is_close(),
+        "a truncated DescribeGroups body must close the connection"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_truncated_list_groups_body_when_handled_should_return_invalid_request() {
+    let state = test_state(immediate_config());
+    let response = handle_request_bounded(
+        &state,
+        API_KEY_LIST_GROUPS,
+        4,
+        Bytes::from_static(&[
+            0x02, // one states_filter entry
+            0x03, // compact string claims 2 bytes
+            b'x', // truncated
+        ]),
+    )
+    .await
+    .expect_response("ListGroups reports a decode failure as INVALID_REQUEST");
+    let mut decoder = Decoder::new(response);
+
+    assert_eq!(decoder.read_i32().unwrap(), 0);
+    assert_eq!(decoder.read_i16().unwrap(), ERROR_INVALID_REQUEST);
+    assert_eq!(decoder.read_varint().unwrap(), 1);
+    assert_eq!(decoder.read_varint().unwrap(), 0);
+    assert_eq!(decoder.remaining(), 0);
+}
+
 // ── Over a real TCP listener ────────────────────────────────────────────────
 
 /// The in-process tests drive one `GatewayState` directly. This one proves the connection loop
@@ -1599,6 +2172,78 @@ async fn tcp_leave_scenario(leave_version: i16) {
     assert_eq!(alone.members.len(), 1, "v{leave_version}");
 }
 
+/// The `given_a_running_group_when_describing_and_listing_*` tests above all drive
+/// `handle_request_bounded` directly, bypassing real TCP dispatch and response headers. This
+/// creates a live group through a real `JoinGroup`/`SyncGroup` round trip over one socket, then
+/// issues real `DescribeGroups` and `ListGroups` requests on that same connection and decodes
+/// their actual wire responses - the real-wire harness this crate already uses for `JoinGroup`/
+/// `SyncGroup`/`LeaveGroup` above, now covering the admin-view APIs those tests never reached.
+#[tokio::test]
+async fn given_a_live_group_over_tcp_should_describe_and_list_it_through_the_real_listener() {
+    let (addr, _shutdown) = spawn_test_server_with_config(GatewayConfig {
+        group: immediate_config(),
+        ..GatewayConfig::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    let protocols: &[(&str, &[u8])] = &[("range", b"sub")];
+    // KIP-394: the first join with no member id only allocates one and answers
+    // MEMBER_ID_REQUIRED; the member must rejoin with that id to actually complete the join.
+    let member = tcp_join(&mut stream, &join_params("", protocols))
+        .await
+        .member_id;
+    let joined = tcp_join(&mut stream, &join_params(&member, protocols)).await;
+    assert_eq!(joined.generation_id, 1);
+    write_request(
+        &mut stream,
+        API_KEY_SYNC_GROUP,
+        SYNC_VERSION,
+        2,
+        &build_sync_group_request(
+            SYNC_VERSION,
+            &SyncGroupParams {
+                group_id: GROUP,
+                generation_id: 1,
+                member_id: &member,
+                assignments: &[(member.as_str(), b"partitions-0")],
+                ..SyncGroupParams::default()
+            },
+        ),
+    )
+    .await;
+    let synced = read_sync(&mut stream).await;
+    assert_eq!(synced.assignment.as_ref(), b"partitions-0");
+
+    write_request(
+        &mut stream,
+        API_KEY_DESCRIBE_GROUPS,
+        6,
+        3,
+        &build_describe_groups_request(6, &[GROUP], false),
+    )
+    .await;
+    let described = read_describe_groups(&mut stream, 6).await;
+    assert_eq!(described.groups.len(), 1);
+    assert_eq!(described.groups[0].group_id, GROUP);
+    assert_eq!(described.groups[0].state, "Stable");
+    assert_eq!(described.groups[0].members.len(), 1);
+
+    write_request(
+        &mut stream,
+        API_KEY_LIST_GROUPS,
+        5,
+        4,
+        &build_list_groups_request(5, &[], &[]),
+    )
+    .await;
+    let listed = read_list_groups(&mut stream, 5).await;
+    assert!(
+        listed.groups.iter().any(|group| group.group_id == GROUP),
+        "the real-TCP DescribeGroups/SyncGroup group must also be visible to ListGroups"
+    );
+}
+
 async fn write_request(
     stream: &mut TcpStream,
     api_key: i16,
@@ -1638,4 +2283,16 @@ async fn read_sync(stream: &mut TcpStream) -> SyncResponse {
     let payload = read_response_frame(stream, 8 * 1024 * 1024).await;
     let (_, body) = parse_response_payload(API_KEY_SYNC_GROUP, SYNC_VERSION, payload);
     SyncResponse::decode(SYNC_VERSION, body)
+}
+
+async fn read_describe_groups(stream: &mut TcpStream, version: i16) -> DescribeResponse {
+    let payload = read_response_frame(stream, 8 * 1024 * 1024).await;
+    let (_, body) = parse_response_payload(API_KEY_DESCRIBE_GROUPS, version, payload);
+    DescribeResponse::decode(version, body)
+}
+
+async fn read_list_groups(stream: &mut TcpStream, version: i16) -> ListResponse {
+    let payload = read_response_frame(stream, 8 * 1024 * 1024).await;
+    let (_, body) = parse_response_payload(API_KEY_LIST_GROUPS, version, payload);
+    ListResponse::decode(version, body)
 }

@@ -34,7 +34,7 @@ Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiV
 **Every unsupported-version case closes the connection, for every listed key** - not just above
 the encoder max. `kafka_protocol`'s schema floor for each supported message happens to equal
 `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0, ApiVersions 0,
-CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1, and 0 for the five group coordination keys), so there is no version below an API's
+CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1, and 0 for the consumer-group, five group coordination keys), so there is no version below an API's
 min that the crate can actually encode a response for either - `unsupported_version_response`
 still tries, but the encode attempt fails and the connection closes rather than sending a
 malformed body.
@@ -61,6 +61,8 @@ it knows the server supports flexible encoding.
 | 12 | Heartbeat | 0 | 4 | 0, 1, 2, 3, 4 | Refreshes a session; `REBALANCE_IN_PROGRESS` (27) drives a rejoin; flexible encoding at v4+ |
 | 13 | LeaveGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Removes members, per-member errors from v3; flexible encoding at v4+ |
 | 14 | SyncGroup | 0 | 5 | 0, 1, 2, 3, 4, 5 | Relays the leader's assignment blobs; flexible encoding at v4+ |
+| 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator; a missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69); flexible encoding at v5+ |
+| 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator; v4+ state filter and v5 type filter; flexible encoding at v3+ |
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
@@ -84,6 +86,8 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 12 | Heartbeat | 0–4 | v4 |
 | 13 | LeaveGroup | 0–5 | v4 |
 | 14 | SyncGroup | 0–5 | v4 |
+| 15 | DescribeGroups | 0–6 | v5 |
+| 16 | ListGroups | 0–5 | v3 |
 | 18 | ApiVersions | 0–3 | v3 |
 | 19 | CreateTopics | 2–5 | v5 |
 | 22 | InitProducerId | 0–5 | v2 |
@@ -96,7 +100,6 @@ All API keys not listed above close the connection (see Governance model above) 
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
-| 15, 16 | DescribeGroups, ListGroups | Admin views — [#3548](https://github.com/apache/iggy/issues/3548) |
 | 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
@@ -164,7 +167,7 @@ nor moved by retention. That is the same core change the ListOffsets `EARLIEST` 
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 12 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the five consumer-group keys, and Produce, Fetch, ListOffsets, Metadata and CreateTopics with a bridge |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 14 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata and CreateTopics with a bridge |
 | **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata and CreateTopics wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)) and CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)) call it |
 
 ---
@@ -355,9 +358,10 @@ Offset persistence design ([#3540](https://github.com/apache/iggy/issues/3540)):
 - [x] FindCoordinator (10), JoinGroup (11), Heartbeat (12), SyncGroup (14) -
       [#3541](https://github.com/apache/iggy/issues/3541); LeaveGroup (13) -
       [#3543](https://github.com/apache/iggy/issues/3543); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
+- [x] DescribeGroups (15), ListGroups (16) -
+      [#3548](https://github.com/apache/iggy/issues/3548); see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md)
 - [x] OffsetCommit (8), OffsetFetch (9) - [#3542](https://github.com/apache/iggy/issues/3542);
       offsets live in Iggy, see [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)
-- [ ] DescribeGroups (15), ListGroups (16) as needed by target clients
 
 ### Phase 3+ — Auth, admin, tuning
 

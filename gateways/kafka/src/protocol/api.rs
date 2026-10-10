@@ -38,9 +38,9 @@ use crate::protocol::bounds_guard::{
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit, offset_fetch,
-    produce, respond_or_close, sync_group,
+    api_versions, create_topics, decode_guarded, describe_groups, dispatch, fetch,
+    find_coordinator, heartbeat, init_producer_id, join_group, leave_group, list_groups,
+    list_offsets, metadata, offset_commit, offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -58,6 +58,8 @@ pub const API_KEY_JOIN_GROUP: i16 = 11;
 pub const API_KEY_HEARTBEAT: i16 = 12;
 pub const API_KEY_LEAVE_GROUP: i16 = 13;
 pub const API_KEY_SYNC_GROUP: i16 = 14;
+pub const API_KEY_DESCRIBE_GROUPS: i16 = 15;
+pub const API_KEY_LIST_GROUPS: i16 = 16;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
@@ -107,6 +109,12 @@ pub const ERROR_ILLEGAL_GENERATION: i16 = 22;
 pub const ERROR_INCONSISTENT_GROUP_PROTOCOL: i16 = 23;
 pub const ERROR_INVALID_GROUP_ID: i16 = 24;
 pub const ERROR_UNKNOWN_MEMBER_ID: i16 = 25;
+/// `DescribeGroups` v6: the named group is not on this coordinator.
+///
+/// Earlier versions of the same response report that miss as state `Dead` with error 0.
+/// Kafka 4.0's `describeGroups` splits it the same way, and a v6 client treats error 0 as a
+/// group that exists.
+pub const ERROR_GROUP_ID_NOT_FOUND: i16 = ResponseError::GroupIdNotFound.code();
 pub const ERROR_INVALID_SESSION_TIMEOUT: i16 = 26;
 /// How a follower learns to rejoin: its heartbeat is answered with this while the group prepares.
 pub const ERROR_REBALANCE_IN_PROGRESS: i16 = 27;
@@ -284,6 +292,8 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     heartbeat::RANGE,
     leave_group::RANGE,
     sync_group::RANGE,
+    describe_groups::RANGE,
+    list_groups::RANGE,
 ];
 
 #[must_use]
