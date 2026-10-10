@@ -974,6 +974,8 @@ where
         })
     }
 
+    /// Apply writes the row before its walk publishes, so the row proves the
+    /// install only once `commit_min` reaches its op.
     #[must_use]
     pub fn installed_consumer_group_owner(
         &self,
@@ -983,13 +985,15 @@ where
             || self.requires_state_transfer()
             || !self.consensus.is_normal()
             || self.consensus.is_transferring()
-            || self.consensus.commit_min() != self.consensus.commit_max()
         {
             return None;
         }
         self.consumer_group_owners
             .get(&installation.group_id)
-            .filter(|installed| installed.installation == *installation)
+            .filter(|installed| {
+                installed.installation == *installation
+                    && installed.partition_op <= self.consensus.commit_min()
+            })
             .map(|installed| installed.partition_op)
     }
 
@@ -16770,6 +16774,58 @@ mod tests {
         assert_eq!(
             partition.consumer_group_owner(GROUP_ID),
             Some(installation.owner)
+        );
+    }
+
+    #[compio::test]
+    async fn given_send_committed_behind_install_when_the_install_publishes_should_prove_it() {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        let config = repair_config();
+        let mut partition = test_partition();
+        let installation = next_test_installation(&partition, GROUP_ID, CLIENT_ID);
+        partition
+            .on_request(owner_install_request(&partition, &installation), None)
+            .await;
+        let install_op = partition.consensus.sequencer().current_sequence();
+        let send = history_send_request(&partition, 1, partition.required_metadata_frontier);
+        partition.on_request(send, None).await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            install_op + 1
+        );
+        partition.consensus.advance_commit_max(install_op + 1);
+
+        let selected = partition.select_persistable_commits(&config);
+        assert!(partition.select_commit(selected, &config, true));
+        loop {
+            match partition.drive_commit().unwrap() {
+                CommitStep::Progress => {}
+                CommitStep::Publish => break,
+                CommitStep::Ready | CommitStep::Pending => {
+                    panic!("an install-only walk needs no I/O before it publishes")
+                }
+            }
+        }
+        assert_eq!(
+            partition.consumer_group_owner(GROUP_ID),
+            Some(installation.owner)
+        );
+        assert_eq!(partition.consensus.commit_min(), install_op - 1);
+        assert_eq!(
+            partition.installed_consumer_group_owner(&installation),
+            None,
+            "an applied install proves nothing before its walk publishes"
+        );
+
+        partition.commit_journal(&config).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus.commit_min(), install_op);
+        assert_eq!(partition.consensus.commit_max(), install_op + 1);
+        assert_eq!(
+            partition.installed_consumer_group_owner(&installation),
+            Some(install_op),
+            "a published install must not wait for later writes to apply"
         );
     }
 
