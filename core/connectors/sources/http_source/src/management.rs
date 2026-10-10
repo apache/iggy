@@ -216,7 +216,7 @@ async fn register_endpoint(
             );
         }
     }
-    warn_if_poll_stopped(&instance, "Registered", endpoint_id.as_str());
+    warn_if_poll_cannot_forward(&instance, "Registered", endpoint_id.as_str());
     if let Some(failure) = republish(&state).await {
         // Undo the insert. Left in place it would be persisted on the next
         // flush and come back live after a restart, despite the caller having
@@ -337,7 +337,7 @@ async fn rotate_secret(
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing");
     }
 
-    warn_if_poll_stopped(&instance, "Rotated", &endpoint_id);
+    warn_if_poll_cannot_forward(&instance, "Rotated", &endpoint_id);
     info!(
         "Rotated the secret for endpoint {} on {CONNECTOR_NAME} connector ID: {}",
         EndpointId::log_prefix_of(&endpoint_id),
@@ -386,7 +386,7 @@ async fn revoke_endpoint(
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing");
     }
 
-    warn_if_poll_stopped(&instance, "Revoked", &endpoint_id);
+    warn_if_poll_cannot_forward(&instance, "Revoked", &endpoint_id);
     info!(
         "Revoked endpoint {} on {CONNECTOR_NAME} connector ID: {}",
         EndpointId::log_prefix_of(&endpoint_id),
@@ -452,18 +452,27 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
         .find(|instance| instance.registry().endpoint(endpoint_id).is_some())
 }
 
-/// Warns when a mutation landed on an instance whose poll task looks stopped.
+/// Warns when a mutation cannot reach the runtime through this poll path.
 ///
-/// [`still_joined`] proves only that the instance is registered. The SDK stops
-/// the poll task after five consecutive NACKs without calling `close()`, so an
-/// instance can stay registered and keep answering 201 and 202 for changes
-/// nothing will ever carry to the runtime. `/admin/health` reports the same
-/// pair, as `poll_is_live` and `has_polled`. See #3941.
-fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
-    if instance.poll_is_live(unix_now_seconds()) {
+/// [`still_joined`] proves only that the instance is registered. A configured
+/// NACK limit can stop polling without calling
+/// `close()`, so an instance can stay registered while changes cannot reach
+/// the runtime. A stuck batch also blocks the next state flush while polling
+/// continues. `/admin/health` reports both conditions separately.
+fn warn_if_poll_cannot_forward(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
+    let now = unix_now_seconds();
+    let poll_is_live = instance.poll_is_live(now);
+    if poll_is_live && !instance.staged_batch_is_stuck(now) {
         return;
     }
     let endpoint = EndpointId::log_prefix_of(endpoint_id);
+    if poll_is_live {
+        warn!(
+            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while a staged batch is still being NACKed; polling continues, but the change cannot reach the runtime until that batch succeeds",
+            instance.id
+        );
+        return;
+    }
     // Two ways to be not live, and they want different words rather than one
     // message or none. Saying "stopped" for an instance that has not started
     // was a false alarm on ordinary startup timing, but staying silent about
@@ -474,7 +483,7 @@ fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: 
     // Without this line nothing at all reports that.
     if instance.has_polled() {
         warn!(
-            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while its poll task looks stopped; the change is in memory but nothing is carrying it to the runtime",
+            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while its poll path has not advanced; the task may be stopped or awaiting a runtime batch result, and the change cannot reach the runtime yet",
             instance.id
         );
     } else {

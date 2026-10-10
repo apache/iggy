@@ -61,13 +61,15 @@ let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
 
 `on_batch_result` (added by #3855) is how a source learns what happened to the batch it just
 returned. The SDK keeps exactly one batch in flight: it will not call `poll()` again until this
-returns, and it stops the source after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs, roughly 1.5s
-of backoff, without calling `close()`.
+returns. By default it stops after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs; a source can
+override `batch_policy()` to disable the limit when its accepted input cannot be replayed after
+restart. A stop is reported to the runtime only when the plugin exports the current SDK's stop
+callback, so rebuild older source plugins.
 
 - `Ack` means the runtime sent the batch **and** persisted its state. `Nack` means it could not
   confirm both, which is **not** the same as neither happening: a batch that reached the topic but
-  whose state save failed is NACKed, and the SDK NACKs on its own result timeout while the send may
-  still have landed. A source that replays on `Nack` is at-least-once, not exactly-once.
+  whose state save failed is NACKed. A missing runtime result leaves the batch pending; it does not
+  produce a synthetic NACK. A source that replays on `Nack` is at-least-once, not exactly-once.
 - The trait has a **default no-op**, which suits only a source with no staged cursor and no
   destructive work. If `poll()` advances a cursor, deletes rows, or drains an in-memory buffer,
   omitting this loses data silently and nothing will tell you. `random_source` and `http_source`
@@ -100,13 +102,14 @@ of backoff, without calling `close()`.
   state needed to resume them safely.
 - Keep `State` small - rewritten every batch. No unbounded vecs.
 
-The SDK allows one in-flight batch. Five consecutive NACKs stop the source and
-require a manual restart. Returning `Err` from `on_batch_result` is fatal, so
+The SDK allows one in-flight batch. Five consecutive NACKs stop a source using
+the default policy and require a manual restart. Returning `Err` from
+`on_batch_result` is fatal regardless of the NACK limit, so
 retry transient backend failures inside the callback before returning an error.
-The runtime must report ACK or NACK within the SDK's 30-second batch-result
-window. Once the result is received, the SDK waits for `on_batch_result` to
-finish, so the callback must bound its own connection acquisition and retry
-budget rather than relying on the SDK deadline.
+If the runtime has not reported ACK or NACK after 30 seconds, the SDK warns
+and keeps waiting for that result without polling or replaying the batch.
+Once the result is received, the SDK waits for `on_batch_result` to finish,
+so the callback must bound its own connection acquisition and retry budget.
 
 ### Sleep first
 

@@ -27,7 +27,10 @@ use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
     TopicMetadata,
-    source::{BatchResultCallback, HandleCallback, SourceBatchResult},
+    source::{
+        BatchResultCallback, HandleCallback, SourceBatchResult, SourceStopReason,
+        SourceStoppedCallback,
+    },
     transforms::Transform,
 };
 use std::{
@@ -43,6 +46,7 @@ use crate::benchmark;
 use crate::configs::connectors::SourceConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
+use crate::manager::source::StopReport;
 use crate::metrics::ConnectorType;
 use crate::metrics::SourceLabels;
 use crate::{
@@ -54,13 +58,17 @@ use crate::{
 use iggy_connector_sdk::api::ConnectorStatus;
 use prometheus_client::metrics::counter::Counter;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
 const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
 
+pub(crate) type RegisterStopCallback = extern "C" fn(u32, SourceStoppedCallback) -> i32;
+
 pub(crate) struct SourceSenderEntry {
     pub(crate) sender: Sender<ProducedBatch>,
+    stop_sender: mpsc::UnboundedSender<SourceStopReason>,
     // Owned errors counter (Arc<AtomicU64> inside) so the FFI callback bumps
     // it with one relaxed atomic - no Family RwLock + HashMap lookup per call.
     pub(crate) error_counter: Counter,
@@ -77,6 +85,12 @@ pub(crate) static SOURCE_SENDERS: LazyLock<DashMap<u32, SourceSenderEntry>> =
 
 pub(crate) fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
+}
+
+extern "C" fn source_stopped(plugin_id: u32, reason: u8) {
+    if let Some(entry) = SOURCE_SENDERS.get(&plugin_id) {
+        let _ = entry.stop_sender.send(SourceStopReason::from(reason));
+    }
 }
 
 /// Initializes all enabled source connectors.
@@ -562,6 +576,7 @@ pub(crate) async fn source_forwarding_loop(
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
     receiver: Receiver<ProducedBatch>,
+    mut stop_receiver: mpsc::UnboundedReceiver<SourceStopReason>,
     batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
     labels: Arc<SourceLabels>,
@@ -588,7 +603,24 @@ pub(crate) async fn source_forwarding_loop(
         topic: producer.topic().to_string(),
     };
 
-    while let Ok(produced_batch) = receiver.recv_async().await {
+    let mut stop_reason = None;
+    let mut stop_receiver_open = true;
+    loop {
+        let produced_batch = tokio::select! {
+            biased;
+            stopped = stop_receiver.recv(), if stop_receiver_open => {
+                if let Some(reason) = stopped {
+                    stop_reason = Some(reason);
+                    break;
+                }
+                stop_receiver_open = false;
+                continue;
+            },
+            batch = receiver.recv_async() => batch,
+        };
+        let Ok(produced_batch) = produced_batch else {
+            break;
+        };
         let total_start = Instant::now();
         let batch_id = produced_batch.id;
         let produced_messages = produced_batch.messages;
@@ -816,14 +848,34 @@ pub(crate) async fn source_forwarding_loop(
     }
 
     info!("Source connector with ID: {plugin_id} stopped.");
-    context
-        .sources
-        .update_status(
-            &plugin_key,
-            ConnectorStatus::Stopped,
-            Some(&context.metrics),
-        )
-        .await;
+    // A self-stopped source must release its sender even when no manager stop follows.
+    cleanup_sender(plugin_id);
+    if let Some(reason) = stop_reason {
+        let error_msg = format!(
+            "Source polling stopped for connector with ID: {plugin_id}: {reason}; restart required"
+        );
+        match context
+            .sources
+            .report_unexpected_stop(&plugin_key, &error_msg, &context.metrics)
+            .await
+        {
+            StopReport::NewError => {
+                error!("{error_msg}");
+                context.metrics.inc_errors_with_labels(&labels.counter);
+            }
+            StopReport::AlreadyError => error!("{error_msg}"),
+            StopReport::Ignored => {}
+        }
+    } else {
+        context
+            .sources
+            .update_status(
+                &plugin_key,
+                ConnectorStatus::Stopped,
+                Some(&context.metrics),
+            )
+            .await;
+    }
 }
 
 fn should_recover_source(batch_result: SourceBatchResult, sent_count: usize) -> bool {
@@ -841,22 +893,25 @@ pub(crate) fn spawn_source_handler(
     transforms: Vec<Arc<dyn Transform>>,
     state_storage: StateStorage,
     handle_callback: HandleCallback,
+    register_stop_callback: Option<RegisterStopCallback>,
     batch_result_callback: BatchResultCallback,
     context: Arc<RuntimeContext>,
 ) -> Vec<JoinHandle<()>> {
     let (sender, receiver) = flume::unbounded();
+    let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
     let plugin_key = plugin_key.to_string();
     let labels = Arc::new(SourceLabels::new(&plugin_key));
     SOURCE_SENDERS.insert(
         plugin_id,
         SourceSenderEntry {
             sender,
+            stop_sender,
             error_counter: context.metrics.error_counter(&labels.counter),
         },
     );
 
     let blocking_handle = tokio::task::spawn_blocking(move || {
-        handle_callback(plugin_id, handle_produced_messages);
+        start_source_polling(plugin_id, handle_callback, register_stop_callback)
     });
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
@@ -869,6 +924,7 @@ pub(crate) fn spawn_source_handler(
             transforms,
             state_storage,
             receiver,
+            stop_receiver,
             batch_result_callback,
             context,
             labels,
@@ -877,6 +933,32 @@ pub(crate) fn spawn_source_handler(
     });
 
     vec![blocking_handle, handler_task]
+}
+
+fn start_source_polling(
+    plugin_id: u32,
+    handle_callback: HandleCallback,
+    register_stop_callback: Option<RegisterStopCallback>,
+) {
+    let registration_failed = match register_stop_callback {
+        Some(register) => register(plugin_id, source_stopped) != 0,
+        None => {
+            warn!(
+                "Source connector with ID: {plugin_id} has no stop callback export; rebuild it with the current connector SDK to report poll-task stops"
+            );
+            false
+        }
+    };
+    let stop_reason = if registration_failed {
+        Some(SourceStopReason::RegistrationFailed)
+    } else if handle_callback(plugin_id, handle_produced_messages) != 0 {
+        Some(SourceStopReason::HandlerFailed)
+    } else {
+        None
+    };
+    if let Some(reason) = stop_reason {
+        source_stopped(plugin_id, reason as u8);
+    }
 }
 
 pub fn handle(
@@ -912,6 +994,7 @@ pub fn handle(
                 plugin.transforms,
                 plugin.state_storage,
                 source.handle_callback,
+                source.register_stop_callback,
                 source.batch_result_callback,
                 context.clone(),
             );
@@ -1126,13 +1209,162 @@ fn build_iggy_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configs::connectors::create_connectors_config_provider;
+    use crate::configs::runtime::{ConnectorsConfig, LocalConnectorsConfig};
+    use crate::manager::sink::SinkManager;
+    use crate::manager::source::{SourceDetails, SourceInfo, SourceManager};
+    use crate::metrics::Metrics;
+    use crate::state::FileStateFactory;
+    use crate::stream::IggyClients;
+    use iggy_common::IggyTimestamp;
+    use iggy_connector_sdk::source::SendCallback;
+    use secrecy::SecretString;
     use std::collections::VecDeque;
     use std::future::ready;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     static TEST_PLUGIN_ID: AtomicU32 = AtomicU32::new(u32::MAX / 2);
+    static HANDLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DRAINED_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+    static DRAINED_BATCH_RESULT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    extern "C" fn reject_stop_registration(_: u32, _: SourceStoppedCallback) -> i32 {
+        -1
+    }
+
+    extern "C" fn accept_stop_registration(_: u32, _: SourceStoppedCallback) -> i32 {
+        0
+    }
+
+    extern "C" fn reject_source_handle(_: u32, _: SendCallback) -> i32 {
+        HANDLE_CALLS.fetch_add(1, Ordering::SeqCst);
+        -1
+    }
+
+    extern "C" fn reject_source_handle_untracked(_: u32, _: SendCallback) -> i32 {
+        -1
+    }
+
+    extern "C" fn ignore_batch_result(_: u32, _: u64, _: u8) -> i32 {
+        0
+    }
+
+    extern "C" fn record_drained_batch_result(_: u32, batch_id: u64, result: u8) -> i32 {
+        DRAINED_BATCH_RESULT.store(u32::from(result), Ordering::SeqCst);
+        DRAINED_BATCH_ID.store(batch_id, Ordering::SeqCst);
+        0
+    }
+
+    async fn test_source_runtime(
+        plugin_id: u32,
+        plugin_key: &str,
+        directory: &std::path::Path,
+    ) -> (Arc<RuntimeContext>, StateStorage, IggyProducer) {
+        let config_provider =
+            create_connectors_config_provider(&ConnectorsConfig::Local(LocalConnectorsConfig {
+                config_dir: directory.display().to_string(),
+            }))
+            .await
+            .expect("local config provider should initialize");
+        let state_factory = Arc::new(FileStateFactory::new(directory.display().to_string()));
+        let state_storage = state_factory
+            .storage_for(plugin_key)
+            .expect("file state storage should initialize");
+        let producer = IggyClient::default()
+            .producer("stream", "topic")
+            .expect("producer builder should initialize")
+            .build();
+        let context = Arc::new(RuntimeContext {
+            sinks: SinkManager::new(vec![]),
+            sources: SourceManager::new(vec![SourceDetails {
+                info: SourceInfo {
+                    id: plugin_id,
+                    key: plugin_key.to_string(),
+                    name: plugin_key.to_string(),
+                    path: "test".to_string(),
+                    version: "test".to_string(),
+                    enabled: true,
+                    status: ConnectorStatus::Stopped,
+                    last_error: None,
+                    plugin_config_format: None,
+                },
+                config: SourceConfig {
+                    key: plugin_key.to_string(),
+                    ..SourceConfig::default()
+                },
+                handler_tasks: vec![],
+                container: None,
+                restart_guard: Arc::new(tokio::sync::Mutex::new(())),
+            }]),
+            api_key: SecretString::from("test".to_string()),
+            config_provider: Arc::from(config_provider),
+            metrics: Arc::new(Metrics::init()),
+            start_time: IggyTimestamp::now(),
+            iggy_clients: Arc::new(IggyClients {
+                producer: IggyClient::default(),
+                consumer: IggyClient::default(),
+            }),
+            state_factory,
+        });
+        (context, state_storage, producer)
+    }
+
+    async fn assert_start_failure(
+        register_stop_callback: Option<RegisterStopCallback>,
+        expected_reason: SourceStopReason,
+    ) {
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+
+        let tasks = spawn_source_handler(
+            plugin_id,
+            &plugin_key,
+            false,
+            false,
+            producer,
+            Schema::Raw.encoder(),
+            vec![],
+            state_storage,
+            reject_source_handle_untracked,
+            register_stop_callback,
+            ignore_batch_result,
+            Arc::clone(&context),
+        );
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("source task should stop")
+                .expect("source task should complete");
+        }
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should be registered");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        let message = &source
+            .info
+            .last_error
+            .as_ref()
+            .expect("stop should record the reason")
+            .message;
+        assert!(message.contains(&expected_reason.to_string()));
+        assert!(message.contains("restart required"));
+        assert_eq!(context.metrics.get_sources_running(), 0);
+        assert_eq!(
+            context
+                .metrics
+                .error_counter(&SourceLabels::new(&plugin_key).counter)
+                .get(),
+            1
+        );
+    }
 
     fn next_plugin_id() -> u32 {
         TEST_PLUGIN_ID.fetch_add(1, Ordering::Relaxed)
@@ -1320,10 +1552,12 @@ mod tests {
         let plugin_id = next_plugin_id();
         let batch_id = 73;
         let (sender, receiver) = flume::unbounded();
+        let (stop_sender, _stop_receiver) = mpsc::unbounded_channel();
         SOURCE_SENDERS.insert(
             plugin_id,
             SourceSenderEntry {
                 sender,
+                stop_sender,
                 error_counter: Counter::default(),
             },
         );
@@ -1353,14 +1587,275 @@ mod tests {
     }
 
     #[test]
+    fn given_source_stop_when_callback_runs_should_signal_forwarder() {
+        let plugin_id = next_plugin_id();
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        source_stopped(plugin_id, SourceStopReason::NackLimit as u8);
+        assert_eq!(stop_receiver.try_recv(), Ok(SourceStopReason::NackLimit));
+
+        cleanup_sender(plugin_id);
+        assert!(receiver.is_disconnected());
+    }
+
+    #[test]
+    fn given_registration_failure_should_stop_without_starting_handle() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+        HANDLE_CALLS.store(0, Ordering::SeqCst);
+
+        start_source_polling(
+            plugin_id,
+            reject_source_handle,
+            Some(reject_stop_registration),
+        );
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::RegistrationFailed)
+        );
+        assert_eq!(HANDLE_CALLS.load(Ordering::SeqCst), 0);
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_handle_failure_should_signal_stop_reason() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        start_source_polling(
+            plugin_id,
+            reject_source_handle_untracked,
+            Some(accept_stop_registration),
+        );
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::HandlerFailed)
+        );
+        cleanup_sender(plugin_id);
+    }
+
+    #[test]
+    fn given_old_plugin_without_stop_export_should_still_start_handle() {
+        let plugin_id = next_plugin_id();
+        let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, mut stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender,
+                stop_sender,
+                error_counter: Counter::default(),
+            },
+        );
+
+        start_source_polling(plugin_id, reject_source_handle_untracked, None);
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Ok(SourceStopReason::HandlerFailed)
+        );
+        cleanup_sender(plugin_id);
+    }
+
+    #[tokio::test]
+    async fn given_stop_registration_failure_should_report_restart_required() {
+        assert_start_failure(
+            Some(reject_stop_registration),
+            SourceStopReason::RegistrationFailed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_source_handle_failure_should_report_restart_required() {
+        assert_start_failure(
+            Some(accept_stop_registration),
+            SourceStopReason::HandlerFailed,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn given_queued_batch_and_existing_error_when_stopped_should_not_process_or_recount() {
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+        let (sender, receiver) = flume::unbounded();
+        let queued = receiver.clone();
+        let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        SOURCE_SENDERS.insert(
+            plugin_id,
+            SourceSenderEntry {
+                sender: sender.clone(),
+                stop_sender: stop_sender.clone(),
+                error_counter: Counter::default(),
+            },
+        );
+        let labels = Arc::new(SourceLabels::new(&plugin_key));
+        let forwarding = tokio::spawn(source_forwarding_loop(
+            plugin_id,
+            plugin_key.clone(),
+            false,
+            false,
+            producer,
+            Schema::Raw.encoder(),
+            vec![],
+            state_storage,
+            receiver,
+            stop_receiver,
+            ignore_batch_result,
+            Arc::clone(&context),
+            Arc::clone(&labels),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while context.metrics.get_sources_running() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("forwarding loop should reach Running");
+        context
+            .sources
+            .set_error(&plugin_key, "prior send failure", Some(&context.metrics))
+            .await;
+        sender
+            .send(ProducedBatch {
+                id: 1,
+                messages: ProducedMessages {
+                    schema: Schema::Raw,
+                    messages: vec![],
+                    state: None,
+                },
+            })
+            .expect("batch should enter the queue");
+        stop_sender
+            .send(SourceStopReason::NackLimit)
+            .expect("stop should reach the forwarding loop");
+
+        tokio::time::timeout(Duration::from_secs(2), forwarding)
+            .await
+            .expect("forwarding loop should stop")
+            .expect("forwarding task should complete");
+        assert_eq!(queued.try_recv().expect("queued batch must remain").id, 1);
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should remain registered");
+        let source = source.lock().await;
+        assert_eq!(source.info.status, ConnectorStatus::Error);
+        assert!(
+            source
+                .info
+                .last_error
+                .as_ref()
+                .expect("stop reason should replace the prior error")
+                .message
+                .contains("consecutive NACK limit reached")
+        );
+        assert_eq!(context.metrics.get_sources_running(), 0);
+        assert_eq!(context.metrics.error_counter(&labels.counter).get(), 0);
+        assert!(!SOURCE_SENDERS.contains_key(&plugin_id));
+    }
+
+    #[tokio::test]
+    async fn given_queued_batch_when_stop_channel_closes_should_deliver_result_before_stopping() {
+        DRAINED_BATCH_ID.store(0, Ordering::SeqCst);
+        DRAINED_BATCH_RESULT.store(u32::MAX, Ordering::SeqCst);
+        let plugin_id = next_plugin_id();
+        let plugin_key = format!("source_{plugin_id}");
+        let directory = tempfile::tempdir().expect("test directory should exist");
+        let (context, state_storage, producer) =
+            test_source_runtime(plugin_id, &plugin_key, directory.path()).await;
+        let (sender, receiver) = flume::unbounded();
+        let (stop_sender, stop_receiver) = mpsc::unbounded_channel();
+        sender
+            .send(ProducedBatch {
+                id: 41,
+                messages: ProducedMessages {
+                    schema: Schema::Raw,
+                    messages: vec![],
+                    state: None,
+                },
+            })
+            .expect("batch should enter the queue");
+        drop(sender);
+        drop(stop_sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            source_forwarding_loop(
+                plugin_id,
+                plugin_key.clone(),
+                false,
+                false,
+                producer,
+                Schema::Raw.encoder(),
+                vec![],
+                state_storage,
+                receiver,
+                stop_receiver,
+                record_drained_batch_result,
+                Arc::clone(&context),
+                Arc::new(SourceLabels::new(&plugin_key)),
+            ),
+        )
+        .await
+        .expect("forwarding loop should drain and stop");
+
+        assert_eq!(DRAINED_BATCH_ID.load(Ordering::SeqCst), 41);
+        assert_eq!(
+            DRAINED_BATCH_RESULT.load(Ordering::SeqCst),
+            u32::from(SourceBatchResult::Ack as u8)
+        );
+        let source = context
+            .sources
+            .get(&plugin_key)
+            .await
+            .expect("source should remain registered");
+        assert_eq!(source.lock().await.info.status, ConnectorStatus::Stopped);
+    }
+
+    #[test]
     fn given_invalid_payload_when_callback_runs_should_reject_batch() {
         let plugin_id = next_plugin_id();
         let (sender, _receiver) = flume::unbounded();
+        let (stop_sender, _stop_receiver) = mpsc::unbounded_channel();
         let error_counter = Counter::default();
         SOURCE_SENDERS.insert(
             plugin_id,
             SourceSenderEntry {
                 sender,
+                stop_sender,
                 error_counter: error_counter.clone(),
             },
         );

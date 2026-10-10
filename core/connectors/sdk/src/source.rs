@@ -17,11 +17,12 @@
 
 use crate::log::{CallbackLayer, LogCallback};
 use crate::retry::exponential_backoff;
-use crate::{ConnectorState, Source, get_runtime};
+use crate::{ConnectorState, ProducedMessages, Source, get_runtime};
 use serde::de::DeserializeOwned;
+use std::num::NonZeroU32;
 use std::sync::{
     Arc, Mutex, MutexGuard, PoisonError,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::Duration;
 use tokio::{
@@ -50,12 +51,89 @@ pub type SendCallback = extern "C" fn(
 ) -> i32;
 
 pub type BatchResultCallback = extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32;
+pub type SourceStoppedCallback = extern "C" fn(plugin_id: u32, reason: u8);
 
-/// Maximum time the runtime may take to report a source batch result.
+/// Reason source polling stopped, reported by the SDK callback or the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SourceStopReason {
+    /// The SDK poll task panicked, or the runtime received an unknown reason byte.
+    Unexpected = 0,
+    /// The SDK reached the source's configured consecutive-NACK limit.
+    NackLimit = 1,
+    /// The SDK could not apply a batch result to the source.
+    BatchResultError = 2,
+    /// The SDK lost the pending batch's result channel.
+    ResultChannelClosed = 3,
+    /// The runtime could not register the SDK's stop callback.
+    RegistrationFailed = 4,
+    /// The runtime could not start the source handler.
+    HandlerFailed = 5,
+    /// Normal SDK shutdown; this reason is not sent to the runtime callback.
+    Shutdown = 6,
+}
+
+impl std::fmt::Display for SourceStopReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Unexpected => "source poll task exited unexpectedly",
+            Self::NackLimit => "consecutive NACK limit reached",
+            Self::BatchResultError => "batch result could not be applied",
+            Self::ResultChannelClosed => "batch result channel closed",
+            Self::RegistrationFailed => "source stop callback registration failed",
+            Self::HandlerFailed => "source handler failed to start",
+            Self::Shutdown => "source shut down",
+        })
+    }
+}
+
+impl From<u8> for SourceStopReason {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::NackLimit,
+            2 => Self::BatchResultError,
+            3 => Self::ResultChannelClosed,
+            4 => Self::RegistrationFailed,
+            5 => Self::HandlerFailed,
+            6 => Self::Shutdown,
+            _ => Self::Unexpected,
+        }
+    }
+}
+
+struct StopNotification {
+    plugin_id: u32,
+    callback: Option<SourceStoppedCallback>,
+    closing: Arc<AtomicBool>,
+}
+
+impl StopNotification {
+    fn report(mut self, reason: SourceStopReason) {
+        let callback = self.callback.take();
+        if reason != SourceStopReason::Shutdown
+            && !self.closing.load(Ordering::Acquire)
+            && let Some(callback) = callback
+        {
+            callback(self.plugin_id, reason as u8);
+        }
+    }
+}
+
+impl Drop for StopNotification {
+    fn drop(&mut self) {
+        if !self.closing.load(Ordering::Acquire)
+            && let Some(callback) = self.callback
+        {
+            callback(self.plugin_id, SourceStopReason::Unexpected as u8);
+        }
+    }
+}
+
+/// Time after which a missing source batch result is logged as a warning.
 pub const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 const NACK_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_NACK_RETRY_DELAY: Duration = Duration::from_secs(5);
-/// Number of consecutive rejected batches after which a source is stopped.
+/// Default number of consecutive rejected batches after which a source is stopped.
 pub const MAX_CONSECUTIVE_NACKS: u32 = 5;
 
 /// Delivery result for the single batch currently in flight from a source plugin.
@@ -97,15 +175,28 @@ enum PendingBatchClearResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchCompletion {
     Applied(SourceBatchResult),
-    Stop,
+    Stop(SourceStopReason),
 }
 
+/// Polling policy for one source instance. The default stops after five NACKs.
 #[derive(Debug, Clone, Copy)]
-struct BatchPolicy {
+pub struct BatchPolicy {
     result_timeout: Duration,
     nack_retry_delay: Duration,
     max_nack_retry_delay: Duration,
-    max_consecutive_nacks: u32,
+    max_consecutive_nacks: Option<NonZeroU32>,
+}
+
+impl BatchPolicy {
+    pub fn max_consecutive_nacks(&self) -> Option<NonZeroU32> {
+        self.max_consecutive_nacks
+    }
+
+    /// Sets the NACK limit. `None` keeps polling with capped backoff until shutdown.
+    pub fn with_max_consecutive_nacks(mut self, max_consecutive_nacks: Option<NonZeroU32>) -> Self {
+        self.max_consecutive_nacks = max_consecutive_nacks;
+        self
+    }
 }
 
 impl Default for BatchPolicy {
@@ -114,7 +205,7 @@ impl Default for BatchPolicy {
             result_timeout: BATCH_RESULT_TIMEOUT,
             nack_retry_delay: NACK_RETRY_DELAY,
             max_nack_retry_delay: MAX_NACK_RETRY_DELAY,
-            max_consecutive_nacks: MAX_CONSECUTIVE_NACKS,
+            max_consecutive_nacks: NonZeroU32::new(MAX_CONSECUTIVE_NACKS),
         }
     }
 }
@@ -127,6 +218,9 @@ pub struct SourceContainer<T: Source + std::fmt::Debug> {
     task: Option<JoinHandle<()>>,
     pending_batch: Arc<Mutex<Option<PendingBatch>>>,
     consecutive_nacks: Arc<AtomicU32>,
+    batch_policy: BatchPolicy,
+    stop_callback: Option<SourceStoppedCallback>,
+    closing: Arc<AtomicBool>,
 }
 
 impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
@@ -138,6 +232,9 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
             task: None,
             pending_batch: Arc::new(Mutex::new(None)),
             consecutive_nacks: Arc::new(AtomicU32::new(0)),
+            batch_policy: BatchPolicy::default(),
+            stop_callback: None,
+            closing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -185,6 +282,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
             let mut source = factory(id, config, state);
             let runtime = get_runtime();
             let result = runtime.block_on(source.open());
+            self.batch_policy = source.batch_policy();
             self.id = id;
             self.source = Some(Arc::new(source));
             if result.is_ok() { 0 } else { 1 }
@@ -203,6 +301,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
         };
 
         info!("Closing source connector with ID: {}...", self.id);
+        self.closing.store(true, Ordering::Release);
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
@@ -246,8 +345,14 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
         let source = Arc::clone(source);
         let pending_batch = Arc::clone(&self.pending_batch);
         let consecutive_nacks = Arc::clone(&self.consecutive_nacks);
+        let batch_policy = self.batch_policy;
+        let stop_notification = StopNotification {
+            plugin_id,
+            callback: self.stop_callback,
+            closing: Arc::clone(&self.closing),
+        };
         let handle = runtime.spawn(async move {
-            handle_messages(
+            let reason = handle_messages(
                 plugin_id,
                 source,
                 move |plugin_id, batch_id, messages_ptr, messages_len| {
@@ -256,13 +361,23 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
                 shutdown_rx,
                 pending_batch,
                 consecutive_nacks,
-                BatchPolicy::default(),
+                batch_policy,
             )
             .await;
+            stop_notification.report(reason);
         });
 
         self.shutdown = Some(shutdown_tx);
         self.task = Some(handle);
+        0
+    }
+
+    #[doc(hidden)]
+    pub fn register_stop_callback(&mut self, callback: SourceStoppedCallback) -> i32 {
+        if self.source.is_none() || self.task.is_some() {
+            return -1;
+        }
+        self.stop_callback = Some(callback);
         0
     }
 
@@ -280,7 +395,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
             batch_id,
             result,
             self.id,
-            MAX_CONSECUTIVE_NACKS,
+            self.batch_policy.max_consecutive_nacks,
         )
     }
 }
@@ -289,20 +404,50 @@ async fn handle_messages<T, F>(
     plugin_id: u32,
     source: Arc<T>,
     callback: F,
+    shutdown: watch::Receiver<()>,
+    pending_batch: Arc<Mutex<Option<PendingBatch>>>,
+    consecutive_nacks: Arc<AtomicU32>,
+    policy: BatchPolicy,
+) -> SourceStopReason
+where
+    T: Source,
+    F: Fn(u32, u64, *const u8, usize) -> i32,
+{
+    handle_messages_with_serializer(
+        plugin_id,
+        source,
+        callback,
+        shutdown,
+        pending_batch,
+        consecutive_nacks,
+        policy,
+        postcard::to_allocvec,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_messages_with_serializer<T, F, S>(
+    plugin_id: u32,
+    source: Arc<T>,
+    callback: F,
     mut shutdown: watch::Receiver<()>,
     pending_batch: Arc<Mutex<Option<PendingBatch>>>,
     consecutive_nacks: Arc<AtomicU32>,
     policy: BatchPolicy,
-) where
+    serialize: S,
+) -> SourceStopReason
+where
     T: Source,
     F: Fn(u32, u64, *const u8, usize) -> i32,
+    S: Fn(&ProducedMessages) -> Result<Vec<u8>, postcard::Error>,
 {
     let mut batch_id = 1u64;
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 info!("Shutting down source connector with ID: {plugin_id}");
-                break;
+                break SourceStopReason::Shutdown;
             }
             messages = source.poll() => {
                 let messages = match messages {
@@ -313,24 +458,24 @@ async fn handle_messages<T, F>(
                     }
                 };
 
-                let messages = match postcard::to_allocvec(&messages) {
+                let messages = match serialize(&messages) {
                     Ok(messages) => messages,
                     Err(err) => {
                         error!("Failed to serialize messages for source connector with ID: {plugin_id}. {err}");
-                        if matches!(
-                            apply_batch_result(
+                        let completion = apply_batch_result(
                                 &source,
                                 &consecutive_nacks,
                                 SourceBatchResult::Nack,
                                 plugin_id,
                                 policy.max_consecutive_nacks,
                             )
-                            .await,
-                            BatchCompletion::Stop
-                        ) {
-                            break;
+                            .await;
+                        if let BatchCompletion::Stop(reason) = completion {
+                            break reason;
                         }
-                        sleep_after_nack(&consecutive_nacks, policy).await;
+                        if sleep_after_nack(&consecutive_nacks, policy, &mut shutdown).await {
+                            break SourceStopReason::Shutdown;
+                        }
                         continue;
                     }
                 };
@@ -352,7 +497,7 @@ async fn handle_messages<T, F>(
                     if clear_pending_batch(&pending_batch, batch_id, plugin_id)
                         != PendingBatchClearResult::Cleared
                     {
-                        break;
+                        break SourceStopReason::Unexpected;
                     }
                     let completion = apply_batch_result(
                         &source,
@@ -362,81 +507,71 @@ async fn handle_messages<T, F>(
                         policy.max_consecutive_nacks,
                     )
                     .await;
-                    if matches!(completion, BatchCompletion::Stop) {
-                        break;
+                    if let BatchCompletion::Stop(reason) = completion {
+                        break reason;
                     }
-                    sleep_after_nack(&consecutive_nacks, policy).await;
+                    if sleep_after_nack(&consecutive_nacks, policy, &mut shutdown).await {
+                        break SourceStopReason::Shutdown;
+                    }
                     batch_id += 1;
                     continue;
                 }
 
                 let mut result_receiver = Box::pin(result_receiver);
-                let (completion, shutting_down) = tokio::select! {
-                    biased;
-                    result = &mut result_receiver => {
-                        (result.unwrap_or(BatchCompletion::Stop), false)
-                    },
-                    _ = shutdown.changed() => {
-                        let completion = match clear_pending_batch(
-                            &pending_batch,
-                            batch_id,
-                            plugin_id,
-                        ) {
-                            PendingBatchClearResult::Cleared => apply_batch_result(
-                                &source,
-                                &consecutive_nacks,
-                                SourceBatchResult::Nack,
+                let mut timeout_warned = false;
+                let (completion, shutting_down) = loop {
+                    let outcome = tokio::select! {
+                        biased;
+                        result = &mut result_receiver => {
+                            (result.unwrap_or(BatchCompletion::Stop(SourceStopReason::ResultChannelClosed)), false)
+                        },
+                        _ = shutdown.changed() => {
+                            let completion = match clear_pending_batch(
+                                &pending_batch,
+                                batch_id,
                                 plugin_id,
-                                policy.max_consecutive_nacks,
-                            ).await,
-                            PendingBatchClearResult::ResultReceived
-                            | PendingBatchClearResult::Unavailable => result_receiver
-                                .as_mut()
-                                .await
-                                .unwrap_or(BatchCompletion::Stop),
-                        };
-                        (completion, true)
-                    },
-                    _ = tokio::time::sleep(policy.result_timeout) => {
-                        warn!(
-                            "Timed out waiting for batch result for source connector with ID: {plugin_id}, batch ID: {batch_id}"
-                        );
-                        let completion = match clear_pending_batch(
-                            &pending_batch,
-                            batch_id,
-                            plugin_id,
-                        ) {
-                            PendingBatchClearResult::Cleared => apply_batch_result(
-                                &source,
-                                &consecutive_nacks,
-                                SourceBatchResult::Nack,
-                                plugin_id,
-                                policy.max_consecutive_nacks,
-                            ).await,
-                            PendingBatchClearResult::ResultReceived
-                            | PendingBatchClearResult::Unavailable => result_receiver
-                                .as_mut()
-                                .await
-                                .unwrap_or(BatchCompletion::Stop),
-                        };
-                        (completion, false)
-                    }
+                            ) {
+                                PendingBatchClearResult::Cleared => apply_batch_result(
+                                    &source,
+                                    &consecutive_nacks,
+                                    SourceBatchResult::Nack,
+                                    plugin_id,
+                                    policy.max_consecutive_nacks,
+                                ).await,
+                                PendingBatchClearResult::ResultReceived
+                                | PendingBatchClearResult::Unavailable => result_receiver
+                                    .as_mut()
+                                    .await
+                                    .unwrap_or(BatchCompletion::Stop(SourceStopReason::ResultChannelClosed)),
+                            };
+                            (completion, true)
+                        },
+                        _ = tokio::time::sleep(policy.result_timeout), if !timeout_warned => {
+                            warn!(
+                                "Still waiting for batch result for source connector with ID: {plugin_id}, batch ID: {batch_id}"
+                            );
+                            timeout_warned = true;
+                            continue;
+                        }
+                    };
+                    break outcome;
                 };
 
-                if matches!(completion, BatchCompletion::Stop) {
-                    break;
+                if let BatchCompletion::Stop(reason) = completion {
+                    break reason;
                 }
 
                 if shutting_down {
                     info!("Shutting down source connector with ID: {plugin_id}");
-                    break;
+                    break SourceStopReason::Shutdown;
                 }
 
                 if matches!(
                     completion,
                     BatchCompletion::Applied(SourceBatchResult::Nack)
-                ) {
-                    sleep_after_nack(&consecutive_nacks, policy).await;
+                ) && sleep_after_nack(&consecutive_nacks, policy, &mut shutdown).await
+                {
+                    break SourceStopReason::Shutdown;
                 }
                 batch_id += 1;
             }
@@ -451,7 +586,7 @@ fn complete_pending_batch<T>(
     batch_id: u64,
     result_code: u8,
     plugin_id: u32,
-    max_consecutive_nacks: u32,
+    max_consecutive_nacks: Option<NonZeroU32>,
 ) -> i32
 where
     T: Source + 'static,
@@ -487,7 +622,7 @@ where
         return -1;
     }
 
-    if invalid_result || matches!(completion, BatchCompletion::Stop) {
+    if invalid_result || matches!(completion, BatchCompletion::Stop(_)) {
         -1
     } else {
         0
@@ -578,11 +713,11 @@ async fn apply_batch_result<T: Source>(
     consecutive_nacks: &AtomicU32,
     result: SourceBatchResult,
     plugin_id: u32,
-    max_consecutive_nacks: u32,
+    max_consecutive_nacks: Option<NonZeroU32>,
 ) -> BatchCompletion {
     if let Err(err) = source.on_batch_result(result).await {
         error!("Failed to process {result:?} for source connector with ID: {plugin_id}. {err}");
-        return BatchCompletion::Stop;
+        return BatchCompletion::Stop(SourceStopReason::BatchResultError);
     }
 
     let consecutive_nacks = match result {
@@ -590,20 +725,31 @@ async fn apply_batch_result<T: Source>(
             consecutive_nacks.store(0, Ordering::Relaxed);
             0
         }
-        SourceBatchResult::Nack => consecutive_nacks.fetch_add(1, Ordering::Relaxed) + 1,
+        SourceBatchResult::Nack => consecutive_nacks
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            })
+            .map_or(u32::MAX, |previous| previous.saturating_add(1)),
     };
-    if consecutive_nacks >= max_consecutive_nacks {
+    if max_consecutive_nacks.is_some_and(|limit| consecutive_nacks >= limit.get()) {
         error!(
             "Stopping source connector with ID: {plugin_id} after {consecutive_nacks} consecutive NACKs"
         );
-        return BatchCompletion::Stop;
+        return BatchCompletion::Stop(SourceStopReason::NackLimit);
     }
 
     BatchCompletion::Applied(result)
 }
 
-async fn sleep_after_nack(consecutive_nacks: &AtomicU32, policy: BatchPolicy) {
-    tokio::time::sleep(nack_retry_delay(consecutive_nacks, policy)).await;
+async fn sleep_after_nack(
+    consecutive_nacks: &AtomicU32,
+    policy: BatchPolicy,
+    shutdown: &mut watch::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        _ = shutdown.changed() => true,
+        _ = tokio::time::sleep(nack_retry_delay(consecutive_nacks, policy)) => false,
+    }
 }
 
 fn nack_retry_delay(consecutive_nacks: &AtomicU32, policy: BatchPolicy) -> Duration {
@@ -627,6 +773,7 @@ macro_rules! source_connector {
         use std::sync::LazyLock;
         use $crate::LogCallback;
         use $crate::source::SendCallback;
+        use $crate::source::SourceStoppedCallback;
         use $crate::source::SourceContainer;
 
         static INSTANCES: LazyLock<DashMap<u32, SourceContainer<$type>>> =
@@ -687,6 +834,18 @@ macro_rules! source_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
+        extern "C" fn iggy_source_register_stop_callback(
+            id: u32,
+            callback: SourceStoppedCallback,
+        ) -> i32 {
+            let Some(mut instance) = INSTANCES.get_mut(&id) else {
+                return -1;
+            };
+            instance.register_stop_callback(callback)
+        }
+
+        #[cfg(not(test))]
+        #[unsafe(no_mangle)]
         extern "C" fn iggy_source_batch_result(id: u32, batch_id: u64, result: u8) -> i32 {
             let Some(instance) = INSTANCES.get(&id) else {
                 tracing::error!(
@@ -727,15 +886,287 @@ mod tests {
     use crate::{ProducedMessages, Schema};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Notify, mpsc};
+
+    static STOPPED_PLUGIN: AtomicU32 = AtomicU32::new(0);
+    static STOP_REASON: AtomicU32 = AtomicU32::new(0);
+    static STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLOSE_STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SHUTDOWN_STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLOSING_NACK_STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PANIC_STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PANIC_STOP_REASON: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    extern "C" fn record_stop(plugin_id: u32, reason: u8) {
+        STOPPED_PLUGIN.store(plugin_id, Ordering::SeqCst);
+        STOP_REASON.store(u32::from(reason), Ordering::SeqCst);
+        STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn reject_batch(_: u32, _: u64, _: *const u8, _: usize) -> i32 {
+        -1
+    }
+
+    extern "C" fn accept_batch(_: u32, _: u64, _: *const u8, _: usize) -> i32 {
+        0
+    }
+
+    extern "C" fn record_close_stop(_: u32, _: u8) {
+        CLOSE_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn record_shutdown_stop(_: u32, _: u8) {
+        SHUTDOWN_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn record_closing_nack_stop(_: u32, _: u8) {
+        CLOSING_NACK_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn record_panic_stop(_: u32, reason: u8) {
+        PANIC_STOP_REASON.store(u32::from(reason), Ordering::SeqCst);
+        PANIC_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn given_unopened_source_when_registering_stop_callback_should_reject() {
+        let mut container = SourceContainer::<TestSource>::new(39);
+        assert_eq!(container.register_stop_callback(record_panic_stop), -1);
+    }
+
+    #[test]
+    fn given_nack_limit_when_polling_stops_should_notify_runtime() {
+        STOPPED_PLUGIN.store(0, Ordering::SeqCst);
+        STOP_REASON.store(0, Ordering::SeqCst);
+        STOP_COUNT.store(0, Ordering::SeqCst);
+        let mut container = SourceContainer::<TestSource>::new(32);
+        let config = b"{}";
+        assert_eq!(
+            unsafe {
+                container.open(
+                    32,
+                    config.as_ptr(),
+                    config.len(),
+                    std::ptr::null(),
+                    0,
+                    ignore_log,
+                    |_, _: serde_json::Value, _| TestSource {
+                        batch_policy: test_policy().with_max_consecutive_nacks(NonZeroU32::new(2)),
+                        ..TestSource::default()
+                    },
+                )
+            },
+            0
+        );
+        assert_eq!(container.register_stop_callback(record_stop), 0);
+        assert_eq!(unsafe { container.handle(reject_batch) }, 0);
+        get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while STOPPED_PLUGIN.load(Ordering::SeqCst) != 32 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("source did not report its terminal NACK limit");
+        });
+        let source = Arc::clone(container.source.as_ref().expect("source should be open"));
+        assert_eq!(source.polls.load(Ordering::SeqCst), 2);
+        drop(source);
+        assert_eq!(unsafe { container.close() }, 0);
+        assert_eq!(STOPPED_PLUGIN.load(Ordering::SeqCst), 32);
+        assert_eq!(
+            STOP_REASON.load(Ordering::SeqCst),
+            SourceStopReason::NackLimit as u32
+        );
+        assert_eq!(STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(container.consecutive_nacks.load(Ordering::SeqCst), 2);
+
+        drop(StopNotification {
+            plugin_id: 33,
+            callback: Some(record_stop),
+            closing: Arc::new(AtomicBool::new(true)),
+        });
+        assert_eq!(STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn given_running_source_when_closed_should_not_notify_runtime() {
+        CLOSE_STOP_COUNT.store(0, Ordering::SeqCst);
+        let mut container = SourceContainer::<TestSource>::new(35);
+        let config = b"{}";
+        assert_eq!(
+            unsafe {
+                container.open(
+                    35,
+                    config.as_ptr(),
+                    config.len(),
+                    std::ptr::null(),
+                    0,
+                    ignore_log,
+                    |_, _: serde_json::Value, _| TestSource::default(),
+                )
+            },
+            0
+        );
+        assert_eq!(container.register_stop_callback(record_close_stop), 0);
+        assert_eq!(unsafe { container.handle(accept_batch) }, 0);
+        let source = Arc::clone(container.source.as_ref().expect("source should be open"));
+        get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while source.polls.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("source did not begin polling");
+        });
+        drop(source);
+
+        assert_eq!(unsafe { container.close() }, 0);
+        assert_eq!(CLOSE_STOP_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn given_shutdown_reason_without_close_should_not_notify_runtime() {
+        SHUTDOWN_STOP_COUNT.store(0, Ordering::SeqCst);
+        StopNotification {
+            plugin_id: 36,
+            callback: Some(record_shutdown_stop),
+            closing: Arc::new(AtomicBool::new(false)),
+        }
+        .report(SourceStopReason::Shutdown);
+        assert_eq!(SHUTDOWN_STOP_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn given_nack_limit_during_close_should_not_notify_runtime() {
+        CLOSING_NACK_STOP_COUNT.store(0, Ordering::SeqCst);
+        let nack_entered = Arc::new(Notify::new());
+        let finish_nack = Arc::new(Notify::new());
+        let mut container = SourceContainer::<TestSource>::new(37);
+        let config = b"{}";
+        assert_eq!(
+            unsafe {
+                container.open(
+                    37,
+                    config.as_ptr(),
+                    config.len(),
+                    std::ptr::null(),
+                    0,
+                    ignore_log,
+                    |_, _: serde_json::Value, _| TestSource {
+                        batch_policy: test_policy().with_max_consecutive_nacks(NonZeroU32::new(1)),
+                        nack_pause: Some((Arc::clone(&nack_entered), Arc::clone(&finish_nack))),
+                        ..TestSource::default()
+                    },
+                )
+            },
+            0
+        );
+        assert_eq!(
+            container.register_stop_callback(record_closing_nack_stop),
+            0
+        );
+        assert_eq!(unsafe { container.handle(reject_batch) }, 0);
+        get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), nack_entered.notified())
+                .await
+                .expect("source did not enter NACK handling");
+        });
+
+        let closing = Arc::clone(&container.closing);
+        let close_thread = std::thread::spawn(move || unsafe { container.close() });
+        get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !closing.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("close did not mark the source as closing");
+        });
+        finish_nack.notify_one();
+        assert_eq!(
+            close_thread.join().expect("source close thread panicked"),
+            0
+        );
+        assert_eq!(CLOSING_NACK_STOP_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn given_poll_panic_should_notify_runtime_once_as_unexpected() {
+        PANIC_STOP_COUNT.store(0, Ordering::SeqCst);
+        PANIC_STOP_REASON.store(u32::MAX, Ordering::SeqCst);
+        let mut container = SourceContainer::<TestSource>::new(38);
+        let config = b"{}";
+        assert_eq!(
+            unsafe {
+                container.open(
+                    38,
+                    config.as_ptr(),
+                    config.len(),
+                    std::ptr::null(),
+                    0,
+                    ignore_log,
+                    |_, _: serde_json::Value, _| TestSource {
+                        panic_on_poll: AtomicBool::new(true),
+                        ..TestSource::default()
+                    },
+                )
+            },
+            0
+        );
+        assert_eq!(container.register_stop_callback(record_panic_stop), 0);
+        assert_eq!(unsafe { container.handle(accept_batch) }, 0);
+        assert_eq!(container.register_stop_callback(record_panic_stop), -1);
+        get_runtime().block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while PANIC_STOP_COUNT.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("poll panic should report a stop");
+        });
+        assert_eq!(
+            PANIC_STOP_REASON.load(Ordering::SeqCst),
+            SourceStopReason::Unexpected as u32
+        );
+        assert_eq!(unsafe { container.close() }, 0);
+        assert_eq!(PANIC_STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn source_stop_reasons_should_keep_their_wire_bytes() {
+        for (reason, byte) in [
+            (SourceStopReason::Unexpected, 0),
+            (SourceStopReason::NackLimit, 1),
+            (SourceStopReason::BatchResultError, 2),
+            (SourceStopReason::ResultChannelClosed, 3),
+            (SourceStopReason::RegistrationFailed, 4),
+            (SourceStopReason::HandlerFailed, 5),
+            (SourceStopReason::Shutdown, 6),
+        ] {
+            assert_eq!(reason as u8, byte);
+            assert_eq!(SourceStopReason::from(byte), reason);
+        }
+        assert_eq!(
+            SourceStopReason::from(u8::MAX),
+            SourceStopReason::Unexpected
+        );
+    }
 
     fn test_policy() -> BatchPolicy {
         BatchPolicy {
             result_timeout: Duration::from_millis(500),
             nack_retry_delay: Duration::from_millis(1),
             max_nack_retry_delay: Duration::from_millis(2),
-            max_consecutive_nacks: MAX_CONSECUTIVE_NACKS,
+            max_consecutive_nacks: test_nack_limit(),
         }
+    }
+
+    fn test_nack_limit() -> Option<NonZeroU32> {
+        NonZeroU32::new(MAX_CONSECUTIVE_NACKS)
     }
 
     #[derive(Debug, Default)]
@@ -743,7 +1174,10 @@ mod tests {
         polls: AtomicUsize,
         results: Mutex<Vec<SourceBatchResult>>,
         fail_batch_result: AtomicBool,
+        panic_on_poll: AtomicBool,
         batch_result_delay: Duration,
+        batch_policy: BatchPolicy,
+        nack_pause: Option<(Arc<Notify>, Arc<Notify>)>,
     }
 
     #[async_trait::async_trait]
@@ -752,8 +1186,13 @@ mod tests {
             Ok(())
         }
 
+        fn batch_policy(&self) -> BatchPolicy {
+            self.batch_policy
+        }
+
         async fn poll(&self) -> Result<ProducedMessages, crate::Error> {
             self.polls.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic_on_poll.load(Ordering::SeqCst));
             Ok(ProducedMessages {
                 schema: Schema::Raw,
                 messages: Vec::new(),
@@ -762,6 +1201,12 @@ mod tests {
         }
 
         async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), crate::Error> {
+            if result == SourceBatchResult::Nack
+                && let Some((entered, finish)) = &self.nack_pause
+            {
+                entered.notify_one();
+                finish.notified().await;
+            }
             if !self.batch_result_delay.is_zero() {
                 tokio::time::sleep(self.batch_result_delay).await;
             }
@@ -782,6 +1227,83 @@ mod tests {
         }
     }
 
+    extern "C" fn ignore_log(
+        _level: u8,
+        _target_ptr: *const u8,
+        _target_len: usize,
+        _message_ptr: *const u8,
+        _message_len: usize,
+    ) {
+    }
+
+    #[test]
+    fn given_custom_source_policy_when_opened_should_capture_nack_limit() {
+        let mut container = SourceContainer::<TestSource>::new(31);
+        let config = b"{}";
+        let result = unsafe {
+            container.open(
+                31,
+                config.as_ptr(),
+                config.len(),
+                std::ptr::null(),
+                0,
+                ignore_log,
+                |_, _: serde_json::Value, _| TestSource {
+                    batch_policy: BatchPolicy::default().with_max_consecutive_nacks(None),
+                    ..TestSource::default()
+                },
+            )
+        };
+
+        assert_eq!(result, 0);
+        assert_eq!(container.batch_policy.max_consecutive_nacks(), None);
+        assert_eq!(unsafe { container.close() }, 0);
+    }
+
+    #[test]
+    fn given_no_nack_limit_when_completing_six_nacks_should_not_stop() {
+        let mut container = SourceContainer::<TestSource>::new(34);
+        let config = b"{}";
+        assert_eq!(
+            unsafe {
+                container.open(
+                    34,
+                    config.as_ptr(),
+                    config.len(),
+                    std::ptr::null(),
+                    0,
+                    ignore_log,
+                    |_, _: serde_json::Value, _| TestSource {
+                        batch_policy: test_policy().with_max_consecutive_nacks(None),
+                        ..TestSource::default()
+                    },
+                )
+            },
+            0
+        );
+
+        for batch_id in 1..=6 {
+            let (result_sender, result_receiver) = oneshot::channel();
+            *lock_pending_batch(&container.pending_batch) = Some(PendingBatch {
+                id: batch_id,
+                result_sender,
+                result_received: false,
+            });
+            assert_eq!(
+                container.complete_batch(batch_id, SourceBatchResult::Nack as u8),
+                0
+            );
+            assert_eq!(
+                get_runtime()
+                    .block_on(result_receiver)
+                    .expect("batch completion should be delivered"),
+                BatchCompletion::Applied(SourceBatchResult::Nack)
+            );
+        }
+        assert_eq!(container.consecutive_nacks.load(Ordering::Relaxed), 6);
+        assert_eq!(unsafe { container.close() }, 0);
+    }
+
     async fn complete_test_batch(
         pending_batch: Arc<Mutex<Option<PendingBatch>>>,
         source: Arc<TestSource>,
@@ -798,7 +1320,7 @@ mod tests {
                 batch_id,
                 result as u8,
                 plugin_id,
-                MAX_CONSECUTIVE_NACKS,
+                test_nack_limit(),
             )
         })
         .await
@@ -962,7 +1484,7 @@ mod tests {
                 42,
                 SourceBatchResult::Ack as u8,
                 11,
-                MAX_CONSECUTIVE_NACKS,
+                test_nack_limit(),
             ),
             -1
         );
@@ -974,7 +1496,7 @@ mod tests {
                 41,
                 SourceBatchResult::Ack as u8,
                 11,
-                MAX_CONSECUTIVE_NACKS,
+                test_nack_limit(),
             ),
             0
         );
@@ -1008,7 +1530,7 @@ mod tests {
                 51,
                 99,
                 17,
-                MAX_CONSECUTIVE_NACKS,
+                test_nack_limit(),
             ),
             -1
         );
@@ -1030,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn given_result_timeout_should_nack_and_poll_next_batch() {
+    fn given_result_timeout_should_keep_batch_pending_until_result() {
         let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
         runtime.block_on(async {
             let source = Arc::new(TestSource::default());
@@ -1059,18 +1581,41 @@ mod tests {
             ));
 
             assert_eq!(batch_receiver.recv().await, Some(1));
-            let next_batch_id = tokio::time::timeout(Duration::from_secs(1), batch_receiver.recv())
-                .await
-                .expect("source did not poll after timed-out batch")
-                .expect("batch channel closed");
-            assert_eq!(next_batch_id, 2);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), batch_receiver.recv())
+                    .await
+                    .is_err(),
+                "source must not poll again without a runtime result"
+            );
+            assert_eq!(source.polls.load(Ordering::Relaxed), 1);
+            assert_eq!(consecutive_nacks.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                lock_pending_batch(&pending_batch)
+                    .as_ref()
+                    .map(|batch| batch.id),
+                Some(1)
+            );
             assert_eq!(
                 *source
                     .results
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner),
-                vec![SourceBatchResult::Nack]
+                Vec::<SourceBatchResult>::new()
             );
+
+            assert_eq!(
+                complete_test_batch(
+                    Arc::clone(&pending_batch),
+                    Arc::clone(&source),
+                    Arc::clone(&consecutive_nacks),
+                    1,
+                    SourceBatchResult::Ack,
+                    19,
+                )
+                .await,
+                0
+            );
+            assert_eq!(batch_receiver.recv().await, Some(2));
 
             task.abort();
             let _ = task.await;
@@ -1213,7 +1758,7 @@ mod tests {
                         &consecutive_nacks,
                         SourceBatchResult::Nack,
                         23,
-                        MAX_CONSECUTIVE_NACKS,
+                        test_nack_limit(),
                     )
                     .await,
                     BatchCompletion::Applied(SourceBatchResult::Nack)
@@ -1227,14 +1772,303 @@ mod tests {
                     &consecutive_nacks,
                     SourceBatchResult::Nack,
                     23,
-                    MAX_CONSECUTIVE_NACKS,
+                    test_nack_limit(),
                 )
                 .await,
-                BatchCompletion::Stop
+                BatchCompletion::Stop(SourceStopReason::NackLimit)
             );
             assert_eq!(
                 consecutive_nacks.load(Ordering::Relaxed),
                 MAX_CONSECUTIVE_NACKS
+            );
+        });
+    }
+
+    #[test]
+    fn given_no_nack_limit_when_repeated_nacks_should_keep_polling() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource::default());
+            let consecutive_nacks = AtomicU32::new(0);
+
+            for expected_count in 1..=MAX_CONSECUTIVE_NACKS + 1 {
+                assert_eq!(
+                    apply_batch_result(
+                        &source,
+                        &consecutive_nacks,
+                        SourceBatchResult::Nack,
+                        23,
+                        None,
+                    )
+                    .await,
+                    BatchCompletion::Applied(SourceBatchResult::Nack)
+                );
+                assert_eq!(consecutive_nacks.load(Ordering::Relaxed), expected_count);
+            }
+        });
+    }
+
+    #[test]
+    fn given_result_hook_failure_should_stop_even_without_nack_limit() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource {
+                fail_batch_result: AtomicBool::new(true),
+                ..TestSource::default()
+            });
+            let consecutive_nacks = AtomicU32::new(0);
+
+            assert_eq!(
+                apply_batch_result(
+                    &source,
+                    &consecutive_nacks,
+                    SourceBatchResult::Nack,
+                    23,
+                    None,
+                )
+                .await,
+                BatchCompletion::Stop(SourceStopReason::BatchResultError)
+            );
+            assert_eq!(consecutive_nacks.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn given_no_nack_limit_when_callback_rejects_batches_should_poll_past_default_limit() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource::default());
+            let pending_batch = Arc::new(Mutex::new(None));
+            let consecutive_nacks = Arc::new(AtomicU32::new(0));
+            let (shutdown_sender, shutdown_receiver) = watch::channel(());
+            let (batch_sender, mut batch_receiver) = mpsc::unbounded_channel();
+            let policy = test_policy().with_max_consecutive_nacks(None);
+
+            let task = tokio::spawn(handle_messages(
+                23,
+                Arc::clone(&source),
+                move |_, batch_id, _, _| {
+                    batch_sender
+                        .send(batch_id)
+                        .expect("batch receiver should remain open");
+                    -1
+                },
+                shutdown_receiver,
+                pending_batch,
+                Arc::clone(&consecutive_nacks),
+                policy,
+            ));
+
+            for expected_batch_id in 1..=u64::from(MAX_CONSECUTIVE_NACKS + 1) {
+                let batch_id = tokio::time::timeout(Duration::from_secs(1), batch_receiver.recv())
+                    .await
+                    .expect("source stopped polling after repeated NACKs");
+                assert_eq!(batch_id, Some(expected_batch_id));
+            }
+
+            shutdown_sender
+                .send(())
+                .expect("source task should still be running");
+            task.await.expect("source task should shut down cleanly");
+            assert!(
+                consecutive_nacks.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_NACKS,
+                "the source should have handled more NACKs than the default limit"
+            );
+        });
+    }
+
+    #[test]
+    fn given_unlimited_nacks_when_shutdown_during_backoff_should_stop_promptly() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource::default());
+            let pending_batch = Arc::new(Mutex::new(None));
+            let consecutive_nacks = Arc::new(AtomicU32::new(0));
+            let (shutdown_sender, shutdown_receiver) = watch::channel(());
+            let (batch_sender, mut batch_receiver) = mpsc::unbounded_channel();
+            let policy = BatchPolicy {
+                nack_retry_delay: Duration::from_secs(10),
+                max_nack_retry_delay: Duration::from_secs(10),
+                ..test_policy().with_max_consecutive_nacks(None)
+            };
+
+            let task = tokio::spawn(handle_messages(
+                23,
+                source,
+                move |_, batch_id, _, _| {
+                    batch_sender
+                        .send(batch_id)
+                        .expect("batch receiver should remain open");
+                    -1
+                },
+                shutdown_receiver,
+                pending_batch,
+                consecutive_nacks,
+                policy,
+            ));
+
+            let batch_id = tokio::time::timeout(Duration::from_secs(1), batch_receiver.recv())
+                .await
+                .expect("source should submit a batch");
+            assert_eq!(batch_id, Some(1));
+            shutdown_sender
+                .send(())
+                .expect("source task should still be running");
+            tokio::time::timeout(Duration::from_millis(500), task)
+                .await
+                .expect("shutdown should interrupt NACK backoff")
+                .expect("source task should shut down cleanly");
+        });
+    }
+
+    #[test]
+    fn given_runtime_nack_when_shutdown_during_backoff_should_stop_promptly() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource::default());
+            let pending_batch = Arc::new(Mutex::new(None));
+            let consecutive_nacks = Arc::new(AtomicU32::new(0));
+            let (shutdown_sender, shutdown_receiver) = watch::channel(());
+            let (batch_sender, mut batch_receiver) = mpsc::unbounded_channel();
+            let policy = BatchPolicy {
+                nack_retry_delay: Duration::from_secs(10),
+                max_nack_retry_delay: Duration::from_secs(10),
+                ..test_policy().with_max_consecutive_nacks(None)
+            };
+
+            let task = tokio::spawn(handle_messages(
+                24,
+                Arc::clone(&source),
+                move |_, batch_id, _, _| {
+                    batch_sender
+                        .send(batch_id)
+                        .expect("batch receiver should remain open");
+                    0
+                },
+                shutdown_receiver,
+                Arc::clone(&pending_batch),
+                Arc::clone(&consecutive_nacks),
+                policy,
+            ));
+
+            assert_eq!(batch_receiver.recv().await, Some(1));
+            assert_eq!(
+                complete_test_batch(
+                    Arc::clone(&pending_batch),
+                    Arc::clone(&source),
+                    Arc::clone(&consecutive_nacks),
+                    1,
+                    SourceBatchResult::Nack,
+                    24,
+                )
+                .await,
+                0
+            );
+            shutdown_sender
+                .send(())
+                .expect("source task should still be running");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(500), task)
+                    .await
+                    .expect("shutdown should interrupt result-NACK backoff")
+                    .expect("source task should complete"),
+                SourceStopReason::Shutdown
+            );
+            assert_eq!(source.polls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn given_nack_backoff_when_shutdown_should_interrupt_shared_delay() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let consecutive_nacks = AtomicU32::new(1);
+            let policy = BatchPolicy {
+                nack_retry_delay: Duration::from_secs(10),
+                max_nack_retry_delay: Duration::from_secs(10),
+                ..test_policy()
+            };
+            let (shutdown_sender, mut shutdown_receiver) = watch::channel(());
+            let waiting = tokio::spawn(async move {
+                sleep_after_nack(&consecutive_nacks, policy, &mut shutdown_receiver).await
+            });
+            shutdown_sender
+                .send(())
+                .expect("delay should still be active");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), waiting)
+                    .await
+                    .expect("shutdown should interrupt shared NACK delay")
+                    .expect("delay task should complete")
+            );
+        });
+    }
+
+    #[test]
+    fn given_serialization_failure_when_shutdown_during_backoff_should_stop_promptly() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource::default());
+            let pending_batch = Arc::new(Mutex::new(None));
+            let consecutive_nacks = Arc::new(AtomicU32::new(0));
+            let (shutdown_sender, shutdown_receiver) = watch::channel(());
+            let policy = BatchPolicy {
+                nack_retry_delay: Duration::from_secs(10),
+                max_nack_retry_delay: Duration::from_secs(10),
+                ..test_policy().with_max_consecutive_nacks(None)
+            };
+
+            let source_for_task = Arc::clone(&source);
+            let nacks_for_task = Arc::clone(&consecutive_nacks);
+            let task = tokio::spawn(handle_messages_with_serializer(
+                25,
+                source_for_task,
+                |_, _, _, _| panic!("serialization failure must prevent the callback"),
+                shutdown_receiver,
+                pending_batch,
+                nacks_for_task,
+                policy,
+                |_| Err(postcard::Error::SerdeSerCustom),
+            ));
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while consecutive_nacks.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("serialization failure should NACK the batch");
+            shutdown_sender
+                .send(())
+                .expect("source task should still be running");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(500), task)
+                    .await
+                    .expect("shutdown should interrupt serialization-failure backoff")
+                    .expect("source task should complete"),
+                SourceStopReason::Shutdown
+            );
+            assert_eq!(source.polls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn given_custom_nack_limit_when_reached_should_stop() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let source = Arc::new(TestSource::default());
+            let consecutive_nacks = AtomicU32::new(1);
+
+            assert_eq!(
+                apply_batch_result(
+                    &source,
+                    &consecutive_nacks,
+                    SourceBatchResult::Nack,
+                    23,
+                    NonZeroU32::new(2),
+                )
+                .await,
+                BatchCompletion::Stop(SourceStopReason::NackLimit)
             );
         });
     }
@@ -1252,7 +2086,7 @@ mod tests {
                     &consecutive_nacks,
                     SourceBatchResult::Ack,
                     29,
-                    MAX_CONSECUTIVE_NACKS,
+                    test_nack_limit(),
                 )
                 .await,
                 BatchCompletion::Applied(SourceBatchResult::Ack)

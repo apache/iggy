@@ -110,13 +110,15 @@ Don't mix.
 1. `iggy_source_handle(id, send_callback)` - plugin registers itself.
 2. Plugin polls + invokes `send_callback(plugin_id, ptr, len)`.
 3. Callback runs in the SDK macro's spawned async task. Pushes postcard `ProducedMessages` into a `flume` channel keyed by `plugin_id` in `SOURCE_SENDERS: Lazy<DashMap<u32, SourceSenderEntry>>` (`pub(crate)`). `SourceSenderEntry` wraps the sender + a pre-extracted owned `Counter` (the `errors` series, `Arc<AtomicU64>` inside). The FFI callback bumps errors on deserialize or channel-closed failure with one relaxed atomic - no `Family` lookup, no `Arc<Metrics>` handle.
-4. `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, sends to Iggy producer.
-5. On success, save returned `ConnectorState` via `FileStateProvider`.
+4. The runtime registers the optional source-stop callback, then `source_forwarding_loop` pulls from the channel, deserializes, applies transforms, encodes via `StreamEncoder`, and sends to the Iggy producer. The SDK warns after 30 seconds without a result but keeps the same batch pending; it does not poll or enqueue another copy.
+5. On success, save returned `ConnectorState` via `FileStateProvider`, then return the batch result to the plugin. A result NACK may cause replay with capped backoff.
+6. A stop-callback reason ends the forwarding loop and reports an unexpected stop. Closing the stop channel on normal shutdown disables that select arm, allowing already queued batches to receive results before the forwarding channel disconnects.
+7. At loop exit, clean up `SOURCE_SENDERS` and update status and metrics. A self-stop reports `Error` and removes the source from the running gauge; normal shutdown reports `Stopped`.
 
 **Shutdown ordering (`manager/source.rs::stop_connector`):**
 
 1. Call `iggy_source_close` FIRST. It blocks until the plugin's polling task stops, so no new send callbacks fire after it returns.
-2. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender makes the forwarding task's `recv_async()` resolve with `Disconnected` and exit cleanly, instead of blocking until the abort timeout.
+2. `cleanup_sender(plugin_id)` NEXT - dropping the channel sender lets the forwarding task finish any queued batches before `recv_async()` resolves with `Disconnected` and exits cleanly, instead of blocking until the abort timeout.
 3. Finally await spawned handlers with `tokio::time::timeout`. On timeout, `handle.abort()` + drain - prevents leaked tasks colliding with the next `start_connector` (a late `file.save()` could otherwise race the new instance). The silent-drop branch in `handle_produced_messages` only covers the window between close and cleanup.
 
 Gotchas:
