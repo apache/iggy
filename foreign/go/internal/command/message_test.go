@@ -142,7 +142,7 @@ func TestSerialize_SendMessagesMatchesTheGoldenVector(t *testing.T) {
 }
 
 func TestSerialize_SendMessagesRequest(t *testing.T) {
-	message1 := generateTestMessage("data1")
+	message1 := generateTestMessage(t, "data1")
 	streamId, _ := iggcon.NewIdentifier("test_stream_id")
 	topicId, _ := iggcon.NewIdentifier("test_topic_id")
 	request := SendMessages{
@@ -370,10 +370,14 @@ func createDefaultMessageHeaders() []iggcon.HeaderEntry {
 	}
 }
 
-func generateTestMessage(payload string) iggcon.IggyMessage {
-	msg, _ := iggcon.NewIggyMessage(
+func generateTestMessage(t *testing.T, payload string) iggcon.IggyMessage {
+	t.Helper()
+	msg, err := iggcon.NewIggyMessage(
 		[]byte(payload),
 		iggcon.WithID(uuid.New()),
 		iggcon.WithUserHeaders(createDefaultMessageHeaders()))
+	if err != nil {
+		t.Fatalf("failed to create message: %v", err)
+	}
 	return msg
 }
