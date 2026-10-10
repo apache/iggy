@@ -66,6 +66,8 @@ type Stats struct {
 	ThreadsCount        uint32         `json:"threads_count"`
 	FreeDiskSpace       uint64         `json:"free_disk_space"`
 	TotalDiskSpace      uint64         `json:"total_disk_space"`
+	OpenFilesCount      uint64         `json:"open_files_count"`
+	OpenFilesLimit      uint64         `json:"open_files_limit"`
 }
 
 func (cm *CacheMetrics) MarshalBinary() ([]byte, error) {
@@ -135,6 +137,12 @@ func (s *Stats) UnmarshalBinary(payload []byte) error {
 	s.ThreadsCount = r.U32()
 	s.FreeDiskSpace = r.U64()
 	s.TotalDiskSpace = r.U64()
+
+	// Servers that predate the open-files fields end the reply here.
+	if r.Remaining() > 0 {
+		s.OpenFilesCount = r.U64()
+		s.OpenFilesLimit = r.U64()
+	}
 
 	return r.Err()
 }

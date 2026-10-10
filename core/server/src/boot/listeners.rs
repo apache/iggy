@@ -38,7 +38,7 @@ use message_bus::replica::listener::{self as replica_listener};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, AcceptedWssClientFn, DialedReplicaFn, IggyMessageBus,
+    AcceptedWsClientFn, AcceptedWssClientFn, ConnectionCap, DialedReplicaFn, IggyMessageBus,
     MAX_INFLIGHT_REPLICA_HANDSHAKES, connector, installer,
 };
 use shard::metrics::ShardMetrics;
@@ -58,12 +58,14 @@ pub(in crate::boot) struct LocalClientAcceptFns {
 #[allow(clippy::too_many_arguments)]
 pub(in crate::boot) async fn start_tcp_runtime(
     shard: &Rc<ServerShard>,
+    session_liveness: Rc<std::cell::RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
     config: &ServerConfig,
     topology: &TcpTopology,
     roster: Rc<ClusterRoster>,
     accepted_replica: AcceptedReplicaFn,
     dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
+    connections: &Rc<ConnectionCap>,
     shard_metrics_all: &[ShardMetrics],
 ) -> Result<(), ServerError> {
     // HTTP is served over TCP but sits outside the replica_io / manual client
@@ -149,11 +151,13 @@ pub(in crate::boot) async fn start_tcp_runtime(
         http::start(
             http,
             shard,
+            session_liveness,
             &config.http,
             config.metadata.clients_table_max,
             config.personal_access_token.max_tokens_per_user,
             Arc::new(config.clone()),
             roster,
+            connections,
             shard_metrics_all,
         )?;
     }
@@ -407,6 +411,10 @@ pub(in crate::boot) fn make_replica_delegation_fns(
 /// raw sockets through the coordinator before any handshake. The
 /// destination shard supplies its handler and owns handshakes and I/O.
 /// The QUIC callback installs locally through shard 0's UDP endpoint.
+///
+/// Each socket callback takes a slot in `connections` first and closes the
+/// socket when the cap is full. QUIC does not count, because its
+/// connections hold no descriptor of their own.
 // ws/wss bindings intentionally mirror the transport names (same convention as
 // `replica_io::start_on_shard_zero`).
 #[allow(clippy::similar_names)]
@@ -414,20 +422,33 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
     coord: Rc<shard::coordinator::ShardZeroCoordinator>,
     bus: &Rc<IggyMessageBus>,
     on_request: RequestHandler,
+    connections: &Rc<ConnectionCap>,
 ) -> LocalClientAcceptFns {
     let quic_bus = Rc::clone(bus);
     let quic_request = on_request;
 
     let tcp_coord = Rc::clone(&coord);
-    let tcp = Rc::new(move |stream| match tcp_coord.delegate_client(stream) {
-        Ok(client_id) => info!(client_id, "TCP client delegated"),
-        Err(error) => warn!(error = ?error, "delegate_client failed; dropping TCP client"),
+    let tcp_connections = Rc::clone(connections);
+    let tcp = Rc::new(move |stream| {
+        let Some(permit) = tcp_connections.try_acquire() else {
+            return;
+        };
+        match tcp_coord.delegate_client(stream, permit) {
+            Ok(client_id) => info!(client_id, "TCP client delegated"),
+            Err(error) => warn!(error = ?error, "delegate_client failed; dropping TCP client"),
+        }
     });
 
     let ws_coord = Rc::clone(&coord);
-    let ws = Rc::new(move |stream| match ws_coord.delegate_ws_client(stream) {
-        Ok(client_id) => info!(client_id, "WS client delegated"),
-        Err(error) => warn!(error = ?error, "delegate_ws_client failed; dropping WS client"),
+    let ws_connections = Rc::clone(connections);
+    let ws = Rc::new(move |stream| {
+        let Some(permit) = ws_connections.try_acquire() else {
+            return;
+        };
+        match ws_coord.delegate_ws_client(stream, permit) {
+            Ok(client_id) => info!(client_id, "WS client delegated"),
+            Err(error) => warn!(error = ?error, "delegate_ws_client failed; dropping WS client"),
+        }
     });
 
     // QUIC terminates locally on shard 0 but mints its client
@@ -443,8 +464,12 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
     });
 
     let tcp_tls_coord = Rc::clone(&coord);
+    let tcp_tls_connections = Rc::clone(connections);
     let tcp_tls = Rc::new(move |stream, tls_config| {
-        match tcp_tls_coord.delegate_tcp_tls_client(stream, tls_config) {
+        let Some(permit) = tcp_tls_connections.try_acquire() else {
+            return;
+        };
+        match tcp_tls_coord.delegate_tcp_tls_client(stream, tls_config, permit) {
             Ok(client_id) => info!(client_id, "TCP-TLS client delegated"),
             Err(error) => {
                 warn!(error = ?error, "delegate_tcp_tls_client failed; dropping TCP-TLS client");
@@ -453,8 +478,12 @@ pub(in crate::boot) fn make_shard_zero_client_accept_fns(
     });
 
     let wss_coord = coord;
+    let wss_connections = Rc::clone(connections);
     let wss = Rc::new(move |stream, tls_config| {
-        match wss_coord.delegate_wss_client(stream, tls_config) {
+        let Some(permit) = wss_connections.try_acquire() else {
+            return;
+        };
+        match wss_coord.delegate_wss_client(stream, tls_config, permit) {
             Ok(client_id) => info!(client_id, "WSS client delegated"),
             Err(error) => warn!(error = ?error, "delegate_wss_client failed; dropping WSS client"),
         }

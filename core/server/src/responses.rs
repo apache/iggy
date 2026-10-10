@@ -27,16 +27,15 @@ use crate::namespace::ensure_topic_exists;
 use crate::reply_frame::{build_empty_reply, build_reply_from_bytes};
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShard};
-use crate::sysinfo_probe::{probe_system_stats, stats_disk_space};
+use crate::sysinfo_probe::probe_system_stats;
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
-    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
+    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -223,7 +222,7 @@ where
             .len() as u32;
         count
     });
-    // The transport client id is a u128 `(shard << 112) | seq`; the wire
+    // The transport client id is a u128 `shard | boot nonce | seq`; the wire
     // `client_id` is the u32 seq tail.
     #[allow(clippy::cast_possible_truncation)]
     ClientResponse {
@@ -332,22 +331,10 @@ where
         }
         GET_CONSUMER_GROUP_CODE => build_consumer_group_response(shard, body),
         GET_CONSUMER_GROUPS_CODE => build_consumer_groups_response(shard, body),
-        // The server has no on-demand flush primitive, so it denies honestly.
-        // The non-replicated catch-all's empty-ok would otherwise attest a
-        // durability guarantee the server never gave.
-        FLUSH_UNSAVED_BUFFER_CODE => Err(IggyError::FeatureUnavailable),
-        // Snapshot collection blocks on shell-outs, so the dedicated dispatch
-        // and HTTP handlers await it off-thread; this synchronous builder
-        // cannot, and reaching it here is a routing bug. Fail closed rather
-        // than let the catch-all's empty-ok attest an artifact that was never
-        // produced.
-        GET_SNAPSHOT_FILE_CODE => Err(IggyError::InvalidCommand),
-        // Sequenced AFTER the named arms above, so flush keeps answering
-        // `FeatureUnavailable`. A table-listed non-replicated code with no arm
-        // is a routing bug and an unknown code is a client bug; the empty-ok
-        // that used to cover both attested a read that never ran. Only the
-        // named arms return `Empty`, and there it means "resolved to nothing"
-        // (the 404 the HTTP path maps).
+        // A table-listed non-replicated code with no arm is a routing bug and
+        // an unknown code is a client bug; the empty-ok that used to cover both
+        // attested a read that never ran. Only the named arms return `Empty`,
+        // and there it means "resolved to nothing" (the 404 the HTTP path maps).
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
             Some(meta) if meta.is_replicated() => Err(IggyError::FeatureUnavailable),
             _ => Err(IggyError::InvalidCommand),
@@ -528,7 +515,6 @@ where
     )?;
 
     let system = probe_system_stats();
-    let (free_disk_space, total_disk_space) = stats_disk_space();
     Ok(StatsResponse {
         process_id: system.process_id,
         cpu_usage: system.cpu_usage,
@@ -556,8 +542,10 @@ where
         iggy_server_semver: crate::SEMANTIC_VERSION.get_numeric_version().ok(),
         cache_metrics: Vec::new(),
         threads_count: system.threads_count,
-        free_disk_space,
-        total_disk_space,
+        free_disk_space: system.free_disk_space,
+        total_disk_space: system.total_disk_space,
+        open_files_count: system.open_files_count,
+        open_files_limit: system.open_files_limit,
     })
 }
 

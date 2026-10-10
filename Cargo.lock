@@ -1963,7 +1963,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.8.0"
+version = "0.8.1-edge.1"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
@@ -1993,12 +1993,11 @@ dependencies = [
 
 [[package]]
 name = "bench-report"
-version = "0.4.0"
+version = "0.4.1-edge.1"
 dependencies = [
  "charming",
  "colored",
  "comfy-table",
- "derive-new",
  "derive_more",
  "human-repr",
  "rand 0.10.2",
@@ -3258,6 +3257,7 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "bit-set 0.11.1",
+ "blake3",
  "bytemuck",
  "bytes",
  "clock",
@@ -5420,6 +5420,96 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcloud-auth"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b43924e3df02cb3b846ca66a7ee58e8c13eb2556d0308c71f6154083f6980365"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "gcloud-metadata",
+ "home",
+ "jsonwebtoken 10.4.0",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "token-source",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "gcloud-bigquery"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17c9e8ff7894d451cf5b704772326b5fbf112f75b8f229700197c923a763d99f"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-stream",
+ "async-trait",
+ "backon",
+ "base64 0.22.1",
+ "bigdecimal",
+ "gcloud-auth",
+ "gcloud-gax",
+ "gcloud-googleapis",
+ "num-bigint",
+ "prost-types",
+ "reqwest 0.13.5",
+ "reqwest-middleware",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "token-source",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "gcloud-gax"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "558634081d1cf458d1bc0166f69475a80f445b5b991f162028b293a38307059d"
+dependencies = [
+ "http 1.5.0",
+ "thiserror 2.0.20",
+ "token-source",
+ "tokio",
+ "tokio-retry2",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "gcloud-googleapis"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d79fc4ec36213a21b734a2ce204176eb39c439fa528f9a388c9a1349ca344b0d"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
+name = "gcloud-metadata"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd3152612316be627be52fe9ca72331eb48425059b3a6a700e7adde223e061d5"
+dependencies = [
+ "reqwest 0.13.5",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6829,7 +6919,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.0"
+version = "0.11.1-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6845,6 +6935,8 @@ dependencies = [
  "iggy_common",
  "mockall",
  "quinn",
+ "rand 0.10.2",
+ "rcgen",
  "reqwest 0.13.5",
  "reqwest-middleware",
  "reqwest-retry",
@@ -6863,7 +6955,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.0"
+version = "0.6.1-edge.1"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -6893,7 +6985,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.8.0"
+version = "0.8.1-edge.1"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -6921,7 +7013,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.0"
+version = "0.14.1-edge.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6955,7 +7047,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "apache-avro 0.22.0",
  "async-trait",
@@ -7022,12 +7114,14 @@ dependencies = [
  "bytes",
  "crc32c",
  "flate2",
+ "futures",
  "iggy",
  "kafka-protocol",
  "libc",
  "lz4",
  "secrecy",
  "serde",
+ "serde_json",
  "serial_test",
  "snap",
  "socket2 0.6.5",
@@ -7039,15 +7133,17 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "zstd 0.13.3",
 ]
 
 [[package]]
 name = "iggy-mcp"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "axum",
  "axum-server",
+ "clap",
  "configs",
  "configs_derive",
  "dirs 7.0.0",
@@ -7078,7 +7174,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.0"
+version = "0.11.1-edge.1"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -7091,7 +7187,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.0"
+version = "0.11.1-edge.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-broadcast",
@@ -7125,8 +7221,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_bigquery_sink"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bigdecimal",
+ "gcloud-bigquery",
+ "gcloud-gax",
+ "gcloud-googleapis",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "prost",
+ "reqwest 0.13.5",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "token-source",
+ "tokio",
+ "tokio-stream",
+ "toml 1.1.6+spec-1.1.0",
+ "tonic",
+ "tonic-prost",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_clickhouse_sink"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -7144,7 +7271,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_delta_sink"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7162,7 +7289,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_doris_sink"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7182,7 +7309,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7201,7 +7328,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_source"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7221,7 +7348,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_http_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7243,7 +7370,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_http_source"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -7269,7 +7396,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "arrow-array",
  "arrow-json",
@@ -7290,7 +7417,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -7311,7 +7438,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_source"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "ahash",
  "async-trait",
@@ -7337,7 +7464,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_meilisearch_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7355,7 +7482,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_mongodb_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "humantime",
@@ -7371,7 +7498,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7390,7 +7517,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_source"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7413,7 +7540,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_quickwit_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7430,7 +7557,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_rabbitmq_sink"
-version = "0.4.1"
+version = "0.4.2-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7447,7 +7574,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_random_source"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7464,7 +7591,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_redshift_sink"
-version = "0.4.1"
+version = "0.4.2-edge.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7486,7 +7613,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_s3_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7508,7 +7635,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "anyhow",
  "apache-avro 0.22.0",
@@ -7545,7 +7672,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_stdout_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7557,7 +7684,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_surrealdb_sink"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -10140,7 +10267,6 @@ dependencies = [
  "message_bus",
  "nix",
  "papaya",
- "ringbuffer",
  "server_common",
  "smallvec",
  "tempfile",
@@ -11657,6 +11783,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -12698,9 +12825,10 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.0"
+version = "0.9.1-edge.1"
 dependencies = [
  "ahash",
+ "arc-swap",
  "argon2",
  "assert_cmd",
  "async-channel",
@@ -12793,6 +12921,7 @@ dependencies = [
  "argon2",
  "bytemuck",
  "bytes",
+ "chrono",
  "compio",
  "compio-buf",
  "crossbeam",
@@ -12899,6 +13028,7 @@ dependencies = [
  "partitions",
  "prometheus-client",
  "server_common",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -14085,6 +14215,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
+name = "token-source"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75746ae15bef509f21039a652383104424208fdae172a964a8930858b9a78412"
+dependencies = [
+ "async-trait",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14136,6 +14275,16 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-retry2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e05e40fd65880de11383bbc693d3c636045ed1b5010ef1265a1d2b41d73334a1"
+dependencies = [
+ "pin-project",
+ "tokio",
 ]
 
 [[package]]
@@ -14309,6 +14458,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2 0.4.19",
  "http 1.5.0",
  "http-body 1.1.0",
@@ -14321,11 +14471,13 @@ dependencies = [
  "socket2 0.6.5",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

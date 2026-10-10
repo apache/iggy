@@ -18,10 +18,10 @@
 use crate::Storage;
 use compio::buf::IoBuf;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::fs_utils::truncate_file;
 use std::cell::{Cell, UnsafeCell};
-use std::fs;
 use std::io;
-use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 /// File-backed storage implementing the `Storage` trait.
@@ -45,7 +45,8 @@ impl FileStorage {
             .create(true)
             .truncate(false)
             .open(path)
-            .await?;
+            .await
+            .note_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
         let len = file.metadata().await?.len();
         Ok(Self {
             file: UnsafeCell::new(file),
@@ -61,28 +62,17 @@ impl FileStorage {
 
     /// Truncate the file to `len` bytes and make the new length durable.
     ///
-    /// Synchronous `std::fs` on a duplicate of the open descriptor, not compio:
-    /// compio's `set_len` submits `IORING_OP_FTRUNCATE`, which landed in
-    /// mainline Linux 6.9. When the opcode is unavailable, the driver falls
-    /// back to its blocking pool, and shard proactors run with
-    /// `thread_pool_limit(0)`, so the fallback panics the shard instead of
-    /// repairing the WAL. `std::fs` needs neither the opcode nor the pool. The
-    /// sole caller is boot-time torn-tail repair, so blocking the shard thread
-    /// here costs nothing.
-    ///
-    /// `sync_all` makes the durable-truncation contract explicit and matches
-    /// segment recovery. Its additional metadata synchronization is acceptable
-    /// because this runs only during boot-time repair.
+    /// Uses the bounded filesystem worker for kernels without `IORING_OP_FTRUNCATE`,
+    /// then asynchronously syncs the inode before recovery can use the new boundary.
     ///
     /// # Errors
     /// Returns an I/O error if the descriptor cannot be cloned, truncated, or synced.
-    pub(crate) fn truncate(&self, len: u64) -> io::Result<()> {
+    pub(crate) async fn truncate(&self, len: u64) -> io::Result<()> {
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &*self.file.get() };
-        let file = fs::File::from(file.as_fd().try_clone_to_owned()?);
-        file.set_len(len)?;
+        truncate_file(file, len).await?;
         self.write_offset.set(len);
-        file.sync_all()
+        file.sync_all().await
     }
 
     /// Fsync the file to disk.
@@ -162,7 +152,8 @@ impl FileStorage {
             .read(true)
             .write(true)
             .open(&self.path)
-            .await?;
+            .await
+            .note_descriptor_exhaustion(|| format!("reopening {}", self.path.display()))?;
         let len = file.metadata().await?.len();
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         unsafe { *self.file.get() = file };
@@ -197,9 +188,6 @@ mod tests {
     use server_common::executor::create_shard_executor;
     use tempfile::tempdir;
 
-    /// Pins the synchronous truncate signature and verifies it works inside a
-    /// shard executor with no blocking pool. A modern test kernel supports
-    /// `IORING_OP_FTRUNCATE`, so this does not reproduce compio's fallback.
     #[test]
     fn given_a_shard_executor_with_no_blocking_pool_when_truncating_should_repair_the_file() {
         let runtime = create_shard_executor().unwrap();
@@ -209,7 +197,7 @@ mod tests {
             let storage = FileStorage::open(&path).await.unwrap();
             storage.write_append(vec![0xAB_u8; 128]).await.unwrap();
 
-            storage.truncate(64).unwrap();
+            storage.truncate(64).await.unwrap();
 
             assert_eq!(storage.file_len(), 64);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
@@ -228,7 +216,7 @@ mod tests {
             std::fs::rename(&path, &renamed_path).unwrap();
             std::fs::write(&path, vec![0xCD_u8; 256]).unwrap();
 
-            storage.truncate(64).unwrap();
+            storage.truncate(64).await.unwrap();
 
             assert_eq!(storage.file_len(), 64);
             assert_eq!(std::fs::metadata(&renamed_path).unwrap().len(), 64);

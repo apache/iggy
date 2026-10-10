@@ -38,7 +38,6 @@ import {
   ensureConsumerGroup, ensureConsumerGroupAndJoin
 } from './consumer-group/ensure-group.virtual.command.js';
 
-import { purgeTopic } from './topic/purge-topic.command.js';
 import { createTopic } from './topic/create-topic.command.js';
 import { updateTopic } from './topic/update-topic.command.js';
 import { getTopic } from './topic/get-topic.command.js';
@@ -52,14 +51,12 @@ import { deleteOffset } from './offset/delete-offset.command.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
-import { flushUnsavedBuffers } from './message/flush-unsaved-buffers.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
 import { getStream } from './stream/get-stream.command.js';
 import { getStreams } from './stream/get-streams.command.js';
 import { deleteStream } from './stream/delete-stream.command.js';
-import { purgeStream } from './stream/purge-stream.command.js';
 import { ensureStream } from './stream/ensure-stream.virtual.command.js';
 
 import { createPartition } from './partition/create-partition.command.js';
@@ -69,6 +66,7 @@ import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { describeOptions } from './system/describe-options.command.js';
 import { getStats } from './system/get-stats.command.js';
+import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
 
 import { getClusterMetadata } from './cluster/get-cluster-metadata.command.js';
@@ -128,7 +126,6 @@ const streamAPI = (c: ClientProvider) => ({
   create: createStream(c),
   update: updateStream(c),
   delete: deleteStream(c),
-  purge: purgeStream(c),
   ensure: ensureStream(c)
 });
 
@@ -140,7 +137,6 @@ const topicAPI = (c: ClientProvider) => ({
   create: createTopic(c),
   update: updateTopic(c),
   delete: deleteTopic(c),
-  purge: purgeTopic(c),
   ensure: ensureTopic(c)
 });
 
@@ -182,8 +178,7 @@ type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
-  send: sendMessages(c),
-  flushUnsavedBuffers: flushUnsavedBuffers(c)
+  send: sendMessages(c)
 });
 
 type MessageAPI = ReturnType<typeof messageAPI>;
@@ -191,6 +186,7 @@ type MessageAPI = ReturnType<typeof messageAPI>;
 const systemAPI = (c: ClientProvider) => ({
   ping: ping(c),
   getStats: getStats(c),
+  snapshot: snapshot(c),
   describeOptions: describeOptions(c)
 });
 

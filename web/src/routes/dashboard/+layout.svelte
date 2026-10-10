@@ -18,10 +18,10 @@ under the License.
 -->
 
 <script>
-  import AppModals from '$lib/components/Modals/AppModals.svelte';
-  import Navbar from '$lib/components/Navbar.svelte';
-  import AppToasts from '$lib/components/AppToasts.svelte';
-  import Header from '$lib/components/Header.svelte';
+  import AppModals from '#lib/components/Modals/AppModals.svelte';
+  import Navbar from '#lib/components/Navbar.svelte';
+  import AppToasts from '#lib/components/AppToasts.svelte';
+  import Header from '#lib/components/Header.svelte';
 
   /** @type {{data: any, children?: import('svelte').Snippet}} */
   let { data, children } = $props();

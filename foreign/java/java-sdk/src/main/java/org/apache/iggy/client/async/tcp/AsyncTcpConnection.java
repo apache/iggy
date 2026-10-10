@@ -103,6 +103,10 @@ public class AsyncTcpConnection {
     // The pool holds one channel, and one channel lives on one loop.
     static final int DEFAULT_IO_THREADS = 1;
 
+    private static final int STALE_CLIENT = 30;
+    private static final int UNAUTHENTICATED = 40;
+    private static final int UNAUTHORIZED = 41;
+    private static final int REGISTER_RESPONSE_MIN_BYTES = 17;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
     // A missing reply must not hold the single VSR-pinned channel forever.
@@ -121,6 +125,7 @@ public class AsyncTcpConnection {
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
     private final ConsensusSession consensusSession;
+    private volatile boolean sharedSession;
     private final TransientFailoverHandler transientFailoverHandler;
     private final IntConsumer sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
@@ -340,8 +345,21 @@ public class AsyncTcpConnection {
         return consensusSession.metadataWatermark();
     }
 
+    byte[] bindSecret() {
+        return consensusSession.bindSecret();
+    }
+
+    byte[] bindSecret(long clientLow, long clientHigh, long epoch) {
+        return consensusSession.bindSecret(clientLow, clientHigh, epoch);
+    }
+
     long sessionGeneration() {
         return consensusSession.generation();
+    }
+
+    void bindSharedSession(long clientLow, long clientHigh, long epoch, byte[] secret) {
+        consensusSession.bindShared(clientLow, clientHigh, epoch, secret);
+        sharedSession = true;
     }
 
     boolean isAuthenticated() {
@@ -585,7 +603,7 @@ public class AsyncTcpConnection {
                 return;
             }
             if (requiredSessionGeneration != 0 && requiredSessionGeneration != sessionGeneration()) {
-                // Reauthentication replaces the data session and loses its parent attachment.
+                // A replacement channel or eviction reset invalidates the parent attachment.
                 payload.release();
                 responseFuture.completeExceptionally(
                         IggyServerException.fromTcpResponse(TRANSIENT_NOT_ACCEPTED, new byte[0]));
@@ -709,6 +727,36 @@ public class AsyncTcpConnection {
 
     private CompletableFuture<ByteBuf> sendAuthenticationFrame(
             Channel channel, ByteBuf payload, int commandCode, long requestDeadlineNanos) {
+        if (consensusSession.isBound()) {
+            long expectedSession = consensusSession.boundSession();
+            ByteBuf binding = vsrEncoder.bindSession(channel.alloc());
+            CompletableFuture<ByteBuf> bindingFuture = new CompletableFuture<>();
+            sendFrame(
+                    channel, binding, CommandCode.System.BIND_SESSION.getValue(), bindingFuture, requestDeadlineNanos);
+            return bindingFuture
+                    .handle((response, error) -> {
+                        if (error == null) {
+                            payload.release();
+                            if (response.readableBytes() < REGISTER_RESPONSE_MIN_BYTES
+                                    || response.getLongLE(response.readerIndex() + Integer.BYTES) != expectedSession) {
+                                response.release();
+                                throw new IggyNotConnectedException("BindSession returned a different session epoch");
+                            }
+                            return CompletableFuture.completedFuture(response);
+                        }
+                        IggyServerException serverError = findServerError(error);
+                        if (serverError != null
+                                && (serverError.getRawErrorCode() == UNAUTHENTICATED
+                                        || serverError.getRawErrorCode() == STALE_CLIENT)) {
+                            consensusSession.reset();
+                            onSessionEvicted(serverError.getRawErrorCode());
+                            return sendAuthenticationFrame(channel, payload, commandCode, requestDeadlineNanos);
+                        }
+                        payload.release();
+                        return CompletableFuture.<ByteBuf>failedFuture(error);
+                    })
+                    .thenCompose(Function.identity());
+        }
         CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
         sendFrame(channel, payload, commandCode, loginFuture, requestDeadlineNanos);
         return loginFuture;
@@ -762,7 +810,7 @@ public class AsyncTcpConnection {
 
     private static boolean isPollRoutingCode(int commandCode) {
         return commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()
-                || commandCode == CommandCode.System.ATTACH_CONSUMER_SESSION.getValue()
+                || commandCode == CommandCode.System.BIND_SESSION.getValue()
                 || commandCode == CommandCode.Messages.GET_POLL_ROUTING.getValue()
                 || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue();
     }
@@ -772,17 +820,18 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Ping is the only command the server answers without a bound session. The
-     * cluster roster is auth-gated as well, so an unauthenticated caller cannot
-     * enumerate the topology and leader selection can only run on a bound
-     * session.
+     * BindSession authenticates with the parent's proof. Primary polls use that
+     * binding, so neither command sends a password login on auxiliary channels.
      */
-    private static boolean requiresAuthentication(int commandCode) {
+    private boolean requiresAuthentication(int commandCode) {
         return !isAllowedBeforeAuthentication(commandCode);
     }
 
-    private static boolean isAllowedBeforeAuthentication(int commandCode) {
-        return commandCode == CommandCode.System.PING.getValue();
+    private boolean isAllowedBeforeAuthentication(int commandCode) {
+        return commandCode == CommandCode.System.PING.getValue()
+                || (sharedSession
+                        && (commandCode == CommandCode.System.BIND_SESSION.getValue()
+                                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue()));
     }
 
     private void sendFrame(
@@ -810,7 +859,8 @@ public class AsyncTcpConnection {
                     requestDeadlineNanos,
                     deadlineNanos,
                     notAcceptedDeadlineNanos,
-                    commandCode);
+                    commandCode,
+                    false);
         } catch (RuntimeException e) {
             responseFuture.completeExceptionally(e);
         } finally {
@@ -832,7 +882,8 @@ public class AsyncTcpConnection {
             long requestDeadlineNanos,
             long deadlineNanos,
             long notAcceptedDeadlineNanos,
-            int commandCode) {
+            int commandCode,
+            boolean uncertain) {
         if (requestDeadlineNanos - System.nanoTime() <= 0) {
             IggyTimeoutException timeout = responseTimeout(commandCode);
             handler.closeChannel(channel, timeout);
@@ -858,7 +909,9 @@ public class AsyncTcpConnection {
             }
         });
         attempt.whenComplete((response, error) -> {
-            if (shouldRetryTransient(commandCode, error, deadlineNanos, notAcceptedDeadlineNanos)
+            IggyServerException serverError = findServerError(error);
+            boolean nextUncertain = uncertain || isUncertainOutcome(serverError);
+            if (shouldRetryTransient(commandCode, error, deadlineNanos, notAcceptedDeadlineNanos, nextUncertain)
                     && channel.isActive()) {
                 try {
                     channel.eventLoop()
@@ -871,7 +924,8 @@ public class AsyncTcpConnection {
                                             requestDeadlineNanos,
                                             deadlineNanos,
                                             notAcceptedDeadlineNanos,
-                                            commandCode),
+                                            commandCode,
+                                            nextUncertain),
                                     TRANSIENT_RETRY_INTERVAL_MS,
                                     TimeUnit.MILLISECONDS);
                     return;
@@ -881,11 +935,30 @@ public class AsyncTcpConnection {
             }
             frame.release();
             if (error != null) {
-                responseFuture.completeExceptionally(error);
+                responseFuture.completeExceptionally(preserveUncertainOutcome(error, serverError, nextUncertain));
             } else {
                 responseFuture.complete(response);
             }
         });
+    }
+
+    private static boolean isUncertainOutcome(IggyServerException error) {
+        return error != null && error.getRawErrorCode() == TRANSIENT_NOT_COMMITTED;
+    }
+
+    private static Throwable preserveUncertainOutcome(
+            Throwable error, IggyServerException serverError, boolean uncertain) {
+        if (uncertain && serverError != null && isUnadmittedRefusal(serverError.getRawErrorCode())) {
+            return IggyServerException.fromTcpResponse(TRANSIENT_NOT_COMMITTED, new byte[0]);
+        }
+        return error;
+    }
+
+    private static boolean isUnadmittedRefusal(long code) {
+        return code == TRANSIENT_NOT_ACCEPTED
+                || code == UNAUTHORIZED
+                || code == UNAUTHENTICATED
+                || code == STALE_CLIENT;
     }
 
     private static IggyTimeoutException responseTimeout(int commandCode) {
@@ -946,11 +1019,12 @@ public class AsyncTcpConnection {
     }
 
     private static boolean shouldRetryTransient(
-            int commandCode, Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos) {
+            int commandCode, Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos, boolean uncertain) {
         if (isPollRoutingCode(commandCode) || !(error instanceof IggyServerException serverError)) {
             return false;
         }
-        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED) {
+        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED
+                || (uncertain && serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED)) {
             return System.nanoTime() < deadlineNanos;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED) {
@@ -981,9 +1055,8 @@ public class AsyncTcpConnection {
 
     /**
      * A server-side eviction unbinds the transport session and closes its
-     * channel. Bumping the generation makes the replacement channel re-run
-     * login and Register. The fresh session invalidates cached routing state
-     * such as consumer-group assignments.
+     * channel. Bumping the generation makes the replacement channel bind the
+     * retained session; only a definitive bind refusal starts a new Register.
      *
      * The reason travels to the listener so it can drop what belonged to the
      * evicted session and log what happened. The session itself is kept

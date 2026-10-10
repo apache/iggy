@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::IggyDuration;
+
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::server::{
     ConsumerGroupConfig, HeartbeatConfig, MemoryPoolConfig, MessagesMaintenanceConfig,
@@ -180,6 +182,16 @@ impl Default for HeartbeatConfig {
 impl Default for ConsumerGroupConfig {
     fn default() -> ConsumerGroupConfig {
         ConsumerGroupConfig {
+            session_timeout: SERVER_CONFIG
+                .consumer_group
+                .session_timeout
+                .parse()
+                .unwrap(),
+            heartbeat_interval: SERVER_CONFIG
+                .consumer_group
+                .heartbeat_interval
+                .parse()
+                .unwrap(),
             rebalancing_timeout: SERVER_CONFIG
                 .consumer_group
                 .rebalancing_timeout
@@ -211,8 +223,17 @@ impl Default for LoggingConfig {
                 .parse()
                 .unwrap(),
             retention: SERVER_CONFIG.logging.retention.parse().unwrap(),
+            sysinfo_print_interval: default_sysinfo_print_interval(),
         }
     }
+}
+
+pub(crate) fn default_sysinfo_print_interval() -> IggyDuration {
+    SERVER_CONFIG
+        .logging
+        .sysinfo_print_interval
+        .parse()
+        .unwrap()
 }
 
 impl Default for EncryptionConfig {

@@ -88,7 +88,9 @@ The handler in [#3536](https://github.com/apache/iggy/issues/3536) owns the poli
 the mapping refuses. Two shapes are on the table. Skipping serves the records around it and
 leaves a gap, which Kafka consumers already tolerate on a compacted topic. Its cost is that a
 message goes missing with no signal. Quarantining records the offset and surfaces a metric. Its
-cost is somewhere to keep the record. Neither is decided here.
+cost is somewhere to keep the record. Neither is decided here. Until one is, Fetch serves the
+records before such a message and answers `-1` at it, so the consumer stops at that offset.
+Fetch then reads that offset at most once per `max_wait_ms`.
 
 ### Timestamps
 
@@ -299,9 +301,9 @@ example for a request it classifies as a duplicate, in which case the response c
 rather than a guessed offset; Kafka clients surface that as an unknown offset.
 
 ListOffsets LATEST is the high watermark from `IggyBridge::high_watermarks`. EARLIEST has no
-server-side field today (`Partition` carries no log start offset), so it reads the first
-retained message instead, and the `(messages_count, current_offset) == (0, 0)` ambiguity
-documented on `high_watermarks` applies to both.
+server-side field today (`Partition` carries no log start offset), so it answers `0`. The
+`(messages_count, current_offset) == (0, 0)` ambiguity documented on `high_watermark` in
+`src/bridge/iggy_bridge/offsets.rs` applies to LATEST.
 
 ### Header order
 

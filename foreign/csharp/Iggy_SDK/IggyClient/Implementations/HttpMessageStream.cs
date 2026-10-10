@@ -93,16 +93,6 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
-    {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/purge", token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
-    }
-
-    /// <inheritdoc />
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}", token);
@@ -218,16 +208,6 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
-    {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token);
-        if (!response.IsSuccessStatusCode)
-        {
-            await HandleResponseAsync(response);
-        }
-    }
-
-    /// <inheritdoc />
     public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
         CancellationToken token = default)
     {
@@ -300,16 +280,6 @@ public class HttpMessageStream : IIggyClient
 
         return await response.Content.ReadFromJsonAsync<SendMessagesResponse>(_jsonSerializerOptions, token)
                ?? throw new InvalidResponseException("Send messages reply carried no confirmation body.");
-    }
-
-    /// <summary>
-    ///     This feature is not supported by the server.
-    /// </summary>
-    /// <exception cref="FeatureUnavailableException"></exception>
-    public Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
-        CancellationToken token = default)
-    {
-        throw new FeatureUnavailableException();
     }
 
     /// <inheritdoc />
@@ -1125,7 +1095,14 @@ public class HttpMessageStream : IIggyClient
             // the exception message.
         }
 
-        throw new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
+        var error = new IggyInvalidStatusCodeException(errorModel?.Id ?? -1, err, true);
+        if (error.StatusCode == VsrError.REQUEST_TOO_OLD)
+        {
+            // The server no longer knows whether the request committed, so a resend could duplicate it.
+            throw new VsrRequestOutcomeUnknownException(error);
+        }
+
+        throw error;
     }
 
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)

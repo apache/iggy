@@ -21,6 +21,7 @@ use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::EncryptorKind;
+use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
@@ -94,13 +95,13 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// - [`SystemClient`]: ping, server statistics, snapshots, and connected-client info.
 /// - [`UserClient`]: create, inspect, update, and delete users and their permissions.
 /// - [`PersonalAccessTokenClient`]: create, list, and delete personal access tokens, log in with one.
-/// - [`StreamClient`]: create, get, update, delete, and purge streams.
-/// - [`TopicClient`]: create, get, update, delete, and purge topics within a stream.
+/// - [`StreamClient`]: create, get, update, and delete streams.
+/// - [`TopicClient`]: create, get, update, and delete topics within a stream.
 /// - [`PartitionClient`]: add and remove partitions on a topic.
 /// - [`SegmentClient`]: delete closed segments from a partition.
 /// - [`ConsumerGroupClient`]: create, get, delete, and join or leave consumer groups.
 /// - [`ConsumerOffsetClient`]: store, read, and delete consumer offsets.
-/// - [`MessageClient`]: send and poll messages, and flush the unsaved buffer.
+/// - [`MessageClient`]: send and poll messages.
 ///
 /// Additionally, you can bypass invoking methods from these traits and directly talk to the server with [`send_binary_request`] and [`send_http_request`] for http.
 /// Both trade typed API's safety for low-level control. You need to know the server codes and the wire format.
@@ -122,8 +123,9 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
 ///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
 ///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
-///    client that has been shut down cannot reconnect. Note, if `auto-login` is configured, the client
-///    will reconnect automatically and undo the disconnect.
+///    client that has been shut down cannot reconnect. Explicit disconnect clears the remembered sign-in.
+///    Configured auto-login still authenticates on the next connection; otherwise call
+///    [`connect()`] and [`login_user()`] again before issuing requests.
 ///
 /// # Examples
 ///
@@ -148,6 +150,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// // and creates a topic.
 /// let producer = client
 ///     .producer("stream_name", "topic_name")?
+///     .topic_durability(iggy::prelude::Durability::Persisted)
 ///     .background(
 ///         BackgroundConfig::builder()
 ///             .batch_length(1000)
@@ -651,8 +654,8 @@ impl IggyClient {
             self.client.clone(),
             name.to_owned(),
             Consumer::new(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
             None,
@@ -721,9 +724,9 @@ impl IggyClient {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
-            Consumer::group(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Consumer::group(Identifier::named(name)?),
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
             None,
@@ -755,7 +758,8 @@ impl IggyClient {
     /// client.connect().await?;
     ///
     /// let producer = client
-    ///     .producer("stream_name", "topic_name")? // returns IggyProducerBuilder from IggyClient
+    ///     .producer("stream_name", "topic_name")?
+    ///     .topic_durability(iggy::prelude::Durability::Persisted)
     ///     .partitioning(Partitioning::balanced())
     ///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
     ///     .create_topic_if_not_exists(
@@ -781,9 +785,9 @@ impl IggyClient {
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
-            stream.try_into()?,
+            Identifier::named(stream)?,
             stream.to_owned(),
-            topic.try_into()?,
+            Identifier::named(topic)?,
             topic.to_owned(),
             self.encryptor.clone(),
             self.partitioner.clone(),

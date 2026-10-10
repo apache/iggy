@@ -19,7 +19,8 @@ use iggy::prelude::IggyError;
 use thiserror::Error;
 
 use crate::protocol::api::{
-    ERROR_INVALID_PARTITIONS, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REQUEST,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_POLICY_VIOLATION,
     ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, ERROR_TOPIC_AUTHORIZATION_FAILED,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
@@ -61,6 +62,9 @@ pub enum BridgeError {
         partition: u32,
         partitions_count: u32,
     },
+    /// Iggy loads the partition, so its high watermark reads too low. Retriable: 6.
+    #[error("partition {partition} of topic '{topic}' is loading")]
+    PartitionLoading { topic: String, partition: u32 },
     /// `ensure_topic` was asked to ensure a topic that already exists with a different partition
     /// count. `ensure_topic`'s whole contract is "the topic has `partition_count` partitions
     /// afterward" - silently keeping the old count and returning `Ok(())` would let two
@@ -80,6 +84,12 @@ pub enum BridgeError {
     /// raw or non-conformant client, not an expected path.
     #[error("invalid Kafka topic name '{kafka_topic}': {reason}")]
     InvalidKafkaTopicName { kafka_topic: String, reason: String },
+    /// `ensure_stream_and_topic` was asked for `partition_count == 0`. Enforced here, not only
+    /// at the `CreateTopics` wire-validation layer that's this bridge's only caller today - the
+    /// method is `pub`, so a future caller (a test, or a later Produce auto-create path)
+    /// bypassing that layer must not be able to provision a topic nothing can produce to.
+    #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
+    InvalidPartitionCount { kafka_topic: String },
 }
 
 impl BridgeError {
@@ -99,14 +109,36 @@ impl BridgeError {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
             Self::Timeout | Self::SendLost(_) => ERROR_REQUEST_TIMED_OUT,
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            Self::PartitionLoading { .. } => ERROR_NOT_LEADER_OR_FOLLOWER,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
             Self::InvalidKafkaTopicName { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
+            // Same code the wire-validation layer already uses for this exact condition - this
+            // is the same failure reached through a different door, not a new kind of error.
+            Self::InvalidPartitionCount { .. } => ERROR_INVALID_PARTITIONS,
             // Not a wire-response case in practice: an invalid bridge config is caught at
             // `IggyBridge::connect` before any handler exists to answer a Kafka request, so this
             // is reachable only if a future caller starts constructing configs at request time.
             // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
             // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
             Self::InvalidConfig(_) => ERROR_UNKNOWN_SERVER_ERROR,
+        }
+    }
+
+    /// [`Self::to_kafka_error_code`] for `OffsetCommit` and `OffsetFetch`. A failure that a retry
+    /// can fix becomes `COORDINATOR_LOAD_IN_PROGRESS` (14): the Java client retries 14 in both
+    /// APIs, but fails the call on 6, and on 7 in `OffsetFetch`. Offset calls are idempotent, so
+    /// the unknown outcome behind 7 does no harm on a retry. Nor does `RequestTooOld`'s: the retry
+    /// is a new request, which Iggy runs.
+    #[must_use]
+    pub const fn to_offset_error_code(&self) -> i16 {
+        if matches!(self, Self::Iggy(IggyError::RequestTooOld)) {
+            return ERROR_COORDINATOR_LOAD_IN_PROGRESS;
+        }
+        match self.to_kafka_error_code() {
+            ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT => {
+                ERROR_COORDINATOR_LOAD_IN_PROGRESS
+            }
+            code => code,
         }
     }
 
@@ -162,6 +194,10 @@ impl BridgeError {
 /// `UNKNOWN_SERVER_ERROR` instead - correctly fatal (retrying won't fix a wrong password), but
 /// without asserting a cause the Kafka client cannot act on. Produce logs them at `error!`
 /// (see [`BridgeError::is_bridge_login_rejected`]).
+#[expect(
+    clippy::match_same_arms,
+    reason = "aged-out requests must explicitly retain a non-retryable code"
+)]
 const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
     match err {
         IggyError::StreamIdNotFound(_)
@@ -180,7 +216,25 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
         IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
-        IggyError::TooManyPartitions => ERROR_INVALID_PARTITIONS,
+        // The outcome was forgotten; a retry after client eviction could duplicate the write.
+        // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
+        IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
+        // Not `ERROR_INVALID_PARTITIONS` (37): that code's own text, per `kafka-protocol`'s
+        // table, is "Number of partitions is below 1" - the opposite condition from "too many"
+        // (Iggy's server-side cap, above 1000). Reusing 37 for both directions would return a
+        // client-visible error message that contradicts the actual request it sent.
+        IggyError::TooManyPartitions => ERROR_INVALID_REQUEST,
+        // The node is at `[metadata] partitions_max`. Kafka answers a create that breaks a
+        // broker-side rule with 44, and the request itself is valid, so not `INVALID_REQUEST`.
+        IggyError::PartitionsLimitReached => ERROR_POLICY_VIOLATION,
+        // Deliberately NOT special-cased here to ERROR_NONE: this function is shared by every
+        // handler's error path, but "the operation did commit, so report success" only holds for
+        // a caller that issued a *write* - the SDK's own reconnect path replayed a write whose
+        // first attempt already applied, and the server's client-table dedup caught the replay.
+        // A read that somehow reaches this variant has no write to have "already applied"; a
+        // write-side caller (CreateTopics) special-cases it locally, close to the write it
+        // concerns, instead of baking a write-only assumption into a mapping every read also
+        // goes through. OffsetCommit does the same in `group_offsets.rs`.
         _ => ERROR_UNKNOWN_SERVER_ERROR,
     }
 }
@@ -236,8 +290,34 @@ mod tests {
     }
 
     #[test]
-    fn too_many_partitions_maps_to_invalid_partitions() {
+    fn too_many_partitions_maps_to_invalid_request_not_invalid_partitions() {
+        // INVALID_PARTITIONS (37) means "count is below 1" (kafka-protocol's own error table) -
+        // the opposite condition from "too many": reusing it here would send a client-visible
+        // message that contradicts the request it just sent.
         let err = BridgeError::Iggy(IggyError::TooManyPartitions);
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_REQUEST);
+    }
+
+    #[test]
+    fn partitions_limit_reached_maps_to_policy_violation() {
+        let err = BridgeError::Iggy(IggyError::PartitionsLimitReached);
+        assert_eq!(err.to_kafka_error_code(), ERROR_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn request_already_applied_falls_to_the_generic_mapping_here() {
+        // This shared mapping has no write to know "already applied" refers to - CreateTopics
+        // and OffsetCommit (the callers for whom that's a success, not a fault) special-case it
+        // locally instead (`create_topics.rs`, `group_offsets.rs`), close to the write.
+        let err = BridgeError::Iggy(IggyError::RequestAlreadyApplied);
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
+    #[test]
+    fn invalid_partition_count_maps_to_invalid_partitions() {
+        let err = BridgeError::InvalidPartitionCount {
+            kafka_topic: "orders".to_string(),
+        };
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PARTITIONS);
     }
 
@@ -335,6 +415,20 @@ mod tests {
     }
 
     #[test]
+    fn request_too_old_maps_to_non_retryable_unknown_server_error() {
+        let err = BridgeError::Iggy(IggyError::RequestTooOld);
+        let code = err.to_kafka_error_code();
+
+        assert_eq!(code, ERROR_UNKNOWN_SERVER_ERROR);
+        assert!(
+            !kafka_protocol::error::ResponseError::try_from_code(code)
+                .unwrap()
+                .is_retriable(),
+            "an aged-out request has an unknown outcome and must not be retried"
+        );
+    }
+
+    #[test]
     fn timeout_maps_to_request_timed_out_not_not_leader_or_follower() {
         // A caller-side timeout is the same unknown-outcome shape as TransientNotCommitted (the
         // SDK's write/read run in a detached task this timeout cannot abort, so the request may
@@ -370,6 +464,43 @@ mod tests {
             requested: 5,
         };
         assert_eq!(err.to_kafka_error_code(), ERROR_TOPIC_ALREADY_EXISTS);
+    }
+
+    #[test]
+    fn every_sent_error_code_matches_kafka_protocols_own_table() {
+        use kafka_protocol::error::ResponseError;
+
+        for (ours, theirs) in [
+            (
+                ERROR_UNKNOWN_SERVER_ERROR,
+                ResponseError::UnknownServerError,
+            ),
+            (
+                ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                ResponseError::UnknownTopicOrPartition,
+            ),
+            (
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+                ResponseError::NotLeaderOrFollower,
+            ),
+            (ERROR_REQUEST_TIMED_OUT, ResponseError::RequestTimedOut),
+            (
+                ERROR_INVALID_TOPIC_EXCEPTION,
+                ResponseError::InvalidTopicException,
+            ),
+            (
+                ERROR_TOPIC_AUTHORIZATION_FAILED,
+                ResponseError::TopicAuthorizationFailed,
+            ),
+            (
+                ERROR_TOPIC_ALREADY_EXISTS,
+                ResponseError::TopicAlreadyExists,
+            ),
+            (ERROR_INVALID_PARTITIONS, ResponseError::InvalidPartitions),
+            (ERROR_INVALID_REQUEST, ResponseError::InvalidRequest),
+        ] {
+            assert_eq!(ours, theirs.code());
+        }
     }
 
     #[test]

@@ -114,20 +114,18 @@ impl ClientFactory for TcpClientFactory {
             )
         });
         Client::connect(&client).await.unwrap_or_else(|e| {
-            if self.tls_enabled {
-                panic!(
-                    "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
+            assert!(
+                !self.tls_enabled,
+                "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
                     Hint: Make sure the server is started with TLS enabled and self-signed certificate:\n\
                     IGGY_TCP_TLS_ENABLED=true IGGY_TCP_TLS_SELF_SIGNED=true\n
                     or start iggy-bench with relevant tcp tls arguments: --tls --tls-domain <domain> --tls-ca-file <ca_file>\n",
-                    self.server_addr, e
-                )
-            } else {
-                panic!(
-                    "Failed to connect to iggy-server at {}, error: {:?}",
-                    self.server_addr, e
-                )
-            }
+                self.server_addr, e
+            );
+            panic!(
+                "Failed to connect to iggy-server at {}, error: {:?}",
+                self.server_addr, e
+            )
         });
         ClientWrapper::Tcp(client)
     }

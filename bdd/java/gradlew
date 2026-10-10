@@ -112,8 +112,8 @@ die () {
 #
 ##############################################################################
 
-GRADLE_WRAPPER_VERSION=9.7.1
-REQUIRED_WRAPPER_JAR_CHECKSUM="7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d"
+GRADLE_WRAPPER_VERSION=9.8.0
+REQUIRED_WRAPPER_JAR_CHECKSUM="238e777fcddd7e34f9708186085def2abd6e08e658505b38718d79d74c21abd5"
 
 for _ in 1 2 3; do
     if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then

@@ -18,8 +18,8 @@ under the License.
 -->
 
 <script lang="ts" module>
-  import { browser } from '$app/environment';
-  import { invalidateAll } from '$app/navigation';
+  import { browser } from '$app/env';
+  import { refreshAll } from '$app/navigation';
   import { onMount } from 'svelte';
   import { writable } from 'svelte/store';
   import Button from './Button.svelte';
@@ -33,7 +33,7 @@ under the License.
   export async function customInvalidateAll() {
     if (!browser) return;
     isInvalidating.set(true);
-    await invalidateAll();
+    await refreshAll();
     isInvalidating.set(false);
   }
 </script>

@@ -16,14 +16,14 @@
 // under the License.
 
 //! Shard 0 mints monotonic client ids so the registry should never see a
-//! collision. If one leaks in anyway (bad foreign mint, wrap at 2^112),
+//! collision. If one leaks in anyway (bad foreign mint, wrap after 2^48 mints),
 //! the installer must drop the duplicate fd instead of panicking. This
 //! test forces the collision and verifies the first entry survives while
 //! the second is dropped cleanly.
 
 mod common;
 
-use common::{header_only, loopback, test_client_meta};
+use common::{header_only, loopback, test_client_meta, test_permit};
 use compio::net::{TcpListener, TcpStream};
 use iggy_binary_protocol::Command;
 use message_bus::client_listener::RequestHandler;
@@ -59,6 +59,7 @@ async fn duplicate_install_drops_second_fd_without_panic() {
         &bus,
         test_client_meta(client_id, ClientTransportKind::Tcp),
         first,
+        test_permit(),
         on_request.clone(),
     );
     assert!(bus.clients().contains(client_id));
@@ -71,6 +72,7 @@ async fn duplicate_install_drops_second_fd_without_panic() {
         &bus,
         test_client_meta(client_id, ClientTransportKind::Tcp),
         second,
+        test_permit(),
         on_request,
     );
     assert!(bus.clients().contains(client_id));
@@ -127,6 +129,7 @@ async fn orphan_reader_from_losing_install_does_not_invoke_on_request() {
         &bus,
         test_client_meta(client_id, ClientTransportKind::Tcp),
         first_local,
+        test_permit(),
         on_request.clone(),
     );
     assert!(bus.clients().contains(client_id));
@@ -139,6 +142,7 @@ async fn orphan_reader_from_losing_install_does_not_invoke_on_request() {
         &bus,
         test_client_meta(client_id, ClientTransportKind::Tcp),
         second_local,
+        test_permit(),
         on_request,
     );
 
@@ -199,6 +203,7 @@ async fn losing_install_drains_well_before_close_peer_timeout() {
         &bus,
         test_client_meta(client_id, ClientTransportKind::Tcp),
         first_local,
+        test_permit(),
         on_request.clone(),
     );
     assert!(bus.clients().contains(client_id));
@@ -212,6 +217,7 @@ async fn losing_install_drains_well_before_close_peer_timeout() {
         &bus,
         test_client_meta(client_id, ClientTransportKind::Tcp),
         second_local,
+        test_permit(),
         on_request,
     );
     // Yield once so the spawned drain task gets to poll. Even with the

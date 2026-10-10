@@ -46,14 +46,12 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::{
-    DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
-};
+use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamRequest};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
-use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier};
+use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, WireName};
 use iggy_common::{IggyError, variadic};
 use server_common::Message;
 
@@ -157,14 +155,6 @@ pub(crate) fn authorize(
                 perm.delete_stream(user_id, sid)
             })
         }
-        Operation::PurgeStream => {
-            let Ok(request) = PurgeStreamRequest::decode_from(body) else {
-                return None;
-            };
-            stream_scoped(users, streams, &request.stream_id, |perm, sid| {
-                perm.purge_stream(user_id, sid)
-            })
-        }
 
         // Topics. The wire `CreateTopic` is projected to
         // `CreateTopicWithAssignments` before it reaches apply, so only the
@@ -199,18 +189,6 @@ pub(crate) fn authorize(
                 &request.stream_id,
                 &request.topic_id,
                 |perm, sid, tid| perm.delete_topic(user_id, sid, tid),
-            )
-        }
-        Operation::PurgeTopic => {
-            let Ok(request) = PurgeTopicRequest::decode_from(body) else {
-                return None;
-            };
-            topic_scoped(
-                users,
-                streams,
-                &request.stream_id,
-                &request.topic_id,
-                |perm, sid, tid| perm.purge_topic(user_id, sid, tid),
             )
         }
 
@@ -334,6 +312,8 @@ pub(crate) fn authorize(
         | Operation::Logout
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation
+        | Operation::FinalizeSession
+        | Operation::RetireSession
         | Operation::CreateTopic
         | Operation::CreatePartitions
         | Operation::DeleteSegments
@@ -342,6 +322,56 @@ pub(crate) fn authorize(
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
         | Operation::DeleteConsumerOffset => None,
+    }
+}
+
+/// What a create that `[metadata] partitions_max` counts adds partitions to.
+pub(crate) enum PartitionsCreate {
+    /// A `CreateTopic` of a topic with this name.
+    Topic { name: WireName },
+    /// A `CreatePartitions` for this existing topic.
+    Partitions { topic_id: WireIdentifier },
+}
+
+/// Whether a `CreateTopic` or a `CreatePartitions` gets past `authorize` and
+/// the first checks of its apply: the ids resolve, a new topic name is free in
+/// its stream, and `user_id` holds the grant. The primary asks before it denies
+/// a create for `[metadata] partitions_max`, so apply answers `NotFound`,
+/// `Unauthorized` or `TopicNameAlreadyExists` first. A user who cannot create
+/// learns nothing about the cap, and a client that creates a topic only when it
+/// is missing gets the name error it expects.
+pub(crate) fn admits_partitions_create(
+    users: &Users,
+    streams: &Streams,
+    user_id: u32,
+    stream_id: &WireIdentifier,
+    create: &PartitionsCreate,
+) -> bool {
+    match create {
+        PartitionsCreate::Topic { name } => streams
+            .read(|inner| {
+                let stream_id = inner.resolve_stream_id(stream_id)?;
+                let name_taken = inner
+                    .items
+                    .get(stream_id)?
+                    .topic_index
+                    .contains_key(name.as_str());
+                (!name_taken).then_some(stream_id)
+            })
+            .is_some_and(|stream_id| {
+                user_id == ROOT_USER_ID
+                    || users
+                        .authorize(|perm| perm.create_topic(user_id, stream_id))
+                        .is_ok()
+            }),
+        PartitionsCreate::Partitions { topic_id } => streams
+            .resolve_topic_ids(stream_id, topic_id)
+            .is_some_and(|(stream_id, topic_id)| {
+                user_id == ROOT_USER_ID
+                    || users
+                        .authorize(|perm| perm.create_partitions(user_id, stream_id, topic_id))
+                        .is_ok()
+            }),
     }
 }
 
@@ -365,7 +395,7 @@ fn stream_scoped(
     stream_id: &WireIdentifier,
     rule: impl FnOnce(&Permissioner, usize) -> Result<(), IggyError>,
 ) -> Option<ApplyReply> {
-    let stream_id = streams.read(|inner| inner.resolve_stream_id(stream_id))?;
+    let stream_id = streams.resolve_stream_id(stream_id)?;
     check(users, |perm| rule(perm, stream_id))
 }
 
@@ -378,11 +408,7 @@ fn topic_scoped(
     topic_id: &WireIdentifier,
     rule: impl FnOnce(&Permissioner, usize, usize) -> Result<(), IggyError>,
 ) -> Option<ApplyReply> {
-    let (stream_id, topic_id) = streams.read(|inner| {
-        let stream_id = inner.resolve_stream_id(stream_id)?;
-        let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
-        Some((stream_id, topic_id))
-    })?;
+    let (stream_id, topic_id) = streams.resolve_topic_ids(stream_id, topic_id)?;
     check(users, |perm| rule(perm, stream_id, topic_id))
 }
 

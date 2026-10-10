@@ -78,12 +78,9 @@ const MIN_INDEX_ENTRIES: usize = 4;
 /// Infix of the directory the refusal path renames a partition's segment files
 /// into (`partitions::state_transfer::quarantine_partition_files`).
 const FENCED_DIR_MARKER: &str = ".fenced.";
-/// Boot log line recovery emits when the log cannot back the last entry of an
-/// index (`server::segment_recovery::recover_segment_bounds`): the positive
-/// evidence that path ran, as opposed to the clean anchored walk or a refusal.
-/// Distinct from the line the self-contradicting-index check emits, which ends
-/// "rebuilding it from the log".
-const INDEX_REBUILD_MARKER: &str = "discarding the index and rebuilding it from a byte-0 walk";
+/// WAL-owned recovery discards unpublished segment bytes before rebuilding the index.
+const UNPUBLISHED_TAIL_MARKER: &str =
+    "discarding unpublished segment bytes beyond the durable WAL frontier";
 const PARTITION_WAL_REFUSAL_MARKER: &str = "prepare WAL at";
 
 async fn create_stream_and_topic(client: &IggyClient, durability: Durability) {
@@ -677,12 +674,8 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
             )
         });
 
-        // Read the index BEFORE the log, both right after boot: catch-up grows
-        // the two files together, so a log still at the cut proves the index was
-        // read before any append landed, and the rebuild is then the only shape it
-        // may have. Once the log has grown the refilled tail re-mints entries over
-        // the same bytes, and nothing on disk tells the two apart; the boot log
-        // marker below is the evidence that survives that.
+        // WAL recovery discards unpublished bytes; peer repair can immediately refill them.
+        // Read the index first so a log still at the cut proves it cannot describe later bytes.
         //
         // The rebuild's stride is its own, so the entry COUNT is not the spec.
         // What is: the index describes only bytes the walk proved, which is the
@@ -716,9 +709,8 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
         let fenced = fenced_segment_paths(&backup_data);
         assert!(
             fenced.is_empty(),
-            "recovery must rebuild the index from the log, keeping the {} \
-         surviving batches in service; instead the chain was refused and fenced aside: {fenced:?}",
-            surviving.len()
+            "the unpublished tail must be discarded for peer repair, \
+             without quarantining the segment chain: {fenced:?}"
         );
         // `fenced_segment_paths` walks past unreadable directories, so an empty
         // result alone could be vacuous: the files must still be where boot found
@@ -740,9 +732,11 @@ async fn given_an_index_ahead_of_a_truncated_log_when_a_node_recovers_should_pre
                 "boot must absorb an index that outruns its log, not refuse the chain"
             );
             assert!(
-                harness.node(backup).stdout_contains(INDEX_REBUILD_MARKER),
-                "boot must log the byte-0 rebuild ({INDEX_REBUILD_MARKER:?}); recovery took \
-             another path"
+                harness
+                    .node(backup)
+                    .stdout_contains(UNPUBLISHED_TAIL_MARKER),
+                "boot must discard the unpublished tail using the durable WAL frontier \
+                 ({UNPUBLISHED_TAIL_MARKER:?}); recovery took another path"
             );
         }
     }

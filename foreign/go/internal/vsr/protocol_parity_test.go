@@ -46,7 +46,7 @@ var rustSources = map[string]string{
 	"header":    "core/binary_protocol/src/consensus/header.rs",
 	"command":   "core/binary_protocol/src/consensus/command.rs",
 	"operation": "core/binary_protocol/src/consensus/operation.rs",
-	"cargo":     "core/binary_protocol/Cargo.toml",
+	"version":   "core/binary_protocol/src/version.rs",
 	"eviction":  "core/common/src/error/eviction.rs",
 }
 
@@ -62,14 +62,13 @@ var goOperations = map[string]Operation{
 	"RemoveConsumerGroupMember":       OperationRemoveConsumerGroupMember,
 	"CompleteConsumerGroupRevocation": OperationCompleteConsumerGroupRevocation,
 	"TruncatePartition":               OperationTruncatePartition,
+	"FinalizeSession":                 OperationFinalizeSession,
 	"CreateStream":                    OperationCreateStream,
 	"UpdateStream":                    OperationUpdateStream,
 	"DeleteStream":                    OperationDeleteStream,
-	"PurgeStream":                     OperationPurgeStream,
 	"CreateTopic":                     OperationCreateTopic,
 	"UpdateTopic":                     OperationUpdateTopic,
 	"DeleteTopic":                     OperationDeleteTopic,
-	"PurgeTopic":                      OperationPurgeTopic,
 	"CreatePartitions":                OperationCreatePartitions,
 	"DeletePartitions":                OperationDeletePartitions,
 	"DeleteSegments":                  OperationDeleteSegments,
@@ -87,6 +86,7 @@ var goOperations = map[string]Operation{
 	"SendMessages":                    OperationSendMessages,
 	"StoreConsumerOffset":             OperationStoreConsumerOffset,
 	"DeleteConsumerOffset":            OperationDeleteConsumerOffset,
+	"RetireSession":                   OperationRetireSession,
 }
 
 // goEvictionReasons names every eviction discriminant the codec declares.
@@ -145,10 +145,6 @@ var goHeaderOffsets = map[string]map[string]int{
 		"reason":                      evictionOffsetReason,
 	},
 }
-
-// unimplementedCommandCodes are protocol codes the Go SDK deliberately does
-// not declare. FlushUnsavedBuffer has no Go client method.
-var unimplementedCommandCodes = []uint32{102}
 
 // rustFieldLayout is the size and alignment of every field type the consensus
 // headers use, enough to recompute their repr(C) offsets.
@@ -281,8 +277,7 @@ func TestProtocolParity_CommandCodes(t *testing.T) {
 		}
 	}
 	slices.Sort(missing)
-	assert.Equal(t, unimplementedCommandCodes, missing,
-		"the set of protocol codes the Go SDK does not declare has changed")
+	assert.Empty(t, missing, "protocol command codes the Go SDK does not declare")
 }
 
 func TestProtocolParity_OperationDiscriminants(t *testing.T) {
@@ -424,6 +419,7 @@ func TestProtocolParity_OperationClassification(t *testing.T) {
 	rustValues := rustEnumValues(sources["operation"], "Operation")
 	require.NotEmpty(t, rustValues)
 
+	internalNames := rustMatchesAllowlist(t, sources["operation"], "is_internal")
 	metadataNames := rustMatchesAllowlist(t, sources["operation"], "is_metadata")
 	resultFramedNames := rustMatchesAllowlist(t, sources["operation"], "is_result_framed")
 
@@ -434,9 +430,10 @@ func TestProtocolParity_OperationClassification(t *testing.T) {
 
 	for name, value := range rustValues {
 		operation := Operation(value)
-		internal := value >= internalStart && value < metadataStart
+		_, inInternalList := internalNames[name]
+		internal := value >= internalStart && value < metadataStart || inInternalList
 		_, inMetadataList := metadataNames[name]
-		metadata := internal || inMetadataList
+		metadata := internal && value < rustValues["SendMessages"] || inMetadataList
 		_, inResultFramedList := resultFramedNames[name]
 
 		assert.Equal(t, internal, IsInternal(operation), "IsInternal(%s)", name)
@@ -530,15 +527,18 @@ func TestProtocolParity_ClientHeadersCarryNoNamespace(t *testing.T) {
 
 func TestProtocolParity_PackedProtocolVersion(t *testing.T) {
 	sources := loadRustSources(t)
-	pattern := regexp.MustCompile(`(?m)^version = "([0-9]+)\.([0-9]+)\.([0-9]+)`)
-	match := pattern.FindStringSubmatch(sources["cargo"])
-	require.NotNil(t, match, "the binary protocol crate version was not found")
+	pattern := regexp.MustCompile(`IGGY_PROTOCOL_VERSION:\s*u32\s*=\s*pack_protocol_version\((\d+),\s*(\d+),\s*(\d+)\)`)
+	match := pattern.FindStringSubmatch(sources["version"])
+	require.NotNil(t, match, "the explicit binary protocol version was not found")
 
 	major, err := strconv.ParseUint(match[1], 10, 32)
 	require.NoError(t, err)
 	minor, err := strconv.ParseUint(match[2], 10, 32)
 	require.NoError(t, err)
+	patch, err := strconv.ParseUint(match[3], 10, 32)
+	require.NoError(t, err)
 
 	assert.Equal(t, uint32(major), ProtocolVersion>>20, "protocol major")
 	assert.Equal(t, uint32(minor), (ProtocolVersion>>10)&0x3FF, "protocol minor")
+	assert.Equal(t, uint32(patch), ProtocolVersion&0x3FF, "protocol patch")
 }

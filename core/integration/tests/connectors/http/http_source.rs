@@ -124,6 +124,48 @@ async fn named_path_post_produces_message_to_iggy(
     );
 }
 
+/// Iggy refuses to store an empty payload. Accepted with a 200, an empty body
+/// made the runtime NACK its whole batch on every replay, so no webhook queued
+/// behind it ever reached Iggy.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/http/source.toml")),
+    seed = seeds::connector_multi_topic_stream
+)]
+async fn empty_body_post_is_refused_without_blocking_later_webhooks(
+    harness: &TestHarness,
+    fixture: HttpSourceFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let http = webhook_client();
+    wait_for_gateway(&http, &fixture).await;
+
+    let empty = http
+        .post(fixture.named_url(seeds::names::TOPIC))
+        .send()
+        .await
+        .expect("Failed to POST the empty body");
+    let body = r#"{"event":"deployment","environment":"production"}"#;
+    let response = http
+        .post(fixture.named_url(seeds::names::TOPIC))
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to POST the webhook");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let messages = poll_payloads(&client, seeds::names::TOPIC, "http_source_cg_empty", 1).await;
+    assert_eq!(
+        String::from_utf8_lossy(&messages[0].0),
+        body,
+        "the webhook after an empty body must still be delivered"
+    );
+    assert_eq!(
+        empty.status(),
+        StatusCode::BAD_REQUEST,
+        "an empty body must be refused, not queued"
+    );
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/source.toml")),
     seed = seeds::connector_multi_topic_stream

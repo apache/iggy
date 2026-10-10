@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers.Binary;
+using System.Security.Cryptography;
 using System.Text;
 using Apache.Iggy.Utils;
 
@@ -30,28 +31,32 @@ internal static class LoginRegister
 {
     internal const string SDK_NAME = "csharp-sdk";
 
-    /// <summary>Semver of the <c>iggy_binary_protocol</c> crate this SDK is built against.</summary>
+    /// <summary>Explicit wire version from <c>core/binary_protocol/src/version.rs</c>.</summary>
     internal const int PROTOCOL_VERSION_MAJOR = 0;
 
     internal const int PROTOCOL_VERSION_MINOR = 11;
-    internal const int PROTOCOL_VERSION_PATCH = 0;
+    internal const int PROTOCOL_VERSION_PATCH = 1;
 
     /// <summary>Packed protocol version: <c>major &lt;&lt; 20 | minor &lt;&lt; 10 | patch</c>, 10 bits each.</summary>
     internal const uint PROTOCOL_VERSION =
         ((uint)PROTOCOL_VERSION_MAJOR << 20) | ((uint)PROTOCOL_VERSION_MINOR << 10) | PROTOCOL_VERSION_PATCH;
 
     private const int MaxWireNameLength = 255;
+    internal const int BIND_SECRET_BYTES = 32;
+    internal const int SESSION_IDENTITY_BYTES = 32;
 
     private static int VersionInfoLength => 4 + NameLength(SDK_NAME) + NameLength(SdkVersion.Value);
 
-    internal static byte[] Serialize(string username, string password, string? clientContext = null)
+    internal static byte[] Serialize(string username, string password, ReadOnlySpan<byte> bindSecret, string? clientContext = null)
     {
+        ValidateBindSecret(bindSecret);
         CredentialBounds.ValidateUsername(username);
         CredentialBounds.ValidatePassword(password);
 
-        var writer = new BodyWriter(VersionInfoLength + NameLength(username) + NameLength(password) + 4 +
+        var writer = new BodyWriter(VersionInfoLength + BIND_SECRET_BYTES + NameLength(username) + NameLength(password) + 4 +
                                     ContextLength(clientContext));
         writer.WriteVersionInfo();
+        writer.WriteBytes(bindSecret);
         writer.WriteName(username, nameof(username));
         writer.WriteName(password, nameof(password));
         writer.WriteContext(clientContext);
@@ -59,16 +64,45 @@ internal static class LoginRegister
         return writer.Buffer;
     }
 
-    internal static byte[] SerializeWithPersonalAccessToken(string token, string? clientContext = null)
+    internal static byte[] SerializeWithPersonalAccessToken(string token, ReadOnlySpan<byte> bindSecret, string? clientContext = null)
     {
+        ValidateBindSecret(bindSecret);
         CredentialBounds.ValidateToken(token);
 
-        var writer = new BodyWriter(VersionInfoLength + NameLength(token) + 4 + ContextLength(clientContext));
+        var writer = new BodyWriter(VersionInfoLength + BIND_SECRET_BYTES + NameLength(token) + 4 + ContextLength(clientContext));
         writer.WriteVersionInfo();
+        writer.WriteBytes(bindSecret);
         writer.WriteName(token, nameof(token));
         writer.WriteContext(clientContext);
 
         return writer.Buffer;
+    }
+
+    internal static byte[] CreateBindSecret() => RandomNumberGenerator.GetBytes(BIND_SECRET_BYTES);
+
+    internal static byte[] ReadBindSecret(ReadOnlySpan<byte> body) =>
+        body.Slice(VersionInfoLength, BIND_SECRET_BYTES).ToArray();
+
+    internal static byte[] SerializeBindSession(ReadOnlySpan<byte> identity, ReadOnlySpan<byte> bindSecret)
+    {
+        ValidateBindSecret(bindSecret);
+        if (identity.Length != SESSION_IDENTITY_BYTES)
+        {
+            throw new ArgumentException("Session identity must be 32 bytes.", nameof(identity));
+        }
+        var writer = new BodyWriter(VersionInfoLength + SESSION_IDENTITY_BYTES + BIND_SECRET_BYTES);
+        writer.WriteVersionInfo();
+        writer.WriteBytes(identity);
+        writer.WriteBytes(bindSecret);
+        return writer.Buffer;
+    }
+
+    private static void ValidateBindSecret(ReadOnlySpan<byte> bindSecret)
+    {
+        if (bindSecret.Length != BIND_SECRET_BYTES)
+        {
+            throw new ArgumentException("Bind secret must be 32 bytes.", nameof(bindSecret));
+        }
     }
 
     /// <summary>
@@ -131,6 +165,12 @@ internal static class LoginRegister
             _position += 4;
             WriteName(SDK_NAME, nameof(SDK_NAME));
             WriteName(SdkVersion.Value, nameof(SdkVersion));
+        }
+
+        internal void WriteBytes(ReadOnlySpan<byte> value)
+        {
+            value.CopyTo(Buffer.AsSpan(_position));
+            _position += value.Length;
         }
 
         internal void WriteName(string value, string name)

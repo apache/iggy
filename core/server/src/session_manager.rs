@@ -18,7 +18,7 @@
 //! Transport-to-consensus session bridge for server.
 //!
 //! Maps ephemeral transport connections to durable consensus sessions.
-//! Each connection goes through: `connect → login → register → bound`.
+//! Connections bind to a registered session after credential verification.
 //!
 //! The [`SessionManager`] is the server-side counterpart of the SDK's
 //! session lifecycle. It does **not** own the `ClientTable`. That lives
@@ -28,6 +28,7 @@
 use crate::cluster_meta::ClusterRoster;
 use ahash::AHashMap;
 use consensus::client_table::SessionAttachment;
+use iggy_binary_protocol::ConsumerSession;
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
@@ -41,7 +42,7 @@ use std::time::{Duration, Instant};
 /// and the read-your-writes floor. `Default` (everything absent, no address,
 /// floor `0`) stands for a connection neither this map nor the bus knows.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ConnectionContext {
+pub struct ConnectionContext {
     /// `(client_id, session)` once register committed, `None` before.
     pub bound: Option<(u128, u64)>,
     /// Acting user from `login`, `None` while still `Connected`.
@@ -58,21 +59,11 @@ pub(crate) struct ConnectionContext {
     pub metadata_watermark: u64,
 }
 
-/// Connection lifecycle states.
-///
-/// ```text
-///   Connected ──login──> Authenticated ──register──> Bound
-///
-///   Bound ──evict──> Connected   (another conn binds same client_id)
-///   {any} ──disconnect──> ∅
-/// ```
+/// A binding is local to a connection; several connections can share a session.
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
     /// Connection established, not yet authenticated.
     Connected,
-    /// Login succeeded (credentials verified). `user_id` is known.
-    /// Waiting for register to establish a consensus session.
-    Authenticated { user_id: u32 },
     /// Register committed through consensus. Connection is bound to a
     /// `(client_id, session)` pair. Requests on this connection use
     /// these values to populate `RoutedRequestHeader.client` and
@@ -129,18 +120,10 @@ pub struct Connection {
 /// ## Invariants
 ///
 /// - A `connection_id` appears in at most one of `connections`.
-/// - A `client_id` appears in at most one `Bound` connection (one connection
-///   per consensus session). If a client reconnects with the same `client_id`,
-///   the old connection must be evicted first.
+/// - Every bound connection holds an attachment invalidated by session end.
+/// - Disconnecting one connection leaves the shared session and its peers live.
 pub struct SessionManager {
-    /// `ahash` over `std`: connection and client ids are server-minted, so
-    /// there is no `HashDoS` surface, and both maps sit on the per-frame path.
-    /// Neither is order-sensitive (`iter_clients` and `collect_stale` both
-    /// consume the whole map).
     connections: AHashMap<u128, Connection>,
-    /// Reverse index: `client_id` → `connection_id` for fast lookup when
-    /// a consensus reply arrives and needs routing to the right connection.
-    client_to_connection: AHashMap<u128, u128>,
     /// This shard's copy of the configured cluster roster, served by the
     /// `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
@@ -153,7 +136,6 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             connections: AHashMap::new(),
-            client_to_connection: AHashMap::new(),
             cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
     }
@@ -197,6 +179,15 @@ impl SessionManager {
     /// bus metadata ([`Self::ensure_connection`]) and asks again.
     pub(crate) fn touch_connection(&mut self, connection_id: u128) -> Option<ConnectionContext> {
         let conn = self.connections.get_mut(&connection_id)?;
+        if conn
+            .consumer_session
+            .as_ref()
+            .is_some_and(|(_, attachment)| !attachment.is_valid())
+        {
+            conn.state = ConnectionState::Connected;
+            conn.consumer_session = None;
+            conn.metadata_watermark = 0;
+        }
         conn.last_heartbeat = Instant::now();
         let (bound, user_id) = match conn.state {
             ConnectionState::Bound {
@@ -204,7 +195,6 @@ impl SessionManager {
                 client_id,
                 session,
             } => (Some((client_id, session)), Some(user_id)),
-            ConnectionState::Authenticated { user_id } => (None, Some(user_id)),
             ConnectionState::Connected => (None, None),
         };
         Some(ConnectionContext {
@@ -216,7 +206,7 @@ impl SessionManager {
     }
 
     /// Connection ids whose last heartbeat is older than `max_age` -- the
-    /// stale set the heartbeat verifier evicts. Only `Bound`/`Authenticated`
+    /// stale set the heartbeat verifier evicts. Only `Bound`
     /// connections are considered (a freshly-`Connected` socket mid-handshake
     /// is left alone until it authenticates).
     #[must_use]
@@ -236,7 +226,7 @@ impl SessionManager {
     pub fn bound_client_id(&self, connection_id: u128) -> Option<u128> {
         match self.connections.get(&connection_id)?.state {
             ConnectionState::Bound { client_id, .. } => Some(client_id),
-            ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+            ConnectionState::Connected => None,
         }
     }
 
@@ -249,111 +239,54 @@ impl SessionManager {
         }
     }
 
-    /// Remove a connection (disconnect). Cleans up the reverse index if bound.
-    ///
-    /// Returns the bound `(client_id, session)` when the removed connection had
-    /// one, so the caller can submit a session-matched `Logout` (the committed
-    /// apply releases the client-table slot cluster-wide).
+    /// Remove a transport connection without ending its durable session.
     pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
         if let Some(conn) = self.connections.remove(&connection_id)
             && let ConnectionState::Bound {
                 client_id, session, ..
             } = conn.state
         {
-            self.client_to_connection.remove(&client_id);
             return Some((client_id, session));
         }
         None
     }
 
-    /// Transition to `Authenticated` after successful login.
-    ///
-    /// # Errors
-    /// Returns `Err` if the connection doesn't exist or isn't in `Connected` state.
-    pub fn login(&mut self, connection_id: u128, user_id: u32) -> Result<(), SessionError> {
-        let conn = self
-            .connections
-            .get_mut(&connection_id)
-            .ok_or(SessionError::ConnectionNotFound(connection_id))?;
-        match conn.state {
-            ConnectionState::Connected => {
-                conn.state = ConnectionState::Authenticated { user_id };
-                // The floor belongs to whoever was told those ops committed,
-                // and this socket now serves someone else: a `Connected`
-                // connection is either fresh or one `bind_session` demoted, so
-                // carrying the old mark over would make the new login wait for
-                // a write it never issued. Never the other direction - the
-                // bind below re-seeds from the register epoch.
-                conn.metadata_watermark = 0;
-                conn.consumer_session = None;
-                Ok(())
-            }
-            _ => Err(SessionError::InvalidTransition {
-                connection_id,
-                from: state_name(&conn.state),
-                to: "Authenticated",
-            }),
-        }
-    }
-
-    /// Transition to `Bound` after register commits through consensus.
-    ///
-    /// The `client_id` is the ephemeral u128 the client generated.
-    /// The `session` is the commit op number assigned by the consensus layer.
-    ///
-    /// If another connection was previously bound to this `client_id`, it is
-    /// forcibly unbound (set back to `Connected`). Only one connection per
-    /// session at a time.
-    ///
-    /// # Errors
-    /// Returns `Err` if the connection doesn't exist or isn't `Authenticated`.
-    ///
-    /// # Panics
-    /// Panics if the connection disappears between validation and mutation
-    /// (impossible in single-threaded use).
-    pub fn bind_session(
+    pub fn bind_authenticated_connection(
         &mut self,
         connection_id: u128,
         client_id: u128,
         session: u64,
-    ) -> Result<(), SessionError> {
-        // Validate state first (immutable borrow).
-        let conn = self
-            .connections
-            .get(&connection_id)
-            .ok_or(SessionError::ConnectionNotFound(connection_id))?;
-        let ConnectionState::Authenticated { user_id } = conn.state else {
-            return Err(SessionError::InvalidTransition {
-                connection_id,
-                from: state_name(&conn.state),
-                to: "Bound",
-            });
-        };
-
-        // Evict any previous connection bound to this client_id.
-        if let Some(&old_conn_id) = self.client_to_connection.get(&client_id)
-            && old_conn_id != connection_id
-            && let Some(old_conn) = self.connections.get_mut(&old_conn_id)
-        {
-            old_conn.state = ConnectionState::Connected;
+        user_id: u32,
+        attachment: SessionAttachment,
+        metadata_watermark: u64,
+    ) -> Result<(), IggyError> {
+        if !attachment.is_valid() {
+            return Err(IggyError::Unauthenticated);
         }
-
-        // Now mutate the target connection.
-        let bound = self
+        let connection = self
             .connections
             .get_mut(&connection_id)
-            .expect("bind_session: connection validated above, single-threaded");
-        bound.state = ConnectionState::Bound {
+            .ok_or(IggyError::Unauthenticated)?;
+        if let ConnectionState::Bound {
+            user_id: bound_user,
+            client_id: bound_client,
+            session: bound_session,
+        } = connection.state
+            && (bound_user != user_id || bound_client != client_id || bound_session != session)
+        {
+            return Err(IggyError::AlreadyAuthenticated);
+        }
+        connection.state = ConnectionState::Bound {
             user_id,
             client_id,
             session,
         };
-        // The session IS the register's commit op, so it floors every metadata
-        // op this client saw committed before it re-homed here. Without the
-        // seed a re-homed connection reads at zero and the gate admits the
-        // pre-write state its own last write already replaced.
-        bound.metadata_watermark = bound.metadata_watermark.max(session);
-        self.client_to_connection.insert(client_id, connection_id);
+        connection.consumer_session = Some((client_id, attachment));
+        connection.metadata_watermark = connection
+            .metadata_watermark
+            .max(metadata_watermark)
+            .max(session);
+        connection.last_heartbeat = Instant::now();
         Ok(())
     }
 
@@ -370,35 +303,6 @@ impl SessionManager {
         }
     }
 
-    /// Attach a consumer-group identity to an authenticated data connection.
-    ///
-    /// This connection retains its own consensus identity and disconnect cleanup.
-    ///
-    /// # Errors
-    /// Returns `Unauthenticated` for an unbound connection or `StaleClient`
-    /// when the parent epoch has ended.
-    pub fn attach_consumer_session(
-        &mut self,
-        connection_id: u128,
-        client_id: u128,
-        attachment: SessionAttachment,
-        metadata_watermark: u64,
-    ) -> Result<(), IggyError> {
-        let connection = self
-            .connections
-            .get_mut(&connection_id)
-            .ok_or(IggyError::Unauthenticated)?;
-        if !matches!(connection.state, ConnectionState::Bound { .. }) {
-            return Err(IggyError::Unauthenticated);
-        }
-        if !attachment.is_valid() {
-            return Err(IggyError::StaleClient);
-        }
-        connection.consumer_session = Some((client_id, attachment));
-        connection.metadata_watermark = connection.metadata_watermark.max(metadata_watermark);
-        Ok(())
-    }
-
     /// Resolve the attached group identity without extending its lifetime.
     ///
     /// # Errors
@@ -412,8 +316,6 @@ impl SessionManager {
             .ok_or(IggyError::Unauthenticated)
     }
 
-    /// An absent alias is an ordinary session; an expired alias must fail closed.
-    ///
     /// # Errors
     /// Returns `Unauthenticated` for an unbound connection and `StaleClient`
     /// when its attached parent session has ended.
@@ -428,9 +330,10 @@ impl SessionManager {
         if !matches!(connection.state, ConnectionState::Bound { .. }) {
             return Err(IggyError::Unauthenticated);
         }
-        let Some((client_id, attachment)) = connection.consumer_session.as_ref() else {
-            return Ok(None);
-        };
+        let (client_id, attachment) = connection
+            .consumer_session
+            .as_ref()
+            .ok_or(IggyError::Unauthenticated)?;
         if !attachment.is_valid() {
             return Err(IggyError::StaleClient);
         }
@@ -457,11 +360,18 @@ impl SessionManager {
     #[must_use]
     pub fn get_session(&self, connection_id: u128) -> Option<(u128, u64)> {
         let conn = self.connections.get(&connection_id)?;
+        if conn
+            .consumer_session
+            .as_ref()
+            .is_some_and(|(_, attachment)| !attachment.is_valid())
+        {
+            return None;
+        }
         match conn.state {
             ConnectionState::Bound {
                 client_id, session, ..
             } => Some((client_id, session)),
-            _ => None,
+            ConnectionState::Connected => None,
         }
     }
 
@@ -469,10 +379,15 @@ impl SessionManager {
     #[must_use]
     pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {
         let conn = self.connections.get(&connection_id)?;
+        if conn
+            .consumer_session
+            .as_ref()
+            .is_some_and(|(_, attachment)| !attachment.is_valid())
+        {
+            return None;
+        }
         match conn.state {
-            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
-                Some(user_id)
-            }
+            ConnectionState::Bound { user_id, .. } => Some(user_id),
             ConnectionState::Connected => None,
         }
     }
@@ -497,6 +412,38 @@ impl SessionManager {
             .iter()
             .map(|(&id, conn)| record_from(id, conn))
     }
+
+    /// The number of locally-homed connected clients, which
+    /// [`Self::iter_clients`] would yield, without building their records.
+    #[must_use]
+    pub fn client_count(&self) -> usize {
+        self.connections.len()
+    }
+
+    pub fn iter_consumer_sessions(
+        &self,
+        timeout: std::time::Duration,
+    ) -> impl Iterator<Item = ConsumerSession> + '_ {
+        let now = std::time::Instant::now();
+        self.connections.values().filter_map(move |connection| {
+            if now.saturating_duration_since(connection.last_heartbeat) >= timeout
+                || connection
+                    .consumer_session
+                    .as_ref()
+                    .is_none_or(|(_, attachment)| !attachment.is_valid())
+            {
+                return None;
+            }
+            if let ConnectionState::Bound {
+                client_id, session, ..
+            } = connection.state
+            {
+                Some(ConsumerSession { client_id, session })
+            } else {
+                None
+            }
+        })
+    }
 }
 
 impl Default for SessionManager {
@@ -505,45 +452,13 @@ impl Default for SessionManager {
     }
 }
 
-#[derive(Debug)]
-pub enum SessionError {
-    ConnectionNotFound(u128),
-    InvalidTransition {
-        connection_id: u128,
-        from: &'static str,
-        to: &'static str,
-    },
-}
-
-impl std::fmt::Display for SessionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ConnectionNotFound(id) => write!(f, "connection {id} not found"),
-            Self::InvalidTransition {
-                connection_id,
-                from,
-                to,
-            } => write!(
-                f,
-                "connection {connection_id}: invalid transition {from} -> {to}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
-
 /// Flatten a connection + its id into a [`ConnectedClientInfo`].
 fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
-    let user_id = match conn.state {
-        ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
-            Some(user_id)
-        }
-        ConnectionState::Connected => None,
-    };
-    let vsr_client_id = match conn.state {
-        ConnectionState::Bound { client_id, .. } => Some(client_id),
-        ConnectionState::Authenticated { .. } | ConnectionState::Connected => None,
+    let (user_id, vsr_client_id) = match conn.state {
+        ConnectionState::Bound {
+            user_id, client_id, ..
+        } => (Some(user_id), Some(client_id)),
+        ConnectionState::Connected => (None, None),
     };
     ConnectedClientInfo {
         client_id: connection_id,
@@ -557,69 +472,71 @@ fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
     }
 }
 
-const fn state_name(state: &ConnectionState) -> &'static str {
-    match state {
-        ConnectionState::Connected => "Connected",
-        ConnectionState::Authenticated { .. } => "Authenticated",
-        ConnectionState::Bound { .. } => "Bound",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reply_frame::build_empty_reply;
     use consensus::ClientTable;
-    use consensus::client_table::SessionEnd;
-    use iggy_binary_protocol::{Operation, RoutedRequestHeader};
+    use iggy_binary_protocol::{Command, Operation, RoutedRequestHeader};
     use std::net::{IpAddr, Ipv4Addr};
+
+    const CLIENT: u128 = 7;
+    const USER: u32 = 1;
+    const EPOCH: u64 = 11;
+    const TIMEOUT: Duration = Duration::from_secs(30);
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }
 
-    #[test]
-    fn data_disconnect_releases_only_its_own_session_and_parent_logout_fences_attachments() {
-        const USER: u32 = 7;
-        const PARENT: u128 = 11;
-        const DATA: u128 = 22;
-        const OTHER_DATA: u128 = 33;
-        let mut sessions = SessionManager::new();
-        let mut table = ClientTable::new(3);
+    fn registry(client: u128, user: u32, epoch: u64) -> ClientTable {
+        let mut table = ClientTable::new(2);
         let header = RoutedRequestHeader {
+            command: Command::Request,
             operation: Operation::Register,
+            client,
+            size: u32::try_from(size_of::<RoutedRequestHeader>()).unwrap(),
             ..Default::default()
         };
-        for (client, epoch) in [(PARENT, 1), (DATA, 2), (OTHER_DATA, 3)] {
-            table.commit_register(
+        table
+            .commit_register(
                 client,
-                USER,
+                user,
+                [0x5a; 32],
                 build_empty_reply(&header, client, epoch, epoch),
-            );
-            sessions.ensure_connection(client, addr(5000), ClientTransportKind::Tcp);
-            sessions.login(client, USER).unwrap();
-            sessions.bind_session(client, client, epoch).unwrap();
-        }
-        for data in [DATA, OTHER_DATA] {
-            let attachment = table.attach_session(PARENT, 1, USER).unwrap();
-            sessions
-                .attach_consumer_session(data, PARENT, attachment, 3)
-                .unwrap();
-            assert_eq!(sessions.consumer_session(data).unwrap().0, PARENT);
-        }
+            )
+            .unwrap();
+        table
+    }
 
-        let disconnected = sessions.remove_connection(DATA);
-        assert_eq!(disconnected, Some((DATA, 2)));
-        table.remove_client(DATA, USER, SessionEnd::DisconnectCleanup);
-        assert_eq!(sessions.get_session(PARENT), Some((PARENT, 1)));
-        assert_eq!(sessions.consumer_session(OTHER_DATA).unwrap().0, PARENT);
+    fn bind(sessions: &mut SessionManager, table: &mut ClientTable, connection: u128) {
+        sessions.ensure_connection(connection, addr(5000), ClientTransportKind::Tcp);
+        let attachment = table.attach_session(CLIENT, EPOCH, USER).unwrap();
+        sessions
+            .bind_authenticated_connection(connection, CLIENT, EPOCH, USER, attachment, EPOCH)
+            .unwrap();
+    }
 
-        table.remove_client(PARENT, USER, SessionEnd::Explicit);
-        assert!(matches!(
-            sessions.consumer_session(OTHER_DATA),
-            Err(IggyError::StaleClient)
-        ));
-        assert_eq!(sessions.get_session(OTHER_DATA), Some((OTHER_DATA, 3)));
+    #[test]
+    fn shared_bindings_survive_disconnect_and_end_together_on_logout() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        for connection in [1, 2, 3] {
+            bind(&mut sessions, &mut table, connection);
+        }
+        assert_eq!(sessions.remove_connection(1), Some((CLIENT, EPOCH)));
+        assert_eq!(table.get_epoch(CLIENT), Some(EPOCH));
+        assert_eq!(sessions.get_session(2), Some((CLIENT, EPOCH)));
+        assert!(table.end_session(CLIENT, USER, EPOCH, EPOCH + 1));
+        for connection in [2, 3] {
+            assert_eq!(sessions.get_session(connection), None);
+            assert_eq!(sessions.get_user_id(connection), None);
+            assert!(matches!(
+                sessions.consumer_session(connection),
+                Err(IggyError::StaleClient)
+            ));
+        }
+        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 0);
     }
 
     #[test]
@@ -669,206 +586,131 @@ mod tests {
     }
 
     #[test]
-    fn full_lifecycle() {
-        let mut mgr = SessionManager::new();
-
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5000), ClientTransportKind::Tcp);
-        assert_eq!(mgr.iter_clients().count(), 1);
-        assert!(mgr.get_session(conn).is_none());
-
-        // Login
-        mgr.login(conn, 42).unwrap();
-        assert!(mgr.get_session(conn).is_none()); // not bound yet
-
-        // Register committed. Bind session
-        let client_id: u128 = 0xDEAD_BEEF;
-        let session: u64 = 100;
-        mgr.bind_session(conn, client_id, session).unwrap();
-
-        assert_eq!(mgr.get_session(conn), Some((client_id, session)));
-
-        // Disconnect returns the bound (client_id, session) and clears state.
-        assert_eq!(mgr.remove_connection(conn), Some((client_id, session)));
-        assert_eq!(mgr.iter_clients().count(), 0);
-        assert!(mgr.get_session(conn).is_none());
-    }
-
-    #[test]
-    fn login_requires_connected_state() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5000), ClientTransportKind::Tcp);
-        mgr.login(conn, 1).unwrap();
-
-        // Double login should fail. Already Authenticated.
-        assert!(mgr.login(conn, 2).is_err());
-    }
-
-    #[test]
-    fn bind_requires_authenticated_state() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5000), ClientTransportKind::Tcp);
-
-        // Bind without login should fail.
-        assert!(mgr.bind_session(conn, 1, 1).is_err());
-    }
-
-    #[test]
-    fn bind_evicts_old_connection_for_same_client() {
-        let mut mgr = SessionManager::new();
-
-        // First connection binds to client_id 99.
-        let conn1 = 1;
-        mgr.ensure_connection(conn1, addr(5000), ClientTransportKind::Tcp);
-        mgr.login(conn1, 1).unwrap();
-        mgr.bind_session(conn1, 99, 10).unwrap();
-        assert_eq!(mgr.get_session(conn1), Some((99, 10)));
-
-        // Second connection binds to same client_id. Evicts conn1.
-        let conn2 = 2;
-        mgr.ensure_connection(conn2, addr(5001), ClientTransportKind::Tcp);
-        mgr.login(conn2, 1).unwrap();
-        mgr.bind_session(conn2, 99, 20).unwrap();
-
-        // conn2 now owns client 99; conn1 reverted to Connected.
-        assert_eq!(mgr.get_session(conn2), Some((99, 20)));
-        assert!(mgr.get_session(conn1).is_none());
-    }
-
-    #[test]
-    fn remove_nonexistent_connection_is_noop() {
-        let mut mgr = SessionManager::new();
-        mgr.remove_connection(999); // should not panic
-    }
-
-    #[test]
-    fn login_nonexistent_connection_errors() {
-        let mut mgr = SessionManager::new();
-        assert!(mgr.login(999, 1).is_err());
-    }
-
-    #[test]
-    fn multiple_independent_sessions() {
-        let mut mgr = SessionManager::new();
-
-        let c1 = 1;
-        let c2 = 2;
-        mgr.ensure_connection(c1, addr(5000), ClientTransportKind::Tcp);
-        mgr.ensure_connection(c2, addr(5001), ClientTransportKind::Tcp);
-        mgr.login(c1, 1).unwrap();
-        mgr.login(c2, 2).unwrap();
-        mgr.bind_session(c1, 100, 10).unwrap();
-        mgr.bind_session(c2, 200, 20).unwrap();
-
-        assert_eq!(mgr.get_session(c1), Some((100, 10)));
-        assert_eq!(mgr.get_session(c2), Some((200, 20)));
-        assert_eq!(mgr.iter_clients().count(), 2);
-
-        assert_eq!(mgr.remove_connection(c1), Some((100, 10)));
-        assert!(mgr.get_session(c1).is_none());
-        assert_eq!(mgr.get_session(c2), Some((200, 20)));
-    }
-    // Every disconnect releases its consensus session, group member or not.
-    // Holding the slot open for a resume window instead leaked it: nothing
-    // sweeps it afterwards. The heartbeat verifier runs only when
-    // `heartbeat.enabled` is set, and even then evicts only connections that
-    // still hold a consumer-group membership, so the slot survived for the
-    // process lifetime and pushed the client table toward capacity eviction,
-    // which silently erases dedup watermarks.
-    #[test]
-    fn disconnect_releases_the_bound_session_for_logout() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5100), ClientTransportKind::Tcp);
-        mgr.login(conn, 3).unwrap();
-        mgr.bind_session(conn, 100, 7).unwrap();
-
+    fn activity_reports_include_only_recent_valid_bindings() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        sessions.ensure_connection(9, addr(5000), ClientTransportKind::Tcp);
+        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 0);
+        for connection in [1, 2] {
+            bind(&mut sessions, &mut table, connection);
+        }
+        sessions.connections.get_mut(&1).unwrap().last_heartbeat =
+            Instant::now().checked_sub(TIMEOUT).unwrap();
         assert_eq!(
-            mgr.remove_connection(conn),
-            Some((100, 7)),
-            "the disconnect must hand back (client_id, epoch) so the caller can log it out"
+            sessions.iter_consumer_sessions(TIMEOUT).collect::<Vec<_>>(),
+            [ConsumerSession {
+                client_id: CLIENT,
+                session: EPOCH
+            }]
         );
-        assert!(mgr.get_session(conn).is_none());
-        assert_eq!(
-            mgr.remove_connection(conn),
-            None,
-            "a second disconnect has nothing left to release"
-        );
+        sessions.touch_connection(1).unwrap();
+        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 2);
+        sessions.remove_connection(2);
+        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 1);
+        table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
+        assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 0);
     }
 
-    /// The bind seed is what makes a re-homed connection safe: the register's
-    /// commit op floors every metadata op the client committed elsewhere, so
-    /// the read gate cannot admit the pre-write state on a node that has not
-    /// caught up. A recorder that could lower the mark would undo it.
     #[test]
-    fn given_a_bound_connection_when_replies_arrive_should_keep_the_watermark_monotone() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5200), ClientTransportKind::Tcp);
-        assert_eq!(
-            mgr.metadata_watermark(conn),
-            0,
-            "an unbound connection was promised nothing"
-        );
-
-        mgr.login(conn, 3).unwrap();
-        mgr.bind_session(conn, 100, 42).unwrap();
-        assert_eq!(
-            mgr.metadata_watermark(conn),
-            42,
-            "the bound session is the register's commit op and floors the mark"
-        );
-
-        mgr.record_metadata_watermark(conn, 50);
-        mgr.record_metadata_watermark(conn, 7);
-        assert_eq!(
-            mgr.metadata_watermark(conn),
-            50,
-            "a lower commit must not lower the mark"
-        );
+    fn repeated_binding_is_idempotent_and_cannot_replace_a_live_binding() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        bind(&mut sessions, &mut table, 1);
+        let attachment = table.attach_session(CLIENT, EPOCH, USER).unwrap();
+        sessions
+            .bind_authenticated_connection(1, CLIENT, EPOCH, USER, attachment.clone(), EPOCH + 5)
+            .unwrap();
+        assert!(matches!(
+            sessions.bind_authenticated_connection(1, CLIENT + 1, EPOCH, USER, attachment, EPOCH),
+            Err(IggyError::AlreadyAuthenticated)
+        ));
+        assert_eq!(sessions.get_session(1), Some((CLIENT, EPOCH)));
+        assert_eq!(sessions.metadata_watermark(1), EPOCH + 5);
     }
 
-    /// A socket that logs in again is serving a new caller, so it must not
-    /// inherit the floor of the one before it: the mark is what the PREVIOUS
-    /// login was told committed, and waiting for it would only ever delay the
-    /// new one.
     #[test]
-    fn given_a_rebound_connection_when_it_logs_in_again_should_start_from_no_floor() {
-        let mut mgr = SessionManager::new();
-        let conn = 1;
-        mgr.ensure_connection(conn, addr(5201), ClientTransportKind::Tcp);
-        mgr.login(conn, 3).unwrap();
-        mgr.bind_session(conn, 100, 42).unwrap();
-        mgr.record_metadata_watermark(conn, 50);
-
-        // `bind_session` for the same client id on ANOTHER connection demotes
-        // this one to `Connected`, which is the state a re-login accepts.
-        mgr.ensure_connection(2, addr(5202), ClientTransportKind::Tcp);
-        mgr.login(2, 3).unwrap();
-        mgr.bind_session(2, 100, 43).unwrap();
-        assert_eq!(
-            mgr.metadata_watermark(conn),
-            50,
-            "the demotion alone leaves the mark; the re-login is what clears it"
-        );
-
-        mgr.login(conn, 7).unwrap();
-        assert_eq!(
-            mgr.metadata_watermark(conn),
-            0,
-            "a different user on this socket was promised nothing"
-        );
+    fn missing_connection_or_ended_attachment_cannot_bind() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        let attachment = table.attach_session(CLIENT, EPOCH, USER).unwrap();
+        assert!(matches!(
+            sessions.bind_authenticated_connection(
+                1,
+                CLIENT,
+                EPOCH,
+                USER,
+                attachment.clone(),
+                EPOCH
+            ),
+            Err(IggyError::Unauthenticated)
+        ));
+        sessions.ensure_connection(1, addr(5000), ClientTransportKind::Tcp);
+        table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
+        assert!(matches!(
+            sessions.bind_authenticated_connection(1, CLIENT, EPOCH, USER, attachment, EPOCH),
+            Err(IggyError::Unauthenticated)
+        ));
+        assert_eq!(sessions.get_session(1), None);
     }
 
-    /// An unknown connection is not an error: the disconnect callback can win
-    /// the race against a reply relay, and a gate reading `0` then serves the
-    /// read instead of parking a socket that is already gone.
     #[test]
-    fn given_an_unknown_connection_when_recording_a_watermark_should_be_inert() {
-        let mut mgr = SessionManager::new();
-        mgr.record_metadata_watermark(9, 5);
-        assert_eq!(mgr.metadata_watermark(9), 0);
+    fn disconnect_is_idempotent_and_does_not_remove_other_bindings() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        bind(&mut sessions, &mut table, 1);
+        bind(&mut sessions, &mut table, 2);
+        assert_eq!(sessions.remove_connection(1), Some((CLIENT, EPOCH)));
+        assert_eq!(sessions.remove_connection(1), None);
+        assert_eq!(sessions.get_session(2), Some((CLIENT, EPOCH)));
+        assert_eq!(sessions.client_count(), 1);
+    }
+
+    #[test]
+    fn replies_and_rebinding_preserve_the_metadata_floor() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        bind(&mut sessions, &mut table, 1);
+        assert_eq!(sessions.metadata_watermark(1), EPOCH);
+        sessions.record_metadata_watermark(1, 50);
+        sessions.record_metadata_watermark(1, 7);
+        bind(&mut sessions, &mut table, 1);
+        assert_eq!(sessions.metadata_watermark(1), 50);
+    }
+
+    #[test]
+    fn ending_a_session_clears_the_connection_floor_before_another_user_binds() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        bind(&mut sessions, &mut table, 1);
+        sessions.record_metadata_watermark(1, 50);
+        table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
+        let context = sessions.touch_connection(1).unwrap();
+        assert_eq!(context.bound, None);
+        assert_eq!(context.user_id, None);
+        assert_eq!(context.metadata_watermark, 0);
+
+        let mut replacement = registry(CLIENT + 1, USER + 1, EPOCH + 2);
+        let attachment = replacement
+            .attach_session(CLIENT + 1, EPOCH + 2, USER + 1)
+            .unwrap();
+        sessions
+            .bind_authenticated_connection(
+                1,
+                CLIENT + 1,
+                EPOCH + 2,
+                USER + 1,
+                attachment,
+                EPOCH + 2,
+            )
+            .unwrap();
+        assert_eq!(sessions.metadata_watermark(1), EPOCH + 2);
+    }
+
+    #[test]
+    fn a_reply_after_disconnect_does_not_recreate_connection_state() {
+        let mut sessions = SessionManager::new();
+        sessions.record_metadata_watermark(9, 5);
+        assert_eq!(sessions.metadata_watermark(9), 0);
+        assert_eq!(sessions.client_count(), 0);
     }
 }

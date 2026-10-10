@@ -29,6 +29,7 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
 
@@ -97,7 +98,8 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        TOPIC_NAME.getName());
+                        TOPIC_NAME.getName(),
+                        PERSISTED_TOPIC_OPTIONS);
     }
 
     protected void login() {

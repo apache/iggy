@@ -304,6 +304,10 @@ mod ffi {
         threads_count: u32,
         free_disk_space: u64,
         total_disk_space: u64,
+        // `0` when the server cannot count its open file descriptors.
+        open_files_count: u64,
+        // `0` when the server cannot read its soft `RLIMIT_NOFILE`.
+        open_files_limit: u64,
     }
 
     struct TransportEndpoints {
@@ -382,6 +386,7 @@ mod ffi {
         created_at: u64,
         status: UserStatus,
         username: String,
+        options: Vec<HeaderEntry>,
     }
 
     struct UserInfoDetails {
@@ -391,6 +396,7 @@ mod ffi {
         username: String,
         has_permissions: bool,
         permissions: Permissions,
+        options: Vec<HeaderEntry>,
     }
 
     struct LoginInfo {
@@ -484,7 +490,6 @@ mod ffi {
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
@@ -505,7 +510,6 @@ mod ffi {
             options: TopicUpdateOptions,
         ) -> Result<()>;
         fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
-        fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn create_partitions(
             self: &Client,
             stream_id: Identifier,
@@ -604,13 +608,6 @@ mod ffi {
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
         ) -> Result<SendMessagesResponse>;
-        fn flush_unsaved_buffer(
-            self: &Client,
-            stream_id: Identifier,
-            topic_id: Identifier,
-            partition_id: u32,
-            fsync: bool,
-        ) -> Result<()>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
         fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
@@ -656,6 +653,7 @@ mod ffi {
             username: String,
             has_status: bool,
             status: UserStatus,
+            options: Vec<HeaderEntry>,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,

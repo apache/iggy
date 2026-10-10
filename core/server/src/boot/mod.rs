@@ -24,6 +24,7 @@
 //! the leaves hold the support it calls into.
 
 mod credentials;
+mod fd_limit;
 mod handoff;
 mod listeners;
 mod recovery;
@@ -32,13 +33,16 @@ pub mod systemd;
 mod threads;
 mod topology;
 
+pub use crate::dispatch::host::ServerHost;
 pub use credentials::apply_default_root_credentials;
+pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
 use crate::boot::credentials::{
     ensure_default_root_user, load_replica_auth, load_replica_tls_ctx,
     validate_root_credentials_env,
 };
+use crate::boot::fd_limit::client_connection_cap;
 use crate::boot::handoff::{
     BootstrapBarrier, MetadataHandoff, await_bootstrap_complete, await_metadata_bundle,
     broadcast_metadata_bundle, signal_bootstrap_complete,
@@ -57,29 +61,17 @@ use crate::boot::threads::{
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
-use crate::dispatch::submit::make_metadata_submit_handler;
-use crate::dispatch::{
-    make_deferred_client_request_handler, make_deferred_replica_message_handler,
-    make_list_clients_handler,
-};
 use crate::server_error::ServerError;
-use crate::session_manager::SessionManager;
-use crate::shell::{
-    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellBus, ShellHandlers,
-    ShellShardHandle,
-};
+use crate::shell::{ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::{Operation, PrepareHeader};
-use journal::superblock::SuperblockStore;
-use journal::{Journal, JournalHandle};
+use iggy_binary_protocol::Operation;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
-use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
@@ -88,7 +80,7 @@ use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
-use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -96,39 +88,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{error, info, warn};
 
-/// Build the deferred dispatch handlers for `shard_handle` against `bus`.
-///
-/// They share one fresh [`SessionManager`]. The caller must set the weak
-/// self-reference in `shard_handle` once the shard is built, so the
-/// handlers can upgrade it per frame.
-pub fn wire_shell_handlers<B, MJ, S, SB>(
-    bus: &B,
-    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
-    server_config: Arc<ServerConfig>,
-    max_tokens_per_user: u32,
-) -> ShellHandlers
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
-    ShellHandlers {
-        on_replica_message: make_deferred_replica_message_handler(shard_handle),
-        on_client_request: make_deferred_client_request_handler(
-            bus,
-            shard_handle,
-            &sessions,
-            server_config,
-            max_tokens_per_user,
-        ),
-        on_metadata_submit: make_metadata_submit_handler(shard_handle),
-        on_list_clients: make_list_clients_handler(&sessions),
-        sessions,
-    }
-}
+const STORAGE_FORMAT_FILE: &str = "storage-format";
+const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
+const STORAGE_FORMAT: &[u8] = b"IGGY-NO-PURGE-1\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -156,8 +118,17 @@ pub async fn prepare_runtime_dirs(
     logging: &mut Logging,
     fresh: bool,
 ) -> Result<(), ServerError> {
+    let system_path = PathBuf::from(config.get_system_path());
+    let format_present = if fresh {
+        false
+    } else {
+        validate_storage_format(&system_path)?
+    };
     if fresh {
         wipe_system_path(config).await?;
+    }
+    if !format_present {
+        publish_storage_format(&system_path)?;
     }
     create_directories(config).await.map_err(|source| {
         error!(
@@ -178,6 +149,79 @@ pub async fn prepare_runtime_dirs(
     Ok(())
 }
 
+fn validate_storage_format(system_path: &Path) -> Result<bool, ServerError> {
+    let path = system_path.join(STORAGE_FORMAT_FILE);
+    match std::fs::File::open(&path) {
+        Ok(mut file) => {
+            let result = (|| -> std::io::Result<bool> {
+                if file.metadata()?.len() != STORAGE_FORMAT.len() as u64 {
+                    return Ok(false);
+                }
+                let mut bytes = vec![0; STORAGE_FORMAT.len()];
+                file.read_exact(&mut bytes)?;
+                Ok(bytes == STORAGE_FORMAT)
+            })()
+            .map_err(|source| ServerError::StorageFormatIo {
+                path: path.clone(),
+                source,
+            })?;
+            if !result {
+                return Err(ServerError::UnsupportedStorage { path });
+            }
+            Ok(true)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read_dir(system_path) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(|source| ServerError::StorageFormatIo {
+                            path: system_path.to_owned(),
+                            source,
+                        })?;
+                        if entry.file_name() == STORAGE_FORMAT_TEMP_FILE
+                            && entry
+                                .file_type()
+                                .map_err(|source| ServerError::StorageFormatIo {
+                                    path: entry.path(),
+                                    source,
+                                })?
+                                .is_file()
+                        {
+                            continue;
+                        }
+                        return Err(ServerError::UnsupportedStorage {
+                            path: system_path.to_owned(),
+                        });
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ServerError::StorageFormatIo {
+                        path: system_path.to_owned(),
+                        source,
+                    });
+                }
+            }
+            Ok(false)
+        }
+        Err(source) => Err(ServerError::StorageFormatIo { path, source }),
+    }
+}
+
+fn publish_storage_format(system_path: &Path) -> Result<(), ServerError> {
+    let path = system_path.join(STORAGE_FORMAT_FILE);
+    (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(system_path)?;
+        let temporary = system_path.join(STORAGE_FORMAT_TEMP_FILE);
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(STORAGE_FORMAT)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, &path)?;
+        std::fs::File::open(system_path)?.sync_all()
+    })()
+    .map_err(|source| ServerError::StorageFormatIo { path, source })
+}
+
 /// Delete the configured system path so the server boots on empty state.
 async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
     let path = config.get_system_path();
@@ -188,9 +232,9 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
     if config.cluster.enabled {
         warn!(
             path = %resolved.display(),
-            "--fresh wipes only this replica, which then refills from the cluster by \
-             state transfer; wiping a quorum at once destroys committed data, and a \
-             service unit file carrying --fresh re-transfers everything on every restart"
+            "--fresh wipes only this replica; recovery after erasing its entire metadata \
+             directory is outside the automatic recovery guarantee. Wiping a quorum \
+             destroys committed data. Do not keep --fresh in a restart service command"
         );
     }
 
@@ -229,7 +273,7 @@ async fn wipe_system_path(config: &ServerConfig) -> Result<(), ServerError> {
 /// # Errors
 ///
 /// Returns an error if shard allocation fails, the inbox capacity is
-/// invalid, or any OS thread fails to spawn. Per-shard recovery /
+/// invalid, the executable cannot be read, or any OS thread fails to spawn. Per-shard recovery /
 /// listener / consensus failures surface through the per-thread `Result`
 /// the caller observes on `.join()`.
 ///
@@ -257,6 +301,10 @@ pub fn bootstrap(
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
+    // Before the shards, so the first count is there when a client connects.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval.get_duration();
+    crate::sysinfo_probe::start_system_stats_sampler(sysinfo_print_interval)
+        .map_err(|source| ServerError::SystemStatsSamplerSpawnFailed { source })?;
     let (assignments, total_shards) = resolve_shard_assignments(&config.sharding)?;
     let shards_count = assignments.len();
 
@@ -481,6 +529,10 @@ async fn shard_main(
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: message_bus::replica::handshake::binary_identity(
+            crate::VERSION,
+            STORAGE_FORMAT,
+        ),
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,
@@ -529,10 +581,17 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
-                |mux_stm, client, stamp| {
-                    mux_stm
-                        .streams()
-                        .remove_consumer_group_member(client, stamp);
+                |mux_stm, header| {
+                    if header.operation == iggy_binary_protocol::Operation::Register {
+                        mux_stm
+                            .streams()
+                            .refresh_consumer_group_session(header.client, header.op);
+                    } else {
+                        mux_stm.streams().remove_consumer_group_member(
+                            header.client,
+                            iggy_common::IggyTimestamp::from(header.timestamp),
+                        );
+                    }
                 },
             )
             .await
@@ -639,6 +698,7 @@ async fn shard_main(
     // table from scratch, so running it afterwards would drop every resumed
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
+    metadata.set_partitions_max(config.metadata.partitions_max);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
     // clients that kept their identity across the restart (IGGY-137). Recovery
@@ -668,7 +728,7 @@ async fn shard_main(
     let ShardBuild {
         shard,
         sessions,
-        on_client_request,
+        consumer_group_liveness,
         shard_handle,
     } = Box::pin(build_shard_for_thread(
         shard_id,
@@ -862,12 +922,14 @@ async fn shard_main(
     } else {
         None
     };
-    let stop_signals = StopSignals {
+    let mut stop_signals = StopSignals {
         pump: stop_tx,
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
         segment_cleaner: segment_cleaner_stop,
+        sysinfo_printer: None,
+        consumer_group_liveness: None,
     };
 
     // One keep-alive per process, so shard 0 owns it. Started before the
@@ -917,21 +979,6 @@ async fn shard_main(
         let coord = shard
             .coordinator()
             .expect("shard 0 always has a coordinator attached by the builder");
-        // Reseed the client-id minter above every recovered entry before any
-        // listener accepts. The counter is per process; the table it must not
-        // collide with was rebuilt from the previous boot's WAL. Keyed by view
-        // so a later promotion refolds the table (the minting path calls the
-        // same method, see `HttpInner::register_session_once`).
-        let boot_view = shard
-            .plane
-            .metadata()
-            .consensus
-            .as_ref()
-            .map_or(0, consensus::VsrConsensus::view);
-        coord.seed_client_sequence(
-            boot_view,
-            shard.plane.metadata().client_table.borrow().client_ids(),
-        );
         // The request handler strands every frame until the weak
         // self-reference is backfilled, so the build must have done that
         // before the first listener binds.
@@ -944,17 +991,25 @@ async fn shard_main(
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
-        let accepted_client = make_shard_zero_client_accept_fns(coord, &bus, on_client_request);
+        let connections = Rc::new(client_connection_cap(config.message_bus.connections_max));
+        let accepted_client = make_shard_zero_client_accept_fns(
+            coord,
+            &bus,
+            shard.client_request_handler(),
+            &connections,
+        );
         let roster = sessions.borrow().cluster_roster();
 
         if let Err(error) = start_tcp_runtime(
             &shard,
+            Rc::clone(&consumer_group_liveness),
             config,
             &topology,
             roster,
             accepted_replica,
             dialed_replica,
             accepted_client,
+            &connections,
             &shard_metrics_all,
         )
         .await
@@ -976,6 +1031,43 @@ async fn shard_main(
         // this is the first point at which a unit ordered after us may dial.
         #[cfg(feature = "systemd")]
         systemd::notify_ready();
+    }
+
+    if shard_id == 0 {
+        let (stop_tx, stop_rx) = channel(1);
+        let cleaner_shard = Rc::clone(&shard);
+        let interval = config.consumer_group.heartbeat_interval.get_duration();
+        let timeout = config.consumer_group.session_timeout.get_duration();
+        let system_path = config.get_system_path();
+        let handle = compio::runtime::spawn(async move {
+            crate::consumer_group::liveness::run(
+                cleaner_shard,
+                consumer_group_liveness,
+                stop_rx,
+                interval,
+                timeout,
+                system_path,
+            )
+            .await;
+        });
+        bus.track_background(handle);
+        stop_signals.consumer_group_liveness = Some(stop_tx);
+    }
+
+    // Shard 0 only, since the line describes the whole process. After the
+    // bootstrap barrier: before it, a peer that still recovers times out the
+    // client gather, and each tick would warn and print zero clients. A zero
+    // interval disables it.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval;
+    if shard_id == 0 && !sysinfo_print_interval.is_zero() {
+        let (stop_tx, stop_rx) = channel(1);
+        let printer_shard = Rc::clone(&shard);
+        let interval = sysinfo_print_interval.get_duration();
+        let handle = compio::runtime::spawn(async move {
+            crate::sysinfo_printer::run_sysinfo_printer(printer_shard, stop_rx, interval).await;
+        });
+        bus.track_background(handle);
+        stop_signals.sysinfo_printer = Some(stop_tx);
     }
 
     bus.token().wait().await;
@@ -1047,14 +1139,13 @@ fn make_metadata_commit_notifier(
 /// assignment-bearing variant. Kept as defense-in-depth against a future
 /// commit path that emits a bare op.
 ///
-/// "Partition-shape" is not only the partition SET: the purge and truncate
-/// ops leave the set intact but advance per-partition state (purge
-/// generation, delete watermark) that only the reconciler enforces on disk.
-/// Omitting them defers the on-disk effect to the periodic safety tick,
-/// stretching a purge's client-visible tail to a full
-/// `reconcile_periodic_interval`. `DeleteSegments` is absent by design: the
-/// leader rewrites it into `TruncatePartition` before journaling, so no
-/// commit ever carries it.
+/// "Partition-shape" is not only the partition SET: `TruncatePartition`
+/// leaves the set intact but advances the per-partition delete watermark,
+/// which only the reconciler enforces on disk. Omitting it defers the on-disk
+/// effect to the periodic safety tick, stretching a segment delete's
+/// client-visible tail to a full `reconcile_periodic_interval`.
+/// `DeleteSegments` is absent by design: the leader rewrites it into
+/// `TruncatePartition` before journaling, so no commit ever carries it.
 const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
     matches!(
         op,
@@ -1065,8 +1156,6 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
             | Operation::DeleteTopic
             | Operation::DeleteStream
             | Operation::DeletePartitions
-            | Operation::PurgeStream
-            | Operation::PurgeTopic
             | Operation::TruncatePartition
     )
 }
@@ -1075,23 +1164,84 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 mod tests {
     use super::*;
 
+    #[compio::test]
+    async fn given_missing_or_empty_storage_when_booting_should_initialize_without_wiping_on_restart()
+     {
+        let mut logging = Logging::new(crate::VERSION);
+        logging.early_init();
+        for (exists, interrupted) in [(false, false), (true, false), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let data_path = directory.path().join("data");
+            if exists {
+                std::fs::create_dir(&data_path).unwrap();
+            }
+            if interrupted {
+                std::fs::write(data_path.join(STORAGE_FORMAT_TEMP_FILE), b"IGGY-").unwrap();
+            }
+            let mut config = ServerConfig {
+                path: data_path.to_string_lossy().into_owned(),
+                ..ServerConfig::default()
+            };
+            config.logging.file_enabled = false;
+            config.telemetry.enabled = false;
+            prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(data_path.join(STORAGE_FORMAT_FILE)).unwrap(),
+                STORAGE_FORMAT
+            );
+            let sentinel = data_path.join("existing-data");
+            let bytes = b"preserve existing data";
+            std::fs::write(&sentinel, bytes).unwrap();
+            prepare_runtime_dirs(&config, &mut logging, false)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(sentinel).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn incompatible_storage_is_refused_without_changing_existing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let wal = directory.path().join("journal");
+        let marker = directory.path().join(STORAGE_FORMAT_FILE);
+        let bytes = b"existing durable data";
+        std::fs::write(&wal, bytes).unwrap();
+        assert!(matches!(
+            validate_storage_format(directory.path()),
+            Err(ServerError::UnsupportedStorage { .. })
+        ));
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        assert!(!marker.exists());
+        for format in [
+            b"old format\n".as_slice(),
+            b"IGGY-DURABLE-SESSIONS-3\n",
+            &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
+        ] {
+            std::fs::write(&marker, format).unwrap();
+            assert!(matches!(
+                validate_storage_format(directory.path()),
+                Err(ServerError::UnsupportedStorage { .. })
+            ));
+            assert_eq!(std::fs::read(&marker).unwrap(), format);
+            assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        }
+        std::fs::write(&marker, STORAGE_FORMAT).unwrap();
+        assert!(validate_storage_format(directory.path()).unwrap());
+    }
+
     #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {
-        // These commit without touching the partition set, so nothing else
-        // signals the reconciler: `reconcile_partition_purges` and
-        // `reconcile_segment_truncations` are the only code that turns them
-        // into on-disk effect, and they run only when a pass runs. Dropping
-        // one from the filter silently downgrades it to the periodic tick.
-        for op in [
-            Operation::PurgeStream,
-            Operation::PurgeTopic,
-            Operation::TruncatePartition,
-        ] {
-            assert!(
-                operation_triggers_partition_reconcile(op),
-                "{op:?} is enforced by the reconciler and must wake it on commit"
-            );
-        }
+        // `TruncatePartition` commits without touching the partition set, so
+        // nothing else signals the reconciler: `reconcile_segment_truncations`
+        // is the only code that turns it into on-disk effect, and it runs only
+        // when a pass runs. Dropping it from the filter silently downgrades it
+        // to the periodic tick.
+        assert!(
+            operation_triggers_partition_reconcile(Operation::TruncatePartition),
+            "TruncatePartition is enforced by the reconciler and must wake it on commit"
+        );
         assert!(
             !operation_triggers_partition_reconcile(Operation::CreateUser),
             "ops with no partition-shape effect must stay off the broadcast"
