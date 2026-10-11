@@ -20,6 +20,7 @@ use compio::{
     io::AsyncWriteAtExt,
 };
 use iggy_common::{IggyByteSize, IggyError};
+use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::preallocate_file;
 use server_common::iobuf::{Frozen, IOV_MAX};
@@ -196,6 +197,7 @@ async fn write_frozen_chunked<const ALIGN: usize>(
             );
             IggyError::CannotWriteToFile
         })?;
+        DISK_USAGE.charge(chunk_size as u64);
 
         position += chunk_size as u64;
     }

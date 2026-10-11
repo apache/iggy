@@ -18,6 +18,7 @@
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncWriteAtExt;
 use iggy_common::IggyError;
+use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,6 +136,7 @@ impl IggyIndexWriter {
             .await
             .0
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
+        DISK_USAGE.charge(len as u64);
 
         trace!(
             target: "iggy.partitions.storage",

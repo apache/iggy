@@ -20,8 +20,9 @@
 //! lookups. Several older test files still hold local copies of these helpers;
 //! consolidating them onto this module is a follow-up.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -112,6 +113,31 @@ pub fn walk(root: &Path, matches: &mut dyn FnMut(&Path) -> bool) -> Option<PathB
         }
     }
     None
+}
+
+/// Bytes the filesystem has allocated for `root` and everything under it, the
+/// way `du` counts them: from `st_blocks`, each inode once. File lengths would
+/// count a WAL hard link to a segment body twice and miss the preallocated
+/// tail of a segment.
+pub fn allocated_bytes(root: &Path) -> u64 {
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        // Not following links: a link counts as itself, as in `du`.
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if seen.insert((metadata.dev(), metadata.ino())) {
+            total += metadata.blocks() * 512;
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = fs::read_dir(&path)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    total
 }
 
 /// `Ok(())` when every payload in `expected` appears in node-local segment
@@ -527,4 +553,39 @@ pub async fn leader_node_index_via(harness: &TestHarness, via: usize) -> usize {
                 .is_some_and(|address| address.port() == leader_port)
         })
         .expect("the leader must be one of the roster nodes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BYTES: usize = 64 * 1024;
+
+    #[test]
+    fn given_a_hard_link_when_summing_allocated_bytes_should_count_the_inode_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = allocated_bytes(directory.path());
+        let file = directory.path().join("segment.log");
+        fs::write(&file, vec![1u8; BYTES]).unwrap();
+        let with_file = allocated_bytes(directory.path());
+
+        fs::hard_link(&file, directory.path().join("wal.link")).unwrap();
+
+        assert!(with_file - empty >= BYTES as u64);
+        assert_eq!(allocated_bytes(directory.path()), with_file);
+    }
+
+    #[test]
+    fn given_a_sparse_file_when_summing_allocated_bytes_should_skip_the_hole() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = allocated_bytes(directory.path());
+        let file = fs::File::create(directory.path().join("sparse.log")).unwrap();
+
+        file.set_len(16 * BYTES as u64).unwrap();
+
+        assert!(
+            allocated_bytes(directory.path()) - empty < BYTES as u64,
+            "a file's length must not count as allocated space"
+        );
+    }
 }
