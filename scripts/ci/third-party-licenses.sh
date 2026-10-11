@@ -34,10 +34,11 @@
 #   * Path to a Cargo.toml                          -> Rust ecosystem
 #   * Path to a directory containing package.json   -> Node ecosystem
 #
-# Multiple --manifest flags are supported. Multiple Rust manifests are
-# rendered as a deduplicated union via a synthetic root crate. Multiple
-# Node manifests are concatenated. Mixed ecosystems concatenate the
-# Rust block first, Node block second.
+# Multiple --manifest flags are supported. Each Rust manifest is scanned by
+# its own cargo-about run against the real workspace, so the lockfile pins
+# every version and bin-only crates are covered. --generate merges the runs
+# into one deduplicated manifest. Multiple Node manifests are concatenated.
+# Mixed ecosystems concatenate the Rust block first, Node block second.
 
 set -euo pipefail
 
@@ -117,13 +118,13 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not installed: $1"
 }
 
-SYNTH_DIR=""
+JSON_DIR=""
 TMP_OUT=""
 NODE_FMT_FILE=""
 NODE_JSON_FILE=""
 
 cleanup() {
-  [[ -n "$SYNTH_DIR" && -d "$SYNTH_DIR" ]] && rm -rf "$SYNTH_DIR"
+  [[ -n "$JSON_DIR" && -d "$JSON_DIR" ]] && rm -rf "$JSON_DIR"
   [[ -n "$TMP_OUT" && -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
   [[ -n "$NODE_FMT_FILE" && -f "$NODE_FMT_FILE" ]] && rm -f "$NODE_FMT_FILE"
   [[ -n "$NODE_JSON_FILE" && -f "$NODE_JSON_FILE" ]] && rm -f "$NODE_JSON_FILE"
@@ -131,52 +132,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Resolve the Cargo.toml that cargo-about should target. For a single
-# Rust manifest, return it as-is. For multiple Rust manifests, build a
-# synthetic root crate under /tmp that path-deps onto each requested
-# member; cargo-about then renders the deduplicated union in a single
-# pass. The empty [workspace] table prevents the synthetic root from
-# attaching to any ancestor workspace.
-build_rust_target_manifest() {
-  local count=${#RUST_MANIFESTS[@]}
-  if (( count == 1 )); then
-    echo "${RUST_MANIFESTS[0]}"
-    return
-  fi
-
-  SYNTH_DIR="$(mktemp -d -t iggy-license-root-XXXXXX)"
-
-  {
-    printf '[workspace]\n\n'
-    printf '[package]\n'
-    printf 'name = "iggy-license-union"\n'
-    printf 'version = "0.0.0"\n'
-    printf 'edition = "2021"\n'
-    printf 'license = "Apache-2.0"\n'
-    printf 'publish = false\n\n'
-    printf '[dependencies]\n'
-    for m in "${RUST_MANIFESTS[@]}"; do
-      local crate_dir crate_name
-      crate_dir="$(cd "$(dirname "$m")" && pwd)"
-      crate_name="$(awk -F'"' '/^\[package\]/{p=1; next} p && /^name *= *"/{print $2; exit}' "$m")"
-      [[ -z "$crate_name" ]] && die "could not extract package.name from $m"
-      printf '%s = { path = "%s" }\n' "$crate_name" "$crate_dir"
-    done
-  } > "$SYNTH_DIR/Cargo.toml"
-
-  mkdir -p "$SYNTH_DIR/src"
-  : > "$SYNTH_DIR/src/lib.rs"
-
-  echo "$SYNTH_DIR/Cargo.toml"
-}
-
-# Run cargo-about against the prepared manifest, writing the result to
-# the supplied path. Always invoked from REPO_ROOT so that
-# `--config about.toml` and the about.hbs template resolve correctly.
-# `--fail` makes a disallowed license abort with a non-zero exit code.
+# Run cargo-about against one manifest, writing the result to the supplied
+# path. Always invoked from REPO_ROOT so that `--config about.toml` and the
+# about.hbs template resolve correctly. `--fail` makes a disallowed license
+# abort with a non-zero exit code. With format "json" there is no template:
+# the scan data is written as-is so several runs can be merged.
 run_cargo_about() {
   local target_manifest="$1"
   local out="$2"
+  local format="${3:-handlebars}"
+  local template=(about.hbs)
+  [[ "$format" == "json" ]] && template=()
   require_cmd cargo-about
 
   local attempt
@@ -186,8 +152,9 @@ run_cargo_about() {
         --config about.toml \
         --manifest-path "$target_manifest" \
         --fail \
+        --format "$format" \
         -o "$out" \
-        about.hbs ); then
+        ${template[@]+"${template[@]}"} ); then
       return 0
     fi
     if ((attempt < CARGO_ABOUT_ATTEMPTS)); then
@@ -196,6 +163,54 @@ run_cargo_about() {
     fi
   done
   return 1
+}
+
+# Merge the per-section data of several cargo-about JSON scans into one
+# manifest: one section per license id, the crates deduplicated by name and
+# version, and the license text taken from the first scan. Section layout
+# mirrors about.hbs, whose header is reused verbatim by render_rust_union.
+UNION_JQ="$(cat <<'EOF'
+def rule: "=" * 80;
+
+def repository_suffix: if (.repository // "") != "" then " (\(.repository))" else "" end;
+
+def section:
+  "\n" + rule + "\nLICENSE: \(.name) (\(.id)) - used by \(.crates | length) crate(s)\nUSED BY:\n"
+  + ([.crates[] | "  - \(.name) \(.version)\(repository_suffix)\n"] | join(""))
+  + rule + "\n\n" + .text + "\n\n";
+
+[ .[] as $scan
+  | $scan.overview[]
+  | { id, name, text, crates: [ .indices[] as $index | $scan.licenses[$index].used_by[].crate ] } ]
+| group_by(.id)
+| map({ id: .[0].id, name: .[0].name, text: .[0].text,
+        crates: ([.[].crates[]] | unique_by([.name, .version])) })
+| sort_by(-(.crates | length), .id)
+| map(section)
+| join("")
+EOF
+)"
+
+# Scan every Rust manifest on its own, against the real workspace and its
+# Cargo.lock, then append the merged manifest to the given file. A synthetic
+# root crate cannot do this: cargo drops bin-only members such as the
+# connectors runtime from a path-dependency union without failing.
+render_rust_union() {
+  local out="$1"
+  require_cmd jq
+
+  JSON_DIR="$(mktemp -d -t iggy-license-scans-XXXXXX)"
+
+  local scans=() index=0 m
+  for m in "${RUST_MANIFESTS[@]}"; do
+    echo "Scanning Rust manifest: $m"
+    run_cargo_about "$m" "$JSON_DIR/$index.json" json || return 1
+    scans+=("$JSON_DIR/$index.json")
+    index=$((index + 1))
+  done
+
+  sed '/^{{#each overview}}/,$d' "$REPO_ROOT/about.hbs" >> "$out"
+  jq -rjs "$UNION_JQ" "${scans[@]}" >> "$out"
 }
 
 # Run license-checker-rseidelsohn against an npm package directory and
@@ -240,13 +255,12 @@ case "$ACTION" in
     TMP_OUT="$(mktemp)"
     failures=()
 
-    if (( ${#RUST_MANIFESTS[@]} > 0 )); then
-      target="$(build_rust_target_manifest)"
-      echo "Validating Rust manifests: ${RUST_MANIFESTS[*]}"
-      if ! run_cargo_about "$target" "$TMP_OUT"; then
-        failures+=("rust: ${RUST_MANIFESTS[*]}")
+    for m in "${RUST_MANIFESTS[@]}"; do
+      echo "Validating Rust manifest: $m"
+      if ! run_cargo_about "$m" "$TMP_OUT"; then
+        failures+=("rust: $m")
       fi
-    fi
+    done
 
     for d in "${NODE_DIRS[@]}"; do
       echo "Validating Node manifest: $d"
@@ -269,10 +283,12 @@ case "$ACTION" in
   generate)
     : > "$OUTPUT"
 
-    if (( ${#RUST_MANIFESTS[@]} > 0 )); then
-      target="$(build_rust_target_manifest)"
+    if (( ${#RUST_MANIFESTS[@]} == 1 )); then
+      echo "Generating Rust manifest section: ${RUST_MANIFESTS[0]}"
+      run_cargo_about "${RUST_MANIFESTS[0]}" "$OUTPUT"
+    elif (( ${#RUST_MANIFESTS[@]} > 1 )); then
       echo "Generating Rust manifest section: ${RUST_MANIFESTS[*]}"
-      run_cargo_about "$target" "$OUTPUT"
+      render_rust_union "$OUTPUT"
     fi
 
     for d in "${NODE_DIRS[@]}"; do

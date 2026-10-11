@@ -244,6 +244,26 @@ components:
     paths:
       - "core/connectors/**"
 
+  # Smoke-builds the fat connectors image so a broken plugin build or
+  # Dockerfile fails the PR instead of the first live publish. Paths are narrow
+  # on purpose: the build takes 15-20 minutes, so ordinary connector source
+  # edits must not trigger it. No ci-infrastructure dependency for the same
+  # reason (it matches all of .github/**), the CI files that define the build
+  # are listed explicitly instead.
+  rust-connectors-image:
+    paths:
+      - "core/connectors/runtime/Dockerfile"
+      - "core/connectors/**/Cargo.toml"
+      - "scripts/ci/connector-plugins.sh"
+      - "scripts/ci/third-party-licenses.sh"
+      - "about.hbs"
+      - "about.toml"
+      - ".dockerignore"
+      - ".github/actions/utils/docker-buildx/**"
+      - ".github/actions/rust/pre-merge/action.yml"
+    tasks:
+      - "docker-connectors-fat"
+
   # MCP AI component
   rust-mcp:
     depends_on:

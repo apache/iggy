@@ -17,8 +17,8 @@
 
 use chrono::{DateTime, Days, Utc};
 use iggy::prelude::{
-    Client, DirectConfig, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyMessage,
-    Partitioning,
+    Client, DirectConfig, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyExpiry,
+    IggyMessage, MaxTopicSize, Partitioning,
 };
 use rand::{
     RngExt,
@@ -50,8 +50,8 @@ async fn main() -> Result<(), DataProducerError> {
     let address = env::var("IGGY_ADDRESS").unwrap_or("localhost:8090".to_owned());
     let username = env::var("IGGY_USERNAME").unwrap_or("iggy".to_owned());
     let password = env::var("IGGY_PASSWORD").unwrap_or("iggy".to_owned());
-    let stream = env::var("IGGY_STREAM").unwrap_or("qw".to_owned());
-    let topic = env::var("IGGY_TOPIC").unwrap_or("records".to_owned());
+    let stream = env::var("IGGY_STREAM").unwrap_or("example_stream".to_owned());
+    let topic = env::var("IGGY_TOPIC").unwrap_or("users".to_owned());
     let client = create_client(&address, &username, &password).await?;
     let producer = client
         .producer(&stream, &topic)?
@@ -62,6 +62,8 @@ async fn main() -> Result<(), DataProducerError> {
                 .build(),
         )
         .partitioning(Partitioning::balanced())
+        .create_stream_if_not_exists()
+        .create_topic_if_not_exists(1, IggyExpiry::ServerDefault, MaxTopicSize::ServerDefault)
         .build();
     producer.init().await?;
 
@@ -82,7 +84,8 @@ async fn main() -> Result<(), DataProducerError> {
     }
 
     info!("Reached maximum batches count");
-    info!("Produced {total_msg} messages.");
+    info!("Produced {total_msg} messages to {stream}/{topic}.");
+    info!("Check the table: docker compose run --rm delta-tools python show.py");
     Ok(())
 }
 
