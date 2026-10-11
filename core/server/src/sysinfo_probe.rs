@@ -21,6 +21,7 @@
 
 use arc_swap::ArcSwap;
 use nix::sys::resource::{Resource, getrlimit};
+use server_common::DISK_USAGE;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -138,9 +139,15 @@ impl SystemStats {
     fn capture(sys: &mut SysinfoSystem, previous_open_files: u64, scan_open_files: bool) -> Self {
         let host = HOST_IDENTITY.get_or_init(HostIdentity::probe);
         let probe = SystemProbe::capture(sys);
-        let disk = STATS_DATA_PATH
-            .get()
-            .and_then(|path| fs2::statvfs(path).ok());
+        // Each sample also re-bases the disk usage estimate the write sites
+        // charge, and the first one, taken before the shards start, seeds it.
+        let disk = STATS_DATA_PATH.get().and_then(|path| {
+            DISK_USAGE.rebase(|| {
+                let stats = fs2::statvfs(path).ok()?;
+                let used_bytes = stats.total_space().saturating_sub(stats.free_space());
+                Some((stats, used_bytes))
+            })
+        });
         Self {
             process_id: probe.process_id,
             cpu_usage: probe.cpu_usage,

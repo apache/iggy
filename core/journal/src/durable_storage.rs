@@ -21,6 +21,7 @@ use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use futures::{Stream, stream};
+use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::{run_blocking, truncate_file};
 use server_common::iobuf::{Frozen, Owned};
@@ -63,6 +64,10 @@ pub struct StorageEntry {
 /// directory does not sync changes inside its child directories.
 pub trait DurableStorage {
     type File: DurableFile;
+
+    /// Count `bytes` just allocated on disk towards the process-wide disk
+    /// usage estimate. Backends that do not write to the data volume ignore it.
+    fn charge_allocation(&self, _bytes: u64) {}
 
     /// Process-local identity for exclusive writer ownership.
     ///
@@ -218,6 +223,10 @@ pub struct DiskStorage;
 
 impl DurableStorage for DiskStorage {
     type File = File;
+
+    fn charge_allocation(&self, bytes: u64) {
+        DISK_USAGE.charge(bytes);
+    }
 
     fn writer_identity(&self, path: &Path) -> io::Result<Option<std::path::PathBuf>> {
         let absolute = if path.is_absolute() {

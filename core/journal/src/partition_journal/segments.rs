@@ -334,6 +334,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         .await?;
                     file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
                         .await?;
+                    self.storage
+                        .charge_allocation((prepare.len() - size_of::<PrepareHeader>()) as u64);
                     file.sync().await?;
                     Some(reference)
                 }
@@ -423,10 +425,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
                 bodies.next();
             }
+            let body_bytes = buffers.iter().map(Frozen::len).sum::<usize>() as u64;
             self.segment_writing_file(first)
                 .await?
                 .write_frozen_vectored(first.position, buffers)
                 .await?;
+            self.storage.charge_allocation(body_bytes);
         }
         Ok(())
     }
@@ -442,7 +446,10 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 reference.position,
                 prepare.slice(size_of::<PrepareHeader>()..),
             )
-            .await
+            .await?;
+        self.storage
+            .charge_allocation((prepare.len() - size_of::<PrepareHeader>()) as u64);
+        Ok(())
     }
 
     async fn segment_writing_file(

@@ -36,6 +36,7 @@ use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
+use server_common::DISK_USAGE;
 use tracing::error;
 
 /// Exports the process-wide clamped-rollup count as a counter series, read at
@@ -185,6 +186,32 @@ impl EncodeLabelValue for EscapedLabelValue<'_> {
     }
 }
 
+/// Exports the disk usage estimate as a gauge, read at encode time like
+/// [`StatsRollupUnderflows`].
+///
+/// The value is the last `statvfs` sample of the volume holding the data
+/// directory plus what Iggy has written since, so it moves with a burst
+/// instead of once a second. No series is exported until the first sample,
+/// since the count alone says nothing about the volume.
+#[derive(Debug)]
+struct DiskUsedBytes;
+
+impl Collector for DiskUsedBytes {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        if !DISK_USAGE.is_measured() {
+            return Ok(());
+        }
+        let gauge = ConstGauge::new(gauge_value(DISK_USAGE.used_bytes()));
+        let metric_encoder = encoder.encode_descriptor(
+            "disk_used_bytes",
+            "estimated bytes used on the volume holding the data directory",
+            None,
+            gauge.metric_type(),
+        )?;
+        gauge.encode(metric_encoder)
+    }
+}
+
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
@@ -238,6 +265,7 @@ impl HttpMetrics {
         registry.register_collector(Box::new(StatsRollupUnderflows));
         let topic_usage = TopicUsage::default();
         registry.register_collector(Box::new(topic_usage.clone()));
+        registry.register_collector(Box::new(DiskUsedBytes));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -387,6 +415,23 @@ mod tests {
         assert!(
             output.contains("\nstats_rollup_underflows_total "),
             "expected the collector's sample in the exposition:\n{output}"
+        );
+    }
+
+    /// Shares the process-wide estimate with every other test in this binary,
+    /// so this asserts the series and its type once a sample exists.
+    #[test]
+    fn disk_used_bytes_lands_in_the_exposition_once_measured() {
+        DISK_USAGE.rebase(|| Some(((), 1)));
+        let metrics = HttpMetrics::init(&[]);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains("# TYPE disk_used_bytes gauge\n"),
+            "expected the disk usage series in the exposition:\n{output}"
+        );
+        assert!(
+            output.contains("\ndisk_used_bytes "),
+            "expected the disk usage sample in the exposition:\n{output}"
         );
     }
 

@@ -26,7 +26,11 @@ use tracing::warn;
 use crate::fatal::NoteDescriptorExhaustion;
 
 #[cfg(target_os = "linux")]
+use crate::DISK_USAGE;
+#[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 
 #[cfg(not(target_os = "linux"))]
 static PREALLOCATION_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
@@ -60,7 +64,7 @@ impl DirEntry {
 /// Unsupported or failed reservations fall back to buffered allocation.
 #[cfg(target_os = "linux")]
 pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
-    let Ok(len) = i64::try_from(len) else {
+    let Ok(reserved_len) = i64::try_from(len) else {
         warn!(
             target: "iggy.partitions.storage",
             file = %file_path.display(),
@@ -77,20 +81,37 @@ pub async fn preallocate_file(file: &fs::File, file_path: &Path, len: u64) {
                 "duplicating a file descriptor to preallocate".to_owned()
             })?;
         run_blocking("iggy-file-preallocate", move || {
-            fallocate(descriptor, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len)
-                .map_err(io::Error::from)
+            reserve(&std::fs::File::from(descriptor), reserved_len)
         })
         .await
     };
-    if let Err(error) = reservation.await {
-        warn!(
+    match reservation.await {
+        Ok(allocated) => DISK_USAGE.charge(allocated),
+        Err(error) => warn!(
             target: "iggy.partitions.storage",
             file = %file_path.display(),
             preallocate_len = len,
             %error,
             "file preallocation failed, using buffered allocation"
-        );
+        ),
     }
+}
+
+/// Reserves `len` bytes and returns how many of them `fallocate` newly
+/// allocated. Recovery reserves segments that already own their blocks again,
+/// which allocates nothing and must not be counted as disk usage.
+#[cfg(target_os = "linux")]
+fn reserve(file: &std::fs::File, len: i64) -> io::Result<u64> {
+    // `st_blocks` counts 512-byte units whatever the filesystem's block size.
+    let allocated = || file.metadata().ok().map(|metadata| metadata.blocks() * 512);
+    let before = allocated();
+    fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len).map_err(io::Error::from)?;
+    // Without the block counts the growth is unknown, so the whole
+    // reservation is charged and the next disk usage sample corrects it.
+    Ok(match (before, allocated()) {
+        (Some(before), Some(after)) => after.saturating_sub(before),
+        _ => len.unsigned_abs(),
+    })
 }
 
 /// Reserve segment space when supported, without changing its logical length.
@@ -256,5 +277,37 @@ mod tests {
             );
         });
         assert_eq!(std::fs::read(&path).unwrap(), b"messages");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_a_reserved_file_when_reserving_again_should_report_nothing_newly_allocated() {
+        const RESERVATION_BYTES: i64 = 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(directory.path().join("segment.log")).unwrap();
+
+        let first = match reserve(&file, RESERVATION_BYTES) {
+            Ok(allocated) => allocated,
+            Err(error) if error.raw_os_error() == Some(nix::libc::EOPNOTSUPP) => {
+                eprintln!("skipped: the temporary directory does not support fallocate");
+                return;
+            }
+            Err(error) => panic!("reserving a fresh file failed: {error}"),
+        };
+        let second = reserve(&file, RESERVATION_BYTES).unwrap();
+
+        assert!(
+            first >= RESERVATION_BYTES.unsigned_abs(),
+            "a fresh reservation must be counted in full, got {first}"
+        );
+        assert_eq!(
+            second, 0,
+            "blocks the file already owns must not be counted again"
+        );
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            0,
+            "the length must not change"
+        );
     }
 }
