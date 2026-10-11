@@ -247,6 +247,7 @@ impl TemplateSource {
     /// result row/document/event to a `FetchedRecord`, using something that
     /// monotonically increases (a timestamp, an ID, a page token) as
     /// `cursor_value` so the state-staging logic in `poll()` below can
+    /// advance the cursor correctly.
     async fn fetch_records(
         &self,
         client: &ClientWithMiddleware,
@@ -405,6 +406,7 @@ impl Source for TemplateSource {
             // later Ack would commit past it permanently.
             new_cursor = Some(record.cursor_value);
             messages.push(ProducedMessage {
+                id: None,
                 headers: None,
                 checksum: None,
                 timestamp: None,
@@ -649,6 +651,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn poll_returns_empty_without_error_when_circuit_is_open() {
         let source = TemplateSource::new(1, test_config(), None);
         source.circuit_breaker.record_failure().await;
         source.circuit_breaker.record_failure().await;
