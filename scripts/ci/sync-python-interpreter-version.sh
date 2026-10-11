@@ -275,10 +275,18 @@ read_classifier_versions() {
 
 ensure_wheel_interpreters() {
     local file="$1"
-    local interpreter_lines
-    local dynamic_lines
+    local selector_script="scripts/ci/wheel-interpreters.sh"
+    # GitHub expressions are literal text here, not shell expansions.
+    # shellcheck disable=SC2016
+    local expected_interpreters='${{ steps.interpreters.outputs.versions }}'
+    local classifier_versions=()
+    local current_interpreters
+    local line
     local selector_steps
-    local macos_setup
+    local selector_calls
+    local version
+    local mismatched=0
+    local total=0
 
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
 
@@ -288,19 +296,49 @@ ensure_wheel_interpreters() {
         return
     fi
 
-    interpreter_lines=$(grep -c -- '--interpreter' "$file" || true)
-    # GitHub expressions are literal text here, not shell expansions.
-    # shellcheck disable=SC2016
-    dynamic_lines=$(grep -Fc -- '--interpreter ${{ steps.interpreters.outputs.versions }}' "$file" || true)
-    selector_steps=$(grep -Fc -- '- name: Select wheel interpreters' "$file" || true)
-    # shellcheck disable=SC2016
-    macos_setup=$(grep -Fc -- 'python-version: ${{ steps.interpreters.outputs.python_versions }}' "$file" || true)
+    while IFS= read -r version; do classifier_versions+=("$version"); done < <(read_classifier_versions)
 
-    if [ "$interpreter_lines" -eq 2 ] && [ "$dynamic_lines" -eq 2 ] &&
-        [ "$selector_steps" -eq 2 ] && [ "$macos_setup" -eq 1 ]; then
-        echo -e "${GREEN}✓${NC} $file: wheel interpreters derive from release classifiers"
+    if [ "${#classifier_versions[@]}" -eq 0 ]; then
+        echo -e "${RED}✗${NC} $SOURCE_FILE: could not find Python version classifiers"
+        FAILED=1
+        return
+    fi
+
+    selector_steps=$(grep -Ec '^[[:space:]]*id: interpreters$' "$file" || true)
+    selector_calls=$(grep -Fc -- "$selector_script >> \"\$GITHUB_OUTPUT\"" "$file" || true)
+    if [ "$selector_steps" -ne 2 ] || [ "$selector_calls" -ne 3 ] ||
+        [ ! -f "$selector_script" ] || ! grep -Fq -- "$SOURCE_FILE" "$selector_script"; then
+        echo -e "${RED}✗${NC} $file: wheel selectors must read $SOURCE_FILE"
+        FAILED=1
+        return
+    fi
+
+    while IFS= read -r line; do
+        total=$((total + 1))
+        current_interpreters=$(echo "$line" | sed -E 's/^.*--interpreter[[:space:]]+//')
+        if [ "$current_interpreters" != "$expected_interpreters" ]; then
+            mismatched=1
+        fi
+    done < <(grep -- '--interpreter' "$file" || true)
+
+    if [ "$total" -eq 0 ]; then
+        echo -e "${RED}✗${NC} $file: could not find wheel interpreter list"
+        FAILED=1
+        return
+    fi
+
+    if [ "$mismatched" -eq 0 ]; then
+        echo -e "${GREEN}✓${NC} $file: wheel interpreter versions"
+        return
+    fi
+
+    if [ "$MODE" = "fix" ]; then
+        sed -i.bak -E "s|(--interpreter[[:space:]]+).*$|\\1${expected_interpreters}|" "$file"
+        rm -f "$file.bak"
+        FIXED_CHECKS=$((FIXED_CHECKS + 1))
+        echo -e "${GREEN}Fixed${NC} $file: wheel interpreter versions"
     else
-        echo -e "${RED}✗${NC} $file: wheel interpreters must derive from release classifiers"
+        echo -e "${RED}✗${NC} $file: wheel interpreter versions are not $expected_interpreters"
         FAILED=1
     fi
 }
