@@ -189,6 +189,17 @@ as described in `rfcs/README.md`. If no scope in
 `.github/workflows/pr-title.yml` fits, add the RFC's feature name to that list
 in the same pull request.
 
+## Reviewing PRs
+
+Anyone can review a PR. You don't need to be a committer, and reviews from contributors
+are welcome. Read the change, run it locally if you can, and leave comments or a review.
+Questions count too. If something isn't clear to you, it probably isn't clear to the next
+reader either.
+
+A committer still has to approve and merge. If you're a returning contributor, your
+"Request changes" review moves the PR to `S-waiting-on-author`, and you can use `/author`
+to do the same.
+
 ## PR Triage Commands
 
 Move a PR around the review queue by posting a slash command on its own
@@ -201,6 +212,8 @@ line in a regular PR comment (not an inline review reply):
 | `/request-review @user-or-team ...` | author or maintainer                | request review from the listed `@user` / `@org/team` handles |
 | `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
 | `/unpin`                            | author or maintainer                | remove `pinned`                                              |
+
+A returning contributor is anyone who has had a commit merged into apache/iggy.
 
 Some labels move on their own. Opening a non-draft PR, or marking a draft
 ready, sets `S-waiting-on-review`. A "Request changes" review sets
