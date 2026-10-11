@@ -27,17 +27,15 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <string>
-#include <utility>
 
 #include "world.hpp"
 
 GIVEN("^I have no streams in the system$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
-    ASSERT_NE(context->client, nullptr);
+    ASSERT_TRUE(context->client.has_value());
 
-    const auto streams = context->client->get_streams();
+    const auto streams = context->client->GetStreams();
     EXPECT_EQ(streams.size(), static_cast<std::size_t>(0));
 }
 
@@ -45,13 +43,13 @@ WHEN("^I create a stream with name \"([^\"]{1,255})\"$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    context->client->create_stream(name);
+    context->client->CreateStream(name);
 }
 
 THEN("^the stream should be created successfully$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto streams = context->client->get_streams();
+    const auto streams = context->client->GetStreams();
     EXPECT_EQ(streams.size(), static_cast<std::size_t>(1));
 }
 
@@ -59,8 +57,8 @@ THEN("^the stream should have name \"([^\"]{1,255})\"$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto stream = context->client->get_stream(bdd::make_numeric_identifier(0));
-    EXPECT_EQ(std::string(stream.name), name);
+    const auto stream = context->client->GetStream(iggy::Identifier::Numeric(0));
+    EXPECT_EQ(stream.Name(), name);
 }
 
 WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0-9]+) partitions$") {
@@ -69,44 +67,37 @@ WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0
     REGEX_PARAM(int, partitions_count);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    iggy::ffi::TopicCreateOptions opts{};
-    opts.has_partitions_count      = true;
-    opts.partitions_count          = static_cast<std::uint32_t>(partitions_count);
-    opts.has_compression_algorithm = true;
-    opts.compression_algorithm     = "none";
-    opts.has_message_expiry        = true;
-    opts.message_expiry_kind       = "never_expire";
-    opts.message_expiry_value      = std::numeric_limits<std::uint64_t>::max();
-    opts.has_max_topic_size        = true;
-    opts.max_topic_size            = "server_default";
+    iggy::TopicCreateOptions options;
+    options.SetPartitionsCount(static_cast<std::uint32_t>(partitions_count))
+        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
+        .SetMessageExpiry(iggy::Expiry::NeverExpire());
 
-    context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
-                                  std::move(opts));
+    context->client->CreateTopic(iggy::Identifier::Numeric(static_cast<std::uint32_t>(stream_id)), topic_name, options);
 }
 
 THEN("^the topic should be created successfully$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto stream = context->client->get_stream(bdd::make_numeric_identifier(0));
-    EXPECT_FALSE(stream.topics.empty());
+    const auto stream = context->client->GetStream(iggy::Identifier::Numeric(0));
+    EXPECT_FALSE(stream.Topics().empty());
 }
 
 THEN("^the topic should have name \"([^\"]{1,255})\"$") {
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto stream = context->client->get_stream(bdd::make_numeric_identifier(0));
-    ASSERT_FALSE(stream.topics.empty());
-    EXPECT_EQ(std::string(stream.topics[0].name), name);
+    const auto stream = context->client->GetStream(iggy::Identifier::Numeric(0));
+    ASSERT_FALSE(stream.Topics().empty());
+    EXPECT_EQ(stream.Topics()[0].Name(), name);
 }
 
 THEN("^the topic should have ([0-9]+) partitions$") {
     REGEX_PARAM(int, partitions_count);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto stream = context->client->get_stream(bdd::make_numeric_identifier(0));
-    ASSERT_FALSE(stream.topics.empty());
-    EXPECT_EQ(stream.topics[0].partitions_count, static_cast<std::uint32_t>(partitions_count));
+    const auto stream = context->client->GetStream(iggy::Identifier::Numeric(0));
+    ASSERT_FALSE(stream.Topics().empty());
+    EXPECT_EQ(stream.Topics()[0].PartitionsCount(), static_cast<std::uint32_t>(partitions_count));
 }
 
 WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([0-9]+)$") {
@@ -116,27 +107,24 @@ WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([
     REGEX_PARAM(int, partition_id);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    std::vector<iggy::IggyMessageToSend> messages;
     for (int index = 0; index < message_count; ++index) {
-        iggy::ffi::IggyMessageToSend message =
-            iggy::ffi::make_message(bdd::to_payload(bdd::expected_payload(static_cast<std::uint32_t>(index))),
-                                    rust::Vec<iggy::ffi::HeaderEntry>());
         // Assign an explicit, 1-based id so the last-sent/last-polled comparison is meaningful.
-        message.id_lo = static_cast<std::uint64_t>(index) + 1;
-        messages.push_back(std::move(message));
+        messages.push_back(
+            iggy::IggyMessageToSend::Create(bdd::expected_payload(static_cast<std::uint32_t>(index)), {},
+                                            static_cast<absl::uint128>(static_cast<std::uint64_t>(index) + 1)));
     }
 
-    context->client->send_messages(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
-                                   bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), "partition_id",
-                                   bdd::partition_id_bytes(static_cast<std::uint32_t>(partition_id)),
-                                   std::move(messages));
+    context->client->SendMessages(iggy::Identifier::Numeric(static_cast<std::uint32_t>(stream_id)),
+                                  iggy::Identifier::Numeric(static_cast<std::uint32_t>(topic_id)),
+                                  iggy::Partitioning::PartitionId(static_cast<std::uint32_t>(partition_id)), messages);
 
     context->last_sent_payload = bdd::expected_payload(static_cast<std::uint32_t>(message_count - 1));
     context->last_sent_id_lo   = static_cast<std::uint64_t>(message_count);
 }
 
 THEN("^all messages should be sent successfully$") {
-    // send_messages() in the WHEN step throws on failure, so reaching this step means the batch
+    // SendMessages() in the WHEN step throws on failure, so reaching this step means the batch
     // was accepted; there is no client-side count to assert (the Rust suite is a no-op here too).
 }
 
@@ -147,19 +135,21 @@ WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) 
     REGEX_PARAM(int, offset);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto polled = context->client->poll_messages(
-        bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
-        bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), "offset", static_cast<std::uint64_t>(offset), 100, false);
+    const auto polled = context->client->PollMessages(
+        iggy::Identifier::Numeric(static_cast<std::uint32_t>(stream_id)),
+        iggy::Identifier::Numeric(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
+        iggy::Consumer::Single(iggy::Identifier::Numeric(1)),
+        iggy::PollingStrategy::Offset(static_cast<std::uint64_t>(offset)), 100, false);
 
-    context->polled.count = polled.count;
+    context->polled.count = polled.Count();
     context->polled.offsets.clear();
     context->polled.id_los.clear();
     context->polled.payloads.clear();
-    for (const auto &message : polled.messages) {
-        context->polled.offsets.push_back(message.offset);
-        context->polled.id_los.push_back(message.id_lo);
-        context->polled.payloads.push_back(bdd::payload_to_string(message.payload));
+    for (const auto &message : polled.Messages()) {
+        context->polled.offsets.push_back(message.Offset());
+        context->polled.id_los.push_back(absl::Uint128Low64(message.Id()));
+        const auto &payload = message.Payload();
+        context->polled.payloads.emplace_back(payload.begin(), payload.end());
     }
 }
 

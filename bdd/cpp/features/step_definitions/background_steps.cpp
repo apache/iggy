@@ -49,19 +49,15 @@ GIVEN("^I have a running Iggy server$") {
     // Empty address makes the SDK fall back to its default TCP endpoint; in CI the address
     // is supplied via IGGY_TCP_ADDRESS (e.g. iggy-server:8090).
     const std::string address = required_env("IGGY_TCP_ADDRESS");
-    iggy::ffi::IggyClientConfig config{};
-    config.server_address     = address;
-    iggy::ffi::Client *client = iggy::ffi::new_connection(std::move(config));
-    ASSERT_NE(client, nullptr);
-    context->client = client;
-    context->client->connect();
+    context->client.emplace(iggy::IggyBlockingClient::Builder().WithServerAddress(address).Build());
+    context->client->Connect();
 }
 
 GIVEN("^I am authenticated as the root user$") {
     cucumber::ScenarioScope<bdd::GlobalContext> context;
-    ASSERT_NE(context->client, nullptr);
+    ASSERT_TRUE(context->client.has_value());
 
     const std::string username = required_env("IGGY_ROOT_USERNAME");
     const std::string password = required_env("IGGY_ROOT_PASSWORD");
-    context->client->login_user(username, password);
+    context->client->Login(username, password);
 }

@@ -20,7 +20,8 @@ use std::{collections::BTreeMap, str::FromStr};
 use bytes::Bytes;
 use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm,
-    ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability, IdKind,
+    Consumer as RustConsumer, ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerKind as RustConsumerKind, Durability as RustDurability, IdKind,
     Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize, IggyExpiry as RustIggyExpiry,
     IggyMessage as RustIggyMessage, MaxTopicSize as RustMaxTopicSize, OptionSpec as RustOptionSpec,
     Partition as RustPartition, PolledMessages as RustPolledMessages,
@@ -87,6 +88,29 @@ impl TryFrom<ffi::Identifier> for RustIdentifier {
             .map_err(|error| format!("invalid identifier: {error}"))?;
 
         Ok(rust_identifier)
+    }
+}
+
+impl TryFrom<ffi::ConsumerKind> for RustConsumerKind {
+    type Error = String;
+
+    fn try_from(kind: ffi::ConsumerKind) -> Result<Self, Self::Error> {
+        match kind {
+            ffi::ConsumerKind::Consumer => Ok(RustConsumerKind::Consumer),
+            ffi::ConsumerKind::ConsumerGroup => Ok(RustConsumerKind::ConsumerGroup),
+            _ => Err(format!("unsupported consumer kind '{}'", kind.repr)),
+        }
+    }
+}
+
+impl TryFrom<ffi::Consumer> for RustConsumer {
+    type Error = String;
+
+    fn try_from(consumer: ffi::Consumer) -> Result<Self, Self::Error> {
+        Ok(RustConsumer {
+            kind: RustConsumerKind::try_from(consumer.kind)?,
+            id: RustIdentifier::try_from(consumer.id)?,
+        })
     }
 }
 
