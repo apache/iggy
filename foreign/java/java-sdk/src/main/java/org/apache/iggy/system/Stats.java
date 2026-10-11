@@ -19,6 +19,9 @@
 
 package org.apache.iggy.system;
 
+import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.annotation.Nulls;
+
 import java.math.BigInteger;
 import java.util.Map;
 import java.util.Optional;
@@ -51,4 +54,8 @@ public record Stats(
         Map<CacheMetricsKey, CacheMetrics> cacheMetrics,
         Long threadsCount,
         String freeDiskSpace,
-        String totalDiskSpace) {}
+        String totalDiskSpace,
+        // Servers that predate these fields omit them. AS_EMPTY reads the missing
+        // key as 0 instead of the null that FAIL_ON_NULL_CREATOR_PROPERTIES rejects.
+        @JsonSetter(nulls = Nulls.AS_EMPTY) BigInteger openFilesCount,
+        @JsonSetter(nulls = Nulls.AS_EMPTY) BigInteger openFilesLimit) {}

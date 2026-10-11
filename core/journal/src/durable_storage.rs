@@ -20,9 +20,9 @@
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
-use futures::channel::oneshot;
-use futures::lock::Mutex;
 use futures::{Stream, stream};
+use server_common::fatal::NoteDescriptorExhaustion;
+use server_common::fs_utils::{run_blocking, truncate_file};
 use server_common::iobuf::{Frozen, Owned};
 use std::ffi::OsString;
 use std::io;
@@ -106,7 +106,7 @@ pub trait DurableStorage {
     fn entries(&self, path: &Path) -> impl Future<Output = io::Result<Vec<StorageEntry>>>;
     /// Enumerate regular files without including directories.
     ///
-    /// Disk scans skip unreadable entries and unsupported file types, and bound
+    /// Disk scans report unreadable entries, skip unsupported file types, and bound
     /// both worker concurrency and buffered paths. Other backends may use their
     /// existing directory enumeration through the default implementation.
     ///
@@ -133,7 +133,9 @@ pub trait DurableStorage {
 pub trait DurableFile {
     /// Best-effort reservation that must not change bytes or logical length.
     /// Backends without physical allocation may ignore this hint.
-    fn preallocate(&self, _path: &Path, _length: u64) {}
+    fn preallocate(&self, _path: &Path, _length: u64) -> impl Future<Output = ()> {
+        async {}
+    }
 
     /// # Errors
     /// Returns an error if the complete range cannot be read.
@@ -249,7 +251,13 @@ impl DurableStorage for DiskStorage {
                 .create(true)
                 .truncate(matches!(mode, OpenMode::Create | OpenMode::CreateWriteOnly));
         }
-        options.open(path).await
+        let opened = options.open(path).await;
+        // A failed read fails only its own request. See `NoteDescriptorExhaustion`.
+        // A caller that opens read-only to sync notes the result itself.
+        if mode == OpenMode::Read {
+            return opened;
+        }
+        opened.note_descriptor_exhaustion(|| format!("opening {}", path.display()))
     }
 
     async fn create_directories(&self, path: &Path) -> io::Result<()> {
@@ -257,7 +265,11 @@ impl DurableStorage for DiskStorage {
     }
 
     async fn sync_directory(&self, path: &Path) -> io::Result<()> {
-        File::open(path).await?.sync_all().await
+        File::open(path)
+            .await
+            .note_descriptor_exhaustion(|| format!("opening directory {}", path.display()))?
+            .sync_all()
+            .await
     }
 
     async fn rename(&self, source: &Path, target: &Path) -> io::Result<()> {
@@ -309,13 +321,13 @@ impl DurableStorage for DiskStorage {
             .spawn(move || {
                 let _permit = permit;
                 let result = (|| {
-                    // An unreadable entry must not hide the remaining files.
-                    // Only opening the directory fails the scan.
+                    let mut scan_error = None;
                     for entry in std::fs::read_dir(&directory)? {
                         let entry = match entry {
                             Ok(entry) => entry,
                             Err(error) => {
                                 warn!(path = %directory.display(), %error, "failed to read directory entry");
+                                scan_error.get_or_insert(error);
                                 continue;
                             }
                         };
@@ -323,6 +335,7 @@ impl DurableStorage for DiskStorage {
                             Ok(file_type) => file_type.is_file(),
                             Err(error) => {
                                 warn!(path = %directory.display(), %error, "failed to read entry type");
+                                scan_error.get_or_insert(error);
                                 continue;
                             }
                         };
@@ -330,7 +343,7 @@ impl DurableStorage for DiskStorage {
                             return Ok(());
                         }
                     }
-                    Ok(())
+                    scan_error.map_or(Ok(()), Err)
                 })();
                 // Explicit completion distinguishes an empty directory from an
                 // interrupted worker. Closed receivers abandon enumeration.
@@ -383,8 +396,8 @@ impl DurableStorage for DiskStorage {
 }
 
 impl DurableFile for File {
-    fn preallocate(&self, path: &Path, length: u64) {
-        server_common::fs_utils::preallocate_file(self, path, length);
+    async fn preallocate(&self, path: &Path, length: u64) {
+        server_common::fs_utils::preallocate_file(self, path, length).await;
     }
 
     async fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
@@ -441,38 +454,12 @@ impl DurableFile for File {
     }
 
     async fn truncate(&self, length: u64) -> io::Result<()> {
-        // Older kernels lack IORING_OP_FTRUNCATE and shard fallback pools are
-        // disabled. Own the inode until the worker completes, even on cancellation.
-        let descriptor = std::os::fd::AsFd::as_fd(self).try_clone_to_owned()?;
-        run_blocking("iggy-file-truncate", move || {
-            std::fs::File::from(descriptor).set_len(length)
-        })
-        .await
+        truncate_file(self, length).await
     }
 
     async fn sync(&self) -> io::Result<()> {
         self.sync_data().await
     }
-}
-
-async fn run_blocking<T: Send + 'static>(
-    name: &'static str,
-    operation: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    // Keep the permit on the worker: cancelling its caller must not admit
-    // another blocking operation while this one still owns filesystem state.
-    static WORKER: Mutex<()> = Mutex::new(());
-    let permit = WORKER.lock().await;
-    let (sender, receiver) = oneshot::channel();
-    std::thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(move || {
-            let _permit = permit;
-            let _ = sender.send(operation());
-        })?;
-    receiver
-        .await
-        .map_err(|_| io::Error::other(format!("{name} stopped")))?
 }
 
 fn directory_entries(path: &Path) -> io::Result<Vec<StorageEntry>> {
@@ -591,6 +578,11 @@ mod tests {
         let mut successor = Box::pin(run_blocking("iggy-test-successor", || Ok(())));
         assert!(futures::poll!(&mut successor).is_pending());
         compio::time::sleep(Duration::from_millis(1)).await;
+        assert!(futures::poll!(&mut successor).is_pending());
+        let independent = std::thread::spawn(|| {
+            futures::executor::block_on(run_blocking("iggy-test-independent", || Ok(())))
+        });
+        independent.join().unwrap().unwrap();
         assert!(futures::poll!(&mut successor).is_pending());
         release.send(()).unwrap();
         successor.await.unwrap();

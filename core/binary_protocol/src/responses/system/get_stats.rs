@@ -55,7 +55,12 @@ impl CacheMetricEntry {
 /// [threads_count:4]
 /// [free_disk_space:8]
 /// [total_disk_space:8]
+/// [open_files_count:8][open_files_limit:8]
 /// ```
+///
+/// The last two fields are an optional tail. A server older than them ends
+/// the reply at `total_disk_space`, and both decode as 0. A tail shorter than
+/// 16 bytes fails the decode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsResponse {
     pub process_id: u32,
@@ -86,11 +91,13 @@ pub struct StatsResponse {
     pub threads_count: u32,
     pub free_disk_space: u64,
     pub total_disk_space: u64,
+    pub open_files_count: u64,
+    pub open_files_limit: u64,
 }
 
 // Fixed-size numeric header before the variable-length string section.
 const NUMERIC_HEADER_SIZE: usize =
-    4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 4 + 4; // 104
+    4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 4 + 4; // 108
 
 fn encode_len_prefixed_str(buf: &mut BytesMut, s: &str) {
     #[allow(clippy::cast_possible_truncation)]
@@ -118,6 +125,8 @@ impl WireEncode for StatsResponse {
             + 4 // threads_count
             + 8 // free_disk_space
             + 8 // total_disk_space
+            + 8 // open_files_count
+            + 8 // open_files_limit
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -162,6 +171,8 @@ impl WireEncode for StatsResponse {
         buf.put_u32_le(self.threads_count);
         buf.put_u64_le(self.free_disk_space);
         buf.put_u64_le(self.total_disk_space);
+        buf.put_u64_le(self.open_files_count);
+        buf.put_u64_le(self.open_files_limit);
     }
 }
 
@@ -239,6 +250,14 @@ impl WireDecode for StatsResponse {
         let total_disk_space = read_u64_le(buf, pos)?;
         pos += 8;
 
+        let mut open_files_count = 0;
+        let mut open_files_limit = 0;
+        if buf.len() > pos {
+            open_files_count = read_u64_le(buf, pos)?;
+            open_files_limit = read_u64_le(buf, pos + 8)?;
+            pos += 16;
+        }
+
         Ok((
             Self {
                 process_id,
@@ -269,6 +288,8 @@ impl WireDecode for StatsResponse {
                 threads_count,
                 free_disk_space,
                 total_disk_space,
+                open_files_count,
+                open_files_limit,
             },
             pos,
         ))
@@ -309,6 +330,8 @@ mod tests {
             threads_count: 16,
             free_disk_space: 107_374_182_400,
             total_disk_space: 512_110_190_592,
+            open_files_count: 1_234,
+            open_files_limit: 1_048_576,
         }
     }
 
@@ -404,6 +427,27 @@ mod tests {
         assert_eq!(read_u32_le(&bytes, 0).unwrap(), 1234);
         assert_eq!(read_u32_le(&bytes, 76).unwrap(), 3);
         assert_eq!(read_u32_le(&bytes, 104).unwrap(), 2);
+    }
+
+    #[test]
+    fn given_reply_without_open_files_fields_when_decoding_should_read_them_as_zero() {
+        let stats = sample_stats();
+        let bytes = stats.to_bytes();
+        let older_reply = &bytes[..bytes.len() - 16];
+
+        let (decoded, consumed) = StatsResponse::decode(older_reply).unwrap();
+
+        assert_eq!(consumed, older_reply.len());
+        assert_eq!(decoded.open_files_count, 0);
+        assert_eq!(decoded.open_files_limit, 0);
+        assert_eq!(decoded.total_disk_space, stats.total_disk_space);
+    }
+
+    #[test]
+    fn given_truncated_open_files_fields_when_decoding_should_fail() {
+        let bytes = sample_stats().to_bytes();
+
+        assert!(StatsResponse::decode(&bytes[..bytes.len() - 4]).is_err());
     }
 
     #[test]

@@ -123,7 +123,7 @@ impl Respond for StateStoreResponder {
         }
         if store
             .fail_next_puts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

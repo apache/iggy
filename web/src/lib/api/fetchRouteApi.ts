@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { env } from '$env/dynamic/public';
-import { authStore } from '$lib/auth/authStore.svelte';
+import { PUBLIC_IGGY_API_URL } from '$app/env/public';
+import { authStore } from '#lib/auth/authStore.svelte.js';
 import type { ApiSchema } from './ApiSchema';
 import { convertBigIntsToStrings } from './convertBigIntsToStrings';
 import { getJson } from './getJson';
@@ -36,7 +36,7 @@ export const fetchRouteApi = async (
     }
 
     // Use PUBLIC_IGGY_API_URL if set, otherwise use relative path (for embedded mode)
-    const baseUrl = env.PUBLIC_IGGY_API_URL || '';
+    const baseUrl = PUBLIC_IGGY_API_URL || '';
     let fullUrl = `${baseUrl}${path}`;
 
     if (queryParams) {

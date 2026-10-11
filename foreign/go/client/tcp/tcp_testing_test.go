@@ -141,6 +141,11 @@ func registerReplyFrame(userID uint32, session uint64) []byte {
 	return replyFrame(vsr.OperationRegister, body)
 }
 
+func bindReplyFrame(userID uint32, session uint64) []byte {
+	registered := registerReplyFrame(userID, session)
+	return replyFrame(vsr.OperationNonReplicated, registered[vsr.HeaderSize+len(resultSection()):])
+}
+
 // clusterMetadataFrame builds a cluster roster where the node at leaderIndex
 // is the healthy leader.
 func clusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []byte {

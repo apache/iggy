@@ -55,11 +55,15 @@ const CONVERGE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Boot line reporting the `(view, log_view)` a consensus group restored from
 /// its superblock: the recovered replica's own account of what it read back.
 /// One line per group since the unified restore constructor, so the parser
-/// filters the metadata group's line out by its `group` field.
+/// filters the metadata group's line out by its `group` field. Partition
+/// groups log it at `debug`, hence the `logging.level` override below.
 const RESTORED_VIEW_MARKER: &str = "restored group view from its superblock";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(sharding.cpu_allocation = "0..1", logging.level = "info,consensus=debug")
+)]
 async fn given_advanced_partition_view_when_survivor_restarts_should_recover_view_from_superblock(
     harness: &mut TestHarness,
 ) {

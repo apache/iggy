@@ -275,6 +275,8 @@ impl From<RustStats> for ffi::Stats {
             threads_count: stats.threads_count,
             free_disk_space: stats.free_disk_space.as_bytes_u64(),
             total_disk_space: stats.total_disk_space.as_bytes_u64(),
+            open_files_count: stats.open_files_count,
+            open_files_limit: stats.open_files_limit,
         }
     }
 }

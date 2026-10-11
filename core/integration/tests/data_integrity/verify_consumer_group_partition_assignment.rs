@@ -28,11 +28,9 @@
 //! assignment. At the former 2s interval the 16-consumer spec sat 2.27s into a
 //! 2.4s deadline over quic -- under 5% margin.
 //!
-//! These specs assert ASSIGNMENT, not liveness, so the deadline is pushed out
-//! of reach instead of being raced. The two that genuinely drive eviction keep
-//! the short interval and are marked as such: they build members with
-//! [`create_stale_tcp_client`], whose 1h client-side heartbeat means only the
-//! server's verifier can ever remove them.
+//! Connection eviction retains logical sessions. The liveness specs also set
+//! a short consumer-group session timeout so ordered Logout can remove stale
+//! memberships. Their stale clients send no further activity.
 
 use iggy::prelude::*;
 use integration::iggy_harness;
@@ -40,15 +38,13 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
 use tokio::time::{Duration, sleep};
 
 const STREAM_NAME: &str = "cg-partition-test-stream";
 const TOPIC_NAME: &str = "cg-partition-test-topic";
 const CONSUMER_GROUP_NAME: &str = "cg-partition-test-group";
 const PARTITIONS_COUNT: u32 = 3;
-/// Bounds [`await_members_count`]. Generous because the slowest path it covers
-/// is heartbeat eviction (2s interval x 1.2 threshold) on a loaded machine.
+/// Bounds [`await_members_count`], including logical-session lease expiry.
 const MEMBERS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
 const MEMBERS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// Slices the slab-reuse wait so the surviving consumer can prove liveness
@@ -83,9 +79,9 @@ async fn create_tcp_client(server_addr: &str) -> IggyClient {
 
 #[iggy_harness(server(
     heartbeat.enabled = true,
-    // Deliberately short: this spec drives the server's eviction path (see the
-    // module note), so the verifier must be able to reap a stale member.
     heartbeat.interval = "2s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
     harness: &TestHarness,
@@ -107,6 +103,8 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
             &TopicCreateOptions {
                 partitions_count: Some(PARTITIONS_COUNT),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -136,8 +134,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
             .unwrap();
     }
 
-    // 3. Create 3 "stale" TCP clients (1h heartbeat - server will detect them as stale
-    //    after ~2.4s because they won't send any heartbeat).
+    // Keep the sockets idle so the logical sessions expire without Logout.
     let stale_client1 = create_stale_tcp_client(&server_addr).await;
     let stale_client2 = create_stale_tcp_client(&server_addr).await;
     let stale_client3 = create_stale_tcp_client(&server_addr).await;
@@ -181,16 +178,7 @@ async fn should_not_duplicate_partition_assignments_after_stale_client_cleanup(
         "stale_client1 should have polled at least one message"
     );
 
-    // 6. DO NOT drop stale clients - simulating kill -9 (no TCP FIN).
-    //    We keep them alive in scope but won't use them again.
-    //    The server will detect them as stale after ~2.4s (heartbeat timeout).
-
-    // 7. Wait for the server's heartbeat verifier to evict the stale clients.
-    //    Server heartbeat interval = 2s, threshold = 2s * 1.2 = 2.4s.
-    //    Stale clients' heartbeat interval is 1h so they won't ping.
-    //    But they DID send one initial ping on connect, so we wait for that to expire.
-    //
-    // 8. Verify ghosts have been evicted.
+    // Membership removal follows logical-session expiry, including after TCP eviction.
     await_members_count(&root_client, 0).await;
 
     // 9. Now create 3 new clients and join same CG (simulating app restart after kill -9).
@@ -585,8 +573,9 @@ async fn should_not_lose_messages_with_concurrent_polls_during_partition_add(
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.enabled = true,
     heartbeat.interval = "60s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -651,10 +640,10 @@ async fn should_handle_partition_add_then_consumer_disconnect_then_new_join(harn
     sleep(Duration::from_millis(500)).await;
 
     // 3. Consumer2 disconnects
+    client2.shutdown().await.unwrap();
     drop(client2);
-    sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 1).await;
     assert_eq!(
         cg.members_count, 1,
         "Only consumer1 should remain. Members: {:?}",
@@ -746,6 +735,8 @@ async fn should_handle_partition_delete_while_multiple_consumers_polling(harness
             &TopicCreateOptions {
                 partitions_count: Some(6),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -881,6 +872,8 @@ async fn should_reach_even_distribution_after_multiple_joins(harness: &TestHarne
             &TopicCreateOptions {
                 partitions_count: Some(6),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -1279,6 +1272,8 @@ async fn should_handle_delete_partitions_with_uncommitted_work(harness: &TestHar
             &TopicCreateOptions {
                 partitions_count: Some(6),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -1617,6 +1612,8 @@ async fn should_rebalance_after_deleting_partitions(harness: &TestHarness) {
             &TopicCreateOptions {
                 partitions_count: Some(6),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -1877,9 +1874,9 @@ async fn should_timeout_revocation(harness: &TestHarness) {
 
 #[iggy_harness(server(
     heartbeat.enabled = true,
-    // Deliberately short: this spec drives the server's eviction path (see the
-    // module note), so the verifier must be able to reap a stale member.
     heartbeat.interval = "2s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHarness) {
     let server_addr = harness.server().raw_tcp_addr().expect("tcp addr");
@@ -1898,6 +1895,8 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
             &TopicCreateOptions {
                 partitions_count: Some(PARTITIONS_COUNT),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -1958,15 +1957,7 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         }
     }
 
-    // 4. Wait for heartbeat to evict stale clients (1h heartbeat → server detects ~2.4s)
-    sleep(Duration::from_secs(5)).await;
-
-    let cg = get_consumer_group(&root_client).await;
-    assert_eq!(
-        cg.members_count, 0,
-        "Stale clients should be evicted. Members: {:?}",
-        cg.members
-    );
+    await_members_count(&root_client, 0).await;
 
     // 5. Phase 2: 3 new clients join, poll concurrently — exactly 1 must get the message
     let new_client1 = create_tcp_client(&server_addr).await;
@@ -2021,7 +2012,13 @@ async fn should_not_duplicate_after_reconnect_without_heartbeat(harness: &TestHa
         .unwrap();
 }
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        consumer_group.heartbeat_interval = "500ms",
+        consumer_group.session_timeout = "8s"
+    )
+)]
 async fn should_not_duplicate_partition_assignments_after_client_reconnect(harness: &TestHarness) {
     let root_client = harness
         .root_client()
@@ -2037,6 +2034,8 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
             &TopicCreateOptions {
                 partitions_count: Some(PARTITIONS_COUNT),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -2090,7 +2089,7 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
     assert_eq!(cg.members_count, 3);
     assert_unique_partition_assignments(&cg);
 
-    // 4. One consumer polls the message, manual ack — does NOT commit.
+    // 4. One consumer polls the message without committing.
     //    Simulates: handler is mid-processing when app gets killed.
     for client in [&client1, &client2, &client3] {
         let polled = client
@@ -2101,7 +2100,7 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
                 &consumer,
                 &PollingStrategy::next(),
                 1,
-                false, // manual ack — no commit
+                false,
             )
             .await
             .unwrap();
@@ -2110,7 +2109,10 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
         }
     }
 
-    // 5. Kill all 3 clients (no ack sent)
+    // Stop activity without Logout; membership lasts until the session lease expires.
+    for client in [&client1, &client2, &client3] {
+        client.shutdown().await.unwrap();
+    }
     drop(client1);
     drop(client2);
     drop(client3);
@@ -2175,11 +2177,8 @@ async fn should_not_duplicate_partition_assignments_after_client_reconnect(harne
 
 /// Poll the group until it reports `expected` members, then return it.
 ///
-/// Member removal is server-side work that a client cannot observe completing:
-/// dropping a client sends a FIN, and eviction of a client that never sends one
-/// waits on the heartbeat verifier. Sleeping a fixed span and asserting assumes
-/// a bound on that work, which does not hold when the machine is running the
-/// rest of the suite -- the assert then reads one leftover member and fails.
+/// Closing a binding preserves its logical session until lease expiry.
+/// Wait for the committed expiry and membership update before checking ownership.
 async fn await_members_count(client: &IggyClient, expected: u32) -> ConsumerGroupDetails {
     let deadline = tokio::time::Instant::now() + MEMBERS_CONVERGENCE_TIMEOUT;
     loop {
@@ -2239,6 +2238,8 @@ async fn setup_stream_topic_cg_with_partitions(client: &IggyClient, partitions: 
             &TopicCreateOptions {
                 partitions_count: Some(partitions),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -2550,8 +2551,9 @@ async fn should_transfer_never_polled_partitions_immediately(harness: &TestHarne
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    heartbeat.enabled = true,
     heartbeat.interval = "60s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -2589,13 +2591,12 @@ async fn should_rebalance_when_member_with_pending_revocation_leaves(harness: &T
         .unwrap();
     join_cg(&client2).await;
 
-    // 3. Consumer1 disconnects (graceful) - should trigger full rebalance
-    //    clearing all pending revocations
+    // Expiry must clear pending revocations after the binding closes.
+    client1.shutdown().await.unwrap();
     drop(client1);
-    sleep(Duration::from_millis(500)).await;
 
     // 4. Consumer2 should now get ALL partitions via full rebalance
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 1).await;
     assert_eq!(
         cg.members_count, 1,
         "Only consumer2 should remain. Members: {:?}",
@@ -2905,6 +2906,8 @@ async fn should_wait_for_manual_commit_before_completing_revocation(harness: &Te
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -2945,11 +2948,11 @@ async fn should_redistribute_when_revocation_target_leaves(harness: &TestHarness
     sleep(Duration::from_millis(100)).await;
 
     // 3. Consumer2 (the revocation TARGET) disconnects before revocation completes
+    client2.shutdown().await.unwrap();
     drop(client2);
-    sleep(Duration::from_millis(500)).await;
 
     // 4. Consumer1 should now have ALL partitions back via full rebalance
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 1).await;
     assert_eq!(
         cg.members_count, 1,
         "Only consumer1 should remain. Members: {:?}",
@@ -3198,6 +3201,8 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -3252,26 +3257,10 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
     let cg = get_consumer_group(&root_client).await;
     assert_eq!(cg.members_count, 3);
 
-    // 4. Consumer3 disconnects — triggers full rebalance (rebalance_members).
-    //    Leave clears only consumer3's polled offsets, not consumer1's.
+    client3.shutdown().await.unwrap();
     drop(client3);
 
-    // 5. After full rebalance, consumer1 and consumer2 split all partitions.
-    //    The key invariant: no partition is assigned to two members.
-    //    Convergence is load-dependent: the dead connection is noticed by the
-    //    heartbeat verifier (interval 2s, worst case ~2x), then the Leave
-    //    commits and the reconciler rebalances -- a fixed sleep flakes under
-    //    parallel-suite load. Poll until the membership and assignments
-    //    converge, then make the terminal assertions.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let cg = loop {
-        let cg = get_consumer_group(&root_client).await;
-        let assigned: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
-        if (cg.members_count == 2 && assigned == PARTITIONS_COUNT) || Instant::now() >= deadline {
-            break cg;
-        }
-        sleep(Duration::from_millis(200)).await;
-    };
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
@@ -3658,6 +3647,8 @@ async fn should_not_starve_any_member_in_large_scale_rebalance(harness: &TestHar
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
+    consumer_group.heartbeat_interval = "500ms",
+    consumer_group.session_timeout = "8s",
 ))]
 async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
     let root_client = harness.root_client().await.unwrap();
@@ -3684,11 +3675,12 @@ async fn should_maintain_balance_after_member_churn(harness: &TestHarness) {
     assert_unique_partition_assignments(&cg);
     assert_balanced_partition_distribution(&cg, 16);
 
+    client3.shutdown().await.unwrap();
+    client4.shutdown().await.unwrap();
     drop(client3);
     drop(client4);
-    sleep(Duration::from_millis(500)).await;
 
-    let cg = get_consumer_group(&root_client).await;
+    let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     let total: u32 = cg.members.iter().map(|m| m.partitions_count).sum();
     assert_eq!(total, 16);

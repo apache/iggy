@@ -472,6 +472,8 @@ impl From<StatsResponse> for Stats {
             threads_count: w.threads_count,
             free_disk_space: IggyByteSize::from(w.free_disk_space),
             total_disk_space: IggyByteSize::from(w.total_disk_space),
+            open_files_count: w.open_files_count,
+            open_files_limit: w.open_files_limit,
         }
     }
 }

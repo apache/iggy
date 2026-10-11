@@ -21,6 +21,7 @@ using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Tests.ClientTests;
@@ -192,20 +193,21 @@ public sealed class HttpTopicOptionsTests
     }
 
     [Fact]
-    public async Task PurgeTopic_Should_SurfaceFailedResponse()
+    public async Task SendMessages_Should_ReportAnAgedOutRequestAsOutcomeUnknown()
     {
-        var handler = new StubHandler("""{"id":5,"code":"feature_unavailable","reason":"Purge disabled."}""")
+        var handler = new StubHandler("""{"id":85,"code":"request_too_old","reason":"Request too old."}""")
         {
-            StatusCode = HttpStatusCode.NotImplemented
+            StatusCode = HttpStatusCode.BadRequest
         };
         using var client = new HttpMessageStream(new HttpClient(handler) { BaseAddress = new Uri("http://localhost") });
 
-        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-            client.PurgeTopicAsync(StreamId, Identifier.Numeric(2), TestContext.Current.CancellationToken));
+        var unknown = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.SendMessagesAsync(StreamId, Identifier.Numeric(1), Kinds.Partitioning.PartitionId(1),
+                [new Message(Guid.NewGuid(), new byte[] { 1 })], TestContext.Current.CancellationToken));
 
-        Assert.Equal(VsrError.FEATURE_UNAVAILABLE, error.StatusCode);
-        Assert.True(error.FromServer);
-        Assert.Equal("/streams/1/topics/2/purge", handler.RequestPath);
+        var refusal = Assert.IsType<IggyInvalidStatusCodeException>(unknown.InnerException);
+        Assert.Equal(VsrError.REQUEST_TOO_OLD, refusal.StatusCode);
+        Assert.True(refusal.FromServer);
     }
 
     private sealed class StubHandler(string json) : HttpMessageHandler

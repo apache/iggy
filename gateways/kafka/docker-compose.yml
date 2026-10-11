@@ -1,0 +1,141 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Quick-start: a real iggy-server plus the Kafka gateway bridged to it, for a Kafka client to
+# talk to end to end. `docker compose up` from this directory. See README.md's "Quick start".
+
+services:
+  iggy-server:
+    # Prebuilt. :edge refreshes on a master push only when `server` or `iggy-cli` is
+    # affected, or `web` or `core/server/Dockerfile` changes - avoids a full from-scratch workspace
+    # release build on first `up --build`. Testing a local server change: comment this out
+    # and uncomment `build:` below instead - `core/server/Dockerfile`'s `runtime` target is
+    # the same Dockerfile and target `apache/iggy:edge` itself is published from
+    # (.github/config/publish.yml), so the healthcheck/volume/listener-address settings below
+    # stay correct either way.
+    image: apache/iggy:edge
+    # :edge is a rolling tag - without this, compose reuses whatever was pulled last time it
+    # happened to not be cached locally, and a stale server can reject a newer gateway's login
+    # once the wire protocol moves. Always check for a newer edge instead of trusting the cache.
+    pull_policy: always
+    # build:
+    #   context: ../..
+    #   dockerfile: core/server/Dockerfile
+    #   target: runtime
+    restart: unless-stopped
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    environment:
+      - IGGY_NODE_ADVERTISED_ADDRESS=localhost
+      # Fixed, non-default root credentials: this quick-start's gateway needs a password it
+      # knows ahead of time, and iggy-server otherwise generates a random one per start.
+      # Dev-only - never reuse these outside a local compose stack.
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy-gateway-quickstart
+      # config.toml's own defaults are all 127.0.0.1 - fine for a single binary on the host,
+      # not reachable from a sibling container. The gateway dials iggy-server:8090 over this
+      # compose network, so TCP at minimum has to bind the wildcard address; the other three
+      # are overridden too since this file also publishes them to the host (see bdd's own
+      # docker-compose.server.yml for the same pattern against the same image).
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
+    networks:
+      - iggy-kafka-gateway
+    ports:
+      - 127.0.0.1:3000:3000
+      - 127.0.0.1:8080:8080
+      - 127.0.0.1:8090:8090
+      - 127.0.0.1:8092:8092
+    volumes:
+      # apache/iggy:edge (core/server/Dockerfile's `runtime`/`runtime-prebuilt` targets) sets
+      # WORKDIR /app; config.toml's own `path = "local_data"` is relative to that, not to `/`.
+      - iggy-server:/app/local_data
+    # This gates the gateway's start on the server actually answering a command, not just
+    # accepting a TCP connect (a bare connect succeeds before the request-processing loop is
+    # wired up; `ping` is unauthenticated - see core/cli/src/commands/binary_system/ping.rs's
+    # `login_required() -> false` - so this still doesn't prove root-user login is ready, only
+    # that the server itself is). Root is seeded during metadata recovery, before the TCP
+    # listeners bind (core/server/src/boot/mod.rs), so there is no "server up, root not ready"
+    # window for the gateway to race against - RECONNECTION_RETRIES in bridge/iggy_bridge/mod.rs
+    # (3 retries after the first attempt, 4 attempts total) exists for transient connect
+    # failures, not for waiting out root provisioning.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/iggy", "ping"]
+      # start_interval covers startup (forks a process + fresh TCP connect every 2s only until
+      # healthy); interval is the steady-state cadence for the rest of the container's life, so
+      # it stays slow enough not to matter.
+      start_interval: 2s
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 30
+
+  iggy-gateway-kafka:
+    build:
+      context: ../..
+      dockerfile: gateways/kafka/Dockerfile
+    container_name: iggy-gateway-kafka
+    restart: unless-stopped
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
+      # Binding the wildcard address above means the gateway cannot derive its own advertised
+      # host (server.rs::BrokerAdvertise::from_server_config refuses to start without this) -
+      # same requirement root docker-compose.yml's IGGY_NODE_ADVERTISED_ADDRESS already carries
+      # for iggy-server, for the same reason: the value a Kafka client's Metadata response
+      # points it back at has to be reachable from outside the container.
+      #
+      # Literal 127.0.0.1, not "localhost": the port below is published on 127.0.0.1 only, and
+      # a client resolving "localhost" to ::1 first (common default on many systems) would get
+      # a Metadata response pointing it at an address nothing is actually listening on.
+      - IGGY_KAFKA_ADVERTISED_HOST=127.0.0.1
+      - IGGY_KAFKA_BRIDGE_ENABLED=true
+      - IGGY_KAFKA_IGGY_ADDR=iggy-server:8090
+      - IGGY_KAFKA_IGGY_USERNAME=iggy
+      - IGGY_KAFKA_IGGY_PASSWORD=iggy-gateway-quickstart
+    networks:
+      - iggy-kafka-gateway
+    ports:
+      - 127.0.0.1:9093:9093
+    # `depends_on: service_healthy` only gates the initial `up`, never a later restart - without
+    # its own healthcheck this container crash-loops invisibly (no state `docker compose ps` can
+    # show) if restarted while iggy-server happens to be down. The listener binds only after the
+    # bridge connects (src/main.rs), so "port answers" already implies "bridge is up".
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9093"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+
+volumes:
+  iggy-server:
+    driver: local
+
+networks:
+  iggy-kafka-gateway:
+    name: iggy-kafka-gateway

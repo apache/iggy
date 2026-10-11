@@ -61,9 +61,9 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		sessionID = session.SessionID()
 	default:
 		sessionID = session.SessionID()
-		// Partition operations consume an id too, even though no
-		// partition-plane dedup exists yet: dedup needs each send to carry a
-		// distinct number, and the metadata watermark tolerates the gaps.
+		// Partition operations consume an id too: dedup needs each send to
+		// carry a distinct number, and the metadata watermark tolerates the
+		// gaps.
 		if request, err = session.NextRequestID(); err != nil {
 			return err
 		}

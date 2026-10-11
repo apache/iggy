@@ -65,17 +65,22 @@ public sealed class PrimaryPollingTests
         Assert.All(cluster.Primaries, primary =>
         {
             Assert.Equal(1, primary.Connections);
-            Assert.Equal(1, primary.Registrations);
-            Assert.Equal(1, primary.Requests(CommandCodes.ATTACH_CONSUMER_SESSION_CODE));
+            Assert.Equal(0, primary.Registrations);
+            Assert.Equal(1, primary.Requests(CommandCodes.BIND_SESSION_CODE));
             Assert.Equal(2, primary.Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE));
         });
         var parent = Assert.Single(cluster.CoordinatorRequests,
             request => request.Operation == (byte)VsrOperation.JoinConsumerGroup);
+        var registration = Assert.Single(cluster.CoordinatorRequests,
+            request => request.Operation == (byte)VsrOperation.Register);
+        var bindSecret = LoginRegister.ReadBindSecret(registration.Body);
         Assert.All(cluster.Attachments, attachment =>
         {
-            Assert.Equal(parent.ClientId, BinaryPrimitives.ReadUInt128LittleEndian(attachment.Body));
-            Assert.Equal(parent.Session, BinaryPrimitives.ReadUInt64LittleEndian(attachment.Body.AsSpan(16)));
-            Assert.NotEqual(parent.ClientId, attachment.ClientId);
+            Assert.Equal(parent.ClientId, BinaryPrimitives.ReadUInt128LittleEndian(BindIdentity(attachment.Body)));
+            Assert.Equal(parent.Session, BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(attachment.Body).AsSpan(16)));
+            Assert.Equal(bindSecret, attachment.Body.AsSpan(^LoginRegister.BIND_SECRET_BYTES).ToArray());
+            Assert.Equal(parent.ClientId, attachment.ClientId);
+            Assert.Equal(parent.Session, attachment.Session);
         });
     }
 
@@ -90,7 +95,7 @@ public sealed class PrimaryPollingTests
 
         Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
         Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
-            BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(24))));
+            BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(24))));
         Assert.Equal(1, cluster.Primaries[0].Connections);
     }
 
@@ -174,7 +179,7 @@ public sealed class PrimaryPollingTests
         await PollAsync(client);
 
         Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
-            BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(24))));
+            BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(24))));
         Assert.Equal(1, cluster.Primaries[0].Connections);
     }
 
@@ -249,7 +254,7 @@ public sealed class PrimaryPollingTests
             await Task.WhenAll(first, waiting);
 
             Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
-                BinaryPrimitives.ReadUInt64LittleEndian(request.Body.AsSpan(24))));
+                BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(24))));
             Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
             Assert.Equal(1, cluster.Primaries[0].Connections);
         }
@@ -351,7 +356,7 @@ public sealed class PrimaryPollingTests
 
         Assert.Equal(2, polls);
         Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
-        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.ATTACH_CONSUMER_SESSION_CODE));
+        Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.BIND_SESSION_CODE));
         Assert.Equal(1, cluster.Primaries[0].Connections);
         Assert.Equal(1, cluster.Coordinator.Registrations);
     }
@@ -384,8 +389,9 @@ public sealed class PrimaryPollingTests
         await PollAsync(client);
 
         Assert.Equal(2, routes);
-        Assert.Equal(2, cluster.Coordinator.Registrations);
-        Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        Assert.Equal(1, cluster.Coordinator.Registrations);
+        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.BIND_SESSION_CODE));
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE));
     }
 
@@ -396,7 +402,7 @@ public sealed class PrimaryPollingTests
         var attachments = 0;
         cluster.OnPrimaryAttachment = request => Interlocked.Increment(ref attachments) == 1
             ? Reply(request.Operation, [], VsrError.STALE_CLIENT)
-            : Answer(request);
+            : BindingReply(request);
         using var client = await cluster.ConnectAsync();
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
         await PollAsync(client);
@@ -406,6 +412,21 @@ public sealed class PrimaryPollingTests
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE));
         Assert.Equal(1, cluster.Coordinator.Registrations);
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+    }
+
+    [Fact]
+    public async Task given_wrong_binding_epoch_when_polling_should_refuse_before_polling()
+    {
+        using var cluster = new PollCluster();
+        cluster.OnPrimaryAttachment = request => Reply(request.Operation, RegisterBody(session: 129)[4..]);
+        using var client = await cluster.ConnectAsync();
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
+
+        Assert.Equal(VsrError.INVALID_FORMAT, error.StatusCode);
+        Assert.All(cluster.Primaries, primary =>
+            Assert.Equal(0, primary.Requests(CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE)));
+        Assert.Equal(1, cluster.Coordinator.Registrations);
     }
 
     [Fact]
@@ -440,7 +461,7 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
-    public async Task given_self_credentials_changed_when_opening_new_primary_should_use_the_updated_login()
+    public async Task given_self_credentials_changed_when_opening_new_primary_should_reuse_the_registered_proof()
     {
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
@@ -451,7 +472,13 @@ public sealed class PrimaryPollingTests
         await client.PollMessagesAsync(Stream, Topic, 1, Consumer.Group(3), PollingStrategy.Next(), 10, true,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(LoginRegister.Serialize("renamed", "new-secret"), cluster.Registrations.Last().Body);
+        Assert.Empty(cluster.Registrations);
+        var attachments = cluster.Attachments.ToArray();
+        var registration = Assert.Single(cluster.CoordinatorRequests,
+            request => request.Operation == (byte)VsrOperation.Register);
+        var expectedSecret = LoginRegister.ReadBindSecret(registration.Body);
+        Assert.All(attachments, attachment =>
+            Assert.Equal(expectedSecret, attachment.Body.AsSpan(^LoginRegister.BIND_SECRET_BYTES).ToArray()));
         Assert.Equal(1, cluster.Coordinator.Registrations);
     }
 
@@ -461,13 +488,13 @@ public sealed class PrimaryPollingTests
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
         await PollAsync(client);
-        var oldParent = BinaryPrimitives.ReadUInt128LittleEndian(cluster.Attachments.Single().Body);
+        var oldParent = BinaryPrimitives.ReadUInt128LittleEndian(BindIdentity(cluster.Attachments.Single().Body));
         await client.LogoutUserAsync(TestContext.Current.CancellationToken);
         await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
         await PollAsync(client);
 
         Assert.Equal(2, cluster.Primaries[0].Connections);
-        Assert.NotEqual(oldParent, BinaryPrimitives.ReadUInt128LittleEndian(cluster.Attachments.Last().Body));
+        Assert.NotEqual(oldParent, BinaryPrimitives.ReadUInt128LittleEndian(BindIdentity(cluster.Attachments.Last().Body)));
     }
 
     [Fact]
@@ -499,6 +526,20 @@ public sealed class PrimaryPollingTests
     private static uint Partition(MockRequest request) =>
         BinaryPrimitives.ReadUInt32LittleEndian(request.Body.AsSpan(request.Body.Length - 18));
 
+    private static byte[] BindIdentity(byte[] body)
+    {
+        var position = 4;
+        for (var index = 0; index < 2; index++)
+        {
+            position += 1 + body[position];
+        }
+        Assert.Equal(position + LoginRegister.SESSION_IDENTITY_BYTES + LoginRegister.BIND_SECRET_BYTES, body.Length);
+        return body.AsSpan(position, LoginRegister.SESSION_IDENTITY_BYTES).ToArray();
+    }
+
+    private static byte[] BindingReply(MockRequest request) => Reply(request.Operation,
+        RegisterBody(BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(16)))[4..]);
+
     private sealed class PollCluster : IDisposable
     {
         internal readonly MockNode Coordinator = new();
@@ -507,7 +548,7 @@ public sealed class PrimaryPollingTests
         internal readonly ConcurrentQueue<MockRequest> Attachments = new();
         internal readonly ConcurrentQueue<MockRequest> Registrations = new();
         internal Func<MockRequest, byte[]> OnPrimaryPoll = Batch;
-        internal Func<MockRequest, byte[]> OnPrimaryAttachment = Answer;
+        internal Func<MockRequest, byte[]> OnPrimaryAttachment = BindingReply;
         internal Func<MockRequest, byte[]?>? OnCoordinator;
 
         internal PollCluster(int primaryCount = 2)
@@ -573,9 +614,10 @@ public sealed class PrimaryPollingTests
                     if (request.Operation == OPERATION_REGISTER)
                     {
                         Registrations.Enqueue(request);
+                        return Reply(request.Operation, [], VsrError.UNAUTHENTICATED);
                     }
 
-                    if (request.Code == CommandCodes.ATTACH_CONSUMER_SESSION_CODE)
+                    if (request.Code == CommandCodes.BIND_SESSION_CODE)
                     {
                         Attachments.Enqueue(request);
                         return OnPrimaryAttachment(request);

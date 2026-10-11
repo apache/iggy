@@ -27,13 +27,17 @@
 
 use crate::server::scenarios::create_client;
 use bytes::Bytes;
+use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
-use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
+use iggy_common::VsrSessionControl;
 use iggy_common::wire_conversions::{
     consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
 };
@@ -41,6 +45,7 @@ use integration::harness::{TestHarness, login_root};
 
 const STREAM_NAME: &str = "auth-test-stream";
 const TOPIC_NAME: &str = "auth-test-topic";
+const INVALID_BIND_SECRET: [u8; 32] = [0; 32];
 
 /// Shared test context with identifiers used across command tests.
 struct TestContext {
@@ -69,8 +74,18 @@ pub async fn run(harness: &TestHarness) {
     // Phase 1: Verify ping works without auth
     client.ping().await.expect("ping should work without auth");
 
+    let registered = harness.tcp_root_client().await.unwrap();
+    let binding_identity = {
+        let handle = registered.client();
+        let transport = handle.read().await;
+        let ClientWrapper::Tcp(tcp) = &*transport else {
+            panic!("TCP fixture must use the TCP transport");
+        };
+        tcp.session_identity().await.unwrap()
+    };
+
     // Phase 2: Verify all protected commands fail without auth
-    test_all_commands_require_auth(&client).await;
+    test_all_commands_require_auth(&client, binding_identity).await;
 
     // Phase 3: Login and verify commands work
     let identity = login_root(&client).await.expect("login failed");
@@ -80,7 +95,7 @@ pub async fn run(harness: &TestHarness) {
 
     // Phase 4: Logout and verify commands fail again
     client.logout_user().await.expect("logout should succeed");
-    test_all_commands_require_auth(&client).await;
+    test_all_commands_require_auth(&client, binding_identity).await;
 
     // Phase 5: Test PAT authentication
     login_root(&client).await.expect("login failed");
@@ -112,7 +127,7 @@ pub async fn run(harness: &TestHarness) {
 /// Tests all commands require authentication by iterating the dispatch table.
 /// New entries in `COMMAND_TABLE` will hit the wildcard arm and panic,
 /// forcing an explicit decision about each new command.
-async fn test_all_commands_require_auth(client: &IggyClient) {
+async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: SessionIdentity) {
     let ctx = TestContext::new();
 
     for entry in COMMAND_TABLE {
@@ -165,13 +180,17 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 .describe_options(OptionsScope::Topic)
                 .await
                 .map(|_| ()),
-            ATTACH_CONSUMER_SESSION_CODE => client
+            BIND_SESSION_CODE => client
                 .send_binary_request(
                     code,
-                    AttachConsumerSessionRequest {
-                        client_id: 0,
-                        session: 0,
-                        metadata_watermark: 0,
+                    BindSessionRequest {
+                        version_info: ClientVersionInfo {
+                            protocol_version: IGGY_PROTOCOL_VERSION,
+                            sdk_name: WireName::new("authentication-test").unwrap(),
+                            sdk_version: WireName::new(env!("CARGO_PKG_VERSION")).unwrap(),
+                        },
+                        identity: binding_identity,
+                        bind_secret: BindSecret::new(Box::new(INVALID_BIND_SECRET)),
                     }
                     .to_bytes(),
                 )
@@ -214,7 +233,6 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                     .update_stream(&ctx.stream_id, "x", &StreamUpdateOptions::default())
                     .await
             }
-            PURGE_STREAM_CODE => client.purge_stream(&ctx.stream_id).await,
 
             // Topics
             GET_TOPIC_CODE => client
@@ -245,7 +263,6 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                     )
                     .await
             }
-            PURGE_TOPIC_CODE => client.purge_topic(&ctx.stream_id, &ctx.topic_id).await,
 
             // Partitions
             CREATE_PARTITIONS_CODE => {
@@ -443,6 +460,7 @@ async fn setup_test_resources(client: &IggyClient) {
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

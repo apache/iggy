@@ -40,6 +40,11 @@ pub trait TopicClient {
     /// server's defaults at admission, so a future key costs no signature
     /// change here. Authentication is required, and the permission to manage
     /// the topics.
+    ///
+    /// If the new partitions would take the node past `[metadata]
+    /// partitions_max`, a binary transport returns
+    /// `IggyError::PartitionsLimitReached`. `HttpClient` returns
+    /// `IggyError::HttpResponseError` instead.
     async fn create_topic(
         &self,
         stream_id: &Identifier,
@@ -60,14 +65,6 @@ pub trait TopicClient {
     ///
     /// Authentication is required, and the permission to manage the topics.
     async fn delete_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError>;
-    /// Purge a topic by unique ID or name.
-    ///
-    /// Authentication is required, and the permission to manage the topics.
-    async fn purge_topic(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,

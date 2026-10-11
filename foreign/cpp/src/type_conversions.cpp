@@ -351,7 +351,8 @@ Stats Stats::FromFfi(ffi::Stats stats) {
                  std::string(stats.os_version.c_str(), stats.os_version.size()),
                  std::string(stats.kernel_version.c_str(), stats.kernel_version.size()),
                  std::string(stats.iggy_server_version.c_str(), stats.iggy_server_version.size()), server_semver,
-                 std::move(cache_metrics), stats.threads_count, stats.free_disk_space, stats.total_disk_space);
+                 std::move(cache_metrics), stats.threads_count, stats.free_disk_space, stats.total_disk_space,
+                 stats.open_files_count, stats.open_files_limit);
 }
 
 }  // namespace iggy

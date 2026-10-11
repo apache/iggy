@@ -39,7 +39,7 @@ public sealed class VsrProtocolDriftTests
     private const string CodesPath = "core/binary_protocol/src/codes.rs";
     private const string DispatchPath = "core/binary_protocol/src/dispatch.rs";
     private const string ErrorPath = "core/common/src/error/iggy_error.rs";
-    private const string ManifestPath = "core/binary_protocol/Cargo.toml";
+    private const string VersionPath = "core/binary_protocol/src/version.rs";
     private const string EvictionGraderPath = "core/common/src/error/eviction.rs";
     private const string ReplyResultPath = "core/binary_protocol/src/consensus/reply_result.rs";
     private const string CredentialDefaultsPath = "core/common/src/http/users/defaults.rs";
@@ -153,12 +153,13 @@ public sealed class VsrProtocolDriftTests
     }
 
     [Fact]
-    public void ProtocolVersion_MatchesTheBinaryProtocolCrateVersion()
+    public void ProtocolVersion_MatchesTheExplicitBinaryProtocolVersion()
     {
-        var manifest = ReadRustSource(ManifestPath);
-        var declared = Regex.Match(manifest, @"^version\s*=\s*""(\d+)\.(\d+)\.(\d+)", RegexOptions.Multiline);
+        var version = ReadRustSource(VersionPath);
+        var declared = Regex.Match(version,
+            @"IGGY_PROTOCOL_VERSION:\s*u32\s*=\s*pack_protocol_version\((\d+),\s*(\d+),\s*(\d+)\)");
 
-        Assert.True(declared.Success, "iggy_binary_protocol no longer declares a semver version.");
+        Assert.True(declared.Success, "The explicit binary protocol version was not found.");
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MAJOR, Group(declared, 1));
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_MINOR, Group(declared, 2));
         Assert.Equal(LoginRegister.PROTOCOL_VERSION_PATCH, Group(declared, 3));
@@ -271,6 +272,20 @@ public sealed class VsrProtocolDriftTests
         Assert.True(matched > 40, $"Only {matched} dispatch entries were matched by name; the Rust naming drifted.");
     }
 
+    [Fact]
+    public void InternalOperations_MatchTheRustClassifier()
+    {
+        var body = MatchesArmBody(ReadRustSource(OperationPath), "is_internal");
+        var rust = Regex.Matches(body, @"Self::(\w+)").Select(match => match.Groups[1].Value).ToHashSet();
+        Assert.NotEmpty(rust);
+        foreach (VsrOperation operation in Enum.GetValues<VsrOperation>())
+        {
+            var expected = ((byte)operation >= (byte)VsrOperation.CreateTopicWithAssignments
+                && (byte)operation < (byte)VsrOperation.CreateStream) || rust.Contains(operation.ToString());
+            Assert.Equal(expected, operation.IsInternal());
+        }
+    }
+
     /// <summary>
     ///     Pins <see cref="VsrOperations.IsMetadata" /> against <c>Operation::is_metadata</c>. Metadata replies
     ///     lead their body with a committed result section, so an operation misclassified here has its rejection
@@ -286,9 +301,8 @@ public sealed class VsrProtocolDriftTests
         var mismatches = new List<string>();
         foreach (VsrOperation operation in Enum.GetValues<VsrOperation>())
         {
-            // is_internal() short-circuits ahead of the match arm on both sides, so those members are metadata
-            // without appearing in the list.
-            var expected = rust.Contains(operation.ToString()) || operation.IsInternal();
+            var expected = rust.Contains(operation.ToString())
+                || (operation.IsInternal() && (byte)operation < (byte)VsrOperation.SendMessages);
             if (operation.IsMetadata() != expected)
             {
                 mismatches.Add($"{operation}: rust {expected}, .NET {operation.IsMetadata()}");

@@ -22,10 +22,8 @@ not rendered. See [What is not mapped](#what-is-not-mapped).
 
 ## Why this is worth doing before the data plane exists
 
-Authorization cannot be *enforced* yet. Produce and Fetch are stubs
-([#3535](https://github.com/apache/iggy/issues/3535),
-[#3536](https://github.com/apache/iggy/issues/3536)), so there is no operation to gate, and the
-verified identity is currently discarded.
+Authorization cannot be *enforced* yet. Produce and Fetch act as the bridge's Iggy user for every
+client, so no operation runs as the principal, and the verified identity is discarded.
 
 `DescribeAcls` is the one authorization surface that needs neither. It is a read: take the
 authenticated principal, take the permissions Iggy already holds for it, and answer in Kafka's
@@ -122,9 +120,8 @@ An empty result is `error_code` 0 with no resources, not an error. Kafka draws a
 rendering a Kafka topic name means resolving every id through a lookup, one call per resource, on
 what should be a cheap read. Worse, the resolution can be ambiguous in the direction we need it:
 the topic mapping is one-way, from Kafka name to Iggy stream and topic, and an override means an
-Iggy topic name does not identify the Kafka name it came from. The same limitation is already
-recorded against `OffsetFetch` with a null topic list. Closing it needs a reverse index, which
-belongs with whichever change first needs one.
+Iggy topic name does not identify the Kafka name it came from. Closing it needs a reverse index,
+which belongs with whichever change first needs one.
 
 The consequence is honest but worth stating: a principal whose access is granted per topic rather
 than globally is described as having no topic bindings. That under-reports rather than

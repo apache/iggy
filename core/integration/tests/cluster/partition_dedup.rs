@@ -18,32 +18,38 @@
 //! Spec tests for partition-plane request dedup (IGGY-274).
 //!
 //! Each partition consensus group keeps a slice of the VSR client table:
-//! per-client request watermarks folded in at commit. A replay of an
-//! already-committed `(client, request)` is answered with the empty success its
-//! original earned instead of committing a second copy.
+//! per-session request watermarks and original receipts folded in at commit.
+//! A committed retry returns that receipt without committing a second copy.
 //!
 //! The frames are hand-crafted on a raw TCP socket for the same reason
-//! `client_table_restart` does it: the Rust SDK mints a fresh `client_id` and
-//! request id per attempt, so it cannot express "the same request, twice" --
+//! `client_table_restart` does it: the Rust SDK allocates request IDs itself,
+//! so it cannot express "the same request, twice" --
 //! which is precisely the input under test. The SDK is still used for setup and
 //! for reading the log back, where it is the more honest observer.
 
+use crate::server::raw_tcp::TEST_BIND_SECRET;
 use bytes::{Bytes, BytesMut};
+use consensus::client_table::COMMITTED_WINDOW_BITS;
 use futures::future::join_all;
 use iggy::prelude::*;
-use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::consensus::{
-    Command, Operation, ReplyHeader, RequestHeader, read_size_field,
+    Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
+    result_section_len,
 };
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::send_messages::{RawMessage, SendMessagesEncoder};
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireConsumer, WireIdentifier,
     WireName, WirePartitioning,
 };
 use integration::harness::TestHarness;
 use integration::iggy_harness;
+use journal::partition_journal::{FRONTIER_FILE_NAME, PARTITION_WAL_BLOCK_SIZE};
 use secrecy::SecretString;
 use std::mem::offset_of;
 use std::net::SocketAddr;
@@ -85,14 +91,19 @@ async fn given_committed_send_when_replayed_should_absorb_without_a_second_copy(
     let body = send_messages_body(b"only-once");
     let header = request_header(Operation::SendMessages, session, 1, body.len());
 
-    let original = exchange_until_committed(&mut stream, &header, &body).await;
-    assert_eq!(original, 0, "the original send must commit");
-
-    // Byte-identical replay: what a retry after a lost reply looks like.
-    let replayed = exchange_until_committed(&mut stream, &header, &body).await;
+    let original = receipt_until_committed(&mut stream, &header, &body).await;
+    let replayed = receipt_until_committed(&mut stream, &header, &body).await;
     assert_eq!(
-        replayed, 0,
-        "an absorbed duplicate is a success, not an error"
+        replayed, original,
+        "a replay must return the original append receipt"
+    );
+
+    let changed_body = send_messages_body(b"changed-payload-must-not-append");
+    let changed_header = request_header(Operation::SendMessages, session, 1, changed_body.len());
+    let replayed = receipt_until_committed(&mut stream, &changed_header, &changed_body).await;
+    assert_eq!(
+        replayed, original,
+        "the first receipt must win even when a retry changes the payload"
     );
 
     let polled = poll_all(&client).await;
@@ -100,6 +111,297 @@ async fn given_committed_send_when_replayed_should_absorb_without_a_second_copy(
         polled, 1,
         "the replayed send must not append a second copy (got {polled} messages)"
     );
+}
+
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+async fn given_empty_partition_and_registration_churn_when_cluster_restarts_should_elect_and_bootstrap_new_groups(
+    harness: &mut TestHarness,
+) {
+    const REGISTRATIONS: u128 = 12;
+    const NEW_TOPIC: &str = "after-restart-topic";
+    let client = harness.root_client().await.unwrap();
+    seed_topic(&client).await;
+    let mut registrations = Vec::new();
+    for id in CLIENT_ID..CLIENT_ID + REGISTRATIONS {
+        registrations.push(
+            register_client_with_budget(harness.node(0).tcp_addr().unwrap(), id, COMMIT_BUDGET)
+                .await
+                .0,
+        );
+    }
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    while !(0..harness.cluster_size()).all(|node| {
+        harness
+            .node(node)
+            .data_path()
+            .join("streams/0/topics/0/partitions/0/prepares-1/frontier")
+            .exists()
+    }) {
+        assert!(
+            Instant::now() < deadline,
+            "every empty replica must publish its WAL frontier before restart"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+    drop(client);
+    drop(registrations);
+    harness.restart_cluster().await.unwrap();
+    let client = harness.root_client().await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        durability: Durability::Persisted,
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    };
+    client
+        .create_topic(&stream, NEW_TOPIC, &options)
+        .await
+        .unwrap();
+    for topic in [TOPIC_NAME, NEW_TOPIC] {
+        let topic = Identifier::named(topic).unwrap();
+        let mut messages = vec![
+            IggyMessage::builder()
+                .payload(Bytes::from_static(b"after-empty-restart"))
+                .build()
+                .unwrap(),
+        ];
+        client
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+        let polled = client
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(0),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            polled.messages.len(),
+            1,
+            "both the recovered empty group and a new group must have a primary"
+        );
+    }
+}
+
+#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
+async fn given_lost_send_reply_when_singleton_restarts_should_return_the_original_receipt(
+    harness: &mut TestHarness,
+) {
+    verify_lost_reply_restart(harness).await;
+}
+
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+async fn given_lost_send_reply_when_whole_cluster_restarts_should_return_the_original_receipt(
+    harness: &mut TestHarness,
+) {
+    verify_lost_reply_restart(harness).await;
+}
+
+async fn verify_lost_reply_restart(harness: &mut TestHarness) {
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    seed_topic(&observer).await;
+    let addr = harness.node(0).tcp_addr().unwrap();
+    let (mut original, session) = register(addr).await;
+    let body = send_messages_body(b"lost-reply-durable");
+    let header = request_header(Operation::SendMessages, session, 1, body.len());
+    original
+        .write_all(bytemuck::bytes_of(&header))
+        .await
+        .unwrap();
+    original.write_all(&body).await.unwrap();
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    while poll_all(&observer).await != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "unread request must commit before the crash"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+    let mut shared = bind(addr, session).await;
+    let expected = receipt_until_committed(&mut shared, &header, &body).await;
+    let directory = harness
+        .node(0)
+        .data_path()
+        .join("streams/0/topics/0/partitions/0");
+    let bytes = std::fs::read(directory.join("00000000000000000000.log")).unwrap();
+    assert!(
+        iggy_binary_protocol::batch::decode_batch_slice(&bytes).is_ok(),
+        "durable segment must decode before crash"
+    );
+    drop(original);
+    harness.kill_cluster().unwrap();
+    harness.restart_cluster().await.unwrap();
+    let nodes = (0..harness.cluster_size()).collect::<Vec<_>>();
+    let receipt = replay_on_nodes(harness, &nodes, session, &header, &body).await;
+    assert_eq!(
+        receipt, expected,
+        "restart must return the original append receipt"
+    );
+    let changed_body = send_messages_body(b"changed-after-recovery");
+    let changed_header = request_header(Operation::SendMessages, session, 1, changed_body.len());
+    let receipt = replay_on_nodes(harness, &nodes, session, &changed_header, &changed_body).await;
+    assert_eq!(
+        receipt, expected,
+        "recovery must preserve the first receipt when a retry changes the payload"
+    );
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    assert_eq!(
+        poll_all(&observer).await,
+        1,
+        "lost reply retry must not append again"
+    );
+    let next_body = send_messages_body(b"after-recovery");
+    let next_header = request_header(Operation::SendMessages, session, 2, next_body.len());
+    let _ = replay_on_nodes(harness, &nodes, session, &next_header, &next_body).await;
+    assert_eq!(
+        poll_all(&observer).await,
+        2,
+        "recovery must also preserve the next append position"
+    );
+}
+
+#[iggy_harness(cluster_nodes = 3, server(partition.wal_bytes_max = "134225920 B", sharding.cpu_allocation = "0..1"))]
+async fn given_reclaimed_wal_when_recovered_quorum_replays_should_return_the_original_receipt(
+    harness: &mut TestHarness,
+) {
+    const CHECKPOINT_OP: u64 = 2;
+    const MESSAGES_PER_BATCH: u32 = 33;
+    const PAYLOAD_BYTES: usize = 1024 * 1024;
+    const WAL_FRONTIER_SLOTS: usize = 2;
+    const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL4";
+    const WAL_CHECKPOINT_OFFSET: usize = 48;
+    const WAL_HEAD_OFFSET: usize = 72;
+    let observer = harness.root_client_for_node(0).await.unwrap();
+    seed_topic(&observer).await;
+    let (mut connection, session) = register(harness.node(0).tcp_addr().unwrap()).await;
+    let mut last = None;
+    for request in 1..=CHECKPOINT_OP {
+        let payload = vec![request as u8; PAYLOAD_BYTES];
+        let messages = (0..MESSAGES_PER_BATCH)
+            .map(|index| RawMessage {
+                id: u128::from(index) + 1,
+                origin_timestamp: 0,
+                headers: None,
+                payload: &payload,
+            })
+            .collect::<Vec<_>>();
+        let body = encode_send_messages(&messages);
+        let header = request_header(Operation::SendMessages, session, request, body.len());
+        let receipt = receipt_until_committed(&mut connection, &header, &body).await;
+        last = Some((header, body, receipt));
+    }
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        let checkpointed = (0..harness.cluster_size()).all(|node| {
+            let directory = harness
+                .node(node)
+                .data_path()
+                .join("streams/0/topics/0/partitions/0/prepares-1");
+            std::fs::read(directory.join(FRONTIER_FILE_NAME)).is_ok_and(|bytes| {
+                assert_eq!(
+                    bytes.len(),
+                    WAL_FRONTIER_SLOTS * PARTITION_WAL_BLOCK_SIZE,
+                    "unexpected partition WAL frontier size on node {node}"
+                );
+                bytes
+                    .as_chunks::<PARTITION_WAL_BLOCK_SIZE>()
+                    .0
+                    .iter()
+                    .any(|slot| {
+                        assert_eq!(
+                            &slot[..WAL_FRONTIER_MAGIC.len()],
+                            WAL_FRONTIER_MAGIC,
+                            "unsupported partition WAL frontier format on node {node}"
+                        );
+                        u64::from_le_bytes(
+                            slot[WAL_CHECKPOINT_OFFSET..WAL_CHECKPOINT_OFFSET + size_of::<u64>()]
+                                .try_into()
+                                .unwrap(),
+                        ) == CHECKPOINT_OP
+                            && u64::from_le_bytes(
+                                slot[WAL_HEAD_OFFSET..WAL_HEAD_OFFSET + size_of::<u64>()]
+                                    .try_into()
+                                    .unwrap(),
+                            ) == CHECKPOINT_OP
+                    })
+            }) && directory.join("receipts-2.checkpoint").exists()
+        });
+        if checkpointed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "every replica must publish receipt protection and reclaim the paired WAL"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+    let (header, body, expected) = last.unwrap();
+    harness.kill_cluster().unwrap();
+    harness.restart_node(1).unwrap();
+    harness.restart_node(2).unwrap();
+    let _ = harness.root_client_for_node(1).await.unwrap();
+    let receipt = replay_on_nodes(harness, &[1, 2], session, &header, &body).await;
+    assert_eq!(
+        receipt, expected,
+        "WAL reclamation must preserve the original receipt on a recovered quorum"
+    );
+    let changed_body = send_messages_body(b"changed-after-wal-reclamation");
+    let changed_header = request_header(
+        Operation::SendMessages,
+        session,
+        CHECKPOINT_OP,
+        changed_body.len(),
+    );
+    let receipt = replay_on_nodes(harness, &[1, 2], session, &changed_header, &changed_body).await;
+    assert_eq!(
+        receipt, expected,
+        "the checkpoint must preserve the first receipt for a changed payload"
+    );
+    let observer = harness.root_client_for_node(1).await.unwrap();
+    assert_eq!(
+        poll_all(&observer).await,
+        CHECKPOINT_OP as u32 * MESSAGES_PER_BATCH
+    );
+}
+
+async fn replay_on_nodes(
+    harness: &TestHarness,
+    nodes: &[usize],
+    session: u64,
+    header: &RequestHeader,
+    body: &Bytes,
+) -> Bytes {
+    let mut connections = Vec::new();
+    for &node in nodes {
+        connections.push(bind(harness.node(node).tcp_addr().unwrap(), session).await);
+    }
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        for connection in &mut connections {
+            let (status, receipt) = exchange_receipt(connection, header, body).await;
+            if status == 0 {
+                return receipt;
+            }
+            assert!(is_transient(status), "recovered request refused: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no recovered partition primary returned the receipt"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
 }
 
 #[iggy_harness(server(sharding.cpu_allocation = "0..1"))]
@@ -165,8 +467,20 @@ async fn given_committed_consumer_offset_when_replayed_should_absorb(harness: &m
     let addr = harness.node(0).tcp_addr().expect("node tcp address");
     let (mut stream, session) = register(addr).await;
 
-    // Seed a message so offset 0 is in range for the store.
-    let produce = send_messages_body(b"seed");
+    let produce = encode_send_messages(&[
+        RawMessage {
+            id: 1,
+            origin_timestamp: 0,
+            headers: None,
+            payload: b"seed-first",
+        },
+        RawMessage {
+            id: 2,
+            origin_timestamp: 0,
+            headers: None,
+            payload: b"seed-next",
+        },
+    ]);
     let produce_header = request_header(Operation::SendMessages, session, 1, produce.len());
     assert_eq!(
         exchange_until_committed(&mut stream, &produce_header, &produce).await,
@@ -177,13 +491,34 @@ async fn given_committed_consumer_offset_when_replayed_should_absorb(harness: &m
     let body = store_offset_body(0);
     let header = request_header(Operation::StoreConsumerOffset, session, 2, body.len());
 
-    let original = exchange_until_committed(&mut stream, &header, &body).await;
-    assert_eq!(original, 0, "the original offset store must commit");
-
-    let replayed = exchange_until_committed(&mut stream, &header, &body).await;
+    let original = receipt_until_committed(&mut stream, &header, &body).await;
+    let replayed = receipt_until_committed(&mut stream, &header, &body).await;
     assert_eq!(
-        replayed, 0,
-        "a replayed offset store is absorbed as a success"
+        replayed, original,
+        "a replayed offset store must return the original receipt"
+    );
+    let changed_body = store_offset_body(1);
+    let changed_header = request_header(
+        Operation::StoreConsumerOffset,
+        session,
+        2,
+        changed_body.len(),
+    );
+    let replayed = receipt_until_committed(&mut stream, &changed_header, &changed_body).await;
+    assert_eq!(replayed, original);
+    let stored = client
+        .get_consumer_offset(
+            &Consumer::new(Identifier::numeric(1).unwrap()),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.stored_offset, 0,
+        "a changed retry must not replace the committed offset"
     );
 
     // The next id still gets through: the watermark must not wedge the client.
@@ -299,6 +634,9 @@ const TOTAL_SENDS: u64 = TESTED_CLIENT_SENDS + FILLER_SENDS;
 /// Replayed id: the tested client's watermark itself. Absorbing it requires an
 /// entry for that client, which only the transferred artifact can supply.
 const REPLAYED_REQUEST: u64 = TESTED_CLIENT_SENDS;
+/// The newest id the window has aged out: exactly one window width below the
+/// watermark.
+const AGED_OUT_REQUEST: u64 = REPLAYED_REQUEST - COMMITTED_WINDOW_BITS;
 
 /// Filler identity whose sends evict the tested client from the repair ring.
 const FILLER_CLIENT_ID: u128 = 0x0DED_F111_E400;
@@ -389,6 +727,13 @@ async fn given_transferred_dedup_slice_when_old_request_replays_should_absorb(
     assert_eq!(
         replayed, 0,
         "a replay of a transferred watermark is absorbed as a success"
+    );
+
+    let aged_out = send_reconnecting(addr, CLIENT_ID, AGED_OUT_REQUEST, FINAL_COMMIT_BUDGET).await;
+    assert_eq!(
+        aged_out,
+        IggyError::RequestTooOld.as_code(),
+        "the transferred window must reject an aged-out request with an unknown outcome"
     );
 
     // The count is the discriminator: an absorbed replay leaves it at
@@ -497,6 +842,8 @@ async fn seed_topic(client: &IggyClient) {
                 // the repair floor past a rejoiner and forces the transfer the
                 // transferred-slice spec depends on.
                 messages_required_to_save: Some(1),
+                durability: Durability::Persisted,
+                consumer_offset_durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -529,9 +876,6 @@ async fn poll_up_to(client: &IggyClient, max: u32) -> u32 {
 
 /// Full `SendMessages` body: metadata prefix, batch header, one message.
 fn send_messages_body(payload: &[u8]) -> Bytes {
-    let stream_id = WireIdentifier::named(STREAM_NAME).expect("stream identifier");
-    let topic_id = WireIdentifier::named(TOPIC_NAME).expect("topic identifier");
-    let partitioning = WirePartitioning::PartitionId(PARTITION_ID);
     let messages = [RawMessage {
         // A fixed id keeps the replay byte-identical; a zero would be
         // server-stamped and the two frames would diverge.
@@ -540,9 +884,16 @@ fn send_messages_body(payload: &[u8]) -> Bytes {
         headers: None,
         payload,
     }];
-    let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &messages);
+    encode_send_messages(&messages)
+}
+
+fn encode_send_messages(messages: &[RawMessage<'_>]) -> Bytes {
+    let stream_id = WireIdentifier::named(STREAM_NAME).expect("stream identifier");
+    let topic_id = WireIdentifier::named(TOPIC_NAME).expect("topic identifier");
+    let partitioning = WirePartitioning::PartitionId(PARTITION_ID);
+    let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, messages);
     let mut buf = BytesMut::with_capacity(size);
-    SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &messages)
+    SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, messages)
         .expect("encode send_messages body");
     buf.freeze()
 }
@@ -618,26 +969,31 @@ async fn exchange_with_budget(
 /// [`DISCONNECTED`] rather than panicking, so the reconnecting callers can
 /// treat it like an eviction; a reply that never comes is still a failure.
 async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) -> u32 {
+    exchange_receipt(stream, header, body).await.0
+}
+
+async fn exchange_receipt(
+    stream: &mut TcpStream,
+    header: &RequestHeader,
+    body: &Bytes,
+) -> (u32, Bytes) {
     if stream.write_all(bytemuck::bytes_of(header)).await.is_err() {
-        return DISCONNECTED;
+        return (DISCONNECTED, Bytes::new());
     }
     if !body.is_empty() && stream.write_all(body).await.is_err() {
-        return DISCONNECTED;
+        return (DISCONNECTED, Bytes::new());
     }
 
     let mut reply_header = [0u8; HEADER_SIZE];
     match timeout(REPLY_WAIT, stream.read_exact(&mut reply_header)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(_)) => return DISCONNECTED,
+        Ok(Err(_)) => return (DISCONNECTED, Bytes::new()),
         Err(_) => panic!("reply header timed out"),
     }
 
     let command_offset = offset_of!(RequestHeader, command);
     if reply_header[command_offset] == Command::Eviction as u8 {
-        // The session died (view change, epoch fence): the contract is
-        // reconnect + re-register, and dedup must still hold because it keys
-        // on the client id, not the session.
-        return EVICTED;
+        return (EVICTED, Bytes::new());
     }
     assert_eq!(
         reply_header[command_offset],
@@ -652,15 +1008,82 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
             .unwrap(),
     );
     let total_size = read_size_field(&reply_header).expect("reply size field") as usize;
-    if total_size > HEADER_SIZE {
-        let mut discard = vec![0u8; total_size - HEADER_SIZE];
-        match timeout(REPLY_WAIT, stream.read_exact(&mut discard)).await {
+    assert!(
+        total_size >= HEADER_SIZE,
+        "reply frame is shorter than its header"
+    );
+    let mut receipt = vec![0u8; total_size - HEADER_SIZE];
+    if !receipt.is_empty() {
+        match timeout(REPLY_WAIT, stream.read_exact(&mut receipt)).await {
             Ok(Ok(_)) => {}
-            Ok(Err(_)) => return DISCONNECTED,
+            Ok(Err(_)) => return (DISCONNECTED, Bytes::new()),
             Err(_) => panic!("reply body timed out"),
         }
     }
-    status
+    (status, Bytes::from(receipt))
+}
+
+async fn receipt_until_committed(
+    stream: &mut TcpStream,
+    header: &RequestHeader,
+    body: &Bytes,
+) -> Bytes {
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        let (status, receipt) = exchange_receipt(stream, header, body).await;
+        if status == 0 {
+            assert!(
+                !receipt.is_empty(),
+                "successful send must retain its original receipt"
+            );
+            return receipt;
+        }
+        assert!(is_transient(status), "unexpected send refusal: {status}");
+        assert!(
+            Instant::now() < deadline,
+            "send did not commit within {COMMIT_BUDGET:?}"
+        );
+        sleep(RETRY_PAUSE).await;
+    }
+}
+
+async fn bind(addr: SocketAddr, session: u64) -> TcpStream {
+    let body = BindSessionRequest {
+        version_info: ClientVersionInfo {
+            protocol_version: IGGY_PROTOCOL_VERSION,
+            sdk_name: WireName::new("iggy274-raw").unwrap(),
+            sdk_version: WireName::new("0.0.1").unwrap(),
+        },
+        identity: SessionIdentity {
+            client_id: CLIENT_ID,
+            session,
+            metadata_watermark: session,
+        },
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
+    }
+    .to_bytes();
+    let header = RequestHeader::for_request(
+        iggy_binary_protocol::codes::BIND_SESSION_CODE,
+        CLIENT_ID,
+        0,
+        session,
+        &body,
+    )
+    .unwrap();
+    let deadline = Instant::now() + COMMIT_BUDGET;
+    loop {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let (status, _) = exchange_receipt(&mut stream, &header, &body).await;
+        if status == 0 {
+            return stream;
+        }
+        assert!(
+            is_transient(status) || status == DISCONNECTED,
+            "binding refused: {status}"
+        );
+        assert!(Instant::now() < deadline, "binding did not recover");
+        sleep(RETRY_PAUSE).await;
+    }
 }
 
 /// Register `CLIENT_ID` as root, returning the connection and its bound
@@ -705,6 +1128,7 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
         username: WireName::new(DEFAULT_ROOT_USERNAME).unwrap(),
         password: SecretString::from(DEFAULT_ROOT_PASSWORD),
         client_context: None,
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
     }
     .to_bytes();
     let header = request_header_for(client, Operation::Register, 0, 0, body.len());
@@ -728,19 +1152,24 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
             .unwrap(),
     );
     let total_size = read_size_field(&reply_header).expect("login reply size") as usize;
+    assert!(
+        total_size >= HEADER_SIZE,
+        "reply frame is shorter than its header"
+    );
     let mut reply_body = vec![0u8; total_size - HEADER_SIZE];
     let Ok(Ok(_)) = timeout(REPLY_WAIT, stream.read_exact(&mut reply_body)).await else {
         return None;
     };
-    if status != 0 {
+    if status != 0 || result_code(&reply_body) != Some(0) {
         return None;
     }
-    let session_offset = offset_of!(ReplyHeader, commit);
-    Some(u64::from_le_bytes(
-        reply_header[session_offset..session_offset + 8]
-            .try_into()
-            .unwrap(),
-    ))
+    let payload = &reply_body[result_section_len(&reply_body).unwrap()..];
+    let response = LoginRegisterResponse::decode_from(payload).unwrap();
+    assert_ne!(
+        response.session, 0,
+        "only a committed registration supplies a session"
+    );
+    Some(response.session)
 }
 
 fn is_transient(code: u32) -> bool {

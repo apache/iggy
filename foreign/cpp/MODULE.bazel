@@ -23,13 +23,30 @@ module(
 bazel_dep(name = "rules_cc", version = "0.2.25")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "googletest", version = "1.18.0.bcr.1")
-bazel_dep(name = "cucumber-cpp", version = "0.8.0.bcr.1")
+bazel_dep(name = "cucumber-cpp", version = "0.9.0")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 bazel_dep(name = "abseil-cpp", version = "20260526.0")
+
+iggy_source = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
+iggy_source(
+    name = "iggy_source",
+    build_file_content = """
+filegroup(
+    name = "cpp_rust_dependencies",
+    srcs = glob([
+        "core/binary_protocol/**",
+        "core/common/**",
+        "core/sdk/**",
+    ]) + ["Cargo.toml"],
+    visibility = ["//visibility:public"],
+)
+""",
+    path = "../..",
+)
 
 rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
 rust_host_tools.host_tools(
     name = "rs_host_tools",
-    version = "1.98.0",
+    version = "1.99.0",
 )
 use_repo(rust_host_tools, "rs_host_tools")

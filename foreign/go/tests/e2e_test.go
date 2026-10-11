@@ -28,7 +28,6 @@ import (
 	"testing"
 	"time"
 
-	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -234,9 +233,8 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, coordinatorEndpoint.Port == primaryEndpoint.Port && coordinatorEndpoint.IP.Equal(primaryEndpoint.IP),
 		"the fixture must separate metadata and partition primaries")
-	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	beforeClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
-	beforeClient := binaryserialization.DeserializeClient(before)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
 	counts := make(map[uint32]int)
 	for range int(details.PartitionsCount) * messagesPerPartition {
@@ -259,9 +257,8 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, polled.Messages, 1)
 	}
-	after, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	afterClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
-	afterClient := binaryserialization.DeserializeClient(after)
 	assert.Equal(t, beforeClient.ID, afterClient.ID)
 	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount)
 	assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress)
@@ -294,9 +291,8 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
 	consumer := iggcon.NewGroupConsumer(groupID)
 	coordinator := connected.GetConnectionInfo().ServerAddress
-	before, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	beforeClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
-	beforeClient := binaryserialization.DeserializeClient(before)
 	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
 
 	partition := uint32(0)
@@ -311,9 +307,8 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, uint64(1), stored.StoredOffset)
-	after, err := connected.SendBinaryRequest(ctx, uint32(command.GetMeCode), nil)
+	afterClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
-	afterClient := binaryserialization.DeserializeClient(after)
 	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
 	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
 }
@@ -333,6 +328,27 @@ func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
 	topic, err := connected.GetTopic(ctx, streamId, topicId)
 	require.NoError(t, err, "a metadata request still commits after raw traffic")
 	require.NotNil(t, topic)
+}
+
+// GetMe is self-scoped: the reply must describe this connection and this user,
+// so the user id is checked against the one the sign-in returned rather than
+// against a constant.
+func TestE2E_GetMeDescribesTheCallingClient(t *testing.T) {
+	connected := newClient(t)
+	ctx := context.Background()
+
+	identity, err := connected.LoginUser(ctx, rootUsername, rootPassword)
+	require.NoError(t, err)
+
+	me, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, me)
+	assert.Positive(t, me.ID)
+	assert.Equal(t, identity.UserId, me.UserID)
+	// The literal pins the wire value: MapClientInfo writes string(iggcon.Tcp)
+	// for transport byte 1, so comparing against the constant would pass for
+	// any value of it.
+	assert.Equal(t, "tcp", me.Transport)
 }
 
 func TestE2E_RejectsSessionControlCodesOnTheRawPath(t *testing.T) {
@@ -410,6 +426,10 @@ func TestE2E_OnlyPingWorksBeforeSigningIn(t *testing.T) {
 	metadata, err := connected.GetClusterMetadata(context.Background())
 	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
 	assert.Nil(t, metadata, "no roster leaks to an unauthenticated reader")
+
+	me, err := connected.GetMe(context.Background())
+	require.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Nil(t, me, "the caller's own client info is not served before sign-in")
 }
 
 func TestE2E_LogoutEndsTheSession(t *testing.T) {

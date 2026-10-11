@@ -152,6 +152,17 @@ pub struct MessageBusConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub handshake_grace: IggyDuration,
+
+    /// Node-wide cap on open client sockets: TCP, TCP-TLS, WS, WSS, HTTP and
+    /// HTTPS together. Shard 0 closes a connection past it at accept, so
+    /// clients cannot take the descriptors that storage writes need. QUIC
+    /// does not count, because its connections share one UDP socket.
+    ///
+    /// `None` resolves at boot to half the soft `RLIMIT_NOFILE`. Zero is no
+    /// cap.
+    #[config_env(leaf)]
+    #[serde(default)]
+    pub connections_max: Option<u32>,
 }
 
 impl Validatable<ConfigurationError> for MessageBusConfig {

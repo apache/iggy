@@ -20,9 +20,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use std::sync::Arc;
 
 #[async_trait]
@@ -75,6 +79,48 @@ mod vsr_session_sealed {
 /// mutation corrupts the dedup counter or silently breaks at-most-once.
 #[async_trait]
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
+    /// Internal bearer proof. Never log or expose this value to application users.
+    #[doc(hidden)]
+    async fn session_bind_secret(&self) -> Result<BindSecret, IggyError>;
+    async fn session_identity(&self) -> Result<SessionIdentity, IggyError>;
+    #[doc(hidden)]
+    fn decode_session_binding(
+        &self,
+        identity: SessionIdentity,
+        response: &[u8],
+    ) -> Result<LoginRegisterResponse, IggyError> {
+        let bound =
+            LoginRegisterResponse::decode_from(response).map_err(|_| IggyError::InvalidFormat)?;
+        if bound.session == 0 {
+            return Err(IggyError::InvalidSession(bound.session));
+        }
+        if identity.session != 0 && bound.session != identity.session {
+            return Err(IggyError::SessionMismatch(identity.session, bound.session));
+        }
+        Ok(bound)
+    }
+    async fn resume_vsr_session(&self) -> Result<(), IggyError>
+    where
+        Self: Sync,
+    {
+        let identity = self.session_identity().await?;
+        let request = BindSessionRequest {
+            version_info: crate::rust_sdk_version_info(self.sdk_version())?,
+            identity,
+            bind_secret: self.session_bind_secret().await?,
+        };
+        let response = self
+            .send_raw_with_response(
+                iggy_binary_protocol::codes::BIND_SESSION_CODE,
+                request.to_bytes(),
+            )
+            .await?;
+        let bound = self.decode_session_binding(identity, &response)?;
+        self.bind_vsr_session(bound.session).await?;
+        self.set_state(ClientState::Authenticated).await;
+        self.publish_event(DiagnosticEvent::SignedIn).await;
+        Ok(())
+    }
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
     /// Keep the credentials a sign-in succeeded with, so a transport that

@@ -6,7 +6,8 @@ Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
 Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
-> Skills live under `.claude/skills/`. Load
+> Skills live under `.claude/skills/`, with per-skill links under
+> `.agents/skills/` for Codex. Load
 > [connectors-overview](.claude/skills/connectors-overview/SKILL.md)
 > first for any change under `core/connectors/`. Other subsystems
 > follow the repo-wide principles in this file.
@@ -134,6 +135,9 @@ iggy/
 
 Each `SKILL.md` has YAML frontmatter (name, description). For
 connectors work, load `connectors-overview` first as router.
+Claude Code uses `/skill-name`; Codex uses `$skill-name` or `/skills`.
+Keep one source under `.claude/skills/` and link its directory from
+`.agents/skills/`. Keep templates and references inside the source directory.
 
 - [connectors-overview](.claude/skills/connectors-overview/SKILL.md) - router + universal connector rules
 - [connector-runtime](.claude/skills/connector-runtime/SKILL.md) - FFI host, lifecycle, state, metrics
@@ -143,12 +147,20 @@ connectors work, load `connectors-overview` first as router.
 - [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
 - [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
 
-Repo-wide, user-invoked only. `disable-model-invocation: true` keeps it
-out of the agent's context; do not replicate its steps. When a
-non-trivial change passes verification, suggest `/team-review <target>`.
+Review skills are user-invoked only. Keep `disable-model-invocation: true`
+for Claude Code and `policy.allow_implicit_invocation: false` in
+`agents/openai.yaml` for Codex. Do not replicate their steps without an
+explicit invocation. When a non-trivial change passes verification,
+suggest `/team-review <target>` in Claude Code or `$team-review <target>`
+in Codex.
 
 - [connector-review](.claude/skills/connector-review/SKILL.md) - adversarial connectors PR/branch review with validation
 - [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
+- [team-review-slim](.claude/skills/team-review-slim/SKILL.md) - four-expert review without independent validation rounds
+
+Review skills share [execution instructions](.claude/skills/team-review/references/execution.md)
+for target preparation and client-specific agent tools. Run
+`./scripts/ci/skills.sh` to check skill metadata, links, and invocation policies.
 
 ## Repo-wide principles
 

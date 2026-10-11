@@ -162,6 +162,7 @@ public class SystemTests
         response.FreeDiskSpace.ShouldBeGreaterThan(0u);
         response.FreeDiskSpace.ShouldBeGreaterThan(0u);
         response.FreeDiskSpace.ShouldBeLessThanOrEqualTo(response.TotalDiskSpace);
+        response.OpenFilesLimit.ShouldBeGreaterThan(0u);
     }
 
     [Test]

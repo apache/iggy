@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::env;
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -146,9 +147,18 @@ fn given_a_ceiling_at_the_u16_maximum_when_choosing_a_band_should_refuse() {
 }
 
 /// Exclusive claim on one port, released (and the port freed for reuse) when dropped - including
-/// on an unclean process exit, since the OS drops the `flock` with the file descriptor. Unlike
-/// bind-then-drop, this process itself never binds the port before `iggy-server` does; see
-/// `port_band`'s doc comment for the limits of that guarantee against *other* processes.
+/// on an unclean process exit, since the OS drops the `flock` with the file descriptor.
+///
+/// `acquire` also bind-probes the port (bind, then drop the listener with no accepted
+/// connections, so nothing lingers in `TIME_WAIT`) before handing it out. The flock alone only
+/// excludes another `PortGuard`-based process; it does nothing against a process from a *prior*
+/// test run that's still holding the port (killed hard enough to skip `Drop`, so its own flock
+/// died with it but its listener didn't). A bind-probe catches that case at acquisition time
+/// instead of leaving callers to detect a stale listener after the fact - detecting it after
+/// the fact can't work on the first readiness-poll iteration, before the real child has even
+/// attempted its own `bind()` yet, so a successful connect this early is ambiguous between
+/// "ours, racing ahead of its own listen" and "a stale orphan's". See `port_band`'s doc comment
+/// for the limits of this guarantee against a `bind(0)` from an unrelated process.
 pub struct PortGuard {
     pub port: u16,
     _lock: File,
@@ -171,7 +181,10 @@ impl PortGuard {
             else {
                 continue;
             };
-            if file.try_lock().is_ok() {
+            // A stale listener (not another PortGuard user, the flock already excludes those)
+            // can still hold this port - skip it on a failed bind, leave the lock file for the
+            // next acquire to try again, keep scanning.
+            if file.try_lock().is_ok() && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
                 return Self { port, _lock: file };
             }
         }
@@ -250,6 +263,13 @@ impl TestServer {
         let address = format!("127.0.0.1:{}", port_guard.port);
 
         let mut command = Command::new(iggy_server_binary());
+        // env_clear(): without it the child inherits this test process's full environment, and
+        // a stray recognized IGGY_* var could silently change the spawned server's behavior out
+        // from under this harness's assertions (same reasoning as gateway_process.rs's spawn).
+        command.env_clear();
+        if let Some(llvm_profile_file) = env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", llvm_profile_file);
+        }
         command
             .env("IGGY_PATH", data_dir.display().to_string())
             .env("IGGY_TCP_ADDRESS", &address)
@@ -293,40 +313,15 @@ impl TestServer {
     }
 
     /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
-    /// `RECONNECTION_RETRIES` (3 dials at ~1s apart) on every failed attempt, so a poll loop built
+    /// `RECONNECTION_RETRIES` (3 retries after the first attempt, 4 dials at ~1s apart total) on
+    /// every failed attempt, so a poll loop built
     /// on it pays several real seconds per iteration instead of running at its own 100ms cadence,
     /// and a *successful* poll iteration would authenticate a client and then drop it without
     /// `close()`, leaking a session server-side. A TCP accept slightly ahead of the app being
     /// ready to authenticate is fine - every caller's own subsequent `IggyBridge::connect` already
     /// retries a few times, which covers the last few hundred ms of that gap.
-    ///
-    /// Checks `try_wait()` every iteration: a server that fails at boot (bad config, a port
-    /// stolen between `PortGuard::acquire` and its own bind) exits almost immediately, and without
-    /// this check that reads as "still starting" for the full 30s budget - the eventual failure
-    /// names the wrong cause ("did not become ready") instead of the real one (exited early, with
-    /// whatever it printed before dying).
     async fn wait_ready(&mut self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll child status") {
-                panic!(
-                    "iggy-server at {} exited during startup with {status}",
-                    self.address
-                );
-            }
-            if tokio::net::TcpStream::connect(self.address.as_str())
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "iggy-server at {} did not become ready within the startup budget",
-                self.address
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        wait_for_listener(&mut self.child, &self.address, "iggy-server").await;
     }
 
     pub fn test_config(&self) -> IggyBridgeConfig {
@@ -352,7 +347,32 @@ impl TestServer {
 const SIGTERM_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGKILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-fn graceful_kill(child: &mut Child) {
+/// Shared by `TestServer::wait_ready` and `TestGateway::wait_ready` (`gateway_process.rs`) -
+/// identical poll loop, only the process label in the panic/assert messages differs.
+///
+/// Checks `try_wait()` every iteration: a process that fails at boot (bad config, a port stolen
+/// between `PortGuard::acquire` and its own bind) exits almost immediately, and without this
+/// check that reads as "still starting" for the full 30s budget - the eventual failure names the
+/// wrong cause ("did not become ready") instead of the real one (exited early, with whatever it
+/// printed before dying).
+pub async fn wait_for_listener(child: &mut Child, address: &str, label: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            panic!("{label} at {address} exited during startup with {status}");
+        }
+        if tokio::net::TcpStream::connect(address).await.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{label} at {address} did not become ready within the startup budget"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+pub fn graceful_kill(child: &mut Child) {
     // `wait_ready` calls `try_wait()` too (and panics on an early exit, unwinding into this via
     // `Drop`) - if it already reaped the child, `child.id()` is a PID the OS is free to hand to an
     // unrelated process by the time we get here, and a raw `libc::kill` (unlike `std::Child::kill`,

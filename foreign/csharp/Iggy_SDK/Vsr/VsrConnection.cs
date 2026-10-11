@@ -38,7 +38,7 @@ internal sealed class VsrConnection : IDisposable
     private readonly long _maxResponseFrameSize;
 
     /// <summary>
-    ///     Tears this connection down at the transport level - session reset, state event - when a frame-level
+    ///     Tears this connection down at the transport level when a frame-level
     ///     failure makes the socket unusable. Runs under the sending lock the caller holds, and it is the
     ///     transport's job to ignore the call when a reconnect already replaced this connection.
     /// </summary>
@@ -99,6 +99,7 @@ internal sealed class VsrConnection : IDisposable
     {
         var encoded = false;
         var requestStarted = false;
+        var uncertain = false;
 
         try
         {
@@ -139,10 +140,23 @@ internal sealed class VsrConnection : IDisposable
 
                     return VsrAttempt.Ok(response, this);
                 }
-                catch (IggyInvalidStatusCodeException e) when (retryTransient && IsReplayableTransient(e, transientDeadline,
-                                                                   readDeadline))
+                catch (IggyInvalidStatusCodeException e)
                 {
-                    var governingDeadline = e.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
+                    uncertain |= e is { FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_COMMITTED };
+                    var verdict = uncertain && e is
+                    {
+                        FromServer: true,
+                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.UNAUTHORIZED or
+                            VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT
+                    }
+                        ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
+                            "A later refusal does not resolve the original request outcome.")
+                        : e;
+                    if (!retryTransient || !IsReplayableTransient(verdict, transientDeadline, readDeadline))
+                    {
+                        return VsrAttempt.Failed(encoded, verdict, requestStarted, this);
+                    }
+                    var governingDeadline = verdict.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
                         ? readDeadline
                         : transientDeadline;
                     var remaining = governingDeadline - Environment.TickCount64;

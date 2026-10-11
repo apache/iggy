@@ -70,21 +70,18 @@ pub trait Pipeline {
     fn verify(&self);
 
     /// True iff either queue carries `client_id`. Used by metadata-plane
-    /// preflight for in-flight dedup; the partition plane uses the narrower
-    /// [`Self::has_message_from_client_request`] instead, to keep a client's
-    /// pipeline depth. Default `false`; falls through to slot dedup in
-    /// `check_request`.
+    /// preflight for in-flight dedup. Default `false` falls through to the
+    /// committed receipt check.
     fn has_message_from_client(&self, _client_id: u128) -> bool {
         false
     }
 
-    /// True iff either queue carries this exact `(client, request)`. The
-    /// partition-plane in-flight dedup check: narrow on purpose, so a client
-    /// keeps its pipeline depth and only an exact replay is absorbed.
-    /// Default `false`.
-    fn has_message_from_client_request(&self, _client_id: u128, _request: u64) -> bool {
-        false
-    }
+    fn pending_client_ids(&self) -> impl Iterator<Item = u128>;
+    /// The unresolved session, request number, and operation.
+    fn pending_request(
+        &self,
+        client_id: u128,
+    ) -> Option<(u64, u64, iggy_binary_protocol::Operation)>;
 
     /// Drop reply senders on every entry; receivers wake `Canceled`.
     /// View-change reset uses this to unblock awaiters while preserving
@@ -108,6 +105,11 @@ pub trait Pipeline {
     /// Pop request-queue head. Called when a prepare commits and frees
     /// a slot. Default `None` (no queue).
     fn pop_request(&mut self) -> Option<Self::Request> {
+        None
+    }
+
+    /// Inspect the original queue head without transferring reply ownership.
+    fn request_head(&self) -> Option<&Self::Request> {
         None
     }
 }
@@ -171,8 +173,8 @@ pub mod client_table;
 pub mod le_cursor;
 pub use client_table::{
     CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableMode,
-    ClientTableSnapshot, ClientTableWireError, CommitReply, DISCONNECT_LOGOUT_REQUEST_ID,
-    DedupWatermark, FenceSnapshot, SessionEnd,
+    ClientTableSnapshot, ClientTableWireError, CommitReply, DedupWatermark,
+    EXPIRED_SESSION_REQUEST_ID, RESERVED_CLIENT_ID, is_partition_receipt_operation,
 };
 pub mod state_manifest;
 pub use state_manifest::{
@@ -188,8 +190,7 @@ pub use state_transfer::{
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver, Sender, channel as oneshot_channel};
 
-mod fatal;
-pub use fatal::{FatalReason, fatal};
+pub use server_common::fatal::{FatalReason, fatal};
 
 mod impls;
 pub use impls::*;

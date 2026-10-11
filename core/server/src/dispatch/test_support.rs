@@ -29,8 +29,9 @@ use message_bus::installer::ConnectionInstaller;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, JoinHandle, MessageBus,
-    ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError, SharedTlsServerConfig,
+    BusMessage, ClientConnectionLostFn, ClientForwardFn, ConnectionLostFn, ConnectionPermit,
+    JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
+    SharedTlsServerConfig,
 };
 use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::stream::Streams;
@@ -144,11 +145,19 @@ impl ConnectionInstaller for SpyBus {
     }
     fn release_replica_handshake_slot(&self, _slot: u64) {}
     fn clear_replica_dial_pending(&self, _replica_id: u8) {}
-    fn install_client_fd(&self, _fd: DupedFd, _meta: ClientConnMeta, _on_request: RequestHandler) {}
+    fn install_client_fd(
+        &self,
+        _fd: DupedFd,
+        _meta: ClientConnMeta,
+        _permit: ConnectionPermit,
+        _on_request: RequestHandler,
+    ) {
+    }
     fn install_client_ws_fd(
         &self,
         _fd: DupedFd,
         _meta: ClientConnMeta,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -157,6 +166,7 @@ impl ConnectionInstaller for SpyBus {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -165,6 +175,7 @@ impl ConnectionInstaller for SpyBus {
         _fd: DupedFd,
         _meta: ClientConnMeta,
         _config: SharedTlsServerConfig,
+        _permit: ConnectionPermit,
         _on_request: RequestHandler,
     ) {
     }
@@ -181,6 +192,10 @@ impl ConnectionInstaller for SpyBus {
 /// far apart as the random draw at bootstrap makes them.
 pub const FIRST_BOOT: u128 = 0x5EED_0001;
 pub const SECOND_BOOT: u128 = 0x9E37_79B9_7F4A_7C15;
+
+/// `reserved_codes_remain_unknown` pins 131 as never reused, so a new
+/// operation cannot claim it.
+pub const UNDECLARED_OPERATION: u8 = 131;
 
 /// Shard 0 carrying a metadata consensus group of `replica_count`
 /// replicas in which this node is `replica`. No journal: every test using
@@ -299,6 +314,8 @@ pub fn prepare_message(
             client,
             request,
             user_id: 0,
+            session: 1,
+            retry_capacity: u32::try_from(consensus::CLIENTS_TABLE_MAX).unwrap(),
             group: server_common::sharding::METADATA_GROUP,
             ..Default::default()
         };

@@ -84,6 +84,18 @@ func (c *GetStats) MarshalBinary() ([]byte, error) {
 	return []byte{}, nil
 }
 
+// GetMe asks for the info of the client that sent the request, so it needs no
+// identifier and carries no payload.
+type GetMe struct{}
+
+func (c *GetMe) Code() Code {
+	return GetMeCode
+}
+
+func (c *GetMe) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
+}
+
 type Ping struct{}
 
 func (p *Ping) Code() Code {

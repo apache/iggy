@@ -20,4 +20,5 @@ pub mod api;
 pub mod bounds_guard;
 pub mod handlers;
 pub mod header;
+pub(crate) mod probe_board;
 pub mod sasl;

@@ -56,6 +56,8 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -406,6 +408,8 @@ async fn given_full_consumer_offset_table_when_server_restarts_should_preserve_a
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),
+                durability: iggy::prelude::Durability::Persisted,
+                consumer_offset_durability: iggy::prelude::Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )

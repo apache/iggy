@@ -34,8 +34,9 @@ public class HeartbeatTests
     private const string TopicName = "heartbeat-topic";
     private const string GroupName = "heartbeat-group";
 
-    // Comfortably past the server's stale threshold of 1.2 intervals, with room for the verifier's own tick.
-    private static readonly TimeSpan IdleFor = IggyServerFixture.ServerHeartbeatInterval * 3;
+    // Transport eviction removes the binding; committed lease expiry removes membership.
+    private static readonly TimeSpan IdleFor = IggyServerFixture.SessionTimeout +
+                                              IggyServerFixture.ServerHeartbeatInterval * 3;
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture Fixture { get; init; }

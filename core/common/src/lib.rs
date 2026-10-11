@@ -91,6 +91,7 @@ pub use traits::message_client::MessageClient;
 pub use traits::partition_client::PartitionClient;
 pub use traits::partitioner::Partitioner;
 pub use traits::personal_access_token_client::PersonalAccessTokenClient;
+pub use traits::rust_sdk_version_info;
 pub use traits::segment_client::SegmentClient;
 pub use traits::sizeable::Sizeable;
 pub use traits::stream_client::StreamClient;

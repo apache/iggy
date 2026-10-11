@@ -85,7 +85,7 @@ runs:
       if: inputs.task == 'lint'
       uses: golangci/golangci-lint-action@v9
       with:
-        version: v2.11.3
+        version: v2.13.2
         working-directory: foreign/go
         args: --timeout=5m
         skip-cache: true
@@ -94,7 +94,7 @@ runs:
       if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
       uses: golangci/golangci-lint-action@v9
       with:
-        version: v2.11.3
+        version: v2.13.2
         working-directory: bdd/go
         args: --timeout=5m
         skip-cache: true
@@ -103,7 +103,7 @@ runs:
       if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
       uses: golangci/golangci-lint-action@v9
       with:
-        version: v2.11.3
+        version: v2.13.2
         working-directory: examples/go
         args: --timeout=5m
         skip-cache: true

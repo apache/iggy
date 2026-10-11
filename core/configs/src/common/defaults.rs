@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::IggyDuration;
+
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::server::{
     ConsumerGroupConfig, HeartbeatConfig, MemoryPoolConfig, MessagesMaintenanceConfig,
@@ -221,8 +223,17 @@ impl Default for LoggingConfig {
                 .parse()
                 .unwrap(),
             retention: SERVER_CONFIG.logging.retention.parse().unwrap(),
+            sysinfo_print_interval: default_sysinfo_print_interval(),
         }
     }
+}
+
+pub(crate) fn default_sysinfo_print_interval() -> IggyDuration {
+    SERVER_CONFIG
+        .logging
+        .sysinfo_print_interval
+        .parse()
+        .unwrap()
 }
 
 impl Default for EncryptionConfig {

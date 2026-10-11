@@ -33,6 +33,19 @@ use server_common::sharding::IggyNamespace;
 
 pub(super) type PollTestMetadata = MuxStateMachine<variadic!(Users, Streams)>;
 
+pub(super) fn partitions_config() -> PartitionsConfig {
+    let segment_size = IggyByteSize::from(1_048_576_u64);
+    PartitionsConfig {
+        messages_required_to_save: 100,
+        size_of_messages_required_to_save: segment_size,
+        validate_checksum: true,
+        segment_size,
+        preallocate_segments: false,
+        encryptor: None,
+        path_layout: PartitionPathLayout::default(),
+    }
+}
+
 /// Commit one batch starting at offset zero and keep it resident. Each call
 /// creates an independent partition history, even for the same namespace.
 #[allow(clippy::future_not_send)]
@@ -44,16 +57,8 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
     let cluster_id = 1;
     let replica_id = 0;
     let replica_count = 3;
-    let segment_size = IggyByteSize::from(1_048_576_u64);
-    let config = PartitionsConfig {
-        messages_required_to_save: 100,
-        size_of_messages_required_to_save: segment_size,
-        validate_checksum: true,
-        segment_size,
-        preallocate_segments: false,
-        encryptor: None,
-        path_layout: PartitionPathLayout::default(),
-    };
+    let config = partitions_config();
+    let segment_size = config.segment_size;
     let consensus = VsrConsensus::new(
         cluster_id,
         replica_id,
@@ -68,6 +73,11 @@ pub(super) async fn partition_with_messages<B: MessageBus + Clone>(
         consensus,
         segment_size,
     ));
+    partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+        durability: iggy_common::Durability::Persisted,
+        consumer_offset_durability: iggy_common::Durability::Persisted,
+        ..Default::default()
+    });
 
     assert!(!payloads.is_empty(), "fixture requires messages");
     let mut messages = IggyMessages::with_capacity(payloads.len());

@@ -29,7 +29,7 @@ use reqwest::{Method, Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -346,6 +346,7 @@ impl HttpClient {
                     StatusCode::UNAUTHORIZED => Err(IggyError::Unauthenticated),
                     StatusCode::FORBIDDEN => Err(IggyError::Unauthorized),
                     StatusCode::NOT_FOUND => Err(IggyError::ResourceNotFound(reason)),
+                    _ if is_request_too_old_body(&reason) => Err(IggyError::RequestTooOld),
                     _ => Err(IggyError::HttpResponseError(status.as_u16(), reason)),
                 }
             }
@@ -374,6 +375,18 @@ impl HttpClient {
 #[derive(Debug, Serialize)]
 struct RefreshToken {
     token: String,
+}
+
+/// True when an error body is the server's JSON error whose `id` is the
+/// `RequestTooOld` code. The producer stops retrying on that error, so it must
+/// not reach the caller as a plain `HttpResponseError`.
+fn is_request_too_old_body(body: &str) -> bool {
+    #[derive(Deserialize)]
+    struct ErrorId {
+        id: u32,
+    }
+    serde_json::from_str::<ErrorId>(body)
+        .is_ok_and(|error| error.id == IggyError::RequestTooOld.as_code())
 }
 
 /// Unit tests for HttpClient.

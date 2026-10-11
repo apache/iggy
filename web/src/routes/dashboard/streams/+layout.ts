@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { clientApi } from '$lib/api/clientApi';
-import { streamMapper, type Stream } from '$lib/domain/Stream';
+import { clientApi } from '#lib/api/clientApi.js';
+import { streamMapper, type Stream } from '#lib/domain/Stream.js';
 import type { LayoutLoad } from './$types';
 
 export const load: LayoutLoad = async () => {

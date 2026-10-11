@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -25,6 +26,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
@@ -38,8 +40,59 @@ namespace Apache.Iggy.Tests.VsrTests;
 /// </summary>
 public sealed class EndpointFailoverTests
 {
-    [Fact]
-    public async Task ResumesOnASurvivorAfterTheSignedInNodeDies()
+    [Theory]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
+    [InlineData(VsrError.UNAUTHORIZED)]
+    [InlineData(VsrError.UNAUTHENTICATED)]
+    [InlineData(VsrError.STALE_CLIENT)]
+    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite(int refusal)
+    {
+        const int RefusalCount = 50;
+        using var node = new MockNode();
+        var attempts = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePartitions)
+            {
+                attempts.Enqueue(request);
+                var status = attempts.Count switch
+                {
+                    1 => VsrError.TRANSIENT_NOT_COMMITTED,
+                    <= RefusalCount => refusal,
+                    _ => 0
+                };
+                return Reply(request.Operation, status == 0 ? new byte[4] : [], (uint)status);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1)
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(RefusalCount + 1, attempts.Count);
+        var original = attempts.First();
+        Assert.All(attempts, replay =>
+        {
+            Assert.Equal(original.ClientId, replay.ClientId);
+            Assert.Equal(original.Session, replay.Session);
+            Assert.Equal(original.RequestId, replay.RequestId);
+            Assert.Equal(original.Body, replay.Body);
+        });
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ResumesOnASurvivorAfterTheSignedInNodeDies(bool changeCredentials)
     {
         using var primary = new MockNode();
         using var survivor = new MockNode();
@@ -49,9 +102,12 @@ public sealed class EndpointFailoverTests
         primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
             ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
             : Answer(request));
-        survivor.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
-            ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, survivor.Port))
-            : Answer(request));
+        survivor.Serve(request =>
+        {
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, survivor.Port))
+                : Answer(request);
+        });
 
         var configuration = new IggyClientConfigurator
         {
@@ -70,6 +126,12 @@ public sealed class EndpointFailoverTests
         // No auto login: the credentials come from the caller's own sign-in, which is the shape that could not
         // reconnect at all before.
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        if (changeCredentials)
+        {
+            await client.UpdateUserAsync(Identifier.Numeric(7), "renamed", token: TestContext.Current.CancellationToken);
+            await client.ChangePasswordAsync(Identifier.String("renamed"), "iggy", "new-secret",
+                TestContext.Current.CancellationToken);
+        }
         await client.PingAsync(TestContext.Current.CancellationToken);
         Assert.Equal(1, primary.Pings);
 
@@ -81,8 +143,114 @@ public sealed class EndpointFailoverTests
         Assert.True(resumed,
             $"the client has to resume on the survivor the roster named ({lastError}, survivor saw " +
             $"{survivor.Registrations} registrations and {survivor.Pings} pings)");
-        Assert.True(survivor.Registrations >= 1, "the remembered credentials signed in again on the survivor");
+        Assert.Equal(0, survivor.Registrations);
+        Assert.True(survivor.Requests(BIND_SESSION_CODE) >= 1, "the retained session resumed on the survivor");
         Assert.True(survivor.Pings >= 1, "the request landed on the survivor");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(VsrError.UNAUTHENTICATED)]
+    [InlineData(VsrError.STALE_CLIENT)]
+    [InlineData(VsrError.TRANSIENT_NOT_COMMITTED)]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
+    [InlineData(VsrError.SESSION_MISMATCH)]
+    public async Task ReconnectUsesBindBeforeReplacingALogicalSession(int bindStatus)
+    {
+        const ulong FirstSession = 128;
+        using var node = new MockNode();
+        var registrations = new ConcurrentQueue<MockRequest>();
+        var bindings = new ConcurrentQueue<MockRequest>();
+        var writes = new ConcurrentQueue<MockRequest>();
+        var pings = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == OPERATION_REGISTER)
+            {
+                registrations.Enqueue(request);
+                return Reply(request.Operation, RegisterBody(FirstSession + (ulong)registrations.Count - 1));
+            }
+            if (request.Code == BIND_SESSION_CODE)
+            {
+                bindings.Enqueue(request);
+                if (bindings.Count == 1 && bindStatus == VsrError.SESSION_MISMATCH)
+                {
+                    return Reply(request.Operation, RegisterBody(request.Session + 1)[4..]);
+                }
+                return bindings.Count == 1 && bindStatus != 0
+                    ? Reply(request.Operation, [], (uint)bindStatus)
+                    : Answer(request);
+            }
+            if (request.Operation == (byte)VsrOperation.CreateStream)
+            {
+                writes.Enqueue(request);
+                throw new IOException("The connection lost the committed write reply.");
+            }
+            if (request.Code == PING_CODE)
+            {
+                pings.Enqueue(request);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.Zero,
+                WaitAfterReconnect = TimeSpan.Zero
+            }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        var registration = Assert.Single(registrations);
+
+        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.CreateStreamAsync("lost-reply", token: TestContext.Current.CancellationToken));
+        var write = Assert.Single(writes);
+        Assert.Equal(registration.ClientId, write.ClientId);
+
+        if (bindStatus is VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.SESSION_MISMATCH)
+        {
+            var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+                client.PingAsync(TestContext.Current.CancellationToken));
+            Assert.Equal(bindStatus, refusal.StatusCode);
+            Assert.Single(registrations);
+            Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        }
+        await client.PingAsync(TestContext.Current.CancellationToken);
+
+        Assert.Single(writes);
+        Assert.NotEmpty(bindings);
+        Assert.All(bindings, binding =>
+        {
+            Assert.Equal(registration.ClientId, binding.ClientId);
+            Assert.Equal(write.Session, binding.Session);
+            Assert.Equal(LoginRegister.ReadBindSecret(registration.Body),
+                binding.Body.AsSpan(binding.Body.Length - LoginRegister.BIND_SECRET_BYTES).ToArray());
+        });
+        var ping = Assert.Single(pings);
+        if (bindStatus is VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT)
+        {
+            Assert.Equal(2, registrations.Count);
+            Assert.NotEqual(registration.ClientId, ping.ClientId);
+            Assert.NotEqual(write.Session, ping.Session);
+            Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        }
+        else
+        {
+            Assert.Single(registrations);
+            Assert.Equal(write.ClientId, ping.ClientId);
+            Assert.Equal(write.Session, ping.Session);
+            Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        }
     }
 
     [Fact]
@@ -198,6 +366,11 @@ public sealed class EndpointFailoverTests
                 return Reply(OPERATION_REGISTER, RegisterBody(session: 128));
             }
 
+            if (request.Code == BIND_SESSION_CODE)
+            {
+                return Reply(OPERATION_NON_REPLICATED, [], VsrError.UNAUTHENTICATED);
+            }
+
             if (evict)
             {
                 evict = false;
@@ -254,6 +427,11 @@ public sealed class EndpointFailoverTests
                 return Reply(OPERATION_REGISTER, RegisterBody(session: 128));
             }
 
+            if (request.Code == BIND_SESSION_CODE)
+            {
+                return Reply(OPERATION_NON_REPLICATED, [], VsrError.UNAUTHENTICATED);
+            }
+
             if (evict)
             {
                 evict = false;
@@ -290,6 +468,115 @@ public sealed class EndpointFailoverTests
         await client.PingAsync(TestContext.Current.CancellationToken);
         Assert.True(node.Registrations > registrationsBeforeEviction,
             "the reconnect signed in again with the remembered credentials");
+    }
+
+    [Fact]
+    public async Task LostOffsetReplyDoesNotReplayOverAnotherClientsProgress()
+    {
+        const long FirstOffset = 10;
+        const long AdvancedOffset = 20;
+        const int OffsetAndAckSize = sizeof(long) + sizeof(byte);
+        using var node = new MockNode();
+        using var advanced = new ManualResetEventSlim();
+        var committed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writes = 0;
+        long storedOffset = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.StoreConsumerOffset)
+            {
+                var attempt = Interlocked.Increment(ref writes);
+                var offset = BinaryPrimitives.ReadInt64LittleEndian(
+                    request.Body.AsSpan(request.Body.Length - OffsetAndAckSize, sizeof(long)));
+                Interlocked.Exchange(ref storedOffset, offset);
+                if (attempt == 1)
+                {
+                    committed.SetResult();
+                    if (!advanced.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        throw new TimeoutException("The second client did not advance the offset.");
+                    }
+                    return [];
+                }
+                advanced.Set();
+                return Reply(request.Operation, new byte[4]);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1),
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.Zero,
+                WaitAfterReconnect = TimeSpan.Zero
+            }
+        };
+        using var first = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+        using var second = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+        await first.ConnectAsync(TestContext.Current.CancellationToken);
+        await first.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await second.ConnectAsync(TestContext.Current.CancellationToken);
+        await second.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        var pending = first.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
+            FirstOffset, 0, TestContext.Current.CancellationToken);
+        await committed.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.Equal(FirstOffset, Volatile.Read(ref storedOffset));
+        await second.StoreOffsetAsync(Kinds.Consumer.New(3), Identifier.Numeric(1), Identifier.Numeric(2),
+            AdvancedOffset, 0, TestContext.Current.CancellationToken);
+        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => pending);
+        Assert.Equal(2, Volatile.Read(ref writes));
+        Assert.Equal(AdvancedOffset, Volatile.Read(ref storedOffset));
+    }
+
+    /// <summary>
+    ///     REQUEST_TOO_OLD refuses a write whose request id fell below the server's deduplication window. The
+    ///     server no longer knows whether it committed, so the caller gets the outcome-unknown type that the
+    ///     publisher refuses to resend, the same stop the Rust producer makes on this code.
+    /// </summary>
+    [Fact]
+    public async Task AgedOutRefusalOfAWriteIsReportedAsOutcomeUnknown()
+    {
+        using var node = new MockNode();
+        var sends = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.SendMessages)
+            {
+                Interlocked.Increment(ref sends);
+
+                return Reply(request.Operation, [], VsrError.REQUEST_TOO_OLD);
+            }
+
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+
+        var unknown = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.SendMessagesAsync(Identifier.Numeric(1), Identifier.Numeric(1),
+                Kinds.Partitioning.PartitionId(1), new Message(Guid.NewGuid(), new byte[] { 1 }),
+                TestContext.Current.CancellationToken));
+
+        var refusal = Assert.IsType<IggyInvalidStatusCodeException>(unknown.InnerException);
+        Assert.Equal(VsrError.REQUEST_TOO_OLD, refusal.StatusCode);
+        Assert.Equal(1, Volatile.Read(ref sends));
     }
 
     /// <summary>
@@ -356,7 +643,8 @@ public sealed class EndpointFailoverTests
             await comesUp;
 
             Assert.NotNull(survivor);
-            Assert.True(survivor!.Registrations >= 1, "the session was re-established on the survivor");
+            Assert.Equal(0, survivor!.Registrations);
+            Assert.True(survivor.Requests(BIND_SESSION_CODE) >= 1, "the session resumed on the survivor");
         }
         finally
         {

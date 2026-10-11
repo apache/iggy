@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod client_lifecycle;
 mod consumer_group;
 mod consumer_group_membership;
 mod consumer_offset;
@@ -27,3 +28,4 @@ mod producer;
 mod protocol_version;
 mod raw;
 mod send_confirmation;
+mod stream_builder;

@@ -193,6 +193,7 @@ async fn client_panic_evicts_registry_slot() {
         &bus,
         test_client_meta(CLIENT_ID, ClientTransportKind::Tcp),
         PanickingConn,
+        None,
         on_request.clone(),
     );
     {
@@ -209,6 +210,7 @@ async fn client_panic_evicts_registry_slot() {
         &bus,
         test_client_meta(CLIENT_ID, ClientTransportKind::Tcp),
         ParkingConn,
+        None,
         on_request,
     );
     {
@@ -331,6 +333,7 @@ async fn client_writer_panic_evicts_registry_via_conn_shutdown() {
         &bus,
         test_client_meta(CLIENT_ID, ClientTransportKind::Tcp),
         WriterPanicConn,
+        None,
         on_request,
     );
 

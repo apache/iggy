@@ -466,11 +466,11 @@ where
 
 impl Message<RequestHeader> {
     /// Retype the client-wire request into the server-internal
-    /// [`RoutedRequestHeader`] shape in place, with `group` starting unset.
+    /// [`RoutedRequestHeader`] shape in place, with server routing fields unset.
     ///
     /// The two layouts share every field offset (const-asserted where they
-    /// are declared) and `group` claims the client header's reserved tail,
-    /// so the promotion zeroes those eight bytes instead of rebuilding the
+    /// are declared) and routing fields claim the client header's reserved tail,
+    /// so the promotion zeroes those bytes instead of rebuilding the
     /// whole 256-byte header. This is the only sanctioned crossing between
     /// the two layouts: transmute-based reads across them would alias
     /// `group` with reserved bytes a client may have sent nonzero.
@@ -483,8 +483,9 @@ impl Message<RequestHeader> {
     #[must_use]
     pub fn into_routed(self) -> Message<RoutedRequestHeader> {
         let group_offset = offset_of!(RoutedRequestHeader, group);
+        let metadata_offset = offset_of!(RoutedRequestHeader, metadata_watermark);
         let mut owned = self.into_owned();
-        owned.as_mut_slice()[group_offset..group_offset + size_of::<u64>()].fill(0);
+        owned.as_mut_slice()[metadata_offset..group_offset + size_of::<u64>()].fill(0);
         Message::try_from(owned).expect("retyped request message must stay valid")
     }
 }
@@ -847,10 +848,12 @@ impl MessageBag {
 
 /// Why `H`'s header bytes failed bytemuck's checked cast.
 ///
-/// An operation discriminant this build does not define means the sender runs a
-/// newer release; the frame is wire-valid and the node needs upgrading, which is
-/// a different operator action from the corrupted-header case. bytemuck reports
-/// both as one error, so the operation byte is probed here to separate them.
+/// An operation discriminant this build does not define means the sender runs
+/// another release: a newer one adds operations, and an older one can still
+/// send a retired one. The frame is wire-valid and the releases must be
+/// aligned, a different operator action from the corrupted-header case.
+/// bytemuck reports both as one error, so the operation byte is probed here to
+/// separate them.
 fn classify_failed_cast<H>(bytes: &[u8]) -> ConsensusError
 where
     H: ConsensusHeader,
@@ -870,7 +873,7 @@ where
 ///
 /// This classification runs before `verify_frame`, so the byte is still
 /// unverified: a flipped bit landing in an undefined discriminant would
-/// otherwise be reported as "upgrade this node", and for a `PrepareOk` --
+/// otherwise be reported as version skew, and for a `PrepareOk` --
 /// which echoes an operation this primary minted itself -- corruption is the
 /// likelier cause anyway. Sealed headers verify the frame checksum; the
 /// Prepare family verifies the identity checksum, which covers the operation
@@ -972,9 +975,11 @@ where
             Command::ForwardLogoutResult => Ok(Self::ForwardLogoutResult(
                 value.try_into_typed::<ForwardLogoutResultHeader>()?,
             )),
-            Command::ConsumerSessionHeartbeat => Ok(Self::ConsumerSessionHeartbeat(
-                value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
-            )),
+            Command::ConsumerSessionHeartbeat | Command::SessionRetirementProgress => {
+                Ok(Self::ConsumerSessionHeartbeat(
+                    value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
+                ))
+            }
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command::Reply | Command::Eviction => Err(ConsensusError::ClientBoundCommand(command)),
@@ -1604,7 +1609,7 @@ mod tests {
 
     // Promotion must carry the data-bearing reserved prefix verbatim (the
     // non-replicated op code lives in `reserved[0..4]`) and unset only the
-    // `group` tail, whatever junk the client sent in those eight bytes.
+    // routing fields, whatever bytes the client sent in that tail.
     #[test]
     fn into_routed_keeps_reserved_prefix_and_unsets_group() {
         const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
@@ -1623,13 +1628,14 @@ mod tests {
         let header = routed.header();
         assert_eq!(
             header.reserved[..],
-            client_header.reserved[..52],
+            client_header.reserved[..header.reserved.len()],
             "the reserved prefix carries data and must survive promotion"
         );
         assert_eq!(
             header.group, 0,
             "the client-sent reserved tail must not leak into `group`"
         );
+        assert_eq!(header.metadata_watermark, 0);
         assert_eq!(header.client, client_header.client);
         assert_eq!(header.operation, client_header.operation);
         assert_eq!(header.session, client_header.session);

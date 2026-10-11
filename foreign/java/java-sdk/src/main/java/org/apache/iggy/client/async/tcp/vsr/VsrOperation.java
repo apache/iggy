@@ -39,15 +39,14 @@ public final class VsrOperation {
     public static final int REMOVE_CONSUMER_GROUP_MEMBER = 66;
     public static final int COMPLETE_CONSUMER_GROUP_REVOCATION = 67;
     public static final int TRUNCATE_PARTITION = 68;
+    public static final int FINALIZE_SESSION = 70;
 
     public static final int CREATE_STREAM = 128;
     public static final int UPDATE_STREAM = 129;
     public static final int DELETE_STREAM = 130;
-    public static final int PURGE_STREAM = 131;
     public static final int CREATE_TOPIC = 132;
     public static final int UPDATE_TOPIC = 133;
     public static final int DELETE_TOPIC = 134;
-    public static final int PURGE_TOPIC = 135;
     public static final int CREATE_PARTITIONS = 136;
     public static final int DELETE_PARTITIONS = 137;
     public static final int DELETE_SEGMENTS = 138;
@@ -66,6 +65,7 @@ public final class VsrOperation {
     public static final int SEND_MESSAGES = 160;
     public static final int STORE_CONSUMER_OFFSET = 161;
     public static final int DELETE_CONSUMER_OFFSET = 162;
+    public static final int RETIRE_SESSION = 166;
 
     private static final int INTERNAL_START = 64;
     private static final int METADATA_START = 128;
@@ -90,11 +90,9 @@ public final class VsrOperation {
             Map.entry(202, CREATE_STREAM),
             Map.entry(203, DELETE_STREAM),
             Map.entry(204, UPDATE_STREAM),
-            Map.entry(205, PURGE_STREAM),
             Map.entry(302, CREATE_TOPIC),
             Map.entry(303, DELETE_TOPIC),
             Map.entry(304, UPDATE_TOPIC),
-            Map.entry(305, PURGE_TOPIC),
             Map.entry(402, CREATE_PARTITIONS),
             Map.entry(403, DELETE_PARTITIONS),
             Map.entry(503, DELETE_SEGMENTS),
@@ -110,10 +108,14 @@ public final class VsrOperation {
     static {
         KNOWN_OPERATIONS.set(RESERVED, LOGOUT + 1);
         KNOWN_OPERATIONS.set(CREATE_TOPIC_WITH_ASSIGNMENTS, TRUNCATE_PARTITION + 1);
-        KNOWN_OPERATIONS.set(CREATE_STREAM, LEAVE_CONSUMER_GROUP + 1);
+        KNOWN_OPERATIONS.set(CREATE_STREAM, DELETE_STREAM + 1);
+        KNOWN_OPERATIONS.set(CREATE_TOPIC, DELETE_TOPIC + 1);
+        KNOWN_OPERATIONS.set(CREATE_PARTITIONS, LEAVE_CONSUMER_GROUP + 1);
         KNOWN_OPERATIONS.set(SEND_MESSAGES);
         KNOWN_OPERATIONS.set(STORE_CONSUMER_OFFSET);
         KNOWN_OPERATIONS.set(DELETE_CONSUMER_OFFSET);
+        KNOWN_OPERATIONS.set(FINALIZE_SESSION);
+        KNOWN_OPERATIONS.set(RETIRE_SESSION);
     }
 
     private VsrOperation() {}

@@ -135,7 +135,7 @@ impl FromRequestParts<HttpState> for Identity {
         let client_ip = parts
             .extensions
             .get::<ConnectInfo<ClientAddr>>()
-            .map(|ConnectInfo(address)| address.0.ip());
+            .map(|ConnectInfo(address)| address.addr.ip());
         if client_ip.is_none() {
             debug!(
                 path = parts.uri.path(),
@@ -181,6 +181,7 @@ pub(in crate::http) async fn resolve_credential(
     if let Ok(claims) = state.jwt.decode(bearer).await
         && let Ok(user_id) = claims.sub.parse::<u32>()
     {
+        state.ensure_active_user(user_id)?;
         return Ok((
             format!("{JWT_KEY_PREFIX}{}", claims.jti),
             user_id,

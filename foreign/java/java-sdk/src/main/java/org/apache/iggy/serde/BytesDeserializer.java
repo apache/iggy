@@ -89,6 +89,7 @@ public final class BytesDeserializer {
     // 50-byte fixed part + a one-character name (the server rejects an empty
     // one) + two u32 options-block length prefixes.
     private static final int MIN_TOPIC_BYTES = 59;
+    private static final int OPEN_FILES_FIELDS_BYTES = 2 * Long.BYTES;
 
     private BytesDeserializer() {}
 
@@ -413,6 +414,18 @@ public final class BytesDeserializer {
         var freeDiskSpace = readU64AsBigInteger(response);
         var totalDiskSpace = readU64AsBigInteger(response);
 
+        var openFilesCount = BigInteger.ZERO;
+        var openFilesLimit = BigInteger.ZERO;
+        // Servers that predate the open files fields end the reply at total_disk_space.
+        if (response.isReadable()) {
+            if (response.readableBytes() < OPEN_FILES_FIELDS_BYTES) {
+                throw new IggyMalformedResponseException(
+                        "Truncated open files fields: " + response.readableBytes() + " bytes left");
+            }
+            openFilesCount = readU64AsBigInteger(response);
+            openFilesLimit = readU64AsBigInteger(response);
+        }
+
         return new Stats(
                 processId,
                 cpuUsage,
@@ -441,7 +454,9 @@ public final class BytesDeserializer {
                 cacheMetrics,
                 threadsCount,
                 freeDiskSpace.toString(),
-                totalDiskSpace.toString());
+                totalDiskSpace.toString(),
+                openFilesCount,
+                openFilesLimit);
     }
 
     public static ClientInfoDetails readClientInfoDetails(ByteBuf response) {

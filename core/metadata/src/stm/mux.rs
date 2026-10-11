@@ -318,7 +318,7 @@ mod tests {
 
         // Encode to bytes
         let encoded = snapshot.encode().unwrap();
-        assert!(!encoded.is_empty());
+        assert_ne!(encoded, b"");
 
         // Decode from bytes
         let decoded = IggySnapshot::decode(&encoded).unwrap();

@@ -25,7 +25,7 @@ const (
 	GetSnapshotFileCode       Code = 11
 	GetClusterMetadataCode    Code = 12
 	DescribeOptionsCode       Code = 13
-	AttachConsumerSessionCode Code = 14
+	BindSessionCode           Code = 15
 	GetMeCode                 Code = 20
 	GetClientCode             Code = 21
 	GetClientsCode            Code = 22
@@ -57,13 +57,11 @@ const (
 	CreateStreamCode          Code = 202
 	DeleteStreamCode          Code = 203
 	UpdateStreamCode          Code = 204
-	PurgeStreamCode           Code = 205
 	GetTopicCode              Code = 300
 	GetTopicsCode             Code = 301
 	CreateTopicCode           Code = 302
 	DeleteTopicCode           Code = 303
 	UpdateTopicCode           Code = 304
-	PurgeTopicCode            Code = 305
 	CreatePartitionsCode      Code = 402
 	DeletePartitionsCode      Code = 403
 	DeleteSegmentsCode        Code = 503

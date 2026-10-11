@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp.vsr;
 
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 
 import java.security.SecureRandom;
@@ -29,54 +30,47 @@ import java.security.SecureRandom;
  *
  * <p>The (client id, request id) pair is the server's dedup key for
  * replicated operations, and the session value is the fence epoch of the
- * latest committed {@code Register}. None of these are bearer tokens; auth
- * is bound to the transport connection server-side.
+ * latest committed {@code Register}. The bind secret is a bearer credential
+ * that authenticates another connection to this identity. Keep it private to
+ * the client and never log or expose it.
  */
 public final class ConsensusSession {
 
+    static final int BIND_SECRET_BYTES = 32;
     private static final SecureRandom RANDOM = new SecureRandom();
+    private final byte[] bindSecret = new byte[BIND_SECRET_BYTES];
 
     private long clientIdLow;
     private long clientIdHigh;
     private Long session;
     private long requestCounter = 1;
     private long correlationCounter = 1;
-    private boolean registerConsumed;
     private long generation;
     private long metadataWatermark;
+    private boolean shared;
 
     public ConsensusSession() {
         regenerateClientId();
     }
 
     /**
-     * Arms a {@code Register}: on re-login (or a consumed one-shot register)
-     * the whole identity re-arms with a fresh client id so the server sees a
-     * brand-new registration. Returns the request id a Register carries,
-     * which is always zero.
+     * Returns the zero request id of Register without changing its identity.
+     * Repeating a registration after a lost reply must resolve the same epoch.
      *
-     * <p>The request counter is deliberately not rewound. This SDK multiplexes
-     * a single pinned channel and correlates replies by (operation, request
-     * id), so a send still in flight when a re-login re-arms would share its
-     * key with the first send of the new session: the correlation map would
-     * refuse the second one and a late reply for the first could be handed to
-     * it. A re-arm registers a fresh client id, which the server admits at
-     * watermark zero and which accepts any id above it, so carrying the
-     * counter forward costs nothing on the wire.
+     * <p>The request counter survives explicit resets too, so late replies
+     * cannot collide with pending requests from a replacement identity.
      */
     synchronized long beginRegister() {
-        if (registerConsumed || session != null) {
-            regenerateClientId();
-            session = null;
-        }
-        registerConsumed = true;
         return 0;
     }
 
     /** Binds the fence epoch returned by a committed Register reply. */
     synchronized void bind(long sessionEpoch) {
-        if (sessionEpoch <= 0) {
-            throw new IllegalStateException("Register reply carried a non-positive session epoch: " + sessionEpoch);
+        if (sessionEpoch == 0) {
+            throw new IllegalStateException("Register reply carried a zero session epoch");
+        }
+        if (session != null && session != sessionEpoch) {
+            throw new IllegalStateException("Register reply changed the bound session epoch");
         }
         this.session = sessionEpoch;
         generation++;
@@ -120,21 +114,53 @@ public final class ConsensusSession {
         return session == null ? 0 : session;
     }
 
-    synchronized long boundSession() {
+    public synchronized long boundSession() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
         }
         return session;
     }
 
-    synchronized boolean isBound() {
+    public synchronized boolean isBound() {
         return session != null;
     }
 
-    /** Clears the bound epoch (logout / eviction); next login re-registers. */
-    synchronized void reset() {
+    /** Ends the local identity after explicit logout or a refused session bind. */
+    public synchronized void reset() {
         session = null;
+        metadataWatermark = 0;
+        regenerateClientId();
         generation++;
+    }
+
+    public synchronized byte[] bindSecret() {
+        return bindSecret.clone();
+    }
+
+    public synchronized byte[] bindSecret(long clientLow, long clientHigh, long epoch) {
+        if (session == null || session != epoch || clientIdLow != clientLow || clientIdHigh != clientHigh) {
+            throw new IggyNotConnectedException("Poll attachment no longer belongs to the parent session");
+        }
+        return bindSecret.clone();
+    }
+
+    /** Uses a parent identity for BindSession and non-replicated requests only. */
+    public synchronized void bindShared(long clientLow, long clientHigh, long epoch, byte[] secret) {
+        if ((clientLow == 0 && clientHigh == 0) || epoch == 0 || secret == null || secret.length != BIND_SECRET_BYTES) {
+            throw new IggyInvalidArgumentException("Shared session requires a nonzero client, a nonzero epoch and a "
+                    + BIND_SECRET_BYTES + "-byte bind secret");
+        }
+        bind(epoch);
+        clientIdLow = clientLow;
+        clientIdHigh = clientHigh;
+        System.arraycopy(secret, 0, bindSecret, 0, BIND_SECRET_BYTES);
+        shared = true;
+    }
+
+    synchronized void onChannelCreated() {
+        if (shared) {
+            generation++;
+        }
     }
 
     public synchronized long generation() {
@@ -160,6 +186,7 @@ public final class ConsensusSession {
     }
 
     private void regenerateClientId() {
+        RANDOM.nextBytes(bindSecret);
         do {
             clientIdLow = RANDOM.nextLong();
             clientIdHigh = RANDOM.nextLong();

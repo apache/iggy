@@ -25,7 +25,6 @@ use kafka_protocol::messages::produce_request::PartitionProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
 use kafka_protocol::protocol::StrBytes;
-use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::bridge::{BridgeError, IggyBridge, TopicTarget};
 use crate::error::Result;
@@ -34,13 +33,14 @@ use crate::protocol::api::{
     ERROR_MESSAGE_TOO_LARGE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
     ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
     ERROR_UNSUPPORTED_COMPRESSION_TYPE, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    supported_max_version,
+    REQUEST_DEADLINE, UNKNOWN_OFFSET, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, is_transactional, respond_or_close,
-    unsupported_version_response,
+    CODEC_OFF_WORKER_BYTES, decode_guarded, encode_message, is_transactional, off_worker,
+    respond_or_close, unsupported_version_response,
 };
+use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
     Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
     is_compressed, to_iggy,
@@ -60,18 +60,6 @@ const ACKS_ALL: i16 = -1;
 /// First Produce version that may carry zstd batches.
 const ZSTD_MIN_VERSION: i16 = 7;
 
-/// Kafka's "no offset here", used for `base_offset` on any failure, for a committed send the
-/// server named no offset for, and for `log_start_offset` always. The real log start costs a
-/// `get_topic` round trip per request and no producer reads it yet.
-const UNKNOWN_OFFSET: i64 = -1;
-
-/// Ceiling on how long one request may spend writing, whatever the client asked for.
-///
-/// One request is many Iggy calls, so without this a request naming many partitions has no
-/// bound. Deliberately a clock and not a partition-count cap: a cap refuses a producer writing
-/// to a wide topic, and a client set on hogging the shared bridge just sends more requests.
-const MAX_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
-
 /// Frame bytes per record slot. Caps one partition at 131,072 slots, about 40 MB, at the default
 /// 8 MiB frame.
 ///
@@ -83,9 +71,6 @@ const FRAME_BYTES_PER_RECORD: usize = 64;
 /// 64 MiB at the default 8 MiB frame, so a 1 MB request can compress 64x before the rest of it
 /// answers 6.
 const REQUEST_ALLOWANCES: usize = 8;
-
-/// Blobs this large, or compressed ones, plan off the async worker.
-const BLOCKING_PLAN_BYTES: usize = 64 * 1024;
 
 const RESPONSE_BASE_BYTES: usize = 512;
 
@@ -193,7 +178,8 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     } else {
         Zstd::Refused
     };
-    let responses = write_request(bridge, &request, budget, zstd, deadline).await;
+    let responses =
+        write_request(bridge, &state.probe_board, &request, budget, zstd, deadline).await;
 
     // Kafka closes an `acks=0` connection on any error, so the client refreshes metadata.
     if request.acks == ACKS_NONE {
@@ -233,7 +219,7 @@ impl Deadline {
         let wait = request_timeout(timeout_ms);
         Self {
             at: tokio::time::Instant::now() + wait,
-            ceiling: wait == MAX_REQUEST_DEADLINE,
+            ceiling: wait == REQUEST_DEADLINE,
         }
     }
 
@@ -276,6 +262,7 @@ impl From<RecordCodecError> for Refusal {
 /// just queue on its stream mutex (see the README's "Concurrency ceiling").
 async fn write_request(
     bridge: &IggyBridge,
+    board: &ProbeBoard,
     request: &ProduceRequest,
     budget: DecompressionBudget,
     zstd: Zstd,
@@ -287,6 +274,7 @@ async fn write_request(
         let name = topic.name.as_str();
         let target = bridge.topic_target(name);
         let mut responses = Vec::with_capacity(topic.partition_data.len());
+        let mut wrote = false;
         for partition in &topic.partition_data {
             let outcome = match &target {
                 // Skip the decode. The answer is 7 either way.
@@ -302,9 +290,13 @@ async fn write_request(
                 }
                 Err(error) => Err(refusal_code(name, error).into()),
             };
+            wrote |= outcome.is_ok();
             responses.push(partition_outcome(partition.index, outcome));
             // Planning is sync CPU work. Let other connections on this worker run.
             tokio::task::yield_now().await;
+        }
+        if wrote {
+            board.wrote(name);
         }
         topics.push(
             TopicProduceResponse::default()
@@ -330,12 +322,8 @@ fn plan(
         && partition
             .records
             .as_ref()
-            .is_some_and(|blob| blob.len() >= BLOCKING_PLAN_BYTES || is_compressed(blob));
-    if heavy && Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
-        tokio::task::block_in_place(run)
-    } else {
-        run()
-    }
+            .is_some_and(|blob| blob.len() >= CODEC_OFF_WORKER_BYTES || is_compressed(blob));
+    off_worker(heavy, run)
 }
 
 fn partition_outcome(
@@ -416,8 +404,8 @@ fn request_timeout(timeout_ms: i32) -> Duration {
     u64::try_from(timeout_ms)
         .ok()
         .filter(|ms| *ms > 0)
-        .map_or(MAX_REQUEST_DEADLINE, Duration::from_millis)
-        .min(MAX_REQUEST_DEADLINE)
+        .map_or(REQUEST_DEADLINE, Duration::from_millis)
+        .min(REQUEST_DEADLINE)
 }
 
 /// Sends one partition's messages, or answers 7 once the deadline has passed.
@@ -574,6 +562,7 @@ fn partition_response(index: i32, error_code: i16) -> PartitionProduceResponse {
         .with_index(index)
         .with_error_code(error_code)
         .with_base_offset(UNKNOWN_OFFSET)
+        // The real log start costs a `get_topic` per request, and no producer reads it.
         .with_log_start_offset(UNKNOWN_OFFSET)
 }
 
@@ -867,18 +856,18 @@ mod tests {
         assert_eq!(request_timeout(5_000), Duration::from_secs(5));
         assert_eq!(
             request_timeout(30_000),
-            MAX_REQUEST_DEADLINE,
+            REQUEST_DEADLINE,
             "a client asking for longer than this gateway allows gets the gateway's ceiling"
         );
-        assert_eq!(request_timeout(i32::MAX), MAX_REQUEST_DEADLINE);
+        assert_eq!(request_timeout(i32::MAX), REQUEST_DEADLINE);
     }
 
     #[test]
     fn given_no_client_timeout_when_bounded_should_still_attempt_the_write() {
         // A value naming no budget means no preference, not "fail now".
-        assert_eq!(request_timeout(0), MAX_REQUEST_DEADLINE);
-        assert_eq!(request_timeout(-1), MAX_REQUEST_DEADLINE);
-        assert_eq!(request_timeout(i32::MIN), MAX_REQUEST_DEADLINE);
+        assert_eq!(request_timeout(0), REQUEST_DEADLINE);
+        assert_eq!(request_timeout(-1), REQUEST_DEADLINE);
+        assert_eq!(request_timeout(i32::MIN), REQUEST_DEADLINE);
     }
 
     #[test]

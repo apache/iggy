@@ -2235,6 +2235,8 @@ TEST_F(E2E_Client, GetStatsReturnsServerStats) {
     EXPECT_GT(empty_stats.TotalMemory(), 0u);
     EXPECT_LE(empty_stats.AvailableMemory(), empty_stats.TotalMemory());
     EXPECT_GE(empty_stats.TotalDiskSpace(), empty_stats.FreeDiskSpace());
+    EXPECT_GT(empty_stats.OpenFilesLimit(), 0u);
+    EXPECT_LE(empty_stats.OpenFilesCount(), empty_stats.OpenFilesLimit());
     EXPECT_FALSE(empty_stats.Hostname().empty());
     EXPECT_FALSE(empty_stats.OsName().empty());
     EXPECT_FALSE(empty_stats.OsVersion().empty());

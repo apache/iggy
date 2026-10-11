@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
       - name: Checkout code
@@ -63,7 +63,7 @@ jobs:
 
       - name: Setup uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Install PHP build dependencies
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
@@ -74,15 +74,19 @@ jobs:
             libclang-dev \
             libhwloc-dev \
             libssl-dev \
-            php8.3-cli \
-            php8.3-dev \
+            php8.5-cli \
+            php8.5-dev \
             pkg-config
 
-          php_bin="$(command -v php8.3)"
-          php_config="$(command -v php-config8.3)"
+          php_bin="$(command -v php8.5)"
+          php_config="$(command -v php-config8.5)"
+          # bindgen loads the newest libclang on the runner but reads builtin
+          # headers from the default clang, and the two differ on Ubuntu 26.04.
+          llvm_dir="$(dirname "$(dirname "$(readlink -f "$(command -v clang)")")")"
           {
             echo "PHP=${php_bin}"
             echo "PHP_CONFIG=${php_config}"
+            echo "LIBCLANG_PATH=${llvm_dir}/lib"
           } >> "$GITHUB_ENV"
           "${php_bin}" --version
           "${php_config}" --version

@@ -52,6 +52,7 @@ type pollExchangeState struct {
 // Published under c.mtx after authentication, then immutable. Warm data polls
 // must not wait behind unrelated coordinator I/O just to read their identity.
 type activePollSession struct {
+	bindSecret    [vsr.BindSecretBytes]byte
 	parent        consumerSession
 	configuration config
 }
@@ -63,6 +64,7 @@ func (c *IggyTcpClient) publishPollSession() {
 	configuration := c.config
 	configuration.autoLogin = c.rememberedLogin
 	c.pollSession.Store(&activePollSession{
+		bindSecret:    c.session.BindSecret(),
 		parent:        consumerSession{client: c.session.ClientID(), session: c.session.SessionID()},
 		configuration: configuration,
 	})
@@ -288,7 +290,16 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	}
 	if !slot.attached || slot.parent.client != route.parent.client ||
 		slot.parent.session != route.parent.session || slot.parent.watermark < route.parent.watermark {
-		if _, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.AttachConsumerSessionCode), route.parent.bytes()); err != nil {
+		current := c.pollSession.Load()
+		if current == nil || current.parent.client != route.parent.client || current.parent.session != route.parent.session {
+			return nil, ierror.ErrTransientNotAccepted
+		}
+		binding, err := vsr.SerializeBindSession(route.parent.bytes(), iggcon.Version, current.bindSecret)
+		if err != nil {
+			return nil, err
+		}
+		response, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.BindSessionCode), binding)
+		if err != nil {
 			// An attach cannot advance an offset, even if its reply is lost.
 			state.written = false
 			err = slot.exchangeError(ctx, state, err)
@@ -296,6 +307,15 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 				c.polls.dropConnection(route.endpoint, slot)
 			}
 			return nil, err
+		}
+		bound, err := vsr.DecodeLoginRegister(response)
+		if err != nil {
+			c.polls.dropConnection(route.endpoint, slot)
+			return nil, err
+		}
+		if bound.Session != route.parent.session {
+			c.polls.dropConnection(route.endpoint, slot)
+			return nil, ierror.SessionMismatch{Requested: route.parent.session, Bound: bound.Session}
 		}
 		slot.parent = route.parent
 		slot.attached = true
@@ -392,7 +412,16 @@ func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) 
 	configuration.serverAddress = route.endpoint
 	configuration.reconnection.enabled = false
 	client := NewIggyTcpClient(c.logger, func(options *Options) { options.config = configuration })
-	if err := client.Connect(suppressLeaderSettlement(ctx)); err != nil {
+	if err := client.Connect(suppressAutoLogin(suppressLeaderSettlement(ctx))); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	client.mtx.Lock()
+	client.session = vsr.NewSessionWithClientID(route.parent.client)
+	err := client.session.Bind(route.parent.session)
+	client.session.SetBindSecret(snapshot.bindSecret)
+	client.mtx.Unlock()
+	if err != nil {
 		_ = client.Close()
 		return nil, err
 	}

@@ -372,14 +372,12 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.GetStreams(), iggy::IggyException);
     EXPECT_THROW(client.GetStream(stream), iggy::IggyException);
     EXPECT_THROW(client.DeleteStream(stream), iggy::IggyException);
-    EXPECT_THROW(client.PurgeStream(stream), iggy::IggyException);
     EXPECT_THROW(client.CreateTopic(stream, "topic", iggy::TopicCreateOptions().SetPartitionsCount(1)),
                  iggy::IggyException);
     EXPECT_THROW(client.UpdateTopic(stream, topic, "updated-topic"), iggy::IggyException);
     EXPECT_THROW(client.GetTopics(stream), iggy::IggyException);
     EXPECT_THROW(client.GetTopic(stream, topic), iggy::IggyException);
     EXPECT_THROW(client.DeleteTopic(stream, topic), iggy::IggyException);
-    EXPECT_THROW(client.PurgeTopic(stream, topic), iggy::IggyException);
     EXPECT_THROW(client.CreatePartitions(stream, topic, 1), iggy::IggyException);
     EXPECT_THROW(client.DeletePartitions(stream, topic, 1), iggy::IggyException);
     EXPECT_THROW(client.DeleteSegments(stream, topic, 0, 1), iggy::IggyException);

@@ -17,7 +17,7 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode};
-use crate::requests::system::AttachConsumerSessionRequest;
+use crate::requests::system::SessionIdentity;
 use crate::responses::system::get_cluster_metadata::ClusterNodeResponse;
 use bytes::BytesMut;
 
@@ -28,7 +28,7 @@ use bytes::BytesMut;
 /// identity and metadata floor, never credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollRoutingResponse {
-    pub consumer_session: AttachConsumerSessionRequest,
+    pub consumer_session: SessionIdentity,
     pub primary: ClusterNodeResponse,
 }
 
@@ -45,7 +45,7 @@ impl WireEncode for PollRoutingResponse {
 
 impl WireDecode for PollRoutingResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let (consumer_session, consumed) = AttachConsumerSessionRequest::decode(buf)?;
+        let (consumer_session, consumed) = SessionIdentity::decode(buf)?;
         let (primary, node_size) = ClusterNodeResponse::decode(&buf[consumed..])?;
         Ok((
             Self {
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn roundtrip_and_reject_truncation() {
         let response = PollRoutingResponse {
-            consumer_session: AttachConsumerSessionRequest {
+            consumer_session: SessionIdentity {
                 client_id: u128::MAX,
                 session: 7,
                 metadata_watermark: 11,

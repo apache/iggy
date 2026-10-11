@@ -2339,6 +2339,18 @@ class Stats final {
      */
     [[nodiscard]] std::uint64_t TotalDiskSpace() const noexcept { return total_disk_space_; }
 
+    /**
+     * @brief Returns the number of file descriptors the server process holds open.
+     * @return Open descriptor count, or zero when the server cannot count them.
+     */
+    [[nodiscard]] std::uint64_t OpenFilesCount() const noexcept { return open_files_count_; }
+
+    /**
+     * @brief Returns the server's soft `RLIMIT_NOFILE`, the count at which opens fail.
+     * @return Descriptor limit, or zero when the server cannot read it.
+     */
+    [[nodiscard]] std::uint64_t OpenFilesLimit() const noexcept { return open_files_limit_; }
+
   private:
     Stats(std::uint32_t process_id,
           float cpu_usage,
@@ -2367,7 +2379,9 @@ class Stats final {
           std::vector<CacheMetricEntry> cache_metrics,
           std::uint32_t threads_count,
           std::uint64_t free_disk_space,
-          std::uint64_t total_disk_space)
+          std::uint64_t total_disk_space,
+          std::uint64_t open_files_count,
+          std::uint64_t open_files_limit)
         : process_id_(process_id),
           cpu_usage_(cpu_usage),
           total_cpu_usage_(total_cpu_usage),
@@ -2395,7 +2409,9 @@ class Stats final {
           cache_metrics_(std::move(cache_metrics)),
           threads_count_(threads_count),
           free_disk_space_(free_disk_space),
-          total_disk_space_(total_disk_space) {}
+          total_disk_space_(total_disk_space),
+          open_files_count_(open_files_count),
+          open_files_limit_(open_files_limit) {}
 
     static Stats FromFfi(ffi::Stats stats);
 
@@ -2429,6 +2445,8 @@ class Stats final {
     std::uint32_t threads_count_;
     std::uint64_t free_disk_space_;
     std::uint64_t total_disk_space_;
+    std::uint64_t open_files_count_;
+    std::uint64_t open_files_limit_;
 };
 
 /**
@@ -3604,18 +3622,6 @@ class IggyBlockingClient final {
     void DeleteStream(const Identifier &stream);
 
     /**
-     * @brief Removes all messages from every topic in a stream.
-     *
-     * The stream, its topics, and topic configuration remain available. A
-     * transport failure after submission can still leave the purge committed.
-     * @param stream Stream to purge, addressed by numeric ID or name.
-     * @throws IggyException if the client is unavailable, the caller lacks
-     *         stream-management permission, the stream does not exist, or the
-     *         request fails.
-     */
-    void PurgeStream(const Identifier &stream);
-
-    /**
      * @brief Creates a topic and its initial partitions in a stream.
      *
      * The server creates the topic's initial partitions and applies the
@@ -3700,22 +3706,6 @@ class IggyBlockingClient final {
      *         commit the write.
      */
     void DeleteTopic(const Identifier &stream, const Identifier &topic);
-
-    /**
-     * @brief Removes retained messages from every partition of a topic.
-     *
-     * The topic, its partitions, names, and configuration remain. New messages
-     * can be sent after a purge. A failed or unknown transport outcome can
-     * still leave the purge committed.
-     *
-     * @param stream Parent stream, addressed by numeric ID or name.
-     * @param topic Topic to purge, addressed by numeric ID or name.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the stream or topic does not exist; the caller lacks
-     *         topic-management permission; or the server rejects or cannot
-     *         commit the write.
-     */
-    void PurgeTopic(const Identifier &stream, const Identifier &topic);
 
     /**
      * @brief Adds partitions to a topic.

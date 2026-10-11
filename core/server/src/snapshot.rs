@@ -196,16 +196,9 @@ fn process_list() -> io::Result<Vec<u8>> {
 }
 
 fn server_logs(server_config: &ServerConfig) -> io::Result<Vec<u8>> {
-    // Mirror the logger's path derivation (server_common `Logging::late_init`):
-    // it canonicalizes the configured subdirectory before joining the system
-    // path, so a relative `logging.path` that already exists resolves against the
-    // CWD. Skipping the canonicalize here would read a different (often empty)
-    // directory than the one the logger actually writes to.
-    let logs_subdirectory = PathBuf::from(&server_config.logging.path);
-    let logs_subdirectory = logs_subdirectory
-        .canonicalize()
-        .unwrap_or(logs_subdirectory);
-    let logs_path = PathBuf::from(server_config.get_system_path()).join(logs_subdirectory);
+    // Must match the path that server_common `Logging::late_init` writes to.
+    let logs_path =
+        PathBuf::from(server_config.get_system_path()).join(&server_config.logging.path);
     let mut log_files = Vec::new();
     for entry in std::fs::read_dir(&logs_path)? {
         let entry = entry?;

@@ -174,6 +174,7 @@ impl Default for MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
             clients_table_max: metadata.clients_table_max as usize,
+            partitions_max: metadata.partitions_max as u32,
         }
     }
 }
@@ -303,6 +304,7 @@ impl Default for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
             close_grace: bus.close_grace.parse().unwrap(),
             handshake_grace: bus.handshake_grace.parse().unwrap(),
+            connections_max: None,
         }
     }
 }

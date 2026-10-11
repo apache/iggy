@@ -24,7 +24,7 @@ use bytes::Bytes;
 use iggy::prelude::IggyError;
 use kafka_protocol::messages::create_topics_request::{CreatableReplicaAssignment, CreatableTopic};
 use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
-use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse, TopicName};
+use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse};
 use kafka_protocol::protocol::StrBytes;
 
 use tokio::time::Instant;
@@ -38,6 +38,9 @@ use crate::protocol::api::{
     ERROR_TOPIC_ALREADY_EXISTS, GatewayState, HandleOutcome,
 };
 use crate::protocol::bounds_guard::validate_create_topics_shape;
+use crate::protocol::handlers::topic_config::{
+    MAX_CONFIG_TOPICS, find_duplicate_names, topic_cap_message,
+};
 use crate::protocol::handlers::{
     decode_guarded, encode_message, handle_versioned_request, is_supported_version,
     respond_or_close, unsupported_version_response,
@@ -62,18 +65,6 @@ const DEFAULT_PARTITION_COUNT: u32 = 1;
 /// same rejection the real path would eventually get from the bridge, instead of reporting
 /// `NONE` for a partition count the real path can never actually create.
 const MAX_PARTITIONS_COUNT: u32 = 1000;
-
-/// Cap on distinct topic names one `CreateTopics` request may address through the bridge.
-///
-/// `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096) is a pre-decode `DoS` ceiling, not a usability
-/// recommendation: each non-duplicate requested name here costs up to ~4 Iggy round trips
-/// (`ensure_stream` + `create_topic`, plus a possible race-retry read on either) against the
-/// single lockstep `IggyClient` every Kafka connection on this gateway shares
-/// (`bridge/iggy_bridge/mod.rs`'s "Concurrency ceiling"). 100 keeps a worst-case batch's
-/// aggregate bridge cost small relative to that shared resource while remaining generous for any
-/// real admin batch. Duplicate names never count against this cap - they're rejected by
-/// [`find_duplicate_names`] before ever reaching the bridge.
-const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
 /// Bounds imposed on the request's own `timeout_ms` before it becomes the aggregate bridge-work
 /// deadline. That value is client-supplied and otherwise unchecked: `0` or negative would abort
@@ -127,25 +118,23 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
-    let duplicate_names = find_duplicate_names(&req.topics);
+    let topic_names: Vec<&str> = req.topics.iter().map(|topic| topic.name.as_str()).collect();
+    let duplicate_names = find_duplicate_names(topic_names.iter().copied());
 
-    let distinct_bridge_backed: HashSet<&TopicName> = req
-        .topics
+    let distinct_bridge_backed: HashSet<&str> = topic_names
         .iter()
-        .map(|topic| &topic.name)
-        .filter(|name| !duplicate_names.contains(*name))
+        .copied()
+        .filter(|name| !duplicate_names.contains(name))
         .collect();
-    if distinct_bridge_backed.len() > MAX_BRIDGE_BACKED_TOPICS {
+    if distinct_bridge_backed.len() > MAX_CONFIG_TOPICS {
         tracing::warn!(
             distinct_topics = distinct_bridge_backed.len(),
-            max = MAX_BRIDGE_BACKED_TOPICS,
+            max = MAX_CONFIG_TOPICS,
             "CreateTopics request addresses too many distinct topics; rejecting"
         );
-        // A server-imposed limit, not a malformed request - INVALID_REQUEST would blame the
+        // A server-imposed limit, not a malformed request. INVALID_REQUEST would blame the
         // client for a request Kafka itself would accept.
-        let message = StrBytes::from(format!(
-            "this gateway addresses at most {MAX_BRIDGE_BACKED_TOPICS} distinct topics per CreateTopics request"
-        ));
+        let message = StrBytes::from(topic_cap_message("CreateTopics"));
         let results = req
             .topics
             .iter()
@@ -191,13 +180,13 @@ async fn create_all_topics(
     bridge: &IggyBridge,
     api_version: i16,
     topics: &[CreatableTopic],
-    duplicate_names: &HashSet<TopicName>,
+    duplicate_names: &HashSet<&str>,
     validate_only: bool,
     deadline: Instant,
 ) -> Vec<CreatableTopicResult> {
     let mut results = Vec::with_capacity(topics.len());
     for topic in topics {
-        let result = if duplicate_names.contains(&topic.name) {
+        let result = if duplicate_names.contains(topic.name.as_str()) {
             CreatableTopicResult::default()
                 .with_name(topic.name.clone())
                 .with_error_code(ERROR_INVALID_REQUEST)
@@ -226,21 +215,6 @@ async fn create_all_topics(
         results.push(result);
     }
     results
-}
-
-/// Every topic name that appears more than once in `topics` - real Kafka
-/// (`ControllerApis.createTopics`) refuses every occurrence of a duplicate name with
-/// `INVALID_REQUEST` (42) and creates nothing for it, rather than creating the first occurrence
-/// and reporting the rest as already existing.
-fn find_duplicate_names(topics: &[CreatableTopic]) -> HashSet<TopicName> {
-    let mut seen = HashSet::with_capacity(topics.len());
-    let mut duplicates = HashSet::new();
-    for topic in topics {
-        if !seen.insert(topic.name.clone()) {
-            duplicates.insert(topic.name.clone());
-        }
-    }
-    duplicates
 }
 
 /// Validates and, when the topic is not rejected outright, provisions one requested topic.
@@ -333,7 +307,8 @@ fn local_shape_error(
         return Err((
             ERROR_INVALID_CONFIG,
             Some(StrBytes::from(
-                "per-topic configs are not supported by this bridge".to_string(),
+                "CreateTopics does not apply per-topic configs. Set retention.ms with AlterConfigs"
+                    .to_string(),
             )),
         ));
     }
@@ -348,8 +323,10 @@ fn local_shape_error(
 /// defaults on that path), so sending it to the client risks sending a wrong claim rather than no
 /// claim. The two client-caused variants are the exception - their text is fixed and always
 /// correct, so it's safe to forward and logged at `debug!` (attacker/misuse-controlled, not
-/// operator-actionable); everything else points at the bridge or Iggy itself and is logged at
-/// `error!` (`bridge/error.rs:155`'s own guidance: handlers log the real Iggy error).
+/// operator-actionable). `PartitionsLimitReached` carries no data, so its fixed text is correct
+/// too, and it is logged at `warn!` for the operator who set the cap. Everything else points at
+/// the bridge or Iggy itself and is logged at `error!` (`bridge/error.rs:155`'s own guidance:
+/// handlers log the real Iggy error).
 fn bridge_error_result(
     result: CreatableTopicResult,
     kafka_topic: &str,
@@ -376,6 +353,17 @@ fn bridge_error_result(
                 .with_error_code(error_code)
                 .with_error_message(Some(StrBytes::from(
                     "partition count must be at least 1".to_string(),
+                )))
+        }
+        BridgeError::Iggy(IggyError::PartitionsLimitReached) => {
+            tracing::warn!(
+                kafka_topic,
+                "CreateTopics refused: the Iggy node is at metadata.partitions_max"
+            );
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(
+                    "the Iggy node has reached its partition limit".to_string(),
                 )))
         }
         other => {
@@ -577,6 +565,8 @@ fn encode_inner(version: i16, topics: &[CreatableTopic], forced_error: i16) -> R
 
 #[cfg(test)]
 mod tests {
+    use kafka_protocol::messages::TopicName;
+
     use super::*;
 
     fn topic_name(name: &str) -> TopicName {
@@ -757,25 +747,6 @@ mod tests {
             validate_create_topic_shape(5, &topic),
             Err(ERROR_INVALID_REQUEST)
         );
-    }
-
-    #[test]
-    fn find_duplicate_names_finds_a_name_repeated_across_two_requested_topics() {
-        let topics = vec![creatable_topic(1, 1), creatable_topic(1, 1)];
-        let duplicates = find_duplicate_names(&topics);
-        assert_eq!(duplicates, HashSet::from([topic_name("orders")]));
-    }
-
-    #[test]
-    fn find_duplicate_names_is_empty_when_every_name_is_unique() {
-        let topics = vec![
-            creatable_topic(1, 1),
-            CreatableTopic::default()
-                .with_name(topic_name("payments"))
-                .with_num_partitions(1)
-                .with_replication_factor(1),
-        ];
-        assert!(find_duplicate_names(&topics).is_empty());
     }
 
     #[test]

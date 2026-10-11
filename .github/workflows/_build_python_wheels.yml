@@ -53,16 +53,16 @@ jobs:
       matrix:
         include:
           - target: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             manylinux: 2_34
           - target: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-26.04
             manylinux: musllinux_1_2
           - target: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             manylinux: auto
           - target: aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             manylinux: musllinux_1_2
     steps:
       - name: Download latest copy script from master
@@ -277,7 +277,7 @@ jobs:
           retention-days: 7
 
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
@@ -315,7 +315,7 @@ jobs:
     name: Collect all wheels
     needs: [linux, macos, windows, sdist]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:

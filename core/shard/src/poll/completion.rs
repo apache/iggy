@@ -86,7 +86,7 @@ impl PollCompletionLane {
         if self
             .state
             .reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 (reserved < self.state.capacity).then_some(reserved + 1)
             })
             .is_err()

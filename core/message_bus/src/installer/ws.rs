@@ -19,9 +19,9 @@
 
 use super::conn_info::ClientConnMeta;
 use super::tcp::install_client_conn;
-use crate::IggyMessageBus;
 use crate::client_listener::RequestHandler;
 use crate::transports::ws::WsTransportConn;
+use crate::{ConnectionPermit, IggyMessageBus};
 use compio::net::TcpStream;
 use std::rc::Rc;
 
@@ -44,6 +44,7 @@ pub fn install_client_ws(
     bus: &Rc<IggyMessageBus>,
     meta: ClientConnMeta,
     stream: compio_ws::WebSocketStream<TcpStream>,
+    permit: ConnectionPermit,
     on_request: RequestHandler,
 ) {
     let cfg = bus.config();
@@ -51,6 +52,7 @@ pub fn install_client_ws(
         bus,
         meta,
         WsTransportConn::new_server(stream).with_close_grace(cfg.close_grace),
+        Some(permit),
         on_request,
     );
 }

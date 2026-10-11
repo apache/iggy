@@ -42,6 +42,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -161,7 +162,8 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        "test-topic")
+                        "test-topic",
+                        PERSISTED_TOPIC_OPTIONS)
                 .get(5, TimeUnit.SECONDS);
 
         // when - fire a burst of concurrent requests to exercise lazy
@@ -201,7 +203,8 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        "test-topic")
+                        "test-topic",
+                        PERSISTED_TOPIC_OPTIONS)
                 .get(5, TimeUnit.SECONDS);
 
         List<CompletableFuture<SendMessagesResponse>> warmupFutures = new ArrayList<>();

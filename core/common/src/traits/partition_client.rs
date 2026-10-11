@@ -26,6 +26,11 @@ pub trait PartitionClient {
     /// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 1 to 5).
     ///
     /// Authentication is required, and the permission to manage the partitions.
+    ///
+    /// If the new partitions would take the node past `[metadata]
+    /// partitions_max`, a binary transport returns
+    /// `IggyError::PartitionsLimitReached`. `HttpClient` returns
+    /// `IggyError::HttpResponseError` instead.
     async fn create_partitions(
         &self,
         stream_id: &Identifier,

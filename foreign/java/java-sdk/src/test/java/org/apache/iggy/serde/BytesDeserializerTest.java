@@ -585,6 +585,8 @@ class BytesDeserializerTest {
             buffer.writeIntLE(42); // threads count
             writeU64(buffer, BigInteger.valueOf(500_000_000_000L)); // free disk space
             writeU64(buffer, BigInteger.valueOf(1_000_000_000_000L)); // total disk space
+            writeU64(buffer, BigInteger.valueOf(1234)); // open files count
+            writeU64(buffer, BigInteger.valueOf(1_048_576)); // open files limit
 
             // when
             var stats = readStats(buffer);
@@ -618,6 +620,45 @@ class BytesDeserializerTest {
             assertThat(stats.threadsCount()).isEqualTo(42L);
             assertThat(stats.freeDiskSpace()).isEqualTo("500000000000");
             assertThat(stats.totalDiskSpace()).isEqualTo("1000000000000");
+            assertThat(stats.openFilesCount()).isEqualTo(BigInteger.valueOf(1234));
+            assertThat(stats.openFilesLimit()).isEqualTo(BigInteger.valueOf(1_048_576));
+            assertThat(buffer.isReadable()).isFalse();
+        }
+
+        @Test
+        void shouldReadOpenFilesFieldsAsZeroWhenServerOmitsThem() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeBaseStatsFields(buffer);
+            writeServerVersionFields(buffer);
+            buffer.writeIntLE(0); // cache_metrics (empty)
+            buffer.writeIntLE(42); // threads count
+            writeU64(buffer, BigInteger.valueOf(500_000_000_000L)); // free disk space
+            writeU64(buffer, BigInteger.valueOf(1_000_000_000_000L)); // total disk space
+
+            // when
+            var stats = readStats(buffer);
+
+            // then
+            assertThat(stats.totalDiskSpace()).isEqualTo("1000000000000");
+            assertThat(stats.openFilesCount()).isEqualTo(BigInteger.ZERO);
+            assertThat(stats.openFilesLimit()).isEqualTo(BigInteger.ZERO);
+        }
+
+        @Test
+        void shouldFailWhenOpenFilesFieldsAreTruncated() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeBaseStatsFields(buffer);
+            writeServerVersionFields(buffer);
+            buffer.writeIntLE(0); // cache_metrics (empty)
+            buffer.writeIntLE(42); // threads count
+            writeU64(buffer, BigInteger.valueOf(500_000_000_000L)); // free disk space
+            writeU64(buffer, BigInteger.valueOf(1_000_000_000_000L)); // total disk space
+            writeU64(buffer, BigInteger.valueOf(1234)); // open files count, limit missing
+
+            // when / then
+            assertThatThrownBy(() -> readStats(buffer)).isInstanceOf(IggyMalformedResponseException.class);
         }
 
         @Test

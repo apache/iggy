@@ -591,6 +591,6 @@ mod tests {
         let polled = resync_required_polled_messages();
         assert_eq!(polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL);
         assert_eq!(polled.count, 0);
-        assert!(polled.messages.is_empty());
+        assert_eq!(polled.messages, []);
     }
 }

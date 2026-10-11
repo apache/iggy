@@ -81,7 +81,9 @@
 //! duplicate state across the transport and dispatcher (drift hazard)
 //! or force every transport to parse application frames (layering
 //! violation). DoS-shaped abuse is bounded instead by handshake-grace
-//! timeouts and the bus-wide [`crate::installer`] backpressure budget.
+//! timeouts and the node-wide [`crate::ConnectionCap`]
+//! (`[message_bus] connections_max`), which shard 0 applies before it
+//! delegates a socket.
 
 use std::net::SocketAddr;
 use std::rc::Rc;

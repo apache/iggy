@@ -944,8 +944,9 @@ impl IggyConsumer {
     ///   [`auto_commit()`](crate::prelude::IggyConsumerBuilder::auto_commit) is
     ///   [`AutoCommitWhen::PollingMessages`], checked before anything is sent. See
     ///   [Encryption](IggyConsumer#encryption).
-    /// - [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`] when the
-    ///   stream or the topic still does not exist once the retries are exhausted.
+    /// - [`IggyError::StreamNameNotFound`], [`IggyError::StreamIdNotFound`] or [`IggyError::TopicNameNotFound`],
+    ///   [`IggyError::TopicIdNotFound`] when the stream or the topic still does not exist once the retries are
+    ///   exhausted.
     /// - [`IggyError::ConsumerGroupNameNotFound`] when the consumer group does not exist
     ///   and its auto creation is disabled.
     /// - Any error returned by the server while looking up the stream or the topic, or
@@ -1024,17 +1025,26 @@ impl IggyConsumer {
 
             if !stream_exists {
                 error!("Stream: {stream_id} was not found.");
-                return Err(IggyError::StreamNameNotFound(
-                    self.stream_id.get_string_value().unwrap_or_default(),
-                ));
-            };
+                return Err(match stream_id.kind {
+                    IdKind::String => IggyError::StreamNameNotFound(stream_id.get_string_value()?),
+                    IdKind::Numeric => {
+                        IggyError::StreamIdNotFound(Identifier::from_identifier(&stream_id))
+                    }
+                });
+            }
 
             if !topic_exists {
                 error!("Topic: {topic_id} was not found in stream: {stream_id}.");
-                return Err(IggyError::TopicNameNotFound(
-                    self.topic_id.get_string_value().unwrap_or_default(),
-                    self.stream_id.get_string_value().unwrap_or_default(),
-                ));
+                return Err(match topic_id.kind {
+                    IdKind::String => IggyError::TopicNameNotFound(
+                        topic_id.get_string_value()?,
+                        stream_id.to_string(),
+                    ),
+                    IdKind::Numeric => IggyError::TopicIdNotFound(
+                        Identifier::from_identifier(&topic_id),
+                        Identifier::from_identifier(&stream_id),
+                    ),
+                });
             }
         }
 
@@ -1156,7 +1166,6 @@ impl IggyConsumer {
             self.create_consumer_group_if_not_exists,
             self.stream_id.clone(),
             self.topic_id.clone(),
-            self.consumer.clone(),
             &self.consumer_name,
             self.joined_consumer_group.clone(),
         )
@@ -1257,7 +1266,6 @@ impl IggyConsumer {
                     create_consumer_group_if_not_exists,
                     stream_id.clone(),
                     topic_id.clone(),
-                    consumer.clone(),
                     &consumer_name,
                     joined_consumer_group.clone(),
                 )
@@ -1420,7 +1428,6 @@ impl IggyConsumer {
         create_consumer_group_if_not_exists: bool,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
-        consumer: Arc<Consumer>,
         consumer_name: &str,
         joined_consumer_group: Arc<AtomicBool>,
     ) -> Result<(), IggyError> {
@@ -1429,12 +1436,7 @@ impl IggyConsumer {
         }
 
         let client = client.read().await;
-        let (name, _id) = match consumer.id.kind {
-            IdKind::Numeric => (consumer_name.to_owned(), Some(consumer.id.get_u32_value()?)),
-            IdKind::String => (consumer.id.get_string_value()?, None),
-        };
-
-        let consumer_group_id = name.to_owned().try_into()?;
+        let consumer_group_id = Identifier::named(consumer_name)?;
         trace!(
             "Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
         );
@@ -1447,7 +1449,7 @@ impl IggyConsumer {
                 error!("Consumer group does not exist and auto-creation is disabled.");
                 let topic_identifier = Identifier::from_identifier(&topic_id);
                 return Err(IggyError::ConsumerGroupNameNotFound(
-                    name.to_owned(),
+                    consumer_name.to_owned(),
                     topic_identifier,
                 ));
             }
@@ -1456,7 +1458,7 @@ impl IggyConsumer {
                 "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
             );
             match client
-                .create_consumer_group(&stream_id, &topic_id, &name)
+                .create_consumer_group(&stream_id, &topic_id, consumer_name)
                 .await
             {
                 Ok(_) => {}

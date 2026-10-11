@@ -31,8 +31,10 @@ pub mod consumer_timestamp_polling_scenario;
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
+pub mod delete_segments_scenario;
 pub mod delete_stats_rollback_scenario;
 pub mod encryption_scenario;
+pub mod external_group_offsets_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
@@ -40,7 +42,6 @@ pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;
 pub mod permissions_scenario;
-pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
 pub mod reconnect_after_restart_scenario;
 pub mod restart_offset_skip_scenario;
@@ -65,7 +66,7 @@ const PARTITION_ID: u32 = 0;
 // One pair for every wait in these scenarios, because they all wait out the
 // same thing: the partition plane applies committed ops asynchronously on the
 // owning shard (a send folds into the shared stats and into the servable log at
-// commit-apply; purge and delete zero them when the reconciler drives the wipe),
+// commit-apply; a delete zeroes them when the reconciler drives the wipe),
 // so a read racing that window sees a pre-apply value. Retry until the
 // expectation holds, then make the terminal assertion for a real mismatch.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(10);

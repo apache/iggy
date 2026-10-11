@@ -81,6 +81,15 @@ pub struct Stats {
     pub free_disk_space: IggyByteSize,
     /// The total disk space for the data directory.
     pub total_disk_space: IggyByteSize,
+    /// The number of file descriptors the server process holds open, 0 when unknown.
+    /// Where the kernel cannot count them without a scan (Linux before 6.2, macOS),
+    /// the server scans at least every 10 seconds, so the count can be 10 seconds old.
+    #[serde(default)]
+    pub open_files_count: u64,
+    /// The soft limit on open file descriptors (`RLIMIT_NOFILE`) of the server
+    /// process, 0 when unknown.
+    #[serde(default)]
+    pub open_files_limit: u64,
 }
 
 /// Key for identifying a specific partition's cache metrics
@@ -191,6 +200,8 @@ impl Default for Stats {
             threads_count: 0,
             free_disk_space: 0.into(),
             total_disk_space: 0.into(),
+            open_files_count: 0,
+            open_files_limit: 0,
         }
     }
 }

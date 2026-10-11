@@ -20,6 +20,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
 use kafka_protocol::messages::add_partitions_to_txn_request::*;
+use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::create_topics_request::*;
 use kafka_protocol::messages::delete_records_request::*;
 use kafka_protocol::messages::delete_topics_request::*;
@@ -29,6 +30,7 @@ use kafka_protocol::messages::join_group_request::*;
 use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
 use kafka_protocol::messages::offset_commit_request::*;
+use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestGroup;
 use kafka_protocol::messages::produce_request::*;
 use kafka_protocol::messages::txn_offset_commit_request::*;
 use kafka_protocol::messages::*;
@@ -360,10 +362,16 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .context("OffsetCommit")?;
         }
         9 => {
-            OffsetFetchRequest::default()
-                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
-                .encode(&mut buf, version)
-                .context("OffsetFetch")?;
+            let group = GroupId::from(StrBytes::from_static_str("test-group"));
+            // v8 moved the group into `groups`, and the encoder refuses the top-level id there.
+            let request = if version >= 8 {
+                OffsetFetchRequest::default().with_groups(vec![
+                    OffsetFetchRequestGroup::default().with_group_id(group),
+                ])
+            } else {
+                OffsetFetchRequest::default().with_group_id(group)
+            };
+            request.encode(&mut buf, version).context("OffsetFetch")?;
         }
         10 => {
             let key = StrBytes::from_static_str("test-group");
@@ -549,6 +557,15 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .with_resources(vec![r])
                 .encode(&mut buf, version)
                 .context("DescribeConfigs")?;
+        }
+        33 => {
+            let resource = AlterConfigsResource::default()
+                .with_resource_type(2)
+                .with_resource_name(StrBytes::from_static_str("test-topic"));
+            AlterConfigsRequest::default()
+                .with_resources(vec![resource])
+                .encode(&mut buf, version)
+                .context("AlterConfigs")?;
         }
         36 => {
             SaslAuthenticateRequest::default()

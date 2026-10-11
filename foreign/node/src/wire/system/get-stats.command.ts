@@ -18,6 +18,16 @@
 import type { CommandResponse } from '../../client/index.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { wrapCommand } from '../command.utils.js';
+import { deserializeError } from '../error.utils.js';
+
+export type CacheMetrics = {
+  streamId: number,
+  topicId: number,
+  partitionId: number,
+  hits: bigint,
+  misses: bigint,
+  hitRatio: number
+}
 
 export type Stats = {
   processId: number,
@@ -41,10 +51,51 @@ export type Stats = {
   hostname: string,
   osName: string,
   osVersion: string,
-  kernelVersion: string
+  kernelVersion: string,
+  iggyServerVersion: string,
+  /** 0 when the server does not report it. */
+  iggyServerSemver: number,
+  cacheMetrics: CacheMetrics[],
+  threadsCount: number,
+  freeDiskSpace: bigint,
+  totalDiskSpace: bigint,
+  openFilesCount: bigint,
+  openFilesLimit: bigint
 }
 
+// process_id through consumer_groups_count
+const FIXED_HEAD_SIZE = 108;
+// stream_id, topic_id, partition_id, hits, misses, hit_ratio
+const CACHE_METRIC_SIZE = 4 + 4 + 4 + 8 + 8 + 4;
+// threads_count, free_disk_space, total_disk_space
+const THREADS_AND_DISK_SIZE = 4 + 8 + 8;
+// open_files_count, open_files_limit
+const OPEN_FILES_SIZE = 8 + 8;
+
+const ensureLength = (b: Buffer, end: number) => {
+  if (end > b.length)
+    deserializeError('stats', end, b.length);
+};
+
+/** A u32 length, then that many bytes of text. */
+const deserializeString = (b: Buffer, position: number) => {
+  ensureLength(b, position + 4);
+  const end = position + 4 + b.readUInt32LE(position);
+  ensureLength(b, end);
+  return { value: b.subarray(position + 4, end).toString(), end };
+};
+
+const deserializeCacheMetric = (b: Buffer, position: number): CacheMetrics => ({
+  streamId: b.readUInt32LE(position),
+  topicId: b.readUInt32LE(position + 4),
+  partitionId: b.readUInt32LE(position + 8),
+  hits: b.readBigUInt64LE(position + 12),
+  misses: b.readBigUInt64LE(position + 20),
+  hitRatio: b.readFloatLE(position + 28)
+});
+
 const deserializeGetStats = (b: Buffer) => {
+  ensureLength(b, FIXED_HEAD_SIZE);
   const processId = b.readUInt32LE(0);
   const cpuUsage = b.readFloatLE(4);
   const totalCpuUsage = b.readFloatLE(8);
@@ -64,33 +115,37 @@ const deserializeGetStats = (b: Buffer) => {
   const clientsCount = b.readUInt32LE(100);
   const consumersGroupsCount = b.readUInt32LE(104);
 
-  let position = 104 + 4;
-  const hostnameLength = b.readUInt32LE(position);
-  const hostname = b.subarray(
-    position + 4,
-    position + 4 + hostnameLength
-  ).toString();
-  position += 4 + hostnameLength;
+  const hostname = deserializeString(b, FIXED_HEAD_SIZE);
+  const osName = deserializeString(b, hostname.end);
+  const osVersion = deserializeString(b, osName.end);
+  const kernelVersion = deserializeString(b, osVersion.end);
+  const iggyServerVersion = deserializeString(b, kernelVersion.end);
+  let position = iggyServerVersion.end;
 
-  const osNameLength = b.readUInt32LE(position);
-  const osName = b.subarray(
-    position + 4,
-    position + 4 + osNameLength
-  ).toString();
-  position += 4 + osNameLength;
+  ensureLength(b, position + 4 + 4);
+  const iggyServerSemver = b.readUInt32LE(position);
+  const cacheMetricsCount = b.readUInt32LE(position + 4);
+  position += 4 + 4;
+  ensureLength(b, position + cacheMetricsCount * CACHE_METRIC_SIZE + THREADS_AND_DISK_SIZE);
+  const cacheMetrics: CacheMetrics[] = [];
+  for (let index = 0; index < cacheMetricsCount; index += 1) {
+    cacheMetrics.push(deserializeCacheMetric(b, position));
+    position += CACHE_METRIC_SIZE;
+  }
 
-  const osVersionLength = b.readUInt32LE(position);
-  const osVersion = b.subarray(
-    position + 4,
-    position + 4 + osVersionLength
-  ).toString();
-  position += 4 + osVersionLength;
+  const threadsCount = b.readUInt32LE(position);
+  const freeDiskSpace = b.readBigUInt64LE(position + 4);
+  const totalDiskSpace = b.readBigUInt64LE(position + 12);
+  position += THREADS_AND_DISK_SIZE;
 
-  const kernelVersionLength = b.readUInt32LE(position);
-  const kernelVersion = b.subarray(
-    position + 4,
-    position + 4 + kernelVersionLength
-  ).toString();
+  // Servers that predate the open-files fields end the reply here.
+  let openFilesCount = 0n;
+  let openFilesLimit = 0n;
+  if (b.length > position) {
+    ensureLength(b, position + OPEN_FILES_SIZE);
+    openFilesCount = b.readBigUInt64LE(position);
+    openFilesLimit = b.readBigUInt64LE(position + 8);
+  }
 
   return {
     processId,
@@ -111,10 +166,18 @@ const deserializeGetStats = (b: Buffer) => {
     messagesCount,
     clientsCount,
     consumersGroupsCount,
-    hostname,
-    osName,
-    osVersion,
-    kernelVersion
+    hostname: hostname.value,
+    osName: osName.value,
+    osVersion: osVersion.value,
+    kernelVersion: kernelVersion.value,
+    iggyServerVersion: iggyServerVersion.value,
+    iggyServerSemver,
+    cacheMetrics,
+    threadsCount,
+    freeDiskSpace,
+    totalDiskSpace,
+    openFilesCount,
+    openFilesLimit
   };
 };
 

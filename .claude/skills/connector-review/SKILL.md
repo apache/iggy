@@ -3,14 +3,20 @@ name: connector-review
 description: |
  Adversarial review of a connectors PR, branch, or ref range, with clean-room validation of every finding. Experts
  work alone and use the focused connector skills as their source of subsystem rules.
+ Use only when the user explicitly requests connector-review.
 argument-hint: "[PR number | branch | ref range]"
 disable-model-invocation: true
 ---
 
 # Apache Iggy Connector Review
 
-`<TARGET>` = `$ARGUMENTS`: a PR number, a branch, or a ref range. Empty means `origin/master...HEAD`. Scope: anything
-under `core/connectors/` plus connector integration tests under `core/integration/tests/connectors/`.
+`<TARGET>` is the PR number, branch, or ref range supplied after the skill name. With no target, review `HEAD`
+from its merge base with `origin/master`. Scope: anything
+under `core/connectors/` plus connector integration tests under `core/integration/tests/connectors/`. Other changed
+paths, such as harness files and `Cargo.toml`, are in scope where connector code depends on them.
+
+Read [execution instructions](../team-review/references/execution.md) before starting. Use the section for your client to
+translate the tool calls below. Include those instructions in worker prompts. Keep this skill's Charter, roles, rounds, and report.
 
 You = **moderator**. You never open the diff or a source file: you route paths, merge claims, synthesize. Every token
 you load rides along every later turn. Reviewers and validators are one-shot agents that deliver by writing a file.
@@ -103,25 +109,9 @@ Nobody chats.
 
 ## Step 1: Identify the target (no reading)
 
-- Classify `<TARGET>`: matches `^#?(pr)?[0-9]+$` case-insensitively -> PR, the digits are `<PR>`. Anything else -> ref
-  range or bare branch. Empty -> review `origin/master...HEAD`.
-- `<TOPIC>`: `<TARGET>` lowercased, chars outside `[a-z0-9-]` replaced by `-`, repeats collapsed, trimmed, max 40 chars
-  (`PR3123` -> `pr3123`, `origin/master...HEAD` -> `origin-master-head`). Empty -> `date +%s`.
-- `<DIR>` = `<session scratchpad dir from your system prompt>/review-<TOPIC>`. `mkdir -p` it.
-- PR: `gh pr view <PR> --json title,body,headRefOid > <DIR>/pr.json`, `gh pr diff <PR> > <DIR>/diff.patch`,
-  `gh pr diff <PR> --name-only > <DIR>/files.txt`. `<SHORTCOMMIT>` = first 8 of `headRefOid`.
-- Empty target: `git diff origin/master...HEAD > <DIR>/diff.patch`, same with `--name-only`, and `<SHORTCOMMIT>` =
-  `git rev-parse --short=8 HEAD`.
-- Ref range (`A..B` / `A...B`): `git diff <TARGET> > <DIR>/diff.patch`, same with `--name-only`, and `<SHORTCOMMIT>` =
-  `git rev-parse --short=8 <TARGET-end>`.
-- Bare branch `<BRANCH>`: `git diff $(git merge-base origin/master <BRANCH>)..<BRANCH> > <DIR>/diff.patch`, same with
-  `--name-only`, and `<SHORTCOMMIT>` = `git rev-parse --short=8 <BRANCH>`. Do not create `pr.json` for these three cases.
-- Guard: `git rev-parse HEAD` must equal the reviewed head (`headRefOid` for a PR, `HEAD` for an empty target,
-  `<TARGET-end>` for a range, or `<BRANCH>` for a branch). Experts read the local checkout. If it differs, stop and ask
-  the user to check out the reviewed head.
-- `<DESCR>`: 1-3 word `snake_case` summary, `[a-z0-9_]`, <= 24 chars. From the PR title; no PR -> from
-  `git log -1 --format=%s`.
-- Report path: `<DIR>/report.md`.
+Prepare the target and artifacts as the execution instructions specify. Use the resolved starting commit and reviewed
+head for every round. Read `files.txt` to select roles, but do not read the diff or source files in the moderator
+context.
 
 Do not `cat` any of the files you just wrote. `wc -l <DIR>/diff.patch` is the only look you take.
 
@@ -232,6 +222,7 @@ Output in the simple English of the Charter. The Charter binds you too:
 Confirmed critical + warning only. Simplifications informational. Reason: one line.
 
 Counts: critical N, warning N, nit N, simplify N (Confirmed + Simplification sections)
+Verification: <actual commands and outcomes, or none ran>.
 ```
 
 Then write `<DIR>/report.md` with:
@@ -243,4 +234,4 @@ Then write `<DIR>/report.md` with:
 5. `## Validation record`: counts of PASS / FIX / REMOVE, sweep additions, contested outcomes.
 
 Last user-facing line: `Findings written: <DIR>/report.md`. Do not clean up. One-shot agents end themselves, and
-`<DIR>` stays in the scratchpad.
+`<DIR>` keeps its artifacts.

@@ -31,11 +31,9 @@ const replicated = new Map<number, number>([
   [COMMAND_CODE.CreateStream, Operation.CreateStream],
   [COMMAND_CODE.UpdateStream, Operation.UpdateStream],
   [COMMAND_CODE.DeleteStream, Operation.DeleteStream],
-  [COMMAND_CODE.PurgeStream, Operation.PurgeStream],
   [COMMAND_CODE.CreateTopic, Operation.CreateTopic],
   [COMMAND_CODE.UpdateTopic, Operation.UpdateTopic],
   [COMMAND_CODE.DeleteTopic, Operation.DeleteTopic],
-  [COMMAND_CODE.PurgeTopic, Operation.PurgeTopic],
   [COMMAND_CODE.CreatePartitions, Operation.CreatePartitions],
   [COMMAND_CODE.DeletePartitions, Operation.DeletePartitions],
   [COMMAND_CODE.DeleteSegments, Operation.DeleteSegments],
@@ -82,6 +80,9 @@ describe('VSR operation classification', () => {
     assert.equal(isInternal(64), true);
     assert.equal(isInternal(63), false);
     assert.equal(isInternal(Operation.CreateStream), false);
+    assert.equal(isInternal(Operation.RetireSession), true);
+    assert.equal(isMetadata(Operation.RetireSession), false);
+    assert.equal(isResultFramed(Operation.RetireSession), false);
     assert.equal(isMetadata(Operation.CreateStream), true);
     assert.equal(isMetadata(Operation.LeaveConsumerGroup), true);
     assert.equal(isMetadata(Operation.DeleteSegments), false);
@@ -94,7 +95,9 @@ describe('VSR operation classification', () => {
   it('recognizes only declared operation discriminants', () => {
     assert.equal(isKnownOperation(Operation.Register), true);
     assert.equal(isKnownOperation(Operation.SendMessages), true);
-    for (const undeclared of [69, 127, 150, 159, 163, 164, 165, 166, 255])
+    assert.equal(isKnownOperation(Operation.RetireSession), true);
+    assert.equal(isKnownOperation(Operation.FinalizeSession), true);
+    for (const undeclared of [69, 127, 131, 135, 150, 159, 163, 164, 165, 167, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });

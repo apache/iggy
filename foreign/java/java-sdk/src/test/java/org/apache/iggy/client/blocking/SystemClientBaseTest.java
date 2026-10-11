@@ -76,6 +76,8 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
         assertThat(stats.threadsCount()).isNotNull();
         assertThat(stats.freeDiskSpace()).isNotNull();
         assertThat(stats.totalDiskSpace()).isNotNull();
+        assertThat(stats.openFilesCount()).isNotNull();
+        assertThat(stats.openFilesLimit()).isNotNull();
     }
 
     @Test

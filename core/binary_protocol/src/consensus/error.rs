@@ -80,13 +80,15 @@ pub enum ConsensusError {
     InvalidBitPattern,
 
     // Consequence deliberately left out: `RequestHeader` reaches here too, and a
-    // client frame is dropped without a reply rather than stalling a consensus
-    // group. The plane-specific outcome belongs to the call site that logs it.
+    // client frame is denied with `InvalidCommand` rather than stalling a
+    // consensus group. The plane-specific outcome belongs to the call site that
+    // handles it.
     // "Likely", not asserted: replica frames authenticate the byte (frame seal
     // or prepare identity) before this is raised, but a client `Request` has
     // neither checksum, so its byte stays unverifiable.
     #[error(
-        "operation {operation:#04x} is not known to this build; a newer release likely added it"
+        "operation {operation:#04x} is not known to this build; the sender likely runs \
+         another release"
     )]
     UnsupportedOperation { operation: u8 },
 

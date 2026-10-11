@@ -299,7 +299,7 @@ pub fn new_shard(
 
     // A data directory arms the `SnapshotCoordinator`; without one
     // `checkpoint_if_needed` returns immediately and nothing ever checkpoints.
-    let metadata = IggyMetadata::new(
+    let mut metadata = IggyMetadata::new(
         metadata_consensus,
         metadata_journal,
         metadata_snapshot,
@@ -308,6 +308,9 @@ pub fn new_shard(
         data_dir,
     )
     .with_applied_frontier(applied_frontier);
+    if let Some(coordinator) = metadata.coordinator.as_mut() {
+        coordinator.use_synchronous_io();
+    }
 
     // Both halves are load-bearing: the pairing keeps a later view-change superblock
     // write from regressing to `(0, 0)`, and the folded table is the floor the replayed
@@ -315,8 +318,7 @@ pub fn new_shard(
     if let Some((snapshot, checksum)) = local_checkpoint.as_ref() {
         metadata.seed_checkpoint_ref(snapshot.snapshot().sequence_number, *checksum);
         if let Some(table) = snapshot.snapshot().client_table.clone() {
-            let capacity = metadata.client_table_capacity();
-            let restored = ClientTable::from_snapshot(table, capacity)
+            let restored = ClientTable::from_snapshot(table)
                 .expect("the local checkpoint's client table decodes");
             assert!(
                 metadata.install_client_table(restored),
@@ -437,6 +439,7 @@ pub fn new_shard(
             inbox,
             reply_inbox,
             ServerConfig::default().sharding.poll_completion_capacity,
+            None,
             PapayaShardsTable::new(),
             shard::PartitionConsensusConfig::with_clock(
                 CLUSTER_ID,

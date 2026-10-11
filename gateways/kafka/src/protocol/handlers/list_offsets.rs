@@ -18,7 +18,7 @@
 //! `ListOffsets` (API key 2).
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
@@ -31,15 +31,13 @@ use tokio::time::Instant;
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
-    API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    API_KEY_LIST_OFFSETS, ApiVersionRange, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT, GatewayState,
+    HandleOutcome, REQUEST_DEADLINE, UNKNOWN_OFFSET,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
-use crate::protocol::handlers::{
-    decode_guarded, encode_message, handle_versioned_request, is_supported_version,
-    respond_or_close, unsupported_version_response,
-};
+use crate::protocol::handlers::fetch::{Spells, sight_loading};
+use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
     api_key: API_KEY_LIST_OFFSETS,
@@ -62,76 +60,43 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// its own within a couple of retries, rather than resending the same oversized request forever.
 const MAX_BRIDGE_BACKED_TOPICS: usize = 100;
 
-/// Wall-clock ceiling for one request's aggregate bridge work.
-///
-/// `ListOffsets` carries no `timeout_ms` field in any version this gateway supports (that field
-/// is v10+; [`RANGE`] tops out at v6) - unlike `CreateTopics`, there is no client-supplied value
-/// to honor here, so this is a fixed ceiling instead. Sized well above one `high_watermarks`
-/// call's own `REQUEST_TIMEOUT` (15s, bridge-internal) so a single slow-but-alive call is not the
-/// common trigger, while still bounding the sum across up to [`MAX_BRIDGE_BACKED_TOPICS`] calls -
-/// without this, a large batch against a struggling bridge could hold the shared client for
-/// `MAX_BRIDGE_BACKED_TOPICS * 15s`, not just one call's worth.
-///
-/// Applied per call, not once around the whole batch: [`resolve_all_topics`] checks it before
-/// starting each topic's `high_watermarks` call and wraps the call itself in
-/// [`tokio::time::timeout_at`] against the same instant, so a topic already resolved when the
-/// deadline arrives keeps its real answer and only the not-yet-started ones fall back to
-/// [`ERROR_REQUEST_TIMED_OUT`].
-const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
-
 /// KIP-79 sentinel: the offset of the next message that would be produced.
 const LATEST_TIMESTAMP: i64 = -1;
 /// KIP-79 sentinel: the offset of the first message still retained.
 const EARLIEST_TIMESTAMP: i64 = -2;
-/// Placeholder offset/timestamp for a partition result that carries an error - matches real
-/// Kafka's own convention on the error path.
-const NO_OFFSET: i64 = -1;
 
 /// [`IggyBridge::high_watermarks`]'s return type, spelled once for [`resolve_one_partition`].
 type HighWatermarksResult =
     core::result::Result<Vec<(u32, core::result::Result<i64, BridgeError>)>, BridgeError>;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
-    let Some(bridge) = &state.bridge else {
-        return handle_versioned_request(
-            API_KEY_LIST_OFFSETS,
-            api_version,
-            body,
-            |v, b| {
-                decode_guarded::<ListOffsetsRequest>(v, b, |v, b| {
-                    validate_list_offsets_shape(v, b, state.max_frame_size)
-                })
-            },
-            encode_response,
-            encode_error_response,
-            "ListOffsets",
-        );
-    };
-
-    if !is_supported_version(API_KEY_LIST_OFFSETS, api_version) {
-        return unsupported_version_response(API_KEY_LIST_OFFSETS, api_version, |version| {
-            encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
-        });
-    }
-
-    let req = match decode_guarded::<ListOffsetsRequest>(api_version, body, |v, b| {
-        validate_list_offsets_shape(v, b, state.max_frame_size)
-    }) {
+    let decoded = decode_request(
+        API_KEY_LIST_OFFSETS,
+        api_version,
+        body,
+        |v, b| decode(state, v, b),
+        encode_error_response,
+        "ListOffsets",
+    );
+    let req = match decoded {
         Ok(req) => req,
-        Err(error) => {
-            // debug!, not warn!: attacker-controlled, not operator-actionable.
-            tracing::debug!(%error, "Failed to decode ListOffsets request");
-            return respond_or_close(
-                encode_error_response(api_version, ERROR_INVALID_REQUEST),
-                "ListOffsets",
-            );
-        }
+        Err(outcome) => return outcome,
+    };
+    let Some(bridge) = &state.bridge else {
+        return respond_or_close(encode_response(api_version, &req), "ListOffsets");
     };
 
+    // No `timeout_ms` below v10, so the ceiling is fixed. It bounds the sum of the topic calls.
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let topics = resolve_all_topics(bridge, &req.topics, deadline).await;
+    let topics = resolve_all_topics(bridge, &state.loading, &req.topics, deadline).await;
     let resp = ListOffsetsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets")
+}
+
+fn decode(state: &GatewayState, version: i16, body: Bytes) -> Result<ListOffsetsRequest> {
+    decode_guarded::<ListOffsetsRequest>(version, body, |v, b| {
+        validate_list_offsets_shape(v, b, state.max_frame_size)
+    })
 }
 
 /// One topic's bridge-lookup outcome, decided once per distinct name in [`resolve_all_topics`]
@@ -144,7 +109,8 @@ enum TopicLookup {
     Watermarks(HighWatermarksResult),
     /// Beyond [`MAX_BRIDGE_BACKED_TOPICS`], or the deadline elapsed before this topic's turn - no
     /// call was made. Answered [`ERROR_REQUEST_TIMED_OUT`] (retriable) rather than
-    /// [`ERROR_INVALID_REQUEST`] so a client's own per-topic retry narrows the batch on its own.
+    /// [`ERROR_INVALID_REQUEST`](crate::protocol::api::ERROR_INVALID_REQUEST) so a client's own
+    /// per-topic retry narrows the batch on its own.
     NotAttempted,
 }
 
@@ -187,8 +153,13 @@ fn group_requested_topics(requested: &[ListOffsetsTopic]) -> (Vec<&str>, HashMap
 /// when time runs out keeps its real answer. A topic with no *valid* partition index at all
 /// skips the call - there is nothing `high_watermarks` could tell us that would change any
 /// partition's answer, since every one of them already fails its own index check.
+///
+/// A partition that reads as loading counts toward its `loading` spell, so the log shows one that
+/// stays so. It answers 6 past the grace too: a high watermark read during a load is too low, and
+/// a consumer that seeks to it reads those records again.
 async fn resolve_topic_lookups<'a>(
     bridge: &IggyBridge,
+    loading: &Mutex<Spells>,
     order: &[&'a str],
     partitions_by_name: &HashMap<&'a str, Vec<u32>>,
     deadline: Instant,
@@ -262,6 +233,11 @@ async fn resolve_topic_lookups<'a>(
                 tracing::error!(topic = name, %call_err, "ListOffsets bridge lookup failed");
             }
         }
+        for (partition, watermark) in result.iter().flatten() {
+            if matches!(watermark, Err(BridgeError::PartitionLoading { .. })) {
+                sight_loading(loading, name, *partition, Instant::now());
+            }
+        }
         lookups.insert(name, TopicLookup::Watermarks(result));
     }
     lookups
@@ -274,11 +250,13 @@ async fn resolve_topic_lookups<'a>(
 /// [`ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT`] rather than a fabricated offset.
 async fn resolve_all_topics(
     bridge: &IggyBridge,
+    loading: &Mutex<Spells>,
     requested: &[ListOffsetsTopic],
     deadline: Instant,
 ) -> Vec<ListOffsetsTopicResponse> {
     let (order, partitions_by_name) = group_requested_topics(requested);
-    let lookups = resolve_topic_lookups(bridge, &order, &partitions_by_name, deadline).await;
+    let lookups =
+        resolve_topic_lookups(bridge, loading, &order, &partitions_by_name, deadline).await;
 
     requested
         .iter()
@@ -340,9 +318,9 @@ fn resolve_one_partition(
         // Real only for a partition retention has never trimmed: Iggy tracks no rolling
         // low-watermark distinct from partition creation, so a `0` here for an older,
         // already-trimmed partition names a log-start offset that no longer exists - a real
-        // consumer with `auto.offset.reset=earliest` would seek into a hole. Harmless *today*
-        // only because Fetch (`#3536`) is still a stub - nothing yet reads at the offset this
-        // returns. Not fixable client-side; needs the bridge to expose a real start offset.
+        // consumer with `auto.offset.reset=earliest` would seek into a hole. Fetch there reads
+        // from the oldest kept message, so the consumer skips the gap. Not fixable client-side;
+        // needs the bridge to expose a real start offset.
         EARLIEST_TIMESTAMP => offset_response(requested.partition_index, 0),
         // Non-retriable, unlike ERROR_UNKNOWN_SERVER_ERROR: a Java client resolves this
         // immediately instead of retrying the request until its own default.api.timeout.ms.
@@ -364,8 +342,8 @@ fn error_response(partition: i32, error_code: i16) -> ListOffsetsPartitionRespon
     ListOffsetsPartitionResponse::default()
         .with_partition_index(partition)
         .with_error_code(error_code)
-        .with_timestamp(NO_OFFSET)
-        .with_offset(NO_OFFSET)
+        .with_timestamp(UNKNOWN_OFFSET)
+        .with_offset(UNKNOWN_OFFSET)
 }
 
 /// Well-formed `ListOffsets` response with a single placeholder topic/partition.
@@ -462,7 +440,7 @@ mod tests {
         let lookup = TopicLookup::Watermarks(Ok(ok_watermarks(&[(0, 42)])));
         let resp = resolve_one_partition(&partition(0, 1_700_000_000_000), &lookup);
         assert_eq!(resp.error_code, ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT);
-        assert_eq!(resp.offset, NO_OFFSET);
+        assert_eq!(resp.offset, UNKNOWN_OFFSET);
     }
 
     #[test]
@@ -481,7 +459,7 @@ mod tests {
         let resp =
             resolve_one_partition(&partition(0, LATEST_TIMESTAMP), &TopicLookup::NotAttempted);
         assert_eq!(resp.error_code, ERROR_REQUEST_TIMED_OUT);
-        assert_eq!(resp.offset, NO_OFFSET);
+        assert_eq!(resp.offset, UNKNOWN_OFFSET);
     }
 
     #[test]

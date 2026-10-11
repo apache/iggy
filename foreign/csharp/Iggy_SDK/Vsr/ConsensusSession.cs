@@ -38,6 +38,7 @@ internal sealed class ConsensusSession
     private readonly object _gate = new();
 #endif
     private UInt128 _clientId;
+    private readonly byte[] _bindSecret = new byte[LoginRegister.BIND_SECRET_BYTES];
     private ulong _generation;
     private bool _registerPending;
     private ulong _requestCounter;
@@ -79,6 +80,29 @@ internal sealed class ConsensusSession
         }
     }
 
+    internal byte[] BindSecret
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return (byte[])_bindSecret.Clone();
+            }
+        }
+    }
+
+    internal void SetBindSecret(ReadOnlySpan<byte> bindSecret)
+    {
+        if (bindSecret.Length != LoginRegister.BIND_SECRET_BYTES)
+        {
+            throw new ArgumentException("Bind secret must be 32 bytes.", nameof(bindSecret));
+        }
+        lock (_gate)
+        {
+            bindSecret.CopyTo(_bindSecret);
+        }
+    }
+
     internal bool IsBound
     {
         get
@@ -117,6 +141,16 @@ internal sealed class ConsensusSession
         _requestCounter = 1;
     }
 
+    internal ConsensusSession(UInt128 clientId, ulong session, ReadOnlySpan<byte> bindSecret) : this(clientId)
+    {
+        if (session == 0)
+        {
+            throw VsrError.Exception(VsrError.INVALID_FORMAT, "Shared session requires a nonzero epoch.");
+        }
+        _session = session;
+        SetBindSecret(bindSecret);
+    }
+
     /// <summary>
     ///     Resolves the identity one request header is encoded from, in a single atomic step so no reset can
     ///     interleave between the client id, the request id and the session.
@@ -136,6 +170,7 @@ internal sealed class ConsensusSession
 
     /// <summary>Bind the session from a committed register reply.</summary>
     /// <param name="session">The session number the register reply carried.</param>
+    /// <param name="bindSecret">The private proof sent in the corresponding register.</param>
     /// <exception cref="NotConnectedException">
     ///     No register is awaiting a binding, so the identity was re-armed while this one was in flight. Binding
     ///     regardless would pair the session with a client id the server never registered, and it would fence
@@ -145,11 +180,15 @@ internal sealed class ConsensusSession
     ///     The register reply carried no session. The value comes off the wire, so a malformed reply has to
     ///     surface as a protocol error rather than as argument validation.
     /// </exception>
-    internal void Bind(ulong session)
+    internal void Bind(ulong session, ReadOnlySpan<byte> bindSecret)
     {
         if (session == 0)
         {
             throw VsrError.Exception(VsrError.INVALID_FORMAT, "Register reply carried no session.");
+        }
+        if (bindSecret.Length != LoginRegister.BIND_SECRET_BYTES)
+        {
+            throw new ArgumentException("Bind secret must be 32 bytes.", nameof(bindSecret));
         }
 
         lock (_gate)
@@ -160,11 +199,12 @@ internal sealed class ConsensusSession
             }
 
             _registerPending = false;
+            bindSecret.CopyTo(_bindSecret);
             _session = session;
         }
     }
 
-    /// <summary>Forget the binding and the client id, e.g. after an eviction or a torn connection.</summary>
+    /// <summary>Forget the binding and client id after logout or a terminal bind refusal.</summary>
     internal void Reset()
     {
         lock (_gate)
@@ -203,8 +243,13 @@ internal sealed class ConsensusSession
         var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
             "A replicated request requires a bound consensus session.");
 
-        // Partition ops consume an id too, even though no partition-plane dedup exists yet: dedup needs
-        // each send to carry a distinct number, and the metadata watermark tolerates the gaps.
+        if (_requestCounter == ulong.MaxValue)
+        {
+            throw VsrError.Exception(VsrError.REQUEST_ID_EXHAUSTED, "Request ID counter exhausted.");
+        }
+
+        // Partition ops consume an id too: dedup needs each send to carry a distinct number, and the
+        // metadata watermark tolerates the gaps.
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 
@@ -214,6 +259,7 @@ internal sealed class ConsensusSession
     private void ReArmLocked()
     {
         _clientId = GenerateClientId();
+        Array.Clear(_bindSecret);
         _session = null;
         _requestCounter = 1;
         _registerPending = false;
