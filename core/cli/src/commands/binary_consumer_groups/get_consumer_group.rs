@@ -20,7 +20,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
-use iggy_common::Identifier;
+use iggy_common::{Consumer, ConsumerGroupMember, Identifier, Partition};
+use std::collections::HashMap;
 use tracing::{Level, event};
 
 pub struct GetConsumerGroupCmd {
@@ -37,6 +38,22 @@ impl GetConsumerGroupCmd {
             group_id: consumer_group_id,
         }
     }
+}
+
+fn partition_owner(members: &[ConsumerGroupMember]) -> HashMap<u32, u32> {
+    let mut partition_to_member = HashMap::new();
+    for member in members {
+        for partition_id in &member.partitions {
+            partition_to_member.insert(*partition_id, member.id);
+        }
+    }
+    partition_to_member
+}
+
+fn find_partition(partitions: &[Partition], partition_id: u32) -> Option<&Partition> {
+    partitions
+        .iter()
+        .find(|partition| partition.id == partition_id)
 }
 
 #[async_trait]
@@ -65,6 +82,89 @@ impl CliCommand for GetConsumerGroupCmd {
         }
 
         let consumer_group = consumer_group.unwrap();
+
+        let topic = client
+            .get_topic(&self.stream_id, &self.topic_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "Problem getting topic with ID: {} in stream with ID: {}",
+                    self.topic_id, self.stream_id
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "Topic with ID: {} in stream with ID: {} was not found",
+                    self.topic_id, self.stream_id
+                )
+            })?;
+
+        let consumer = Consumer::group(self.group_id.clone());
+        let partition_to_member = partition_owner(&consumer_group.members);
+
+        let mut partitions_table = Table::new();
+        partitions_table.load_style(ASCII_NO_BORDERS);
+        partitions_table.set_header(vec![
+            "Partition",
+            "Member",
+            "Current offset",
+            "Stored offset",
+            "Lag",
+        ]);
+
+        for partition_id in 0..consumer_group.partitions_count {
+            let partition = find_partition(&topic.partitions, partition_id).with_context(|| {
+                format!(
+                    "Partition with ID: {} in topic with ID: {} was not found",
+                    partition_id, self.topic_id
+                )
+            })?;
+
+            let consumer_offset = client
+                .get_consumer_offset(
+                    &consumer,
+                    &self.stream_id,
+                    &self.topic_id,
+                    Some(partition_id),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Problem getting consumer offset for consumer group with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {}",
+                        self.group_id, self.stream_id, self.topic_id, partition_id
+                    )
+                })?;
+
+            let member = partition_to_member
+                .get(&partition_id)
+                .map(|member_id| format!("{}", member_id))
+                .unwrap_or_else(|| "-".to_string());
+
+            let (current_offset, stored_offset, lag) = match consumer_offset {
+                Some(offset_info) => {
+                    let lag = offset_info.current_offset - offset_info.stored_offset;
+                    (
+                        format!("{}", offset_info.current_offset),
+                        format!("{}", offset_info.stored_offset),
+                        format!("{}", lag),
+                    )
+                }
+                None => (
+                    format!("{}", partition.current_offset),
+                    "-".to_string(),
+                    format!("{}", partition.messages_count),
+                ),
+            };
+
+            partitions_table.add_row(vec![
+                format!("{}", partition_id),
+                member,
+                current_offset,
+                stored_offset,
+                lag,
+            ]);
+        }
+
         let mut table = Table::new();
 
         table.set_header(vec!["Property", "Value"]);
@@ -101,6 +201,8 @@ impl CliCommand for GetConsumerGroupCmd {
             }
             table.add_row(vec!["Members", members_table.to_string().as_str()]);
         }
+
+        table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");
 
