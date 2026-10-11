@@ -143,6 +143,19 @@ struct FetchedRecord {
     /// The value `cursor` should advance to once this record's batch is
     /// acknowledged — typically this record's timestamp/ID/token.
     cursor_value: String,
+    /// TODO(ConnectorDeveloper): set this from a true per-record identity —
+    /// a numeric row PK, a hash of a document `_id`, an event UUID the
+    /// upstream system itself assigned — so `ProducedMessage.id` below is
+    /// stable across a NACK-triggered redelivery of this same record. A
+    /// *fresh* random id per emit defeats a downstream sink's dedup-by-id
+    /// (see `connector-pr-review` B5): a redelivered row would arrive with a
+    /// different id than its first delivery, so a sink keying its upsert on
+    /// `message.id` would store it twice instead of overwriting. Leave this
+    /// `None` only when records genuinely have no natural per-record
+    /// identity (a pure generator, e.g. `random_source`) — `cursor_value`
+    /// alone usually isn't it either, since a timestamp-based cursor is
+    /// commonly shared by more than one record.
+    natural_id: Option<u128>,
     payload: serde_json::Value,
 }
 
@@ -234,7 +247,8 @@ impl TemplateSource {
     /// result row/document/event to a `FetchedRecord`, using something that
     /// monotonically increases (a timestamp, an ID, a page token) as
     /// `cursor_value` so the state-staging logic in `poll()` below can
-    /// advance the cursor correctly.
+    /// advance the cursor correctly, and set `natural_id` from a true
+    /// per-record identity if one exists (see the field's own doc comment).
     async fn fetch_records(
         &self,
         client: &ClientWithMiddleware,
@@ -391,9 +405,10 @@ impl Source for TemplateSource {
             // into `messages` - advancing on a dropped (unserializable) record
             // would stage a cursor past data that was never produced, and a
             // later Ack would commit past it permanently.
+            let natural_id = record.natural_id;
             new_cursor = Some(record.cursor_value);
             messages.push(ProducedMessage {
-                id: None,
+                id: natural_id,
                 headers: None,
                 checksum: None,
                 timestamp: None,
@@ -453,6 +468,23 @@ impl Source for TemplateSource {
     /// delivered. If `fetch_records()` ever needs to perform a destructive
     /// read against the source (delete-after-read, mark-as-processed),
     /// stage that side effect the same way and only apply it here on `Ack`.
+    ///
+    /// If you add real I/O here (an external ack call, a delete, a mark-
+    /// processed update), two things from a real connector's review history
+    /// apply directly:
+    ///
+    /// 1. This runs inside the SDK's fixed ~30s batch-result window, and a
+    ///    size-your-own-timeout mistake here is fatal, not just slow — a
+    ///    NACK from that window stops the source for good after repeated
+    ///    consecutive NACKs. If you stage more than one operation, budget
+    ///    for *all* of them inside the window, not one op's worth, and
+    ///    reject `max_retries`/`retry_delay` combinations in `open()` that
+    ///    could blow it. See `connector-pr-review` B11.
+    /// 2. A failed op must not be silently logged while the batch is still
+    ///    ACKed — the cursor has already committed past it by the time you
+    ///    find out. Count consecutive failures and return `Err` past a
+    ///    threshold so the SDK stops the source, instead of resending the
+    ///    same broken operation forever.
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
         let candidate_state = self.pending_state.lock().await.take();
         if result == SourceBatchResult::Ack
@@ -534,7 +566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_empty_connection_string() {
+    async fn given_empty_connection_string_should_reject_open() {
         let mut config = test_config();
         config.connection_string = SecretString::from("   ");
         let mut source = TemplateSource::new(1, config, None);
@@ -622,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn poll_returns_empty_without_error_when_circuit_is_open() {
+    async fn given_open_circuit_breaker_should_return_empty_without_error() {
         let source = TemplateSource::new(1, test_config(), None);
         source.circuit_breaker.record_failure().await;
         source.circuit_breaker.record_failure().await;

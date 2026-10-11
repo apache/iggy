@@ -7,6 +7,31 @@ doc comment at the top of `src/lib.rs` for the full rationale, and the
 `iggy-connector-review` skill / the "Building Connectors That Pass Review"
 blog post for the checklist this template is built against.
 
+## Delivery Semantics
+
+The framework around `push_batch()` gives you retry (`max_retries` total attempts,
+`retry_delay`/`retry_max_delay` backoff) and a circuit breaker that opens after
+`circuit_breaker_threshold` consecutive failures. Everything below that line
+depends on what you write in `push_batch()` — fill in the three blanks with your
+real behavior before shipping:
+
+1. **Transient failure**: retries up to `max_retries` total attempts, then
+   `consume()` returns the error. The runtime's handling of that error is fatal
+   to the whole connector — see `connector-pr-review` B2.
+2. **Permanent failure** (bad schema, destination rejects the payload shape):
+   return `Error::PermanentHttpError` from `push_batch()` — `consume()` drops
+   and counts that one batch instead of taking the whole connector down.
+3. **Duplication window**: at-least-once. A batch can be retried after a
+   partial write (e.g. your destination accepted some rows then the connection
+   dropped before the response), so a retry can re-send already-written rows.
+4. **Dedup key**: none by default — `push_batch()` doesn't build one yet.
+   Before shipping, derive a stable key from `message.id` plus
+   `topic_metadata`/`messages_metadata` (see `mongodb_sink::build_composite_document_id`
+   for `stream:topic:partition:message_id`) and make your destination's write
+   idempotent on it (upsert / `ON CONFLICT` / unique index) — otherwise the
+   at-least-once retry above will create duplicates. See `connector-pr-review`
+   B5.
+
 ## What's already done for you
 
 - Config parsing with `#[serde(deny_unknown_fields)]` so a typo in a TOML

@@ -7,6 +7,33 @@ doc comment at the top of `src/lib.rs` for the full rationale, and the
 `iggy-connector-review` skill / the "Building Connectors That Pass Review"
 blog post for the checklist this template is built against.
 
+## Delivery Semantics
+
+The framework around `fetch_records()` gives you retry (`max_retries` total
+attempts), a circuit breaker, and the ACK/NACK cursor handshake described
+below. Everything past "what fetches" depends on what you write in
+`fetch_records()` — fill in the blanks with your real behavior before
+shipping:
+
+1. **Transient failure**: retries up to `max_retries` total attempts, then
+   `poll()` returns the error; the circuit breaker counts it. The runtime
+   retries `poll()` again next interval.
+2. **Permanent failure** (auth rejected, schema gone): return
+   `Error::PermanentHttpError` from `fetch_records()` — `poll()` does not
+   trip the circuit breaker on it, since a bad config/auth state isn't a
+   connectivity signal the breaker should react to.
+3. **Duplication window**: at-least-once. `poll()` stages the cursor as
+   *candidate* state; the runtime persists it only after the batch is sent,
+   then reports `Ack`/`Nack`. A NACK (or a crash between send and the
+   persisted-state write) redelivers the same range on the next poll.
+4. **Dedup key**: set `FetchedRecord::natural_id` from a true per-record
+   identity (row PK, document `_id`, event UUID) whenever your source has
+   one — it becomes `ProducedMessage.id`, which a downstream sink can key an
+   idempotent upsert on (see `mongodb_sink`) so the redelivery above doesn't
+   produce a duplicate at the destination. Leave it `None` only when records
+   genuinely have no natural identity (a pure generator). See
+   `connector-pr-review` B5.
+
 ## What's already done for you
 
 - Config parsing with `#[serde(deny_unknown_fields)]` so a typo in a TOML

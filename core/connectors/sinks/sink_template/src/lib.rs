@@ -230,18 +230,59 @@ impl TemplateSink {
     /// returned, which the runtime treats as fatal for the whole connector —
     /// so a permanent classification is what keeps one bad message from
     /// taking every future batch down with it.
+    ///
+    /// Delivery is at-least-once: a retried batch can re-send rows your
+    /// destination already wrote from an earlier attempt that failed after
+    /// partially succeeding. Build a stable key with `dedup_key()` below for
+    /// every message you write, and make the write idempotent on it (upsert /
+    /// `ON CONFLICT` / unique index) — see `connector-pr-review` B5.
+    ///
+    /// If your destination's write call can succeed at the transport level
+    /// while rejecting some or all rows individually (a bulk/batch API
+    /// returning 200 with per-item errors, a stream-load response, a bulk
+    /// index response), count accepted rows yourself and return `Err` when
+    /// that count is zero for a non-empty `batch` — never `Ok(())`. Four
+    /// unrelated sinks shipped exactly this bug in review (BigQuery,
+    /// Elasticsearch, Doris, S3): the call "succeeded," `consume()` reported
+    /// success, and the batch was gone with no signal anywhere. See
+    /// `connector-pr-review` B9.
     async fn push_batch(
         &self,
         client: &ClientWithMiddleware,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
         batch: &[ConsumedMessage],
     ) -> Result<(), Error> {
-        let _ = (client, batch); // remove once implemented
+        let _ = client; // remove once implemented
+        for message in batch {
+            // TODO(ConnectorDeveloper): use `key` as the identity your destination's
+            // write is idempotent on (upsert key, `ON CONFLICT` target, document _id).
+            let key = dedup_key(topic_metadata, messages_metadata, message);
+            let _ = key;
+        }
         Err(Error::InitError(
             "TemplateSink::push_batch is not implemented yet — see the TODO(ConnectorDeveloper) comment in \
              template_sink/src/lib.rs"
                 .to_string(),
         ))
     }
+}
+
+/// Stable per-message dedup key: `stream:topic:partition:message_id`. Mirrors
+/// `mongodb_sink::build_composite_document_id` — copy this, not a random UUID,
+/// for whatever identity column/key your destination's upsert needs. Offset
+/// is deliberately excluded: it only identifies a message within one
+/// partition's log, not across the retries and redeliveries this key has to
+/// survive.
+fn dedup_key(
+    topic_metadata: &TopicMetadata,
+    messages_metadata: &MessagesMetadata,
+    message: &ConsumedMessage,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        topic_metadata.stream, topic_metadata.topic, messages_metadata.partition_id, message.id
+    )
 }
 
 // ── Sink trait ────────────────────────────────────────────────────────────────
@@ -395,7 +436,10 @@ impl Sink for TemplateSink {
         let mut failed = 0u64;
 
         for batch in messages.chunks(self.batch_size_limit) {
-            match self.push_batch(client, batch).await {
+            match self
+                .push_batch(client, topic_metadata, &messages_metadata, batch)
+                .await
+            {
                 Ok(()) => written += batch.len() as u64,
                 Err(Error::PermanentHttpError(message)) => {
                     failed += batch.len() as u64;
@@ -498,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_empty_connection_string() {
+    async fn given_empty_connection_string_should_reject_open() {
         let mut config = test_config();
         config.connection_string = SecretString::from("   ");
         let mut sink = TemplateSink::new(1, config);
@@ -509,7 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_rejects_invalid_target_identifier() {
+    async fn given_invalid_target_identifier_should_reject_open() {
         let mut config = test_config();
         config.target = "events; DROP TABLE users;--".to_string();
         let mut sink = TemplateSink::new(1, config);
@@ -520,17 +564,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_identifier_accepts_plain_names() {
+    fn validate_identifier_should_accept_plain_names() {
         assert!(validate_identifier("target", "events_v2").is_ok());
     }
 
     #[test]
-    fn validate_identifier_rejects_empty() {
+    fn validate_identifier_should_reject_empty() {
         assert!(validate_identifier("target", "").is_err());
     }
 
     #[test]
-    fn validate_identifier_rejects_path_and_query_characters() {
+    fn validate_identifier_should_reject_path_and_query_characters() {
         for bad in [
             "../etc/passwd",
             "events?x=1",
@@ -544,8 +588,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dedup_key_should_join_stream_topic_partition_and_message_id() {
+        let (topic_metadata, messages_metadata) = topic_and_messages_metadata();
+        let message = consumed_message();
+        assert_eq!(
+            dedup_key(&topic_metadata, &messages_metadata, &message),
+            "s:t:1:1"
+        );
+    }
+
     #[tokio::test]
-    async fn consume_short_circuits_when_breaker_is_open() {
+    async fn given_open_circuit_breaker_should_short_circuit_consume() {
         let sink = TemplateSink::new(1, test_config());
         sink.circuit_breaker.record_failure().await;
         sink.circuit_breaker.record_failure().await;
@@ -592,7 +646,7 @@ mod tests {
     // of the chunking loop end to end, including the failed-count and
     // circuit-breaker bookkeeping.
     #[tokio::test]
-    async fn consume_with_unimplemented_push_batch_returns_err_and_counts_failure() {
+    async fn given_unimplemented_push_batch_should_return_err_and_count_failure() {
         let mut sink = TemplateSink::new(1, test_config());
         sink.open().await.expect("open should succeed");
         let (topic_metadata, messages_metadata) = topic_and_messages_metadata();

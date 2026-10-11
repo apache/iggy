@@ -136,6 +136,75 @@ that state on success, then calls `on_batch_result(Ack | Nack)`. Only
       re-emit an entire index without calling that out in README.
 - [ ] Config flag combos that no-op should `warn!` or `Err`, not silently ignore.
 
+### B9. Zero delivered is a failure, even if the call "succeeded"
+
+A bulk/batch API call returning 200 does not mean every row in it landed.
+Recurring, independently-discovered bug across four different sinks:
+
+- [ ] If your destination's write API can partially or fully reject a batch
+      while the call itself succeeds (HTTP 200 with per-item errors, a bulk
+      index response, a stream-load response), count accepted items and
+      return `Err` when the accepted count is **zero** for a non-empty input —
+      never `Ok(())`. BigQuery (#4394): "when every row of a non-empty batch
+      is rejected, `consume` still returns `Ok`." Elasticsearch (#4154): bulk
+      index knows the rejected count but still returns `Ok`. Doris (#3215):
+      "if every message in the batch is non-JSON... `consume()` returns
+      `Ok(())`" with the batch silently gone. S3 (#3103): a formatter failure
+      produced an empty placeholder that was still counted as uploaded.
+- [ ] A per-record encode/serialize failure must not silently substitute an
+      empty/null/default value that then gets counted as delivered — skip
+      and count it as lost (visibly), or fail the whole chunk.
+
+### B10. A wrapping timeout does not cancel in-flight work
+
+`tokio::time::timeout(dur, fut)` dropping `fut` on expiry does **not** mean
+the operation didn't happen — for a blocking-executor call, an FFI call, or
+anything already past the "no going back" point in the wire protocol, the
+work keeps running after the timeout fires and can still complete
+server-side. Confirmed independently on two unrelated backends:
+
+- [ ] Treat an expired wrapping timeout as **unknown outcome**, not
+      **didn't happen** — do not assume it's safe to retry the identical
+      operation without a dedup/idempotency key. RabbitMQ (#3973): "Wrapping
+      `basic_publish` in `timeout()` does not make it abortable... usually
+      already delivered." Postgres (#3957): "`timeout` drops the client
+      future, it does not abort the statement — a DELETE... can still commit
+      server-side after this logs a failure."
+- [ ] Prefer a protocol/transport-level timeout over (or in addition to) a
+      wrapping `tokio::time::timeout`: `reqwest::ClientBuilder::timeout`,
+      a connection-string timeout parameter (`?connection_timeout=` for AMQP),
+      or a driver's own `statement_timeout`. A bare `TcpStream::connect` run
+      on a blocking executor is not cancelled by an outer async timeout and
+      leaks a pool thread until the kernel's own SYN timeout (RabbitMQ #3973).
+- [ ] This is why `build_raw_client()` in the sink/source templates sets
+      `.timeout()` on the `reqwest::Client` itself rather than wrapping calls
+      — copy that pattern, don't wrap instead of it.
+
+### B11. Ack-path work must fit inside the SDK's fixed batch-result window
+
+If `on_batch_result` (or any post-ack cleanup) does real I/O — not just an
+in-memory state swap — that I/O runs inside the SDK's ~30s batch-result
+timeout, and a NACK from that timeout is often **fatal** (stops the source
+for good after repeated consecutive NACKs), not a retry signal.
+
+- [ ] Any retry/timeout budget inside `on_batch_result` must be sized well
+      under the SDK's window, and **multiplied by how many operations run
+      inside it** — not assumed to be one shared budget. Postgres (#3957,
+      critical): "10s is per operation, not per batch... N tables burn
+      N\*10s inside the SDK's 30s window."
+- [ ] User-configurable `max_retries`/`retry_delay` can produce a wait time
+      that exceeds a hardcoded internal deadline — validate the combination
+      in `open()` and reject configs that cannot fit, rather than letting
+      the ack path blow its budget at runtime. Same PR: "`max_retries=3`
+      with `retry_delay=\"2s\"`, both straight from the readme, needs 12s
+      and fails startup."
+- [ ] A failed destructive/cleanup op inside `on_batch_result` must not be
+      silently logged and ignored while the batch is still ACKed — count
+      consecutive failures and return `Err` past a threshold so the SDK
+      stops the source, rather than resending the same broken operation
+      forever. Same PR: "a failed slot advance only logs. the batch is
+      already ACKed, so nothing stops it."
+
 ## High-frequency convention nits
 
 These are "cheap" but burn full review rounds when missed.
@@ -164,25 +233,66 @@ These are "cheap" but burn full review rounds when missed.
 - [ ] New fields: `Option<T>` + `#[serde(default)]` where needed.
 - [ ] Prefer `#[serde(deny_unknown_fields)]` on plugin config so typo’d knobs
       fail loud.
+- [ ] Reject degenerate numeric values (`0`, empty string) for a field where
+      zero makes a check always-true or always-false, rather than letting it
+      silently misbehave — `batch_size`/`max_messages_per_file` zero
+      triggered S3 (#3103) to rotate on every single message. If a sibling
+      connector already clamps a field like this (`.max(1)`), clamp
+      consistently rather than leaving one sibling to reject what another
+      silently accepts.
+- [ ] Never derive a value that must stay identical across a retry of the
+      *same* logical batch (a destination key, filename, or dedup id) from
+      wall-clock time (`Utc::now()`) — derive it from the batch's own fixed
+      fields (an offset, a message id, `origin_timestamp`). S3 (#3103): a
+      `{timestamp}` path placeholder rendered at upload time broke the
+      README's own idempotent-retry claim.
 
 ### C3. Crate / path / docs checklist
 
 - [ ] `[lib] crate-type = ["cdylib", "lib"]`.
+- [ ] `publish = false` in `[package]` — every in-tree plugin needs it, and
+      it's easy to forget on a new crate (missed on S3 #3103 and Doris
+      #3215, both caught in review).
 - [ ] Example TOML plugin path uses `../../target/release/lib…` like siblings.
 - [ ] Row added to `sinks/README.md` or `sources/README.md`.
 - [ ] Sample under `runtime/example_config/connectors/`.
 - [ ] README defaults **byte-equal** to consts in code (diff them).
 - [ ] No links to non-existent docs.
+- [ ] Helper modules stay crate-private (no `pub mod`) unless genuinely part
+      of the plugin's public API — S3 (#3103) exposed `buffer`/`client`/etc.
+      as public on a cdylib plugin where every sibling keeps them private.
 
 ### C4. Hot path
 
 - [ ] No `payload.clone().try_to_bytes()` — use `try_to_bytes(&self)`.
 - [ ] `Vec::with_capacity(n)` for per-batch buffers.
 - [ ] No `std::sync::Mutex` across `.await`; use `tokio::sync::Mutex`.
+- [ ] Even a `tokio::sync::Mutex` must not be **held across** a slow network
+      call or a retry sleep — lock, clone/extract what you need, drop the
+      guard, *then* do I/O. This isn't just a deadlock rule: holding the
+      lock across the call serializes every concurrent caller sharing that
+      plugin instance onto one upload/write at a time, killing the
+      parallelism the runtime's per-partition tasks were meant to give you.
+      S3 (#3103): one `buffers.lock().await` held through `put_object()`
+      *and* the retry sleep capped the whole sink's throughput to one
+      upload in flight regardless of partition count.
 - [ ] `&self` on `consume` / `poll` (interior mutability only).
 - [ ] No `tokio::spawn` inside plugin code.
 - [ ] No `unwrap()`/`expect()` on external I/O outside tests.
 - [ ] No eager `format!` around tracing args.
+- [ ] Never `let _ = fallible_call()` on a side effect that matters (a
+      cleanup op, a quoted identifier, a staged delete) — log or propagate
+      the error. Postgres (#3957): `let _` on a staged-operation error made
+      an always-failing delete invisible.
+- [ ] If retrying raw HTTP status codes (not just SDK `Error` variants),
+      classify by family — 5xx, 408, 429 retry; other 4xx fail fast. S3
+      (#3103) retried `AccessDenied`/`NoSuchBucket`/`InvalidBucketName`
+      three times each, burning the whole retry budget on failures no retry
+      could fix.
+- [ ] Never log a substring, prefix, or fragment of a credential "for
+      diagnostics" — it still identifies the credential type/shape for zero
+      diagnostic value. S3 (#3103) logged the first 3 characters of an AWS
+      access key (`AKIA`/`ASIA`/`AROA` prefix).
 
 ### C5. Containers / fixtures
 
@@ -238,10 +348,22 @@ Paste into the PR description (or run mentally before `/ready`):
 Recurring comments mined from connector PRs including (non-exhaustive):
 SurrealDB sink (#3453), Meilisearch sink/source (#3497/#3498), OpenSearch
 source (#3515), Quickwit convention (#3523), MySQL source (#3568), JDBC
-source (#3588), Doris retry (#3574), Redshift sink (#3654), Airflow trigger
-(#3716), Fluss sink (#3782). Highest-density themes: delivery/offset
-semantics, idempotency IDs, transient/permanent mapping, config-name drift,
-secrets, README/code drift, false-green tests, CI/lockfile hygiene.
+source (#3588), Doris retry (#3574) and sink review (#3215), Redshift sink
+(#3654), Airflow trigger (#3716), Fluss sink (#3782), S3 sink (#3103),
+Google BigQuery sink (#4394), Delta sink production hardening (#4219),
+RabbitMQ sink (#3973), Elasticsearch sink batch semantics (#4154),
+Postgres source ACK/NACK + CDC hardening (#3957), the shared
+`retry_async`/`RetryPolicy` SDK helper review (#4104). Highest-density
+themes: delivery/offset semantics, idempotency IDs, transient/permanent
+mapping, config-name drift, secrets, README/code drift, false-green tests,
+CI/lockfile hygiene, zero-delivered-still-reports-Ok, a wrapping timeout
+that doesn't cancel in-flight work, ack-path work blowing its fixed budget,
+and holding a lock across slow I/O.
+
+Re-derive or extend this list with `gh pr list --repo apache/iggy --search
+"connectors in:title" --state all --limit 100` plus `gh api
+repos/apache/iggy/pulls/<N>/comments --paginate` for PRs under
+`core/connectors/`.
 
 ---
 
