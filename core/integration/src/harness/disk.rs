@@ -140,6 +140,13 @@ pub fn allocated_bytes(root: &Path) -> u64 {
     total
 }
 
+/// Bytes used on the volume holding `path`, counted as `df` and the server's
+/// disk usage sampler count them: total minus free.
+pub fn volume_used_bytes(path: &Path) -> u64 {
+    let stats = fs2::statvfs(path).expect("statvfs on the data volume");
+    stats.total_space().saturating_sub(stats.free_space())
+}
+
 /// `Ok(())` when every payload in `expected` appears in node-local segment
 /// bytes at a non-decreasing position, otherwise the first discrepancy.
 pub fn installed_payloads_complete(data_path: &Path, expected: &[String]) -> Result<(), String> {

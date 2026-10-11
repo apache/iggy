@@ -80,6 +80,9 @@ mod connections_limit_vsr;
 mod consumer_offset_quota_vsr;
 // A write that runs out of file descriptors flushes, then exits with status 4.
 mod descriptor_exhaustion_vsr;
+// The disk usage estimate stays within a stated bound of statvfs, and a
+// sample picks up writes the server cannot charge.
+mod disk_usage;
 mod general;
 mod partitions_limit_vsr;
 // The expired-token cleaner deletes under the reserved client id, and later

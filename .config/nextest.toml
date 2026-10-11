@@ -27,6 +27,12 @@ nextest-version = { required = "0.9.77" }
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
+# The disk usage tests compare the server's estimate with statvfs of the volume
+# every test writes to, so no other test may run beside them.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/server::disk_usage::/)'
+threads-required = "num-cpus"
+
 # Elasticsearch tests share one reusable container (fixed name
 # `iggy-test-elasticsearch`, ReuseDirective::Always). Serializing the group
 # lets the first test create it and the rest attach by name, instead of racing
