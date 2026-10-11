@@ -89,7 +89,7 @@ jobs:
 
       - name: Select wheel interpreters
         id: interpreters
-        run: bash scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
+        run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -159,7 +159,7 @@ jobs:
 
       - name: Select wheel interpreters
         id: interpreters
-        run: bash scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
+        run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
       - name: Setup wheel Python versions
         uses: actions/setup-python@v7.0.0
@@ -342,7 +342,7 @@ jobs:
 
       - name: Read Python support from release commit
         id: support
-        run: bash scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
+        run: ./scripts/ci/wheel-interpreters.sh >> "$GITHUB_OUTPUT"
 
       - name: Download all wheels
         uses: actions/download-artifact@v8
