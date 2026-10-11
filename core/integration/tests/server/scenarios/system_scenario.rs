@@ -667,41 +667,6 @@ pub async fn run(harness: &TestHarness) {
         u64::from(updated_topic.max_topic_size).to_string()
     );
 
-    // 39. Purge the existing topic and ensure it has no messages
-    client
-        .purge_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(&updated_topic_name).unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // The purge is applied by the owning shard's reconciler after the commit;
-    // poll until the wiped partition is observable.
-    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
-    let polled_messages = loop {
-        let polled_messages = client
-            .poll_messages(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(&updated_topic_name).unwrap(),
-                Some(PARTITION_ID),
-                &consumer,
-                &PollingStrategy::offset(0),
-                MESSAGES_COUNT,
-                false,
-            )
-            .await
-            .unwrap();
-        if (polled_messages.current_offset == 0 && polled_messages.messages.is_empty())
-            || Instant::now() >= deadline
-        {
-            break polled_messages;
-        }
-        sleep(TOPIC_RETRY_INTERVAL).await;
-    };
-    assert_eq!(polled_messages.current_offset, 0);
-    assert!(polled_messages.messages.is_empty());
-
     // 40. Update the existing stream and ensure it's updated
     let updated_stream_name = format!("{STREAM_NAME}-updated");
 
@@ -721,49 +686,6 @@ pub async fn run(harness: &TestHarness) {
         .expect("Failed to get stream");
 
     assert_eq!(updated_stream.name, updated_stream_name);
-
-    // 41. Purge the existing stream and ensure it has no messages
-    let mut messages = create_messages();
-    client
-        .send_messages(
-            &Identifier::named(&updated_stream_name).unwrap(),
-            &Identifier::named(&updated_topic_name).unwrap(),
-            &Partitioning::partition_id(PARTITION_ID),
-            &mut messages,
-        )
-        .await
-        .unwrap();
-
-    client
-        .purge_stream(&Identifier::named(&updated_stream_name).unwrap())
-        .await
-        .unwrap();
-
-    // As with the topic purge above, the stream purge is applied by the
-    // owning shard's reconciler after the commit; poll until observable.
-    let deadline = Instant::now() + TOPIC_CONVERGENCE_TIMEOUT;
-    let polled_messages = loop {
-        let polled_messages = client
-            .poll_messages(
-                &Identifier::named(&updated_stream_name).unwrap(),
-                &Identifier::named(&updated_topic_name).unwrap(),
-                Some(PARTITION_ID),
-                &consumer,
-                &PollingStrategy::offset(0),
-                MESSAGES_COUNT,
-                false,
-            )
-            .await
-            .unwrap();
-        if (polled_messages.current_offset == 0 && polled_messages.messages.is_empty())
-            || Instant::now() >= deadline
-        {
-            break polled_messages;
-        }
-        sleep(TOPIC_RETRY_INTERVAL).await;
-    };
-    assert_eq!(polled_messages.current_offset, 0);
-    assert!(polled_messages.messages.is_empty());
 
     // 42. Delete the existing topic and ensure it doesn't exist anymore
     client

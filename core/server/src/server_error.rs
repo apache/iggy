@@ -28,7 +28,7 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum ServerError {
     #[error(
-        "storage at {path} does not match the durable-session format; offline migration or explicit --fresh initialization is required"
+        "storage at {path} does not match this build's storage format; offline migration or explicit --fresh initialization is required"
     )]
     UnsupportedStorage { path: PathBuf },
     #[error("cannot validate or publish the storage format at {path}: {source}")]
@@ -369,6 +369,8 @@ pub enum ServerError {
     /// as clean.
     #[error("server shut down after a panic: {description}")]
     Panicked { description: String },
+    #[error("Failed to list config environment variables")]
+    ListConfigEnvVars(#[source] std::io::Error),
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

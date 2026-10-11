@@ -21,12 +21,12 @@ under the License.
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { resolve } from '$app/paths';
-  import { authStore } from '$lib/auth/authStore.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
+  import { authStore } from '#lib/auth/authStore.svelte.js';
+  import { typedRoute } from '#lib/types/appRoutes.js';
 
   onMount(() => {
     authStore.logout();
-    goto(resolve(typedRoute('/auth/sign-in')));
+    goto(resolve(typedRoute('auth/sign-in')));
   });
 </script>
 

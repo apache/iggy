@@ -1207,7 +1207,8 @@ where
         }
     };
     let namespace = IggyNamespace::from_raw(namespace_raw);
-    // A purge after offset resolution must keep its committed history-change result.
+    // A delete and re-create after offset resolution must keep its committed
+    // history-change result.
     let committed_history = shard
         .plane
         .metadata()
@@ -1225,18 +1226,15 @@ where
         .await
     {
         Some(PartitionReadReply::SegmentDeleteOffset {
-            created_revision,
-            purge_generation,
-            ..
-        }) if !committed_history.matches_partition(Some(created_revision), purge_generation) => {
+            created_revision, ..
+        }) if !committed_history.matches_partition(Some(created_revision)) => {
             return Err(IggyError::TransientNotAccepted);
         }
         Some(PartitionReadReply::SegmentDeleteOffset {
             up_to_offset: Some(offset),
             created_revision,
-            purge_generation,
             ..
-        }) => (offset, Some((created_revision, purge_generation))),
+        }) => (offset, Some(created_revision)),
         // Nothing sealed to delete on a replica that has not converged on the
         // replicated log (a backup behind the commit frontier may be missing
         // whole sealed segments). Answering now would commit a no-op truncate
@@ -1258,9 +1256,8 @@ where
         Some(PartitionReadReply::SegmentDeleteOffset {
             up_to_offset: None,
             created_revision,
-            purge_generation,
             ..
-        }) => (0, Some((created_revision, purge_generation))),
+        }) => (0, Some(created_revision)),
         other => {
             debug!(
                 client_id,
@@ -1299,7 +1296,7 @@ mod tests {
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{
-        CreateTopicRequest, CreateTopicWithAssignmentsRequest, PurgeTopicRequest,
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
     use iggy_binary_protocol::{
         Command, PrepareOkHeader, ReplyHeader, WireEncode, WireIdentifier, WireName, WireOptions,
@@ -1328,21 +1325,6 @@ mod tests {
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
         let shard = Rc::new(shard);
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .update(prepare_message(
-                Operation::PurgeTopic,
-                CLIENT,
-                1,
-                &PurgeTopicRequest {
-                    stream_id: WireIdentifier::numeric(0),
-                    topic_id: WireIdentifier::numeric(0),
-                }
-                .to_bytes(),
-            ))
-            .unwrap();
         let body = DeleteSegmentsRequest {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
@@ -1351,45 +1333,44 @@ mod tests {
         }
         .to_bytes();
         let request = request_message(Operation::DeleteSegments, CLIENT, 1, 1, &body);
-        for history in [(created_revision, 0), (created_revision.wrapping_sub(1), 1)] {
-            for up_to_offset in [Some(7), None] {
-                let owner = async {
-                    let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                        namespace: resolved,
-                        read: PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
-                        reply,
-                    }) = owner_inbox.recv().await.unwrap()
-                    else {
-                        panic!("segment deletion must read its owner");
-                    };
-                    assert_eq!(resolved, namespace);
-                    reply
-                        .try_send(PartitionReadReply::SegmentDeleteOffset {
-                            up_to_offset,
-                            lagging: false,
-                            created_revision: history.0,
-                            purge_generation: history.1,
-                        })
-                        .unwrap();
+        let stale_revision = created_revision.wrapping_sub(1);
+        for up_to_offset in [Some(7), None] {
+            let owner = async {
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    namespace: resolved,
+                    read: PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
+                    reply,
+                }) = owner_inbox.recv().await.unwrap()
+                else {
+                    panic!("segment deletion must read its owner");
                 };
-                let (result, ()) = futures::join!(
-                    resolve_delete_segments_truncate(&shard, request.header(), CLIENT, 1, &body),
-                    owner,
-                );
-                assert!(
-                    matches!(result, Err(IggyError::TransientNotAccepted)),
-                    "offset {up_to_offset:?} from history {history:?} must retry before submission"
-                );
-            }
+                assert_eq!(resolved, namespace);
+                reply
+                    .try_send(PartitionReadReply::SegmentDeleteOffset {
+                        up_to_offset,
+                        lagging: false,
+                        created_revision: stale_revision,
+                    })
+                    .unwrap();
+            };
+            let (result, ()) = futures::join!(
+                resolve_delete_segments_truncate(&shard, request.header(), CLIENT, 1, &body),
+                owner,
+            );
+            assert!(
+                matches!(result, Err(IggyError::TransientNotAccepted)),
+                "offset {up_to_offset:?} from revision {stale_revision} must retry before submission"
+            );
         }
     }
 
     #[compio::test]
-    async fn given_purge_after_segment_resolution_when_committing_should_report_history_changed() {
+    async fn given_recreate_after_segment_resolution_when_committing_should_report_history_changed()
+    {
         const CLIENT: u128 = 1;
         let bus = SpyBus::default();
         let mut shard = test_shard(&bus, 0, 1, 1);
-        let (_, created_revision) = create_segment_delete_topic(&shard);
+        let (namespace, _) = create_segment_delete_topic(&shard);
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
         let shard = Rc::new(shard);
@@ -1402,12 +1383,13 @@ mod tests {
         .to_bytes();
         let request = request_message(Operation::DeleteSegments, CLIENT, 1, 1, &body);
         for up_to_offset in [Some(7), None] {
-            let purge_generation = shard
+            let created_revision = shard
                 .plane
                 .metadata()
                 .mux_stm
                 .streams()
-                .partition_purge_generation(0, 0, 0);
+                .created_revision_for_namespace(namespace)
+                .unwrap();
             let owner = async {
                 let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
                     owner_inbox.recv().await.unwrap()
@@ -1419,24 +1401,26 @@ mod tests {
                         up_to_offset,
                         lagging: false,
                         created_revision,
-                        purge_generation,
                     })
                     .unwrap();
-                shard
-                    .plane
-                    .metadata()
-                    .mux_stm
-                    .update(prepare_message(
-                        Operation::PurgeTopic,
+                for prepare in [
+                    prepare_message(
+                        Operation::DeleteTopic,
                         CLIENT,
                         1,
-                        &PurgeTopicRequest {
+                        &DeleteTopicRequest {
                             stream_id: WireIdentifier::numeric(0),
                             topic_id: WireIdentifier::numeric(0),
                         }
                         .to_bytes(),
-                    ))
-                    .unwrap();
+                    ),
+                    create_topic_prepare(),
+                ] {
+                    assert_eq!(
+                        shard.plane.metadata().mux_stm.update(prepare).unwrap().code,
+                        0
+                    );
+                }
             };
             let (resolved, ()) = futures::join!(
                 resolve_delete_segments_truncate(&shard, request.header(), CLIENT, 1, &body),
@@ -1447,10 +1431,7 @@ mod tests {
                 .unwrap()
                 .0;
             assert_eq!(truncate.up_to_offset, up_to_offset.unwrap_or(0));
-            assert_eq!(
-                truncate.expected_history,
-                Some((created_revision, purge_generation))
-            );
+            assert_eq!(truncate.expected_history, Some(created_revision));
             let reply = shard
                 .plane
                 .metadata()
@@ -2763,26 +2744,7 @@ mod tests {
                 }
                 .to_bytes(),
             ),
-            prepare_message(
-                Operation::CreateTopicWithAssignments,
-                1,
-                2,
-                &CreateTopicWithAssignmentsRequest {
-                    request: CreateTopicRequest {
-                        stream_id: WireIdentifier::numeric(0),
-                        partitions_count: 1,
-                        name: WireName::new("topic").unwrap(),
-                        options: WireOptions::empty(),
-                    },
-                    derived_options: WireOptions::empty(),
-                    partitions: vec![CreatedPartitionAssignment {
-                        partition_id: 0,
-                        consensus_group_id: 1,
-                    }],
-                    created_view: 0,
-                }
-                .to_bytes(),
-            ),
+            create_topic_prepare(),
         ] {
             assert_eq!(metadata.mux_stm.update(prepare).unwrap().code, 0);
         }
@@ -2796,6 +2758,31 @@ mod tests {
             .created_revision_for_namespace(namespace)
             .unwrap();
         (namespace, created_revision)
+    }
+
+    /// Applied again after a topic delete, it re-creates partition 0 under a
+    /// new `created_revision`.
+    fn create_topic_prepare() -> Message<PrepareHeader> {
+        prepare_message(
+            Operation::CreateTopicWithAssignments,
+            1,
+            2,
+            &CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                }],
+                created_view: 0,
+            }
+            .to_bytes(),
+        )
     }
 
     /// Attempt an already resolved poll and require an error, including when no

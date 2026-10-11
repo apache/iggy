@@ -85,13 +85,11 @@ impl ActionWeights {
     pub fn metadata_only() -> Self {
         Self::new(&[
             (Action::CreateStream, 12),
-            (Action::UpdateStream, 6),
+            (Action::UpdateStream, 10),
             (Action::DeleteStream, 6),
-            (Action::PurgeStream, 4),
             (Action::CreateTopic, 12),
-            (Action::UpdateTopic, 6),
+            (Action::UpdateTopic, 10),
             (Action::DeleteTopic, 6),
-            (Action::PurgeTopic, 4),
             (Action::CreatePartitions, 6),
             (Action::DeletePartitions, 4),
             (Action::CreateConsumerGroup, 6),

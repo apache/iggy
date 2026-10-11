@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Store consumer bookmarks and the partition's applied purge generation.
+//! Store consumer bookmarks.
 //!
-//! A bookmark records the last consumed offset. The purge marker instead records
-//! which reset was applied to this incarnation of the partition. Recovery uses
-//! them to restore progress and decide whether a purge must be repeated.
+//! A bookmark records the last consumed offset. Recovery uses it to restore
+//! progress.
 //!
 //! Functions ending in `_with_storage` share the persistence sequence between
 //! real disk and simulated storage. File sync makes record contents durable;
 //! directory sync makes creation, replacement, or deletion durable. Offset callers
-//! own that directory sync, while purge marker writes include it before returning.
+//! own that directory sync.
 
 use server_common::fatal::NoteDescriptorExhaustion;
 use std::cell::{Cell, RefCell};
@@ -41,7 +40,6 @@ use compio::{
 };
 use iggy_common::{IggyError, calculate_checksum};
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage, OpenMode};
-use tracing::warn;
 
 #[cfg(unix)]
 use nix::sys::resource::{Resource, getrlimit};
@@ -55,18 +53,8 @@ const CHECKSUM_SIZE: usize = core::mem::size_of::<u64>();
 /// flipped bit silently rewinds the consumer into redelivery or skips it forward.
 pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 
-/// Per-partition file recording the purge generation this replica last applied
-/// locally, in the partition dir beside the segments it fences.
-///
-/// Two LE u64s: the applied generation, then the `created_revision` of the
-/// partition incarnation it was applied for.
-pub const PURGE_GENERATION_FILE: &str = "purge.gen";
-
 /// Sibling name an atomic offset replacement writes before its rename lands.
 const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
-
-/// `[generation][created_revision]`, both LE u64.
-const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
 
 #[cfg(unix)]
 const OFFSET_FILES_TOTAL_MAX: usize = 1024;
@@ -346,7 +334,7 @@ pub async fn persist_offset_with_storage<S: DurableStorage>(
 ) -> Result<(), IggyError> {
     let record = encode_offset_record(offset);
     if persisted {
-        replace_file(storage, path, record, true, false).await
+        replace_file(storage, path, record, true).await
     } else {
         write_in_place(storage, path, record).await
     }
@@ -441,7 +429,6 @@ async fn replace_file<S: DurableStorage, const N: usize>(
     path: &str,
     record: [u8; N],
     persisted: bool,
-    sync_parent: bool,
 ) -> Result<(), IggyError> {
     let temporary = write_replacement(storage, path, record, persisted).await?;
     if storage
@@ -451,12 +438,6 @@ async fn replace_file<S: DurableStorage, const N: usize>(
     {
         let _ = storage.remove_file(Path::new(&temporary)).await;
         return Err(IggyError::CannotWriteToFile);
-    }
-    if sync_parent && let Some(parent) = Path::new(path).parent() {
-        storage
-            .sync_directory(parent)
-            .await
-            .map_err(|_| IggyError::CannotSyncFile)?;
     }
 
     Ok(())
@@ -571,119 +552,6 @@ pub async fn read_offset_max(path: &str, offset: u64) -> Result<PersistedOffset,
         offset: effective,
         written,
     })
-}
-
-/// Durably record the purge generation a partition has locally applied, keyed
-/// to the incarnation (`created_revision`) it was applied for.
-///
-/// Atomic replacement like [`persist_offset`] but always synced, regardless of
-/// the consumer offset durability policy: purges are rare, the record is 16 bytes, and
-/// a generation lost from the page cache in a crash makes the reconciler
-/// repeat the purge on restart, wiping messages appended after the purge.
-/// The parent directory is synced after the replacement is renamed into place.
-/// A failure before rename preserves the previous record. If the directory sync
-/// fails, the replacement is visible but its survival across a crash is uncertain.
-///
-/// # Errors
-/// Propagates the underlying open, write, or sync failure.
-pub async fn persist_purge_generation(
-    path: &str,
-    generation: u64,
-    created_revision: u64,
-) -> Result<(), IggyError> {
-    persist_purge_generation_with_storage(&DiskStorage, path, generation, created_revision).await
-}
-
-/// Persist a purge completion marker through the supplied storage backend.
-///
-/// The record includes the partition incarnation. Both the replacement file and
-/// its parent directory are synced as in [`persist_purge_generation`]. Calls for
-/// one path must be serialized because they share a temporary filename.
-///
-/// # Errors
-/// Returns the directory, open, write, or sync error from [`persist_purge_generation`].
-pub async fn persist_purge_generation_with_storage<S: DurableStorage>(
-    storage: &S,
-    path: &str,
-    generation: u64,
-    created_revision: u64,
-) -> Result<(), IggyError> {
-    let mut record = [0u8; PURGE_GENERATION_RECORD_SIZE];
-    record[..OFFSET_SIZE].copy_from_slice(&generation.to_le_bytes());
-    record[OFFSET_SIZE..].copy_from_slice(&created_revision.to_le_bytes());
-    replace_file(storage, path, record, true, true).await
-}
-
-/// Read the purge generation this replica applied for the `created_revision`
-/// incarnation of the partition through the supplied storage backend.
-///
-/// Absent and torn files map to `Ok(0)`, which makes the reconciler apply any
-/// committed purge again. A failed existence probe is logged and treated as absence.
-///
-/// A record written for a different incarnation maps to `Ok(0)` too. A failed
-/// `delete_partitions_from_disk` leaves the directory (and this file) behind;
-/// the recreated topic's generations restart at 0, so hydrating the dead
-/// incarnation's generation would swallow every purge of the new topic until
-/// the committed counter climbed past it.
-///
-/// An open or read error propagates. Collapsing it to `0` would purge a
-/// partition whose durable generation is intact but momentarily unreadable,
-/// destroying every message appended after that purge.
-///
-/// # Errors
-/// Propagates an open or read failure after the existence probe, except a short read.
-pub async fn read_purge_generation<S: DurableStorage>(
-    storage: &S,
-    path: &str,
-    created_revision: u64,
-) -> Result<u64, IggyError> {
-    match storage.exists_following_links(Path::new(path)).await {
-        Ok(true) => {}
-        Ok(false) => return Ok(0),
-        Err(error) => {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                path,
-                %error,
-                "failed to check purge generation file, treating it as absent"
-            );
-            return Ok(0);
-        }
-    }
-    let file = storage
-        .open(Path::new(path), OpenMode::Read)
-        .await
-        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    let buf = match file.read(0, PURGE_GENERATION_RECORD_SIZE).await {
-        Ok(buf) => buf,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(0),
-        Err(_) => return Err(IggyError::CannotReadConsumerOffsets(path.to_owned())),
-    };
-    let (generation_bytes, revision_bytes) = buf.split_at(OFFSET_SIZE);
-    let generation = u64::from_le_bytes(
-        generation_bytes
-            .try_into()
-            .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?,
-    );
-    let stored_revision = u64::from_le_bytes(
-        revision_bytes
-            .try_into()
-            .map_err(|_| IggyError::CannotReadConsumerOffsets(path.to_owned()))?,
-    );
-    if stored_revision != created_revision {
-        warn!(
-            target: "iggy.partitions.diag",
-            plane = "partitions",
-            path,
-            generation,
-            stored_revision,
-            created_revision,
-            "ignoring a purge generation recorded for another partition incarnation"
-        );
-        return Ok(0);
-    }
-    Ok(generation)
 }
 
 /// Read whatever a consumer-offset file holds. `None` only when absent; a short file
@@ -1005,106 +873,6 @@ mod tests {
         assert!(
             matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
             "real I/O error must propagate, got {result:?}",
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[compio::test]
-    async fn purge_generation_absent_or_torn_is_zero_but_io_error_propagates() {
-        let dir = unique_temp_dir();
-        let path = dir
-            .join(PURGE_GENERATION_FILE)
-            .to_string_lossy()
-            .into_owned();
-
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 11)
-                .await
-                .expect("absent file"),
-            0,
-            "absent file is 0"
-        );
-
-        persist_purge_generation(&path, 3, 11)
-            .await
-            .expect("persist generation");
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 11)
-                .await
-                .expect("valid file"),
-            3,
-            "round-trip"
-        );
-
-        std::fs::write(&path, [0xAB, 0xCD]).expect("write torn file");
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 11)
-                .await
-                .expect("torn file"),
-            0,
-            "torn file degrades to 0 so the reconciler re-applies the purge"
-        );
-
-        // A directory path is a real I/O error, not a short read: it must
-        // surface, not collapse to the re-purge sentinel (a silent re-purge
-        // would destroy post-purge messages).
-        let result = read_purge_generation(&DiskStorage, &dir.to_string_lossy(), 11).await;
-        assert!(
-            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
-            "real I/O error must propagate, got {result:?}",
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A failed `delete_partitions_from_disk` leaves the directory and this
-    /// file behind. The recreated partition's generations restart at 0, so a
-    /// record from the DEAD incarnation must not be hydrated: it would swallow
-    /// every purge of the new topic until the committed counter climbed past
-    /// it.
-    #[compio::test]
-    async fn purge_generation_from_another_incarnation_reads_as_zero() {
-        let dir = unique_temp_dir();
-        let path = dir
-            .join(PURGE_GENERATION_FILE)
-            .to_string_lossy()
-            .into_owned();
-
-        persist_purge_generation(&path, 9, 41)
-            .await
-            .expect("persist generation");
-
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 41)
-                .await
-                .expect("same dir"),
-            9,
-            "the incarnation that wrote it still hydrates it"
-        );
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 42)
-                .await
-                .expect("stale file"),
-            0,
-            "a record from a dead incarnation must not fence the new one"
-        );
-
-        // The new incarnation's own purge re-keys the file.
-        persist_purge_generation(&path, 1, 42)
-            .await
-            .expect("persist generation");
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 42)
-                .await
-                .expect("rekeyed"),
-            1
-        );
-        assert_eq!(
-            read_purge_generation(&DiskStorage, &path, 41)
-                .await
-                .expect("now stale"),
-            0
         );
 
         let _ = std::fs::remove_dir_all(&dir);

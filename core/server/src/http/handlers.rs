@@ -49,13 +49,12 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
-    PurgeStreamRequest, UpdateStreamRequest,
+    UpdateStreamRequest,
 };
 use iggy_binary_protocol::requests::system::DescribeOptionsRequest;
 use iggy_binary_protocol::requests::system::GetStatsRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
-    UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
@@ -902,27 +901,6 @@ pub(in crate::http) async fn delete_stream(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /streams/{stream_id}/purge`: drop a stream's messages. Returns 204.
-pub(in crate::http) async fn purge_stream(
-    State(state): State<HttpState>,
-    identity: Authenticated,
-    Path(stream_id): Path<String>,
-) -> Result<StatusCode, WriteError> {
-    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    let request = PurgeStreamRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-    };
-    let body = request.to_bytes();
-    SendWrapper::new(submit_write(
-        &state,
-        &identity.session,
-        Operation::PurgeStream,
-        body,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// `POST /streams/{stream_id}/topics`: create a topic under a stream and render
 /// the committed reply as the same `TopicDetails` JSON the legacy server returns.
 ///
@@ -1108,30 +1086,6 @@ pub(in crate::http) async fn delete_topic(
         &state,
         &identity.session,
         Operation::DeleteTopic,
-        body,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// `DELETE /streams/{stream_id}/topics/{topic_id}/purge`: drop a topic's
-/// messages. Returns 204.
-pub(in crate::http) async fn purge_topic(
-    State(state): State<HttpState>,
-    identity: Authenticated,
-    Path((stream_id, topic_id)): Path<(String, String)>,
-) -> Result<StatusCode, WriteError> {
-    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
-    let request = PurgeTopicRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
-    };
-    let body = request.to_bytes();
-    SendWrapper::new(submit_write(
-        &state,
-        &identity.session,
-        Operation::PurgeTopic,
         body,
     ))
     .await?;

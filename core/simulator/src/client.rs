@@ -36,12 +36,11 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, PurgeStreamRequest,
-    UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, UpdateStreamRequest,
 };
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{
@@ -336,15 +335,6 @@ impl SimClient {
     }
 
     /// # Panics
-    /// Panics if `stream` is not a valid `WireName`.
-    pub fn purge_stream(&self, stream: &str) -> Message<RoutedRequestHeader> {
-        let wire = PurgeStreamRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-        };
-        self.build_request(Operation::PurgeStream, &wire.to_bytes())
-    }
-
-    /// # Panics
     /// Panics if `stream` or `name` is not a valid `WireName`.
     pub fn create_topic(
         &self,
@@ -392,16 +382,6 @@ impl SimClient {
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
         };
         self.build_request(Operation::DeleteTopic, &wire.to_bytes())
-    }
-
-    /// # Panics
-    /// Panics if `stream` or `topic` is not a valid `WireName`.
-    pub fn purge_topic(&self, stream: &str, topic: &str) -> Message<RoutedRequestHeader> {
-        let wire = PurgeTopicRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-        };
-        self.build_request(Operation::PurgeTopic, &wire.to_bytes())
     }
 
     /// # Panics

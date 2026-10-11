@@ -150,8 +150,7 @@ public interface CommandCode {
         GET_ALL(301),
         CREATE(302),
         DELETE(303),
-        UPDATE(304),
-        PURGE(305);
+        UPDATE(304);
 
         private final int value;
 

@@ -213,13 +213,6 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
-    {
-        var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
-        await SendAckAsync(CommandCodes.PURGE_STREAM_CODE, message, token);
-    }
-
-    /// <inheritdoc />
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
@@ -300,14 +293,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         await SendAckAsync(CommandCodes.DELETE_TOPIC_CODE, message, token);
         _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
     }
-
-    /// <inheritdoc />
-    public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
-    {
-        var message = TcpContracts.PurgeTopic(streamId, topicId);
-        await SendAckAsync(CommandCodes.PURGE_TOPIC_CODE, message, token);
-    }
-
 
     /// <inheritdoc />
     public Task<SendMessagesResponse> SendMessagesAsync(Identifier streamId, Identifier topicId,

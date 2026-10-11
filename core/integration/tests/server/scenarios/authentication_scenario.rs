@@ -233,7 +233,6 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                     .update_stream(&ctx.stream_id, "x", &StreamUpdateOptions::default())
                     .await
             }
-            PURGE_STREAM_CODE => client.purge_stream(&ctx.stream_id).await,
 
             // Topics
             GET_TOPIC_CODE => client
@@ -264,7 +263,6 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                     )
                     .await
             }
-            PURGE_TOPIC_CODE => client.purge_topic(&ctx.stream_id, &ctx.topic_id).await,
 
             // Partitions
             CREATE_PARTITIONS_CODE => {

@@ -848,10 +848,12 @@ impl MessageBag {
 
 /// Why `H`'s header bytes failed bytemuck's checked cast.
 ///
-/// An operation discriminant this build does not define means the sender runs a
-/// newer release; the frame is wire-valid and the node needs upgrading, which is
-/// a different operator action from the corrupted-header case. bytemuck reports
-/// both as one error, so the operation byte is probed here to separate them.
+/// An operation discriminant this build does not define means the sender runs
+/// another release: a newer one adds operations, and an older one can still
+/// send a retired one. The frame is wire-valid and the releases must be
+/// aligned, a different operator action from the corrupted-header case.
+/// bytemuck reports both as one error, so the operation byte is probed here to
+/// separate them.
 fn classify_failed_cast<H>(bytes: &[u8]) -> ConsensusError
 where
     H: ConsensusHeader,
@@ -871,7 +873,7 @@ where
 ///
 /// This classification runs before `verify_frame`, so the byte is still
 /// unverified: a flipped bit landing in an undefined discriminant would
-/// otherwise be reported as "upgrade this node", and for a `PrepareOk` --
+/// otherwise be reported as version skew, and for a `PrepareOk` --
 /// which echoes an operation this primary minted itself -- corruption is the
 /// likelier cause anyway. Sealed headers verify the frame checksum; the
 /// Prepare family verifies the identity checksum, which covers the operation

@@ -23,10 +23,11 @@
 //! 3. The owner checks the reply connection, history, and recovery state, admits
 //!    any automatic commit, and updates progress before releasing the reply.
 //!
-//! A disk read can yield while purge or state transfer replaces the history,
-//! even on the same shard thread. The detached task therefore cannot advance
-//! progress or authorize a successful reply. Completion validation and progress
-//! updates run synchronously on the owner, before any replication wait.
+//! A disk read can yield while a delete and re-create or a state transfer
+//! replaces the history, even on the same shard thread. The detached task
+//! therefore cannot advance progress or authorize a successful reply.
+//! Completion validation and progress updates run synchronously on the owner,
+//! before any replication wait.
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
@@ -120,10 +121,9 @@ where
                     && consensus.is_primary()
                     && consensus.is_normal()
                     && !consensus.is_transferring()
-                    && attachment.metadata.matches_partition(
-                        self.shards_table.epoch_for(namespace),
-                        partition.applied_purge_generation(),
-                    )
+                    && attachment
+                        .metadata
+                        .matches_partition(self.shards_table.epoch_for(namespace))
             })
             .unwrap_or(false);
         if !admissible {
@@ -167,10 +167,9 @@ where
                     return !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
-                        || !attachment.metadata.matches_partition(
-                            self.shards_table.epoch_for(namespace),
-                            partition.applied_purge_generation(),
-                        );
+                        || !attachment
+                            .metadata
+                            .matches_partition(self.shards_table.epoch_for(namespace));
                 }
                 false
             })
@@ -296,12 +295,11 @@ where
                 .segment_delete_resolution(&namespace, count)
                 .map_or(
                     PartitionReadReply::NotFound,
-                    |(up_to_offset, lagging, created_revision, purge_generation)| {
+                    |(up_to_offset, lagging, created_revision)| {
                         PartitionReadReply::SegmentDeleteOffset {
                             up_to_offset,
                             lagging,
                             created_revision,
-                            purge_generation,
                         }
                     },
                 ),

@@ -41,11 +41,9 @@ const (
 	OperationCreateStream              Operation = 128
 	OperationUpdateStream              Operation = 129
 	OperationDeleteStream              Operation = 130
-	OperationPurgeStream               Operation = 131
 	OperationCreateTopic               Operation = 132
 	OperationUpdateTopic               Operation = 133
 	OperationDeleteTopic               Operation = 134
-	OperationPurgeTopic                Operation = 135
 	OperationCreatePartitions          Operation = 136
 	OperationDeletePartitions          Operation = 137
 	OperationDeleteSegments            Operation = 138
@@ -89,11 +87,9 @@ var allOperations = []Operation{
 	OperationCreateStream,
 	OperationUpdateStream,
 	OperationDeleteStream,
-	OperationPurgeStream,
 	OperationCreateTopic,
 	OperationUpdateTopic,
 	OperationDeleteTopic,
-	OperationPurgeTopic,
 	OperationCreatePartitions,
 	OperationDeletePartitions,
 	OperationDeleteSegments,
@@ -134,11 +130,9 @@ var replicatedOperation = map[uint32]Operation{
 	uint32(command.CreateStreamCode):         OperationCreateStream,
 	uint32(command.DeleteStreamCode):         OperationDeleteStream,
 	uint32(command.UpdateStreamCode):         OperationUpdateStream,
-	uint32(command.PurgeStreamCode):          OperationPurgeStream,
 	uint32(command.CreateTopicCode):          OperationCreateTopic,
 	uint32(command.DeleteTopicCode):          OperationDeleteTopic,
 	uint32(command.UpdateTopicCode):          OperationUpdateTopic,
-	uint32(command.PurgeTopicCode):           OperationPurgeTopic,
 	uint32(command.CreatePartitionsCode):     OperationCreatePartitions,
 	uint32(command.DeletePartitionsCode):     OperationDeletePartitions,
 	uint32(command.DeleteSegmentsCode):       OperationDeleteSegments,

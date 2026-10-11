@@ -1569,6 +1569,25 @@ mod tests {
             "selector env expansion must stop at max_elements = 16"
         );
     }
+
+    #[test]
+    fn advertised_addresses_env_template_keeps_each_vector_limit() {
+        let template = <ClusterConfig as configs::ConfigEnvMappings>::env_templates()
+            .iter()
+            .find(|template| template.env_name == "NODES_<N>_ADVERTISED_ADDRESSES_<N>_CLIENT_CIDR")
+            .expect("advertised address template");
+
+        assert_eq!(template.max_elements, &[256, 16]);
+
+        let mapping = <ClusterConfig as configs::ConfigEnvMappings>::env_mappings()
+            .iter()
+            .find(|mapping| mapping.env_name == "NODES_3_ADVERTISED_ADDRESSES_7_CLIENT_CIDR")
+            .expect("expanded advertised address mapping");
+        assert_eq!(
+            mapping.config_path,
+            "nodes.3.advertised_addresses.7.client_cidr"
+        );
+    }
 }
 
 #[cfg(test)]

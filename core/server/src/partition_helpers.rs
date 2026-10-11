@@ -711,8 +711,6 @@ async fn load_partition(
     partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
-    // Before the hydrate: the durable record is keyed by incarnation, so a
-    // `purge.gen` left behind by a previous life of this namespace reads 0.
     partition.set_created_revision(partition_metadata.created_revision);
     partition
         .restore_retry_checkpoint(recovered_persistence.0.checkpoint_op())
@@ -726,7 +724,6 @@ async fn load_partition(
         segment_checkpoint,
     )
     .await?;
-    partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
         &partition_dir,
@@ -1073,14 +1070,7 @@ pub async fn build_partition_fresh(
     partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);
-    // Fresh dirs read generation 0; a dir surviving from a crashed process
-    // (this "fresh" build races repair re-materialization) reads the last
-    // durably-applied purge so the reconciler does not re-wipe messages
-    // appended after it. Keyed by incarnation, so a dir left behind by a failed
-    // delete does not fence the recreated partition's purges: set the revision
-    // first.
     partition.set_created_revision(created_revision);
-    partition.hydrate_applied_purge_generation().await?;
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);
@@ -1347,7 +1337,7 @@ mod tests {
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
     const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
-    const OFFSETS_VERSION: u8 = 4;
+    const OFFSETS_VERSION: u8 = 6;
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
@@ -2247,7 +2237,7 @@ mod tests {
         }
         let mut protection = OFFSETS_MAGIC.to_vec();
         protection.push(OFFSETS_VERSION);
-        for value in [0_u64, 1, 0] {
+        for value in [1_u64, 0] {
             protection.extend_from_slice(&value.to_le_bytes());
         }
         protection.extend_from_slice(

@@ -295,7 +295,7 @@ async fn submit_gated(
 /// Run one authenticated control-plane write end to end and return the committed
 /// reply's typed payload. Wraps [`submit_committed`] and decodes the reply body
 /// via [`committed_payload`]: `create_stream` decodes the payload into an entity,
-/// the update/delete/purge routes ignore it (it is empty) and answer 204.
+/// the update/delete routes ignore it (it is empty) and answer 204.
 pub(in crate::http) async fn submit_write(
     state: &HttpInner,
     session: &Rc<HttpSession>,

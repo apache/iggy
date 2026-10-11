@@ -1448,28 +1448,6 @@ class IggyClient:
                 `manage_streams` or per-stream `manage_stream` permission, the
                 stream does not exist, or the request fails.
         """
-    def purge_stream(
-        self, stream_id: builtins.str | builtins.int
-    ) -> collections.abc.Awaitable[None]:
-        r"""
-        Delete all messages from every topic in a stream.
-
-        The stream, topics, and partitions remain available. Repeated purges of an
-        existing empty stream succeed. `stream_id` accepts a stream name as `str`
-        or numeric ID as `int`. A decimal-only string is interpreted as a numeric
-        ID.
-
-        Returns:
-            None.
-
-        Raises:
-            TypeError: If `stream_id` is not `str` or an integer in
-                `0..=2**32 - 1`.
-            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
-            RuntimeError: If the client is not authenticated, the user lacks global
-                `manage_streams` or per-stream `manage_stream` permission, the
-                stream does not exist, or the request fails.
-        """
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
@@ -1589,24 +1567,6 @@ class IggyClient:
 
         Returns:
             An awaitable that resolves to `None` when the topic is deleted.
-
-        Raises:
-            RuntimeError: If an identifier is invalid or the request fails.
-        """
-    def purge_topic(
-        self,
-        stream_id: builtins.str | builtins.int,
-        topic_id: builtins.str | builtins.int,
-    ) -> collections.abc.Awaitable[None]:
-        r"""
-        Purge all messages from a topic.
-
-        Args:
-            stream_id: Stream identifier as `str | int`.
-            topic_id: Topic identifier as `str | int`.
-
-        Returns:
-            An awaitable that resolves to `None` when the topic is purged.
 
         Raises:
             RuntimeError: If an identifier is invalid or the request fails.

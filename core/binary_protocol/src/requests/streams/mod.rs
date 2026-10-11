@@ -19,12 +19,10 @@ pub mod create_stream;
 pub mod delete_stream;
 pub mod get_stream;
 pub mod get_streams;
-pub mod purge_stream;
 pub mod update_stream;
 
 pub use create_stream::CreateStreamRequest;
 pub use delete_stream::DeleteStreamRequest;
 pub use get_stream::GetStreamRequest;
 pub use get_streams::GetStreamsRequest;
-pub use purge_stream::PurgeStreamRequest;
 pub use update_stream::UpdateStreamRequest;

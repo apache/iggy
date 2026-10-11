@@ -202,46 +202,6 @@ async fn given_lost_send_reply_when_singleton_restarts_should_return_the_origina
     verify_lost_reply_restart(harness).await;
 }
 
-#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
-async fn given_committed_send_when_purged_and_restarted_should_preserve_its_receipt(
-    harness: &mut TestHarness,
-) {
-    let observer = harness.root_client_for_node(0).await.unwrap();
-    seed_topic(&observer).await;
-    let (mut connection, session) = register(harness.node(0).tcp_addr().unwrap()).await;
-    let body = send_messages_body(b"purged-but-still-acknowledged");
-    let header = request_header(Operation::SendMessages, session, 1, body.len());
-    let expected = receipt_until_committed(&mut connection, &header, &body).await;
-    assert_eq!(poll_all(&observer).await, 1);
-    observer
-        .purge_topic(
-            &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::named(TOPIC_NAME).unwrap(),
-        )
-        .await
-        .unwrap();
-    let deadline = Instant::now() + COMMIT_BUDGET;
-    while poll_all(&observer).await != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "purge must remove visible messages"
-        );
-        sleep(RETRY_PAUSE).await;
-    }
-    drop(connection);
-    harness.kill_cluster().unwrap();
-    harness.restart_cluster().await.unwrap();
-
-    let actual = replay_on_nodes(harness, &[0], session, &header, &body).await;
-    assert_eq!(actual, expected, "purge must preserve the original receipt");
-    let observer = harness.root_client_for_node(0).await.unwrap();
-    assert_eq!(
-        poll_all(&observer).await,
-        0,
-        "retry must not resurrect messages"
-    );
-}
-
 #[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
 async fn given_lost_send_reply_when_whole_cluster_restarts_should_return_the_original_receipt(
     harness: &mut TestHarness,
@@ -320,7 +280,7 @@ async fn given_reclaimed_wal_when_recovered_quorum_replays_should_return_the_ori
     const MESSAGES_PER_BATCH: u32 = 33;
     const PAYLOAD_BYTES: usize = 1024 * 1024;
     const WAL_FRONTIER_SLOTS: usize = 2;
-    const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL3";
+    const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL4";
     const WAL_CHECKPOINT_OFFSET: usize = 48;
     const WAL_HEAD_OFFSET: usize = 72;
     let observer = harness.root_client_for_node(0).await.unwrap();
