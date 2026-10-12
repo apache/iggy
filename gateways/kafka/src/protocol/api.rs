@@ -26,6 +26,7 @@ use kafka_protocol::messages::{
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
@@ -38,9 +39,9 @@ use crate::protocol::bounds_guard::{
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    api_versions, create_topics, decode_guarded, dispatch, fetch, find_coordinator, heartbeat,
-    init_producer_id, join_group, leave_group, list_offsets, metadata, offset_commit, offset_fetch,
-    produce, respond_or_close, sync_group,
+    alter_configs, api_versions, create_topics, decode_guarded, describe_configs, dispatch, fetch,
+    find_coordinator, heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata,
+    offset_commit, offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -61,6 +62,8 @@ pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
+pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
+pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
@@ -140,14 +143,17 @@ pub const ERROR_INVALID_REPLICATION_FACTOR: i16 = 38;
 /// map's keys the same way regardless of what a client's replica list under each key says (this
 /// bridge doesn't model replicas at all, so only the key set is checked).
 pub const ERROR_INVALID_REPLICA_ASSIGNMENT: i16 = 39;
-/// `CreateTopics` stub: do not claim topics were created (no controller / no Iggy bridge).
+/// No controller and no Iggy bridge. `CreateTopics`, `DescribeConfigs`, and `AlterConfigs`
+/// answer this so a client does not treat a stub as a completed create, read, or alter.
 pub const ERROR_NOT_CONTROLLER: i16 = 41;
 pub const ERROR_INVALID_REQUEST: i16 = 42;
-/// `CreateTopics`: a requested topic carried one or more per-topic Kafka configs.
+/// A config this gateway will not apply.
 ///
-/// None of `retention.ms`, `cleanup.policy`, etc. maps onto an Iggy topic option this bridge
-/// applies, so every non-empty `configs` list is rejected outright rather than silently dropping
-/// a subset an operator might believe took effect.
+/// `CreateTopics` rejects any per-topic config list and points the client at `AlterConfigs`.
+/// `AlterConfigs` stores `retention.ms`, `retention.minutes`, or `retention.hours` as
+/// `message_expiry` in milliseconds and rejects every other key, and a value that cannot
+/// be stored. `DescribeConfigs` sends this when a requested key is unknown or a stored expiry
+/// cannot be shown as `retention.ms`.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
 /// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
 ///
@@ -157,7 +163,8 @@ pub const ERROR_INVALID_CONFIG: i16 = 40;
 /// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
 pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 =
     ResponseError::UnsupportedForMessageFormat.code();
-/// `CreateTopics`: request addressed more distinct topics than this bridge admits in one call.
+/// `CreateTopics`, `DescribeConfigs`, and `AlterConfigs`: the request addressed more distinct
+/// topics than this bridge admits in one call.
 ///
 /// A server-imposed limit, not a malformed request - `INVALID_REQUEST` would blame the client for
 /// a request Kafka itself would accept.
@@ -278,6 +285,8 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     offset_fetch::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    describe_configs::RANGE,
+    alter_configs::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,
@@ -430,18 +439,22 @@ pub async fn handle_request_bounded(
     body: Bytes,
 ) -> HandleOutcome {
     let connection = ConnectionState::default();
-    handle_connection_request(state, &connection, api_key, api_version, body).await
+    handle_connection_request(state, &connection, None, api_key, api_version, body).await
 }
 
 /// [`handle_request_bounded`] for one request of `connection`.
+///
+/// `principal` is `None` when SASL is off, or for a key the connection reached before
+/// authenticating - only `crate::server::route_frame` ever has a principal to pass.
 pub async fn handle_connection_request(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_key: i16,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
-    dispatch(state, connection, api_key, api_version, body).await
+    dispatch(state, connection, principal, api_key, api_version, body).await
 }
 
 #[must_use]
@@ -689,6 +702,10 @@ pub fn encode_error_for_key(
         API_KEY_FETCH => fetch::encode_error_response(api_version, error_code),
         API_KEY_LIST_OFFSETS => list_offsets::encode_error_response(api_version, error_code),
         API_KEY_CREATE_TOPICS => create_topics::encode_error_response(api_version, error_code),
+        API_KEY_DESCRIBE_CONFIGS => {
+            describe_configs::encode_error_response(api_version, error_code)
+        }
+        API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
         // Carries the live SASL setting, not a hardcoded `false`: answering an illegal-state
         // ApiVersions with a SASL-less key set contradicts the advertisement sent one frame
         // earlier on the same connection.

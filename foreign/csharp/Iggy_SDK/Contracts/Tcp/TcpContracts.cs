@@ -767,13 +767,6 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] PurgeTopic(Identifier streamId, Identifier topicId)
-    {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        return bytes.ToArray();
-    }
-
     internal static byte[] UpdateOffset(Identifier streamId, Identifier topicId, Consumer consumer, ulong offset,
         uint? partitionId)
     {

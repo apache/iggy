@@ -26,9 +26,23 @@
 //! every function some *other* binary uses as unused here.
 #![allow(dead_code)]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use kafka_protocol::protocol::{Decodable, Encodable};
 
 use super::codec::Encoder;
+
+/// Encodes any `kafka_protocol` request or response type at `version`.
+pub fn encode<M: Encodable>(message: &M, version: i16) -> Bytes {
+    let mut buf = BytesMut::new();
+    message.encode(&mut buf, version).expect("encode request");
+    buf.freeze()
+}
+
+/// Decodes any `kafka_protocol` request or response type at `version`.
+pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
+    let mut buf = body;
+    M::decode(&mut buf, version).expect("decode response")
+}
 
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
@@ -210,6 +224,41 @@ pub fn build_produce_flexible_empty_request(acks: i16) -> Bytes {
     enc.write_i32(1_000); // timeout_ms
     enc.write_varint(1); // empty topics compact array (N+1)
     enc.write_empty_tagged_fields();
+    enc.freeze()
+}
+
+/// `DescribeConfigs` with no resources. Flexible from v4. `include_documentation` exists from v3.
+pub fn build_describe_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // include_synonyms
+    if version >= 3 {
+        enc.write_bool(false); // include_documentation
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `AlterConfigs` with no resources. Flexible from v2.
+pub fn build_alter_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
     enc.freeze()
 }
 

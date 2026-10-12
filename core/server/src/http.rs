@@ -73,9 +73,9 @@ use crate::http::handlers::{
     delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
     get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
     get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
-    login_with_personal_access_token, logout_user, ping, poll_messages, purge_stream, purge_topic,
-    refresh_token, send_messages, store_consumer_offset, update_permissions, update_stream,
-    update_topic, update_user,
+    login_with_personal_access_token, logout_user, ping, poll_messages, refresh_token,
+    send_messages, store_consumer_offset, update_permissions, update_stream, update_topic,
+    update_user,
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
@@ -516,7 +516,6 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
             "/streams/{stream_id}",
             get(get_stream).put(update_stream).delete(delete_stream),
         )
-        .route("/streams/{stream_id}/purge", delete(purge_stream))
         .route(
             "/streams/{stream_id}/topics",
             get(get_topics).post(create_topic),
@@ -524,10 +523,6 @@ fn forwardable_routes(state: HttpState) -> Router<HttpState> {
         .route(
             "/streams/{stream_id}/topics/{topic_id}",
             get(get_topic).put(update_topic).delete(delete_topic),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/purge",
-            delete(purge_topic),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/partitions",

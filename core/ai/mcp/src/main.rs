@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ::configs::ConfigProvider;
+use ::configs::{
+    ConfigEnvMappings, ConfigProvider, MCP_CONFIG_PATH_ENV, MCP_ENV_PATH_ENV, MCP_RUNTIME_ENV_VARS,
+    print_env_var_names,
+};
+use clap::Parser;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
@@ -42,7 +46,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const DEFAULT_CONFIG_PATH: &str = "core/ai/mcp/config.toml";
 
+#[derive(Debug, Parser)]
+#[command(author = "Apache Iggy", version)]
+struct Args {
+    /// Print supported configuration environment variables and exit.
+    #[arg(long)]
+    list_config_env_vars: bool,
+}
+
 fn main() -> Result<(), McpRuntimeError> {
+    let args = Args::parse();
+    if args.list_config_env_vars {
+        print_config_env_vars().map_err(McpRuntimeError::ListConfigEnvVars)?;
+        return Ok(());
+    }
     let runtime = Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -53,12 +70,23 @@ fn main() -> Result<(), McpRuntimeError> {
     result
 }
 
+fn print_config_env_vars() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout();
+    print_env_var_names(
+        McpServerConfig::env_templates()
+            .iter()
+            .map(|t| t.env_name)
+            .chain(MCP_RUNTIME_ENV_VARS.iter().copied()),
+        &mut stdout,
+    )
+}
+
 async fn run() -> Result<(), McpRuntimeError> {
     let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert("Iggy MCP Server");
     eprintln!("{}", figure.unwrap());
 
-    if let Ok(env_path) = std::env::var("IGGY_MCP_ENV_PATH") {
+    if let Ok(env_path) = std::env::var(MCP_ENV_PATH_ENV) {
         if dotenvy::from_path(&env_path).is_ok() {
             eprintln!("Loaded environment variables from path: {env_path}");
         }
@@ -70,7 +98,7 @@ async fn run() -> Result<(), McpRuntimeError> {
     }
 
     let config_path =
-        env::var("IGGY_MCP_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+        env::var(MCP_CONFIG_PATH_ENV).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     eprintln!("Configuration file path: {config_path}");
     let config: McpServerConfig = McpServerConfig::config_provider(config_path)
         .load_config()

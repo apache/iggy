@@ -39,7 +39,7 @@ use crate::replica::Replica;
 use crate::workload::invariants::Invariants;
 use crate::workload::shadow::Shadow;
 use crate::workload::{Workload, apply_sim_commands, resubmit_due, state_checker};
-use consensus::{Consensus, MetadataHandle, Status};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle, Status};
 use metadata::impls::metadata::StreamsFrontend;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -160,6 +160,7 @@ pub fn drive_to_quiesce(
 /// packet loss in play that distinction is the whole diagnosis, so name what is
 /// outstanding and what every live replica believes.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
     let mut report = format!(
         "did not drain: {} request(s) still outstanding (seed={:#x})\n",
@@ -229,6 +230,41 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
             );
         }
         report.push('\n');
+        let replica = &sim.replicas[usize::from(replica_idx)];
+        for intent in replica.shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .pending_lifecycles()
+        {
+            let _ = writeln!(report, "    pending lifecycle: {intent:?}");
+            for target in intent.partitions {
+                let namespace = server_common::sharding::IggyNamespace::new(
+                    intent.stream_id as usize,
+                    target.topic_id as usize,
+                    target.partition_id as usize,
+                );
+                let partition = replica
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace);
+                let _ = writeln!(
+                    report,
+                    "      {namespace:?}: {:?}",
+                    partition.map(|partition| (
+                        partition.created_revision(),
+                        partition.history_deleted(),
+                        partition.fatal(),
+                        partition.consensus().status(),
+                        partition.consensus().view(),
+                        partition.consensus().commit_min(),
+                        partition.consensus().commit_max(),
+                    ))
+                );
+            }
+        }
         // Per-client table state. `check_request` admits anything above the
         // watermark, so the watermark says whether an outstanding request is still
         // expected (above it) or already answered and owed a cached-reply replay (at
