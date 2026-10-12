@@ -40,20 +40,15 @@ pub(crate) fn diagnostic_event_channel() -> (Sender<DiagnosticEvent>, Receiver<D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    #[tokio::test]
-    async fn publishing_past_the_capacity_with_an_idle_receiver_does_not_wait() {
+    #[test]
+    fn publishing_past_the_capacity_with_an_idle_receiver_succeeds() {
         let (sender, _idle) = diagnostic_event_channel();
 
         for event in 1..=DIAGNOSTIC_EVENT_CAPACITY + 1 {
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                sender.broadcast(DiagnosticEvent::Disconnected),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("event {event} waited for a free slot"))
-            .expect("the channel is open");
+            sender
+                .try_broadcast(DiagnosticEvent::Disconnected)
+                .unwrap_or_else(|error| panic!("event {event}: {error}"));
         }
     }
 }

@@ -67,6 +67,9 @@ pub struct HttpClient {
     access_token: IggyRwLock<String>,
     /// The contexts that fence sends to an explicit partition, read from the topic details.
     pub(super) send_contexts: ConsumerGroupClientState,
+    /// HTTP keeps no connection, so no event is ever published here. The
+    /// channel exists only because the `Client` trait requires
+    /// `subscribe_events`.
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
 }
 

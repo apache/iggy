@@ -233,7 +233,7 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
+        if let Err(error) = self.events.0.try_broadcast(event) {
             error!("Failed to send a TCP diagnostic event: {error}");
         }
     }

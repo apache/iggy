@@ -67,5 +67,10 @@ pub trait Client:
     async fn shutdown(&self) -> Result<(), IggyError>;
 
     /// Subscribe to diagnostic events.
+    ///
+    /// The event channel is bounded. When it is full, the client drops the
+    /// oldest event, so publishing never waits for a subscriber. A subscriber
+    /// that falls behind loses old events, not the newest ones. HTTP keeps no
+    /// connection, so it publishes no events.
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent>;
 }
