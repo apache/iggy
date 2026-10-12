@@ -33,25 +33,11 @@ impl TopicClient for HttpClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Option<TopicDetails>, IggyError> {
-        let response = self
-            .get(&get_details_path(
-                &stream_id.as_cow_str(),
-                &topic_id.as_cow_str(),
-            ))
-            .await;
-        if let Err(error) = response {
-            if matches!(error, IggyError::ResourceNotFound(_)) {
-                return Ok(None);
-            }
-
-            return Err(error);
+        match self.topic_details(stream_id, topic_id).await {
+            Ok(topic) => Ok(Some(topic)),
+            Err(IggyError::ResourceNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
         }
-
-        let topic = response?
-            .json()
-            .await
-            .map_err(|_| IggyError::InvalidJsonResponse)?;
-        Ok(Some(topic))
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
@@ -129,7 +115,30 @@ impl TopicClient for HttpClient {
             &topic_id.as_cow_str(),
         ))
         .await?;
+        self.send_contexts.invalidate_topic_discovery();
         Ok(())
+    }
+}
+
+impl HttpClient {
+    /// Reads the topic details and keeps their partition contexts for the sends that follow.
+    pub(super) async fn topic_details(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<TopicDetails, IggyError> {
+        let topic: TopicDetails = self
+            .get(&get_details_path(
+                &stream_id.as_cow_str(),
+                &topic_id.as_cow_str(),
+            ))
+            .await?
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)?;
+        self.send_contexts
+            .set_topic_partitions(stream_id, topic_id, &topic.partitions);
+        Ok(topic)
     }
 }
 

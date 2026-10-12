@@ -109,6 +109,7 @@ impl<B: BinaryClient> StreamClient for B {
             DeleteStreamRequest { stream_id: wire_id }.to_bytes(),
         )
         .await?;
+        self.consumer_group_state().invalidate_topic_discovery();
         Ok(())
     }
 }

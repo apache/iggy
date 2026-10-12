@@ -550,9 +550,10 @@ repair_chunk_max = 128
 # group that cannot persist its view is already fenced quorum-invisible and
 # retries with capped backoff; past this window the process exits with a distinct
 # status so a supervisor restarts or replaces it instead of an operator finding
-# the wedge in logs. "0" disables the fail-stop and leaves the group fenced
-# indefinitely. Nonzero values must be at least 30s so a transient disk hiccup
-# cannot kill the process.
+# the wedge in logs. It is also the deadline of each running partition file job
+# (see [sharding] partition_io_capacity). "0" disables the fail-stop and leaves
+# the group fenced indefinitely. Nonzero values must be at least 30s so a
+# transient disk hiccup cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
 # Superblock compatibility: 74-byte records include the partition offset
@@ -763,6 +764,8 @@ poll_completion_capacity = 1024
 
 # Active partition file jobs plus results awaiting owner acceptance per shard (1..=256).
 # Exhausting either limit queues partition file work until capacity is released.
+# Running jobs use [cluster] superblock_wedged_fatal_timeout, counted in pump ticks.
+# Expiry fences the owner and stops the node; 0 disables this deadline.
 partition_io_capacity = 16
 # Omission selects the largest legal job charge, slightly above 4 GiB per shard.
 # This is an admission ceiling, not an eager allocation. A smaller budget fails boot.

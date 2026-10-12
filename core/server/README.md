@@ -88,6 +88,14 @@ receipt still replays its original result, but a lost receipt cannot prevent
 another execution. NoAck and internal auto-commit polls retain their weaker
 completion contracts.
 
+Topics have an immutable `partition_resize_policy` creation option. The default,
+`mutable`, permits partition addition and deletion without a bounded cutover or
+per-key ordering across partition layouts. `fixed` rejects both operations with
+`PartitionResizeDisabled` (2023). Existing messages stay in their original
+partitions. Neither policy prevents retention or deletion of the topic.
+Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
+`options` map, or the CLI's `--set partition_resize_policy=fixed`.
+
 ## Upgrade recovery
 
 This release changes protocol and storage formats. Servers and compatible
@@ -171,7 +179,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-NO-PURGE-1` requires this initialization contract;
+Storage format `IGGY-OWNERSHIP-HISTORY-4` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

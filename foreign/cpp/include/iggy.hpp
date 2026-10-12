@@ -1370,6 +1370,58 @@ class Topic final {
 };
 
 /**
+ * @brief Partition incarnation and consumer-group owner captured by a read or
+ *        a poll.
+ *
+ * Store an offset under the context that delivered it with
+ * IggyBlockingClient::StoreConsumerPosition(). The store then fails instead of
+ * landing on a recreated partition or under a newer consumer-group owner. The
+ * server refuses a context whose incarnation is zero.
+ */
+class PartitionContext final {
+  public:
+    /**
+     * @brief Creates a context from the values a poll or a read returned.
+     * @param incarnation Creation revision of the partition. It changes when a
+     *        deleted partition ID is created again.
+     * @param owner_generation Consumer-group owner generation, or zero outside
+     *        a consumer group.
+     * @param metadata_op Metadata operation the context was captured at.
+     */
+    PartitionContext(std::uint64_t incarnation, std::uint64_t owner_generation, std::uint64_t metadata_op)
+        : incarnation_(incarnation), owner_generation_(owner_generation), metadata_op_(metadata_op) {}
+
+    /**
+     * @brief Returns the creation revision of the partition.
+     * @return Partition incarnation.
+     */
+    [[nodiscard]] std::uint64_t Incarnation() const noexcept { return incarnation_; }
+
+    /**
+     * @brief Returns the consumer-group owner generation.
+     * @return Owner generation, or zero outside a consumer group.
+     */
+    [[nodiscard]] std::uint64_t OwnerGeneration() const noexcept { return owner_generation_; }
+
+    /**
+     * @brief Returns the metadata operation the context was captured at.
+     * @return Metadata operation number.
+     */
+    [[nodiscard]] std::uint64_t MetadataOp() const noexcept { return metadata_op_; }
+
+  private:
+    [[nodiscard]] ffi::PartitionContext ToFfi() const;
+    static PartitionContext FromFfi(ffi::PartitionContext context);
+
+    friend class Partition;
+    friend class IggyBlockingClient;
+
+    std::uint64_t incarnation_;
+    std::uint64_t owner_generation_;
+    std::uint64_t metadata_op_;
+};
+
+/**
  * @brief Partition metadata returned within TopicDetails.
  *
  * Represents the state of a partition when its topic was retrieved. This is a
@@ -1414,19 +1466,29 @@ class Partition final {
      */
     [[nodiscard]] std::uint64_t MessagesCount() const noexcept { return messages_count_; }
 
+    /**
+     * @brief Returns the partition incarnation and the metadata operation the
+     *        details were read at.
+     * @return Context whose owner generation is zero, because topic details
+     *         belong to no consumer group.
+     */
+    [[nodiscard]] PartitionContext Context() const noexcept { return context_; }
+
   private:
     Partition(std::uint32_t id,
               std::uint64_t created_at,
               std::uint32_t segments_count,
               std::uint64_t current_offset,
               std::uint64_t size_bytes,
-              std::uint64_t messages_count)
+              std::uint64_t messages_count,
+              PartitionContext context)
         : id_(id),
           created_at_(created_at),
           segments_count_(segments_count),
           current_offset_(current_offset),
           size_bytes_(size_bytes),
-          messages_count_(messages_count) {}
+          messages_count_(messages_count),
+          context_(context) {}
 
     static Partition FromFfi(ffi::Partition partition);
 
@@ -1438,6 +1500,7 @@ class Partition final {
     std::uint64_t current_offset_;
     std::uint64_t size_bytes_;
     std::uint64_t messages_count_;
+    PartitionContext context_;
 };
 
 /**
@@ -2678,6 +2741,9 @@ constexpr std::string_view to_string(const Durability durability) {
  * unset to use the server default. Use SetRawEntries() for supported options
  * that do not yet have a typed setter. When both specify the same option, the
  * typed setting takes precedence.
+ *
+ * For example, the entry `partition_resize_policy` set to `fixed` makes the
+ * server reject later partition creation and deletion on this topic.
  */
 class TopicCreateOptions final {
   public:
@@ -3889,6 +3955,13 @@ class IggyBlockingClient final {
      * own @p partition_id in that group. This ownership fence does not apply to
      * individual consumers.
      *
+     * The request takes the partition context its cached route reports. After
+     * another client deleted and recreated the partition, one call can fail
+     * with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned (5009)
+     * for a consumer group. The failed route is dropped and the next call
+     * routes again. StoreConsumerPosition() stores under the context that
+     * delivered the offset instead.
+     *
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
@@ -3906,6 +3979,32 @@ class IggyBlockingClient final {
                              const Identifier &topic,
                              std::optional<std::uint32_t> partition_id,
                              std::uint64_t offset);
+
+    /**
+     * @brief Stores an offset under the partition context that delivered it.
+     *
+     * Every retry keeps @p context. The store fails instead of landing on a
+     * recreated partition or under a newer consumer-group owner. Otherwise it
+     * behaves as StoreConsumerOffset() with @p partition_id set.
+     *
+     * @param consumer Consumer identity that owns the offset.
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param partition_id Partition that delivered @p offset.
+     * @param offset Message offset to store.
+     * @param context Context the poll that delivered @p offset returned.
+     * @throws IggyException if the partition was deleted or recreated after
+     *         @p context was captured (HistoryUnavailable, 87); this client no
+     *         longer owns the partition in the consumer group
+     *         (ConsumerGroupPartitionNotOwned, 5009); or for any reason
+     *         StoreConsumerOffset() throws.
+     */
+    void StoreConsumerPosition(const Consumer &consumer,
+                               const Identifier &stream,
+                               const Identifier &topic,
+                               std::uint32_t partition_id,
+                               std::uint64_t offset,
+                               const PartitionContext &context);
 
     /**
      * @brief Retrieves the stored offset for a consumer or consumer group.
@@ -3947,6 +4046,12 @@ class IggyBlockingClient final {
      * For a consumer group, the group must exist and the current client must
      * own @p partition_id in that group. This ownership fence does not apply to
      * individual consumers.
+     *
+     * The request takes the partition context its cached route reports. After
+     * another client deleted and recreated the partition, one call can fail
+     * with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned (5009)
+     * for a consumer group. The failed route is dropped and the next call
+     * routes again.
      *
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.

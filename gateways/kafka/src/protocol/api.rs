@@ -39,9 +39,9 @@ use crate::protocol::bounds_guard::{
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_topics, decode_guarded, describe_configs, dispatch, fetch,
-    find_coordinator, heartbeat, init_producer_id, join_group, leave_group, list_offsets, metadata,
-    offset_commit, offset_fetch, produce, respond_or_close, sync_group,
+    alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_configs,
+    dispatch, fetch, find_coordinator, heartbeat, init_producer_id, join_group, leave_group,
+    list_offsets, metadata, offset_commit, offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -62,10 +62,11 @@ pub const API_KEY_SYNC_GROUP: i16 = 14;
 pub const API_KEY_SASL_HANDSHAKE: i16 = 17;
 pub const API_KEY_API_VERSIONS: i16 = 18;
 pub const API_KEY_CREATE_TOPICS: i16 = 19;
-pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
-pub const API_KEY_ALTER_CONFIGS: i16 = 33;
+pub const API_KEY_DELETE_TOPICS: i16 = 20;
 pub const API_KEY_INIT_PRODUCER_ID: i16 = 22;
 pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
+pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
+pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
@@ -285,6 +286,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     offset_fetch::RANGE,
     api_versions::RANGE,
     create_topics::RANGE,
+    delete_topics::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
     init_producer_id::RANGE,
