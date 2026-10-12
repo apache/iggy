@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 use crate::client::non_zero_duration_micros;
 use crate::error::to_php_exception;
 use crate::message_iterator::MessageIterator;
-use crate::receive_message::ReceiveMessage;
+use crate::receive_message::{ConsumerPosition, ReceiveMessage};
 use crate::runtime::runtime;
 
 /// A PHP class representing the Iggy consumer.
@@ -76,6 +76,17 @@ impl IggyConsumer {
     /// Stores the provided offset for the provided partition id.
     ///
     /// If partition_id is null, at least one message must have been polled first.
+    ///
+    /// The offset is committed under the partition context of the latest message consumed
+    /// from that partition. After the partition was recreated or changed owner, that context
+    /// can be newer than the message's, and the offset then lands on the newer partition. Use
+    /// storePosition($message->position()) to commit under the context that delivered the
+    /// message.
+    ///
+    /// When nothing was consumed from that partition, the store uses the context of its route
+    /// and can fail once with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
+    /// (5009), after another client deleted and recreated the partition. The failed route is
+    /// dropped, and the next call routes again.
     pub fn store_offset(&self, offset: u64, partition_id: Option<u32>) -> PhpResult {
         let inner = self.inner.clone();
 
@@ -89,9 +100,32 @@ impl IggyConsumer {
         })
     }
 
+    /// Stores a message position under the partition incarnation and owner that delivered it.
+    ///
+    /// Pass $message->position() to commit a message after later polls or a rebalance. A
+    /// position from a deleted or recreated partition fails with HistoryUnavailable (87), and
+    /// one from a previous owner fails with ConsumerGroupPartitionNotOwned (5009). The stored
+    /// offset is then unchanged.
+    pub fn store_position(&self, position: &ConsumerPosition) -> PhpResult {
+        let position = position.inner;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            let inner = inner.lock().await;
+            inner
+                .store_position(position)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Deletes the stored offset for the provided partition id.
     ///
     /// If partition_id is null, at least one message must have been polled first.
+    ///
+    /// The delete uses the context of its route. It can fail once with HistoryUnavailable
+    /// (87), or ConsumerGroupPartitionNotOwned (5009), after another client deleted and
+    /// recreated the partition. The failed route is dropped, and the next call routes again.
     pub fn delete_offset(&self, partition_id: Option<u32>) -> PhpResult {
         let inner = self.inner.clone();
 
@@ -110,8 +144,14 @@ impl IggyConsumer {
     /// The callback is called as callback(ReceiveMessage $message). A finite limit is required.
     ///
     /// With AutoCommit::when(), offsets may already be queued for commit before the
-    /// PHP callback runs. Use AutoCommit::disabled() and call storeOffset() after a
-    /// successful callback when at-least-once callback processing is required.
+    /// PHP callback runs. Use AutoCommit::disabled() and call
+    /// storePosition($message->position()) after a successful callback when at-least-once
+    /// callback processing is required.
+    ///
+    /// After another client deleted and recreated a partition, or after its consumer group
+    /// owner changed, a poll can fail once with HistoryUnavailable (87) or
+    /// ConsumerGroupPartitionNotOwned (5009). The failed route is dropped, and the next call
+    /// routes again.
     pub fn consume_messages(&self, callback: ZendCallable, limit: u32) -> PhpResult<u32> {
         let mut consumed = 0;
 
@@ -130,6 +170,11 @@ impl IggyConsumer {
     }
 
     /// Returns an iterator over messages for use with foreach.
+    ///
+    /// After another client deleted and recreated a partition, or after its consumer group
+    /// owner changed, a poll can fail once with HistoryUnavailable (87) or
+    /// ConsumerGroupPartitionNotOwned (5009). The failed route is dropped, and the next call
+    /// routes again.
     pub fn iter_messages(&self) -> MessageIterator {
         MessageIterator::new(self.inner.clone())
     }
@@ -152,10 +197,7 @@ impl IggyConsumer {
             let mut inner = inner.lock().await;
 
             match inner.next().await {
-                Some(Ok(message)) => Ok(Some(ReceiveMessage {
-                    inner: message.message,
-                    partition_id: message.partition_id,
-                })),
+                Some(Ok(message)) => Ok(Some(ReceiveMessage::from(message))),
                 Some(Err(err)) => Err(to_php_exception(err)),
                 None => Ok(None),
             }

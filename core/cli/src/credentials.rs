@@ -19,7 +19,7 @@ use crate::args::CliOptions;
 use crate::error::{CmdToolError, IggyCmdError};
 use anyhow::{Context, bail};
 use iggy::clients::client::IggyClient;
-use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
+use iggy::prelude::{IggyError, PersonalAccessTokenClient, UserClient};
 use iggy_cli::commands::binary_system::session::{ServerSession, ensure_default_store};
 use passterm::{Stream, isatty, prompt_password_tty};
 use secrecy::{ExposeSecret, SecretString};
@@ -58,7 +58,7 @@ pub(crate) struct IggyCredentials<'a> {
 impl<'a> IggyCredentials<'a> {
     pub(crate) fn new(
         cli_options: &CliOptions,
-        iggy_args: &Args,
+        server_address: &str,
         login_required: bool,
         prefer_explicit_credentials: bool,
     ) -> anyhow::Result<Self, anyhow::Error> {
@@ -71,11 +71,10 @@ impl<'a> IggyCredentials<'a> {
         }
 
         let session_credentials = || -> Option<Credentials> {
-            let server_address = iggy_args.get_server_address()?;
-            let token = ServerSession::new(server_address.clone()).get_token()?;
+            let token = ServerSession::new(server_address.to_string()).get_token()?;
             Some(Credentials::SessionWithToken(
                 SecretString::from(token),
-                server_address,
+                server_address.to_string(),
             ))
         };
 
@@ -93,25 +92,18 @@ impl<'a> IggyCredentials<'a> {
 
         #[cfg(feature = "login-session")]
         if let Some(token_name) = &cli_options.token_name {
-            return match iggy_args.get_server_address() {
-                Some(server_address) => {
-                    let server_address = format!("iggy:{server_address}");
-                    event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
-                    server_address, token_name);
-                    ensure_default_store()?;
-                    let entry = Entry::new(&server_address, token_name)?;
-                    let token = entry.get_password()?;
+            let server_address = format!("iggy:{server_address}");
+            event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
+            server_address, token_name);
+            ensure_default_store()?;
+            let entry = Entry::new(&server_address, token_name)?;
+            let token = entry.get_password()?;
 
-                    Ok(Self {
-                        credentials: Some(Credentials::PersonalAccessToken(SecretString::from(
-                            token,
-                        ))),
-                        iggy_client: None,
-                        login_required,
-                    })
-                }
-                None => Err(IggyCmdError::CmdToolError(CmdToolError::MissingServerAddress).into()),
-            };
+            return Ok(Self {
+                credentials: Some(Credentials::PersonalAccessToken(SecretString::from(token))),
+                iggy_client: None,
+                login_required,
+            });
         }
 
         if let Some(token) = &cli_options.token {
@@ -154,7 +146,7 @@ impl<'a> IggyCredentials<'a> {
                 iggy_client: None,
                 login_required,
             })
-        } else if let Some(credentials) = session_credentials() {
+        } else if prefer_explicit_credentials && let Some(credentials) = session_credentials() {
             // `iggy login` with no explicit credentials: reuse the cached
             // session token so a still-valid session reports "already logged in"
             // instead of demanding credentials for a no-op.

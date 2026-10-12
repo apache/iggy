@@ -63,6 +63,7 @@ pub enum Operation {
     /// the same offset deterministically. No client wire code.
     TruncatePartition = 68,
     FinalizeSession = 70,
+    CompleteLifecycle = 71,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -98,6 +99,9 @@ pub enum Operation {
     DeleteConsumerOffset = 162,
     // 163 is reserved; 164 and 165 are retired offset operations.
     RetireSession = 166,
+    InstallConsumerGroupOwner = 167,
+    TransitionPartitionHistory = 168,
+    RetireConsumerGroupOwners = 169,
 }
 
 impl Operation {
@@ -133,8 +137,28 @@ impl Operation {
     #[must_use]
     #[inline]
     pub const fn is_internal(&self) -> bool {
+        // The SDK protocol checks parse this list, so it names every operation.
         ((*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START)
-            || matches!(self, Self::RetireSession)
+            || matches!(
+                self,
+                Self::RetireSession
+                    | Self::InstallConsumerGroupOwner
+                    | Self::TransitionPartitionHistory
+                    | Self::RetireConsumerGroupOwners
+            )
+    }
+
+    /// Partition fences that metadata orders. Each one changes consumer-group
+    /// ownership or the partition history, so it applies alone.
+    #[must_use]
+    #[inline]
+    pub const fn is_partition_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            Self::InstallConsumerGroupOwner
+                | Self::TransitionPartitionHistory
+                | Self::RetireConsumerGroupOwners
+        )
     }
 
     /// Metadata / control-plane operations handled by shard 0.
@@ -249,7 +273,11 @@ impl Operation {
             | Self::CompleteConsumerGroupRevocation
             | Self::TruncatePartition
             | Self::FinalizeSession
-            | Self::RetireSession => None,
+            | Self::CompleteLifecycle
+            | Self::RetireSession
+            | Self::InstallConsumerGroupOwner
+            | Self::TransitionPartitionHistory
+            | Self::RetireConsumerGroupOwners => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream

@@ -686,13 +686,11 @@ async fn handle_client_request<B, MJ, S, SB>(
                     return;
                 }
             };
-            // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
-            // partition count for Join) before replication; see `crate::consumer_group`.
-            let request = match maybe_rewrite_consumer_group_request(shard, request).await {
+            // Attach the authenticated member identity to consumer-group
+            // Join/Leave before replication; see `crate::consumer_group`.
+            let request = match maybe_rewrite_consumer_group_request(request) {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
-                    // Preserve transient recovery rejection so the client can
-                    // retry the join once partition state is available.
                     send_pre_consensus_deny(
                         shard,
                         transport_client_id,
@@ -709,59 +707,64 @@ async fn handle_client_request<B, MJ, S, SB>(
             // bring the committed reply back here. This shard owns the connection,
             // so it writes the reply to the socket via the transport client id --
             // shard 0 can't route by the consensus client id (no home-shard bits).
-            match submit_client_request_on_owner(shard, request).await {
-                Some(reply) => {
-                    // Recorded before the reply reaches the socket, so a read the client
-                    // sends the instant it decodes this frame already sees the mark.
-                    if let Some(commit) = committed_reply_commit(&reply) {
-                        sessions
-                            .borrow_mut()
-                            .record_metadata_watermark(transport_client_id, commit);
-                    }
-                    // The raw PAT token never enters consensus (it is non-deterministic
-                    // and secret), so the committed reply body is empty. Substitute the
-                    // raw-token response here, on the minting client's home shard, using
-                    // the confirmed commit position from the committed reply.
-                    let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
-                        Ok(reply) => reply,
-                        Err(error) => {
-                            warn!(
-                                transport_client_id,
-                                error = %error,
-                                "failed to build raw PAT reply"
-                            );
-                            // The op COMMITTED; only the reply could not be
-                            // rendered. A typed deny is still the right frame:
-                            // silence wedges the lockstep connection on a
-                            // request that succeeded server-side. The raw
-                            // token is unrecoverable either way -- it lives in
-                            // that one reply and a retry dedups to the empty
-                            // committed body -- so the caller must delete the
-                            // token and mint a new one.
-                            send_deny_reply(shard, transport_client_id, &header, error.as_code())
-                                .await;
-                            return;
-                        }
-                    };
-                    send_host_frame(
-                        &shard.bus,
-                        transport_client_id,
-                        reply.into_frozen(),
-                        FrameChannel::Reply,
-                        "committed_reply",
-                    )
-                    .await;
-                }
-                None => {
-                    // Transient submit failure (not primary / not caught up / dedup
-                    // absorbed). Stay silent; the SDK read-timeout replays.
+            let Some(reply) = submit_client_request_on_owner(shard, request).await else {
+                // No verdict came back, for example because the inbox of
+                // shard 0 refused the forward. The outcome is unknown, so
+                // only a replay of this request id is safe. A silent drop
+                // leaves the client waiting for its whole read timeout.
+                warn!(
+                    transport_client_id,
+                    operation = ?header.operation,
+                    "replicated request has no metadata verdict; client replays"
+                );
+                send_deny_reply(
+                    shard,
+                    transport_client_id,
+                    &header,
+                    IggyError::TransientNotCommitted.as_code(),
+                )
+                .await;
+                return;
+            };
+            // Recorded before the reply reaches the socket, so a read the client
+            // sends the instant it decodes this frame already sees the mark.
+            if let Some(commit) = committed_reply_commit(&reply) {
+                sessions
+                    .borrow_mut()
+                    .record_metadata_watermark(transport_client_id, commit);
+            }
+            // The raw PAT token never enters consensus (it is non-deterministic
+            // and secret), so the committed reply body is empty. Substitute the
+            // raw-token response here, on the minting client's home shard, using
+            // the confirmed commit position from the committed reply.
+            let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
+                Ok(reply) => reply,
+                Err(error) => {
                     warn!(
                         transport_client_id,
-                        operation = ?header.operation,
-                        "replicated request not committed (transient); client will replay"
+                        error = %error,
+                        "failed to build raw PAT reply"
                     );
+                    // The op COMMITTED; only the reply could not be
+                    // rendered. A typed deny is still the right frame:
+                    // silence wedges the lockstep connection on a
+                    // request that succeeded server-side. The raw
+                    // token is unrecoverable either way -- it lives in
+                    // that one reply and a retry dedups to the empty
+                    // committed body -- so the caller must delete the
+                    // token and mint a new one.
+                    send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+                    return;
                 }
-            }
+            };
+            send_host_frame(
+                &shard.bus,
+                transport_client_id,
+                reply.into_frozen(),
+                FrameChannel::Reply,
+                "committed_reply",
+            )
+            .await;
         }
     }
 }
@@ -1944,6 +1947,70 @@ mod tests {
                 "the deny must echo the request's own operation byte"
             );
         }
+    }
+
+    /// A home shard other than 0 forwards a metadata write to shard 0. A full
+    /// inbox there drops the forward, so no verdict comes back. A silent drop
+    /// left the client waiting for its whole read timeout.
+    #[compio::test]
+    async fn given_full_owner_inbox_when_metadata_write_is_forwarded_should_deny_transient_not_committed()
+     {
+        const TRANSPORT: u128 = 95;
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const USER: u32 = 0;
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (owner, _owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        owner
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("owner inbox has one slot");
+        let (home, _, _) = shard_channel(1, 1, 1);
+        shard.id = 1;
+        shard.attach_senders(vec![owner, home]);
+        let attachment = {
+            let mut client_table = shard.plane.metadata().client_table.borrow_mut();
+            client_table
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, SESSION))
+                .unwrap();
+            client_table.attach_session(CLIENT, SESSION, USER).unwrap()
+        };
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+        sessions
+            .borrow_mut()
+            .bind_authenticated_connection(TRANSPORT, CLIENT, SESSION, USER, attachment, SESSION)
+            .unwrap();
+        let body = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(1),
+        }
+        .to_bytes();
+        let request = wire_request(Operation::DeleteUser, CLIENT, SESSION, 1, &body);
+
+        handle_client_request(
+            &Rc::new(shard),
+            &sessions,
+            &Arc::new(ServerConfig::default()),
+            1,
+            TRANSPORT,
+            request.into_generic(),
+        )
+        .await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "a lost forward must still answer");
+        let (client, reply) = &replies[0];
+        assert_eq!(*client, TRANSPORT);
+        assert_eq!(frame_command(reply), Command::Reply as u8);
+        assert_eq!(
+            reply_status(reply),
+            IggyError::TransientNotCommitted.as_code(),
+            "only a replay of the same request id is safe"
+        );
     }
 
     /// The per-client queue entry goes with its last frame. The

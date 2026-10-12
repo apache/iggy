@@ -23,7 +23,8 @@ use crate::leader_aware::{
 use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::prelude::AutoLogin;
 use crate::session::ConsensusSession;
-use crate::vsr::retain_replay_header;
+use crate::vsr::{RetainedRequest, retain_replay_header};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
@@ -143,15 +144,19 @@ impl BinaryTransport for QuicClient {
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.write_offset(self, code, payload).await
+        self.poll_router
+            .write_offset(self, code, payload, context)
+            .await
     }
 
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.poll(self, request).await
+        self.poll_router.poll(self, request, context).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -172,12 +177,19 @@ impl BinaryTransport for QuicClient {
         }
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
         if is_poll_routing_code(code) {
-            return self.send_poll_request(code, payload).await;
+            return self
+                .send_poll_request_with_context(code, payload, context)
+                .await;
         }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-        let mut header = None;
+        let mut header = RetainedRequest::new(context);
         let mut result = self
             .send_raw_retaining_header(code, payload.clone(), &mut header)
             .await;
@@ -552,8 +564,14 @@ impl PollTransport for QuicClient {
         Ok(client)
     }
 
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        self.send_raw_request(code, payload, false, &mut None).await
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, false, &mut RetainedRequest::new(context))
+            .await
     }
 }
 
@@ -1036,7 +1054,7 @@ impl QuicClient {
         &self,
         code: u32,
         payload: Bytes,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
     ) -> Result<Bytes, IggyError> {
         self.send_raw_request(code, payload, true, header).await
     }
@@ -1046,7 +1064,66 @@ impl QuicClient {
         code: u32,
         payload: Bytes,
         retry_transient: bool,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
+    ) -> Result<Bytes, IggyError> {
+        // One deadline bounds the whole request including transient replays
+        // and lifecycle retries.
+        let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+        // `TransientNotAccepted` gets a short same-connection window
+        // only: past it the refusal is a verdict about who leads, not
+        // load, and the caller runs a leader recheck or roster walk.
+        // Login/register keeps the full budget on this connection: the
+        // connect flow owns its leader settlement.
+        let not_accepted_deadline = if is_login_register_code(code) {
+            deadline
+        } else {
+            deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
+        };
+        let mut retry_outcome = crate::vsr::RetryOutcome::default();
+        let mut lifecycle_retry_interval = NOT_READY_RETRY_INTERVAL;
+        loop {
+            match self
+                .send_raw_exchange(
+                    code,
+                    payload.clone(),
+                    retry_transient,
+                    header,
+                    deadline,
+                    not_accepted_deadline,
+                    &mut retry_outcome,
+                )
+                .await
+            {
+                // The refusal committed under this request id, so the retry is a
+                // new request. The pause holds no connection lock, and the next
+                // exchange takes its id only once it holds the connection, above
+                // any id another request sent during the pause.
+                Err(IggyError::LifecycleBusy)
+                    if retry_transient
+                        && tokio::time::Instant::now() + lifecycle_retry_interval < deadline =>
+                {
+                    header.header = None;
+                    tokio::time::sleep(lifecycle_retry_interval).await;
+                    lifecycle_retry_interval = (lifecycle_retry_interval * 2)
+                        .min(crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// The part of [`Self::send_raw_request`] that holds the connection lock.
+    /// `retry_outcome` carries over between the exchanges of one request.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_raw_exchange(
+        &self,
+        code: u32,
+        payload: Bytes,
+        retry_transient: bool,
+        header: &mut RetainedRequest,
+        deadline: tokio::time::Instant,
+        not_accepted_deadline: tokio::time::Instant,
+        retry_outcome: &mut crate::vsr::RetryOutcome,
     ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
@@ -1076,7 +1153,8 @@ impl QuicClient {
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         let preencoded = *header;
-        let (used_header, result) = tokio::spawn(async move {
+        let mut outcome_so_far = std::mem::take(retry_outcome);
+        let (used_header, result, outcome_so_far) = tokio::spawn(async move {
             let mut used_header = preencoded;
             let result = async {
                 let connection = connection.lock().await;
@@ -1085,42 +1163,18 @@ impl QuicClient {
                     return Err(IggyError::NotConnected);
                 };
 
-                let request_header = match preencoded {
-                    Some(header) => {
-                        let session = consensus_session
-                            .lock()
-                            .map_err(|_| IggyError::InvalidConfiguration)?;
-                        crate::vsr::validate_retained_header(&header, &session)?;
-                        header
-                    }
-                    None => {
-                        let mut session = consensus_session
-                            .lock()
-                            .map_err(|_| IggyError::InvalidConfiguration)?;
-                        crate::vsr::encode_request_header(&mut session, code, &payload)?.0
-                    }
+                let request_header = {
+                    let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                    used_header.encode(&mut session, code, &payload)?
                 };
-                used_header = Some(request_header);
                 trace!(
                     "Sending a QUIC VSR request of size {} with code: {code}",
                     request_header.size
                 );
                 // Replays retain the exact identity so committed receipts resolve
                 // uncertain attempts. Silence alone does not authorize a replay.
-                let header_bytes = bytemuck::bytes_of(&request_header);
-                let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-                // `TransientNotAccepted` gets a short same-connection window
-                // only: past it the refusal is a verdict about who leads, not
-                // load, and the caller runs a leader recheck or roster walk.
-                // Login/register keeps the full budget on this connection: the
-                // connect flow owns its leader settlement.
-                let not_accepted_deadline = if is_login_register_code(code) {
-                    deadline
-                } else {
-                    deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
-                };
-                let mut retry_outcome = crate::vsr::RetryOutcome::default();
                 loop {
+                    let header_bytes = bytemuck::bytes_of(&request_header);
                     let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                         error!("Failed to open a bidirectional stream: {error}");
                         IggyError::QuicError
@@ -1151,7 +1205,7 @@ impl QuicClient {
                         &metadata_watermark,
                     )
                     .await
-                    .map_err(|error| retry_outcome.observe(error))
+                    .map_err(|error| outcome_so_far.observe(error))
                     {
                         Ok(reply) => return Ok(reply),
                         Err(error) if !retry_transient => return Err(error),
@@ -1189,7 +1243,7 @@ impl QuicClient {
                 }
             }
             .await;
-            (used_header, result)
+            (used_header, result, outcome_so_far)
         })
         .await
         .map_err(|e| {
@@ -1197,6 +1251,7 @@ impl QuicClient {
             IggyError::QuicError
         })?;
         *header = used_header;
+        *retry_outcome = outcome_so_far;
         result
     }
 }
@@ -1276,7 +1331,8 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
 mod tests {
     use super::*;
 
-    use iggy_binary_protocol::codes::SEND_MESSAGES_CODE;
+    use iggy_binary_protocol::codes::{JOIN_CONSUMER_GROUP_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
     use iggy_binary_protocol::requests::system::BindSessionRequest;
     use iggy_binary_protocol::responses::users::LoginRegisterResponse;
     use iggy_binary_protocol::{
@@ -1350,19 +1406,19 @@ mod tests {
             .is_err()
         );
 
-        let mut header = None;
+        let mut request = crate::vsr::RetainedRequest::default();
         assert_eq!(
             client
                 .send_raw_request(
                     SEND_MESSAGES_CODE,
                     Bytes::from_static(b"send"),
                     false,
-                    &mut header,
+                    &mut request,
                 )
                 .await,
             Err(IggyError::InvalidConfiguration)
         );
-        assert!(header.is_none());
+        assert!(request.header.is_none());
         assert_eq!(
             client.reset_vsr_session().await,
             Err(IggyError::InvalidConfiguration)
@@ -1412,7 +1468,10 @@ mod tests {
         .unwrap()
         .0;
         let connection_guard = client.connection.lock().await;
-        let mut retained = Some(retained);
+        let mut retained = RetainedRequest {
+            header: Some(retained),
+            ..Default::default()
+        };
         let attempt = client.send_raw_request(SEND_MESSAGES_CODE, payload, false, &mut retained);
         tokio::pin!(attempt);
         tokio::select! {
@@ -1435,6 +1494,102 @@ mod tests {
                 .is_err()
         );
         Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_lifecycle_refusal_when_retried_should_not_block_other_requests() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = Arc::new(
+            QuicClient::create(Arc::new(QuicClientConfig {
+                server_address: endpoint.local_addr().unwrap().to_string(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        );
+        let (connection, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&*client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let (refused, first_refusal) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            let mut refused = Some(refused);
+            let mut other = None;
+            loop {
+                let (mut reply, request, _) = read_test_request(&connection).await;
+                if request.operation == Operation::SendMessages {
+                    answer_test_request(&mut reply, &request, 0, b"sent").await;
+                    other = Some(request);
+                } else if let Some(other) = other {
+                    // The server accepts only request ids above its watermark.
+                    assert!(
+                        request.request > other.request,
+                        "a retry must take its request id after the requests sent during its pause"
+                    );
+                    let mut success = 0u32.to_le_bytes().to_vec();
+                    success.extend_from_slice(b"joined");
+                    answer_test_request(&mut reply, &request, 0, &success).await;
+                    return;
+                } else {
+                    answer_test_request(&mut reply, &request, 0, &rejection).await;
+                    if let Some(refused) = refused.take() {
+                        refused.send(()).unwrap();
+                    }
+                }
+            }
+        });
+        let join = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_raw_request(
+                        JOIN_CONSUMER_GROUP_CODE,
+                        Bytes::new(),
+                        true,
+                        &mut RetainedRequest::default(),
+                    )
+                    .await
+            })
+        };
+        first_refusal.await.unwrap();
+        // Start inside the first pause, so a retry that took its request id
+        // before the pause would reach the peer below this request's id.
+        tokio::time::sleep(NOT_READY_RETRY_INTERVAL / 2).await;
+
+        let sent = tokio::time::timeout(
+            TEST_BUDGET,
+            client.send_raw_request(
+                SEND_MESSAGES_CODE,
+                Bytes::from_static(b"send-body"),
+                true,
+                &mut RetainedRequest::default(),
+            ),
+        )
+        .await
+        .expect("a request must not wait out the lifecycle retries of another request");
+        assert_eq!(sent.unwrap(), Bytes::from_static(b"sent"));
+        tokio::time::timeout(TEST_BUDGET, peer)
+            .await
+            .unwrap()
+            .unwrap();
+        let joined = tokio::time::timeout(TEST_BUDGET, join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.unwrap(), Bytes::from_static(b"joined"));
+        Client::shutdown(&*client).await.unwrap();
     }
 
     #[tokio::test]
@@ -1547,7 +1702,11 @@ mod tests {
             });
             let result = tokio::time::timeout(
                 TEST_BUDGET,
-                client.send_raw_with_response(SEND_MESSAGES_CODE, Bytes::from_static(b"lost-send")),
+                client.send_raw_with_context(
+                    SEND_MESSAGES_CODE,
+                    Bytes::from_static(b"lost-send"),
+                    PartitionContext::default(),
+                ),
             )
             .await
             .unwrap();
@@ -1559,9 +1718,10 @@ mod tests {
                 );
                 assert_eq!(
                     client
-                        .send_raw_with_response(
+                        .send_raw_with_context(
                             SEND_MESSAGES_CODE,
-                            Bytes::from_static(b"explicit-new-send")
+                            Bytes::from_static(b"explicit-new-send"),
+                            PartitionContext::default()
                         )
                         .await
                         .unwrap(),

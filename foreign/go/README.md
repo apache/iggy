@@ -64,16 +64,16 @@ confirms replication, while `persisted` also waits for the required replicas
 to persist the message data. An empty confirmation list is a valid success
 but does not by itself prove that new messages were appended.
 
-In a cluster, auto-commit polls use persistent connections to partition
-primaries while the coordinator keeps the consumer's group membership.
+In a cluster, polls use persistent connections to partition primaries
+while the coordinator keeps the consumer's group membership.
 Servers must support primary poll routing and shared-session binding
 (binary commands 15 (`BindSession`), 103 and 104). Pause binary auto-commit consumers for the
 whole upgrade: upgrade every server first, then the SDKs, and restart consumers
 so they rejoin their groups. Older SDKs can lose membership when a backup
 refuses an offset commit; the new SDK does not fall back to legacy polling.
 Only a poll refused before admission is retried. `ErrTransientNotCommitted`
-or cancellation after sending a poll can mean its offset advanced without
-a reply; the SDK does not replay that poll automatically.
+or cancellation after sending an auto-commit poll can mean its offset advanced
+without a reply; the SDK does not replay that poll automatically.
 
 ## Testing
 

@@ -15,6 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-export function match(value: any) {
-  return /^-?\d+(\.\d+)?$/.test(value);
+use serde::{Deserialize, Serialize};
+use strum::{AsRefStr, Display, EnumString};
+
+/// Immutable topic policy for adding and deleting partitions.
+/// Retention and deletion of the topic remain destructive under either policy.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    AsRefStr,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum PartitionResizePolicy {
+    /// Resize is allowed without a bounded cutover or per-key ordering across layouts.
+    #[default]
+    Mutable,
+    /// The partition set is fixed at topic creation.
+    Fixed,
 }
