@@ -98,6 +98,11 @@ pub struct WebSocketClient {
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent callers cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -114,10 +119,12 @@ impl Default for WebSocketClient {
 #[async_trait]
 impl Client for WebSocketClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         WebSocketClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
         self.forget_session_credentials().await;
         WebSocketClient::disconnect_transport(self).await?;
         self.reset_vsr_session().await
@@ -177,6 +184,12 @@ impl BinaryTransport for WebSocketClient {
         payload: Bytes,
         context: PartitionContext,
     ) -> Result<Bytes, IggyError> {
+        if self.caller_disconnected() {
+            return Err(match self.get_state().await {
+                ClientState::Shutdown => IggyError::ClientShutdown,
+                _ => IggyError::NotConnected,
+            });
+        }
         if is_poll_routing_code(code) {
             return self
                 .send_poll_request_with_context(code, payload, context)
@@ -605,6 +618,7 @@ impl WebSocketClient {
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -627,7 +641,7 @@ impl WebSocketClient {
         }
     }
 
-    async fn connect(&self) -> Result<(), IggyError> {
+    pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         self.connect_with_settlement(false).await
     }
 
@@ -655,6 +669,13 @@ impl WebSocketClient {
             .await
     }
 
+    /// A reconnect sweep checks this before each dial and before it installs
+    /// the stream: once the caller disconnects, nothing in the sweep may bring
+    /// the client back.
+    fn caller_disconnected(&self) -> bool {
+        self.disconnected_by_caller.load(Ordering::SeqCst)
+    }
+
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         let single_attempt = context.single_attempt();
@@ -668,6 +689,10 @@ impl WebSocketClient {
                 ClientState::Connected
                 | ClientState::Authenticating
                 | ClientState::Authenticated => return Ok(()),
+                _ if self.caller_disconnected() => {
+                    trace!("Cannot connect. The caller disconnected the client.");
+                    return Err(IggyError::NotConnected);
+                }
                 _ => {}
             }
 
@@ -703,6 +728,12 @@ impl WebSocketClient {
                         info!("Trying to connect to the server in: {remaining}");
                         sleep(remaining.get_duration()).await;
                     }
+                }
+
+                if self.caller_disconnected() {
+                    self.set_state(ClientState::Disconnected).await;
+                    self.publish_event(DiagnosticEvent::Disconnected).await;
+                    return Err(IggyError::NotConnected);
                 }
 
                 let server_addr = tokio::net::lookup_host(&*current_address)
@@ -753,6 +784,13 @@ impl WebSocketClient {
                     Err(IggyError::Disconnected) => continue,
                     Err(error) => return Err(error),
                 };
+
+                if self.caller_disconnected() {
+                    drop(connection_stream);
+                    self.set_state(ClientState::Disconnected).await;
+                    self.publish_event(DiagnosticEvent::Disconnected).await;
+                    return Err(IggyError::NotConnected);
+                }
 
                 *self.stream.lock().await = Some(connection_stream);
                 *self.client_address.lock().await = Some(server_addr);
@@ -1098,6 +1136,12 @@ impl WebSocketClient {
                 .map(|_| ()),
         };
         if let Err(error) = result {
+            // An explicit disconnect landed during the sign-in. The
+            // non-retryable arm below would keep the stream up.
+            if self.caller_disconnected() {
+                self.disconnect_transport().await?;
+                return Err(IggyError::NotConnected);
+            }
             if crate::vsr::resume_error_is_retryable(&error) {
                 self.disconnect_transport().await?;
             } else {
@@ -1109,15 +1153,17 @@ impl WebSocketClient {
     }
 
     async fn disconnect_transport(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Disconnected {
+        // Taken before the state is read: a teardown aborted after it set
+        // `Disconnected` can leave the stream installed.
+        let stream = self.stream.lock().await.take();
+        if stream.is_none() && self.get_state().await == ClientState::Disconnected {
             return Ok(());
         }
 
         let client_address = self.get_client_address_value().await;
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
-
-        self.stream.lock().await.take();
+        drop(stream);
 
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -1429,6 +1475,7 @@ const fn is_login_register_code(code: u32) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::time::Duration;
 
     use futures_util::{SinkExt, StreamExt};
     use iggy_binary_protocol::codes::{JOIN_CONSUMER_GROUP_CODE, SEND_MESSAGES_CODE};
@@ -2072,5 +2119,22 @@ mod tests {
 
         let client = client.unwrap();
         assert_eq!(client.config.server_address, "localhost:8092");
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = WebSocketClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
+        );
     }
 }
