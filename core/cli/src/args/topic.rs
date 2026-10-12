@@ -79,19 +79,6 @@ pub(crate) enum TopicAction {
     ///  iggy topic list prod
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(TopicListArgs),
-    /// Purge topic with given ID in given stream ID
-    ///
-    /// Command removes all messages from given topic
-    /// Stream ID can be specified as a stream name or ID
-    /// Topic ID can be specified as a topic name or ID
-    ///
-    /// Examples
-    ///  iggy topic purge 1 1
-    ///  iggy topic purge prod 2
-    ///  iggy topic purge test debugs
-    ///  iggy topic purge 2 debugs
-    #[clap(verbatim_doc_comment, visible_alias = "p")]
-    Purge(TopicPurgeArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -207,20 +194,6 @@ pub(crate) struct TopicListArgs {
     /// List mode (table or list)
     #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
     pub(crate) list_mode: ListMode,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct TopicPurgeArgs {
-    /// Stream ID to purge topic
-    ///
-    /// Stream ID can be specified as a stream name or ID
-    #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) stream_id: Identifier,
-    /// Topic ID to purge
-    ///
-    /// Topic ID can be specified as a topic name or ID
-    #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) topic_id: Identifier,
 }
 
 #[cfg(test)]

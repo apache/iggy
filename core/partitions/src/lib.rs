@@ -51,7 +51,7 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
+pub use iggy_partition::{IggyPartition, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
@@ -134,6 +134,11 @@ pub struct RetainedPartitionState {
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
     pub external_group_offsets: Vec<(u32, u64)>,
+    pub(crate) consumer_group_owners:
+        std::collections::BTreeMap<u64, iggy_partition::InstalledConsumerGroupOwner>,
+    pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,
+    pub(crate) owner_retirement:
+        Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
 }
 
 /// Partition-level data plane operations.

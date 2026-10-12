@@ -47,6 +47,7 @@ internal static class CommandCodes
     internal const int SEND_MESSAGES_CODE = 101;
     internal const int GET_POLL_ROUTING_CODE = 103;
     internal const int POLL_MESSAGES_ON_PRIMARY_CODE = 104;
+    internal const int GET_SEND_CONTEXT_CODE = 105;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;
@@ -56,13 +57,11 @@ internal static class CommandCodes
     internal const int CREATE_STREAM_CODE = 202;
     internal const int DELETE_STREAM_CODE = 203;
     internal const int UPDATE_STREAM_CODE = 204;
-    internal const int PURGE_STREAM_CODE = 205;
     internal const int GET_TOPIC_CODE = 300;
     internal const int GET_TOPICS_CODE = 301;
     internal const int CREATE_TOPIC_CODE = 302;
     internal const int DELETE_TOPIC_CODE = 303;
     internal const int UPDATE_TOPIC_CODE = 304;
-    internal const int PURGE_TOPIC_CODE = 305;
     internal const int CREATE_PARTITIONS_CODE = 402;
     internal const int DELETE_PARTITIONS_CODE = 403;
     internal const int DELETE_SEGMENTS_CODE = 503;

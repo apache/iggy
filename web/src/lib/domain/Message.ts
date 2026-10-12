@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { formatDateWithMicroseconds } from '$lib/utils/formatters/dateFormatter';
+import { formatDateWithMicroseconds } from '#lib/utils/formatters/dateFormatter.js';
 
 export type MessagePartition = {
   partitionId: number;

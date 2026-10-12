@@ -66,7 +66,6 @@ enum Mutation {
     CheckpointBufferedTail,
     Truncate,
     Reset,
-    Purge,
 }
 
 #[test]
@@ -132,7 +131,6 @@ fn wal_fault_sweep_preserves_acknowledged_history_at_every_io_boundary() {
             Mutation::CheckpointBufferedTail,
             Mutation::Truncate,
             Mutation::Reset,
-            Mutation::Purge,
         ] {
             let (storage, mut journal) = baseline().await;
             storage.clear_trace();
@@ -174,7 +172,6 @@ fn referenced_wal_fault_sweep_preserves_bodies_through_publication_and_reclamati
             Mutation::Checkpoint,
             Mutation::Truncate,
             Mutation::Reset,
-            Mutation::Purge,
         ] {
             let (storage, mut journal) = referenced_baseline().await;
             storage.clear_trace();
@@ -1710,7 +1707,6 @@ fn owned_segment_fault_sweep_preserves_acknowledged_bodies_and_checkpoint_bounds
             Mutation::Checkpoint,
             Mutation::Truncate,
             Mutation::Reset,
-            Mutation::Purge,
         ] {
             for buffered in [false, true] {
                 let (storage, mut journal) = owned_segment_baseline(buffered).await;
@@ -2230,12 +2226,6 @@ async fn mutate_owned_segments(
                 )
                 .await
         }
-        Mutation::Purge => {
-            journal.mark_purge(1, 2).await?;
-            journal
-                .append(owned_prepare(3, second.header().checksum, 0).into_frozen())
-                .await
-        }
     }
 }
 
@@ -2248,20 +2238,11 @@ async fn assert_owned_segments(
 ) {
     let first = owned_prepare(1, 0, 0);
     let second = owned_prepare(2, first.header().checksum, 1);
-    let third = owned_prepare(
-        3,
-        second.header().checksum,
-        if matches!(mutation, Mutation::Purge) {
-            0
-        } else {
-            2
-        },
-    );
+    let third = owned_prepare(3, second.header().checksum, 2);
     let expected = [first, second, third];
     let checkpoint = journal.segment_checkpoint().unwrap();
     let checkpointed = match mutation {
         Mutation::Checkpoint if journal.checkpoint_op() == 2 => 2,
-        Mutation::Purge if journal.purge_marker() == (1, 2) => 0,
         Mutation::Reset if journal.checkpoint_op() == 2 => 0,
         _ => 1,
     };
@@ -2275,7 +2256,7 @@ async fn assert_owned_segments(
         "{context}"
     );
     let expected_head = match mutation {
-        Mutation::Append | Mutation::Purge => 3,
+        Mutation::Append => 3,
         Mutation::Truncate => 1,
         _ => 2,
     };
@@ -2284,23 +2265,11 @@ async fn assert_owned_segments(
     }
     let baseline_head = if buffered { 1 } else { 2 };
     assert!(
-        [
-            baseline_head,
-            if matches!(mutation, Mutation::Purge) {
-                2
-            } else {
-                expected_head
-            },
-            expected_head
-        ]
-        .contains(&journal.head()),
+        [baseline_head, expected_head].contains(&journal.head()),
         "{context}"
     );
     if completed && matches!(mutation, Mutation::Checkpoint) {
         assert_eq!(checkpointed, 2, "{context}");
-    }
-    if completed && matches!(mutation, Mutation::Purge) {
-        assert_eq!(checkpointed, 0, "{context}");
     }
     let prepares = journal.prepares().await.unwrap();
     let expected_ops: Vec<_> = (journal.checkpoint_op()..=journal.head()).collect();
@@ -2315,25 +2284,14 @@ async fn assert_owned_segments(
     for prepare in &prepares {
         let index = usize::try_from(prepare.header().op - 1).unwrap();
         assert_eq!(prepare.as_slice(), expected[index].as_slice(), "{context}");
-        assert_eq!(
+        assert!(
             journal.segment_reference(prepare.header()).is_some(),
-            prepare.header().op > journal.purge_marker().1,
             "{context}"
         );
     }
     assert_eq!(
         journal.size_bytes(),
-        prepares
-            .iter()
-            .map(|prepare| {
-                if prepare.header().op <= journal.purge_marker().1 {
-                    journal::partition_journal::record_length(prepare.as_slice().len()).unwrap()
-                        as u64
-                } else {
-                    PARTITION_WAL_BLOCK_SIZE as u64
-                }
-            })
-            .sum::<u64>(),
+        (prepares.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
         "{context}"
     );
 }
@@ -2438,23 +2396,6 @@ async fn mutate_referenced(
         Mutation::Checkpoint | Mutation::CheckpointBufferedTail => journal.checkpoint(2).await,
         Mutation::Truncate => journal.truncate_from(2).await,
         Mutation::Reset => journal.reset(7, None).await,
-        Mutation::Purge => {
-            journal.mark_purge(1, 2).await?;
-            for offset in [0, 1] {
-                storage
-                    .remove_file(&Path::new(DIRECTORY).join(format!("{offset:020}.log")))
-                    .await?;
-            }
-            storage.sync_directory(Path::new(DIRECTORY)).await?;
-            append_referenced(
-                storage,
-                journal,
-                &prepare(3, second.header().checksum),
-                1,
-                0,
-            )
-            .await
-        }
     }
 }
 
@@ -2465,7 +2406,7 @@ async fn assert_referenced_recovery(
     context: &str,
 ) {
     match mutation {
-        Mutation::Append | Mutation::Purge => {
+        Mutation::Append => {
             assert!((2..=3).contains(&journal.head()), "{context}");
             if completed {
                 assert_eq!(journal.head(), 3, "{context}");
@@ -2519,15 +2460,6 @@ async fn assert_referenced_recovery(
         expected_ops,
         "{context}",
     );
-    if matches!(mutation, Mutation::Purge) {
-        assert!(
-            [(0, 0), (1, 2)].contains(&journal.purge_marker()),
-            "{context}"
-        );
-        if completed || journal.head() == 3 {
-            assert_eq!(journal.purge_marker(), (1, 2), "{context}");
-        }
-    }
     assert_eq!(
         journal.size_bytes(),
         (recovered.len() * PARTITION_WAL_BLOCK_SIZE) as u64,
@@ -2583,12 +2515,6 @@ async fn mutate(
         Mutation::Reset => {
             replace(storage, Path::new("/partition/materialized"), b"1-7").await?;
             journal.reset(7, None).await
-        }
-        Mutation::Purge => {
-            journal.mark_purge(9, 3).await?;
-            storage.remove_file(Path::new("/partition/state")).await?;
-            storage.sync_directory(Path::new(DIRECTORY)).await?;
-            replace(storage, Path::new("/partition/purge.gen"), b"9").await
         }
     }
 }
@@ -2690,27 +2616,6 @@ async fn assert_recovery(
             }
             if completed {
                 assert_eq!(journal.head(), 7);
-            }
-        }
-        Mutation::Purge => {
-            assert_eq!(journal.head(), 3);
-            assert!([(0, 0), (9, 3)].contains(&journal.purge_marker()));
-            if storage
-                .exists(Path::new("/partition/purge.gen"))
-                .await
-                .unwrap()
-            {
-                assert_eq!(journal.purge_marker(), (9, 3));
-                assert!(!storage.exists(Path::new("/partition/state")).await.unwrap());
-            }
-            if completed {
-                assert_eq!(journal.purge_marker(), (9, 3));
-                assert!(
-                    storage
-                        .exists(Path::new("/partition/purge.gen"))
-                        .await
-                        .unwrap()
-                );
             }
         }
     }

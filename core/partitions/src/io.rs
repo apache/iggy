@@ -43,8 +43,7 @@ use tracing::warn;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::offset_storage::{
     OffsetFilePermit, PersistedOffset, delete_persisted_offset,
-    delete_persisted_offset_with_storage, persist_offset, persist_offset_retained,
-    persist_purge_generation_with_storage, read_offset_max,
+    delete_persisted_offset_with_storage, persist_offset, persist_offset_retained, read_offset_max,
 };
 use crate::{IggyIndexWriter, MessagesWriter, Segment};
 
@@ -93,20 +92,11 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
         strict: bool,
     },
     EmptySegment(SegmentIoJob),
-    PurgeCleanup {
-        directory: String,
-        bodies: bool,
-    },
-    PurgeOffsets {
+    OffsetCleanup {
         directory: String,
         known: HashSet<u32>,
         /// Sorted IDs preserved by a state-transfer install.
         retained: Vec<u32>,
-    },
-    PurgeGeneration {
-        path: String,
-        generation: u64,
-        revision: u64,
     },
     RetryCheckpoint {
         path: PathBuf,
@@ -143,9 +133,7 @@ pub enum PartitionIoResult {
     },
     SegmentRemoved(Result<(), IggyError>),
     EmptySegment(Result<InstalledSegment, IggyError>),
-    PurgeCleanup(std::io::Result<()>),
-    PurgeOffsets(PurgeOffsetsIoResult),
-    PurgeGeneration(Result<(), IggyError>),
+    OffsetCleanup(OffsetCleanupIoResult),
     RetryCheckpoint(std::io::Result<()>),
     ReclaimRetryCheckpoints(std::io::Result<()>),
     Quarantine(std::io::Result<String>),
@@ -167,7 +155,6 @@ pub enum PartitionIoContinuation {
     Superblock,
     Checkpoint,
     Retention,
-    Purge,
     Quarantine,
 }
 
@@ -319,10 +306,6 @@ pub enum PartitionIoStep {
     ViewApplied {
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
-    },
-    PurgeFinished {
-        generation: u64,
-        outcome: Result<(), crate::PurgeError>,
     },
     QuarantineFinished(std::io::Result<Option<String>>),
     TransferReady,
@@ -499,7 +482,7 @@ pub struct OffsetDirectoriesIoResult {
     pub(crate) failed: [bool; ConsumerKind::COUNT],
 }
 
-pub struct PurgeOffsetsIoResult {
+pub struct OffsetCleanupIoResult {
     /// Consumer ids whose offset files were removed or already absent.
     pub(crate) released: Vec<u32>,
     /// Consumer ids whose offset file could not be removed.
@@ -619,9 +602,7 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             | Self::SegmentDirectory(_)
             | Self::RemoveSegment { .. }
             | Self::EmptySegment(_)
-            | Self::PurgeCleanup { .. }
-            | Self::PurgeOffsets { .. }
-            | Self::PurgeGeneration { .. }
+            | Self::OffsetCleanup { .. }
             | Self::RetryCheckpoint { .. }
             | Self::ReclaimRetryCheckpoints { .. }
             | Self::Quarantine { .. } => {}
@@ -631,16 +612,6 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
 
     #[allow(clippy::future_not_send)]
     pub async fn execute(self) -> PartitionIoResult {
-        self.execute_with_storage(&DiskStorage).await
-    }
-
-    /// Directory syncs and the purge's offset and generation files go through
-    /// `storage`. Other file work uses its disk implementation.
-    #[allow(clippy::future_not_send)]
-    pub(crate) async fn execute_with_storage<S: DurableStorage>(
-        self,
-        storage: &S,
-    ) -> PartitionIoResult {
         match self {
             Self::Materialize(job) => PartitionIoResult::Materialize(job.execute().await),
             Self::OffsetWrite(job) => PartitionIoResult::OffsetWrite(job.execute().await),
@@ -651,9 +622,9 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             Self::OffsetDirectories(job) => {
                 PartitionIoResult::OffsetDirectories(job.execute().await)
             }
-            Self::SegmentDirectory(path) => {
-                PartitionIoResult::SegmentDirectory(storage.sync_directory(Path::new(&path)).await)
-            }
+            Self::SegmentDirectory(path) => PartitionIoResult::SegmentDirectory(
+                DiskStorage.sync_directory(Path::new(&path)).await,
+            ),
             Self::IndexSync(writer) => {
                 let outcome = writer.fsync().await;
                 PartitionIoResult::IndexSync { writer, outcome }
@@ -679,34 +650,12 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                 PartitionIoResult::SegmentRemoved(outcome)
             }
             Self::EmptySegment(job) => PartitionIoResult::EmptySegment(job.execute().await),
-            Self::PurgeCleanup { directory, bodies } => {
-                let outcome = if bodies {
-                    crate::state_transfer::remove_public_segment_files(&directory).await
-                } else {
-                    Ok(())
-                };
-                if outcome.is_ok() {
-                    crate::state_transfer::sweep_staging_except(
-                        &directory,
-                        std::collections::HashSet::new(),
-                    )
-                    .await;
-                }
-                PartitionIoResult::PurgeCleanup(outcome)
-            }
-            Self::PurgeOffsets {
+            Self::OffsetCleanup {
                 directory,
                 known,
                 retained,
-            } => PartitionIoResult::PurgeOffsets(
-                purge_offset_files(storage, &directory, known, &retained).await,
-            ),
-            Self::PurgeGeneration {
-                path,
-                generation,
-                revision,
-            } => PartitionIoResult::PurgeGeneration(
-                persist_purge_generation_with_storage(storage, &path, generation, revision).await,
+            } => PartitionIoResult::OffsetCleanup(
+                remove_offset_files(&DiskStorage, &directory, known, &retained).await,
             ),
             Self::RetryCheckpoint { path, bytes } => PartitionIoResult::RetryCheckpoint(
                 crate::state_transfer::write_retry_checkpoint(&path, bytes).await,
@@ -822,16 +771,15 @@ fn execution_allocation_charge<SB: SuperblockStore>() -> Option<usize> {
         .checked_add(IO_CONTROL_ALLOCATION_RESERVE)
 }
 
-/// Sweep the directory, not just the ids the live maps hold: a pre-purge op
-/// re-persisted by journal repair on a restarted replica would otherwise leave
-/// an offset file for boot to hydrate back. The caller syncs the directory.
-async fn purge_offset_files<S: DurableStorage>(
+/// Sweep the directory, not just the ids the live maps hold, so a file they do
+/// not track cannot be hydrated back at boot. The caller syncs the directory.
+async fn remove_offset_files<S: DurableStorage>(
     storage: &S,
     directory: &str,
     mut known: HashSet<u32>,
     retained: &[u32],
-) -> PurgeOffsetsIoResult {
-    let mut result = PurgeOffsetsIoResult {
+) -> OffsetCleanupIoResult {
+    let mut result = OffsetCleanupIoResult {
         released: Vec::new(),
         failed: Vec::new(),
         scan_error: None,
@@ -888,7 +836,7 @@ async fn purge_offset_files<S: DurableStorage>(
     result
 }
 
-impl PurgeOffsetsIoResult {
+impl OffsetCleanupIoResult {
     async fn remove<S: DurableStorage>(
         &mut self,
         storage: &S,
@@ -1478,7 +1426,7 @@ mod tests {
         for id in [1, 99] {
             std::fs::write(directory.path().join(id.to_string()), [0; 16]).unwrap();
         }
-        let result = purge_offset_files(
+        let result = remove_offset_files(
             &FailedOffsetScan,
             directory.path().to_str().unwrap(),
             HashSet::from([1, 99]),

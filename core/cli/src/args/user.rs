@@ -94,6 +94,10 @@ pub(crate) enum UserAction {
     /// options are set, the default behavior is to remove permissions for the
     /// specified user.
     ///
+    /// The command replaces the full permission set of the user. If only
+    /// --global-permissions is set, stream permissions are removed. If only
+    /// --stream-permissions is set, all global permissions are set to false.
+    ///
     /// Examples:
     ///  iggy user permissions 2
     ///  iggy user permissions client
@@ -249,7 +253,7 @@ pub(crate) struct UserPermissionsArgs {
     ///
     /// The user ID can be specified as either a username or an ID
     pub(crate) user_id: Identifier,
-    /// Set global permissions for created user
+    /// Set global permissions for the user
     ///
     /// All global permissions by default are set to false and this command line option
     /// allows to set each permission individually. Permissions are separated
@@ -263,12 +267,12 @@ pub(crate) struct UserPermissionsArgs {
     /// read_topics / r_top, poll_messages / p_msg, send_messages / s_msg
     ///
     /// Examples:
-    ///  iggy user create guest guess --global-permissions p_msg,s_msg
-    ///  iggy user create admin pass#1%X! -g m_srv,r_srv,m_usr,r_usr,m_str,r_str,m_top,r_top,p_msg,s_msg
+    ///  iggy user permissions guest --global-permissions p_msg,s_msg
+    ///  iggy user permissions admin -g m_srv,r_srv,m_usr,r_usr,m_str,r_str,m_top,r_top,p_msg,s_msg
     #[clap(short, long, verbatim_doc_comment)]
     #[arg(value_parser = clap::value_parser!(GlobalPermissionsArg))]
     pub(crate) global_permissions: Option<GlobalPermissionsArg>,
-    /// Set stream permissions for created user
+    /// Set stream permissions for the user
     ///
     /// Stream permissions are defined by each stream separately. Setting permission for stream
     /// allows to set each permission individually, by default, if no permission is provided
@@ -294,10 +298,10 @@ pub(crate) struct UserPermissionsArgs {
     /// Permissions format: STREAM_ID\[:STREAM_PERMISSIONS\]\[#TOPIC_ID\[:TOPIC_PERMISSIONS\]\]
     ///
     /// Examples:
-    ///  iggy user create guest guest -s 1:manage_topics,read_topics
-    ///  iggy user create admin p@Ss! --stream-permissions 2:m_str,r_str,m_top,r_top,p_msg,s_msg
-    ///  iggy user create sender s3n43r -s 3#1:s_msg#2:s_msg
-    ///  iggy user create user1 test12 -s 4:manage_stream,r_top#1:s_msg,p_msg#2:manage_topic
+    ///  iggy user permissions guest -s 1:manage_topics,read_topics
+    ///  iggy user permissions admin --stream-permissions 2:m_str,r_str,m_top,r_top,p_msg,s_msg
+    ///  iggy user permissions sender -s 3#1:s_msg#2:s_msg
+    ///  iggy user permissions user1 -s 4:manage_stream,r_top#1:s_msg,p_msg#2:manage_topic
     #[clap(short, long, verbatim_doc_comment)]
     #[arg(value_parser = clap::value_parser!(StreamPermissionsArg))]
     pub(crate) stream_permissions: Option<Vec<StreamPermissionsArg>>,
