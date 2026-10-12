@@ -51,12 +51,9 @@ Kafka producer id therefore needs one bound session per producer.
 The request id is different. The transmute copies the header and replaces only `group`, `client`,
 `session` and `user_id`, so a caller-supplied request id survives to the `ClientTable`.
 
-One session per producer is a connection pool keyed by producer id. That is the pool the
-README's "Concurrency ceiling" section already owes before
-[#3535](https://github.com/apache/iggy/issues/3535) and
-[#3536](https://github.com/apache/iggy/issues/3536).
-
-Two SDK seams are missing for it:
+One session per producer is a connection pool keyed by producer id. The gateway has that pool, for
+throughput: see the README's "Concurrency ceiling". Retries are still not deduplicated, because two
+SDK seams are missing:
 
 - a caller-chosen client id at build time. `ConsensusSession::with_client_id` is public, but both
   construction sites build with `ConsensusSession::new()`
@@ -130,7 +127,7 @@ a birthday collision, not a remote one.
 The id is a pool key, not a dedup identity. Under the design above, the dedup identity is the
 session's own random client id, minted at register. The producer id only decides which connection
 serves a producer. Kafka still requires it to be unique across the cluster, which is what the
-instance number buys. It also has to stay unique across a restart once the pool lands or
+instance number buys. It also has to stay unique across a restart once dedup lands or
 Produce persists, because `producer_epoch` is always 0, so a replayed id is a replayed
 `(producer_id, producer_epoch)` pair a live producer may still hold. The counter therefore starts
 at the wall clock in milliseconds rather than at 0. A restarted gateway starts above every id its
@@ -186,7 +183,7 @@ Produce:
   gateway closes the connection instead, as a Kafka broker does on any `acks=0` produce error.
   The check runs before the `acks=0` branch, so no write path can see a transactional batch
 
-Those first two codes stay unsent even once the pool lands. The watermark accepts any request
+Those first two codes stay unsent even once dedup lands. The watermark accepts any request
 above it without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending
 either code claims a detection the gateway does not have.
 
@@ -235,8 +232,7 @@ A producer that holds an id believes its retries are deduplicated. They are not.
 network timeout writes the record twice, and both copies reach the stream with their own offsets.
 
 Iggy's own deduplication does not help, because it guards the other hop. Delivery through the
-gateway is at-least-once until the pool lands, and at-least-once across a gateway restart after
-that.
+gateway is at-least-once until dedup lands, and at-least-once across a gateway restart after that.
 
 The README states that limitation under "Delivery guarantees", so a user does not have to infer
 it from the presence of key 22.

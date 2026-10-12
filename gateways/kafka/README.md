@@ -356,7 +356,12 @@ Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record
 per slot. Past it: 10.
 
 Request budget: 8 partition caps, refused partitions included. Past it: 6 for the rest, not
-decoded. 4 requests decode at once.
+decoded.
+
+Decode memory: 4 partition caps across all requests, counted in bytes. A request holds what its
+largest partition may decode: its bytes or 64 per declared record, whichever is more, or a whole
+cap when compressed. One holding 64 KiB or more first takes one of 4 large slots, and holds no
+memory while it waits for one. Past its deadline waiting for either: 7.
 
 [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 
@@ -507,13 +512,16 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-- One `IggyClient` serves Produce, Metadata, CreateTopics, DescribeConfigs and AlterConfigs for
-  every Kafka connection, one Iggy request at a time. Fetch polls use 4 more, one per read slot.
-  Topic probes use 1 more. Offset  calls use 8 more: a commit client and a read client per offset slot.
+- Each producer sends on an `IggyClient` of its own, one send at a time, so its batches land in
+  order. A producer is its producer id, or its connection when its batches carry none. Up to 256
+  of these stay open. Opening one closes the free ones idle for 10 minutes, then the least
+  recently used free one if 256 are open. A Produce request that finds all 256 busy answers 7.
+- Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
+  Iggy request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
+  Offset calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
-- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in
-  [docs/SCOPE.md](docs/SCOPE.md).
+- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that.
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
   can land after later ones.
 

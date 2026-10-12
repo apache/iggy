@@ -239,7 +239,8 @@ pub struct TestServer {
     child: Child,
     address: String,
     password: String,
-    _port_guard: PortGuard,
+    /// `None` once [`Self::stop`] handed it to the caller.
+    port_guard: Option<PortGuard>,
 }
 
 impl TestServer {
@@ -306,10 +307,21 @@ impl TestServer {
             child,
             address,
             password: password.to_string(),
-            _port_guard: port_guard,
+            port_guard: Some(port_guard),
         };
         server.wait_ready().await;
         server
+    }
+
+    /// Stops the server and keeps its port until the returned guard drops. Without it, another
+    /// test's server can take the port while a client of this one still retries there.
+    pub fn stop(mut self) -> PortGuard {
+        let port_guard = self
+            .port_guard
+            .take()
+            .expect("a running server holds its port");
+        drop(self);
+        port_guard
     }
 
     /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries

@@ -867,6 +867,20 @@ pub fn is_compressed(blob: &[u8]) -> bool {
         .is_some_and(|attributes| attributes & 0b111 != 0)
 }
 
+/// The producer id of the first batch in `blob`, bytes 43 to 50. `None` when it has none.
+#[must_use]
+pub fn producer_id(blob: &[u8]) -> Option<i64> {
+    let id = i64::from_be_bytes(blob.get(43..51)?.try_into().ok()?);
+    (id != NO_PRODUCER_ID).then_some(id)
+}
+
+/// The record count the first batch in `blob` declares, bytes 57 to 60. `None` when it has none.
+#[must_use]
+pub fn declared_records(blob: &[u8]) -> Option<usize> {
+    let count = i32::from_be_bytes(blob.get(57..BATCH_HEADER_BYTES)?.try_into().ok()?);
+    usize::try_from(count).ok()
+}
+
 /// Decodes the one record batch a Produce partition carries.
 ///
 /// # Errors
@@ -1837,6 +1851,22 @@ mod tests {
         assert!(is_compressed(&encode_with(&records, Compression::Gzip)));
         assert!(!is_compressed(&encode_with(&records, Compression::None)));
         assert!(!is_compressed(&[]));
+    }
+
+    #[test]
+    fn given_a_batch_when_its_records_are_counted_should_read_the_declared_count() {
+        let mut records = [record_at_offset(0, b"a"), record_at_offset(1, b"b")];
+        assert_eq!(
+            declared_records(&encode_batch(&mut records).unwrap()),
+            Some(2)
+        );
+        // `encode_batch` set the sequences that keep both records in one batch.
+        assert_eq!(
+            declared_records(&encode_with(&records, Compression::Gzip)),
+            Some(2),
+            "the header counts records before compression"
+        );
+        assert_eq!(declared_records(&[0; BATCH_HEADER_BYTES - 1]), None);
     }
 
     #[test]

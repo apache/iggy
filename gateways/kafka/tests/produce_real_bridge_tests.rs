@@ -651,7 +651,8 @@ async fn given_a_stopped_server_when_handled_should_answer_retriable() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
-    drop(server);
+    // The Produce session connects at its first send, after this, so the port stays ours.
+    let _port = server.stop();
 
     let entries = [(0, batch(&[record(0, None, b"v", &[])], Compression::None))];
     let [(_, code, _)] = produce(&state, 3, 1, TOPIC, &entries).await[..] else {

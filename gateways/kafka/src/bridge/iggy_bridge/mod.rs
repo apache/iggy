@@ -40,6 +40,8 @@ use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
+use produce::ProducePool;
+pub use produce::{ProduceSession, Producer};
 pub use topics::{KafkaTopicMetadata, StreamTopicCache, TopicCreationOutcome, TopicLoad};
 
 /// Passes attempted, after the first, before [`IggyBridge::connect`] gives up and returns `Err`.
@@ -114,17 +116,19 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
-/// One lockstep client serves Produce, Metadata and `CreateTopics` for every Kafka connection, so
-/// those Iggy calls run one at a time. Topic probes use a client of their own, Fetch polls one per
-/// read slot, and offset calls two per offset slot. A Produce pool is a TODO in `docs/SCOPE.md`.
+/// Each producer sends on a client of its own, one send at a time. Metadata, `CreateTopics`,
+/// `DeleteTopics`, `DescribeConfigs` and `AlterConfigs` share one more client. Topic probes use a
+/// client of their own, Fetch polls one per read slot, and offset calls two per offset slot.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
 pub struct IggyBridge {
+    /// The client of Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
+    /// `AlterConfigs`.
     client: Arc<IggyClient>,
     config: IggyBridgeConfig,
-    /// One Produce send inside the SDK at a time. See `send_records`.
-    send_slot: Arc<Semaphore>,
+    /// One Iggy session per producer. See `send_records`.
+    produce_pool: ProducePool,
     /// Fetch read slots, each with its own client. See `fetch_slot`.
     fetch_pool: Arc<FetchPool>,
     /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
@@ -165,7 +169,7 @@ impl IggyBridge {
         Ok(Self {
             client: Arc::new(client),
             config,
-            send_slot: Arc::new(Semaphore::new(1)),
+            produce_pool: ProducePool::new(),
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
@@ -222,11 +226,13 @@ impl IggyBridge {
     /// was already in a state that rejects a clean shutdown). Every client is shut down even when
     /// one fails, and the error is the first one.
     pub async fn close(self) -> Result<(), BridgeError> {
+        let produce_clients = self.produce_pool.close().await;
         let fetch_clients = self.fetch_pool.close().await;
         let probe_client = self.probe_client.close().await;
         let offset_clients = self.offset_pool.close().await;
         let shared_client = with_request_timeout(self.client.shutdown()).await;
-        fetch_clients
+        produce_clients
+            .and(fetch_clients)
             .and(probe_client)
             .and(offset_clients)
             .and(shared_client)
@@ -243,9 +249,12 @@ async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeE
 
     let credentials =
         Credentials::UsernamePassword(config.username.clone(), config.password.clone());
+    // A send over the SDK's 8 KiB write buffer leaves as two writes, header then payload. With
+    // Nagle on, the payload waits for the server's delayed ACK of the header: about 40 ms a send.
     let client = IggyClientBuilder::new()
         .with_tcp()
         .with_server_address(config.address.clone())
+        .with_no_delay()
         .with_auto_sign_in(AutoLogin::Enabled(credentials))
         .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
         .build()

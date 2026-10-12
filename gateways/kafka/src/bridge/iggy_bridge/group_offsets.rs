@@ -412,7 +412,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::bridge::iggy_bridge::FetchPool;
+    use crate::bridge::iggy_bridge::{FetchPool, ProducePool};
     use crate::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
 
     fn target(topic: &str) -> TopicTarget {
@@ -458,7 +458,7 @@ mod tests {
                 topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new()).unwrap(),
                 max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             },
-            send_slot: Arc::new(Semaphore::new(1)),
+            produce_pool: ProducePool::new(),
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             offset_pool: OffsetPool {
