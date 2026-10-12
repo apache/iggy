@@ -258,8 +258,14 @@ async fn fetch_on(
     request
         .encode(&mut body, VERSION)
         .expect("the request encodes at this version");
-    let handled =
-        handle_connection_request(state, connection, API_KEY_FETCH, VERSION, body.freeze());
+    let handled = handle_connection_request(
+        state,
+        connection,
+        None,
+        API_KEY_FETCH,
+        VERSION,
+        body.freeze(),
+    );
     let mut response = tokio::time::timeout(PROMPT, handled)
         .await
         .expect("records or an error answer at once")
@@ -577,6 +583,14 @@ async fn given_minus_one_holds_on_two_connections_when_both_retry_should_keep_ea
     assert_refused(
         only(&fetch_on(&state, &fresh, &at(2)).await),
         ERROR_NOT_LEADER_OR_FOLLOWER,
+    );
+
+    store(&server, 0, &[keyed(b"a"), keyed(b"b"), keyed(b"c")]).await;
+    let response = fetch_on(&state, &fresh, &at(2)).await;
+    assert_eq!(only(&response).error_code, ERROR_NONE);
+    assert_eq!(
+        values(only(&response)),
+        vec![Some(Bytes::from_static(b"c"))]
     );
 }
 

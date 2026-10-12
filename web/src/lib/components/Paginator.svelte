@@ -18,8 +18,8 @@ under the License.
 -->
 
 <script lang="ts">
-  import Button from '$lib/components/Button.svelte';
-  import Icon from '$lib/components/Icon.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import Icon from '#lib/components/Icon.svelte';
   import { createEventDispatcher } from 'svelte';
 
   interface Props {

@@ -34,6 +34,7 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 enumset = { workspace = true }
 secrecy = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 twox-hash = { workspace = true }
 

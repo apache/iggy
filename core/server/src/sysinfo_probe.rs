@@ -23,7 +23,6 @@ use arc_swap::ArcSwap;
 use nix::sys::resource::{Resource, getrlimit};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,7 +88,6 @@ static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 static PUBLISHED_STATS: LazyLock<ArcSwap<SystemStats>> =
     LazyLock::new(|| ArcSwap::from_pointee(SystemStats::default()));
-static SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 const SYSTEM_STATS_INTERVAL: Duration = Duration::from_secs(1);
 const OPEN_FILES_SCAN_INTERVAL: Duration = Duration::from_secs(10);
@@ -100,18 +98,10 @@ pub fn init_stats_data_path(path: PathBuf) {
 }
 
 /// Start one process-lifetime sampler before any shard threads exist.
-/// Samples refresh every second, or the printer interval when shorter. The
-/// descriptor-scan fallback refreshes every ten seconds or printer interval.
+/// Samples refresh every second. The descriptor-scan fallback refreshes every
+/// ten seconds or printer interval.
 /// Sampling time extends these intervals; readers always get the last completed sample.
 pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Result<()> {
-    if SAMPLER_STARTED.swap(true, Ordering::AcqRel) {
-        return Ok(());
-    }
-    let interval = if sysinfo_print_interval.is_zero() {
-        SYSTEM_STATS_INTERVAL
-    } else {
-        sysinfo_print_interval.min(SYSTEM_STATS_INTERVAL)
-    };
     let scan_interval = if sysinfo_print_interval.is_zero() {
         OPEN_FILES_SCAN_INTERVAL
     } else {
@@ -121,12 +111,12 @@ pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Resul
     let initial = SystemStats::capture(&mut system, 0, true);
     let mut open_files_count = initial.open_files_count;
     PUBLISHED_STATS.store(Arc::new(initial));
-    let spawned = thread::Builder::new()
+    thread::Builder::new()
         .name("iggy-system-stats".to_owned())
         .spawn(move || {
             let mut last_scan = Instant::now();
             loop {
-                thread::sleep(interval);
+                thread::sleep(SYSTEM_STATS_INTERVAL);
                 let scan = last_scan.elapsed() >= scan_interval;
                 let sample = SystemStats::capture(&mut system, open_files_count, scan);
                 open_files_count = sample.open_files_count;
@@ -135,11 +125,8 @@ pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Resul
                 }
                 PUBLISHED_STATS.store(Arc::new(sample));
             }
-        });
-    if spawned.is_err() {
-        SAMPLER_STARTED.store(false, Ordering::Release);
-    }
-    spawned.map(drop)
+        })
+        .map(drop)
 }
 
 /// Read the last completed sample without filesystem access or a blocking lock.

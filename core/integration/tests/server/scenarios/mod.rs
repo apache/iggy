@@ -265,6 +265,17 @@ async fn join_consumer_group(client: &IggyClient) {
         )
         .await
         .unwrap();
+
+    let members_count = get_consumer_group(client).await.members_count;
+    integration::harness::wait_for_consumer_group_assignment(
+        client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        members_count,
+        CONVERGENCE_TIMEOUT,
+    )
+    .await;
 }
 
 async fn leave_consumer_group(client: &IggyClient) {

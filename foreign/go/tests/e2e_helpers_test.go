@@ -60,6 +60,11 @@ const (
 	// AckLevel values of the consumer-offset requests.
 	ackNoAck  = 0
 	ackQuorum = 1
+
+	// How long a member that joined may take to own its partitions, and how
+	// often the wait checks the group.
+	groupAssignmentBudget       = 20 * time.Second
+	groupAssignmentPollInterval = 50 * time.Millisecond
 )
 
 // serverAddress returns the address the suite runs against, skipping when the
@@ -143,6 +148,34 @@ func scratchTopic(t *testing.T, connected iggcon.Client, partitionsCount uint32)
 	require.NoError(t, err)
 
 	return streamId, topicId
+}
+
+// waitForGroupAssignment waits until the only member of the group owns every
+// partition of the topic. A join commits the membership at once, but the
+// member owns a partition only once that partition has installed it as the
+// owner. Until then a sync returns no partitions, and group polls and offset
+// writes are refused with ConsumerGroupPartitionNotOwned.
+func waitForGroupAssignment(
+	t *testing.T,
+	connected iggcon.Client,
+	streamId, topicId, groupId iggcon.Identifier,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(groupAssignmentBudget)
+	for {
+		group, err := connected.GetConsumerGroup(context.Background(), streamId, topicId, groupId)
+		require.NoError(t, err)
+		if len(group.Members) == 1 && group.Members[0].PartitionsCount == group.PartitionsCount {
+			return
+		}
+		if time.Now().After(deadline) {
+			require.Failf(t, "the only member does not own every partition",
+				"after %v the group of %d partitions has members %+v",
+				groupAssignmentBudget, group.PartitionsCount, group.Members)
+		}
+		time.Sleep(groupAssignmentPollInterval)
+	}
 }
 
 // testMessages builds count messages with predictable payloads.

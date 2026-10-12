@@ -18,6 +18,7 @@
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, JoinConsumerGroupRequest,
 };
@@ -55,7 +56,8 @@ use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccess
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
@@ -74,6 +76,7 @@ pub struct SimClient {
     /// a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
+    partition_contexts: RefCell<BTreeMap<IggyNamespace, PartitionContext>>,
     /// Whether this client talks to the server's real dispatch layer, which
     /// changes what a PAT request must contain.
     ///
@@ -95,6 +98,7 @@ impl SimClient {
             request_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
+            partition_contexts: RefCell::new(BTreeMap::new()),
             shell_wire: Cell::new(false),
         }
     }
@@ -125,6 +129,26 @@ impl SimClient {
     #[must_use]
     pub const fn client_id(&self) -> u128 {
         self.client_id
+    }
+
+    /// Discovery updates affect new requests; retained messages keep their captured context.
+    pub fn set_partition_context(&self, namespace: IggyNamespace, context: PartitionContext) {
+        self.partition_contexts
+            .borrow_mut()
+            .insert(namespace, context);
+    }
+
+    fn stamp_partition_context(&self, header: &mut RoutedRequestHeader) {
+        if let Some(context) = self
+            .partition_contexts
+            .borrow()
+            .get(&IggyNamespace::from_raw(header.group))
+        {
+            header.partition_incarnation = context.incarnation;
+            header.owner_generation = context.owner_generation;
+            header.minimum_metadata_op = context.metadata_op;
+            header.metadata_watermark = context.metadata_op;
+        }
     }
 
     /// Next deterministic, non-zero, cross-client-unique message id, standing
@@ -659,9 +683,8 @@ impl SimClient {
     ) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
-        let mut reserved = [0u8; 44];
-        reserved[..4].copy_from_slice(&code.to_le_bytes());
-        let header = RoutedRequestHeader {
+        let reserved = code.to_le_bytes();
+        let mut header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::NonReplicated,
             size: total_size as u32,
@@ -672,6 +695,7 @@ impl SimClient {
             group,
             ..Default::default()
         };
+        self.stamp_partition_context(&mut header);
 
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(bytemuck::bytes_of(&header));
@@ -788,6 +812,7 @@ impl SimClient {
         let total_size = header_size + payload.len();
 
         let mut header = self.header(operation, group.inner(), total_size);
+        self.stamp_partition_context(&mut header);
         header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
 
         let header_bytes = bytemuck::bytes_of(&header);

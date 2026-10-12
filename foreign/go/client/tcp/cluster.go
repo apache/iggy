@@ -43,3 +43,13 @@ func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.Cluster
 	c.topologyKnown.Store(true)
 	return &metadata, nil
 }
+
+// ensureTopology reads the roster once, so a partition request knows whether
+// it must go to the partition primary.
+func (c *IggyTcpClient) ensureTopology(ctx context.Context) error {
+	if c.topologyKnown.Load() {
+		return nil
+	}
+	_, err := c.GetClusterMetadata(ctx)
+	return err
+}

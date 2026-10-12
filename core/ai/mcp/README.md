@@ -58,7 +58,11 @@ The configuration file must use TOML. The default path is `core/ai/mcp/config.to
 
 Set `IGGY_MCP_ENV_PATH` to load a particular dotenv file. Otherwise `.env` is searched for in the current directory and its parents. Existing environment variables take precedence over dotenv values.
 
+Run `iggy-mcp --list-config-env-vars` to print the supported configuration environment variables and exit before loading dotenv or configuration files or creating the runtime.
+
 A non-empty `iggy.token` takes precedence over username and password. It accepts a literal PAT or a `file:` reference such as `file:/run/secrets/iggy_pat`; file contents are trimmed and a leading `~/` expands to the home directory.
+
+`iggy-mcp` rejects unknown command-line arguments with exit code 2. Keep the client or container `args` list empty unless it contains a supported flag.
 
 Set `command` to the absolute path of the built executable. This Claude Desktop example uses the development broker credentials:
 

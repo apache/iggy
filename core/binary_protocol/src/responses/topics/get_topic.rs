@@ -17,14 +17,15 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+use crate::primitives::partition_history::PartitionContext;
 use crate::responses::streams::get_stream::TopicHeader;
 use bytes::{BufMut, BytesMut};
 
 /// Partition details within a `GetTopic` response.
 ///
-/// Wire format (40 bytes fixed):
+/// Wire format (64 bytes fixed):
 /// ```text
-/// [id:4][created_at:8][segments_count:4][current_offset:8][size_bytes:8][messages_count:8]
+/// [id:4][created_at:8][segments_count:4][current_offset:8][size_bytes:8][messages_count:8][context:24]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionResponse {
@@ -34,11 +35,14 @@ pub struct PartitionResponse {
     pub current_offset: u64,
     pub size_bytes: u64,
     pub messages_count: u64,
+    pub context: PartitionContext,
 }
 
 impl PartitionResponse {
-    const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 8 + 8; // 40
+    const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 8 + 8 + PartitionContext::ENCODED_SIZE;
 }
+// Wire pin: SDK decoders read fixed 64-byte partition records.
+const _: () = assert!(PartitionResponse::FIXED_SIZE == 64);
 
 impl WireEncode for PartitionResponse {
     fn encoded_size(&self) -> usize {
@@ -52,6 +56,7 @@ impl WireEncode for PartitionResponse {
         buf.put_u64_le(self.current_offset);
         buf.put_u64_le(self.size_bytes);
         buf.put_u64_le(self.messages_count);
+        self.context.encode(buf);
     }
 }
 
@@ -63,6 +68,7 @@ impl WireDecode for PartitionResponse {
         let current_offset = read_u64_le(buf, 16)?;
         let size_bytes = read_u64_le(buf, 24)?;
         let messages_count = read_u64_le(buf, 32)?;
+        let (context, _) = PartitionContext::decode(&buf[40..])?;
 
         Ok((
             Self {
@@ -72,6 +78,7 @@ impl WireDecode for PartitionResponse {
                 current_offset,
                 size_bytes,
                 messages_count,
+                context,
             },
             Self::FIXED_SIZE,
         ))
@@ -159,6 +166,11 @@ mod tests {
             current_offset: 99,
             size_bytes: 1024,
             messages_count: 100,
+            context: PartitionContext {
+                incarnation: 23,
+                owner_generation: 0,
+                metadata_op: 101,
+            },
         }
     }
 

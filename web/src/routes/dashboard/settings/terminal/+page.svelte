@@ -18,7 +18,7 @@ under the License.
 -->
 
 <script>
-  import SettingsLayout from '$lib/components/Layouts/SettingsLayout.svelte';
+  import SettingsLayout from '#lib/components/Layouts/SettingsLayout.svelte';
 </script>
 
 <SettingsLayout>terminal</SettingsLayout>

@@ -22,7 +22,7 @@ under the License.
   import Checkbox from './Checkbox.svelte';
   import Input from './Input.svelte';
   import SegmentedControl from './SegmentedControl.svelte';
-  import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
+  import { durationFormatter } from '#lib/utils/formatters/durationFormatter.js';
 
   interface Props {
     label?: string;
