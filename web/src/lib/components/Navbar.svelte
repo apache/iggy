@@ -23,27 +23,27 @@ under the License.
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { twMerge } from 'tailwind-merge';
-  import { tooltip } from '$lib/actions/tooltip';
-  import { typedRoute } from '$lib/types/appRoutes';
-  import LogoType from '$lib/components/Logo/LogoType.svelte';
-  import LogoMark from '$lib/components/Logo/LogoMark.svelte';
+  import { tooltip } from '#lib/actions/tooltip.js';
+  import { typedRoute } from '#lib/types/appRoutes.js';
+  import LogoType from '#lib/components/Logo/LogoType.svelte';
+  import LogoMark from '#lib/components/Logo/LogoMark.svelte';
   let navItems = $derived([
     {
       name: 'Overview',
       icon: 'home',
-      path: typedRoute('/dashboard/overview'),
-      active: page.url.pathname.includes(typedRoute('/dashboard/overview'))
+      path: typedRoute('dashboard/overview'),
+      active: page.url.pathname.includes(typedRoute('dashboard/overview'))
     },
     {
       name: 'Streams',
       icon: 'stream',
-      path: typedRoute('/dashboard/streams'),
-      active: page.url.pathname.includes(typedRoute('/dashboard/streams'))
+      path: typedRoute('dashboard/streams'),
+      active: page.url.pathname.includes(typedRoute('dashboard/streams'))
     },
     {
       name: 'Settings',
       icon: 'settings',
-      path: typedRoute('/dashboard/settings/webUI'),
+      path: typedRoute('dashboard/settings/webUI'),
       active: page.url.pathname.includes('/dashboard/settings')
     }
   ] satisfies { name: string; icon: iconType; path: string; active: boolean }[]);
@@ -52,10 +52,7 @@ under the License.
 <nav
   class="fixed z-10 left-0 top-0 bottom-0 min-w-[90px] max-w-[90px] pb-7 pt-4 border-r flex flex-col items-center bg-shade-l300 dark:bg-shade-d1000"
 >
-  <a
-    href={resolve(typedRoute('/dashboard/overview'))}
-    class="flex flex-col items-center gap-5 mb-5"
-  >
+  <a href={resolve(typedRoute('dashboard/overview'))} class="flex flex-col items-center gap-5 mb-5">
     <LogoType class="w-[51px] h-[28px] pointer-events-none" />
     <LogoMark class="w-[50px] h-[45px]" />
   </a>

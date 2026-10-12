@@ -20,7 +20,7 @@ use dtor::dtor;
 use integration::harness::get_test_directory;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, RwLock};
@@ -51,6 +51,7 @@ lazy_static! {
         Arc::new(RwLock::new(HashMap::new()));
     static ref FAILED_TEST_CASES: Arc<RwLock<HashSet<String>>> =
         Arc::new(RwLock::new(HashSet::new()));
+    static ref SAVED_LOG_TESTS: RwLock<HashSet<String>> = RwLock::new(HashSet::new());
     /// File handles for real-time log writing, keyed by test name.
     static ref LOG_FILES: Arc<Mutex<HashMap<String, File>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -58,6 +59,16 @@ lazy_static! {
 
 static INIT: Once = Once::new();
 static UNKNOWN_TEST_NAME: &str = "unknown";
+const TEST_LOG_FILE: &str = "test_stdout.log";
+
+fn use_saved_logs_on_failure() {
+    let thread = thread::current();
+    if let Some(test_name) = thread.name()
+        && let Ok(mut tests) = SAVED_LOG_TESTS.write()
+    {
+        tests.insert(test_name.to_owned());
+    }
+}
 
 fn setup() {
     let log_buffer = LOGS_BUFFER.clone();
@@ -139,7 +150,7 @@ fn write_to_log_file(test_name: &str, buf: &[u8]) {
     if let std::collections::hash_map::Entry::Vacant(entry) = files.entry(test_name.to_string())
         && let Some(dir) = get_test_directory(test_name)
     {
-        let log_path = dir.join("test_stdout.log");
+        let log_path = dir.join(TEST_LOG_FILE);
         if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             entry.insert(file);
         }
@@ -166,6 +177,18 @@ fn teardown() {
     {
         for test in failed.iter() {
             if let Some(logs) = buffer.get(test) {
+                if SAVED_LOG_TESTS
+                    .read()
+                    .is_ok_and(|tests| tests.contains(test))
+                    && let Some(directory) = get_test_directory(test)
+                {
+                    let path = directory.join(TEST_LOG_FILE);
+                    // The panic hook adds evidence to the buffer after the last tracing write.
+                    if path.is_file() && fs::write(&path, logs).is_ok() {
+                        eprintln!("Logs for failed test '{test}': {}", path.display());
+                        continue;
+                    }
+                }
                 eprintln!("Logs for failed test '{test}':");
                 eprintln!("{}", String::from_utf8_lossy(logs));
             }
