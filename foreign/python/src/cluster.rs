@@ -140,6 +140,10 @@ impl ClusterNode {
     }
 
     /// The address clients should use to reach the node.
+    ///
+    /// This is a bare host (a hostname or an IP address) with no port and no
+    /// brackets, so an IPv6 address needs brackets before a port is appended,
+    /// for example `[::1]:8090`.
     #[getter]
     pub fn ip(&self) -> String {
         self.inner.ip.clone()
@@ -200,6 +204,9 @@ impl ClusterMetadata {
     }
 
     /// The list of all nodes in the cluster.
+    ///
+    /// Each access builds a fresh list of new `ClusterNode` objects, so cache
+    /// the result when reading it more than once.
     #[getter]
     pub fn nodes(&self) -> Vec<ClusterNode> {
         self.inner
@@ -212,7 +219,7 @@ impl ClusterMetadata {
 
     fn __repr__(&self) -> String {
         format!(
-            "ClusterMetadata(name='{}', nodes={})",
+            "ClusterMetadata(name='{}', nodes_count={})",
             self.inner.name,
             self.inner.nodes.len(),
         )

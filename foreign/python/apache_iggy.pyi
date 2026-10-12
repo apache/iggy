@@ -483,6 +483,9 @@ class ClusterMetadata:
     def nodes(self) -> builtins.list[ClusterNode]:
         r"""
         The list of all nodes in the cluster.
+
+        Each access builds a fresh list of new `ClusterNode` objects, so cache
+        the result when reading it more than once.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -500,6 +503,10 @@ class ClusterNode:
     def ip(self) -> builtins.str:
         r"""
         The address clients should use to reach the node.
+
+        This is a bare host (a hostname or an IP address) with no port and no
+        brackets, so an IPv6 address needs brackets before a port is appended,
+        for example `[::1]:8090`.
         """
     @property
     def endpoints(self) -> TransportEndpoints:

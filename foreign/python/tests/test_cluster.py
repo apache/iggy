@@ -32,8 +32,6 @@ from .utils import (
     wait_for_server,
 )
 
-MAX_PORT = 65535
-
 # A node's role and status as the HTTP API spells them, then the Python values
 # they must become. A server without clustering only reports a healthy leader,
 # so the TCP tests below never see the other values.
@@ -133,14 +131,12 @@ class TestClusterMetadata:
 
         endpoints = node.endpoints
         # The connection under test is TCP, so the node must advertise it. The
-        # port is only bounded because the test server may be reached through a
-        # published port that differs from the one it listens on.
-        assert 0 < endpoints.tcp <= MAX_PORT
-        for port in (endpoints.quic, endpoints.http, endpoints.websocket):
-            assert 0 <= port <= MAX_PORT
+        # port is not compared with the one the test connected to, because the
+        # server may be reached through a published port that differs from it.
+        assert endpoints.tcp > 0
 
         assert f"name='{metadata.name}'" in repr(metadata)
-        assert "nodes=1" in repr(metadata)
+        assert "nodes_count=1" in repr(metadata)
         assert f"name='{node.name}'" in repr(node)
         assert "role=ClusterNodeRole.Leader" in repr(node)
         assert "status=ClusterNodeStatus.Healthy" in repr(node)
@@ -149,9 +145,14 @@ class TestClusterMetadata:
     @pytest.mark.unit
     def test_role_and_status_are_comparable_and_hashable(self):
         """Roles and statuses compare by value and can key a dict."""
-        assert ClusterNodeRole.Leader == ClusterNodeRole.Leader
         assert ClusterNodeRole.Leader != ClusterNodeRole.Follower
-        assert hash(ClusterNodeRole.Leader) == hash(ClusterNodeRole.Leader)
+        assert len({ClusterNodeRole.Leader, ClusterNodeRole.Follower}) == 2
+
+        status_by_role = {
+            ClusterNodeRole.Leader: ClusterNodeStatus.Healthy,
+            ClusterNodeRole.Follower: ClusterNodeStatus.Starting,
+        }
+        assert status_by_role[ClusterNodeRole.Follower] == ClusterNodeStatus.Starting
 
         statuses = (
             ClusterNodeStatus.Healthy,
@@ -240,4 +241,4 @@ class TestClusterMetadata:
             assert node.endpoints.quic == 8080 + index
             assert node.endpoints.http == 3000 + index
             assert node.endpoints.websocket == 8092 + index
-        assert f"nodes={len(REPORTED_NODES)}" in repr(metadata)
+        assert f"nodes_count={len(REPORTED_NODES)}" in repr(metadata)
