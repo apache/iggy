@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder};
+use crate::{Error, Payload, Schema, StreamEncoder, convert::apply_field_mappings};
 use base64::{Engine as Base64Engine, engine::general_purpose};
 use iggy_common::IggyTimestamp;
 use prost::Message;
@@ -279,37 +279,17 @@ impl ProtoStreamEncoder {
         Ok(())
     }
 
-    fn apply_field_transformations(&self, payload: Payload) -> Result<Payload, Error> {
+    fn apply_field_transformations(&self, payload: Payload) -> Payload {
         if let Some(mappings) = &self.config.field_mappings {
-            match payload {
-                Payload::Json(json_value) => {
-                    if let simd_json::OwnedValue::Object(mut map) = json_value {
-                        let mut new_entries = Vec::new();
-
-                        for (key, value) in map.iter() {
-                            let proto_key = mappings
-                                .iter()
-                                .find(|(_, json_name)| *json_name == key)
-                                .map(|(proto_name, _)| proto_name.clone())
-                                .unwrap_or_else(|| key.clone());
-
-                            new_entries.push((proto_key, value.clone()));
-                        }
-
-                        map.clear();
-                        for (key, value) in new_entries {
-                            map.insert(key, value);
-                        }
-
-                        Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                    } else {
-                        Ok(Payload::Json(json_value))
-                    }
-                }
-                other => Ok(other),
-            }
+            apply_field_mappings(payload, |key| {
+                mappings
+                    .iter()
+                    .find(|(_, json_name)| json_name.as_str() == key.as_str())
+                    .map(|(proto_name, _)| proto_name.clone())
+                    .unwrap_or(key)
+            })
         } else {
-            Ok(payload)
+            payload
         }
     }
 
@@ -730,7 +710,7 @@ impl StreamEncoder for ProtoStreamEncoder {
     }
 
     fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
-        let transformed_payload = self.apply_field_transformations(payload)?;
+        let transformed_payload = self.apply_field_transformations(payload);
 
         self.encode_with_schema(transformed_payload)
     }
@@ -909,11 +889,54 @@ mod tests {
         let decoded_json = simd_json::to_owned_value(&mut encoded_bytes_mut).unwrap();
 
         if let simd_json::OwnedValue::Object(map) = decoded_json {
-            assert!(map.contains_key("user_id"));
-            assert!(map.contains_key("full_name"));
-            assert!(map.contains_key("email"));
+            assert_eq!(
+                map.get("user_id").unwrap(),
+                &simd_json::OwnedValue::from(123)
+            );
+            assert_eq!(
+                map.get("full_name").unwrap(),
+                &simd_json::OwnedValue::from("John Doe")
+            );
+            assert_eq!(
+                map.get("email").unwrap(),
+                &simd_json::OwnedValue::from("john@example.com")
+            );
             assert!(!map.contains_key("id"));
             assert!(!map.contains_key("name"));
+        } else {
+            panic!("Expected JSON object");
+        }
+    }
+
+    #[test]
+    fn encode_should_resolve_ambiguous_reverse_lookup_to_one_of_the_colliding_keys() {
+        // Reverse-lookup collision resolves via HashMap iteration order (not deterministic), so only pin that one of the two survives.
+        let mut field_mappings = HashMap::new();
+        field_mappings.insert("proto_a".to_string(), "shared".to_string());
+        field_mappings.insert("proto_b".to_string(), "shared".to_string());
+
+        let config = ProtoEncoderConfig {
+            field_mappings: Some(field_mappings),
+            use_any_wrapper: false,
+            ..ProtoEncoderConfig::default()
+        };
+        let encoder = ProtoStreamEncoder::new_with_config(config);
+
+        let json_value = simd_json::json!({"shared": "value"});
+        let result = encoder.encode(Payload::Json(json_value));
+
+        assert!(result.is_ok());
+        let mut encoded_bytes = result.unwrap();
+        let decoded_json = simd_json::to_owned_value(&mut encoded_bytes).unwrap();
+
+        if let simd_json::OwnedValue::Object(map) = decoded_json {
+            assert_eq!(map.len(), 1);
+            let renamed_to_a = map.get("proto_a") == Some(&simd_json::OwnedValue::from("value"));
+            let renamed_to_b = map.get("proto_b") == Some(&simd_json::OwnedValue::from("value"));
+            assert!(
+                renamed_to_a || renamed_to_b,
+                "expected the value to land on proto_a or proto_b, got {map:?}"
+            );
         } else {
             panic!("Expected JSON object");
         }
