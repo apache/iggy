@@ -20,7 +20,7 @@ use crate::server::scenarios::{
     consumer_group_duplicate_name_create_scenario, consumer_group_join_scenario,
     consumer_group_new_messages_after_restart_scenario, consumer_group_offset_cleanup_scenario,
     consumer_group_with_multiple_clients_polling_messages_scenario,
-    consumer_group_with_single_client_polling_messages_scenario,
+    consumer_group_with_single_client_polling_messages_scenario, external_group_offsets_scenario,
 };
 use integration::iggy_harness;
 
@@ -35,7 +35,11 @@ use integration::iggy_harness;
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn join(harness: &TestHarness) {
     consumer_group_join_scenario::run(harness).await;
@@ -51,7 +55,11 @@ async fn single_client(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn multiple_clients(harness: &TestHarness) {
     consumer_group_with_multiple_clients_polling_messages_scenario::run(harness).await;
@@ -79,6 +87,14 @@ async fn new_messages_after_restart(harness: &TestHarness) {
 )]
 async fn offset_cleanup(harness: &TestHarness) {
     consumer_group_offset_cleanup_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
+async fn external_group_offsets(harness: &TestHarness) {
+    external_group_offsets_scenario::run(harness).await;
 }
 
 #[iggy_harness(

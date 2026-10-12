@@ -18,6 +18,7 @@
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, JoinConsumerGroupRequest,
 };
@@ -36,12 +37,13 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, PurgeStreamRequest,
-    UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, UpdateStreamRequest,
 };
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, UpdateTopicRequest,
 };
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, LoginRegisterRequest,
     UpdatePermissionsRequest, UpdateUserRequest,
@@ -54,7 +56,8 @@ use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccess
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
@@ -73,6 +76,7 @@ pub struct SimClient {
     /// a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
+    partition_contexts: RefCell<BTreeMap<IggyNamespace, PartitionContext>>,
     /// Whether this client talks to the server's real dispatch layer, which
     /// changes what a PAT request must contain.
     ///
@@ -94,6 +98,7 @@ impl SimClient {
             request_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
+            partition_contexts: RefCell::new(BTreeMap::new()),
             shell_wire: Cell::new(false),
         }
     }
@@ -124,6 +129,26 @@ impl SimClient {
     #[must_use]
     pub const fn client_id(&self) -> u128 {
         self.client_id
+    }
+
+    /// Discovery updates affect new requests; retained messages keep their captured context.
+    pub fn set_partition_context(&self, namespace: IggyNamespace, context: PartitionContext) {
+        self.partition_contexts
+            .borrow_mut()
+            .insert(namespace, context);
+    }
+
+    fn stamp_partition_context(&self, header: &mut RoutedRequestHeader) {
+        if let Some(context) = self
+            .partition_contexts
+            .borrow()
+            .get(&IggyNamespace::from_raw(header.group))
+        {
+            header.partition_incarnation = context.incarnation;
+            header.owner_generation = context.owner_generation;
+            header.minimum_metadata_op = context.metadata_op;
+            header.metadata_watermark = context.metadata_op;
+        }
     }
 
     /// Next deterministic, non-zero, cross-client-unique message id, standing
@@ -174,6 +199,37 @@ impl SimClient {
         s
     }
 
+    fn bind_secret(&self) -> [u8; consensus::client_table::BIND_SECRET_BYTES] {
+        let mut secret = [0; consensus::client_table::BIND_SECRET_BYTES];
+        secret[..16].copy_from_slice(&self.client_id.to_le_bytes());
+        secret[16..].copy_from_slice(&self.client_id.to_le_bytes());
+        secret
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the fixed simulator SDK name or version is invalid.
+    pub fn bind_session_request(&self, metadata_watermark: u64) -> Message<RoutedRequestHeader> {
+        let request = BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("simulator").expect("valid SDK name"),
+                sdk_version: WireName::new("1.0.0").expect("valid SDK version"),
+            },
+            identity: SessionIdentity {
+                client_id: self.client_id,
+                session: self.session_id(),
+                metadata_watermark,
+            },
+            bind_secret: BindSecret::new(Box::new(self.bind_secret())),
+        };
+        self.non_replicated_request(
+            iggy_binary_protocol::codes::BIND_SESSION_CODE,
+            METADATA_GROUP,
+            &request.to_bytes(),
+        )
+    }
+
     /// Build a `Register` request for this client.
     ///
     /// Register uses `session=0, request=0` per the protocol spec.
@@ -184,10 +240,12 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let verifier =
+            consensus::client_table::bind_verifier(self.client_id, 0, &self.bind_secret());
         let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
-            size: header_size as u32,
+            size: (header_size + verifier.len()) as u32,
             client: self.client_id,
             session: 0,
             request: 0,
@@ -199,7 +257,8 @@ impl SimClient {
         };
 
         let header_bytes = bytemuck::bytes_of(&header);
-        let buffer = header_bytes.to_vec();
+        let mut buffer = header_bytes.to_vec();
+        buffer.extend_from_slice(&verifier);
 
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("register request must be valid")
@@ -226,6 +285,7 @@ impl SimClient {
                 sdk_version: WireName::new("1.0.0").expect("sim sdk version is valid"),
             },
             username: WireName::new(username).expect("login username is a valid wire name"),
+            bind_secret: BindSecret::new(Box::new(self.bind_secret())),
             password: SecretString::from(password.to_owned()),
             client_context: None,
         }
@@ -299,15 +359,6 @@ impl SimClient {
     }
 
     /// # Panics
-    /// Panics if `stream` is not a valid `WireName`.
-    pub fn purge_stream(&self, stream: &str) -> Message<RoutedRequestHeader> {
-        let wire = PurgeStreamRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-        };
-        self.build_request(Operation::PurgeStream, &wire.to_bytes())
-    }
-
-    /// # Panics
     /// Panics if `stream` or `name` is not a valid `WireName`.
     pub fn create_topic(
         &self,
@@ -319,7 +370,13 @@ impl SimClient {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
             name: WireName::new(name).expect("topic name must be valid"),
-            options: WireOptions::empty(),
+            options: iggy_common::TopicCreateOptions {
+                durability: iggy_common::Durability::Persisted,
+                consumer_offset_durability: iggy_common::Durability::Persisted,
+                ..Default::default()
+            }
+            .to_wire()
+            .expect("valid simulator durability options"),
         };
         self.build_request(Operation::CreateTopic, &wire.to_bytes())
     }
@@ -349,16 +406,6 @@ impl SimClient {
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
         };
         self.build_request(Operation::DeleteTopic, &wire.to_bytes())
-    }
-
-    /// # Panics
-    /// Panics if `stream` or `topic` is not a valid `WireName`.
-    pub fn purge_topic(&self, stream: &str, topic: &str) -> Message<RoutedRequestHeader> {
-        let wire = PurgeTopicRequest {
-            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
-            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-        };
-        self.build_request(Operation::PurgeTopic, &wire.to_bytes())
     }
 
     /// # Panics
@@ -636,9 +683,8 @@ impl SimClient {
     ) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
-        let mut reserved = [0u8; 52];
-        reserved[..4].copy_from_slice(&code.to_le_bytes());
-        let header = RoutedRequestHeader {
+        let reserved = code.to_le_bytes();
+        let mut header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::NonReplicated,
             size: total_size as u32,
@@ -649,6 +695,7 @@ impl SimClient {
             group,
             ..Default::default()
         };
+        self.stamp_partition_context(&mut header);
 
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(bytemuck::bytes_of(&header));
@@ -764,7 +811,9 @@ impl SimClient {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = self.header(operation, group.inner(), total_size);
+        let mut header = self.header(operation, group.inner(), total_size);
+        self.stamp_partition_context(&mut header);
+        header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
@@ -782,7 +831,8 @@ impl SimClient {
         // Every `build_request` caller is a metadata-plane op (partition
         // ops go through `build_request_with_namespace`), and metadata
         // requests carry the metadata consensus group on the wire.
-        let header = self.header(operation, METADATA_GROUP, total_size);
+        let mut header = self.header(operation, METADATA_GROUP, total_size);
+        header.request_checksum = u128::from(iggy_common::calculate_checksum(payload));
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);

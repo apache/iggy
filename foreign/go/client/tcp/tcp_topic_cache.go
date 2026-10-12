@@ -42,12 +42,15 @@ func encodedStream(streamId iggcon.Identifier) string {
 	return string(stream)
 }
 
-// topicCache holds what a send needs to pick a partition without a metadata
-// round trip per batch.
+// topicCache holds what a send needs to pick a partition and stamp its
+// context without a metadata round trip per batch.
 type topicCache struct {
 	mtx              sync.Mutex
 	partitionsCounts map[topicKey]uint32
 	balancedCursors  map[topicKey]uint32
+	// Contexts survive a reconnect: a stale one costs one refused send and a
+	// refresh, never a write into the wrong incarnation.
+	contexts map[topicKey]map[uint32]iggcon.PartitionContext
 }
 
 func (c *topicCache) partitionsCount(key topicKey) (uint32, bool) {
@@ -66,34 +69,73 @@ func (c *topicCache) setPartitionsCount(key topicKey, count uint32) {
 	c.partitionsCounts[key] = count
 }
 
-func (c *topicCache) invalidatePartitionsCount(key topicKey) {
+func (c *topicCache) partitionContext(key topicKey, partition uint32) (iggcon.PartitionContext, bool) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	captured, ok := c.contexts[key][partition]
+	return captured, ok
+}
+
+func (c *topicCache) setPartitionContext(key topicKey, partition uint32, captured iggcon.PartitionContext) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.contexts == nil {
+		c.contexts = make(map[topicKey]map[uint32]iggcon.PartitionContext)
+	}
+	if c.contexts[key] == nil {
+		c.contexts[key] = make(map[uint32]iggcon.PartitionContext)
+	}
+	c.contexts[key][partition] = captured
+}
+
+// invalidate forgets the partition count and contexts of a topic, so the next
+// send rereads them. The balanced cursor survives.
+func (c *topicCache) invalidate(key topicKey) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	delete(c.partitionsCounts, key)
+	delete(c.contexts, key)
+}
+
+// forgetCount forgets the partition count of a topic and keeps its contexts.
+func (c *topicCache) forgetCount(key topicKey) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	delete(c.partitionsCounts, key)
 }
 
+// invalidateAll forgets every partition count and context after the client
+// changed the topology itself. A name and a numeric id cache one topic under
+// two keys, so the change cannot tell which entries it made stale. The
+// balanced cursors survive.
+func (c *topicCache) invalidateAll() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	clear(c.partitionsCounts)
+	clear(c.contexts)
+}
+
+// drop restarts the balanced cursor of a deleted topic, then invalidates every
+// count and context.
 func (c *topicCache) drop(key topicKey) {
 	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	delete(c.partitionsCounts, key)
 	delete(c.balancedCursors, key)
+	c.mtx.Unlock()
+	c.invalidateAll()
 }
 
-// dropStream forgets every topic cached under the encoded stream identifier,
-// because deleting a stream invalidates each topic under it.
+// dropStream restarts the balanced cursor of every topic cached under the
+// encoded stream identifier of a deleted stream, then invalidates every count
+// and context.
 func (c *topicCache) dropStream(stream string) {
 	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	for key := range c.partitionsCounts {
-		if key.stream == stream {
-			delete(c.partitionsCounts, key)
-		}
-	}
 	for key := range c.balancedCursors {
 		if key.stream == stream {
 			delete(c.balancedCursors, key)
 		}
 	}
+	c.mtx.Unlock()
+	c.invalidateAll()
 }
 
 // nextBalanced returns the partition a balanced send targets and advances the

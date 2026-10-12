@@ -114,15 +114,6 @@ impl Permissioner {
         self.manage_topic(user_id, stream_id, topic_id)
     }
 
-    pub fn purge_topic(
-        &self,
-        user_id: u32,
-        stream_id: usize,
-        topic_id: usize,
-    ) -> Result<(), IggyError> {
-        self.manage_topic(user_id, stream_id, topic_id)
-    }
-
     /// Inheritance: `manage_streams` -> `manage_topics`
     fn manage_topic(
         &self,

@@ -19,11 +19,11 @@ under the License.
 
 <script>
   import { goto } from '$app/navigation';
-  import { typedRoute } from '$lib/types/appRoutes';
+  import { typedRoute } from '#lib/types/appRoutes.js';
   import { onMount } from 'svelte';
   import { resolve } from '$app/paths';
 
   onMount(() => {
-    goto(resolve(typedRoute('/dashboard/streams')));
+    goto(resolve(typedRoute('dashboard/streams')));
   });
 </script>

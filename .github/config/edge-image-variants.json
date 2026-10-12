@@ -1,0 +1,117 @@
+{
+  "variant_catalog_version": 2,
+  "work": "edge-images",
+  "variants": [
+    {
+      "id": "rust-server",
+      "dimensions": { "component": "rust-server" },
+      "cargo_roots": [
+        { "package": "server", "target": { "name": "iggy-server", "kind": "bin" } },
+        { "package": "iggy-cli", "target": { "name": "iggy", "kind": "bin" } }
+      ],
+      "external_paths": [
+        ".dockerignore",
+        ".github/actions/utils/docker-buildx/**",
+        ".github/actions/utils/docker-login/**",
+        ".github/config/publish.yml",
+        ".github/workflows/post-merge.yml",
+        ".github/workflows/publish.yml",
+        "LICENSE",
+        "NOTICE",
+        "about.toml",
+        "about.hbs",
+        "core/server/Dockerfile",
+        "web/**",
+        "scripts/extract-version.sh",
+        "scripts/ci/third-party-licenses.sh",
+        "scripts/ci/render-node-licenses.mjs"
+      ]
+    },
+    {
+      "id": "rust-mcp",
+      "dimensions": { "component": "rust-mcp" },
+      "cargo_roots": [
+        { "package": "iggy-mcp", "target": { "name": "iggy-mcp", "kind": "bin" } }
+      ],
+      "external_paths": [
+        ".dockerignore",
+        ".github/actions/utils/docker-buildx/**",
+        ".github/actions/utils/docker-login/**",
+        ".github/config/publish.yml",
+        ".github/workflows/post-merge.yml",
+        ".github/workflows/publish.yml",
+        "LICENSE",
+        "NOTICE",
+        "about.toml",
+        "about.hbs",
+        "core/ai/mcp/Dockerfile",
+        "scripts/extract-version.sh",
+        "scripts/ci/third-party-licenses.sh"
+      ]
+    },
+    {
+      "id": "rust-bench-dashboard",
+      "dimensions": { "component": "rust-bench-dashboard" },
+      "cargo_roots": [
+        { "package": "iggy-bench-dashboard-server", "target": { "name": "iggy-bench-dashboard-server", "kind": "bin" } },
+        { "package": "bench-dashboard-frontend", "target": { "name": "bench-dashboard-frontend", "kind": "bin" } }
+      ],
+      "external_paths": [
+        ".dockerignore",
+        ".github/actions/utils/docker-buildx/**",
+        ".github/actions/utils/docker-login/**",
+        ".github/config/publish.yml",
+        ".github/workflows/post-merge.yml",
+        ".github/workflows/publish.yml",
+        "LICENSE",
+        "NOTICE",
+        "about.toml",
+        "about.hbs",
+        "core/bench/dashboard/server/Dockerfile",
+        "core/bench/dashboard/server/docker-entrypoint.sh",
+        "scripts/extract-version.sh",
+        "scripts/ci/third-party-licenses.sh"
+      ]
+    },
+    {
+      "id": "rust-connectors",
+      "dimensions": { "component": "rust-connectors" },
+      "cargo_roots": [
+        { "package": "iggy-connectors", "target": { "name": "iggy-connectors", "kind": "bin" } }
+      ],
+      "external_paths": [
+        ".dockerignore",
+        ".github/actions/utils/docker-buildx/**",
+        ".github/actions/utils/docker-login/**",
+        ".github/config/publish.yml",
+        ".github/workflows/post-merge.yml",
+        ".github/workflows/publish.yml",
+        "LICENSE",
+        "NOTICE",
+        "about.toml",
+        "about.hbs",
+        "core/connectors/runtime/Dockerfile",
+        "scripts/extract-version.sh",
+        "scripts/ci/third-party-licenses.sh"
+      ]
+    },
+    {
+      "id": "web-ui",
+      "dimensions": { "component": "web-ui" },
+      "external_paths": [
+        ".dockerignore",
+        ".github/actions/utils/docker-buildx/**",
+        ".github/actions/utils/docker-login/**",
+        ".github/config/publish.yml",
+        ".github/workflows/post-merge.yml",
+        ".github/workflows/publish.yml",
+        "LICENSE",
+        "NOTICE",
+        "web/**",
+        "scripts/extract-version.sh",
+        "scripts/ci/third-party-licenses.sh",
+        "scripts/ci/render-node-licenses.mjs"
+      ]
+    }
+  ]
+}

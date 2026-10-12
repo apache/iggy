@@ -220,7 +220,8 @@
 //!     )?;
 //!     client.connect().await?;
 //!
-//!     let producer = client.producer("stream_name", "topic_name")?.build();
+//!     let producer = client.producer("stream_name", "topic_name")?
+//!     .topic_durability(iggy::prelude::Durability::Persisted).build();
 //!     producer.init().await?;
 //!     producer
 //!         .send(vec![IggyMessage::from_str("some_message_payload")?])

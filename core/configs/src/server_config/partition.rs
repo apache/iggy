@@ -204,11 +204,12 @@ pub struct PartitionConfig {
     /// pinned request-buffer memory by the partition count.
     pub prepare_queue_depth: usize,
 
-    /// Distinct clients each partition group tracks request watermarks for,
-    /// deduplicating retried produces and consumer-offset writes. At capacity
-    /// the entry whose newest commit is oldest is evicted, which costs dedup
-    /// coverage for that client (its next replay re-executes, exactly as it
-    /// would have before dedup existed) and never correctness. Must be > 0 and
+    /// Initial capacity for session-qualified retry protection in each partition
+    /// group. Live and unretired sessions occupy slots. A full table refuses new
+    /// writers with `TransientNotAccepted`; existing protection is never evicted.
+    /// Ended sessions release slots only after ordered retirement. The first
+    /// committed operation fixes this limit, so changing configuration does not
+    /// resize an existing group after restart or transfer. Must be > 0 and
     /// <= [`PARTITION_DEDUP_CLIENTS_CEILING`].
     ///
     /// Unlike `[metadata] clients_table_max`, this budget is PER GROUP, so the

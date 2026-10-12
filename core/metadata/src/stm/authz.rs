@@ -46,11 +46,9 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::{
-    DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
-};
+use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, UpdateStreamRequest};
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, WireName};
@@ -97,11 +95,18 @@ pub trait GatedApply:
     /// # Errors
     /// Propagates the underlying [`StateMachine::update`] error.
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError>;
+
+    /// Partition-set revision used to validate retirement coverage during WAL replay.
+    fn namespace_revision(&self) -> u64;
 }
 
 impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         gated_apply(self, prepare)
+    }
+
+    fn namespace_revision(&self) -> u64 {
+        self.streams().read(|inner| inner.namespace_revision)
     }
 }
 
@@ -157,14 +162,6 @@ pub(crate) fn authorize(
                 perm.delete_stream(user_id, sid)
             })
         }
-        Operation::PurgeStream => {
-            let Ok(request) = PurgeStreamRequest::decode_from(body) else {
-                return None;
-            };
-            stream_scoped(users, streams, &request.stream_id, |perm, sid| {
-                perm.purge_stream(user_id, sid)
-            })
-        }
 
         // Topics. The wire `CreateTopic` is projected to
         // `CreateTopicWithAssignments` before it reaches apply, so only the
@@ -199,18 +196,6 @@ pub(crate) fn authorize(
                 &request.stream_id,
                 &request.topic_id,
                 |perm, sid, tid| perm.delete_topic(user_id, sid, tid),
-            )
-        }
-        Operation::PurgeTopic => {
-            let Ok(request) = PurgeTopicRequest::decode_from(body) else {
-                return None;
-            };
-            topic_scoped(
-                users,
-                streams,
-                &request.stream_id,
-                &request.topic_id,
-                |perm, sid, tid| perm.purge_topic(user_id, sid, tid),
             )
         }
 
@@ -334,6 +319,8 @@ pub(crate) fn authorize(
         | Operation::Logout
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation
+        | Operation::FinalizeSession
+        | Operation::RetireSession
         | Operation::CreateTopic
         | Operation::CreatePartitions
         | Operation::DeleteSegments
@@ -341,7 +328,11 @@ pub(crate) fn authorize(
         | Operation::DeletePersonalAccessToken
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
-        | Operation::DeleteConsumerOffset => None,
+        | Operation::DeleteConsumerOffset
+        | Operation::CompleteLifecycle
+        | Operation::TransitionPartitionHistory
+        | Operation::InstallConsumerGroupOwner
+        | Operation::RetireConsumerGroupOwners => None,
     }
 }
 
@@ -439,6 +430,10 @@ fn topic_scoped(
 impl GatedApply for MuxStateMachine<()> {
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
+    }
+
+    fn namespace_revision(&self) -> u64 {
+        0
     }
 }
 

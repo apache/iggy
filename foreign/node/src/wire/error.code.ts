@@ -87,6 +87,9 @@ export const translateErrorCode = (code: number): string => {
     case '84': return "Invalid number value";
     case '85': return "Request is below the deduplication window; outcome unknown, resending may duplicate the write";
 
+    case '87': return "The partition history is no longer available; this request cannot execute again";
+    case '88': return "A committed lifecycle operation prevents this mutation. Retry as a new request.";
+
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";
 
@@ -148,6 +151,7 @@ export const translateErrorCode = (code: number): string => {
     case '2020': return "Topic directory: {0} not found";
     case '2021': return "Too many topics";
     case '2022': return "Partitions limit reached, raise [metadata] partitions_max";
+    case '2023': return "Partition resizing is disabled for this fixed topic";
 
     // TOPIC
     case '3000': return "Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}";
@@ -169,6 +173,7 @@ export const translateErrorCode = (code: number): string => {
     case '3023': return "Cannot open consumer offsets file for path: {0}";
     case '3024': return "Consumer offset limit reached for partition, raise [partition] consumer_offsets_max";
     case '3013': return "Partition id space exhausted for this topic";
+    case '3014': return "Partition history changed after the request was resolved";
 
     // MESSAGE
     case '4000': return "Segment not found";
@@ -236,6 +241,7 @@ export const translateErrorCode = (code: number): string => {
     case '5007': return "Failed to create consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}.";
     case '5008': return "Failed to delete consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}.";
     case '5009': return "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress).";
+    case '5010': return "Too many consumer groups";
     case '6000': return "Base offset is missing";
     case '6001': return "Last offset delta is missing";
     case '6002': return "Max timestamp is missing";
@@ -270,6 +276,8 @@ export const translateErrorCode = (code: number): string => {
     case '14000': return "VSR session already bound; reset before re-binding";
     case '14001': return "VSR session value {0} is invalid (must be non-zero)";
     case '14003': return "Incompatible binary protocol version: client {}, server accepts [{}, {}]";
+    case '14004': return "VSR session mismatch: requested {0}, server bound {1}";
+    case '14005': return "VSR request id exhausted";
 
     default: return 'error';
   }

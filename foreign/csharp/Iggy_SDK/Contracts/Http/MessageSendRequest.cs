@@ -29,4 +29,5 @@ internal sealed class MessageSendRequest
     public required Identifier TopicId { get; init; }
     public required Partitioning Partitioning { get; init; }
     public required IList<Message> Messages { get; init; }
+    public PartitionContext? Context { get; init; }
 }
