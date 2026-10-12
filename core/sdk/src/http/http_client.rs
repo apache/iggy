@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::diagnostic_events::diagnostic_event_channel;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyError, NonZeroIggyDuration};
 use crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL;
-use async_broadcast::{Receiver, Sender, broadcast};
+use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
@@ -242,7 +243,7 @@ impl HttpClient {
             heartbeat_interval: config.heartbeat_interval,
             access_token: IggyRwLock::new(access_token),
             send_contexts: ConsumerGroupClientState::new(),
-            events: broadcast(1000),
+            events: diagnostic_event_channel(),
         })
     }
 
