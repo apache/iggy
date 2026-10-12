@@ -13008,8 +13008,10 @@ mod tests {
         for kind in ["consumers", "groups"] {
             std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
         }
-        partition.consumer_offsets_path = Some(format!("{partition_dir}/offsets/consumers"));
-        partition.consumer_group_offsets_path = Some(format!("{partition_dir}/offsets/groups"));
+        partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] =
+            Some(format!("{partition_dir}/offsets/consumers"));
+        partition.consumer_offset_dirs[ConsumerKind::ConsumerGroup.index()] =
+            Some(format!("{partition_dir}/offsets/groups"));
         partition.open_persistence().await.unwrap();
         let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
         let prepare = checksummed_segment_prepare(1, 0, 0, b"durable");
@@ -13046,6 +13048,9 @@ mod tests {
             groups: Vec::new(),
             external_groups: Vec::new(),
             dedup: Vec::new(),
+            owners: Vec::new(),
+            history_transition: None,
+            owner_retirement: None,
         };
 
         let result = partition
