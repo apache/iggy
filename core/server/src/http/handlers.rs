@@ -129,8 +129,8 @@ use crate::http::error::{
 use crate::http::extractor::{Authenticated, Identity};
 use crate::http::metrics::{TopicUsageSample, gauge_value};
 use crate::http::reads::{
-    authorize_data_plane, gate_local_read, read_local, resolve_gate_stream, resolve_gate_topic,
-    resolve_gate_topic_ids, resolve_gate_user, topic_durability,
+    authorize_data_plane, await_recovery_barrier, gate_local_read, read_local, resolve_gate_stream,
+    resolve_gate_topic, resolve_gate_topic_ids, resolve_gate_user, topic_durability,
 };
 use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
@@ -625,10 +625,17 @@ pub(in crate::http) async fn get_stats(
 ///
 /// Per-topic series are this replica's local view, so a lagging backup may
 /// report smaller values than the primary.
+///
+/// Held behind the post-restart recovery barrier like every other local read:
+/// until the recovered WAL suffix re-commits, the users map may still grant a
+/// permission a committed op revoked, and the walk may name a topic a
+/// committed op deleted. An expired barrier answers the retryable 503 rather
+/// than a partial exposition.
 pub(in crate::http) async fn get_metrics(
     State(state): State<HttpState>,
     identity: Identity,
-) -> String {
+) -> Result<String, ReadError> {
+    SendWrapper::new(await_recovery_barrier(&state.shard)).await?;
     // Awaited before the permission check and the walk so check, walk, replace
     // and encode run without a yield, and a scrape that finishes later never
     // publishes an older per-topic snapshot.
@@ -715,7 +722,7 @@ pub(in crate::http) async fn get_metrics(
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
-    metrics.formatted_output()
+    Ok(metrics.formatted_output())
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP

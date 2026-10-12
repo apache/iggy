@@ -108,15 +108,14 @@ impl TopicUsage {
     pub(in crate::http) fn replace(&self, samples: Vec<TopicUsageSample>) {
         *self.samples.lock().unwrap_or_else(PoisonError::into_inner) = samples;
     }
-
-    fn take(&self) -> Vec<TopicUsageSample> {
-        mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner))
-    }
 }
 
 impl Collector for TopicUsage {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
-        let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+        // The scrape handler refills the snapshot before every encode, so
+        // keeping it past this encode only pins every topic name until the
+        // next scrape.
+        let samples = mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner));
         encode_topic_gauge(
             &mut encoder,
             "topic_size_bytes",
@@ -279,10 +278,6 @@ impl HttpMetrics {
         if let Err(error) = encode(&mut buffer, &self.registry) {
             error!(%error, "failed to encode metrics");
         }
-        // The scrape handler refills the snapshot before every encode, so
-        // holding it past this point only pins every topic name until the
-        // next scrape.
-        drop(self.topic_usage.take());
         self.last_output_len.store(buffer.len(), Ordering::Relaxed);
         buffer
     }
