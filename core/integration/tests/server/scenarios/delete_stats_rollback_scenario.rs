@@ -17,10 +17,10 @@
 
 //! Deleting data that is still counted must leave the parent totals correct.
 //!
-//! `stream_size_validation_scenario` covers delete too, but it purges each
-//! topic first, so every delete it performs removes an already-empty scope and
-//! cannot observe a rollback that never happened. These scenarios delete scopes
-//! that still hold messages, which is what the parent totals are wrong about.
+//! `stream_size_validation_scenario` also deletes scopes that still hold
+//! messages, but it retries each read until the totals converge, and it never
+//! deletes partitions. These scenarios read once after each delete, and they
+//! delete partitions next to one that keeps its messages.
 //!
 //! What this guards, and what it does not. Two mechanisms roll a deleted scope
 //! out of its parents: the metadata STM evicts the registry entries at commit

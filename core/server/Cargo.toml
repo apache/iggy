@@ -89,6 +89,7 @@ systemd = ["dep:sd-notify"]
 
 [dependencies]
 ahash = { workspace = true }
+arc-swap = { workspace = true }
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }

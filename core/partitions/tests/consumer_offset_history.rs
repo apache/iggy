@@ -17,323 +17,248 @@
 
 use consensus::{LocalPipeline, Sequencer, VsrConsensus, oneshot_channel};
 use futures::FutureExt;
-use iggy_binary_protocol::batch::{BatchIntegrity, decode_batch_slice_with};
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::requests::partitions::{
+    InstallConsumerGroupOwnerRequest, TransitionPartitionHistoryRequest,
 };
 use iggy_binary_protocol::{
     AckLevel, Command, Operation, PrepareOkHeader, ReplyHeader, RoutedRequestHeader, WireConsumer,
     WireEncode, WireIdentifier,
 };
-use iggy_common::{ConsumerKind, IggyByteSize, IggyError, PartitionStats, PollingStrategy};
+use iggy_common::{ConsumerKind, IggyByteSize, IggyError, PartitionStats};
 use message_bus::{AUTO_COMMIT_CLIENT_ID, IggyMessageBus};
 use partitions::{
-    IggyPartition, IggyPartitions, Partition, PartitionPathLayout, PartitionsConfig, PollingArgs,
-    PollingConsumer,
+    IggyPartition, Partition, PartitionPathLayout, PartitionsConfig, PollingConsumer,
 };
 use server_common::Message;
 use server_common::send_messages::{
     IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
 };
-use server_common::sharding::{IggyNamespace, ShardId};
+use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
 use std::sync::Arc;
 
 const CONSUMER_ID: u32 = 7;
-const REPLACEMENT: &[u8] = b"replacement record";
+const METADATA_WATERMARK: u64 = 100;
+const DELETE_METADATA_OP: u64 = 2;
+const CLUSTER_REPLICAS: u8 = 3;
 type TestPartition = IggyPartition<Rc<IggyMessageBus>>;
 
 #[compio::test]
-async fn given_queued_offset_store_when_purged_should_not_skip_replacement_records() {
+async fn given_admitted_offset_store_when_deleting_should_drain_before_the_fence() {
     for client_id in [42, AUTO_COMMIT_CLIENT_ID] {
         for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-            let (mut partition, config, _directory) = partition_with_old_record().await;
+            let (mut partition, config, _directory) =
+                Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
             let consumer = polling_consumer(kind);
-            let (returned, delivered) = poll(
-                partition,
-                &config,
-                consumer,
-                &PollingArgs::new(PollingStrategy::first(), 1, false),
-            );
-            partition = returned;
-            assert_eq!(delivered, vec![b"old record".to_vec()]);
-            assert_eq!(partition.get_consumer_offset(consumer), None);
-
             partition
-                .on_request(append(2, b"old pending prepare"), None)
+                .on_request(append(&partition, 2, b"admitted record"), None)
                 .await;
-            assert!(partition.consensus().pipeline_is_full());
-            partition.on_request(append(3, REPLACEMENT), None).await;
+            let delayed = [
+                store(&partition, client_id, 2, kind, 0),
+                delete(&partition, kind, 3),
+                append(&partition, 4, b"delayed record"),
+            ];
             let (sender, receiver) = oneshot_channel();
             partition
-                .on_request(store(client_id, 1, kind, 0), Some(sender))
+                .on_request(store(&partition, client_id, 1, kind, 0), Some(sender))
                 .await;
-            assert_eq!(partition.consensus().request_queue_len(), 2);
+            assert_eq!(partition.consensus().request_queue_len(), 1);
 
-            partition.purge(&config, 1).await.unwrap();
-            assert_eq!(partition.purge_floor_op(), 2);
-            commit_pending(&mut partition, &config).await;
-
-            assert_eq!(
-                partition.get_consumer_offset(consumer),
-                None,
-                "a store admitted before purge must not checkpoint replacement history ({client_id}, {kind:?})",
-            );
-            let reply = receiver
-                .now_or_never()
-                .expect("the queued store must finish")
-                .unwrap();
-            assert_eq!(reply.header().status, IggyError::InvalidOffset(0).as_code());
-            assert_eq!(
-                partition.consensus().sequencer().current_sequence(),
-                3,
-                "reject the obsolete store before assigning an operation"
-            );
-            let (partition, next) = poll(
-                partition,
-                &config,
-                consumer,
-                &PollingArgs::new(PollingStrategy::next(), 10, false),
-            );
-            let (_, first) = poll(
-                partition,
-                &config,
-                PollingConsumer::Consumer(8, 0),
-                &PollingArgs::new(PollingStrategy::first(), 10, false),
-            );
-            assert_eq!(
-                first,
-                vec![REPLACEMENT.to_vec()],
-                "the unrelated queued publish survives"
-            );
-            assert_eq!(next, first, "Next must not skip the replacement record");
-        }
-    }
-}
-
-#[compio::test]
-async fn given_queued_automatic_commit_when_purged_should_keep_replacement_records_unread() {
-    let (mut partition, config, _directory) = partition_with_old_record().await;
-    partition
-        .on_request(append(2, b"old pending prepare"), None)
-        .await;
-    partition.on_request(append(3, REPLACEMENT), None).await;
-    let consumer = polling_consumer(ConsumerKind::Consumer);
-    let (mut partition, delivered) = poll(
-        partition,
-        &config,
-        consumer,
-        &PollingArgs::new(PollingStrategy::first(), 1, true),
-    );
-    assert_eq!(delivered, vec![b"old record".to_vec()]);
-    assert_eq!(partition.consensus().request_queue_len(), 2);
-    partition.purge(&config, 1).await.unwrap();
-    assert_eq!(partition.consensus().request_queue_len(), 1);
-    commit_pending(&mut partition, &config).await;
-    assert_eq!(partition.get_consumer_offset(consumer), None);
-    let (_, next) = poll(
-        partition,
-        &config,
-        consumer,
-        &PollingArgs::new(PollingStrategy::next(), 10, false),
-    );
-    assert_eq!(next, vec![REPLACEMENT.to_vec()]);
-}
-
-#[compio::test]
-async fn given_queued_explicit_store_when_history_is_unchanged_should_allow_rewind() {
-    for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-        let (mut partition, config, _directory) = partition_with_old_record().await;
-        partition
-            .on_request(append(2, b"second record"), None)
-            .await;
-        commit_pending(&mut partition, &config).await;
-        let (sender, receiver) = oneshot_channel();
-        partition
-            .on_request(store(42, 1, kind, 1), Some(sender))
-            .await;
-        commit_pending(&mut partition, &config).await;
-        assert_success(receiver);
-        assert_eq!(
-            partition.get_consumer_offset(polling_consumer(kind)),
-            Some(1)
-        );
-
-        partition.on_request(append(3, b"third record"), None).await;
-        let (sender, receiver) = oneshot_channel();
-        partition
-            .on_request(store(42, 2, kind, 0), Some(sender))
-            .await;
-        assert_eq!(partition.consensus().request_queue_len(), 1);
-        commit_pending(&mut partition, &config).await;
-        assert_success(receiver);
-        assert_eq!(
-            partition.get_consumer_offset(polling_consumer(kind)),
-            Some(0),
-            "history protection must not turn an explicit store into a monotone automatic commit"
-        );
-    }
-}
-
-#[compio::test]
-async fn given_queued_offset_delete_when_history_changes_should_reject_without_replay() {
-    for purge in [false, true] {
-        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
-            let (mut partition, config, _directory) = partition_with_old_record().await;
-            let (sender, receiver) = oneshot_channel();
+            assert_fence_waits(&mut partition).await;
+            let (sender, refused) = oneshot_channel();
             partition
-                .on_request(store(42, 1, kind, 0), Some(sender))
+                .on_request(append(&partition, 5, b"arrived during drain"), Some(sender))
                 .await;
+            assert_status(refused, IggyError::TransientNotAccepted.as_code());
             commit_pending(&mut partition, &config).await;
             assert_success(receiver);
-            partition
-                .on_request(append(2, b"pending prepare"), None)
-                .await;
-            partition.on_request(append(3, REPLACEMENT), None).await;
-            let (sender, receiver) = oneshot_channel();
-            partition.on_request(delete(kind, 2), Some(sender)).await;
-            assert_eq!(partition.consensus().request_queue_len(), 2);
-            if purge {
-                partition.purge(&config, 1).await.unwrap();
+            assert_eq!(partition.get_consumer_offset(consumer), Some(0));
+
+            delete_history(&mut partition, &config).await;
+            let before = partition.consensus().sequencer().current_sequence();
+            for request in delayed {
+                let (sender, receiver) = oneshot_channel();
+                partition.on_request(request, Some(sender)).await;
+                assert_status(receiver, IggyError::HistoryUnavailable.as_code());
             }
-            commit_pending(&mut partition, &config).await;
-            let reply = receiver
-                .now_or_never()
-                .expect("the delete must finish")
-                .unwrap();
-            assert_eq!(
-                reply.header().status,
-                if purge {
-                    IggyError::ConsumerOffsetNotFound(CONSUMER_ID as usize).as_code()
-                } else {
-                    0
-                }
-            );
-            assert_eq!(
-                partition.consensus().sequencer().current_sequence(),
-                if purge { 4 } else { 5 }
-            );
-            assert_eq!(partition.get_consumer_offset(polling_consumer(kind)), None);
+            assert_eq!(partition.consensus().sequencer().current_sequence(), before);
+            assert_eq!(partition.get_consumer_offset(consumer), Some(0));
         }
     }
 }
 
 #[compio::test]
-async fn given_many_obsolete_offsets_when_purged_should_finish_rejections_and_resume_queued_writes()
-{
-    let (mut partition, config, _directory) = partition_with_old_record().await;
-    partition
-        .on_request(append(2, b"old pending prepare"), None)
-        .await;
-    let mut receivers = Vec::new();
-    for request_id in 1_u64..=6 {
-        let (sender, receiver) = oneshot_channel();
-        partition
-            .on_request(
-                store(42 + u128::from(request_id), 1, ConsumerKind::Consumer, 0),
-                Some(sender),
-            )
-            .await;
-        receivers.push(receiver);
-    }
-    partition.on_request(append(3, REPLACEMENT), None).await;
-    partition.purge(&config, 1).await.unwrap();
-    commit_pending(&mut partition, &config).await;
-    assert!(
-        partition.consensus().request_queue_len() > 0,
-        "the rejection budget must leave work for a later owner turn"
-    );
-    assert!(partition.queued_requests_ready());
-    for _ in 0..8 {
-        partition.resume_queued_requests().await;
-        commit_pending(&mut partition, &config).await;
-        if partition.consensus().request_queue_len() == 0 {
-            break;
-        }
-    }
-    assert_eq!(partition.consensus().request_queue_len(), 0);
-    assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
-    for receiver in receivers {
-        let reply = receiver
-            .now_or_never()
-            .expect("every obsolete store gets a reply")
-            .unwrap();
-        assert_eq!(reply.header().status, IggyError::InvalidOffset(0).as_code());
-    }
-    let (_, next) = poll(
-        partition,
-        &config,
-        polling_consumer(ConsumerKind::Consumer),
-        &PollingArgs::new(PollingStrategy::next(), 10, false),
-    );
-    assert_eq!(next, vec![REPLACEMENT.to_vec()]);
-}
-
-#[compio::test]
-async fn given_queued_delete_when_replacement_checkpoint_commits_should_preserve_new_progress() {
-    let kind = ConsumerKind::Consumer;
-    let (mut partition, config, _directory) = partition_with_old_record().await;
+async fn given_unassigned_owner_when_automatic_offsets_arrive_should_only_allow_matching_cleanup() {
+    let (mut partition, config, _directory) =
+        Box::pin(partition_with_old_record(CLUSTER_REPLICAS)).await;
+    let consumer = polling_consumer(ConsumerKind::ConsumerGroup);
     let (sender, receiver) = oneshot_channel();
     partition
-        .on_request(store(42, 1, kind, 0), Some(sender))
+        .on_request(
+            store(&partition, 42, 1, ConsumerKind::ConsumerGroup, 0),
+            Some(sender),
+        )
         .await;
     commit_pending(&mut partition, &config).await;
     assert_success(receiver);
-    partition
-        .on_request(append(2, b"old pending prepare"), None)
-        .await;
-    partition.on_request(append(3, REPLACEMENT), None).await;
-    let mut obsolete_stores = Vec::new();
-    for request_id in 2_u64..=5 {
+    let stale_cleanup = delete(&partition, ConsumerKind::ConsumerGroup, 2).transmute_header(
+        |old, header: &mut RoutedRequestHeader| {
+            *header = old;
+            header.client = AUTO_COMMIT_CLIENT_ID;
+        },
+    );
+    let installation = InstallConsumerGroupOwnerRequest {
+        incarnation: partition.created_revision(),
+        group_id: u64::from(CONSUMER_ID),
+        owner: ConsumerGroupOwner {
+            client_id: 0,
+            session: 0,
+            generation: 2,
+        },
+        metadata_op: 2,
+    };
+    install_owner_record(&mut partition, &config, installation).await;
+    let automatic_store = store(
+        &partition,
+        AUTO_COMMIT_CLIENT_ID,
+        3,
+        ConsumerKind::ConsumerGroup,
+        0,
+    );
+    let before = partition.consensus().sequencer().current_sequence();
+    for request in [automatic_store, stale_cleanup] {
         let (sender, receiver) = oneshot_channel();
-        partition
-            .on_request(store(42 + u128::from(request_id), 1, kind, 0), Some(sender))
-            .await;
-        obsolete_stores.push(receiver);
+        partition.on_request(request, Some(sender)).await;
+        assert_status(
+            receiver,
+            IggyError::ConsumerGroupPartitionNotOwned(CONSUMER_ID, 0).as_code(),
+        );
+        assert_eq!(partition.get_consumer_offset(consumer), Some(0));
     }
-    let (sender, deleted) = oneshot_channel();
-    partition.on_request(delete(kind, 6), Some(sender)).await;
-    partition.purge(&config, 1).await.unwrap();
-    commit_pending(&mut partition, &config).await;
-    assert_eq!(
-        partition.consensus().request_queue_len(),
-        1,
-        "the rejection budget leaves the old delete for a later turn"
-    );
+    assert_eq!(partition.consensus().sequencer().current_sequence(), before);
 
-    // A new owner turn can admit a valid store while obsolete queued work
-    // waits for the next bounded promotion turn.
-    let (sender, stored) = oneshot_channel();
+    let cleanup = delete(&partition, ConsumerKind::ConsumerGroup, 4).transmute_header(
+        |old, header: &mut RoutedRequestHeader| {
+            *header = old;
+            header.client = AUTO_COMMIT_CLIENT_ID;
+        },
+    );
+    let delayed_cleanup = cleanup.deep_copy();
+    let (sender, receiver) = oneshot_channel();
+    partition.on_request(cleanup, Some(sender)).await;
+    commit_pending(&mut partition, &config).await;
+    assert_success(receiver);
+    assert_eq!(partition.get_consumer_offset(consumer), None);
+
+    install_owner_record(
+        &mut partition,
+        &config,
+        InstallConsumerGroupOwnerRequest {
+            owner: ConsumerGroupOwner {
+                client_id: 77,
+                session: 1,
+                generation: 3,
+            },
+            metadata_op: 3,
+            ..installation
+        },
+    )
+    .await;
+    let (sender, receiver) = oneshot_channel();
     partition
-        .on_request(store(43, 1, kind, 0), Some(sender))
+        .on_request(
+            store(&partition, 77, 1, ConsumerKind::ConsumerGroup, 0),
+            Some(sender),
+        )
         .await;
     commit_pending(&mut partition, &config).await;
-    assert_success(stored);
-    let reply = deleted
-        .now_or_never()
-        .expect("the old delete must finish")
-        .unwrap();
-    assert_eq!(
-        reply.header().status,
-        IggyError::ConsumerOffsetNotFound(CONSUMER_ID as usize).as_code()
+    assert_success(receiver);
+    let (sender, receiver) = oneshot_channel();
+    partition.on_request(delayed_cleanup, Some(sender)).await;
+    assert_status(
+        receiver,
+        IggyError::ConsumerGroupPartitionNotOwned(CONSUMER_ID, 0).as_code(),
     );
-    assert_eq!(
-        partition.get_consumer_offset(polling_consumer(kind)),
-        Some(0),
-        "the obsolete delete must not remove the replacement checkpoint"
-    );
-    assert_eq!(partition.consensus().sequencer().current_sequence(), 5);
-    for receiver in obsolete_stores {
-        let reply = receiver
-            .now_or_never()
-            .expect("the obsolete store must finish")
-            .unwrap();
-        assert_eq!(reply.header().status, IggyError::InvalidOffset(0).as_code());
-    }
+    assert_eq!(partition.get_consumer_offset(consumer), Some(0));
 }
 
 #[allow(clippy::future_not_send)]
-async fn partition_with_old_record() -> (TestPartition, PartitionsConfig, tempfile::TempDir) {
+async fn install_owner_record(
+    partition: &mut TestPartition,
+    config: &PartitionsConfig,
+    installation: InstallConsumerGroupOwnerRequest,
+) {
+    let (sender, receiver) = oneshot_channel();
+    partition
+        .on_request(
+            offset_request(
+                partition,
+                Operation::InstallConsumerGroupOwner,
+                AUTO_COMMIT_CLIENT_ID,
+                installation.metadata_op,
+                &installation.to_bytes(),
+                0,
+            ),
+            Some(sender),
+        )
+        .await;
+    commit_pending(partition, config).await;
+    assert_success(receiver);
+    assert!(
+        partition
+            .installed_consumer_group_owner(&installation)
+            .is_some()
+    );
+}
+
+fn delete_fence(partition: &TestPartition) -> Message<RoutedRequestHeader> {
+    let transition = TransitionPartitionHistoryRequest {
+        incarnation: partition.created_revision(),
+        metadata_op: DELETE_METADATA_OP,
+    };
+    offset_request(
+        partition,
+        Operation::TransitionPartitionHistory,
+        AUTO_COMMIT_CLIENT_ID,
+        transition.metadata_op,
+        &transition.to_bytes(),
+        0,
+    )
+}
+
+#[allow(clippy::future_not_send)]
+async fn assert_fence_waits(partition: &mut TestPartition) {
+    let before = partition.consensus().sequencer().current_sequence();
+    let (sender, receiver) = oneshot_channel();
+    partition
+        .on_request(delete_fence(partition), Some(sender))
+        .await;
+    assert_status(receiver, IggyError::TransientNotAccepted.as_code());
+    assert_eq!(partition.consensus().sequencer().current_sequence(), before);
+}
+
+#[allow(clippy::future_not_send)]
+async fn delete_history(partition: &mut TestPartition, config: &PartitionsConfig) {
+    assert_eq!(partition.consensus().request_queue_len(), 0);
+    let fence_op = partition.consensus().commit_min() + 1;
+    let (sender, receiver) = oneshot_channel();
+    partition
+        .on_request(delete_fence(partition), Some(sender))
+        .await;
+    commit_pending(partition, config).await;
+    assert_success(receiver);
+    assert!(partition.history_deleted());
+    assert_eq!(partition.consensus().commit_min(), fence_op);
+}
+
+#[allow(clippy::future_not_send)]
+async fn partition_with_old_record(
+    replica_count: u8,
+) -> (TestPartition, PartitionsConfig, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let segment_size = IggyByteSize::from(1_048_576_u64);
     let config = PartitionsConfig {
@@ -348,7 +273,7 @@ async fn partition_with_old_record() -> (TestPartition, PartitionsConfig, tempfi
     let consensus = VsrConsensus::new(
         1,
         0,
-        3,
+        replica_count,
         namespace().inner(),
         Rc::new(IggyMessageBus::new(0)),
         LocalPipeline::with_capacities(1, 8),
@@ -360,9 +285,22 @@ async fn partition_with_old_record() -> (TestPartition, PartitionsConfig, tempfi
         segment_size,
     );
     partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-    partition.on_request(append(1, b"old record"), None).await;
+    let installation = InstallConsumerGroupOwnerRequest {
+        incarnation: partition.created_revision(),
+        group_id: u64::from(CONSUMER_ID),
+        owner: ConsumerGroupOwner {
+            client_id: 42,
+            session: 1,
+            generation: 1,
+        },
+        metadata_op: 1,
+    };
+    install_owner_record(&mut partition, &config, installation).await;
+    partition
+        .on_request(append(&partition, 1, b"old record"), None)
+        .await;
     commit_pending(&mut partition, &config).await;
-    assert_eq!(partition.consensus().commit_min(), 1);
+    assert_eq!(partition.consensus().commit_min(), 2);
     (partition, config, directory)
 }
 
@@ -393,38 +331,6 @@ async fn process_self_acknowledgments(partition: &mut TestPartition, config: &Pa
     }
 }
 
-fn poll(
-    partition: TestPartition,
-    config: &PartitionsConfig,
-    consumer: PollingConsumer,
-    args: &PollingArgs,
-) -> (TestPartition, Vec<Vec<u8>>) {
-    let owner = IggyPartitions::new(ShardId::new(0), config.clone());
-    owner.insert(namespace(), partition);
-    let read = owner
-        .build_poll_snapshot(&namespace(), consumer, args)
-        .unwrap()
-        .execute_resident();
-    let completion = owner.complete_poll(&namespace(), read).unwrap();
-    assert!(
-        completion.replication.is_none(),
-        "automatic commits in this fixture must queue"
-    );
-    let payloads = completion
-        .fragments
-        .iter()
-        .flat_map(|fragment| {
-            let batch =
-                decode_batch_slice_with(fragment.as_slice(), BatchIntegrity::Verify).unwrap();
-            batch
-                .iter_with_offsets()
-                .map(|record| record.message.payload.to_vec())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    (owner.remove(&namespace()).unwrap(), payloads)
-}
-
 fn namespace() -> IggyNamespace {
     IggyNamespace::new(1, 1, 0)
 }
@@ -437,7 +343,7 @@ const fn polling_consumer(kind: ConsumerKind) -> PollingConsumer {
     }
 }
 
-fn append(request: u64, payload: &[u8]) -> Message<RoutedRequestHeader> {
+fn append(partition: &TestPartition, request: u64, payload: &[u8]) -> Message<RoutedRequestHeader> {
     let mut messages = IggyMessages::with_capacity(1);
     messages.push(IggyMessage {
         header: IggyMessageHeader {
@@ -457,12 +363,15 @@ fn append(request: u64, payload: &[u8]) -> Message<RoutedRequestHeader> {
             session: 1,
             request,
             group: namespace().inner(),
+            partition_incarnation: partition.created_revision(),
+            metadata_watermark: METADATA_WATERMARK,
             ..Default::default()
         })
         .unwrap()
 }
 
 fn store(
+    partition: &TestPartition,
     client: u128,
     request: u64,
     kind: ConsumerKind,
@@ -480,10 +389,21 @@ fn store(
         ack: AckLevel::Quorum,
     }
     .to_bytes();
-    offset_request(Operation::StoreConsumerOffset, client, request, &body)
+    offset_request(
+        partition,
+        Operation::StoreConsumerOffset,
+        client,
+        request,
+        &body,
+        owner_generation(partition, kind),
+    )
 }
 
-fn delete(kind: ConsumerKind, request: u64) -> Message<RoutedRequestHeader> {
+fn delete(
+    partition: &TestPartition,
+    kind: ConsumerKind,
+    request: u64,
+) -> Message<RoutedRequestHeader> {
     let body = DeleteConsumerOffsetRequest {
         consumer: WireConsumer {
             kind: kind.as_code(),
@@ -495,14 +415,23 @@ fn delete(kind: ConsumerKind, request: u64) -> Message<RoutedRequestHeader> {
         ack: AckLevel::Quorum,
     }
     .to_bytes();
-    offset_request(Operation::DeleteConsumerOffset, 42, request, &body)
+    offset_request(
+        partition,
+        Operation::DeleteConsumerOffset,
+        42,
+        request,
+        &body,
+        owner_generation(partition, kind),
+    )
 }
 
 fn offset_request(
+    partition: &TestPartition,
     operation: Operation,
     client: u128,
     request: u64,
     body: &[u8],
+    owner_generation: u64,
 ) -> Message<RoutedRequestHeader> {
     let size = size_of::<RoutedRequestHeader>() + body.len();
     let mut message = Message::<RoutedRequestHeader>::new(size);
@@ -516,15 +445,34 @@ fn offset_request(
             session: 1,
             request,
             group: namespace().inner(),
+            owner_generation,
+            partition_incarnation: partition.created_revision(),
+            metadata_watermark: METADATA_WATERMARK,
             ..Default::default()
         };
     })
 }
 
+fn owner_generation(partition: &TestPartition, kind: ConsumerKind) -> u64 {
+    match kind {
+        ConsumerKind::Consumer | ConsumerKind::ExternalGroup => 0,
+        ConsumerKind::ConsumerGroup => {
+            partition
+                .consumer_group_owner(u64::from(CONSUMER_ID))
+                .unwrap()
+                .generation
+        }
+    }
+}
+
 fn assert_success(receiver: consensus::Receiver<Message<ReplyHeader>>) {
+    assert_status(receiver, 0);
+}
+
+fn assert_status(receiver: consensus::Receiver<Message<ReplyHeader>>, status: u32) {
     let reply = receiver
         .now_or_never()
-        .expect("the store must finish")
+        .expect("the request must finish")
         .unwrap();
-    assert_eq!(reply.header().status, 0);
+    assert_eq!(reply.header().status, status);
 }

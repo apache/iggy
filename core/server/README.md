@@ -37,7 +37,7 @@ To run one node of a cluster, pass its replica ID from the `cluster.nodes` roste
 cargo run --bin iggy-server --release -- --replica-id 0
 ```
 
-`--replica-id` selects the configured replica. Other settings come from configuration.
+Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
 ## Configuration
 
@@ -87,6 +87,14 @@ offset writes support the configured policy. Crash-safe send retries require
 receipt still replays its original result, but a lost receipt cannot prevent
 another execution. NoAck and internal auto-commit polls retain their weaker
 completion contracts.
+
+Topics have an immutable `partition_resize_policy` creation option. The default,
+`mutable`, permits partition addition and deletion without a bounded cutover or
+per-key ordering across partition layouts. `fixed` rejects both operations with
+`PartitionResizeDisabled` (2023). Existing messages stay in their original
+partitions. Neither policy prevents retention or deletion of the topic.
+Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
+`options` map, or the CLI's `--set partition_resize_policy=fixed`.
 
 ## Upgrade recovery
 
@@ -171,7 +179,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-DURABLE-SESSIONS-3` requires this initialization contract;
+Storage format `IGGY-OWNERSHIP-HISTORY-4` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory
@@ -185,8 +193,8 @@ permanent failures.
 Partition retirement barriers batch up to 128 ended sessions per commit. Each
 session still requires retirement reports covering every allocated partition
 from a common replica quorum before metadata releases its registry slot. Segment
-deletion and purge do not invalidate those reports; changes to partition
-incarnations do. Metadata snapshot format 8 persists that separate revision.
+deletion does not invalidate those reports; changes to partition incarnations
+do. Metadata snapshot format 10 persists that separate revision.
 
 A committed partition that has never initialized on this replica can finish
 initialization after a crash, including when all replicas stopped before their

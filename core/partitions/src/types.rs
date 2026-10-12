@@ -16,14 +16,14 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
+use iggy_common::{EncryptorKind, IggyByteSize, PollingKind, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///
-/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// The replica is divergent from here on: the commit walk popped
 /// the op, its `commit_min` never advanced, and the next
 /// `advance_commit_min` would assert on the gap. Continuing would either
 /// serve a prefix the cluster has moved past or panic somewhere less
@@ -103,7 +103,8 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
 pub struct PollingArgs {
-    pub strategy: PollingStrategy,
+    pub kind: PollingKind,
+    pub value: u64,
     pub count: u32,
     pub auto_commit: bool,
 }
@@ -115,7 +116,8 @@ impl PollingArgs {
     #[must_use]
     pub const fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
         Self {
-            strategy,
+            kind: strategy.kind,
+            value: strategy.value,
             count,
             auto_commit,
         }

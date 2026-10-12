@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { Entries, ObjectKeys } from '$lib/types/utilTypes';
+import type { Entries, ObjectKeys } from '#lib/types/utilTypes.js';
 
 declare global {
   interface ObjectConstructor {

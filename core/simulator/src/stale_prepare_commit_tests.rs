@@ -420,9 +420,20 @@ fn given_an_old_primary_holding_several_stale_prepares_when_it_rejoins_should_ca
     let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
 
     isolate(&mut sim, OLD_PRIMARY, false);
+    // Timed from the adoption, not the heal: how long the old primary takes to
+    // learn of the new view is the view probe's business, not the proof's.
+    (0..SETTLE_STEPS)
+        .find(|_| {
+            sim.step();
+            group_state(&sim, OLD_PRIMARY, namespace).1 >= new_view
+        })
+        .expect("the old primary never adopted the new view");
     let caught_up = (0..SETTLE_STEPS).find(|_| {
+        if group_state(&sim, OLD_PRIMARY, namespace).2 >= majority_commit {
+            return true;
+        }
         sim.step();
-        group_state(&sim, OLD_PRIMARY, namespace).2 >= majority_commit
+        false
     });
     let caught_up =
         caught_up.unwrap_or_else(|| panic!("the old primary never caught up to {majority_commit}"));

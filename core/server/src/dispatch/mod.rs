@@ -46,7 +46,7 @@ pub mod test_support;
 use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::dispatch::failure::{
     FrameChannel, send_deny_reply, send_eviction, send_host_frame, send_pre_consensus_deny,
-    send_unbound_deny_reply,
+    send_unbound_deny_reply, send_undeclared_operation_deny,
 };
 use crate::dispatch::partition::{dispatch_partition_request, handle_delete_segments_request};
 use crate::dispatch::reads::handle_non_replicated_request;
@@ -68,7 +68,7 @@ use iggy_binary_protocol::codes::{
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{
-    EvictionReason, GenericHeader, Operation, RequestHeader, RoutedRequestHeader,
+    EvictionReason, GenericHeader, HEADER_SIZE, Operation, RequestHeader, RoutedRequestHeader,
 };
 use iggy_common::{IggyError, UserStatus};
 use journal::superblock::SuperblockStore;
@@ -78,6 +78,7 @@ use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::mem::offset_of;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -168,10 +169,12 @@ fn enqueue_client_request<B, MJ, S, SB>(
 /// [`MAX_QUEUED_CLIENT_REQUESTS`] with the retryable transient denial.
 ///
 /// Spawned rather than awaited: the enqueue path is sync (it runs straight off
-/// frame arrival) and the reply goes out on the bus. Two shapes are dropped
-/// rather than answered: a frame whose header will not even cast, exactly as
-/// the drain loop drops it, and a frame that arrives before the shard is
-/// built, which leaves nothing to render a reply from.
+/// frame arrival) and the reply goes out on the bus. The header decodes as in
+/// the drain loop: an undeclared operation byte gets the `InvalidCommand` deny
+/// instead of the transient one, because no retry of that frame can succeed,
+/// and any other header that will not cast is dropped. A frame that arrives
+/// before the shard is built is dropped too: nothing exists yet to render a
+/// reply from.
 fn deny_overflowing_client_request<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     transport_client_id: u128,
@@ -195,22 +198,20 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
         return;
     };
     shard.metrics().record_client_request_denied_queue_full();
-    let Ok(request) = message.try_into_typed::<RequestHeader>() else {
-        warn!(
-            transport_client_id,
-            "dropping over-queue client request with invalid header"
-        );
-        return;
-    };
-    let request = request.into_routed();
-    debug!(
-        transport_client_id,
-        operation = ?request.header().operation,
-        queued = MAX_QUEUED_CLIENT_REQUESTS,
-        "denying client request retryable: this connection's request queue is full"
-    );
     let bus = shard.bus.clone();
     bus.spawn(async move {
+        let Some(request) =
+            decode_or_deny_client_request(&shard, transport_client_id, message).await
+        else {
+            return;
+        };
+        let request = request.into_routed();
+        debug!(
+            transport_client_id,
+            operation = ?request.header().operation,
+            queued = MAX_QUEUED_CLIENT_REQUESTS,
+            "denying client request retryable: this connection's request queue is full"
+        );
         send_deny_reply(
             &shard,
             transport_client_id,
@@ -382,6 +383,52 @@ fn non_replicated_code(header: &RoutedRequestHeader) -> u32 {
     u32::from_le_bytes(header.reserved[..4].try_into().unwrap())
 }
 
+/// A copy of the header of a client frame whose operation byte this build
+/// does not declare, for the deny to patch and echo. A declared byte costs
+/// one read and no copy.
+fn undeclared_operation_header(message: &Message<GenericHeader>) -> Option<[u8; HEADER_SIZE]> {
+    let header = message.as_slice().get(..HEADER_SIZE)?;
+    if Operation::is_known_code(header[offset_of!(RequestHeader, operation)]) {
+        return None;
+    }
+    header.try_into().ok()
+}
+
+/// Type a client frame as a request. A frame whose operation byte this build
+/// does not declare gets the `InvalidCommand` deny, and any other header that
+/// will not cast is dropped with a warning: both return `None`. Probing the
+/// byte first skips the cast's command check, which is safe because the
+/// transport admits only `Request` frames.
+#[allow(clippy::future_not_send)]
+async fn decode_or_deny_client_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    message: Message<GenericHeader>,
+) -> Option<Message<RequestHeader>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Some(request_header) = undeclared_operation_header(&message) {
+        send_undeclared_operation_deny(shard, transport_client_id, request_header).await;
+        return None;
+    }
+    match message.try_into_typed::<RequestHeader>() {
+        Ok(request) => Some(request),
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "dropping client request with invalid header"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -397,16 +444,9 @@ async fn handle_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let request = match message.try_into_typed::<RequestHeader>() {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                transport_client_id,
-                error = %error,
-                "dropping client request with invalid header"
-            );
-            return;
-        }
+    let Some(request) = decode_or_deny_client_request(shard, transport_client_id, message).await
+    else {
+        return;
     };
     // Promote to the server-internal routed shape at the boundary: the
     // client wire carries no group (it is derived -- plane from `operation`,
@@ -646,13 +686,11 @@ async fn handle_client_request<B, MJ, S, SB>(
                     return;
                 }
             };
-            // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
-            // partition count for Join) before replication; see `crate::consumer_group`.
-            let request = match maybe_rewrite_consumer_group_request(shard, request).await {
+            // Attach the authenticated member identity to consumer-group
+            // Join/Leave before replication; see `crate::consumer_group`.
+            let request = match maybe_rewrite_consumer_group_request(request) {
                 Ok(rewritten) => rewritten,
                 Err(error) => {
-                    // Preserve transient recovery rejection so the client can
-                    // retry the join once partition state is available.
                     send_pre_consensus_deny(
                         shard,
                         transport_client_id,
@@ -669,59 +707,64 @@ async fn handle_client_request<B, MJ, S, SB>(
             // bring the committed reply back here. This shard owns the connection,
             // so it writes the reply to the socket via the transport client id --
             // shard 0 can't route by the consensus client id (no home-shard bits).
-            match submit_client_request_on_owner(shard, request).await {
-                Some(reply) => {
-                    // Recorded before the reply reaches the socket, so a read the client
-                    // sends the instant it decodes this frame already sees the mark.
-                    if let Some(commit) = committed_reply_commit(&reply) {
-                        sessions
-                            .borrow_mut()
-                            .record_metadata_watermark(transport_client_id, commit);
-                    }
-                    // The raw PAT token never enters consensus (it is non-deterministic
-                    // and secret), so the committed reply body is empty. Substitute the
-                    // raw-token response here, on the minting client's home shard, using
-                    // the confirmed commit position from the committed reply.
-                    let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
-                        Ok(reply) => reply,
-                        Err(error) => {
-                            warn!(
-                                transport_client_id,
-                                error = %error,
-                                "failed to build raw PAT reply"
-                            );
-                            // The op COMMITTED; only the reply could not be
-                            // rendered. A typed deny is still the right frame:
-                            // silence wedges the lockstep connection on a
-                            // request that succeeded server-side. The raw
-                            // token is unrecoverable either way -- it lives in
-                            // that one reply and a retry dedups to the empty
-                            // committed body -- so the caller must delete the
-                            // token and mint a new one.
-                            send_deny_reply(shard, transport_client_id, &header, error.as_code())
-                                .await;
-                            return;
-                        }
-                    };
-                    send_host_frame(
-                        &shard.bus,
-                        transport_client_id,
-                        reply.into_frozen(),
-                        FrameChannel::Reply,
-                        "committed_reply",
-                    )
-                    .await;
-                }
-                None => {
-                    // Transient submit failure (not primary / not caught up / dedup
-                    // absorbed). Stay silent; the SDK read-timeout replays.
+            let Some(reply) = submit_client_request_on_owner(shard, request).await else {
+                // No verdict came back, for example because the inbox of
+                // shard 0 refused the forward. The outcome is unknown, so
+                // only a replay of this request id is safe. A silent drop
+                // leaves the client waiting for its whole read timeout.
+                warn!(
+                    transport_client_id,
+                    operation = ?header.operation,
+                    "replicated request has no metadata verdict; client replays"
+                );
+                send_deny_reply(
+                    shard,
+                    transport_client_id,
+                    &header,
+                    IggyError::TransientNotCommitted.as_code(),
+                )
+                .await;
+                return;
+            };
+            // Recorded before the reply reaches the socket, so a read the client
+            // sends the instant it decodes this frame already sees the mark.
+            if let Some(commit) = committed_reply_commit(&reply) {
+                sessions
+                    .borrow_mut()
+                    .record_metadata_watermark(transport_client_id, commit);
+            }
+            // The raw PAT token never enters consensus (it is non-deterministic
+            // and secret), so the committed reply body is empty. Substitute the
+            // raw-token response here, on the minting client's home shard, using
+            // the confirmed commit position from the committed reply.
+            let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
+                Ok(reply) => reply,
+                Err(error) => {
                     warn!(
                         transport_client_id,
-                        operation = ?header.operation,
-                        "replicated request not committed (transient); client will replay"
+                        error = %error,
+                        "failed to build raw PAT reply"
                     );
+                    // The op COMMITTED; only the reply could not be
+                    // rendered. A typed deny is still the right frame:
+                    // silence wedges the lockstep connection on a
+                    // request that succeeded server-side. The raw
+                    // token is unrecoverable either way -- it lives in
+                    // that one reply and a retry dedups to the empty
+                    // committed body -- so the caller must delete the
+                    // token and mint a new one.
+                    send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+                    return;
                 }
-            }
+            };
+            send_host_frame(
+                &shard.bus,
+                transport_client_id,
+                reply.into_frozen(),
+                FrameChannel::Reply,
+                "committed_reply",
+            )
+            .await;
         }
     }
 }
@@ -830,8 +873,8 @@ mod tests {
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestMux, TestShard, prepare_message, register_reply, request_message,
-        test_shard,
+        FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, prepare_message,
+        register_reply, request_message, test_shard,
     };
     use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
@@ -1145,6 +1188,7 @@ mod tests {
             inbox_rx,
             reply_inbox_rx,
             POLL_COMPLETION_CAPACITY,
+            None,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
@@ -1849,6 +1893,124 @@ mod tests {
             assert_eq!(frame_command(frame), Command::Reply as u8);
             assert_eq!(reply_status(frame), 0, "a served ping succeeds");
         }
+    }
+
+    /// The two frames differ only in the operation byte. A declared one gets
+    /// the retryable deny, and an undeclared one gets `InvalidCommand`,
+    /// because no retry of that frame can succeed.
+    #[compio::test]
+    async fn overflowing_request_gets_transient_deny_unless_its_operation_is_undeclared() {
+        const TRANSPORT: u128 = 99;
+        assert!(
+            !Operation::is_known_code(UNDECLARED_OPERATION),
+            "test needs an operation byte this build does not declare"
+        );
+        for (operation, status) in [
+            (
+                Operation::NonReplicated as u8,
+                IggyError::TransientNotAccepted.as_code(),
+            ),
+            (UNDECLARED_OPERATION, IggyError::InvalidCommand.as_code()),
+        ] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let shard_handle = unset_shard_handle();
+            *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+            let mut frame = non_replicated_request(TRANSPORT, PING_CODE);
+            frame.as_mut_slice()[offset_of!(RequestHeader, operation)] = operation;
+
+            deny_overflowing_client_request(&shard_handle, TRANSPORT, frame);
+            for _ in 0..500 {
+                if !bus.client_replies.borrow().is_empty() {
+                    break;
+                }
+                run_spawned_tasks().await;
+            }
+
+            let replies = bus.client_replies.borrow();
+            assert_eq!(
+                replies.len(),
+                1,
+                "operation {operation:#04x}: an over-queue request must be answered"
+            );
+            let (client, reply) = &replies[0];
+            assert_eq!(*client, TRANSPORT);
+            assert_eq!(frame_command(reply), Command::Reply as u8);
+            assert_eq!(
+                reply_status(reply),
+                status,
+                "operation {operation:#04x}: wrong deny status"
+            );
+            assert_eq!(
+                reply[offset_of!(ReplyHeader, operation)],
+                operation,
+                "the deny must echo the request's own operation byte"
+            );
+        }
+    }
+
+    /// A home shard other than 0 forwards a metadata write to shard 0. A full
+    /// inbox there drops the forward, so no verdict comes back. A silent drop
+    /// left the client waiting for its whole read timeout.
+    #[compio::test]
+    async fn given_full_owner_inbox_when_metadata_write_is_forwarded_should_deny_transient_not_committed()
+     {
+        const TRANSPORT: u128 = 95;
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const USER: u32 = 0;
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (owner, _owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        owner
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("owner inbox has one slot");
+        let (home, _, _) = shard_channel(1, 1, 1);
+        shard.id = 1;
+        shard.attach_senders(vec![owner, home]);
+        let attachment = {
+            let mut client_table = shard.plane.metadata().client_table.borrow_mut();
+            client_table
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, SESSION))
+                .unwrap();
+            client_table.attach_session(CLIENT, SESSION, USER).unwrap()
+        };
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        sessions.borrow_mut().ensure_connection(
+            TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+        sessions
+            .borrow_mut()
+            .bind_authenticated_connection(TRANSPORT, CLIENT, SESSION, USER, attachment, SESSION)
+            .unwrap();
+        let body = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(1),
+        }
+        .to_bytes();
+        let request = wire_request(Operation::DeleteUser, CLIENT, SESSION, 1, &body);
+
+        handle_client_request(
+            &Rc::new(shard),
+            &sessions,
+            &Arc::new(ServerConfig::default()),
+            1,
+            TRANSPORT,
+            request.into_generic(),
+        )
+        .await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "a lost forward must still answer");
+        let (client, reply) = &replies[0];
+        assert_eq!(*client, TRANSPORT);
+        assert_eq!(frame_command(reply), Command::Reply as u8);
+        assert_eq!(
+            reply_status(reply),
+            IggyError::TransientNotCommitted.as_code(),
+            "only a replay of the same request id is safe"
+        );
     }
 
     /// The per-client queue entry goes with its last frame. The

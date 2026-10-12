@@ -172,6 +172,7 @@ impl HttpSessionExt for HttpClient {
             topic_id: Identifier::default(),
             partitioning: Partitioning::partition_id(partition_id),
             batch: IggyMessagesBatch::from(&messages),
+            context: None,
         };
         self.client
             .post(self.url(&format!("/streams/{stream}/topics/{topic}/messages{query}")))
@@ -482,6 +483,7 @@ async fn given_consumer_offset_when_stored_and_deleted_should_round_trip(harness
 
     let offsets_path = "/streams/http-offsets/topics/offsets/consumer-offsets";
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 1,
@@ -598,6 +600,7 @@ async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harn
         "produce must commit"
     );
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 0,
@@ -627,6 +630,46 @@ async fn given_missing_consumer_offset_when_deleting_should_reject_404_fast(harn
         StatusCode::NO_CONTENT,
         "existing offset delete must commit"
     );
+}
+
+#[iggy_harness]
+async fn given_purge_paths_when_deleting_should_answer_404_and_keep_messages(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-purge-paths", "kept", 1)
+        .await;
+    let messages = vec![text_message(1, "kept".to_string())];
+    let response = http
+        .produce("http-purge-paths", "kept", PARTITION_ID, messages)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+
+    for path in [
+        "/streams/http-purge-paths/purge",
+        "/streams/http-purge-paths/topics/kept/purge",
+    ] {
+        let response = http.delete(path).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must match no route"
+        );
+        let body = response.text().await.expect("read 404 body");
+        assert!(
+            body.is_empty(),
+            "{path} must match no route, not a handler 404: {body}"
+        );
+    }
+
+    let polled = http
+        .poll("http-purge-paths", "kept", PARTITION_ID, 0, 10)
+        .await;
+    assert_eq!(polled.messages.len(), 1, "the topic must keep its message");
 }
 
 /// A store of an out-of-range consumer offset is denied by the partition
@@ -666,6 +709,7 @@ async fn given_out_of_range_consumer_offset_when_storing_should_reject_400_fast(
     // Offset 5 runs past the committed tail (offset 1), so it is out of range.
     let offsets_path = "/streams/http-store-range/topics/offsets/consumer-offsets";
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer id")),
         partition_id: Some(PARTITION_ID),
         offset: 5,

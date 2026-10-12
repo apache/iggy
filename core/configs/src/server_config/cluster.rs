@@ -308,7 +308,8 @@ pub struct ClusterConfig {
     /// Applies per plane: the metadata superblock, and each PARTITION's own. While
     /// wedged the group is already fenced quorum-invisible and peers elect around
     /// it; this converts the log-only limp into a distinct exit status a
-    /// supervisor can act on. Zero (and the `0` /
+    /// supervisor can act on. It is also the deadline of each running
+    /// partition file job (`sharding.partition_io_capacity`). Zero (and the `0` /
     /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
     /// the fail-stop; nonzero values below
     /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.
@@ -1567,6 +1568,25 @@ mod tests {
                 .iter()
                 .any(|mapping| mapping.env_name.contains("ADVERTISED_ADDRESSES_16_")),
             "selector env expansion must stop at max_elements = 16"
+        );
+    }
+
+    #[test]
+    fn advertised_addresses_env_template_keeps_each_vector_limit() {
+        let template = <ClusterConfig as configs::ConfigEnvMappings>::env_templates()
+            .iter()
+            .find(|template| template.env_name == "NODES_<N>_ADVERTISED_ADDRESSES_<N>_CLIENT_CIDR")
+            .expect("advertised address template");
+
+        assert_eq!(template.max_elements, &[256, 16]);
+
+        let mapping = <ClusterConfig as configs::ConfigEnvMappings>::env_mappings()
+            .iter()
+            .find(|mapping| mapping.env_name == "NODES_3_ADVERTISED_ADDRESSES_7_CLIENT_CIDR")
+            .expect("expanded advertised address mapping");
+        assert_eq!(
+            mapping.config_path,
+            "nodes.3.advertised_addresses.7.client_cidr"
         );
     }
 }

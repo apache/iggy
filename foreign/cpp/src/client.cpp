@@ -179,10 +179,6 @@ void IggyBlockingClient::DeleteStream(const Identifier &stream) {
     RethrowAsIggyException([this, &stream] { Handle()->delete_stream(stream.ToFfi()); });
 }
 
-void IggyBlockingClient::PurgeStream(const Identifier &stream) {
-    RethrowAsIggyException([this, &stream] { Handle()->purge_stream(stream.ToFfi()); });
-}
-
 TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
                                              std::string name,
                                              const TopicCreateOptions &options) {
@@ -275,10 +271,6 @@ void IggyBlockingClient::DeleteTopic(const Identifier &stream, const Identifier 
     RethrowAsIggyException([this, &stream, &topic] { Handle()->delete_topic(stream.ToFfi(), topic.ToFfi()); });
 }
 
-void IggyBlockingClient::PurgeTopic(const Identifier &stream, const Identifier &topic) {
-    RethrowAsIggyException([this, &stream, &topic] { Handle()->purge_topic(stream.ToFfi(), topic.ToFfi()); });
-}
-
 void IggyBlockingClient::CreatePartitions(const Identifier &stream,
                                           const Identifier &topic,
                                           const std::uint32_t partitions_count) {
@@ -368,6 +360,18 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
         Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
                                         std::string(consumer.KindName()), consumer.Id().ToFfi(), offset);
+    });
+}
+
+void IggyBlockingClient::StoreConsumerPosition(const Consumer &consumer,
+                                               const Identifier &stream,
+                                               const Identifier &topic,
+                                               const std::uint32_t partition_id,
+                                               const std::uint64_t offset,
+                                               const PartitionContext &context) {
+    RethrowAsIggyException([this, &consumer, &stream, &topic, partition_id, offset, &context] {
+        Handle()->store_consumer_position(stream.ToFfi(), topic.ToFfi(), partition_id, std::string(consumer.KindName()),
+                                          consumer.Id().ToFfi(), offset, context.ToFfi());
     });
 }
 
