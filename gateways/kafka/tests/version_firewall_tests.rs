@@ -37,12 +37,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DESCRIBE_CONFIGS,
-    API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID,
-    API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
-    API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP,
-    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION, advertised_min_version,
-    handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
+    API_KEY_DESCRIBE_CONFIGS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT,
+    API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP, API_KEY_LIST_OFFSETS,
+    API_KEY_METADATA, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE,
+    API_KEY_SYNC_GROUP, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_UNSUPPORTED_VERSION,
+    advertised_min_version, handle_request, is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -57,17 +57,17 @@ use tcp::{
 use wire::{
     JoinGroupParams, OUT_OF_SCOPE_API_KEYS, SyncGroupParams, build_alter_configs_empty_request,
     build_api_versions_flexible_request, build_create_topics_empty_request,
-    build_describe_configs_empty_request, build_fetch_empty_topics_request,
-    build_find_coordinator_request, build_heartbeat_request, build_init_producer_id_request,
-    build_join_group_request, build_leave_group_request, build_list_offsets_request,
-    build_metadata_all_topics_flexible, build_metadata_all_topics_legacy,
-    build_metadata_flexible_request_v10, build_offset_commit_request, build_offset_fetch_request,
-    build_sync_group_request,
+    build_delete_topics_empty_request, build_describe_configs_empty_request,
+    build_fetch_empty_topics_request, build_find_coordinator_request, build_heartbeat_request,
+    build_init_producer_id_request, build_join_group_request, build_leave_group_request,
+    build_list_offsets_request, build_metadata_all_topics_flexible,
+    build_metadata_all_topics_legacy, build_metadata_flexible_request_v10,
+    build_offset_commit_request, build_offset_fetch_request, build_sync_group_request,
 };
 
 #[test]
-fn supported_ranges_table_has_sixteen_entries() {
-    assert_eq!(supported_api_ranges().len(), 16);
+fn supported_ranges_table_has_seventeen_entries() {
+    assert_eq!(supported_api_ranges().len(), 17);
 }
 
 #[test]
@@ -104,7 +104,10 @@ fn is_supported_version_matches_scope_table() {
 ///
 /// The wire rows are `supported_api_ranges()` sorted by `api_key` (`api_versions.rs`).
 /// `SCOPED_API_KEYS` is already in that ascending order, and this test reads the response
-/// in that order. `supported_ranges_table_has_sixteen_entries` and
+/// in that order (Produce, Fetch, `ListOffsets`, Metadata, `OffsetCommit`, `OffsetFetch`,
+/// `FindCoordinator`, `JoinGroup`, Heartbeat, `LeaveGroup`, `SyncGroup`, `ApiVersions`,
+/// `CreateTopics`, `DeleteTopics`, `InitProducerId`, `DescribeConfigs`, `AlterConfigs`).
+/// `supported_ranges_table_has_seventeen_entries` and
 /// `is_supported_version_matches_scope_table` pin that both tables cover the same keys.
 #[tokio::test]
 async fn apiversions_advertises_exact_supported_ranges_v1() {
@@ -496,6 +499,7 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             .flatten()
             .unwrap_or_else(|| build_list_offsets_request(version, "scope-topic", 0)),
         API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
+        API_KEY_DELETE_TOPICS => build_delete_topics_empty_request(version),
         API_KEY_FIND_COORDINATOR => build_find_coordinator_request(version, &["scope-group"], 0),
         // A member id the coordinator never handed out, so every in-range version answers
         // UNKNOWN_MEMBER_ID immediately instead of creating a group and parking on its join
