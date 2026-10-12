@@ -524,3 +524,106 @@ async fn given_rename_only_when_updating_topic_should_leave_settings_alone(harne
         "a key the update did not carry keeps its value"
     );
 }
+
+#[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
+async fn given_resize_policy_when_resizing_should_enforce_the_immutable_partition_set(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.unwrap();
+    client.create_stream("resize-stream").await.unwrap();
+    let stream = Identifier::named("resize-stream").unwrap();
+    let policy_key = HeaderKey::from_str(topic_option_keys::PARTITION_RESIZE_POLICY).unwrap();
+
+    for (name, policy) in [
+        ("default", None),
+        ("mutable", Some(PartitionResizePolicy::Mutable)),
+        ("fixed", Some(PartitionResizePolicy::Fixed)),
+    ] {
+        let created = client
+            .create_topic(
+                &stream,
+                name,
+                &TopicCreateOptions {
+                    partitions_count: Some(2),
+                    partition_resize_policy: policy,
+                    ..TopicCreateOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let effective = policy.unwrap_or_default();
+        assert_eq!(
+            created.options[&policy_key].value.to_string_value(),
+            effective.to_string()
+        );
+        assert_eq!(created.options[&policy_key].explicit, policy.is_some());
+        let topic = Identifier::named(name).unwrap();
+
+        let added = client.create_partitions(&stream, &topic, 1).await;
+        if effective == PartitionResizePolicy::Fixed {
+            assert_policy_error(added.unwrap_err(), IggyError::PartitionResizeDisabled);
+        } else {
+            added.unwrap();
+        }
+        let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
+        assert_eq!(
+            details.partitions.len(),
+            if effective == PartitionResizePolicy::Fixed {
+                2
+            } else {
+                3
+            }
+        );
+
+        let deleted = client.delete_partitions(&stream, &topic, 1).await;
+        if effective == PartitionResizePolicy::Fixed {
+            assert_policy_error(deleted.unwrap_err(), IggyError::PartitionResizeDisabled);
+        } else {
+            deleted.unwrap();
+        }
+        let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
+        assert_eq!(details.partitions.len(), 2);
+
+        let replacement = if effective == PartitionResizePolicy::Fixed {
+            "mutable"
+        } else {
+            "fixed"
+        };
+        let updated = client
+            .update_topic(
+                &stream,
+                &topic,
+                "renamed",
+                &TopicUpdateOptions {
+                    raw: BTreeMap::from([(
+                        topic_option_keys::PARTITION_RESIZE_POLICY.to_owned(),
+                        replacement.to_owned(),
+                    )]),
+                    ..TopicUpdateOptions::default()
+                },
+            )
+            .await;
+        assert_policy_error(
+            updated.unwrap_err(),
+            IggyError::UnsupportedOptionKey(String::new()),
+        );
+        let details = client.get_topic(&stream, &topic).await.unwrap().unwrap();
+        assert_eq!(details.name, name);
+        assert_eq!(
+            details.options[&policy_key].value.to_string_value(),
+            effective.to_string()
+        );
+        client.delete_topic(&stream, &topic).await.unwrap();
+    }
+}
+
+fn assert_policy_error(error: IggyError, expected: IggyError) {
+    if let IggyError::HttpResponseError(status, body) = error {
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST.as_u16());
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["id"], expected.as_code());
+        assert_eq!(body["code"], expected.as_string());
+    } else {
+        assert_eq!(error.as_code(), expected.as_code(), "{error:?}");
+    }
+}

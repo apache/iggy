@@ -47,6 +47,7 @@ excludes = [
     "**/.gitignore",
     "**/.gitattributes",
     "**/.dockerignore",
+    "**/Dockerfile.dockerignore",
     "**/.helmignore",
     "**/.prettierignore",
     "**/.editorconfig",

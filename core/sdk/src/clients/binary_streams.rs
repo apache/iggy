@@ -52,8 +52,4 @@ impl StreamClient for IggyClient {
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
         self.client.read().await.delete_stream(stream_id).await
     }
-
-    async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.client.read().await.purge_stream(stream_id).await
-    }
 }

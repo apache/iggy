@@ -15,32 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Consensus-level session state for the SDK.
+//! A logical session keeps its identity, bind secret, and request counter
+//! across transport reconnects. Registration retries recover the original
+//! committed session. Explicit logout starts a new logical session.
 //!
-//! Each SDK client instance generates an ephemeral random `client_id: u128`
-//! on construction. After login, the server registers this client through
-//! consensus and returns a `session` number (the commit op number).
+//! # Lifecycle
 //!
-//! The SDK tracks the `(client_id, session)` pair and a monotonically
-//! increasing `request_id` counter. These values populate the consensus
-//! headers (`RequestHeader.client`, `.session`, `.request`) when the
-//! transport sends requests through the server.
-//!
-//! ## Lifecycle
-//!
-//! ```text
-//! new()                  - fresh client_id generated, session = None
-//! begin_register()       - returns 0; re-arms a used session for a re-login
-//! bind(session)          - session assigned by server after register commits
-//! next_request_id()      - returns 1, 2, 3, ... (application requests)
-//! drop + new()           - on disconnect/crash, create a fresh session
-//! ```
-//!
-//! A single registration is one-shot ([`ConsensusSession::register_request_id`]
-//! panics if reused), but a re-login re-arms the same value in place via
-//! [`ConsensusSession::begin_register`], which mints a fresh `client_id` and
-//! clears the binding. A new `client_id` avoids ambiguous re-register; the old
-//! entry stays in the server `ClientTable` until evicted.
+//! Create one session per logical login. Registration preserves its client
+//! identity and secret when retried. `bind` accepts only a
+//! nonzero epoch matching any previous binding. Application request IDs are
+//! available only after binding; exhaustion fails instead of wrapping.
+//! Both `bind` and `next_request_id` return `Result` and callers must handle
+//! failure. Explicit disconnect clears remembered sign-in; configured AutoLogin
+//! still authenticates the next connection.
+
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_common::IggyError;
 
 /// Consensus-level session state.
 ///
@@ -58,8 +48,7 @@ pub struct ConsensusSession {
     /// Monotonically increasing request counter for application requests.
     /// Starts at 1 after registration. Register itself always uses request=0.
     request_counter: u64,
-    /// Whether `register_request_id()` has been called.
-    register_consumed: bool,
+    bind_secret: BindSecret,
 }
 
 impl ConsensusSession {
@@ -76,7 +65,7 @@ impl ConsensusSession {
             client_id,
             session: None,
             request_counter: 1,
-            register_consumed: false,
+            bind_secret: BindSecret::new(Box::new(rand::random())),
         }
     }
 
@@ -98,66 +87,46 @@ impl ConsensusSession {
         self.session.is_some()
     }
 
-    /// Bind the session after register commits through consensus.
-    /// The `session` value is the commit op number from the server's reply.
-    ///
-    /// # Panics
-    /// Panics if already bound (drop and create a new session instead).
-    pub fn bind(&mut self, session: u64) {
-        assert!(
-            self.session.is_none(),
-            "session already bound (session={})",
-            self.session.unwrap()
-        );
-        assert!(session > 0, "session must be > 0");
+    /// Internal bearer proof retained across reconnects. Never log or expose it.
+    #[doc(hidden)]
+    pub fn bind_secret(&self) -> BindSecret {
+        self.bind_secret.clone()
+    }
+
+    /// Accept the original registration, including its replay after reconnect.
+    pub fn bind(&mut self, session: u64) -> Result<(), IggyError> {
+        if session == 0 {
+            return Err(IggyError::InvalidSession(session));
+        }
+        if let Some(bound) = self.session
+            && bound != session
+        {
+            return Err(IggyError::SessionMismatch(bound, session));
+        }
         self.session = Some(session);
+        Ok(())
     }
 
     /// Returns the request ID for the register operation (always 0).
     ///
-    /// Must be called exactly once, before [`bind`](Self::bind).
-    ///
-    /// # Panics
-    /// Panics if called more than once or after the session is bound.
-    pub fn register_request_id(&mut self) -> u64 {
-        assert!(
-            !self.register_consumed,
-            "register_request_id already called"
-        );
-        assert!(!self.is_bound(), "register_request_id called after bind");
-        self.register_consumed = true;
+    pub const fn register_request_id(&self) -> u64 {
         0
-    }
-
-    /// Begin a registration, re-arming the session if it was already used.
-    ///
-    /// A re-login (fresh credentials, reconnect, or restart replay) reuses the
-    /// same `ConsensusSession`. If it is already bound or a prior register was
-    /// consumed, start a fresh session (new `client_id`, unbound) so the
-    /// Register encodes cleanly. Unlike the one-shot
-    /// [`register_request_id`](Self::register_request_id), this never panics on
-    /// a repeat login. Returns the register request id (always 0).
-    pub fn begin_register(&mut self) -> u64 {
-        if self.register_consumed || self.is_bound() {
-            *self = Self::new();
-        }
-        self.register_request_id()
     }
 
     /// Get the next application request ID and advance the counter.
     ///
     /// Returns 1, 2, 3, ... (request 0 is reserved for register).
     ///
-    /// # Panics
-    /// Panics if the session is not bound.
-    pub fn next_request_id(&mut self) -> u64 {
-        assert!(self.is_bound(), "next_request_id called before bind");
+    pub fn next_request_id(&mut self) -> Result<u64, IggyError> {
+        if !self.is_bound() {
+            return Err(IggyError::Unauthenticated);
+        }
         let id = self.request_counter;
         self.request_counter = self
             .request_counter
             .checked_add(1)
-            .expect("request counter overflow (u64::MAX requests on a single session)");
-        id
+            .ok_or(IggyError::RequestIdExhausted)?;
+        Ok(id)
     }
 
     /// Current request counter value (the next ID that will be returned).
@@ -183,112 +152,75 @@ fn generate_client_id() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     #[test]
-    fn new_session_is_unbound() {
-        let session = ConsensusSession::new();
-        assert!(!session.is_bound());
-        assert!(session.session().is_none());
-        assert_ne!(session.client_id(), 0);
+    fn new_session_is_unbound_and_has_unique_credentials() {
+        let first = ConsensusSession::new();
+        let second = ConsensusSession::new();
+        assert!(!first.is_bound());
+        assert_ne!(first.client_id(), 0);
+        assert_ne!(first.client_id(), second.client_id());
+        assert_ne!(
+            first.bind_secret().expose_secret(),
+            second.bind_secret().expose_secret()
+        );
     }
 
     #[test]
-    fn client_id_is_unique() {
-        let s1 = ConsensusSession::new();
-        let s2 = ConsensusSession::new();
-        assert_ne!(s1.client_id(), s2.client_id());
-    }
-
-    #[test]
-    fn bind_sets_session() {
-        let mut session = ConsensusSession::with_client_id(42);
-        session.bind(100);
-        assert!(session.is_bound());
-        assert_eq!(session.session(), Some(100));
-    }
-
-    #[test]
-    fn register_request_id_returns_zero() {
-        let mut session = ConsensusSession::with_client_id(1);
+    fn lost_registration_reply_preserves_identity_and_secret() {
+        let session = ConsensusSession::with_client_id(7);
+        let secret = session.bind_secret();
         assert_eq!(session.register_request_id(), 0);
-    }
-
-    #[test]
-    fn request_ids_are_monotonic_after_bind() {
-        let mut session = ConsensusSession::with_client_id(1);
-        let _ = session.register_request_id();
-        session.bind(10);
-        assert_eq!(session.next_request_id(), 1);
-        assert_eq!(session.next_request_id(), 2);
-        assert_eq!(session.next_request_id(), 3);
-        assert_eq!(session.current_request_id(), 4);
-    }
-
-    #[test]
-    #[should_panic(expected = "register_request_id already called")]
-    fn double_register_request_id_panics() {
-        let mut session = ConsensusSession::with_client_id(1);
-        let _ = session.register_request_id();
-        let _ = session.register_request_id();
-    }
-
-    #[test]
-    fn begin_register_on_fresh_session_keeps_client_id() {
-        let mut session = ConsensusSession::with_client_id(7);
-        assert_eq!(session.begin_register(), 0);
-        // The first registration keeps the session's client id; only a re-login
-        // re-arms with a fresh one.
+        assert_eq!(session.register_request_id(), 0);
         assert_eq!(session.client_id(), 7);
+        assert_eq!(
+            session.bind_secret().expose_secret(),
+            secret.expose_secret()
+        );
         assert!(!session.is_bound());
     }
 
     #[test]
-    fn begin_register_re_arms_after_consume_without_bind() {
-        // A prior register that never bound (failed login / dropped connection
-        // before the retry) must not panic the next login.
-        let mut session = ConsensusSession::with_client_id(1);
-        let _ = session.begin_register();
-        assert_eq!(session.begin_register(), 0);
-        assert!(!session.is_bound());
+    fn reconnect_preserves_binding_and_request_counter() {
+        let mut session = ConsensusSession::with_client_id(7);
+        session.bind(42).unwrap();
+        assert_eq!(session.next_request_id().unwrap(), 1);
+        assert_eq!(session.register_request_id(), 0);
+        session.bind(42).unwrap();
+        assert_eq!(session.client_id(), 7);
+        assert_eq!(session.session(), Some(42));
+        assert_eq!(session.next_request_id().unwrap(), 2);
     }
 
     #[test]
-    fn begin_register_re_arms_after_bind() {
-        let mut session = ConsensusSession::with_client_id(1);
-        let _ = session.begin_register();
-        session.bind(42);
-        assert_eq!(session.begin_register(), 0);
-        assert!(!session.is_bound());
+    fn conflicting_registration_cannot_replace_a_live_session() {
+        let mut session = ConsensusSession::with_client_id(7);
+        assert_eq!(session.bind(0), Err(IggyError::InvalidSession(0)));
+        session.bind(42).unwrap();
+        assert!(matches!(
+            session.bind(43),
+            Err(IggyError::SessionMismatch(42, 43))
+        ));
+        assert_eq!(session.session(), Some(42));
     }
 
     #[test]
-    #[should_panic(expected = "next_request_id called before bind")]
-    fn next_request_id_before_bind_panics() {
-        let mut session = ConsensusSession::with_client_id(1);
-        let _ = session.next_request_id();
+    fn unbound_session_cannot_number_a_mutation() {
+        let mut session = ConsensusSession::with_client_id(7);
+        assert_eq!(session.next_request_id(), Err(IggyError::Unauthenticated));
+        assert_eq!(session.current_request_id(), 1);
     }
 
     #[test]
-    #[should_panic(expected = "already bound")]
-    fn double_bind_panics() {
-        let mut session = ConsensusSession::with_client_id(1);
-        session.bind(10);
-        session.bind(20);
-    }
-
-    #[test]
-    fn reconnect_uses_fresh_session() {
-        let s1 = ConsensusSession::new();
-        let s2 = ConsensusSession::new();
-        // Each new session gets a different client_id. No reuse.
-        assert_ne!(s1.client_id(), s2.client_id());
-        assert!(!s1.is_bound());
-        assert!(!s2.is_bound());
-    }
-
-    #[test]
-    fn with_client_id_deterministic() {
-        let session = ConsensusSession::with_client_id(0xDEAD_BEEF);
-        assert_eq!(session.client_id(), 0xDEAD_BEEF);
+    fn exhausted_counter_cannot_wrap_or_issue_another_request() {
+        let mut session = ConsensusSession::with_client_id(7);
+        session.bind(42).unwrap();
+        session.request_counter = u64::MAX;
+        assert_eq!(
+            session.next_request_id(),
+            Err(IggyError::RequestIdExhausted)
+        );
+        assert_eq!(session.current_request_id(), u64::MAX);
     }
 }

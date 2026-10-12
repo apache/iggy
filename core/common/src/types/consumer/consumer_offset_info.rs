@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::PartitionContext;
 use serde::{Deserialize, Serialize};
 
 /// `ConsumerOffsetInfo` represents the information about a consumer offset.
@@ -30,4 +31,15 @@ pub struct ConsumerOffsetInfo {
     pub current_offset: u64,
     /// The stored offset by the consumer in the partition.
     pub stored_offset: u64,
+}
+
+/// A checkpoint retains the partition incarnation and owner that delivered its messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerPosition {
+    /// Partition from which the message was consumed.
+    pub partition_id: u32,
+    /// Inclusive message offset to commit.
+    pub offset: u64,
+    /// Partition incarnation and owner captured by the poll; retain both for a delayed commit.
+    pub context: PartitionContext,
 }

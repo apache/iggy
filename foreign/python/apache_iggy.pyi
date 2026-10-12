@@ -39,6 +39,7 @@ __all__ = [
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "ConsumerPosition",
     "DirectProducerConfig",
     "GlobalPermissions",
     "HeaderKey",
@@ -51,6 +52,7 @@ __all__ = [
     "MaxTopicSize",
     "OptionSpec",
     "Partition",
+    "PartitionContext",
     "Partitioning",
     "Permissions",
     "PollingStrategy",
@@ -557,6 +559,34 @@ class ConsumerGroupMember:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
         """
+
+@typing.final
+class ConsumerPosition:
+    r"""
+    The position of a received message: its partition, its offset and the context of
+    the poll that delivered it. Commit it with `IggyConsumer.store_position()`.
+    """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        The partition the message was read from.
+        """
+    @property
+    def offset(self) -> builtins.int:
+        r"""
+        The offset of the message. Committing it marks the message as consumed.
+        """
+    @property
+    def context(self) -> PartitionContext:
+        r"""
+        The partition incarnation and owner the poll was served under.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(
+        cls, partition_id: builtins.int, offset: builtins.int, context: PartitionContext
+    ) -> ConsumerPosition: ...
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class DirectProducerConfig:
@@ -1347,12 +1377,10 @@ class IggyClient:
         for the rest of `reestablish_after` (5 s by default). The sign-in made
         with `login_user` is dropped, so it must be repeated after reconnecting.
         A client configured with auto-login credentials signs in again on
-        `connect`. Over HTTP there is no connection to close and this call does
-        nothing.
-
-        Known issue: unless reconnection is disabled, the heartbeat of a client
-        with auto-login credentials connects it again and signs in within one
-        heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+        `connect`. Until then, requests fail with `RuntimeError`, and nothing
+        connects the client again in the background, even with auto-login
+        credentials. Over HTTP there is no connection to close and this call
+        does nothing.
 
         Raises:
             RuntimeError: If the connection cannot be closed.
@@ -1448,28 +1476,6 @@ class IggyClient:
                 `manage_streams` or per-stream `manage_stream` permission, the
                 stream does not exist, or the request fails.
         """
-    def purge_stream(
-        self, stream_id: builtins.str | builtins.int
-    ) -> collections.abc.Awaitable[None]:
-        r"""
-        Delete all messages from every topic in a stream.
-
-        The stream, topics, and partitions remain available. Repeated purges of an
-        existing empty stream succeed. `stream_id` accepts a stream name as `str`
-        or numeric ID as `int`. A decimal-only string is interpreted as a numeric
-        ID.
-
-        Returns:
-            None.
-
-        Raises:
-            TypeError: If `stream_id` is not `str` or an integer in
-                `0..=2**32 - 1`.
-            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
-            RuntimeError: If the client is not authenticated, the user lacks global
-                `manage_streams` or per-stream `manage_stream` permission, the
-                stream does not exist, or the request fails.
-        """
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
@@ -1504,6 +1510,8 @@ class IggyClient:
             preallocate_segments: Reserve segment bytes on open as `bool | None`.
             options: Additional option keys as `dict[str, str] | None`, sent
                 verbatim so a newer server key can be set from this build.
+                `{"partition_resize_policy": "fixed"}` makes the server reject
+                later partition creation and deletion on this topic.
 
         Every option left as `None` resolves against the server default at
         admission.
@@ -1593,24 +1601,6 @@ class IggyClient:
         Raises:
             RuntimeError: If an identifier is invalid or the request fails.
         """
-    def purge_topic(
-        self,
-        stream_id: builtins.str | builtins.int,
-        topic_id: builtins.str | builtins.int,
-    ) -> collections.abc.Awaitable[None]:
-        r"""
-        Purge all messages from a topic.
-
-        Args:
-            stream_id: Stream identifier as `str | int`.
-            topic_id: Topic identifier as `str | int`.
-
-        Returns:
-            An awaitable that resolves to `None` when the topic is purged.
-
-        Raises:
-            RuntimeError: If an identifier is invalid or the request fails.
-        """
     def create_partitions(
         self,
         stream_id: builtins.str | builtins.int,
@@ -1670,6 +1660,42 @@ class IggyClient:
                 `manage_streams` or `manage_topics`, per-stream `manage_stream` or
                 `manage_topics`, or per-topic `manage_topic` permission, or the
                 request fails.
+        """
+    def delete_segments(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partition_id: builtins.int,
+        segments_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete the oldest sealed segments of a partition, including all messages
+        stored in them. The active segment is never deleted, and deletion stops at
+        the lowest offset any consumer or consumer group has committed on the
+        partition, so fewer than `segments_count` segments may be removed at first.
+        The server keeps the request and removes the remaining segments later, up
+        to the requested count, as consumers commit past them.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partition_id: Partition ID as `int`.
+            segments_count: Maximum number of segments to delete as `int`, starting
+                from the oldest; `0` deletes nothing.
+
+        Returns:
+            An awaitable that resolves to `None` when deletion is accepted; segment
+            files are removed asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            TypeError: If an integer identifier is outside the unsigned 32-bit range.
+            OverflowError: If `partition_id` or `segments_count` is outside the
+                unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, the
+                stream, topic, or partition does not exist, or the request fails.
         """
     def create_consumer_group(
         self,
@@ -1848,6 +1874,7 @@ class IggyClient:
         topic_max_size: MaxTopicSize | None = None,
         send_retries: builtins.int | None = 3,
         send_retry_interval: datetime.timedelta | None = ...,
+        topic_durability: Durability | None = None,
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
         Creates and initializes a high-level producer bound to a stream and topic.
@@ -1856,7 +1883,9 @@ class IggyClient:
         producer semantics, see https://iggy.apache.org/docs/sdk/rust/high-level-sdk/.
         `None` selects direct mode. `BackgroundProducerConfig` starts background
         workers and makes successful sends mean queue acceptance rather than a
-        server commit. The returned producer is ready to send.
+        server commit. Replicated topics accept producer writes. Set
+        `topic_durability=Durability.PERSISTED` for an automatically created topic
+        when sends require crash-safe retry receipts.
 
         Raises `ValueError` for invalid names or numeric ranges and `RuntimeError`
         when stream/topic initialization fails.
@@ -1871,11 +1900,20 @@ class IggyClient:
         count: builtins.int,
         auto_commit: builtins.bool,
         partition_id: builtins.int | None = None,
+        context: PartitionContext | None = None,
     ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
         Polls for messages from the specified topic on behalf of the given consumer.
         Omitting `partition_id` reads partition 0 for a regular consumer, and
         polls the member's assigned partitions for a consumer group.
+        `context` continues from a message received earlier, usually with
+        `PollingStrategy.Offset`: pass that message's `context()` and `partition_id()`.
+        The poll is then refused if the partition was deleted and created again, or if its
+        consumer group owner changed, instead of reading the new partition at that offset.
+        Without `context`, the poll takes the context its route reports. After another
+        client deleted and created the partition again, one such poll can fail with
+        `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
+        consumer group member. The failed route is dropped, and the next call routes again.
         Returns a list of received messages or a RuntimeError on failure.
         """
     def consumer_group(
@@ -1943,15 +1981,13 @@ class IggyConsumer:
         self, partition_id: builtins.int
     ) -> builtins.int | None:
         r"""
-        Get the last consumed offset for the given partition, or `None` while that partition
-        is untracked. Polling starts tracking a partition at `0`, so `0` also means
-        "seen, nothing consumed yet".
+        Get the last offset handed over for this partition, or `None` until a message
+        from the partition has been consumed.
         """
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
-        Get the last stored offset for the given partition, or `None` while that partition is
-        untracked. Polling starts tracking a partition at `0`, so `0` also means
-        "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
+        Get the last offset successfully stored for this partition, or `None` until
+        this consumer has stored one. Polling under `AutoCommit.Disabled()` leaves it unset.
         """
     def name(self) -> builtins.str:
         r"""
@@ -1975,6 +2011,30 @@ class IggyConsumer:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
+        The offset is stored under the context of the latest message consumed from the
+        partition. To commit a message held across a newer poll or an ownership change,
+        pass `message.position()` to `store_position()` instead.
+        Before a message is consumed from the partition, the write takes the context its
+        route reports. After another client deleted and created the partition again, one
+        such write can fail with `HistoryUnavailable` (87), or
+        `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
+        route is dropped, and the next call routes again.
+        Raises `RuntimeError` if the operation fails.
+        """
+    def store_position(
+        self, position: ConsumerPosition
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Stores the position of a received message, taken from `ReceiveMessage.position()`.
+        The write keeps the context that delivered the message, so it fails with
+        `HistoryUnavailable` (87) after the partition was deleted and created again, and
+        with `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
+        changed, instead of committing the offset to the new partition.
+        A position that is not ahead of the last one stored under the same partition
+        incarnation and owner is skipped without a request, unless the consumer was
+        created with `allow_replay=True`. The same holds for an offset that
+        `store_offset()` stored before a message was consumed from the partition,
+        but a position at offset 0 is never skipped in that case.
         Raises `RuntimeError` if the operation fails.
         """
     def delete_offset(
@@ -1983,6 +2043,10 @@ class IggyConsumer:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
+        The write takes the context its route reports. After another client deleted and
+        created the partition again, one such write can fail with `HistoryUnavailable` (87),
+        or `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
+        route is dropped, and the next call routes again.
         Raises `RuntimeError` if the operation fails.
         """
     def iter_messages(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
@@ -1994,6 +2058,11 @@ class IggyConsumer:
         For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
         only the interval part is applied; the `after` mode is ignored.
         Use `consume_messages()` if you need commit-after-processing semantics.
+        After another client deleted and created a partition again, or after the consumer
+        group moved a partition to another member, one iteration can raise `RuntimeError`
+        with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
+        consumer group member. The consumer drops the failed route and the position it
+        continued from, and the next iteration routes again.
         """
     def consume_messages(
         self,
@@ -2005,6 +2074,10 @@ class IggyConsumer:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+        After another client deleted and created a partition again, one poll can fail with
+        `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a consumer
+        group member. The error is logged, not raised: the failed route is dropped, and the
+        next poll routes again.
         """
 
 class IggyExpiry:
@@ -2226,6 +2299,48 @@ class Partition:
         r"""
         The number of messages in the partition.
         """
+    @property
+    def context(self) -> PartitionContext:
+        r"""
+        The partition incarnation and the metadata operation the details were read at.
+        The owner generation is `0` because the details belong to no consumer group.
+        """
+
+@typing.final
+class PartitionContext:
+    r"""
+    The partition incarnation and consumer group owner a poll was served under.
+
+    Keep it with an offset to continue or commit under the same partition later: the
+    server refuses a context whose partition was deleted and created again, or whose
+    consumer group owner changed, instead of applying the offset to the new partition.
+    """
+    @property
+    def incarnation(self) -> builtins.int:
+        r"""
+        Identifies one creation of the partition. It changes when a deleted partition id is
+        created again.
+        """
+    @property
+    def owner_generation(self) -> builtins.int:
+        r"""
+        The consumer group owner generation, or `0` outside a consumer group.
+        """
+    @property
+    def metadata_op(self) -> builtins.int:
+        r"""
+        The metadata operation the server must have applied before it serves a request with
+        this context.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(
+        cls,
+        incarnation: builtins.int,
+        owner_generation: builtins.int,
+        metadata_op: builtins.int,
+    ) -> PartitionContext: ...
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class Partitioning:
@@ -2545,6 +2660,18 @@ class ReceiveMessage:
         r"""
         Retrieves the partition this message belongs to.
         """
+    def context(self) -> PartitionContext:
+        r"""
+        Retrieves the partition incarnation and owner the poll that delivered this message
+        was served under.
+        """
+    def position(self) -> ConsumerPosition:
+        r"""
+        The position to commit for this message with `IggyConsumer.store_position()`.
+        It keeps the context that delivered the message, so a commit after the partition
+        was deleted and created again, or after its consumer group owner changed, is
+        refused instead of landing on the new partition.
+        """
     def user_headers(self) -> UserHeaders | None:
         r"""
         Retrieves user headers attached to the received message.
@@ -2597,9 +2724,8 @@ class SendMessagesConfirmation:
         r"""
         Gets the offset assigned to the first message of the batch in this partition.
 
-        The offset locates the batch, it does not identify it. Delivery is
-        at-least-once, so an earlier retry may already have committed these
-        messages at a lower offset.
+        The offset locates the batch, it does not identify it. An application
+        resend creates another request and can duplicate the messages.
 
         Confirmation follows VSR quorum commit. A topic with persisted message
         durability also waits for recoverable stable-storage copies on the quorum.
@@ -2618,10 +2744,10 @@ class SendMessagesResponse:
         The list is empty when the server reports no offsets, so check whether
         it is empty before indexing into it.
 
-        A reported `base_offset` never implies uniqueness, because delivery is
-        at-least-once and an earlier retry may already have committed the same
-        messages at a lower offset. Confirmation follows the topic's message
-        durability policy: quorum commit, plus stable storage for persisted topics.
+        A reported `base_offset` never implies uniqueness: an application resend
+        can commit the same messages at another offset. Confirmation follows the
+        topic's policy: quorum commit, plus stable storage and crash-safe retry
+        receipts for persisted topics.
         """
 
 @typing.final
@@ -3559,6 +3685,6 @@ class UserStatus(enum.Enum):
     The user account is inactive and cannot be used.
     """
 
-class Durability(str, enum.Enum):
+class Durability(str, enum.Enum):  # noqa: UP042
     REPLICATED = "replicated"
     PERSISTED = "persisted"

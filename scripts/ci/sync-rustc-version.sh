@@ -235,6 +235,27 @@ check_devcontainer_json() {
 
 check_devcontainer_json
 
+# Bazel's Rust shim profiles must match the LLVM tools from rust-toolchain.toml.
+CPP_BAZEL_MODULE="foreign/cpp/MODULE.bazel"
+BAZEL_RUST_VERSION=$(sed -n '/rust_host_tools\.host_tools(/,/^)/ s/^[[:space:]]*version = "\([^"]*\)",/\1/p' "$CPP_BAZEL_MODULE")
+if [ -z "$BAZEL_RUST_VERSION" ]; then
+    echo -e "${RED}Error: Could not extract host_tools version from $CPP_BAZEL_MODULE${NC}"
+    exit 1
+fi
+
+TOTAL_FILES=$((TOTAL_FILES + 1))
+if [ "$BAZEL_RUST_VERSION" = "$RUST_VERSION" ]; then
+    echo -e "${GREEN}✓${NC} $CPP_BAZEL_MODULE: host_tools version ${GREEN}$RUST_VERSION${NC}"
+elif [ "$MODE" = "check" ]; then
+    MISALIGNED_FILES+=("$CPP_BAZEL_MODULE")
+    echo -e "${RED}✗${NC} $CPP_BAZEL_MODULE: host_tools version ${RED}$BAZEL_RUST_VERSION${NC} (expected: ${GREEN}$RUST_VERSION${NC})"
+else
+    sed -i.bak -E "/rust_host_tools\.host_tools\(/,/^\)/ s/(version = \")[^\"]+(\",)/\1$RUST_VERSION\2/" "$CPP_BAZEL_MODULE"
+    rm -f "$CPP_BAZEL_MODULE.bak"
+    FIXED_FILES=$((FIXED_FILES + 1))
+    echo -e "${GREEN}Fixed${NC} $CPP_BAZEL_MODULE: host_tools version ${RED}$BAZEL_RUST_VERSION${NC} -> ${GREEN}$RUST_VERSION${NC}"
+fi
+
 echo ""
 echo "────────────────────────────────────────────────"
 

@@ -33,8 +33,8 @@ pub fn request_body(request: &Message<RoutedRequestHeader>) -> &[u8] {
 /// Check a client's `request_checksum` against the body it stamps.
 ///
 /// Must run BEFORE any body rewrite: PAT / password / consumer-group paths
-/// substitute server-chosen bytes. Zero is "unstamped" and skips the check, so an
-/// SDK predating the stamp still works.
+/// substitute server-chosen bytes. Zero means unstamped and skips this check;
+/// retry identity is validated separately.
 ///
 /// # Errors
 /// [`IggyError::InvalidFormat`] when the stamp disagrees with the body.
@@ -87,9 +87,8 @@ pub fn rewrite_request_body(
     // downstream. Clear rather than recompute; carrying them forward is a stale claim.
     header.checksum = 0;
     header.checksum_body = 0;
-    // `request_checksum` is deliberately NOT touched: it stamps what the CLIENT sent,
-    // already validated at admission. Re-stamping it over the substituted body would
-    // make the client-table reuse check compare a value no client ever produced.
+    // Preserve the original validated client stamp in the prepare and receipt;
+    // the substituted body's integrity is sealed separately.
     rewritten.as_mut_slice()[std::mem::size_of::<RoutedRequestHeader>()..].copy_from_slice(body);
     Ok(rewritten)
 }
@@ -148,8 +147,6 @@ mod tests {
 
     #[test]
     fn given_an_unstamped_request_when_rewriting_should_stay_unstamped() {
-        // Zero means "unstamped" all the way through the client table, so a rewrite
-        // must not manufacture a stamp for a client that sent none.
         let original = request(b"plaintext-secret", 0);
         let rewritten = rewrite_request_body(&original, &Bytes::from_static(b"argon2-hash"))
             .expect("the rewritten body fits a request message");

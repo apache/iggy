@@ -33,9 +33,9 @@ use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard};
 use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
-use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use secrecy::ExposeSecret;
 use server_common::Message;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -70,6 +70,9 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             shard::MetadataSubmit::ConsumerSessionHeartbeat(message) => {
                 let metadata = shard.plane.metadata();
                 if let Some(consensus) = metadata.consensus.as_ref() {
+                    if message.header().replica >= consensus.replica_count() {
+                        return;
+                    }
                     liveness.borrow_mut().receive(
                         consensus.cluster(),
                         (consensus.is_primary()
@@ -82,10 +85,10 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     );
                 }
             }
-            shard::MetadataSubmit::AttachConsumerSession {
+            shard::MetadataSubmit::BindSession {
                 vsr_client_id,
                 session,
-                user_id,
+                secret,
                 reply,
             } => {
                 let attached = shard
@@ -93,26 +96,36 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .metadata()
                     .client_table
                     .borrow_mut()
-                    .attach_session(vsr_client_id, session, user_id)
-                    .ok_or(IggyError::StaleClient);
+                    .bind_session(vsr_client_id, session, secret.expose_secret());
                 let _ = reply.try_send(attached);
             }
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,
+                verifier,
                 reply,
             } => {
-                let bound = submit_register_local_or_forward(&shard, vsr_client_id, user_id).await;
+                let bound =
+                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, verifier)
+                        .await;
                 let _ = reply.try_send(bound);
             }
             shard::MetadataSubmit::ForwardedRegister {
                 vsr_client_id,
                 user_id,
+                verifier,
                 nonce,
                 origin_replica,
             } => {
-                answer_forwarded_register(&shard, vsr_client_id, user_id, nonce, origin_replica)
-                    .await;
+                answer_forwarded_register(
+                    &shard,
+                    vsr_client_id,
+                    user_id,
+                    verifier,
+                    nonce,
+                    origin_replica,
+                )
+                .await;
             }
             shard::MetadataSubmit::ForwardedLogout {
                 vsr_client_id,
@@ -156,12 +169,24 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                 };
                 let _ = reply.try_send(committed);
             }
+            shard::MetadataSubmit::CompleteLifecycle {
+                request,
+                reporter,
+                reply,
+            } => {
+                let applied = shard
+                    .plane
+                    .metadata()
+                    .submit_complete_lifecycle_in_process(request, reporter)
+                    .await;
+                let _ = reply.try_send(matches!(applied, Ok(true)));
+            }
             shard::MetadataSubmit::CompleteRevocation {
                 stream_id,
                 topic_id,
-                group_id,
-                source_client_id,
                 partition_id,
+                installation,
+                partition_op,
                 reply,
             } => {
                 let commit = shard
@@ -170,9 +195,9 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     .submit_complete_revocation_in_process(
                         stream_id,
                         topic_id,
-                        group_id,
-                        source_client_id,
                         partition_id,
+                        installation,
+                        partition_op,
                     )
                     .await
                     .ok();
@@ -190,7 +215,9 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
 /// the committed reply back here so the caller can write it to the
 /// originating socket -- shard 0 cannot route the reply by the consensus
 /// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
-/// `None` = transient submit failure (SDK read-timeout replays).
+/// `None` = no verdict, for example after shard 0 refused the forward. The
+/// outcome is unknown, so callers answer `TransientNotCommitted`, which
+/// licenses only a replay of the same request id.
 #[allow(clippy::future_not_send)]
 pub async fn submit_client_request_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,

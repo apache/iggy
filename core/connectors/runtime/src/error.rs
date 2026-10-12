@@ -69,6 +69,10 @@ pub enum RuntimeError {
     CannotConvertConfiguration,
     #[error("IO operation failed with error: {0:?}")]
     IoError(#[from] std::io::Error),
+    #[error("Failed to list configuration environment variables")]
+    ListConfigEnvVars(#[source] std::io::Error),
+    #[error("Failed to create Tokio runtime")]
+    RuntimeCreation(#[source] std::io::Error),
     #[error("HTTP request failed: {0}")]
     HttpRequestFailed(String),
     #[error("Token file not found: {0}")]

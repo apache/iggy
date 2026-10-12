@@ -40,9 +40,11 @@ class TopicsHttpClient implements TopicsClient {
     private static final String STREAMS = "/streams";
     private static final String TOPICS = "/topics";
     private final InternalHttpClient httpClient;
+    private final SendContexts sendContexts;
 
-    public TopicsHttpClient(InternalHttpClient httpClient) {
+    public TopicsHttpClient(InternalHttpClient httpClient, SendContexts sendContexts) {
         this.httpClient = httpClient;
+        this.sendContexts = sendContexts;
     }
 
     @Override
@@ -100,6 +102,7 @@ class TopicsHttpClient implements TopicsClient {
     public void deleteTopic(StreamId streamId, TopicId topicId) {
         var request = httpClient.prepareDeleteRequest(STREAMS + "/" + streamId + TOPICS + "/" + topicId);
         httpClient.execute(request);
+        sendContexts.clear();
     }
 
     /**

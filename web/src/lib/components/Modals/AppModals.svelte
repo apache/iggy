@@ -31,9 +31,9 @@ under the License.
   import StreamSettingsModal from './StreamSettingsModal.svelte';
   import TopicSettingsModal from './TopicSettingsModal.svelte';
   import { fade } from 'svelte/transition';
-  import { noTypeCheck } from '$lib/utils/noTypeCheck';
+  import { noTypeCheck } from '#lib/utils/noTypeCheck.js';
   import { writable } from 'svelte/store';
-  import { Keys } from '$lib/utils/constants/keys';
+  import { Keys } from '#lib/utils/constants/keys.js';
 
   const modals = {
     AddPartitionsModal,

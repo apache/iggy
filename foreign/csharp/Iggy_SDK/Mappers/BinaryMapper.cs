@@ -348,6 +348,17 @@ internal static class BinaryMapper
         };
     }
 
+    internal static PartitionContext MapPartitionContext(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.Length < PartitionContext.ENCODED_SIZE)
+        {
+            throw new MalformedResponseException("Truncated partition context.");
+        }
+        return new PartitionContext(BinaryPrimitives.ReadUInt64LittleEndian(bytes),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes[16..]));
+    }
+
     internal static PolledMessagesRental MapRentedMessages(ReadOnlyMemory<byte> payload,
         IMemoryOwner<byte> payloadOwner, IMessageEncryptor? encryptor = null)
     {
@@ -356,12 +367,19 @@ internal static class BinaryMapper
         var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(span[..4]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
         var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
-        var position = 16;
+        var context = MapPartitionContext(span[16..]);
+        var position = 16 + PartitionContext.ENCODED_SIZE;
         if (position >= length)
         {
+            if (messagesCount != 0)
+            {
+                throw new MalformedResponseException("Poll count does not match its messages.");
+            }
+
             return new PolledMessagesRental(payloadOwner)
             {
                 PartitionId = partitionId,
+                Context = context,
                 CurrentOffset = currentOffset,
                 Messages = []
             };
@@ -384,7 +402,7 @@ internal static class BinaryMapper
                 }
             }
 
-            var maxMessages = (length - 16) / BatchWireFormat.FRAME_HEADER_SIZE;
+            var maxMessages = (length - position) / BatchWireFormat.FRAME_HEADER_SIZE;
             var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
             List<RentedMessageResponse> messages = new(capacity);
 
@@ -470,9 +488,15 @@ internal static class BinaryMapper
                 position = batchEnd;
             }
 
+            if (messages.Count != messagesCount)
+            {
+                throw new MalformedResponseException("Poll count does not match its messages.");
+            }
+
             return new PolledMessagesRental(payloadOwner, plaintextOwner)
             {
                 PartitionId = partitionId,
+                Context = context,
                 CurrentOffset = currentOffset,
                 Messages = messages
             };
@@ -544,7 +568,7 @@ internal static class BinaryMapper
     // and frame walk as the main loop, so both agree on which messages are included.
     private static int SumMaxDecryptedLength(ReadOnlySpan<byte> span, int length, IMessageEncryptor encryptor)
     {
-        var position = 16;
+        var position = 16 + PartitionContext.ENCODED_SIZE;
         var total = 0;
         while (position < length)
         {
@@ -584,6 +608,7 @@ internal static class BinaryMapper
         return new PolledMessages
         {
             PartitionId = rental.PartitionId,
+            Context = rental.Context,
             CurrentOffset = rental.CurrentOffset,
             Messages = messages
         };
@@ -606,6 +631,7 @@ internal static class BinaryMapper
         return new PolledMessagesRental(EmptyMemoryOwner.Instance)
         {
             PartitionId = messages.PartitionId,
+            Context = messages.Context,
             CurrentOffset = messages.CurrentOffset,
             Messages = rentedMessages
         };
@@ -1098,11 +1124,12 @@ internal static class BinaryMapper
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-        var readBytes = 4 + 4 + 8 + 8 + 8 + 8;
+        var readBytes = 40 + PartitionContext.ENCODED_SIZE;
 
         return (
             new PartitionResponse
             {
+                Context = MapPartitionContext(payload[(position + 40)..]),
                 Id = id,
                 SegmentsCount = segmentsCount,
                 CurrentOffset = currentOffset,

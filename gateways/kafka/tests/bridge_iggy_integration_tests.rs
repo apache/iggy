@@ -785,7 +785,7 @@ async fn list_kafka_topics_is_empty_when_nothing_exists() {
         .list_kafka_topics()
         .await
         .expect("listing against a nonexistent default stream must not error");
-    assert!(topics.is_empty());
+    assert_eq!(topics, []);
 }
 
 #[tokio::test]

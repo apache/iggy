@@ -129,18 +129,6 @@ struct Args {
     /// to exercise a single-replica restart.
     #[arg(long)]
     min_survivors: Option<u8>,
-    /// Let a rebuilt partition recover its consensus frontier from the log the
-    /// harness carried across the restart.
-    ///
-    /// OFF by default, because a real replica cannot do this: the partition journal
-    /// is in-memory and segments carry no op numbers, so production's
-    /// `load_partition` restores the view alone and rejoins quorum-invisible. With it
-    /// off a restarted replica comes back at op 0 and the run exercises that rejoin,
-    /// where `advance_commit_min`'s sequential-advance assert lives. Turn it on to
-    /// look PAST that at something later in the run, studying a system more durable
-    /// than Iggy is.
-    #[arg(long)]
-    restore_partition_frontier: bool,
     /// End the run as vacuous if the entity oracle did not hold at quiesce.
     ///
     /// An eviction disarms it (the forgotten request's fate is unknown) and it
@@ -821,7 +809,6 @@ fn build_cluster(
             network_opts,
         ),
     };
-    sim.set_restore_partition_frontier(args.restore_partition_frontier);
     let sim_clients: Vec<SimClient> = client_ids.iter().map(|&id| SimClient::new(id)).collect();
 
     let ns = IggyNamespace::new(1, 1, 0);

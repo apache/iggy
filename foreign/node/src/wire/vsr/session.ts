@@ -16,6 +16,7 @@
 // under the License.
 
 import { randomBytes } from 'node:crypto';
+import { BIND_SECRET_BYTES } from './register.js';
 
 const MAX_U64 = 0xFFFF_FFFF_FFFF_FFFFn;
 
@@ -33,12 +34,14 @@ export class ConsensusSession {
   private _session: bigint | null;
   private requestCounter: bigint;
   private registerConsumed: boolean;
+  readonly bindSecret: Buffer;
 
   constructor(clientId?: bigint) {
     this._clientId = clientId ?? generateClientId();
     this._session = null;
     this.requestCounter = 1n;
     this.registerConsumed = false;
+    this.bindSecret = randomBytes(BIND_SECRET_BYTES);
   }
 
   get clientId(): bigint {
@@ -62,7 +65,7 @@ export class ConsensusSession {
 
   /** Binds the session after Register commits through consensus. */
   bind(session: bigint): void {
-    if (this._session !== null)
+    if (this._session !== null && this._session !== session)
       throw new Error(`session already bound (session=${this._session})`);
     if (session <= 0n)
       throw new Error('session must be > 0');
@@ -70,18 +73,10 @@ export class ConsensusSession {
   }
 
   /**
-   * Begins a registration, re-arming the session for a re-login. A prior
-   * consumed or bound session is replaced wholesale (fresh client id,
-   * unbound), so a repeat login encodes a clean Register instead of tripping
-   * the one-shot guard. Returns the register request id, always 0.
+   * Retains the identity and secret so a lost login reply can be retried.
+   * A new logical session is created only after explicit logout.
    */
   beginRegister(): bigint {
-    if (this.registerConsumed || this.isBound) {
-      this._clientId = generateClientId();
-      this._session = null;
-      this.requestCounter = 1n;
-      this.registerConsumed = false;
-    }
     this.registerConsumed = true;
     return 0n;
   }

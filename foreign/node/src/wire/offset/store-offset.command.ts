@@ -19,6 +19,7 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { type Id } from '../identifier.utils.js';
+import type { PartitionContext } from '../vsr/header.js';
 import { serializeStoreOffset, type Consumer } from './offset.utils.js';
 
 /**
@@ -34,7 +35,16 @@ export type StoreOffset = {
   /** Partition ID. VSR requires the explicit partition returned by polling. */
   partitionId: number | null,
   /** Offset value to store */
-  offset: bigint
+  offset: bigint,
+  /**
+   * Context of the poll the offset came from (`PollMessagesResponse.context`).
+   * The store then fails instead of committing the offset in a partition
+   * deleted and recreated since that poll. Without one the client takes the
+   * context its cached route reports: after another client deletes and
+   * recreates the partition, one store can fail with 87 (5009 for a group
+   * consumer). The failed route is dropped and the next call routes again.
+   */
+  context?: PartitionContext
 };
 
 /**
@@ -54,4 +64,4 @@ export const STORE_OFFSET = {
 /**
  * Executable store offset command function.
  */
-export const storeOffset = wrapCommand<StoreOffset, boolean>(STORE_OFFSET);
+export const storeOffset = wrapCommand<StoreOffset, boolean>(STORE_OFFSET, ({ context }) => ({ context }));

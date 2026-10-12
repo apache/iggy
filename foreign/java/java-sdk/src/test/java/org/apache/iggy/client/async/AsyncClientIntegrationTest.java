@@ -43,6 +43,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -91,7 +92,13 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
                     .createTopic(
-                            streamId, 2L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic")
+                            streamId,
+                            2L,
+                            CompressionAlgorithm.None,
+                            BigInteger.ZERO,
+                            BigInteger.ZERO,
+                            "test-topic",
+                            PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             List<Message> messages = new ArrayList<>();
@@ -140,7 +147,13 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
                     .createTopic(
-                            streamId, 2L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic")
+                            streamId,
+                            2L,
+                            CompressionAlgorithm.None,
+                            BigInteger.ZERO,
+                            BigInteger.ZERO,
+                            "test-topic",
+                            PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages concurrently from multiple threads
@@ -197,7 +210,13 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
                     .createTopic(
-                            streamId, 2L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, "test-topic")
+                            streamId,
+                            2L,
+                            CompressionAlgorithm.None,
+                            BigInteger.ZERO,
+                            BigInteger.ZERO,
+                            "test-topic",
+                            PERSISTED_TOPIC_OPTIONS)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when — send messages in concurrent batches

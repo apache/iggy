@@ -110,7 +110,7 @@ static PARTITION_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("partition",
 /// Subtract `amount`, clamping at zero instead of wrapping. Returns what was
 /// actually taken, which is what the caller passes on to its parent.
 ///
-/// `fetch_update` rather than a load followed by a subtract: the counters are
+/// `try_update` rather than a load followed by a subtract: the counters are
 /// written from the metadata shard and from whichever shard owns the partition,
 /// so a separate load leaves a window where the clamp reads one value and
 /// subtracts from another.
@@ -118,7 +118,7 @@ macro_rules! clamped_sub {
     ($name:ident, $counter:ty, $amount:ty) => {
         fn $name(counter: &$counter, amount: $amount, site: &'static UnderflowSite) -> $amount {
             let previous = counter
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     // `None` on an already-zero counter: no store, and the
                     // `Err` it returns carries that same zero, so the clamp
                     // reports identically either way. That is the steady shape

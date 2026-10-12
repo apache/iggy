@@ -130,11 +130,15 @@ async fn given_live_member_when_backup_restarts_should_preserve_membership(
         .join_consumer_group(&stream, &topic, &group_id)
         .await
         .unwrap();
-    let before = consumer_client
-        .get_consumer_group(&stream, &topic, &group_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let before = integration::harness::wait_for_consumer_group_assignment(
+        &consumer_client,
+        &stream,
+        &topic,
+        &group_id,
+        1,
+        STALE_EVICTION_TIMEOUT,
+    )
+    .await;
     assert_eq!(before.members_count, 1);
 
     harness.kill_node(2).unwrap();
@@ -171,6 +175,15 @@ async fn verify_replacement_after_restart(
         .join_consumer_group(&stream, &topic, &group_id)
         .await
         .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        &original,
+        &stream,
+        &topic,
+        &group_id,
+        1,
+        STALE_EVICTION_TIMEOUT,
+    )
+    .await;
     let before = original
         .poll_messages(
             &stream,
@@ -184,6 +197,17 @@ async fn verify_replacement_after_restart(
         .await
         .unwrap();
     assert_eq!(before.messages.len(), 1);
+    // A poll reply does not acknowledge durable AUTO completion.
+    original
+        .store_consumer_offset(
+            &consumer,
+            &stream,
+            &topic,
+            Some(before.partition_id),
+            before.messages[0].header.offset,
+        )
+        .await
+        .expect("persist the restart cursor before stopping the original member");
     match restart {
         Restart::Client => {}
         Restart::ServerShutdown => harness.stop_node(0).unwrap(),
@@ -379,7 +403,7 @@ async fn should_handle_stale_client_with_manual_reconnection(
     let server_addr = harness.server().raw_tcp_addr().unwrap();
 
     let setup_client = create_client(&server_addr, "500ms").await;
-    setup_resources(&setup_client, Durability::default()).await;
+    setup_resources(&setup_client, Durability::Persisted).await;
 
     // Client with 1h heartbeat will become stale
     let stale_client = create_client(&server_addr, "1h").await;
@@ -440,7 +464,8 @@ async fn should_handle_stale_client_with_manual_reconnection(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?},              group still reports {} member(s)",
+            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?}, \
+             group still reports {} member(s)",
             group.members_count
         );
         sleep(STALE_EVICTION_RETRY_INTERVAL).await;
@@ -524,7 +549,7 @@ async fn should_handle_stale_client_with_auto_reconnection(
     let server_addr = harness.server().raw_tcp_addr().unwrap();
 
     let setup_client = create_client(&server_addr, "500ms").await;
-    setup_resources(&setup_client, Durability::default()).await;
+    setup_resources(&setup_client, Durability::Persisted).await;
 
     let consumer_client = create_reconnecting_client(&server_addr).await;
     // Note: auto_login is enabled in create_reconnecting_client, so no manual login needed

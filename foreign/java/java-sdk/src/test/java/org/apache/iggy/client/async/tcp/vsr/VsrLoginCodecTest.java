@@ -30,12 +30,36 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EmptySource;
 import org.junit.jupiter.params.provider.NullSource;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class VsrLoginCodecTest {
+
+    @Test
+    void protocolVersionMatchesRustWireVersion() throws IOException {
+        Path versionPath = Path.of("core/binary_protocol/src/version.rs");
+        Path root = Path.of("").toAbsolutePath();
+        while (root != null && !Files.isRegularFile(root.resolve(versionPath))) {
+            root = root.getParent();
+        }
+        assertThat(root).as("repository containing %s", versionPath).isNotNull();
+        Matcher version = Pattern.compile(
+                        "pub const IGGY_PROTOCOL_VERSION:\\s*u32\\s*=\\s*pack_protocol_version\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)")
+                .matcher(Files.readString(root.resolve(versionPath)));
+        assertThat(version.find()).as("Rust wire protocol version declaration").isTrue();
+        int major = Integer.parseInt(version.group(1));
+        int minor = Integer.parseInt(version.group(2));
+        int patch = Integer.parseInt(version.group(3));
+        assertThat(VsrLoginCodec.PROTOCOL_VERSION).isEqualTo((major << 20) | (minor << 10) | patch);
+    }
 
     @Test
     void sdkVersionFieldEncodesVersionAsUtf8() {
@@ -88,11 +112,15 @@ class VsrLoginCodecTest {
         ByteBuf loginPayload = BytesSerializer.toBytes(username, "username");
         loginPayload.writeBytes(BytesSerializer.toBytes(password, "password"));
 
-        ByteBuf body = VsrLoginCodec.rewriteUserLogin(UnpooledByteBufAllocator.DEFAULT, loginPayload);
+        ByteBuf body = VsrLoginCodec.rewriteUserLogin(
+                UnpooledByteBufAllocator.DEFAULT, loginPayload, new byte[ConsensusSession.BIND_SECRET_BYTES]);
         try {
             assertThat(body.readIntLE()).isEqualTo(VsrLoginCodec.PROTOCOL_VERSION);
             assertThat(readShortField(body)).isEqualTo(VsrLoginCodec.SDK_NAME);
             assertThat(readShortField(body)).isNotEmpty();
+            byte[] secret = new byte[ConsensusSession.BIND_SECRET_BYTES];
+            body.readBytes(secret);
+            assertThat(secret).containsOnly((byte) 0);
             assertThat(readShortField(body)).isEqualTo(username);
             assertThat(readShortField(body)).isEqualTo(password);
             assertThat(body.readIntLE()).isZero();
@@ -110,7 +138,8 @@ class VsrLoginCodecTest {
         loginPayload.writeBytes(BytesSerializer.toBytes("secret", "password"));
         CountingAllocator alloc = new CountingAllocator();
 
-        assertThatThrownBy(() -> VsrLoginCodec.rewriteUserLogin(alloc, loginPayload))
+        assertThatThrownBy(() -> VsrLoginCodec.rewriteUserLogin(
+                        alloc, loginPayload, new byte[ConsensusSession.BIND_SECRET_BYTES]))
                 .isInstanceOf(IggyInvalidArgumentException.class)
                 .hasMessageContaining("username");
         assertThat(alloc.allocations).isZero();
@@ -123,11 +152,34 @@ class VsrLoginCodecTest {
         loginPayload.writeByte(0);
         CountingAllocator alloc = new CountingAllocator();
 
-        assertThatThrownBy(() -> VsrLoginCodec.rewritePatLogin(alloc, loginPayload))
+        assertThatThrownBy(() -> VsrLoginCodec.rewritePatLogin(
+                        alloc, loginPayload, new byte[ConsensusSession.BIND_SECRET_BYTES]))
                 .isInstanceOf(IggyInvalidArgumentException.class)
                 .hasMessageContaining("token");
         assertThat(alloc.allocations).isZero();
         loginPayload.release();
+    }
+
+    @Test
+    void bindSessionPlacesTheRegisteredProofAfterVersionAndIdentity() {
+        byte[] secret = new byte[ConsensusSession.BIND_SECRET_BYTES];
+        Arrays.fill(secret, (byte) 0x5a);
+        ByteBuf body = VsrRequestEncoder.bindSession(UnpooledByteBufAllocator.DEFAULT, 7, 9, 11, 13, secret);
+        try {
+            assertThat(body.readIntLE()).isEqualTo(VsrLoginCodec.PROTOCOL_VERSION);
+            assertThat(readShortField(body)).isEqualTo(VsrLoginCodec.SDK_NAME);
+            assertThat(readShortField(body)).isNotEmpty();
+            assertThat(body.readLongLE()).isEqualTo(7);
+            assertThat(body.readLongLE()).isEqualTo(9);
+            assertThat(body.readLongLE()).isEqualTo(11);
+            assertThat(body.readLongLE()).isEqualTo(13);
+            byte[] proof = new byte[ConsensusSession.BIND_SECRET_BYTES];
+            body.readBytes(proof);
+            assertThat(proof).isEqualTo(secret);
+            assertThat(body.isReadable()).isFalse();
+        } finally {
+            body.release();
+        }
     }
 
     private static String readShortField(ByteBuf buffer) {

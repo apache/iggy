@@ -27,7 +27,6 @@ publish = false
 charming = { workspace = true }
 colored = { workspace = true }
 comfy-table = { workspace = true }
-derive-new = { workspace = true }
 derive_more = { workspace = true }
 human-repr = { workspace = true }
 rand = { workspace = true }

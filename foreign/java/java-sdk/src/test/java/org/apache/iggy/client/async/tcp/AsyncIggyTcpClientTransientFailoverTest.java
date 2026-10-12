@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyClientException;
+import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
@@ -61,12 +62,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientTransientFailoverTest {
+    static final int OPERATION_REGISTER = 1;
+    static final int OPERATION_NON_REPLICATED = 2;
+    static final int GET_CLUSTER_METADATA_CODE = 12;
+    static final int TRANSIENT_NOT_ACCEPTED = 58;
+    static final int POLL_CODE = 100;
+    static final int GET_POLL_ROUTING_CODE = 103;
+    static final int POLL_ON_PRIMARY_CODE = 104;
+    static final int BIND_SESSION_CODE = 15;
+    static final int GROUP_SYNC_CODE = 606;
+
     private static final int HEADER_SIZE = 256;
     private static final int SIZE_OFFSET = 48;
     private static final int COMMAND_OFFSET = 60;
     private static final int REQUEST_ID_OFFSET = 168;
     private static final int REQUEST_OPERATION_OFFSET = 176;
     private static final int REQUEST_CODE_OFFSET = 196;
+    private static final int REQUEST_INCARNATION_OFFSET = 200;
+    private static final int REQUEST_OWNER_GENERATION_OFFSET = 208;
+    private static final int REQUEST_METADATA_OP_OFFSET = 216;
     private static final int REPLY_REQUEST_ID_OFFSET = 200;
     private static final int REPLY_OPERATION_OFFSET = 208;
     private static final int REPLY_STATUS_OFFSET = 216;
@@ -76,19 +90,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
 
     private static final int COMMAND_REPLY = 8;
     private static final int COMMAND_EVICTION = 13;
-    private static final int OPERATION_REGISTER = 1;
-    private static final int OPERATION_NON_REPLICATED = 2;
     private static final int OPERATION_LOGOUT = 3;
     private static final int OPERATION_CREATE_STREAM = 128;
-    private static final int GET_CLUSTER_METADATA_CODE = 12;
     private static final int CREATE_STREAM_CODE = 202;
-    private static final int TRANSIENT_NOT_ACCEPTED = 58;
     private static final int EVICTION_STALE_CLIENT = 13;
-    private static final int GET_POLL_ROUTING_CODE = 103;
-    private static final int POLL_ON_PRIMARY_CODE = 104;
-    private static final int ATTACH_CONSUMER_SESSION_CODE = 14;
-    private static final int POLL_CODE = 100;
-    private static final int GROUP_SYNC_CODE = 606;
     private static final int GROUP_JOIN_OPERATION = 148;
     private static final int UPDATE_USER_OPERATION = 142;
     private static final int CHANGE_PASSWORD_OPERATION = 144;
@@ -98,6 +103,122 @@ class AsyncIggyTcpClientTransientFailoverTest {
     // Longer than the retry interval, so a refusal is held before the poll deadline.
     private static final Duration REFUSAL_HOLD_WINDOW = Duration.ofSeconds(1);
     private static final Duration REFUSAL_HELD_AFTER = TEST_POLL_TIMEOUT.minus(REFUSAL_HOLD_WINDOW);
+
+    @Test
+    void shouldRetainUncertainMutationOutcomeAfterLaterRefusal() throws Exception {
+        for (int refusal : new int[] {
+            IggyErrorCode.STALE_CLIENT.getCode(),
+            IggyErrorCode.UNAUTHENTICATED.getCode(),
+            IggyErrorCode.UNAUTHORIZED.getCode(),
+            TRANSIENT_NOT_ACCEPTED
+        }) {
+            InetAddress loopback = InetAddress.getLoopbackAddress();
+            try (ServerSocket socket = new ServerSocket(0, 1, loopback)) {
+                AtomicInteger attempts = new AtomicInteger();
+                List<Long> requestIds = new CopyOnWriteArrayList<>();
+                CompletableFuture<Void> server = serve(socket, request -> {
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                    }
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.operation() == OPERATION_CREATE_STREAM) {
+                        requestIds.add(request.requestId());
+                        int attempt = attempts.incrementAndGet();
+                        return Response.error(
+                                OPERATION_CREATE_STREAM,
+                                attempt == 1
+                                        ? TRANSIENT_NOT_COMMITTED
+                                        : attempt == 2 ? refusal : IggyErrorCode.UNAUTHORIZED.getCode());
+                    }
+                    throw new IllegalStateException("Unexpected request: " + request);
+                });
+                AsyncIggyTcpClient client = client(socket);
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                    assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                    .get(5, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(IggyServerException.class)
+                            .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
+                                    .isEqualTo(TRANSIENT_NOT_COMMITTED));
+                    assertThat(requestIds).hasSizeGreaterThanOrEqualTo(2).containsOnly(requestIds.get(0));
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                server.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void shouldBindRetainedSessionAfterTransportLoss() throws Exception {
+        assertReconnectBinding(false);
+    }
+
+    @Test
+    void shouldRegisterFreshOnlyAfterRetainedSessionBindIsRefused() throws Exception {
+        assertReconnectBinding(true);
+    }
+
+    private static void assertReconnectBinding(boolean refuseBinding) throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket socket = new ServerSocket(0, 2, loopback)) {
+            List<Request> registrations = new CopyOnWriteArrayList<>();
+            List<Request> bindings = new CopyOnWriteArrayList<>();
+            AtomicBoolean disconnectNextRead = new AtomicBoolean();
+            CompletableFuture<Void> server = serve(socket, 2, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    registrations.add(request);
+                    return Response.success(OPERATION_REGISTER, registerBody(registrations.size()));
+                }
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    bindings.add(request);
+                    ByteBuffer identity = bindIdentity(request.body());
+                    assertThat(identity.getLong(0))
+                            .isEqualTo(registrations.get(0).clientLow());
+                    assertThat(identity.getLong(8))
+                            .isEqualTo(registrations.get(0).clientHigh());
+                    assertThat(identity.getLong(16)).isEqualTo(1);
+                    ByteBuf reply = registerBody(1);
+                    reply.skipBytes(Integer.BYTES);
+                    if (refuseBinding) {
+                        reply.release();
+                        return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                    }
+                    return Response.success(OPERATION_NON_REPLICATED, reply);
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return disconnectNextRead.compareAndSet(true, false)
+                            ? Response.disconnect()
+                            : Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                disconnectNextRead.set(true);
+                assertThatThrownBy(() -> client.sendBinaryRequest(GET_CLUSTER_METADATA_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyConnectionException.class);
+                client.sendBinaryRequest(GET_CLUSTER_METADATA_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+                assertThat(bindings).hasSize(1);
+                assertThat(registrations).hasSize(refuseBinding ? 2 : 1);
+                if (refuseBinding) {
+                    Request first = registrations.get(0);
+                    Request second = registrations.get(registrations.size() - 1);
+                    assertThat(second.clientLow() != first.clientLow() || second.clientHigh() != first.clientHigh())
+                            .isTrue();
+                }
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
 
     @Test
     void shouldCancelAnAutoCommitWaitingForTopologyWithoutClosingCoordinator() throws Exception {
@@ -121,6 +242,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     releaseProbe.join();
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, coordinatorSocket.getLocalPort()));
                 }
                 if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     polls.incrementAndGet();
@@ -192,7 +317,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
 
     @Test
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
-    void shouldRequireKnownTopologyBeforeAutoCommitAndRecoverDiscovery() throws Exception {
+    void shouldRequireKnownTopologyBeforePollingAndRecoverDiscovery() throws Exception {
         for (boolean clustered : new boolean[] {false, true}) {
             InetAddress loopback = InetAddress.getLoopbackAddress();
             try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
@@ -227,9 +352,13 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                 Unpooled.buffer().writeLongLE(1).writeIntLE(1).writeIntLE(0));
                     }
                     if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
-                        assertThat(clustered).isTrue();
                         return Response.success(
-                                OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(
+                                        request,
+                                        1,
+                                        1,
+                                        clustered ? primarySocket.getLocalPort() : coordinatorSocket.getLocalPort()));
                     }
                     if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                         legacyPolls.incrementAndGet();
@@ -242,7 +371,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                             if (request.operation() == OPERATION_REGISTER) {
                                 return Response.success(OPERATION_REGISTER, registerBody(2));
                             }
-                            if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                            if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                                 return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                             }
                             if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
@@ -258,27 +387,22 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     client.login().get(5, TimeUnit.SECONDS);
                     assertThat(client.rosterTargets()).isEmpty();
                     assertThat(metadataReads).hasValue(1);
-                    poll(client, Optional.of(0L), false).get(5, TimeUnit.SECONDS);
-                    assertThat(metadataReads).hasValue(1);
-                    assertThatThrownBy(
-                                    () -> poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS))
-                            .hasRootCauseInstanceOf(IggyServerException.class)
-                            .rootCause()
-                            .extracting(error -> ((IggyServerException) error).getRawErrorCode())
-                            .isEqualTo(TRANSIENT_NOT_ACCEPTED);
+                    assertServerError(poll(client, Optional.of(0L), false), TRANSIENT_NOT_ACCEPTED);
                     assertThat(metadataReads).hasValue(2);
-                    assertThat(legacyPolls).hasValue(1);
+                    assertServerError(poll(client, Optional.empty(), true), TRANSIENT_NOT_ACCEPTED);
+                    assertThat(metadataReads).hasValue(3);
+                    assertThat(legacyPolls).hasValue(0);
                     assertThat(primaryPolls).hasValue(0);
 
                     metadataUnavailable.set(false);
                     poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS);
-                    assertThat(metadataReads).hasValue(3);
+                    assertThat(metadataReads).hasValue(4);
                     assertThat(client.rosterTargets()).hasSize(clustered ? 2 : 1);
                     metadataUnavailable.set(true);
                     client.findLeaderElsewhere(client.getConnectionInfo()).get(5, TimeUnit.SECONDS);
-                    poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS);
-                    assertThat(metadataReads).hasValue(4);
-                    assertThat(legacyPolls).hasValue(clustered ? 1 : 3);
+                    poll(client, Optional.of(0L), false).get(5, TimeUnit.SECONDS);
+                    assertThat(metadataReads).hasValue(5);
+                    assertThat(legacyPolls).hasValue(clustered ? 0 : 2);
                     assertThat(primaryPolls).hasValue(clustered ? 2 : 0);
                     assertThat(logins).hasValue(1);
                     assertThat(client.getConnectionInfo().port()).isEqualTo(coordinatorSocket.getLocalPort());
@@ -321,6 +445,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     throw new IllegalStateException("Unexpected old-leader request: " + request);
                 });
                 CompletableFuture<Void> newLeader = serve(newSocket, 2, request -> {
+                    if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                    }
                     if (request.operation() == OPERATION_REGISTER) {
                         logins.add(request.bodyAsText());
                         return Response.success(OPERATION_REGISTER, registerBody(logins.size() + 1));
@@ -383,7 +510,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
                 ServerSocket primarySocket = new ServerSocket(0, 4, loopback)) {
             AtomicInteger logins = new AtomicInteger();
-            AtomicInteger attachedLogin = new AtomicInteger();
+            AtomicInteger attachedConnection = new AtomicInteger(-1);
             AtomicInteger attachments = new AtomicInteger();
             AtomicInteger polls = new AtomicInteger();
             AtomicReference<AsyncTcpConnection> auxiliary = new AtomicReference<>();
@@ -404,13 +531,13 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 if (request.is(CommandCode.System.PING.getValue(), OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                 }
-                if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
-                    attachedLogin.set(logins.get());
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    attachedConnection.set(request.connection());
                     attachments.incrementAndGet();
                     return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                 }
                 if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
-                    if (attachedLogin.get() != logins.get()) {
+                    if (attachedConnection.get() != request.connection()) {
                         return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
                     }
                     return polls.incrementAndGet() == 1
@@ -460,7 +587,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                 1L,
                                 true)
                         .get(5, TimeUnit.SECONDS);
-                assertThat(logins).hasValue(2);
+                assertThat(logins).hasValue(0);
                 assertThat(attachments).hasValue(2);
                 assertThat(polls).hasValue(2);
             } finally {
@@ -522,6 +649,50 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 }
                 coordinator.get(5, TimeUnit.SECONDS);
             }
+        }
+    }
+
+    @Test
+    void shouldRetryRefusedContextDiscoveryBeforeAPlainPoll() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger routes = new AtomicInteger();
+            AtomicInteger polls = new AtomicInteger();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    return routes.incrementAndGet() == 1
+                            ? Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED)
+                            : Response.success(
+                                    OPERATION_NON_REPLICATED,
+                                    pollRoute(request, 1, 1, coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
+                    polls.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertThat(poll(client, Optional.of(0L), false)
+                                .get(5, TimeUnit.SECONDS)
+                                .messages())
+                        .isEmpty();
+                assertThat(routes).hasValue(2);
+                assertThat(polls).hasValue(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
         }
     }
 
@@ -684,10 +855,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     if (request.operation() == OPERATION_REGISTER) {
                         return Response.success(OPERATION_REGISTER, registerBody(2));
                     }
-                    if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
-                        attachments.add(ByteBuffer.wrap(request.body())
-                                .order(ByteOrder.LITTLE_ENDIAN)
-                                .getLong(24));
+                    if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                        attachments.add(bindIdentity(request.body()).getLong(24));
                         if (holdAttachment && attachments.size() == 1) {
                             awaitRelease(held, release);
                         }
@@ -782,7 +951,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         dataLogins.incrementAndGet();
                         return Response.success(OPERATION_REGISTER, registerBody(2));
                     }
-                    if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                         attachments.incrementAndGet();
                         return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                     }
@@ -810,7 +979,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         result.get(5, TimeUnit.SECONDS);
                     }
                     assertThat(polls).hasValue(2);
-                    assertThat(dataLogins).hasValue(cancel ? 2 : 1);
+                    assertThat(dataLogins).hasValue(0);
                     assertThat(attachments).hasValue(2);
                     assertThat(parentLogins).hasValue(1);
                     assertThat(client.getConnectionInfo().port()).isEqualTo(coordinatorSocket.getLocalPort());
@@ -892,11 +1061,12 @@ class AsyncIggyTcpClientTransientFailoverTest {
             RequestHandler primary = request -> {
                 if (request.operation() == OPERATION_REGISTER) {
                     dataLogins.incrementAndGet();
-                    assertThat(request.bodyAsText()).contains("manual-user").doesNotContain("configured-user");
-                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                    throw new IllegalStateException("An auxiliary connection must bind without Register");
                 }
-                if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
-                    ByteBuffer attachment = ByteBuffer.wrap(request.body()).order(ByteOrder.LITTLE_ENDIAN);
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    ByteBuffer attachment = bindIdentity(request.body());
+                    assertThat(request.clientLow()).isEqualTo(parent.get().clientLow());
+                    assertThat(request.clientHigh()).isEqualTo(parent.get().clientHigh());
                     assertThat(attachment.getLong()).isEqualTo(parent.get().clientLow());
                     assertThat(attachment.getLong()).isEqualTo(parent.get().clientHigh());
                     assertThat(attachment.getLong()).isEqualTo(1);
@@ -922,7 +1092,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS);
                 }
                 assertThat(routes).hasValue(2);
-                assertThat(dataLogins).hasValue(2);
+                assertThat(dataLogins).hasValue(0);
                 assertThat(firstPolls).hasValue(2);
                 assertThat(secondPolls).hasValue(2);
                 client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
@@ -931,7 +1101,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 poll(client, Optional.of(0L), false).get(5, TimeUnit.SECONDS);
                 assertThat(attachedWatermarks).containsExactly(1L, 1L, 11L);
                 assertThat(routes).hasValue(3);
-                assertThat(ordinaryPolls).hasValue(1);
+                assertThat(firstPolls).hasValue(5);
+                assertThat(ordinaryPolls).hasValue(0);
                 assertThat(logins).hasValue(1);
                 assertThat(joins).hasValue(1);
                 assertThat(client.getConnectionInfo().port()).isEqualTo(coordinatorSocket.getLocalPort());
@@ -987,7 +1158,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                 .doesNotContain("configured-user");
                         return Response.success(OPERATION_REGISTER, registerBody(2));
                     }
-                    if (request.is(ATTACH_CONSUMER_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                         return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                     }
                     if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
@@ -1017,7 +1188,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                             .get(5, TimeUnit.SECONDS);
                     poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS);
                     assertThat(polls).hasValue(2);
-                    assertThat(logins).hasValue(2);
+                    assertThat(logins).hasValue(0);
                     assertThat(parentLogins).hasValue(1);
                 } finally {
                     client.close().get(5, TimeUnit.SECONDS);
@@ -1028,7 +1199,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         }
     }
 
-    private static AsyncIggyTcpClient client(ServerSocket coordinator) {
+    static AsyncIggyTcpClient client(ServerSocket coordinator) {
         return AsyncIggyTcpClient.builder()
                 .host(coordinator.getInetAddress().getHostAddress())
                 .port(coordinator.getLocalPort())
@@ -1038,7 +1209,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 .build();
     }
 
-    private static CompletableFuture<PolledMessages> poll(
+    static CompletableFuture<PolledMessages> poll(
             AsyncIggyTcpClient client, Optional<Long> partition, boolean autoCommit) {
         return client.messages()
                 .pollMessages(
@@ -1051,24 +1222,53 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         autoCommit);
     }
 
+    private static ByteBuffer bindIdentity(byte[] body) {
+        int offset = Integer.BYTES;
+        for (int index = 0; index < 2; index++) {
+            offset += 1 + Byte.toUnsignedInt(body[offset]);
+        }
+        assertThat(body.length - offset).isEqualTo(64);
+        return ByteBuffer.wrap(body, offset, 32).slice().order(ByteOrder.LITTLE_ENDIAN);
+    }
+
     private static int partition(Request request) {
         return ByteBuffer.wrap(request.body())
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .getInt(request.body().length - POLL_PARAMETERS_BYTES - Integer.BYTES);
     }
 
-    private static ByteBuf pollRoute(Request request, long session, long watermark, int port) {
+    static ByteBuf pollRoute(Request request, long session, long watermark, int port) {
+        return pollRoute(request, session, watermark, port, 0);
+    }
+
+    static ByteBuf pollRoute(Request request, long session, long watermark, int port, long incarnation) {
         ByteBuf body = Unpooled.buffer()
                 .writeLongLE(request.clientLow())
                 .writeLongLE(request.clientHigh())
                 .writeLongLE(session)
                 .writeLongLE(watermark);
-        writeNode(body, "primary", port, false);
+        writeNode(partitionContext(body, incarnation), "primary", port, false);
         return body;
     }
 
-    private static ByteBuf emptyPoll(int partition) {
-        return Unpooled.buffer().writeIntLE(partition).writeLongLE(0).writeIntLE(0);
+    static ByteBuf partitionContext(ByteBuf body, long incarnation) {
+        return body.writeLongLE(incarnation).writeLongLE(0).writeLongLE(0);
+    }
+
+    static void assertServerError(CompletableFuture<?> request, int code) {
+        assertThatThrownBy(() -> request.get(5, TimeUnit.SECONDS))
+                .hasRootCauseInstanceOf(IggyServerException.class)
+                .rootCause()
+                .extracting(error -> ((IggyServerException) error).getRawErrorCode())
+                .isEqualTo(code);
+    }
+
+    static ByteBuf emptyPoll(int partition) {
+        return Unpooled.buffer()
+                .writeIntLE(partition)
+                .writeLongLE(0)
+                .writeIntLE(0)
+                .writeZero(24);
     }
 
     @Test
@@ -1190,6 +1390,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
             AtomicInteger registrations = new AtomicInteger();
             AtomicInteger mutations = new AtomicInteger();
             CompletableFuture<Void> server = serve(serverSocket, 2, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
                 if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
                 }
@@ -1302,6 +1505,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
             List<String> registeredLogins = new CopyOnWriteArrayList<>();
             AtomicBoolean evict = new AtomicBoolean(true);
             CompletableFuture<Void> server = serve(serverSocket, 6, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
                 if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
                 }
@@ -1371,6 +1577,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
             List<String> registeredLogins = new CopyOnWriteArrayList<>();
             AtomicBoolean evict = new AtomicBoolean(true);
             CompletableFuture<Void> server = serve(serverSocket, 6, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
+                }
                 if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
                 }
@@ -1457,7 +1666,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         throw new IllegalStateException("Unexpected request to new leader: " + request);
     }
 
-    private static CompletableFuture<Void> serve(ServerSocket server, RequestHandler handler) {
+    static CompletableFuture<Void> serve(ServerSocket server, RequestHandler handler) {
         return serve(server, 1, handler);
     }
 
@@ -1467,7 +1676,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
      * runners, so three blocking nodes can starve the client continuations the
      * test is waiting for when the full suite runs concurrently.
      */
-    private static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
+    static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
         CompletableFuture<Void> serving = new CompletableFuture<>();
         Thread serverThread = new Thread(
                 () -> {
@@ -1477,7 +1686,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                 InputStream input = socket.getInputStream();
                                 OutputStream output = socket.getOutputStream();
                                 Request request;
-                                while ((request = readRequest(input)) != null) {
+                                while ((request = readRequest(input, connection)) != null) {
                                     Response response = handler.handle(request);
                                     if (response.command() == -1) {
                                         break;
@@ -1502,7 +1711,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return serving;
     }
 
-    private static Request readRequest(InputStream input) throws IOException {
+    private static Request readRequest(InputStream input, int connection) throws IOException {
         byte[] header = input.readNBytes(HEADER_SIZE);
         if (header.length == 0) {
             return null;
@@ -1522,7 +1731,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 fields.getLong(REQUEST_ID_OFFSET),
                 fields.getLong(REQUEST_CLIENT_OFFSET),
                 fields.getLong(REQUEST_CLIENT_OFFSET + Long.BYTES),
-                body);
+                fields.getLong(REQUEST_INCARNATION_OFFSET),
+                fields.getLong(REQUEST_OWNER_GENERATION_OFFSET),
+                fields.getLong(REQUEST_METADATA_OP_OFFSET),
+                body,
+                connection);
     }
 
     private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
@@ -1549,17 +1762,17 @@ class AsyncIggyTcpClientTransientFailoverTest {
         output.flush();
     }
 
-    private static ByteBuf registerBody(long session) {
+    static ByteBuf registerBody(long session) {
         ByteBuf body = Unpooled.buffer();
         body.writeIntLE(0);
         body.writeIntLE(1);
         body.writeLongLE(session);
-        body.writeIntLE(11 << 10);
+        body.writeIntLE((11 << 10) | 1);
         body.writeByte(0);
         return body;
     }
 
-    private static ByteBuf transientResult(int errorCode) {
+    static ByteBuf transientResult(int errorCode) {
         ByteBuf body = Unpooled.buffer(3 * Integer.BYTES);
         body.writeIntLE(1);
         body.writeIntLE(0);
@@ -1567,7 +1780,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return body;
     }
 
-    private static ByteBuf singleNodeMetadata(int port) {
+    static ByteBuf singleNodeMetadata(int port) {
         ByteBuf body = Unpooled.buffer();
         writeString(body, "test-cluster");
         body.writeIntLE(1);
@@ -1575,7 +1788,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return body;
     }
 
-    private static ByteBuf clusterMetadata(int oldLeaderPort, int newLeaderPort, int leaderPort) {
+    static ByteBuf clusterMetadata(int oldLeaderPort, int newLeaderPort, int leaderPort) {
         ByteBuf body = Unpooled.buffer();
         writeString(body, "test-cluster");
         body.writeIntLE(2);
@@ -1611,8 +1824,17 @@ class AsyncIggyTcpClientTransientFailoverTest {
         body.writeBytes(bytes);
     }
 
-    private record Request(
-            int operation, int commandCode, long requestId, long clientLow, long clientHigh, byte[] body) {
+    record Request(
+            int operation,
+            int commandCode,
+            long requestId,
+            long clientLow,
+            long clientHigh,
+            long incarnation,
+            long ownerGeneration,
+            long metadataOp,
+            byte[] body,
+            int connection) {
         boolean is(int expectedCode, int expectedOperation) {
             return commandCode == expectedCode && operation == expectedOperation;
         }
@@ -1623,7 +1845,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         }
     }
 
-    private record Response(
+    record Response(
             int command,
             int operation,
             int status,
@@ -1661,7 +1883,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     @FunctionalInterface
-    private interface RequestHandler {
+    interface RequestHandler {
         Response handle(Request request);
     }
 }
