@@ -46,8 +46,4 @@ pub trait StreamClient {
     ///
     /// Authentication is required, and the permission to manage the streams.
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError>;
-    /// Purge a stream by unique ID or name.
-    ///
-    /// Authentication is required, and the permission to manage the streams.
-    async fn purge_stream(&self, stream_id: &Identifier) -> Result<(), IggyError>;
 }

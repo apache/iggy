@@ -210,6 +210,13 @@ async fn given_partition_batches_spent_request_ids_when_a_metadata_request_is_re
         )
         .await
         .expect("create topic");
+    let context = crate::server::raw_tcp::partition_context(
+        &setup,
+        &Identifier::named(GAP_STREAM).unwrap(),
+        &Identifier::named(GAP_TOPIC).unwrap(),
+        0,
+    )
+    .await;
     drop(setup);
 
     let addr = tcp_addr(harness);
@@ -217,7 +224,7 @@ async fn given_partition_batches_spent_request_ids_when_a_metadata_request_is_re
 
     for request in 1..=GAP_BATCHES {
         let batch = send_messages_payload(u128::from(request));
-        commit_batch(&mut stream, CLIENT_A, session, request, &batch).await;
+        commit_batch(&mut stream, CLIENT_A, session, request, &batch, context).await;
     }
 
     let payload = create_stream_payload("adv-m-after-gap");
@@ -405,8 +412,9 @@ async fn commit_batch(
     session: u64,
     request: u64,
     body: &Bytes,
+    context: PartitionContext,
 ) {
-    let header = RequestHeader {
+    let mut header = RequestHeader {
         command: Command::Request,
         operation: Operation::SendMessages,
         size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
@@ -415,6 +423,7 @@ async fn commit_batch(
         request,
         ..Default::default()
     };
+    context.stamp(&mut header);
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
         match exchange(stream, &header, body).await {

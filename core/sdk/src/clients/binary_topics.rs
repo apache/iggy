@@ -79,16 +79,4 @@ impl TopicClient for IggyClient {
             .delete_topic(stream_id, topic_id)
             .await
     }
-
-    async fn purge_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .purge_topic(stream_id, topic_id)
-            .await
-    }
 }

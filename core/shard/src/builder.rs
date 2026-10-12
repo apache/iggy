@@ -68,6 +68,7 @@ where
     inbox: Receiver<ShardFrame>,
     reply_inbox: Receiver<ShardFrame>,
     poll_completion_capacity: usize,
+    partition_io_limits: Option<crate::PartitionIoLimits>,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
@@ -111,11 +112,19 @@ where
             inbox,
             reply_inbox,
             poll_completion_capacity,
+            partition_io_limits: None,
             shards_table,
             partition_consensus,
             coord_config,
             metrics,
         }
+    }
+
+    /// Override the shard defaults with prevalidated partition I/O limits.
+    #[must_use]
+    pub const fn with_partition_io_limits(mut self, limits: crate::PartitionIoLimits) -> Self {
+        self.partition_io_limits = Some(limits);
+        self
     }
 
     /// Consume the builder and produce a fully wired [`BuiltShard`]. On
@@ -130,6 +139,8 @@ where
     /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
+    /// Returns [`ShardCtorError::PartitionIoLimits`] if the default I/O limits
+    /// cannot represent the compiled job sizes.
     ///
     /// # Panics
     ///
@@ -224,6 +235,7 @@ where
             self.inbox,
             self.reply_inbox,
             self.poll_completion_capacity,
+            self.partition_io_limits,
             self.shards_table,
             self.partition_consensus,
             coordinator,

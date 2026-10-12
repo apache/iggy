@@ -69,12 +69,4 @@ pub trait TopicClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError>;
-    /// Purge a topic by unique ID or name.
-    ///
-    /// Authentication is required, and the permission to manage the topics.
-    async fn purge_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError>;
 }

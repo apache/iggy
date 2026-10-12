@@ -178,6 +178,10 @@ pub enum IggyError {
         "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
     )]
     RequestTooOld = 85,
+    #[error("The partition history is no longer available; this request cannot execute again")]
+    HistoryUnavailable = 87,
+    #[error("A committed lifecycle operation prevents this mutation. Retry as a new request.")]
+    LifecycleBusy = 88,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -292,6 +296,8 @@ pub enum IggyError {
     TooManyTopics = 2021,
     #[error("Partitions limit reached, raise [metadata] partitions_max")]
     PartitionsLimitReached = 2022,
+    #[error("Partition resizing is disabled for this fixed topic")]
+    PartitionResizeDisabled = 2023,
     #[error("Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}")]
     CannotCreatePartition(usize, usize, usize) = 3000,
     #[error(
@@ -332,6 +338,10 @@ pub enum IggyError {
     /// range frees again.
     #[error("Partition id space exhausted for this topic")]
     PartitionIdSpaceExhausted = 3013,
+    /// Clients must resolve the current partition state and submit a new request,
+    /// rather than replay the rejected request against its previous history.
+    #[error("Partition history changed after the request was resolved")]
+    PartitionHistoryChanged = 3014,
     #[error("Failed to read consumers offsets from path: {0}")]
     CannotReadConsumerOffsets(String) = 3020,
     #[error("Consumer offset for consumer with ID: {0} was not found.")]
@@ -493,6 +503,8 @@ pub enum IggyError {
         "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress)."
     )]
     ConsumerGroupPartitionNotOwned(u32, u32) = 5009,
+    #[error("Too many consumer groups")]
+    TooManyConsumerGroups = 5010,
     #[error("Base offset is missing")]
     MissingBaseOffsetRetainedMessageBatch = 6000,
     #[error("Last offset delta is missing")]
@@ -647,6 +659,14 @@ mod tests {
         assert_eq!(error.as_code(), 2022);
         assert_eq!(IggyError::from_code(2022), error);
         assert_eq!(IggyError::from_code_as_string(2022), error.as_string());
+    }
+
+    #[test]
+    fn partition_resize_disabled_round_trips_by_code() {
+        let error = IggyError::PartitionResizeDisabled;
+        assert_eq!(error.as_code(), 2023);
+        assert_eq!(IggyError::from_code(2023), error);
+        assert_eq!(IggyError::from_code_as_string(2023), error.as_string());
     }
 
     #[test]

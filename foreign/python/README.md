@@ -28,7 +28,7 @@ pip install apache-iggy
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 
 Published wheels include the Rust extension; installing a wheel does not require
 Rust. Building from source and running the development checks below also requires:

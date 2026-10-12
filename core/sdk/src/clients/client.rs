@@ -21,6 +21,7 @@ use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::EncryptorKind;
+use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
@@ -94,8 +95,8 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// - [`SystemClient`]: ping, server statistics, snapshots, and connected-client info.
 /// - [`UserClient`]: create, inspect, update, and delete users and their permissions.
 /// - [`PersonalAccessTokenClient`]: create, list, and delete personal access tokens, log in with one.
-/// - [`StreamClient`]: create, get, update, delete, and purge streams.
-/// - [`TopicClient`]: create, get, update, delete, and purge topics within a stream.
+/// - [`StreamClient`]: create, get, update, and delete streams.
+/// - [`TopicClient`]: create, get, update, and delete topics within a stream.
 /// - [`PartitionClient`]: add and remove partitions on a topic.
 /// - [`SegmentClient`]: delete closed segments from a partition.
 /// - [`ConsumerGroupClient`]: create, get, delete, and join or leave consumer groups.
@@ -122,9 +123,11 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
 ///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
 ///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
-///    client that has been shut down cannot reconnect. Explicit disconnect clears the remembered sign-in.
-///    Configured auto-login still authenticates on the next connection; otherwise call
-///    [`connect()`] and [`login_user()`] again before issuing requests.
+///    client that has been shut down cannot reconnect. The disconnect holds until the next
+///    [`connect()`]: requests fail and nothing reconnects in the background, even with `auto-login`.
+///    Explicit disconnect clears the remembered sign-in. Configured auto-login still authenticates
+///    on the next connection; otherwise call [`connect()`] and [`login_user()`] again before
+///    issuing requests.
 ///
 /// # Examples
 ///
@@ -653,8 +656,8 @@ impl IggyClient {
             self.client.clone(),
             name.to_owned(),
             Consumer::new(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
             None,
@@ -723,9 +726,9 @@ impl IggyClient {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
-            Consumer::group(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Consumer::group(Identifier::named(name)?),
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
             None,
@@ -784,9 +787,9 @@ impl IggyClient {
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
-            stream.try_into()?,
+            Identifier::named(stream)?,
             stream.to_owned(),
-            topic.try_into()?,
+            Identifier::named(topic)?,
             topic.to_owned(),
             self.encryptor.clone(),
             self.partitioner.clone(),
@@ -839,6 +842,17 @@ impl IggyClient {
     /// The HTTP counterpart is
     /// [`send_http_request`](IggyClient::send_http_request).
     ///
+    /// Partition commands carry the partition context the typed API would send.
+    /// `SendMessages` with an explicit partition id captures one with
+    /// `GetSendContext` and caches it. `PollMessages`, `StoreConsumerOffset` and
+    /// `DeleteConsumerOffset` are routed like their typed calls and take the
+    /// context their route reports, so after another client deleted and
+    /// recreated the partition, one call can fail with
+    /// [`IggyError::HistoryUnavailable`]
+    /// ([`IggyError::ConsumerGroupPartitionNotOwned`] for a consumer group).
+    /// The failed route is dropped and the next call routes again. See
+    /// [`BinaryTransport::send_raw_with_response`].
+    ///
     /// # Examples
     ///
     /// Ping the server over the raw binary path. `PING_CODE` takes an empty
@@ -865,8 +879,13 @@ impl IggyClient {
     /// [`IggyError::InvalidCommand`] if `code` is one of the session-control
     /// codes (login, logout, and register). Use the typed `login_user` /
     /// `logout_user` methods so the SDK's session state stays correct.
+    /// The same error, before anything is sent, if the payload of a partition
+    /// command does not decode.
     /// [`IggyError::FeatureUnavailable`] on the HTTP transport, which has no
-    /// binary path.
+    /// binary path, and before anything is sent for `SendMessages` with
+    /// `Balanced` or `MessagesKey` partitioning. Use
+    /// [`send_messages`](crate::prelude::MessageClient::send_messages) or an
+    /// explicit partition id.
     ///
     /// [`iggy_binary_protocol`]: iggy_binary_protocol
     /// [`iggy_binary_protocol::codes`]: iggy_binary_protocol::codes
@@ -937,27 +956,24 @@ impl IggyClient {
 
 impl Drop for IggyClient {
     fn drop(&mut self) {
-        let heartbeat_handle = self
-            .heartbeat_handle
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(handle) = heartbeat_handle {
+        if let Some(handle) = self.take_heartbeat() {
             handle.abort();
         }
     }
 }
 
-#[async_trait]
-impl Client for IggyClient {
-    async fn connect(&self) -> Result<(), IggyError> {
-        let heartbeat_interval;
-        {
-            let client = self.client.read().await;
-            client.connect().await?;
-            heartbeat_interval = client.heartbeat_interval().await;
-        }
+impl IggyClient {
+    /// Connects again after a leader redirect without clearing the caller's
+    /// `disconnect()`: one that lands during the redirect holds, and the
+    /// transport refuses the reconnect.
+    pub(crate) async fn reconnect_after_redirect(&self) -> Result<(), IggyError> {
+        self.client.read().await.reconnect_keeping_intent().await?;
+        self.start_heartbeat().await;
+        Ok(())
+    }
 
+    async fn start_heartbeat(&self) {
+        let heartbeat_interval = self.client.read().await.heartbeat_interval().await;
         let mut heartbeat_handle = self
             .heartbeat_handle
             .lock()
@@ -966,7 +982,7 @@ impl Client for IggyClient {
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
         {
-            return Ok(());
+            return;
         }
 
         drop(heartbeat_handle.take());
@@ -993,10 +1009,36 @@ impl Client for IggyClient {
                 sleep(heartbeat_interval.get_duration()).await
             }
         }));
+    }
+
+    fn take_heartbeat(&self) -> Option<JoinHandle<()>> {
+        self.heartbeat_handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+#[async_trait]
+impl Client for IggyClient {
+    async fn connect(&self) -> Result<(), IggyError> {
+        self.client.read().await.connect().await?;
+        self.start_heartbeat().await;
         Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // HTTP keeps no connection, so its disconnect changes nothing and the
+        // heartbeat keeps running.
+        let is_http = matches!(&*self.client.read().await, ClientWrapper::Http(_));
+        // A heartbeat ping on a disconnected client only logs errors, and on
+        // QUIC a redial it starts during the disconnect blocks the call. The
+        // aborted task is awaited, so a reconnect it owned is over before the
+        // transport tears down. `connect` starts the heartbeat again.
+        if !is_http && let Some(handle) = self.take_heartbeat() {
+            handle.abort();
+            let _ = handle.await;
+        }
         self.client.read().await.disconnect().await
     }
 

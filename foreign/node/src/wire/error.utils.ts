@@ -22,10 +22,11 @@ export class ResponseError extends Error {
   readonly commandCode: number;
   readonly errorCode: number;
 
-  constructor(commandCode: number, errorCode: number) {
+  constructor(commandCode: number, errorCode: number, detail?: string) {
     super(
       `command: { code: ${commandCode}, name: ${translateCommandCode(commandCode)} } ` +
-      `error: {code: ${errorCode}, message: ${translateErrorCode(errorCode)} }`
+      `error: {code: ${errorCode}, message: ${translateErrorCode(errorCode)} }` +
+      (detail ? ` ${detail}` : '')
     );
     this.name = 'ResponseError';
     this.commandCode = commandCode;
@@ -34,8 +35,8 @@ export class ResponseError extends Error {
   }
 }
 
-export const responseError = (cmdCode: number, errCode: number) =>
-  new ResponseError(cmdCode, errCode);
+export const responseError = (cmdCode: number, errCode: number, detail?: string) =>
+  new ResponseError(cmdCode, errCode, detail);
 
 export class DeserializeError extends Error {
   constructor(message: string, cause?: Record<string , unknown>) {

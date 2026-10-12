@@ -40,7 +40,7 @@ You can also customize the server using environment variables:
 IGGY_HTTP_ENABLED=true IGGY_HTTP_ADDRESS=127.0.0.1:3000 cargo run --bin iggy-server
 ```
 
-With Python 3.10 or newer and Rust/Cargo available, install dependencies from
+With Python 3.11 or newer and Rust/Cargo available, install dependencies from
 `examples/python`. `uv` selects the local SDK path in `pyproject.toml`; pip needs
 that path explicitly:
 
