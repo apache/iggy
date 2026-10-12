@@ -590,6 +590,7 @@ mod tests {
         let stream_id = Identifier::numeric(1).expect("valid stream id");
         let topic_id = Identifier::named("orders").expect("valid topic id");
         let command = StoreConsumerOffset {
+            context: None,
             consumer: Consumer::group(Identifier::numeric(9).expect("valid id")),
             partition_id: Some(1),
             offset: 42,

@@ -25,7 +25,7 @@ use iggy_common::ConsumerOffsetClient;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, ConsumerPosition};
+use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
@@ -36,7 +36,6 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         position: ConsumerPosition,
     ) -> Result<(), IggyError> {
-        refuse_external_group(consumer)?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
@@ -135,67 +134,6 @@ fn get_path(stream_id: &str, topic_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{MessageClient, PartitionContext, PollingStrategy};
-
-    /// Nothing listens on this port, so a call that reached the network would fail with a
-    /// transport error instead.
-    const UNREACHABLE_API: &str = "http://127.0.0.1:1";
-
-    #[tokio::test]
-    async fn given_external_group_when_polling_over_http_should_refuse_before_sending() {
-        let client = HttpClient::new(UNREACHABLE_API).unwrap();
-        let group = Consumer::external_group(Identifier::numeric(1).unwrap());
-        let stream = Identifier::numeric(1).unwrap();
-        let topic = Identifier::numeric(1).unwrap();
-
-        assert!(matches!(
-            client
-                .store_consumer_offset(&group, &stream, &topic, Some(0), 5)
-                .await,
-            Err(IggyError::FeatureUnavailable)
-        ));
-        assert!(matches!(
-            client
-                .store_consumer_position(
-                    &group,
-                    &stream,
-                    &topic,
-                    ConsumerPosition {
-                        partition_id: 0,
-                        offset: 5,
-                        context: PartitionContext::default(),
-                    },
-                )
-                .await,
-            Err(IggyError::FeatureUnavailable)
-        ));
-        assert!(matches!(
-            client
-                .get_consumer_offset(&group, &stream, &topic, Some(0))
-                .await,
-            Err(IggyError::FeatureUnavailable)
-        ));
-        assert!(matches!(
-            client
-                .delete_consumer_offset(&group, &stream, &topic, Some(0))
-                .await,
-            Err(IggyError::FeatureUnavailable)
-        ));
-        assert!(matches!(
-            client
-                .poll_messages(
-                    &stream,
-                    &topic,
-                    Some(0),
-                    &group,
-                    &PollingStrategy::next(),
-                    1,
-                    false
-                )
-                .await,
-            Err(IggyError::FeatureUnavailable)
-        ));
-    }
 
     #[test]
     fn given_plain_ids_when_building_path_should_join_segments() {
