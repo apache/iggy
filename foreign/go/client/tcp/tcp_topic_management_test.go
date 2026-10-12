@@ -18,16 +18,16 @@
 package tcp
 
 import (
-	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"context"
 	"encoding/binary"
-	"strings"
-	"testing"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"strings"
+	"testing"
 )
 
 func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {

@@ -18,17 +18,17 @@
 package tcp
 
 import (
-	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"context"
 	"encoding/binary"
-	"testing"
-	"time"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
+	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"testing"
+	"time"
 )
 
 // assignmentBody builds the SyncConsumerGroup reply body:

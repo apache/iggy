@@ -18,7 +18,6 @@
 package tcp
 
 import (
-	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -27,6 +26,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
+	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
+	"github.com/apache/iggy/foreign/go/internal/vsr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"log/slog"
 	"math/big"
 	"net"
@@ -36,12 +42,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	ierror "github.com/apache/iggy/foreign/go/errors"
-	"github.com/apache/iggy/foreign/go/internal/command"
-	"github.com/apache/iggy/foreign/go/internal/vsr"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // selfSignedCert mints a throwaway server certificate for the loopback

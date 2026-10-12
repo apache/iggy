@@ -20,12 +20,12 @@ package tcp
 import (
 	"bytes"
 	"errors"
-	"testing"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"testing"
 )
 
 // marshalOnlyCmd implements command.Command without AppendBinary; it forces
