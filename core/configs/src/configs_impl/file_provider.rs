@@ -497,6 +497,18 @@ mod tests {
         );
     }
 
+    /// The integration harness forwards every `IGGY_*` variable to the servers
+    /// it starts, its own `IGGY_TEST_*` knobs included.
+    #[test]
+    fn given_test_harness_variables_when_checking_then_the_server_should_boot() {
+        let unknown = server_unknown_env_names(&["IGGY_TEST_VERBOSE", "IGGY_TEST_CHAOS_SEED"]);
+
+        assert!(
+            unknown.is_empty(),
+            "the boot check must accept the test harness knobs, got: {unknown:?}"
+        );
+    }
+
     /// Runs the boot check's filter over `candidates` with the real server
     /// wiring, and without reading the ambient environment.
     fn server_unknown_env_names(candidates: &[&str]) -> Vec<String> {

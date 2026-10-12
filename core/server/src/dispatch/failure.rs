@@ -26,9 +26,9 @@
 //! | [`FrameChannel::TypedDeny`] | Reply, nonzero status + empty body, or a result-framed rejection body | rejections that must unblock the SDK's lockstep request slot: checksum, undeclared operation byte, authz, pre-consensus rewrite, unknown or unsupported non-replicated code, unbound non-PING read, transient replay hints |
 //! | [`FrameChannel::Eviction`] | session-terminal Eviction frame with a typed reason | the client must register again: `NoSession`, `MalformedLogin`, heartbeat and login evictions. The reason rides the channel label, since one `context` covers four of them |
 //! | [`FrameChannel::ResyncSentinel`] | status-0 poll reply, body carries `RESYNC_REQUIRED_PARTITION_SENTINEL` | a fenced consumer-group poll: the consumer must re-sync its assignment; HTTP mirrors it as `resync_required_polled_messages` in `crate::http::wire` |
-//! | [`FrameChannel::EmptyFrame`] | status 0 with the 16-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
+//! | [`FrameChannel::EmptyFrame`] | status 0 with the 40-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
 //! | [`FrameChannel::Reply`] | status-0 success frame | host-built success replies: login/register, ping, logout, non-replicated read bodies, committed metadata replies |
-//! | silent drop | no frame | one deliberate case, a transient consensus submit failure: the SDK read-timeout replays the same request id, and a synthesized failure could contradict a write that commits moments later. A header `RequestHeader::validate` rejected also drops, but that one is a GAP, not a contract - the fields decode, so a deny could be echoed under the transport id, and the client instead waits out its read timeout |
+//! | silent drop | no frame | only a header `RequestHeader::validate` rejected, and that one is a GAP, not a contract - the fields decode, so a deny can be echoed under the transport id, and the client instead waits out its read timeout. A metadata submit without a verdict is not silent: it answers `TransientNotCommitted` on `TypedDeny`, which licenses only a replay of the same request id, so it cannot contradict a write that commits moments later |
 //! | HTTP status | HTTP status code | the HTTP spine maps the same rejections in `crate::http::error`; it never rides these frames |
 //!
 //! The last two send nothing, so [`FrameChannel`] has no variant for them.
@@ -474,6 +474,7 @@ mod tests {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         metadata_consensus(&shard).advance_commit_max(COMMIT);
+        shard.plane.metadata().advance_applied_frontier(COMMIT);
         (bus, shard)
     }
 

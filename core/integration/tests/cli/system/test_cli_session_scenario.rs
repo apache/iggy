@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cli::common::IggyCmdTest;
+use crate::cli::common::{IggyCmdTest, OverWebSocket};
 use crate::cli::system::test_login_cmd::{TestLoginCmd, TestLoginCmdType};
 use crate::cli::system::test_logout_cmd::TestLogoutCmd;
 use crate::cli::system::test_me_command::{Scenario, TestMeCmd};
+use crate::cli::system::test_session_status_cmd::TestSessionStatusCmd;
 use iggy_common::TransportProtocol;
 use serial_test::serial;
 
@@ -103,5 +104,44 @@ pub async fn should_be_successful() {
             recovery_address,
             TestLoginCmdType::RecoverExpiredSession,
         ))
+        .await;
+}
+
+#[tokio::test]
+#[serial]
+pub async fn should_be_successful_using_transport_ws() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    let server_address = iggy_cmd_test.get_websocket_server_address();
+    assert!(server_address.is_some());
+    let server_address = server_address.unwrap();
+
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestLoginCmd::new(
+            server_address.clone(),
+            TestLoginCmdType::Success,
+        )))
+        .await;
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestSessionStatusCmd::new(
+            server_address.clone(),
+            true,
+        )))
+        .await;
+    iggy_cmd_test
+        .execute_test(TestMeCmd::new(
+            TransportProtocol::WebSocket,
+            Scenario::SuccessWithoutCredentials,
+        ))
+        .await;
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestLogoutCmd::new(server_address.clone())))
+        .await;
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestSessionStatusCmd::new(
+            server_address,
+            false,
+        )))
         .await;
 }

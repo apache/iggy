@@ -35,7 +35,11 @@ use integration::iggy_harness;
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn join(harness: &TestHarness) {
     consumer_group_join_scenario::run(harness).await;
@@ -51,7 +55,11 @@ async fn single_client(harness: &TestHarness) {
 
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
-    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+    server(
+        heartbeat.enabled = true,
+        heartbeat.interval = "60s",
+        consumer_group.rebalancing_timeout = "1s"
+    )
 )]
 async fn multiple_clients(harness: &TestHarness) {
     consumer_group_with_multiple_clients_polling_messages_scenario::run(harness).await;

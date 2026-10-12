@@ -95,11 +95,18 @@ pub trait GatedApply:
     /// # Errors
     /// Propagates the underlying [`StateMachine::update`] error.
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError>;
+
+    /// Partition-set revision used to validate retirement coverage during WAL replay.
+    fn namespace_revision(&self) -> u64;
 }
 
 impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         gated_apply(self, prepare)
+    }
+
+    fn namespace_revision(&self) -> u64 {
+        self.streams().read(|inner| inner.namespace_revision)
     }
 }
 
@@ -321,7 +328,11 @@ pub(crate) fn authorize(
         | Operation::DeletePersonalAccessToken
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
-        | Operation::DeleteConsumerOffset => None,
+        | Operation::DeleteConsumerOffset
+        | Operation::CompleteLifecycle
+        | Operation::TransitionPartitionHistory
+        | Operation::InstallConsumerGroupOwner
+        | Operation::RetireConsumerGroupOwners => None,
     }
 }
 
@@ -419,6 +430,10 @@ fn topic_scoped(
 impl GatedApply for MuxStateMachine<()> {
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
+    }
+
+    fn namespace_revision(&self) -> u64 {
+        0
     }
 }
 
