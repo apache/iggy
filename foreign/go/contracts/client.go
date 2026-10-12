@@ -98,6 +98,12 @@ type Client interface {
 	// Authentication is required, and the permission to manage the servers.
 	GetMetadataChanges(ctx context.Context, query MetadataChangesQuery) (*MetadataChanges, error)
 
+	// Snapshot returns a ZIP archive of the requested server diagnostics.
+	// An unset compression, more than 255 types, or All beside other types
+	// is refused with ierror.ErrInvalidCommand before anything is sent.
+	// Authentication is required, and the permission to manage the servers.
+	Snapshot(ctx context.Context, compression SnapshotCompression, snapshotTypes []SystemSnapshotType) ([]byte, error)
+
 	// CreateTopic create a new topic. Nil options select the defaults.
 	// Authentication is required, and the permission to manage the topics.
 	//
