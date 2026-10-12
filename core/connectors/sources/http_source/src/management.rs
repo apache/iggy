@@ -458,14 +458,22 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
 /// NACK limit can stop polling without calling
 /// `close()`, so an instance can stay registered while changes cannot reach
 /// the runtime. A stuck batch also blocks the next state flush while polling
-/// continues. `/admin/health` reports both conditions separately.
+/// continues. A refused state flush can reach the runtime without being
+/// persisted. `/admin/health` reports these conditions separately.
 fn warn_if_poll_cannot_forward(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
     let now = unix_now_seconds();
     let poll_is_live = instance.poll_is_live(now);
-    if poll_is_live && !instance.staged_batch_is_stuck(now) {
+    if poll_is_live && !instance.staged_batch_is_stuck(now) && !instance.state_flush_is_stuck(now) {
         return;
     }
     let endpoint = EndpointId::log_prefix_of(endpoint_id);
+    if poll_is_live && instance.state_flush_is_stuck(now) {
+        warn!(
+            "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while registry state is still being NACKed; polling continues, but persistence has not been confirmed by the runtime",
+            instance.id
+        );
+        return;
+    }
     if poll_is_live {
         warn!(
             "{action} endpoint {endpoint} on {CONNECTOR_NAME} connector ID: {} while a staged batch is still being NACKed; polling continues, but the change cannot reach the runtime until that batch succeeds",

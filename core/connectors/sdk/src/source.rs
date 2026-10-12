@@ -480,7 +480,7 @@ where
                     }
                 };
 
-                let (result_sender, result_receiver) = oneshot::channel();
+                let (result_sender, mut result_receiver) = oneshot::channel();
                 {
                     let mut pending = lock_pending_batch(&pending_batch);
                     *pending = Some(PendingBatch {
@@ -517,7 +517,6 @@ where
                     continue;
                 }
 
-                let mut result_receiver = Box::pin(result_receiver);
                 let mut timeout_warned = false;
                 let (completion, shutting_down) = loop {
                     let outcome = tokio::select! {
@@ -539,8 +538,7 @@ where
                                     policy.max_consecutive_nacks,
                                 ).await,
                                 PendingBatchClearResult::ResultReceived
-                                | PendingBatchClearResult::Unavailable => result_receiver
-                                    .as_mut()
+                                | PendingBatchClearResult::Unavailable => (&mut result_receiver)
                                     .await
                                     .unwrap_or(BatchCompletion::Stop(SourceStopReason::ResultChannelClosed)),
                             };

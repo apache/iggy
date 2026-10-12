@@ -340,6 +340,7 @@ impl Published {
                 .all(|instance| {
                     instance.poll_is_live(now_seconds)
                         && !instance.staged_batch_is_stuck(now_seconds)
+                        && !instance.state_flush_is_stuck(now_seconds)
                 })
     }
 }
@@ -1354,6 +1355,9 @@ struct InstanceHealth {
     /// A retained batch is still being retried after the readiness window.
     /// Polling may continue even when this is true.
     staged_batch_is_stuck: bool,
+    /// Registry persistence is still being refused after the readiness window.
+    /// Successful webhook batches do not clear this condition.
+    state_flush_is_stuck: bool,
     has_polled: bool,
     state_submitted: bool,
     /// Named to mirror the metric families exactly, so an operator reading
@@ -1378,6 +1382,7 @@ impl InstanceHealth {
             named_path: instance.config.topic_path.is_some(),
             poll_is_live: instance.poll_is_live(now),
             staged_batch_is_stuck: instance.staged_batch_is_stuck(now),
+            state_flush_is_stuck: instance.state_flush_is_stuck(now),
             has_polled: instance.has_polled(),
             // The registry is handed over whole, so an owed flush is the
             // whole answer. Still not `persisted`: the flag clears when the
@@ -1922,6 +1927,7 @@ mod tests {
         assert_eq!(instance["endpoints_revoked"], 0);
         assert_eq!(instance["named_path"], true);
         assert_eq!(instance["staged_batch_is_stuck"], false);
+        assert_eq!(instance["state_flush_is_stuck"], false);
         assert_eq!(instance["state_submitted"], true);
         close(&mut source).await;
     }
@@ -2789,6 +2795,63 @@ mod tests {
         let health = InstanceHealth::from_instance(&shared, &state.metrics, later);
         assert!(health.poll_is_live);
         assert!(health.staged_batch_is_stuck);
+        drop(polling);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_state_flush_nacks_when_idle_should_recover_readiness_on_state_ack() {
+        let mut source = open(
+            1,
+            config(free_port(), free_port(), &[ENDPOINT_ONE, ENDPOINT_TWO]),
+        )
+        .await;
+        let shared = Arc::clone(&source.shared);
+        shared.mutate_registry(|registry| registry.revoke(ENDPOINT_TWO, "rotated".to_string(), 42));
+        let batch = source
+            .poll()
+            .await
+            .expect("the mutation must be polled without traffic");
+        assert!(batch.messages.is_empty());
+        assert!(batch.state.is_some());
+        source
+            .on_batch_result(iggy_connector_sdk::source::SourceBatchResult::Nack)
+            .await
+            .expect("the refused flush must be retried");
+        let state = {
+            let servers = SERVERS.lock().await;
+            Arc::clone(
+                &servers
+                    .get(&shared.config.listen_addr)
+                    .expect("source listener should be registered")
+                    .state,
+            )
+        };
+        let now = unix_now_seconds();
+        assert!(state.published().is_ready(now));
+        let polling = shared.enter_poll();
+        let later = now + crate::POLL_LIVENESS_SECONDS + 1;
+        assert!(shared.poll_is_live(later));
+        assert!(!state.published().is_ready(later));
+        let health = InstanceHealth::from_instance(&shared, &state.metrics, later);
+        assert!(health.poll_is_live);
+        assert!(!health.staged_batch_is_stuck);
+        assert!(health.state_flush_is_stuck);
+        drop(polling);
+
+        let retried = source
+            .poll()
+            .await
+            .expect("the state must be retried without traffic");
+        assert!(retried.state.is_some());
+        source
+            .on_batch_result(iggy_connector_sdk::source::SourceBatchResult::Ack)
+            .await
+            .expect("state ACK must recover readiness");
+        let polling = shared.enter_poll();
+        assert!(state.published().is_ready(later));
+        let health = InstanceHealth::from_instance(&shared, &state.metrics, later);
+        assert!(!health.state_flush_is_stuck);
         drop(polling);
         close(&mut source).await;
     }

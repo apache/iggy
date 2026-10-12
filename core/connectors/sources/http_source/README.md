@@ -334,6 +334,8 @@ Size all of them together.
 
 `poll_is_live` describes the poll path; `staged_batch_is_stuck` separately flags a staged batch that has kept receiving NACKs for more than 60 seconds. In that case polling continues, but public `/health` answers 503. A batch still awaiting its first runtime result instead makes `poll_is_live` false after 60 seconds without marking `staged_batch_is_stuck`.
 
+`state_flush_is_stuck` flags registry state that has remained unacknowledged for more than 60 seconds after its first NACK, even on an idle gateway. Public `/health` answers 503 and `/admin/health` reports `"status":"degraded"` until a batch carrying state receives an ACK. Successful webhook batches and repeated state-flush NACKs do not reset this timer.
+
 `GET /admin/metrics` returns Prometheus text format. The runtime's own stage histograms begin at `poll()`, so they see nothing a sender experiences; these cover the gateway's own handling. The clock starts after the request body has been read, so a slow or large upload is not counted in `http_source_request_duration_seconds`.
 
 | Metric | Type | Labels | Notes |

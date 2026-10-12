@@ -255,6 +255,9 @@ pub struct SharedState {
     last_poll_at: AtomicU64,
     /// First NACK of the currently staged webhook batch, or zero if none.
     staged_nack_since: AtomicU64,
+    /// First refused state flush, cleared only by an ACK carrying state.
+    /// Webhook ACKs must not hide a state store that is still failing.
+    state_nack_since: AtomicU64,
     /// Serializes registry writers, which are all control-plane. The request
     /// path only ever loads the `ArcSwap` and never touches this.
     registry_writer: StdMutex<()>,
@@ -402,6 +405,12 @@ impl SharedState {
         since != 0 && now_seconds.saturating_sub(since) > POLL_LIVENESS_SECONDS
     }
 
+    /// Whether registry state has remained unacknowledged beyond the readiness window.
+    pub(crate) fn state_flush_is_stuck(&self, now_seconds: u64) -> bool {
+        let since = self.state_nack_since.load(Ordering::Acquire);
+        since != 0 && now_seconds.saturating_sub(since) > POLL_LIVENESS_SECONDS
+    }
+
     /// Marks the instance as having left the route table, before anything
     /// counts what its bridge still holds.
     pub(crate) fn mark_departed(&self) {
@@ -459,8 +468,9 @@ impl SharedState {
         });
     }
 
-    /// Clears the refused-flush backoff once the runtime accepts a batch.
+    /// Clears the refused-flush backoff once the runtime accepts a batch carrying state.
     pub fn clear_state_flush_backoff(&self) {
+        self.state_nack_since.store(0, Ordering::Release);
         self.state_flush_nacks.store(0, Ordering::Release);
         self.handed_changes.store(0, Ordering::Release);
     }
@@ -844,6 +854,7 @@ impl HttpSource {
             departed: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
             staged_nack_since: AtomicU64::new(0),
+            state_nack_since: AtomicU64::new(0),
             registry_writer: StdMutex::new(()),
             state_flush: Arc::new(Notify::new()),
             state_flush_nacks: AtomicU32::new(0),
@@ -943,6 +954,12 @@ impl HttpSource {
             if !self.last_batch_carried_state.load(Ordering::Acquire) {
                 return Ok(());
             }
+            let _ = self.shared.state_nack_since.compare_exchange(
+                0,
+                unix_now_seconds(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             // `take_dirty_state` already cleared the flag, so re-arming here is
             // the only thing that stops a revocation being lost while the API
             // reports it durable. This is load-bearing, not defensive.
@@ -1420,6 +1437,71 @@ mod tests {
                 .shared
                 .staged_batch_is_stuck(101 + POLL_LIVENESS_SECONDS)
         );
+    }
+
+    #[tokio::test]
+    async fn given_state_flush_nacks_when_traffic_acked_should_stay_stuck_until_state_ack() {
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+        source.shared.poll_active.store(true, Ordering::Release);
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
+        let flushed = source.poll().await.expect("poll must carry the mutation");
+        assert!(flushed.messages.is_empty());
+        assert!(flushed.state.is_some());
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("the refused flush must be retried");
+        assert_ne!(source.shared.state_nack_since.load(Ordering::Acquire), 0);
+        source.shared.state_nack_since.store(100, Ordering::Release);
+        let later = 101 + POLL_LIVENESS_SECONDS;
+        assert!(
+            !source
+                .shared
+                .state_flush_is_stuck(100 + POLL_LIVENESS_SECONDS)
+        );
+        assert!(source.shared.state_flush_is_stuck(later));
+        assert!(!source.shared.staged_batch_is_stuck(later));
+
+        source
+            .shared
+            .sender
+            .try_send(queued("event"))
+            .expect("bridge must accept");
+        let traffic = source.poll().await.expect("traffic must be polled");
+        assert_eq!(traffic.messages.len(), 1);
+        assert!(traffic.state.is_none());
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("traffic ACK must succeed");
+        assert_eq!(source.shared.state_nack_since.load(Ordering::Acquire), 100);
+        assert!(source.shared.state_flush_is_stuck(later));
+
+        let retried = source
+            .poll()
+            .await
+            .expect("the state flush must be retried");
+        assert!(retried.state.is_some());
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("repeated NACK must succeed");
+        assert_eq!(source.shared.state_nack_since.load(Ordering::Acquire), 100);
+        assert!(source.shared.state_flush_is_stuck(later));
+        let recovered = source
+            .poll()
+            .await
+            .expect("the refused state must be handed out again");
+        assert!(recovered.state.is_some());
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("state ACK must succeed");
+        assert_eq!(source.shared.state_nack_since.load(Ordering::Acquire), 0);
+        assert!(!source.shared.state_flush_is_stuck(later));
+        assert!(source.shared.poll_is_live(later));
     }
 
     #[test]
@@ -2369,6 +2451,7 @@ mod tests {
             !source.shared.has_pending_state(),
             "a NACK of a batch that carried no state must not claim a flush is owed"
         );
+        assert_eq!(source.shared.state_nack_since.load(Ordering::Acquire), 0);
         assert_eq!(
             source.shared.pending_change_count(),
             0,
