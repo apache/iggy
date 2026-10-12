@@ -52,7 +52,6 @@ const (
 	rootPassword = "iggy"
 
 	// Command codes the raw-request cases drive directly.
-	getSnapshotCode          = 11
 	storeConsumerOffsetCode  = 121
 	deleteConsumerOffsetCode = 122
 	vendorCode               = 60000

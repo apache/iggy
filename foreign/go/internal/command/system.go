@@ -19,8 +19,11 @@ package command
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 type GetClient struct {
@@ -104,4 +107,27 @@ func (p *Ping) Code() Code {
 
 func (p *Ping) MarshalBinary() ([]byte, error) {
 	return []byte{}, nil
+}
+
+type Snapshot struct {
+	Compression   iggcon.SnapshotCompression
+	SnapshotTypes []iggcon.SystemSnapshotType
+}
+
+func (s *Snapshot) Code() Code {
+	return GetSnapshotFileCode
+}
+
+func (s *Snapshot) MarshalBinary() ([]byte, error) {
+	if len(s.SnapshotTypes) > math.MaxUint8 {
+		return nil, fmt.Errorf("%w: snapshot type count exceeds %d", ierror.ErrInvalidCommand, math.MaxUint8)
+	}
+
+	body := make([]byte, 2+len(s.SnapshotTypes))
+	body[0] = byte(s.Compression)
+	body[1] = byte(len(s.SnapshotTypes))
+	for index, snapshotType := range s.SnapshotTypes {
+		body[2+index] = byte(snapshotType)
+	}
+	return body, nil
 }
