@@ -52,8 +52,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_PAUSE: Duration = Duration::from_millis(500);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 const WAL_FRONTIER_SLOTS: usize = 2;
-const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL3";
-/// The head field in the checked `IGGYWAL3` frontier slot layout.
+const WAL_FRONTIER_MAGIC: &[u8; 8] = b"IGGYWAL4";
+/// The head field in the checked `IGGYWAL4` frontier slot layout.
 const WAL_HEAD_OFFSET: usize = 72;
 
 /// How a test writes the offset of a new consumer.

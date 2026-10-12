@@ -23,6 +23,7 @@ using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -44,8 +45,7 @@ public class VsrConsumerGroupTests
     public async Task GroupPoll_Should_Drain_EveryAssignedPartition()
     {
         var (client, streamName, groupName) = await CreateGroup();
-        await client.JoinConsumerGroupAsync(Identifier.String(streamName), Identifier.String(TopicName),
-            Identifier.String(groupName));
+        await JoinAsync(client, streamName, TopicName, groupName, 1);
 
         for (uint partitionId = 0; partitionId < PartitionsCount; partitionId++)
         {
@@ -96,8 +96,7 @@ public class VsrConsumerGroupTests
     public async Task Ping_Should_Refresh_TheGroupAssignment_After_PartitionsAreAdded()
     {
         var (client, streamName, groupName) = await CreateGroup();
-        await client.JoinConsumerGroupAsync(Identifier.String(streamName), Identifier.String(TopicName),
-            Identifier.String(groupName));
+        await JoinAsync(client, streamName, TopicName, groupName, 1);
         await PollGroupAsync(client, streamName, groupName);
 
         await client.CreatePartitionsAsync(Identifier.String(streamName), Identifier.String(TopicName), 1);
@@ -105,6 +104,10 @@ public class VsrConsumerGroupTests
 
         (await DrainGroupAsync(client, streamName, groupName, PartitionsCount + 1)).ShouldBe(0);
 
+        // The new partition gets its owner asynchronously. Waiting only now keeps the drain above on the cached
+        // assignment, which a poll re-syncs once it is five seconds old.
+        await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName), Identifier.String(TopicName),
+            Identifier.String(groupName), 1);
         await client.PingAsync();
 
         (await DrainGroupAsync(client, streamName, groupName, PartitionsCount + 1)).ShouldBe(1);
@@ -124,8 +127,8 @@ public class VsrConsumerGroupTests
         await first.CreateConsumerGroupAsync(Identifier.String(streamName), Identifier.String(topicName), groupName);
 
         var second = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
-        await JoinAsync(first, streamName, topicName, groupName);
-        await JoinAsync(second, streamName, topicName, groupName);
+        await JoinAsync(first, streamName, topicName, groupName, 1);
+        await JoinAsync(second, streamName, topicName, groupName, 2);
 
         await first.SendMessagesAsync(Identifier.String(streamName), Identifier.String(topicName),
             Partitioning.PartitionId(0),
@@ -148,11 +151,11 @@ public class VsrConsumerGroupTests
     public async Task GroupPoll_After_ASecondMemberJoins_Should_ResyncTheStaleAssignment()
     {
         var (first, streamName, groupName) = await CreateGroup();
-        await JoinAsync(first, streamName, TopicName, groupName);
+        await JoinAsync(first, streamName, TopicName, groupName, 1);
         await DrainGroupAsync(first, streamName, groupName, PartitionsCount);
 
         var second = await Fixture.CreateAuthenticatedClient(Protocol.Tcp);
-        await JoinAsync(second, streamName, TopicName, groupName);
+        await JoinAsync(second, streamName, TopicName, groupName, 2);
 
         for (uint partitionId = 0; partitionId < PartitionsCount; partitionId++)
         {
@@ -167,10 +170,14 @@ public class VsrConsumerGroupTests
         drained.ShouldBe((int)PartitionsCount);
     }
 
-    private static Task JoinAsync(IIggyClient client, string streamName, string topicName, string groupName)
+    /// <summary>Joins, then waits until the members own every partition, so the next group poll syncs them.</summary>
+    private static async Task JoinAsync(IIggyClient client, string streamName, string topicName, string groupName,
+        uint membersCount)
     {
-        return client.JoinConsumerGroupAsync(Identifier.String(streamName), Identifier.String(topicName),
+        await client.JoinConsumerGroupAsync(Identifier.String(streamName), Identifier.String(topicName),
             Identifier.String(groupName));
+        await client.WaitForConsumerGroupAssignmentAsync(Identifier.String(streamName), Identifier.String(topicName),
+            Identifier.String(groupName), membersCount);
     }
 
     private async Task<(IIggyClient Client, string StreamName, string GroupName)> CreateGroup()

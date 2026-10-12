@@ -205,6 +205,14 @@ namespace Iggy {
         /**
          * Polls messages from the specified topic and partition.
          *
+         * Each message keeps the partition context of this poll. To continue at an offset under
+         * that context, pass PollingStrategy::offset($offset)->withContext($message->context()).
+         * A stale context fails with HistoryUnavailable (87).
+         *
+         * Without a context, the poll uses the context of its route. It can fail once with
+         * HistoryUnavailable (87) after another client deleted and recreated the partition. The
+         * failed route is dropped, and the next call routes again.
+         *
          * @param mixed $stream
          * @param mixed $topic
          * @param int $partition_id
@@ -250,8 +258,14 @@ namespace Iggy {
          * The callback is called as callback(ReceiveMessage $message). A finite limit is required.
          *
          * With AutoCommit::when(), offsets may already be queued for commit before the
-         * PHP callback runs. Use AutoCommit::disabled() and call storeOffset() after a
-         * successful callback when at-least-once callback processing is required.
+         * PHP callback runs. Use AutoCommit::disabled() and call
+         * storePosition($message->position()) after a successful callback when at-least-once
+         * callback processing is required.
+         *
+         * After another client deleted and recreated a partition, or after its consumer group
+         * owner changed, a poll can fail once with HistoryUnavailable (87) or
+         * ConsumerGroupPartitionNotOwned (5009). The failed route is dropped, and the next call
+         * routes again.
          *
          * @param callable $callback
          * @param int $limit
@@ -263,6 +277,10 @@ namespace Iggy {
          * Deletes the stored offset for the provided partition id.
          *
          * If partition_id is null, at least one message must have been polled first.
+         *
+         * The delete uses the context of its route. It can fail once with HistoryUnavailable
+         * (87), or ConsumerGroupPartitionNotOwned (5009), after another client deleted and
+         * recreated the partition. The failed route is dropped, and the next call routes again.
          *
          * @param int|null $partition_id
          * @return void
@@ -288,6 +306,11 @@ namespace Iggy {
         /**
          * Returns an iterator over messages for use with foreach.
          *
+         * After another client deleted and recreated a partition, or after its consumer group
+         * owner changed, a poll can fail once with HistoryUnavailable (87) or
+         * ConsumerGroupPartitionNotOwned (5009). The failed route is dropped, and the next call
+         * routes again.
+         *
          * @return \Iggy\MessageIterator
          */
         public function iterMessages(): \Iggy\MessageIterator {}
@@ -311,11 +334,35 @@ namespace Iggy {
          *
          * If partition_id is null, at least one message must have been polled first.
          *
+         * The offset is committed under the partition context of the latest message consumed
+         * from that partition. After the partition was recreated or changed owner, that context
+         * can be newer than the message's, and the offset then lands on the newer partition. Use
+         * storePosition($message->position()) to commit under the context that delivered the
+         * message.
+         *
+         * When nothing was consumed from that partition, the store uses the context of its route
+         * and can fail once with HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned
+         * (5009), after another client deleted and recreated the partition. The failed route is
+         * dropped, and the next call routes again.
+         *
          * @param int $offset
          * @param int|null $partition_id
          * @return void
          */
         public function storeOffset(int $offset, ?int $partition_id = null): void {}
+
+        /**
+         * Stores a message position under the partition incarnation and owner that delivered it.
+         *
+         * Pass $message->position() to commit a message after later polls or a rebalance. A
+         * position from a deleted or recreated partition fails with HistoryUnavailable (87), and
+         * one from a previous owner fails with ConsumerGroupPartitionNotOwned (5009). The stored
+         * offset is then unchanged.
+         *
+         * @param \Iggy\ConsumerPosition $position
+         * @return void
+         */
+        public function storePosition(\Iggy\ConsumerPosition $position): void {}
 
         /**
          * Gets the stream identifier this consumer is configured for.
@@ -330,6 +377,36 @@ namespace Iggy {
          * @return string
          */
         public function topic(): string {}
+    }
+
+    /**
+     * A PHP class representing a consumed position to commit with Consumer::storePosition().
+     */
+    class ConsumerPosition {
+        /**
+         * The partition incarnation and owner captured by the poll that delivered the message.
+         *
+         * @var \Iggy\PartitionContext
+         */
+        public readonly \Iggy\PartitionContext $context;
+
+        /**
+         * The inclusive message offset to commit.
+         *
+         * @var int
+         */
+        public readonly int $offset;
+
+        public readonly int $partition_id;
+
+        /**
+         * Rebuilds a position from values saved with a processed message.
+         *
+         * @param int $partition_id
+         * @param int $offset
+         * @param \Iggy\PartitionContext $context
+         */
+        public function __construct(int $partition_id, int $offset, \Iggy\PartitionContext $context) {}
     }
 
     enum Durability: string {
@@ -364,6 +441,46 @@ namespace Iggy {
          * @return bool
          */
         public function valid(): bool {}
+    }
+
+    /**
+     * A PHP class representing the partition incarnation and owner that a poll captured.
+     *
+     * Keep it with an offset that is continued or committed later. The server then refuses the
+     * request after the partition was deleted and recreated, or after its consumer group owner
+     * changed.
+     */
+    class PartitionContext {
+        /**
+         * The partition's creation revision. It changes when the partition is deleted and
+         * recreated.
+         *
+         * @var int
+         */
+        public readonly int $incarnation;
+
+        /**
+         * The metadata operation the server must have applied before it serves the request.
+         *
+         * @var int
+         */
+        public readonly int $metadata_op;
+
+        /**
+         * The consumer group owner generation, or 0 for a poll without a consumer group.
+         *
+         * @var int
+         */
+        public readonly int $owner_generation;
+
+        /**
+         * Rebuilds a context from values saved with an offset, for example by another process.
+         *
+         * @param int $incarnation
+         * @param int $owner_generation
+         * @param int $metadata_op
+         */
+        public function __construct(int $incarnation, int $owner_generation, int $metadata_op) {}
     }
 
     class PollingStrategy {
@@ -413,6 +530,17 @@ namespace Iggy {
          * @return \Iggy\PollingStrategy
          */
         public static function timestampSeconds(int $value): \Iggy\PollingStrategy {}
+
+        /**
+         * Continues at an offset under the partition incarnation and owner that produced it.
+         *
+         * A stale context fails the poll instead of reading that offset from a recreated
+         * partition. Without a context, the poll uses the context of its route.
+         *
+         * @param \Iggy\PartitionContext $context
+         * @return \Iggy\PollingStrategy
+         */
+        public function withContext(\Iggy\PartitionContext $context): \Iggy\PollingStrategy {}
     }
 
     /**
@@ -431,6 +559,14 @@ namespace Iggy {
          * @return string
          */
         public function checksum(): string {}
+
+        /**
+         * Retrieves the partition incarnation and owner captured by the poll that delivered
+         * this message.
+         *
+         * @return \Iggy\PartitionContext
+         */
+        public function context(): \Iggy\PartitionContext {}
 
         /**
          * Retrieves the id of the received message.
@@ -476,6 +612,17 @@ namespace Iggy {
          * @return string
          */
         public function payload(): string {}
+
+        /**
+         * Retrieves the position to commit for this message with Consumer::storePosition().
+         *
+         * It keeps the partition incarnation and owner that delivered the message, so a commit
+         * after the partition was recreated or changed owner is refused instead of landing on
+         * the newer partition.
+         *
+         * @return \Iggy\ConsumerPosition
+         */
+        public function position(): \Iggy\ConsumerPosition {}
 
         /**
          * Retrieves the timestamp of the received message.

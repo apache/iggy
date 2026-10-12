@@ -32,32 +32,39 @@ import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Keeps the membership-owning coordinator separate from auto-commit data polls.
- * Polls have no deduplication key; only explicit non-admission permits replay.
+ * Keeps the membership-owning coordinator separate from polls and offset writes,
+ * which only the partition primary serves.
+ * Only explicit non-admission permits rerouting.
  */
 final class PollRouter {
+    static final int POLL_PARAMETERS_BYTES = 14;
+    /** The session identity that leads every routing reply, before its partition context. */
+    static final int ATTACHMENT_BYTES = 32;
+
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
-    private static final int POLL_PARAMETERS_BYTES = 14;
-    private static final int ATTACHMENT_BYTES = 32;
     private static final long RETRY_INTERVAL_MILLIS = 50;
 
     private final Supplier<AsyncTcpConnection> coordinator;
@@ -81,18 +88,49 @@ final class PollRouter {
         this.pollTimeout = pollTimeout;
     }
 
-    CompletableFuture<ByteBuf> poll(ByteBuf payload) {
-        Poll poll;
+    CompletableFuture<ByteBuf> poll(ByteBuf payload, Optional<PartitionContext> context) {
+        byte[] request = takeBytes(payload);
+        return send(new Poll(
+                CommandCode.Messages.GET_POLL_ROUTING,
+                request,
+                CommandCode.Messages.POLL_ON_PRIMARY.getValue(),
+                request,
+                request.length - POLL_PARAMETERS_BYTES,
+                pollTimeout,
+                context));
+    }
+
+    /**
+     * Sends a store or delete offset request to the partition primary. The route is
+     * looked up by the consumer, stream, topic and partition in the first
+     * {@code targetLength} bytes, as in Rust's {@code write_offset}.
+     */
+    CompletableFuture<ByteBuf> writeOffset(
+            int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
+        byte[] request = takeBytes(payload);
+        return send(new Poll(
+                CommandCode.ConsumerOffset.GET_ROUTING,
+                Arrays.copyOf(request, targetLength),
+                command,
+                request,
+                targetLength,
+                pollTimeout,
+                context));
+    }
+
+    private static byte[] takeBytes(ByteBuf payload) {
         try {
-            String key = ByteBufUtil.hexDump(
-                    payload, payload.readerIndex(), payload.readableBytes() - POLL_PARAMETERS_BYTES);
-            poll = new Poll(key, ByteBufUtil.getBytes(payload), pollTimeout);
+            return ByteBufUtil.getBytes(payload);
         } finally {
             payload.release();
         }
+    }
+
+    private CompletableFuture<ByteBuf> send(Poll poll) {
         synchronized (this) {
             if (pending.size() >= MAX_PENDING_POLLS) {
-                return CompletableFuture.failedFuture(new IggyClientException("Too many pending primary polls"));
+                return CompletableFuture.failedFuture(
+                        new IggyClientException("Too many pending primary polls and offset writes"));
             }
             pending.add(poll);
         }
@@ -173,7 +211,7 @@ final class PollRouter {
                 return CompletableFuture.completedFuture(cached);
             }
         }
-        return parent.send(CommandCode.Messages.GET_POLL_ROUTING, Unpooled.wrappedBuffer(poll.payload))
+        return parent.send(poll.routingCommand, Unpooled.wrappedBuffer(poll.routingBody))
                 .thenApply(response -> decodeRoute(parent, poll, response))
                 .exceptionallyCompose(error -> {
                     if (!connectionFailed(error) || poll.result.isDone()) {
@@ -191,7 +229,7 @@ final class PollRouter {
 
     private Route decodeRoute(AsyncTcpConnection parent, Poll poll, ByteBuf response) {
         try {
-            if (response.readableBytes() < ATTACHMENT_BYTES) {
+            if (response.readableBytes() < ATTACHMENT_BYTES + PartitionContext.ENCODED_SIZE) {
                 throw new IggyClientException("Truncated primary poll session attachment");
             }
             Attachment attachment = new Attachment(
@@ -201,6 +239,7 @@ final class PollRouter {
             if (generation != parent.sessionGeneration()) {
                 throw new IggyClientException("Parent session changed while decoding a poll route");
             }
+            var context = BytesDeserializer.readPartitionContext(response);
             var node = BytesDeserializer.readClusterNode(response);
             if (response.isReadable() || node.endpoints().tcp() == 0) {
                 throw new IggyClientException("Invalid TCP primary poll routing response");
@@ -212,7 +251,8 @@ final class PollRouter {
                         attachment.withWatermark(metadataWatermark),
                         parent,
                         generation,
-                        bindSecret);
+                        bindSecret,
+                        context);
                 if (routes.size() >= MAX_ROUTES) {
                     routes.clear();
                 }
@@ -352,7 +392,14 @@ final class PollRouter {
             if (data == null || attached == null) {
                 return CompletableFuture.failedFuture(notAccepted());
             }
-            return data.sendPrimaryPoll(Unpooled.wrappedBuffer(poll.payload), attached.generation)
+            // No poll monitor here: an idle slot sends under the router monitor, while expire()
+            // completes the poll, whose callback takes the router, under the poll monitor.
+            poll.context.compareAndSet(null, route.context);
+            return data.sendOnPrimary(
+                            poll.dataCommand,
+                            Unpooled.wrappedBuffer(poll.payload),
+                            attached.generation,
+                            poll.context.get())
                     .whenComplete((response, error) -> {
                         if (error != null) {
                             if (isNotAccepted(error)) {
@@ -371,6 +418,7 @@ final class PollRouter {
             if (connection == null) {
                 AsyncTcpConnection data = connectData.apply(route.endpoint);
                 data.bindSharedSession(
+                        route.parent,
                         route.attachment.clientLow,
                         route.attachment.clientHigh,
                         route.attachment.session,
@@ -436,18 +484,37 @@ final class PollRouter {
         }
     }
 
+    /** One poll or offset write, routed by the routing command and sent as the data command. */
     private static final class Poll {
         private final String key;
+        private final CommandCode routingCommand;
+        private final byte[] routingBody;
+        private final int dataCommand;
         private final byte[] payload;
         private final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
         private final long deadline;
         private volatile Slot activeSlot;
+        // The caller's context, or else the first route's, kept for every retry of this poll.
+        private final AtomicReference<PartitionContext> context;
         private boolean retryingRefusal;
 
-        private Poll(String key, byte[] payload, Duration pollTimeout) {
-            this.key = key;
+        private Poll(
+                CommandCode routingCommand,
+                byte[] routingBody,
+                int dataCommand,
+                byte[] payload,
+                int keyLength,
+                Duration pollTimeout,
+                Optional<PartitionContext> callerContext) {
+            // Rust keys a route by its routing command too, so a poll and an offset
+            // write of one consumer and partition keep separate routes.
+            this.key = routingCommand.getValue() + ":" + ByteBufUtil.hexDump(payload, 0, keyLength);
+            this.routingCommand = routingCommand;
+            this.routingBody = routingBody;
+            this.dataCommand = dataCommand;
             this.payload = payload;
             this.deadline = System.nanoTime() + pollTimeout.toNanos();
+            this.context = new AtomicReference<>(callerContext.orElse(null));
         }
 
         private void discardConnection() {
@@ -488,7 +555,8 @@ final class PollRouter {
             Attachment attachment,
             AsyncTcpConnection parent,
             long generation,
-            byte[] bindSecret) {}
+            byte[] bindSecret,
+            PartitionContext context) {}
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
         private Attachment {

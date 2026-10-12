@@ -81,16 +81,19 @@ Key new minimums:
 
 | Key | API Name | Min (4.0) | Max (4.0) | Flexible From | Gateway Action |
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
-| 8 | **OffsetCommit** | 2 | 9 | v8 | 🟠 Required Stub |
-| 9 | **OffsetFetch** | 1 | 9 | v6 | 🟠 Required Stub |
+| 8 | **OffsetCommit** | 2 | 9 | v8 | 🔴 Bridge |
+| 9 | **OffsetFetch** | 1 | 9 | v6 | 🔴 Bridge |
 | 10 | **FindCoordinator** | 1 | 6 | v3 | 🟠 Required Stub |
 | 11 | **JoinGroup** | 2 | 9 | v6 | 🟠 Required Stub |
 | 12 | **Heartbeat** | 1 | 4 | v4 | 🟠 Required Stub |
 | 13 | **LeaveGroup** | 1 | 5 | v4 | 🟠 Required Stub |
 | 14 | **SyncGroup** | 1 | 5 | v4 | 🟠 Required Stub |
-| 15 | **DescribeGroups** | 0 | 6 | v5 | 🟡 Optional Stub |
-| 16 | **ListGroups** | 1 | 5 | v3 | 🟡 Optional Stub |
+| 15 | **DescribeGroups** | 0 | 6 | v5 | Implemented |
+| 16 | **ListGroups** | 1 | 5 | v3 | Implemented |
 | 42 | **DeleteGroups** | 1 | 2 | v2 | 🟡 Optional Stub |
+
+> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups.
+> See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 ---
 
@@ -267,9 +270,10 @@ Key new minimums:
 
 | Category | Count | Notes |
 | ---------- | :-----: | ------- |
-| 🔴 Bridge (data path) | 7 | Produce, Fetch, Metadata, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
+| 🔴 Bridge (data path) | 9 | Produce, Fetch, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
 | 🟠 Required Stub (client state machine) | 13 | ListOffsets, consumer group (8-14), CreateTopics, InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
-| 🟡 Optional Stub (admin/observability) | 41 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
+| Implemented | 2 | DescribeGroups (15), ListGroups (16) |
+| 🟡 Optional Stub (admin/observability) | 39 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
 | ❌ Unadvertised | 5 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28), and DeleteRecords (21). Absent from ApiVersions, so a conforming client never sends one |
 | ❌ Reject (broker/KRaft internal) | 22 | Return `INVALID_REQUEST` with valid frame — never close the TCP connection |
 | **Total API Keys in this document** | **88** | Key IDs 0-88 with a gap at 73 |
@@ -293,22 +297,25 @@ Key new minimums:
 | Heartbeat | v0-v4 | v4 | current |
 | LeaveGroup | v0-v5 | v5 | current |
 | SyncGroup | v0-v5 | v5 | current |
+| OffsetCommit | v2-v9 | v9 | current |
+| OffsetFetch | v1-v9 | v9 | current |
 
-### Missing from `SUPPORTED_RANGES` (76 of the 88 API keys in this document)
+### Missing from `SUPPORTED_RANGES` (74 of the 88 API keys in this document)
 
 Every key not in `SUPPORTED_RANGES` closes the connection - the same policy applied to every
 other unlisted key, not a special case for these. The gateway declines to define a response for a
 key it does not advertise, and a conforming client never sends one, so no response shape has to
 be agreed. This includes:
 
-- **Client bootstrap blockers**: OffsetCommit (8), OffsetFetch (9)
 - **New consumer group protocol**: ConsumerGroupHeartbeat (68), opt-in via `group.protocol=consumer` (the 4.0 default is still `classic`)
 - **Share groups (KIP-932)**: ShareFetch, ShareGroupHeartbeat, ShareAcknowledge
 - **Auth flow**: SaslHandshake (17), SaslAuthenticate (36)
 - **All broker/KRaft-internal keys** (Group 14)
 
 The classic consumer group keys FindCoordinator (10), JoinGroup (11), Heartbeat (12),
-LeaveGroup (13) and SyncGroup (14) are supported - see [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
+LeaveGroup (13), SyncGroup (14), DescribeGroups (15) and ListGroups (16) are supported - see
+[`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
+OffsetCommit (8) and OffsetFetch (9) are supported too - see [`OFFSET_STORAGE.md`](OFFSET_STORAGE.md).
 
 Remaining scope (consumer groups, auth, admin/tuning) is tracked in `SCOPE.md`'s TODO section,
 not duplicated here.

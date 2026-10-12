@@ -2,7 +2,9 @@
 
 What [#3541](https://github.com/apache/iggy/issues/3541) added: `FindCoordinator` (10),
 `JoinGroup` (11), `Heartbeat` (12) and `SyncGroup` (14), backed by an in-memory coordinator in
-`src/group/`. [#3543](https://github.com/apache/iggy/issues/3543) added `LeaveGroup` (13). This is Kafka's *classic* group protocol. Offsets are a separate concern and live
+`src/group/`. [#3543](https://github.com/apache/iggy/issues/3543) added `LeaveGroup` (13).
+[#3548](https://github.com/apache/iggy/issues/3548) added `DescribeGroups` (15) and `ListGroups`
+(16). This is Kafka's *classic* group protocol. Offsets are a separate concern and live
 in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 
 | API key | Name | Versions | Notes |
@@ -12,10 +14,47 @@ in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)).
 | 12 | Heartbeat | 0-4 | Refreshes a session; `REBALANCE_IN_PROGRESS` is how a follower learns to rejoin |
 | 13 | LeaveGroup | 0-5 | Removes members; survivors' parked joins and syncs are released at once |
 | 14 | SyncGroup | 0-5 | Relays the leader's assignment blobs; a follower parks until the leader syncs |
+| 15 | DescribeGroups | 0-6 | Members, assignment and state. A group that is not here is `Dead`; v6 also returns `GROUP_ID_NOT_FOUND` (69) |
+| 16 | ListGroups | 0-5 | Groups currently on this coordinator. v4+ can filter by state, v5 by type `classic` |
 
 `kafka-protocol` can encode FindCoordinator v5 and v6 as well, and they are byte-identical to v4.
 They are not advertised because `SCOPE.md`'s governance model only admits a version once it has
 been manually tested.
+
+## Admin views
+
+`DescribeGroups` and `ListGroups` read the same in-memory map the join path writes. State strings
+are `Empty`, `PreparingRebalance`, `CompletingRebalance` and `Stable`. `Empty` means the group
+has no joined members: a v4+ client has been handed a member id and has not rejoined with it yet.
+`Dead` is only the describe answer for an id that is not in the map.
+
+A group with neither members nor pending member ids is removed. Kafka keeps an `Empty` group
+that only has committed offsets. Offsets are not stored here yet.
+TODO(#3542): once offset storage lands, keep those groups and report `Empty`.
+
+`ListGroups` does not tick. It leaves sessions, pending ids and phases untouched, and it omits a
+group whose member sessions and pending-id deadlines are all already past. `DescribeGroups` does
+tick each named group, so that same id is then `Dead`.
+
+While a group is not `Stable`, `DescribeGroups` leaves `protocol_data`, member metadata and
+member assignment empty. Kafka does the same: during `PreparingRebalance` the stored assignment
+is the previous generation, and a rejoined member has already replaced its subscription. A
+`Stable` group whose own description does not fit `max_frame_size` is returned in that same
+shape. Further groups that do not fit the remaining response are returned with a per-group
+`UNKNOWN_SERVER_ERROR` (-1). The connection stays open.
+
+A group id repeated in one `DescribeGroups` request is answered once, not once per repeat: a
+second snapshot of the same members would otherwise multiply the encoded response by the repeat
+count.
+
+`kafka-consumer-groups.sh --list`, `--describe --members` and `--describe --state` use these
+two APIs. The default `--describe` calls `OffsetFetch` (API key 9), which is not implemented,
+so that mode does not work. `--reset-offsets` needs the same API.
+
+Member `client_id` and `client_host` are empty. The coordinator does not keep the request
+header's client id or the connection's peer address. `include_authorized_operations` is answered
+with the omitted sentinel. There is no group ACL bitfield. `ListGroups` v5 sets `group_type` to
+`classic`, which is the only protocol this coordinator runs.
 
 ## Assignment is the client's job
 
@@ -82,7 +121,9 @@ survivors keep the current generation and learn about the rebalance through
 rejoin rather than as lost partitions.
 
 When a group empties, by leave or by expiry, it is dropped, so the next group under that name
-starts again at generation 1. Kafka instead keeps the `Empty` group and its generation. This is
+starts again at generation 1. The pending-member-id window above is the one case that stays and
+reports `Empty`. Kafka also keeps an `Empty` group that only has committed offsets, and its
+generation with it. This coordinator does not, until offset storage lands (#3542). This is
 safe because member ids carry a UUID and every generation check is preceded by a membership
 check, so a stale client is told `UNKNOWN_MEMBER_ID` before its generation is ever compared.
 
@@ -166,19 +207,17 @@ A JoinGroup may list at most `MAX_PROTOCOLS_PER_MEMBER` (16) protocols; more is 
 (42). The byte cap above does not bound the count, protocol selection runs under the coordinator
 lock, and stock clients list one or two assignors.
 
-## What a real consumer still cannot do
+## What a real consumer can and cannot do
 
-A consumer completes JoinGroup and SyncGroup and then holds no partitions. Metadata is a stub that
-answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's assignor sees no
-partitions and hands every member an empty assignment. The consumer stays a member and keeps
-heartbeating, but has nothing to fetch.
+Without a bridge, a consumer completes JoinGroup and SyncGroup and then holds no partitions.
+Metadata is a stub that answers `UNKNOWN_TOPIC_OR_PARTITION` (3) for every topic, so the leader's
+assignor sees no partitions and hands every member an empty assignment. The consumer stays a
+member and keeps heartbeating, but has nothing to fetch.
 
-Once Metadata reports partitions, the next wall is `OffsetFetch` (9), which a consumer sends after
-`SyncGroup` for a non-empty assignment and which is not in scope
-([#3542](https://github.com/apache/iggy/issues/3542)). An unlisted key closes the connection, so
-that consumer would loop: coordinator connection closes, client marks the coordinator unknown,
-re-runs FindCoordinator, retries OffsetFetch, closes again. Fetch reads records with a bridge, so a
-consumer that uses `assign()` outside a group can consume. A group member cannot until #3542 lands.
+With a bridge, Metadata reports the partitions and a group member consumes. After `SyncGroup`, it
+reads its start position with `OffsetFetch` (9) and later commits with `OffsetCommit` (8). Both
+keep the offsets in Iggy ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without a bridge, both answer
+`COORDINATOR_LOAD_IN_PROGRESS` (14), and the client retries them.
 
 A dynamic consumer releases its partitions on close through `LeaveGroup`. A static one does not
 send it (see [Static membership](#static-membership-is-accepted-not-honoured)), so a static

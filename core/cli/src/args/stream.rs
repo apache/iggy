@@ -65,16 +65,6 @@ pub(crate) enum StreamAction {
     ///  iggy stream list -l table
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(StreamListArgs),
-    /// Purge all topics in given stream ID
-    ///
-    /// Command removes all messages from given stream
-    /// Stream ID can be specified as a stream name or ID
-    ///
-    /// Examples:
-    ///  iggy stream purge 1
-    ///  iggy stream purge test
-    #[clap(verbatim_doc_comment, visible_alias = "p")]
-    Purge(StreamPurgeArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -117,12 +107,4 @@ pub(crate) struct StreamListArgs {
     /// List mode (table or list)
     #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
     pub(crate) list_mode: ListMode,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct StreamPurgeArgs {
-    /// Stream ID to purge
-    ///
-    /// Stream ID can be specified as a stream name or ID
-    pub(crate) stream_id: Identifier,
 }

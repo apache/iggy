@@ -29,6 +29,9 @@ pub use namespace::{
 pub use partition_location::PartitionLocation;
 pub use shard_id::ShardId;
 
+/// Slot lookup is linear on the shard pump; bound its worst-case scan.
+pub const PARTITION_IO_CAPACITY_MAX: usize = 256;
+
 /// Maximum time a client-list gather waits for all shard replies.
 pub const LIST_CLIENTS_GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
