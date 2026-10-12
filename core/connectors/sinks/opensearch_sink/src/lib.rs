@@ -41,7 +41,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     future::Future,
     net::IpAddr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -571,10 +571,16 @@ impl OpenSearchSink {
     async fn index_documents(
         &self,
         client: &OpenSearch,
-        documents: Vec<PreparedDocument>,
+        mut documents: Vec<PreparedDocument>,
     ) -> Result<usize, PartialIndexError> {
         let total = documents.len();
-        let mut indexed = 0usize;
+        // Generated IDs are unique per message, so only a configured
+        // `document_id_field` can repeat an ID within a batch.
+        if self.config.document_id_field.is_some() {
+            retain_last_per_id(&mut documents);
+        }
+        // A superseded document is overwritten by design, not lost.
+        let mut indexed = total - documents.len();
         // The runtime commits the offset regardless of this error, so returning
         // early would drop the remaining chunks for good. The first failure is
         // kept, not the last, matching `BulkOutcome::merge`: it's the one an
@@ -1047,6 +1053,21 @@ fn build_bulk_body(index: &str, documents: &[&PreparedDocument]) -> Result<Bytes
         buffer.put_u8(b'\n');
     }
     Ok(buffer.freeze())
+}
+
+/// Keeps only the last document for each `_id`. A per-item retry resends just
+/// the rejected documents, so an older copy rejected transiently would
+/// otherwise be re-indexed after a newer copy with the same `_id` succeeded.
+fn retain_last_per_id(documents: &mut Vec<PreparedDocument>) {
+    let mut seen = HashSet::with_capacity(documents.len());
+    let mut keep: Vec<bool> = documents
+        .iter()
+        .rev()
+        .map(|document| seen.insert(document.id.as_str()))
+        .collect();
+    keep.reverse();
+    let mut keep = keep.into_iter();
+    documents.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// Maps server-echoed item positions back to the documents that were sent.
@@ -2557,6 +2578,71 @@ mod tests {
             id: id.to_string(),
             document: json!({ "id": id }),
         }
+    }
+
+    fn versioned(id: &str, version: u32) -> PreparedDocument {
+        PreparedDocument {
+            id: id.to_string(),
+            document: json!({ "id": id, "version": version }),
+        }
+    }
+
+    #[test]
+    fn given_repeated_ids_should_keep_only_the_last_document_in_order() {
+        let mut documents = vec![
+            versioned("a", 1),
+            versioned("b", 1),
+            versioned("a", 2),
+            versioned("c", 1),
+            versioned("b", 2),
+        ];
+
+        retain_last_per_id(&mut documents);
+
+        let kept: Vec<(&str, u64)> = documents
+            .iter()
+            .map(|document| {
+                (
+                    document.id.as_str(),
+                    document.document["version"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(kept, [("a", 2), ("c", 1), ("b", 2)]);
+    }
+
+    #[tokio::test]
+    async fn given_repeated_document_id_should_send_only_the_newest_copy() {
+        let server = MockServer::start().await;
+        let mut config = fast_retry_config(1);
+        config.url = server.uri();
+        config.document_id_field = Some("id".to_string());
+        let sink = sink_with_config(config);
+        let client = mock_client(&sink);
+        let documents = vec![versioned("a", 1), versioned("b", 1), versioned("a", 2)];
+        let expected_body = build_bulk_body(&sink.config.index, &[&documents[1], &documents[2]])
+            .expect("build expected body");
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": false,
+                "items": [
+                    { "index": { "_id": "b", "status": 201, "result": "created" } },
+                    { "index": { "_id": "a", "status": 201, "result": "created" } }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let indexed = sink
+            .index_documents(&client, documents)
+            .await
+            .expect("the superseded copy should count as handled");
+
+        assert_eq!(indexed, 3);
     }
 
     #[test]

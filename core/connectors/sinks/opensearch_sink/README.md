@@ -126,7 +126,9 @@ asserts the document count is unchanged.
 
 If a user-provided `document_id_field` value collides across otherwise
 distinct messages, those messages will collapse into a single document.
-Operators choosing this field are responsible for its uniqueness.
+Operators choosing this field are responsible for its uniqueness. Within one
+batch the last message for an `_id` wins and earlier ones are not sent, so a
+per-item retry can never overwrite a newer copy with an older one.
 
 ### Metadata
 
