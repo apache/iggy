@@ -18,11 +18,11 @@
 package tcp
 
 import (
+	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"context"
 	"encoding/binary"
 	"testing"
 	"time"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
@@ -50,13 +50,13 @@ func emptyBatchBody(partitionId uint32) []byte {
 	return append(binary.LittleEndian.AppendUint32(body, 0), make([]byte, iggcon.PartitionContextSize)...)
 }
 
-// polledPartition reads the explicit partition id of a recorded poll request
+// polledPartition reads the explicit partition id of a recorded poll Request
 // that was built from numeric identifiers.
-func polledPartition(t *testing.T, read request) uint32 {
+func polledPartition(t *testing.T, read Request) uint32 {
 	t.Helper()
 	// [kind u8][consumer id 6][stream id 6][topic id 6][has_partition u8].
-	require.Equal(t, byte(1), read.payload[19], "the group poll names an explicit partition")
-	return binary.LittleEndian.Uint32(read.payload[20:24])
+	require.Equal(t, byte(1), read.Payload[19], "the group poll names an explicit partition")
+	return binary.LittleEndian.Uint32(read.Payload[20:24])
 }
 
 // groupConsumer builds the group consumer and identifiers the tests poll with.
@@ -86,12 +86,12 @@ func agedGroupEntries(client *IggyTcpClient) {
 
 func TestPollMessages_GroupPollRoundRobinsTheOwnedPartitions(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
-		switch read.code() {
+	server := servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
+		switch read.Code() {
 		case uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1, 3))
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1, 3))
 		default:
-			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+			return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 		}
 	})
 
@@ -105,8 +105,8 @@ func TestPollMessages_GroupPollRoundRobinsTheOwnedPartitions(t *testing.T) {
 	assert.Equal(t, []uint32{1, 3, 1}, partitions,
 		"the cursor advances and wraps across polls")
 	syncs := 0
-	for _, read := range server.recorded() {
-		if read.code() == uint32(command.SyncGroupCode) {
+	for _, read := range server.Recorded() {
+		if read.Code() == uint32(command.SyncGroupCode) {
 			syncs++
 		}
 	}
@@ -115,11 +115,11 @@ func TestPollMessages_GroupPollRoundRobinsTheOwnedPartitions(t *testing.T) {
 
 func TestPollMessages_GroupPollKeepsTheCursorAcrossASameGenerationRefresh(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
-		if read.code() == uint32(command.SyncGroupCode) {
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1, 3))
+	servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
+		if read.Code() == uint32(command.SyncGroupCode) {
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1, 3))
 		}
-		return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+		return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 	})
 
 	first, err := pollOnce(t, client)
@@ -139,11 +139,11 @@ func TestPollMessages_GroupPollKeepsTheCursorAcrossASameGenerationRefresh(t *tes
 func TestPollMessages_GroupPollRestartsTheCursorOnANewGeneration(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	generation := uint64(7)
-	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
-		if read.code() == uint32(command.SyncGroupCode) {
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(generation, 1, 3))
+	servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
+		if read.Code() == uint32(command.SyncGroupCode) {
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(generation, 1, 3))
 		}
-		return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+		return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 	})
 
 	first, err := pollOnce(t, client)
@@ -162,18 +162,18 @@ func TestPollMessages_GroupPollRestartsTheCursorOnANewGeneration(t *testing.T) {
 func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	joined := false
-	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
 		switch {
-		case read.code() == uint32(command.SyncGroupCode) && !joined:
+		case read.Code() == uint32(command.SyncGroupCode) && !joined:
 			// An empty body means the client is not a member yet.
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		case read.code() == uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(1, 0))
-		case read.operation() == vsr.OperationJoinConsumerGroup:
+			return ReplyFrame(vsr.OperationNonReplicated, nil)
+		case read.Code() == uint32(command.SyncGroupCode):
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(1, 0))
+		case read.Operation() == vsr.OperationJoinConsumerGroup:
 			joined = true
-			return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+			return ReplyFrame(vsr.OperationJoinConsumerGroup, ResultSection())
 		default:
-			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+			return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 		}
 	})
 
@@ -182,8 +182,8 @@ func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 	assert.Equal(t, uint32(0), polled.PartitionId)
 
 	operations := make([]vsr.Operation, 0)
-	for _, read := range server.recorded() {
-		operations = append(operations, read.operation())
+	for _, read := range server.Recorded() {
+		operations = append(operations, read.Operation())
 	}
 	assert.Contains(t, operations, vsr.OperationJoinConsumerGroup,
 		"the first poll joins on the caller's behalf")
@@ -191,14 +191,14 @@ func TestPollMessages_GroupPollJoinsTheGroupOnTheFirstPoll(t *testing.T) {
 
 func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
 		switch {
-		case read.code() == uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		case read.operation() == vsr.OperationLeaveConsumerGroup:
-			return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
+		case read.Code() == uint32(command.SyncGroupCode):
+			return ReplyFrame(vsr.OperationNonReplicated, nil)
+		case read.Operation() == vsr.OperationLeaveConsumerGroup:
+			return ReplyFrame(vsr.OperationLeaveConsumerGroup, ResultSection())
 		default:
-			return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+			return ReplyFrame(vsr.OperationJoinConsumerGroup, ResultSection())
 		}
 	})
 
@@ -210,8 +210,8 @@ func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 	assert.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound,
 		"an explicit leave stays left until an explicit join")
 
-	for _, read := range server.recorded() {
-		assert.NotEqual(t, vsr.OperationJoinConsumerGroup, read.operation(),
+	for _, read := range server.Recorded() {
+		assert.NotEqual(t, vsr.OperationJoinConsumerGroup, read.Operation(),
 			"the poll must not undo the leave")
 	}
 }
@@ -219,20 +219,20 @@ func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	member := false
-	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
 		switch {
-		case read.code() == uint32(command.SyncGroupCode) && member:
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(2, 4))
-		case read.code() == uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		case read.operation() == vsr.OperationLeaveConsumerGroup:
+		case read.Code() == uint32(command.SyncGroupCode) && member:
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(2, 4))
+		case read.Code() == uint32(command.SyncGroupCode):
+			return ReplyFrame(vsr.OperationNonReplicated, nil)
+		case read.Operation() == vsr.OperationLeaveConsumerGroup:
 			member = false
-			return replyFrame(vsr.OperationLeaveConsumerGroup, resultSection())
-		case read.operation() == vsr.OperationJoinConsumerGroup:
+			return ReplyFrame(vsr.OperationLeaveConsumerGroup, ResultSection())
+		case read.Operation() == vsr.OperationJoinConsumerGroup:
 			member = true
-			return replyFrame(vsr.OperationJoinConsumerGroup, resultSection())
+			return ReplyFrame(vsr.OperationJoinConsumerGroup, ResultSection())
 		default:
-			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+			return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 		}
 	})
 
@@ -249,11 +249,11 @@ func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
 
 func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheMemberOwnsNothing(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
-		if read.code() == uint32(command.SyncGroupCode) {
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(5))
+	servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
+		if read.Code() == uint32(command.SyncGroupCode) {
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(5))
 		}
-		t.Errorf("unexpected request with code %d", read.code())
+		t.Errorf("unexpected Request with code %d", read.Code())
 		return nil
 	})
 
@@ -267,11 +267,11 @@ func TestPollMessages_GroupPollResyncsAnEmptyAssignmentOnTheNextPoll(t *testing.
 	client, serverConn := newPipeClient(t)
 	// The join committed, but no partition installed the member as owner yet.
 	assignment := assignmentBody(1)
-	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
-		if read.code() == uint32(command.SyncGroupCode) {
-			return replyFrame(vsr.OperationNonReplicated, assignment)
+	server := servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
+		if read.Code() == uint32(command.SyncGroupCode) {
+			return ReplyFrame(vsr.OperationNonReplicated, assignment)
 		}
-		return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+		return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 	})
 
 	first, err := pollOnce(t, client)
@@ -285,8 +285,8 @@ func TestPollMessages_GroupPollResyncsAnEmptyAssignmentOnTheNextPoll(t *testing.
 	assert.Equal(t, uint32(7), second.PartitionId,
 		"an empty assignment is not trusted for the refresh window")
 	syncs := 0
-	for _, read := range server.recorded() {
-		if read.code() == uint32(command.SyncGroupCode) {
+	for _, read := range server.Recorded() {
+		if read.Code() == uint32(command.SyncGroupCode) {
 			syncs++
 		}
 	}
@@ -295,12 +295,12 @@ func TestPollMessages_GroupPollResyncsAnEmptyAssignmentOnTheNextPoll(t *testing.
 
 func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheRebalanceOutlastsTheAttempts(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
-		if read.code() == uint32(command.SyncGroupCode) {
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(9, 0))
+	server := servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
+		if read.Code() == uint32(command.SyncGroupCode) {
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(9, 0))
 		}
 		// The server marks a stale assignment with the resync sentinel.
-		return replyFrame(vsr.OperationNonReplicated,
+		return ReplyFrame(vsr.OperationNonReplicated,
 			emptyBatchBody(iggcon.ResyncRequiredPartition))
 	})
 
@@ -310,8 +310,8 @@ func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheRebalanceOutlastsTheAtte
 	assert.Empty(t, polled.Messages)
 
 	polls := 0
-	for _, read := range server.recorded() {
-		if read.code() == uint32(command.PollMessagesCode) {
+	for _, read := range server.Recorded() {
+		if read.Code() == uint32(command.PollMessagesCode) {
 			polls++
 		}
 	}
@@ -321,17 +321,17 @@ func TestPollMessages_GroupPollReportsAnEmptyPollWhenTheRebalanceOutlastsTheAtte
 func TestPollMessages_GroupPollResyncsAfterAFencedPoll(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	generation := uint64(1)
-	servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+	servePartitionOperations(t, serverConn, func(_ int, read Request) []byte {
 		switch {
-		case read.code() == uint32(command.SyncGroupCode):
-			return replyFrame(vsr.OperationNonReplicated, assignmentBody(generation, 1))
+		case read.Code() == uint32(command.SyncGroupCode):
+			return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(generation, 1))
 		case generation == 1:
 			// The member no longer owns the partition at this generation.
 			generation = 2
-			return statusReplyFrame(vsr.OperationNonReplicated,
+			return StatusReplyFrame(vsr.OperationNonReplicated,
 				uint32(ierror.ConsumerGroupPartitionNotOwnedCode), nil)
 		default:
-			return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
+			return ReplyFrame(vsr.OperationNonReplicated, emptyBatchBody(polledPartition(t, read)))
 		}
 	})
 

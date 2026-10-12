@@ -19,6 +19,7 @@ package client
 
 import (
 	"fmt"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -59,15 +60,23 @@ const (
 //	tls_domain=<name>           TLS server name indication (SNI)
 //	tls_ca_file=<path>          CA certificate file for verification
 //	reconnection_retries=<n|unlimited>
-//	reconnection_interval=<duration>
+//	reconnection_interval=<non-zero duration>
 //	reestablish_after=<duration>
-//	heartbeat_interval=<duration>
+//	heartbeat_interval=<non-zero duration>
 //	nodelay=true|false
 //
-// The Go client takes its reconnect, heartbeat, and nodelay behavior from
-// its own defaults, so those spellings are validated for compatibility and
-// then ignored; a value the other SDKs would reject is still rejected here,
-// so one connection string is either valid everywhere or nowhere.
+// Durations take the units the other SDKs share, from nanos to years,
+// including the hr, hrs, wk, wks and month spellings, with optional
+// fractions and parts run together or spaced, as in 1h30m or 1h 30m.
+// The reconnection_interval and heartbeat_interval spellings must be
+// non-zero, because the Rust SDK types them as non-zero durations;
+// reestablish_after takes the zero spellings, which Rust accepts there.
+// The Go client keeps its own reconnect and heartbeat pacing, so those
+// three spellings are validated for compatibility and then ignored, and
+// a value the other SDKs would reject is still rejected here, so one
+// connection string is either valid everywhere or nowhere. The nodelay
+// spelling is applied, because the Go client carries a matching
+// TCP_NODELAY option.
 func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 	protocolParts := strings.Split(connectionString, "://")
 	if len(protocolParts) != 2 {
@@ -79,6 +88,12 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 		return nil, err
 	}
 	if protocol != tcpProtocol {
+		// Only a plain transport name is echoed, because a malformed
+		// scheme may carry credentials, as the C# SDK notes on the same
+		// check.
+		if !isASCIILetters(protocol) {
+			return nil, ierror.InvalidConnectionString{}
+		}
 		return nil, fmt.Errorf("%w: unsupported transport %q, Go SDK supports tcp only",
 			ierror.InvalidConnectionString{}, protocol)
 	}
@@ -99,6 +114,7 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 	}
 
 	var tlsConfig parsedTLS
+	tlsConfig.noDelay = true
 	if len(serverAndOptions) == 2 {
 		tlsConfig, err = parseConnectionOptions(serverAndOptions[1])
 		if err != nil {
@@ -115,9 +131,10 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 		return nil, ierror.InvalidConnectionString{}
 	}
 	// Node and Rust accept any u16 port, 0 included; the dial fails later
-	// instead of the parse.
+	// instead of the parse. A bad port reports the same error as every other
+	// parse failure, which is what the Rust SDK returns here.
 	if _, err := strconv.ParseUint(portStr, 10, 16); err != nil {
-		return nil, ierror.InvalidNumberValue{}
+		return nil, ierror.InvalidConnectionString{}
 	}
 
 	options := []tcp.Option{tcp.WithServerAddress(serverAddress)}
@@ -132,6 +149,7 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 		}
 		options = append(options, tcp.WithTLS(tlsOpts...))
 	}
+	options = append(options, tcp.WithNoDelay(tlsConfig.noDelay))
 	return options, nil
 }
 
@@ -167,6 +185,7 @@ type parsedTLS struct {
 	enabled bool
 	domain  string
 	caFile  string
+	noDelay bool
 }
 
 // parseConnectionOptions validates the shared connection-string grammar,
@@ -198,14 +217,23 @@ func parseConnectionOptions(optionsString string) (parsedTLS, error) {
 					return parsed, ierror.InvalidNumberValue{}
 				}
 			}
-		case "reconnection_interval", "reestablish_after", "heartbeat_interval":
-			if !isValidIggyDuration(value) {
+		case "reconnection_interval", "heartbeat_interval":
+			// Rust types both as non-zero durations, so the zero spellings
+			// and any zero-valued duration are rejected.
+			if nanos, err := parseIggyDuration(value); err != nil || nanos == 0 {
+				return parsed, ierror.InvalidConnectionString{}
+			}
+		case "reestablish_after":
+			// Rust takes this one as a plain duration, where the zero
+			// spellings parse.
+			if _, err := parseIggyDuration(value); err != nil {
 				return parsed, ierror.InvalidConnectionString{}
 			}
 		case "nodelay":
 			if value != "true" && value != "false" {
 				return parsed, ierror.InvalidConnectionString{}
 			}
+			parsed.noDelay = value == "true"
 		default:
 			return parsed, ierror.InvalidConnectionString{}
 		}
@@ -213,84 +241,220 @@ func parseConnectionOptions(optionsString string) (parsedTLS, error) {
 	return parsed, nil
 }
 
-// isValidIggyDuration reports whether value is a duration the Rust SDK
-// accepts for its connection-string options, which the Go SDK reuses for
-// its grammar: the zero spellings, or a humantime-style duration such as
-// 1s, 500ms, 1h 30m or 1h30m.
-func isValidIggyDuration(value string) bool {
-	lower := strings.ToLower(value)
-	switch lower {
-	case "0", "unlimited", "disabled", "none":
-		return true
+// isASCIILetters reports whether s is non-empty and ASCII letters only, so
+// an unsupported-transport error can echo it without ever echoing the rest
+// of a malformed scheme, which may carry credentials.
+func isASCIILetters(s string) bool {
+	if s == "" {
+		return false
 	}
-	remainder := strings.TrimLeft(lower, " ")
-	for remainder != "" {
-		amount, rest, ok := splitLeadingNumber(remainder)
-		if !ok || amount <= 0 {
+	for i := 0; i < len(s); i++ {
+		if (s[i] < 'a' || s[i] > 'z') && (s[i] < 'A' || s[i] > 'Z') {
 			return false
 		}
-		unit, rest := cutDurationUnit(rest)
-		if unit == "" {
-			return false
-		}
-		// Parts may be separated by spaces, as in 1h 30m, or run
-		// together, as in 1h30m.
-		remainder = strings.TrimLeft(rest, " ")
 	}
 	return true
 }
 
-// splitLeadingNumber consumes the leading decimal digits of s, with an
-// optional fractional part as in 0.5s or 1.005s. A leading sign is
-// rejected, because negative durations do not parse. The value is
-// returned as a number, so a fraction-only amount such as 0.5 still
-// counts as positive.
-func splitLeadingNumber(s string) (float64, string, bool) {
+// parseIggyDuration parses a duration the Rust SDK accepts, returning the
+// total nanoseconds. It mirrors IggyDuration::from_str: the value is
+// lowercased, the zero spellings become a zero duration, and everything
+// else goes through a humantime-style grammar of amounts and units, with
+// optional fractions and parts run together as in 1h30m or spaced as in
+// 1h 30m. Fractions must land on a whole nanosecond, as in the Rust and
+// Node parsers, so 1.5us parses while 0.5ns does not.
+func parseIggyDuration(value string) (uint64, error) {
+	lower := strings.ToLower(value)
+	switch lower {
+	case "0", "unlimited", "disabled", "none":
+		return 0, nil
+	}
+	remainder := strings.TrimLeft(lower, " 	")
+	if remainder == "" {
+		return 0, errInvalidDuration(value)
+	}
+
+	var seconds, nanos big.Int
+	for remainder != "" {
+		wholePart, fracPart, fracScale, rest, ok := cutLeadingAmount(remainder)
+		if !ok {
+			return 0, errInvalidDuration(value)
+		}
+		remainder = rest
+
+		index, rest, ok := cutDurationUnit(remainder)
+		if !ok {
+			return 0, errInvalidDuration(value)
+		}
+		remainder = strings.TrimLeft(rest, " 	")
+		unit := durationUnits[index]
+
+		whole := new(big.Int).SetUint64(wholePart)
+		seconds.Add(&seconds, whole.Mul(whole, new(big.Int).SetUint64(unit.seconds)))
+		whole = new(big.Int).SetUint64(wholePart)
+		nanos.Add(&nanos, whole.Mul(whole, new(big.Int).SetUint64(unit.nanos)))
+
+		if fracScale != 0 {
+			// A fraction of a nanosecond always loses precision, as the
+			// Rust parser reports outright.
+			if unit.seconds == 0 && unit.nanos == 1 {
+				return 0, errInvalidDuration(value)
+			}
+			numerator := new(big.Int).SetUint64(fracPart)
+			denominator := new(big.Int).SetUint64(fracScale)
+			frac := new(big.Int)
+			switch {
+			case unit.nanos != 0: // usec and millis land in nanoseconds
+				frac.Mul(numerator, new(big.Int).SetUint64(unit.nanos))
+				if new(big.Int).Mod(frac, denominator).Sign() != 0 {
+					return 0, errInvalidDuration(value)
+				}
+				nanos.Add(&nanos, frac.Div(frac, denominator))
+			case unit.seconds == 1: // seconds land in nanoseconds
+				frac.Mul(numerator, big.NewInt(1_000_000_000))
+				if new(big.Int).Mod(frac, denominator).Sign() != 0 {
+					return 0, errInvalidDuration(value)
+				}
+				nanos.Add(&nanos, frac.Div(frac, denominator))
+			default: // minutes and above land in whole seconds
+				frac.Mul(numerator, new(big.Int).SetUint64(unit.seconds))
+				if new(big.Int).Mod(frac, denominator).Sign() != 0 {
+					return 0, errInvalidDuration(value)
+				}
+				seconds.Add(&seconds, frac.Div(frac, denominator))
+			}
+		}
+	}
+
+	// A carry out of the nanoseconds, as the Rust implementation does
+	// past a full second.
+	billion := big.NewInt(1_000_000_000)
+	if nanos.Cmp(billion) >= 0 {
+		seconds.Add(&seconds, new(big.Int).Div(&nanos, billion))
+		nanos.Mod(&nanos, billion)
+	}
+	total := new(big.Int).Mul(&seconds, billion)
+	total.Add(total, &nanos)
+	if total.BitLen() > 64 {
+		return 0, errInvalidDuration(value)
+	}
+	return total.Uint64(), nil
+}
+
+func errInvalidDuration(value string) error {
+	return fmt.Errorf("%w: invalid duration %q", ierror.InvalidConnectionString{}, value)
+}
+
+// cutLeadingAmount consumes the leading amount of s: decimal digits with an
+// optional fractional part, as in 5, 0.5 or 1.005. A leading sign is
+// rejected, because negative durations do not parse, and so is a fraction
+// without a digit after the dot. The fraction comes back as a numerator and
+// a power-of-ten scale, so 1.005 is 1005 over 1000 and the caller can
+// divide exactly the way the Rust parser does.
+func cutLeadingAmount(s string) (whole uint64, fraction uint64, scale uint64, rest string, ok bool) {
 	digits := 0
-	for digits < len(s) && s[digits] >= '0' && s[digits] <= '9' {
+	for digits < len(s) && isDigitByte(s[digits]) {
 		digits++
 	}
-	// A fraction only counts when a digit follows the dot, so a bogus
-	// 1.s does not parse and 5. does not either.
-	if digits+2 <= len(s) && s[digits] == '.' && s[digits+1] >= '0' && s[digits+1] <= '9' {
-		digits++ // the dot
-		for digits < len(s) && s[digits] >= '0' && s[digits] <= '9' {
-			digits++
-		}
-	}
 	if digits == 0 {
-		return 0, "", false
+		return 0, 0, 0, "", false
 	}
-	n, err := strconv.ParseFloat(s[:digits], 64)
+	whole, err := strconv.ParseUint(s[:digits], 10, 64)
 	if err != nil {
-		return 0, "", false
+		return 0, 0, 0, "", false
 	}
-	return n, s[digits:], true
+	rest = s[digits:]
+	if len(rest) >= 2 && rest[0] == '.' && isDigitByte(rest[1]) {
+		fractionDigits := 1
+		for fractionDigits < len(rest) && isDigitByte(rest[fractionDigits]) {
+			fractionDigits++
+		}
+		text := rest[1:fractionDigits]
+		if len(text) > 19 {
+			// Beyond u64 precision, which a fraction could not carry
+			// exactly anyway.
+			return 0, 0, 0, "", false
+		}
+		fraction, err = strconv.ParseUint(text, 10, 64)
+		if err != nil {
+			return 0, 0, 0, "", false
+		}
+		scale = 1
+		for range len(text) {
+			scale *= 10
+		}
+		rest = rest[fractionDigits:]
+	}
+	return whole, fraction, scale, rest, true
 }
 
-// durationUnits are the humantime units, longest spelling first so a
-// prefix match cannot cut a longer unit short.
-var durationUnits = []string{
-	"milliseconds", "millisecond", "msec", "millis", "ms",
-	"microseconds", "microsecond", "usec", "us",
-	"nanoseconds", "nanosecond", "nsec", "ns",
-	"seconds", "second", "secs", "sec", "s",
-	"minutes", "minute", "mins", "min", "m",
-	"hours", "hour", "h",
-	"days", "day", "d",
-	"weeks", "week", "w",
-	"years", "year", "y",
+func isDigitByte(b byte) bool {
+	return b >= '0' && b <= '9'
 }
 
-// cutDurationUnit consumes the leading duration unit of s, longest
-// spelling first so a prefix match cannot cut a longer unit short. The
-// unit may run straight into the next amount, as in 1h30m; a leftover
-// with no leading unit, such as the x of 5x, still fails the caller.
-func cutDurationUnit(s string) (unit string, rest string) {
-	for _, unit := range durationUnits {
-		if strings.HasPrefix(s, unit) {
-			return unit, s[len(unit):]
+// durationUnit is one unit of the duration grammar, with its whole-second
+// and sub-second nanosecond weights. A month is 30.44 days and a year is
+// 365.25 days, the same weights the Rust and Node tables carry.
+type durationUnit struct {
+	name    string
+	seconds uint64
+	nanos   uint64
+}
+
+// durationUnits are the humantime units, ordered longest spelling first so
+// a prefix match cannot cut a longer unit short, which is also why the
+// single-letter minute spelling m comes after month and millis. The table
+// matches the one the Node and C# SDKs parse: it carries the hr, hrs, wk,
+// wks and month spellings, and takes millis but not milliseconds.
+var durationUnits = []durationUnit{
+	{"seconds", 1, 0},
+	{"minutes", 60, 0},
+	{"second", 1, 0},
+	{"minute", 60, 0},
+	{"millis", 0, 1_000_000},
+	{"months", 2_630_016, 0},
+	{"month", 2_630_016, 0},
+	{"nanos", 0, 1},
+	{"hours", 3600, 0},
+	{"weeks", 604_800, 0},
+	{"years", 31_557_600, 0},
+	{"nsec", 0, 1},
+	{"usec", 0, 1_000},
+	{"msec", 0, 1_000_000},
+	{"secs", 1, 0},
+	{"mins", 60, 0},
+	{"hour", 3600, 0},
+	{"week", 604_800, 0},
+	{"year", 31_557_600, 0},
+	{"days", 86_400, 0},
+	{"sec", 1, 0},
+	{"min", 60, 0},
+	{"hrs", 3600, 0},
+	{"day", 86_400, 0},
+	{"wks", 604_800, 0},
+	{"yrs", 31_557_600, 0},
+	{"ns", 0, 1},
+	{"us", 0, 1_000},
+	{"ms", 0, 1_000_000},
+	{"hr", 3600, 0},
+	{"wk", 604_800, 0},
+	{"yr", 31_557_600, 0},
+	{"s", 1, 0},
+	{"m", 60, 0},
+	{"h", 3600, 0},
+	{"d", 86_400, 0},
+	{"w", 604_800, 0},
+	{"y", 31_557_600, 0},
+}
+
+// cutDurationUnit consumes the leading duration unit of s. The unit may
+// run straight into the next amount, as in 1h30m; a leftover with no
+// leading unit, such as the x of 5x, still fails the caller.
+func cutDurationUnit(s string) (int, string, bool) {
+	for i, unit := range durationUnits {
+		if strings.HasPrefix(s, unit.name) {
+			return i, s[len(unit.name):], true
 		}
 	}
-	return "", s
+	return 0, s, false
 }

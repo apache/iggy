@@ -19,26 +19,23 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
 	"encoding/pem"
-	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
+	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,7 +64,7 @@ func TestParseConnectionString_ParsesTheExplicitTcpSchemeWithAPersonalAccessToke
 	assert.Equal(t, "localhost:8090", client.GetConnectionInfo().ServerAddress)
 }
 
-func TestParseConnectionString_ParsesIPv6HostWithoutBrackets(t *testing.T) {
+func TestParseConnectionString_ParsesBracketedIPv6Host(t *testing.T) {
 	opts, err := ParseConnectionString("iggy://iggy:secret@[::1]:8090")
 	require.NoError(t, err)
 	client := applyOptions(t, opts)
@@ -75,183 +72,112 @@ func TestParseConnectionString_ParsesIPv6HostWithoutBrackets(t *testing.T) {
 	assert.Equal(t, "[::1]:8090", client.GetConnectionInfo().ServerAddress)
 }
 
-// Frame offsets the fake server reads and writes. They mirror the
-// unexported tables of the codec package, which this package cannot reach.
-const (
-	frameOffsetSize      = 48
-	frameOffsetCommand   = 60
-	frameOffsetClient    = 128
-	frameOffsetRequest   = 168
-	frameOffsetOperation = 176
-	frameOffsetSession   = 184
-	frameOffsetReserved  = 196
+// TestParseConnectionString_NoDelayOptionLandsOnTheClient pins the nodelay
+// rule: the spelling validates and, unlike a dropped validation, the
+// parsed value reaches the client, so ?nodelay=false really turns Nagle
+// back on and the default stays with Nagle off.
+func TestParseConnectionString_NoDelayOptionLandsOnTheClient(t *testing.T) {
+	withoutOption, err := ParseConnectionString("iggy://iggy:secret@localhost:8090")
+	require.NoError(t, err)
+	assert.True(t, applyOptions(t, withoutOption).GetNoDelay(),
+		"the default must keep Nagle disabled")
 
-	replyFrameOffsetRequest   = 200
-	replyFrameOffsetOperation = 208
-	replyFrameOffsetStatus    = 216
-)
+	enabled, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?nodelay=true")
+	require.NoError(t, err)
+	assert.True(t, applyOptions(t, enabled).GetNoDelay())
 
-// wireRequest is one frame the fake server read off the wire.
-type wireRequest struct {
-	header  [vsr.HeaderSize]byte
-	payload []byte
+	disabled, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?nodelay=false")
+	require.NoError(t, err)
+	assert.False(t, applyOptions(t, disabled).GetNoDelay(),
+		"?nodelay=false must reach the dial instead of being dropped")
 }
 
-func (r wireRequest) operation() vsr.Operation {
-	return vsr.Operation(r.header[frameOffsetOperation])
-}
-
-func (r wireRequest) code() uint32 {
-	return binary.LittleEndian.Uint32(r.header[frameOffsetReserved:])
-}
-
-// readWireRequest reads one complete frame from conn.
-func readWireRequest(conn net.Conn) (wireRequest, error) {
-	var read wireRequest
-	if _, err := io.ReadFull(conn, read.header[:]); err != nil {
-		return read, err
-	}
-	size := binary.LittleEndian.Uint32(read.header[frameOffsetSize:])
-	if size > vsr.HeaderSize {
-		read.payload = make([]byte, int(size)-vsr.HeaderSize)
-		if _, err := io.ReadFull(conn, read.payload); err != nil {
-			return read, err
+// TestParseConnectionString_NonZeroDurationOptionsRejectZeroSpellings
+// pins the typing the Rust SDK gives each option:
+// reconnection_interval and heartbeat_interval are non-zero durations, so
+// the zero spellings and any zero-valued duration are refused, while
+// reestablish_after is a plain duration where they parse.
+func TestParseConnectionString_NonZeroDurationOptionsRejectZeroSpellings(t *testing.T) {
+	for _, option := range []string{"reconnection_interval", "heartbeat_interval"} {
+		for _, value := range []string{"0", "none", "disabled", "unlimited", "0s", "0ms"} {
+			invalid := "iggy://iggy:secret@localhost:8090?" + option + "=" + value
+			t.Run(invalid, func(t *testing.T) {
+				opts, err := ParseConnectionString(invalid)
+				require.Error(t, err,
+					"%s is a non-zero duration in the Rust SDK", option)
+				assert.Empty(t, opts)
+			})
 		}
 	}
-	return read, nil
-}
-
-// replyFrameFor builds a reply whose header carries the given operation.
-func replyFrameFor(operation vsr.Operation, body []byte) []byte {
-	frame := make([]byte, vsr.HeaderSize+len(body))
-	binary.LittleEndian.PutUint32(frame[frameOffsetSize:], uint32(len(frame)))
-	frame[frameOffsetCommand] = 8
-	frame[replyFrameOffsetOperation] = byte(operation)
-	binary.LittleEndian.PutUint32(frame[replyFrameOffsetStatus:], 0)
-	copy(frame[vsr.HeaderSize:], body)
-	return frame
-}
-
-// resultSection builds the committed result prefix of a metadata reply.
-func resultSection(codes ...uint32) []byte {
-	section := binary.LittleEndian.AppendUint32(nil, uint32(len(codes)))
-	for index, code := range codes {
-		section = binary.LittleEndian.AppendUint32(section, uint32(index))
-		section = binary.LittleEndian.AppendUint32(section, code)
+	for _, value := range []string{"0", "none", "disabled", "unlimited", "0s", "0ms"} {
+		valid := "iggy://iggy:secret@localhost:8090?reestablish_after=" + value
+		t.Run(valid, func(t *testing.T) {
+			opts, err := ParseConnectionString(valid)
+			require.NoError(t, err,
+				"reestablish_after is a plain duration in the Rust SDK")
+			assert.NotEmpty(t, opts)
+		})
 	}
-	return section
 }
 
-// registerReply builds the reply of a successful sign-in.
-func registerReply(userID uint32, session uint64) []byte {
-	body := binary.LittleEndian.AppendUint32(resultSection(), userID)
-	body = binary.LittleEndian.AppendUint64(body, session)
-	body = binary.LittleEndian.AppendUint32(body, vsr.ProtocolVersion)
-	body = append(body, byte(len("0.11.0-edge.1")))
-	body = append(body, "0.11.0-edge.1"...)
-	return replyFrameFor(vsr.OperationRegister, body)
+// TestParseConnectionString_AcceptsTheExtendedDurationUnits pins the
+// spellings the Node and C# SDKs parse and the shared grammar carries:
+// hr, hrs, wk, wks and month, plus the millis spelling they use instead
+// of milliseconds.
+func TestParseConnectionString_AcceptsTheExtendedDurationUnits(t *testing.T) {
+	for _, options := range []string{
+		"reconnection_interval=1hr",
+		"reconnection_interval=2hrs",
+		"reconnection_interval=1wk",
+		"reconnection_interval=2wks",
+		"reconnection_interval=1month",
+		"reconnection_interval=2months",
+		"reconnection_interval=1hr 30m",
+		"reconnection_interval=250millis",
+		"heartbeat_interval=1hr",
+		"reestablish_after=1month",
+	} {
+		t.Run(options, func(t *testing.T) {
+			opts, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?" + options)
+			require.NoError(t, err)
+			assert.NotEmpty(t, opts)
+		})
+	}
+	// The long spelling stays outside the grammar, as it is in the Node
+	// and C# SDKs.
+	opts, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?reconnection_interval=1milliseconds")
+	require.Error(t, err)
+	assert.Empty(t, opts)
 }
 
-// bindReply builds the reply of a successful session bind.
-func bindReply(userID uint32, session uint64) []byte {
-	registered := registerReply(userID, session)
-	return replyFrameFor(vsr.OperationNonReplicated, registered[vsr.HeaderSize+len(resultSection()):])
-}
-
-// clusterMetadataReply builds a roster where the node at the listener
-// address is the healthy leader.
-func clusterMetadataReply(t *testing.T, address string) []byte {
-	t.Helper()
-
-	metadata := iggcon.ClusterMetadata{Name: "test-cluster"}
-	host, port, err := net.SplitHostPort(address)
-	require.NoError(t, err)
-	tcpPort, err := net.LookupPort("tcp", port)
-	require.NoError(t, err)
-	metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{
-		Name:      host,
-		IP:        host,
-		Role:      iggcon.RoleLeader,
-		Status:    iggcon.Healthy,
-		Endpoints: iggcon.TransportEndpoints{Tcp: uint16(tcpPort)},
+// TestParseConnectionString_RejectsUnsupportedTransports checks the scheme
+// rule and pins the credential rule together: unsupported transports are
+// rejected with an error naming the transport, and a malformed scheme
+// never leaks the credentials embedded in it.
+func TestParseConnectionString_RejectsUnsupportedTransportsAndNeverEchoesCredentials(t *testing.T) {
+	for _, value := range []string{
+		"iggy+quic://iggy:secret@localhost:8090",
+		"iggy+ws://iggy:secret@localhost:8090",
+		"http://iggy:secret@localhost:8090",
+	} {
+		t.Run(value, func(t *testing.T) {
+			opts, err := ParseConnectionString(value)
+			require.Error(t, err)
+			assert.Empty(t, opts)
+			assert.NotContains(t, err.Error(), "secret",
+				"the transport error must not echo the connection string")
+		})
+	}
+	// A scheme that embeds credentials after iggy+ must not surface them
+	// in the error, only the ASCII-letter transport name is echoed.
+	leaking := "iggy+user:secret@host:8090://host:8090"
+	t.Run(leaking, func(t *testing.T) {
+		opts, err := ParseConnectionString(leaking)
+		require.Error(t, err)
+		assert.Empty(t, opts)
+		assert.NotContains(t, err.Error(), "secret")
+		assert.NotContains(t, err.Error(), "user:secret@host")
 	})
-
-	body, err := metadata.MarshalBinary()
-	require.NoError(t, err)
-	return replyFrameFor(vsr.OperationNonReplicated, body)
-}
-
-// fakeVSRServer answers frames the way a single-node Iggy server does, so a
-// test can drive a full connect-and-login flow without a real server.
-type fakeVSRServer struct {
-	mtx      sync.Mutex
-	requests []wireRequest
-	listener net.Listener
-}
-
-func listenFakeVSR(t *testing.T, wrap func(net.Conn) net.Conn) *fakeVSRServer {
-	t.Helper()
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = listener.Close() })
-
-	server := &fakeVSRServer{listener: listener}
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			if wrap != nil {
-				conn = wrap(conn)
-			}
-			go func(conn net.Conn) {
-				defer func() { _ = conn.Close() }()
-				for {
-					read, err := readWireRequest(conn)
-					if err != nil {
-						return
-					}
-					server.mtx.Lock()
-					server.requests = append(server.requests, read)
-					server.mtx.Unlock()
-
-					var answer []byte
-					switch {
-					case read.code() == uint32(command.BindSessionCode):
-						answer = bindReply(7, read.sessionID())
-					case read.code() == uint32(command.GetClusterMetadataCode):
-						answer = clusterMetadataReply(t, server.listener.Addr().String())
-					case read.operation() == vsr.OperationRegister:
-						answer = registerReply(7, 128)
-					default:
-						answer = replyFrameFor(vsr.OperationNonReplicated, nil)
-					}
-					// Echo the request id the way the server correlates replies.
-					if len(answer) >= vsr.HeaderSize && answer[frameOffsetCommand] == 8 {
-						copy(answer[replyFrameOffsetRequest:replyFrameOffsetRequest+8],
-							read.header[frameOffsetRequest:frameOffsetRequest+8])
-					}
-					if _, err := conn.Write(answer); err != nil {
-						return
-					}
-				}
-			}(conn)
-		}
-	}()
-	return server
-}
-
-func (s *fakeVSRServer) recorded() []wireRequest {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	return append([]wireRequest(nil), s.requests...)
-}
-
-// sessionID reads the logical session the request carries.
-func (r wireRequest) sessionID() uint64 {
-	return binary.LittleEndian.Uint64(r.header[frameOffsetSession:])
 }
 
 // TestParseConnectionString_ConnectsAndLogsInAgainstAServer drives the
@@ -259,8 +185,8 @@ func (r wireRequest) sessionID() uint64 {
 // from ParseConnectionString, wired into NewIggyClient via WithTcp,
 // connecting and signing in against a running (fake) server.
 func TestParseConnectionString_ConnectsAndLogsInAgainstAServer(t *testing.T) {
-	server := listenFakeVSR(t, nil)
-	address := server.listener.Addr().String()
+	server := Listen(t, nil)
+	address := server.Listener().Addr().String()
 
 	opts, err := ParseConnectionString("iggy://iggy:iggy@" + address)
 	require.NoError(t, err)
@@ -270,12 +196,12 @@ func TestParseConnectionString_ConnectsAndLogsInAgainstAServer(t *testing.T) {
 
 	require.NoError(t, cli.Connect(context.Background()))
 
-	recorded := server.recorded()
+	recorded := server.Recorded()
 	require.Len(t, recorded, 2)
 	// The roster read is auth-gated, so the sign-in comes first.
-	assert.Equal(t, vsr.OperationRegister, recorded[0].operation())
-	assert.Contains(t, string(recorded[0].payload), "iggy")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
+	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation())
+	assert.Contains(t, string(recorded[0].Payload), "iggy")
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].Code())
 }
 
 // TestParseConnectionString_TLSEnabledByQueryString drives the same flow
@@ -285,10 +211,10 @@ func TestParseConnectionString_ConnectsAndLogsInAgainstAServer(t *testing.T) {
 func TestParseConnectionString_TLSEnabledByQueryString(t *testing.T) {
 	certificate, caPath := selfSignedCert(t)
 
-	server := listenFakeVSR(t, func(conn net.Conn) net.Conn {
+	server := Listen(t, func(conn net.Conn) net.Conn {
 		return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
 	})
-	address := server.listener.Addr().String()
+	address := server.Listener().Addr().String()
 	host, port, err := net.SplitHostPort(address)
 	require.NoError(t, err)
 
@@ -302,10 +228,10 @@ func TestParseConnectionString_TLSEnabledByQueryString(t *testing.T) {
 
 	require.NoError(t, cli.Connect(context.Background()))
 
-	recorded := server.recorded()
+	recorded := server.Recorded()
 	require.Len(t, recorded, 2)
-	assert.Equal(t, vsr.OperationRegister, recorded[0].operation())
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
+	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].Code())
 }
 
 // selfSignedCert mints a throwaway server certificate for the loopback
@@ -343,7 +269,9 @@ func selfSignedCert(t *testing.T) (tls.Certificate, string) {
 }
 
 // TestParseConnectionString_RejectsMalformedConnectionStrings pins every
-// malformed shape the other SDKs reject, copied from their test tables.
+// malformed shape the Node SDK rejects, copied from its test table. The Rust
+// SDK is laxer about some of these shapes, so the Node table is the shared
+// floor.
 func TestParseConnectionString_RejectsMalformedConnectionStrings(t *testing.T) {
 	for _, value := range []string{
 		"",
@@ -427,22 +355,6 @@ func TestParseConnectionString_AcceptsUnlimitedRetries(t *testing.T) {
 			require.NoError(t, err)
 			assert.NotEmpty(t, opts)
 		})
-	}
-}
-
-// TestParseConnectionString_RejectsUnsupportedTransports pins the scheme
-// rule: the default scheme and the explicit tcp spelling parse, other
-// iggy+<transport> spellings are rejected with an error naming the
-// transport.
-func TestParseConnectionString_RejectsUnsupportedTransports(t *testing.T) {
-	for _, value := range []string{
-		"iggy+quic://iggy:secret@localhost:8090",
-		"iggy+ws://iggy:secret@localhost:8090",
-		"http://iggy:secret@localhost:8090",
-	} {
-		opts, err := ParseConnectionString(value)
-		require.Error(t, err)
-		assert.Empty(t, opts)
 	}
 }
 

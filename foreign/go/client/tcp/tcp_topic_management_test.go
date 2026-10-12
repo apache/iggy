@@ -18,11 +18,11 @@
 package tcp
 
 import (
+	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"context"
 	"encoding/binary"
 	"strings"
 	"testing"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
@@ -32,9 +32,9 @@ import (
 
 func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationCreateTopic,
-			append(resultSection(), topicDetailsBody(t, 3)...))
+	Serve(serverConn, func(_ int, _ Request) []byte {
+		return ReplyFrame(vsr.OperationCreateTopic,
+			append(ResultSection(), topicDetailsBody(t, 3)...))
 	})
 
 	topic, err := client.CreateTopic(context.Background(),
@@ -46,8 +46,8 @@ func TestCreateTopic_DecodesTheCreatedTopic(t *testing.T) {
 
 func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationCreateTopic, resultSection())
+	server := Serve(serverConn, func(_ int, _ Request) []byte {
+		return ReplyFrame(vsr.OperationCreateTopic, ResultSection())
 	})
 
 	streamId := numericIdentifier(t, 1)
@@ -71,13 +71,13 @@ func TestCreateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 			assert.ErrorIs(t, err, test.want)
 		})
 	}
-	assert.Empty(t, server.recorded())
+	assert.Empty(t, server.Recorded())
 }
 
 func TestUpdateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateTopic, resultSection())
+	server := Serve(serverConn, func(_ int, _ Request) []byte {
+		return ReplyFrame(vsr.OperationUpdateTopic, ResultSection())
 	})
 
 	streamId := numericIdentifier(t, 1)
@@ -86,13 +86,13 @@ func TestUpdateTopic_RejectsInvalidArgumentsWithoutWriting(t *testing.T) {
 	err := client.UpdateTopic(context.Background(), streamId, topicId,
 		"", 0, iggcon.Duration(0), 0)
 	assert.ErrorIs(t, err, ierror.ErrInvalidTopicName)
-	assert.Empty(t, server.recorded())
+	assert.Empty(t, server.Recorded())
 }
 
 func TestUpdateTopic_AcceptsACommittedUpdate(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationUpdateTopic, resultSection())
+	Serve(serverConn, func(_ int, _ Request) []byte {
+		return ReplyFrame(vsr.OperationUpdateTopic, ResultSection())
 	})
 
 	assert.NoError(t, client.UpdateTopic(context.Background(),
@@ -105,8 +105,8 @@ func TestGetTopics_DecodesTheRoster(t *testing.T) {
 	body := binary.LittleEndian.AppendUint32(nil, 2)
 	body = append(body, topicDetailsBody(t, 3)...)
 	body = append(body, topicDetailsBody(t, 5)...)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationNonReplicated, body)
+	Serve(serverConn, func(_ int, _ Request) []byte {
+		return ReplyFrame(vsr.OperationNonReplicated, body)
 	})
 
 	topics, err := client.GetTopics(context.Background(), numericIdentifier(t, 1))
@@ -118,8 +118,8 @@ func TestGetTopics_DecodesTheRoster(t *testing.T) {
 
 func TestGetTopic_ReportsAMissingTopicAsATypedError(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	serve(serverConn, func(_ int, _ request) []byte {
-		return replyFrame(vsr.OperationNonReplicated, nil)
+	Serve(serverConn, func(_ int, _ Request) []byte {
+		return ReplyFrame(vsr.OperationNonReplicated, nil)
 	})
 
 	_, err := client.GetTopic(context.Background(),
