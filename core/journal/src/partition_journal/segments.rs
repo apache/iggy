@@ -275,7 +275,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             ));
         }
         if self.preallocate_segments {
-            installed_file.preallocate(&cursor.path(&self.directory), max_size);
+            installed_file
+                .preallocate(&cursor.path(&self.directory), max_size)
+                .await;
         }
         let checkpoint_prepare = if let Some(prepare) = prepare {
             let header = self.validate_checkpoint_prepare(&prepare)?;
@@ -355,11 +357,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
 
     pub(super) async fn migrate_segment_prepares(&mut self) -> io::Result<()> {
         if let Some(segments) = self.state.segment_storage
-            && (self
-                .entries
-                .range(..=self.state.purge_floor)
-                .any(|(_, entry)| entry.reference.is_some())
-                || self.segment_migration_needed(segments).await?)
+            && self.segment_migration_needed(segments).await?
         {
             self.rewrite(
                 self.state.checkpoint,
@@ -374,10 +372,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
 
     async fn segment_migration_needed(&self, mut segments: SegmentState) -> io::Result<bool> {
         let mut convertible = false;
-        for (_, entry) in self
-            .entries
-            .range(self.state.purge_floor.saturating_add(1)..)
-        {
+        for entry in self.entries.values() {
             if entry.reference.is_some() {
                 continue;
             }
@@ -532,8 +527,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             .find_map(|(&op, entry)| {
                 let reference = entry.reference?;
                 let next_offset = entry.next_offset?;
-                (op > self.state.purge_floor
-                    && op > self.state.checkpoint
+                (op > self.state.checkpoint
                     && next_offset >= segments.checkpoint.position.next_offset)
                     .then_some(SegmentCursor {
                         generation: reference.generation,
@@ -598,7 +592,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 file.truncate(cursor.position.length).await?;
                 self.segment_files_dirty = true;
                 if self.preallocate_segments {
-                    file.preallocate(&cursor.path(&self.directory), segments.max_size);
+                    file.preallocate(&cursor.path(&self.directory), segments.max_size)
+                        .await;
                 }
             }
             self.sync_segment_files().await?;
@@ -701,7 +696,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 .await?
                 > 0
         {
-            // A purged inode can still be retained by older prepares.
+            // A view change can truncate a suffix that rolled into this offset.
+            // Its public name survives the truncation with the dropped bytes.
             self.remove_segment_name(&public).await?;
         }
         // Segment roll can create the public name during any await. Both
@@ -716,7 +712,7 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         if length == 0
             && let Some(size) = preallocate_size
         {
-            file.preallocate(&retained, size);
+            file.preallocate(&retained, size).await;
         }
         self.segment_files_dirty = true;
         self.segment_links_dirty = true;

@@ -19,7 +19,6 @@ mod create_stream;
 mod delete_stream;
 pub mod get_stream;
 pub mod get_streams;
-mod purge_stream;
 mod stream_response;
 mod update_stream;
 
@@ -28,6 +27,5 @@ pub use create_stream::CreateStreamResponse;
 pub use delete_stream::DeleteStreamResponse;
 pub use get_stream::{GetStreamResponse, TopicHeader};
 pub use get_streams::GetStreamsResponse;
-pub use purge_stream::PurgeStreamResponse;
 pub use stream_response::StreamResponse;
 pub use update_stream::UpdateStreamResponse;

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { clientApi } from '$lib/api/clientApi';
-import { streamDetailsMapper } from '$lib/domain/StreamDetails';
+import { clientApi } from '#lib/api/clientApi.js';
+import { streamDetailsMapper } from '#lib/domain/StreamDetails.js';
 import type { PageLoad } from './$types';
 
 export const load: PageLoad = async ({ params }) => {

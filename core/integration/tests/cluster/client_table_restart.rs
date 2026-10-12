@@ -53,7 +53,7 @@ use crate::server::raw_tcp::TEST_BIND_SECRET;
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use iggy_binary_protocol::codes::{PING_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::codes::{GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::consensus::{
     Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
@@ -66,7 +66,7 @@ use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
-use iggy_binary_protocol::responses::messages::PollMessagesResponse;
+use iggy_binary_protocol::responses::messages::{PollMessagesResponse, PollRoutingResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireIdentifier, WireName, WireOptions,
@@ -733,7 +733,15 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
         exchange(&mut member, &header, &join).await.verdict(),
         Verdict::Success(_)
     ));
-    let original = liveness_group(&observer).await;
+    let original = integration::harness::wait_for_consumer_group_assignment(
+        &observer,
+        &stream,
+        &topic,
+        &group,
+        1,
+        COMMIT_BUDGET,
+    )
+    .await;
     let mut poll_request = PollMessagesRequest {
         consumer: WireConsumer::consumer_group(WireIdentifier::named(LIVENESS_GROUP).unwrap()),
         stream_id: WireIdentifier::named(LIVENESS_STREAM).unwrap(),
@@ -744,8 +752,19 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
         auto_commit: true,
     };
     let first_poll = poll_request.to_bytes();
+    let mut routing_header = request_header(Operation::NonReplicated, session, 0, first_poll.len());
+    routing_header.reserved[..size_of::<u32>()]
+        .copy_from_slice(&GET_POLL_ROUTING_CODE.to_le_bytes());
+    let Exchange::Reply {
+        status: 0, body, ..
+    } = exchange(&mut member, &routing_header, &first_poll).await
+    else {
+        panic!("the installed owner must discover its poll context");
+    };
+    let context = PollRoutingResponse::decode_from(&body).unwrap().context;
     let mut first_header = request_header(Operation::NonReplicated, session, 0, first_poll.len());
     first_header.reserved[..size_of::<u32>()].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+    context.stamp(&mut first_header);
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
         let Exchange::Reply {
@@ -801,6 +820,7 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
     let poll = poll_request.to_bytes();
     let mut header = request_header(Operation::NonReplicated, session, 0, poll.len());
     header.reserved[..size_of::<u32>()].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+    context.stamp(&mut header);
     let deadline = Instant::now() + LIVENESS_OBSERVATION;
     while Instant::now() < deadline {
         assert!(
@@ -1146,11 +1166,15 @@ async fn bind_group_member_on_backup(
     let (backup_connection, new_session) = register(harness.node(backup).tcp_addr().unwrap()).await;
     assert_eq!(new_session, session);
     drop(original);
-    let members = observer
-        .get_consumer_group(&stream, &topic, &group)
-        .await
-        .unwrap()
-        .unwrap();
+    let members = integration::harness::wait_for_consumer_group_assignment(
+        observer,
+        &stream,
+        &topic,
+        &group,
+        1,
+        COMMIT_BUDGET,
+    )
+    .await;
     assert_eq!(members.members_count, 1);
     (backup_connection, session, primary, backup)
 }

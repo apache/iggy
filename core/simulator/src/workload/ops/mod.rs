@@ -44,8 +44,6 @@ pub mod delete_segments;
 pub mod delete_stream;
 pub mod delete_topic;
 pub mod delete_user;
-pub mod purge_stream;
-pub mod purge_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
 pub mod update_permissions;
@@ -191,11 +189,9 @@ op_dispatch! {
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
-    PurgeStream               => purge_stream,
     CreateTopic               => create_topic,
     UpdateTopic               => update_topic,
     DeleteTopic               => delete_topic,
-    PurgeTopic                => purge_topic,
     CreatePartitions          => create_partitions,
     DeletePartitions          => delete_partitions,
     DeleteSegments            => delete_segments,

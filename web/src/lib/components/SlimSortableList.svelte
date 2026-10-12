@@ -32,7 +32,7 @@ under the License.
 <script lang="ts">
   import { run } from 'svelte/legacy';
 
-  import { asConst } from '$lib/utils/asConst';
+  import { asConst } from '#lib/utils/asConst.js';
 
   import Icon from './Icon.svelte';
   import { twMerge } from 'tailwind-merge';
