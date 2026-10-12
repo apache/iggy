@@ -1075,8 +1075,8 @@ pub enum VsrAction {
         /// this replica's own `StoredDvc`: a merge seeing two versions of one
         /// sender's suffix could adopt a header no replica holds.
         suffix: DvcSuffix,
-        /// Stamped as `DoViewChangeHeader::FLAG_LOG_UNTRUSTED`.
-        log_untrusted: bool,
+        /// Stamped as `DoViewChangeHeader::FLAG_UNTRUSTED_LOG`.
+        untrusted_log: bool,
     },
     /// Broadcast a `RequestStartView` probe (recovering replica asking for
     /// the current view's `StartView`; only that view's primary answers).
@@ -1162,7 +1162,7 @@ impl VsrAction {
                 log_view: 0,
                 op: 0,
                 commit: 0,
-                log_untrusted: true,
+                untrusted_log: true,
                 suffix,
                 ..
             } if suffix.is_empty()
@@ -1301,12 +1301,28 @@ where
     /// with a log shorter than what it acknowledged. See
     /// [`Self::set_recovered_log_complete`].
     recovered_log_complete: Cell<bool>,
+    /// This incarnation booted on the log it read back from disk and has not
+    /// been `Normal` since. Set by [`Self::join`] with
+    /// [`JoinMode::ProbeAsBackup`], cleared on the first `Normal`.
+    ///
+    /// A view probe begun later, by a replica that never restarted, finds it
+    /// clear: that log lost nothing, so an unanswered probe is no reason to
+    /// distrust it, and doing so could halt a group one crash short of its
+    /// fault budget.
+    ///
+    /// Adopting a `StartView` and starting a view as primary are the clears
+    /// that matter. Those in [`Self::init`] and [`Self::init_as_backup`] are
+    /// only a safeguard: each runs at boot, before anything but `join` sets
+    /// the flag, and `join` sets it after `init_as_backup` returns.
+    rejoined_on_recovered_log: Cell<bool>,
     /// This replica left `Recovering` through the probe-exhaustion election
-    /// while [`Self::recovered_log_complete`] was false: its log may lack ops it
+    /// on a log read back after a restart (see
+    /// [`Self::rejoined_on_recovered_log`]) while
+    /// [`Self::recovered_log_complete`] was false: its log may lack ops it
     /// acknowledged, and no settled primary has vouched for it since.
     ///
     /// Every `DoViewChange` it sends says so, and no merge counts such a log
-    /// toward a quorum: a view starts from a quorum of trusted senders, or from
+    /// toward a trusted quorum: a view starts from a quorum of trusted senders, or from
     /// every replica (see `merge_view_change`). Cleared by adopting a
     /// `StartView` or by starting a view as primary, whose merged log either
     /// rule makes safe.
@@ -1632,6 +1648,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 await_state_transfer,
             } => {
                 self.init_as_backup();
+                self.rejoined_on_recovered_log.set(true);
                 self.begin_view_probe();
                 if await_state_transfer {
                     self.begin_state_transfer_await();
@@ -1706,6 +1723,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
             recovery_election_allowed: Cell::new(true),
             recovered_log_complete: Cell::new(true),
+            rejoined_on_recovered_log: Cell::new(false),
             untrusted_log: Cell::new(false),
             untrusted_view_change_timeouts: Cell::new(0),
             local_dvc_suffix: RefCell::new(None),
@@ -1798,11 +1816,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// stable storage; `false` when some are sent once the write is queued, as
     /// `replicated` partition durability does.
     ///
-    /// With `false`, a replica whose view probe goes unanswered still elects,
-    /// since a full-cluster restart has nobody to answer it, but its log is
-    /// untrusted until a settled primary vouches for it: its `DoViewChange`
-    /// says so, and no view starts on it short of a trusted quorum or every
-    /// replica reporting. See [`Self::has_untrusted_log`].
+    /// With `false`, a restarted replica whose boot view probe goes unanswered
+    /// still elects, since a full-cluster restart has nobody to answer it, but
+    /// its log is untrusted until a settled primary vouches for it: its
+    /// `DoViewChange` says so, and no view starts on it short of a trusted
+    /// quorum or every replica reporting. See [`Self::has_untrusted_log`].
     pub fn set_recovered_log_complete(&self, complete: bool) {
         self.recovered_log_complete.set(complete);
     }
@@ -1821,6 +1839,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn init(&self) {
         self.status.set(Status::Normal);
+        self.rejoined_on_recovered_log.set(false);
         let mut timeouts = self.timeouts.borrow_mut();
         if self.is_primary() {
             // Prepare is deliberately NOT armed here: a fresh primary has an
@@ -1849,6 +1868,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// it stays quorum-invisible until a `StartView` answers.
     pub fn init_as_backup(&self) {
         self.status.set(Status::Normal);
+        self.rejoined_on_recovered_log.set(false);
         self.ceded_primaryship.set(true);
         self.timeouts
             .borrow_mut()
@@ -2782,8 +2802,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                         // survivor mid view change answers no probe. If this log
                         // can lack acknowledged ops, a quorum of restarted
                         // replicas could otherwise elect past a survivor holding
-                        // committed ops that only it still has.
-                        if !self.recovered_log_complete.get() {
+                        // committed ops that only it still has. Only a log read
+                        // back after a restart can be short of what it acked.
+                        if self.rejoined_on_recovered_log.get()
+                            && !self.recovered_log_complete.get()
+                        {
                             tracing::info!(
                                 replica = self.replica,
                                 namespace_raw = self.group,
@@ -3002,7 +3025,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // NOT the snapshot the first send used: `build_do_view_change` re-reads
         // `local_dvc_suffix()`, whose tag can have moved since, in which case it
         // answers EMPTY, retracting every nack and body offer already sent.
-        // Survivable only because `dvc_record` drops a duplicate sender, so the
+        // Survivable only because `dvc_record` drops a duplicate real vote, so the
         // candidate keeps the first vote. Allow a retransmit to replace a seated vote
         // and this must pin the snapshot instead.
         let action = self.build_do_view_change(self.primary_index(self.view.get()));
@@ -3282,7 +3305,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     op: current_op,
                     commit,
                     suffix: self.local_dvc_suffix(),
-                    log_untrusted: self.untrusted_log.get(),
+                    untrusted_log: self.untrusted_log.get(),
                 };
                 dvc_record(
                     &mut self.do_view_change_from_all_replicas.borrow_mut(),
@@ -3331,12 +3354,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             commit: self.dvc_commit(),
             group: self.group,
             suffix: self.local_dvc_suffix(),
-            log_untrusted: self.untrusted_log.get(),
+            untrusted_log: self.untrusted_log.get(),
         }
     }
 
-    /// The `DoViewChange` a recovering replica barred from electing sends for
-    /// `view`, or `None` when it must stay silent.
+    /// The `DoViewChange` a recovering replica barred from electing sends in
+    /// answer to a `StartViewChange` for `view`, or `None` when it must stay
+    /// silent. Never in answer to a `DoViewChange`: see `handle_do_view_change`.
     ///
     /// Without it a group whose every log is untrusted could never start a
     /// view, since that takes every replica reporting and a barred replica
@@ -3365,7 +3389,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             commit: 0,
             group: self.group,
             suffix: DvcSuffix::empty(),
-            log_untrusted: true,
+            untrusted_log: true,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -3420,12 +3444,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ) -> Vec<VsrAction> {
         assert_eq!(header.group, self.group, "DVC routed to wrong group");
         // Quorum-invisible while recovering (see handle_start_view_change):
-        // a recovering replica must not collect DVCs and crown itself.
+        // a recovering replica must not collect DVCs and crown itself. Nor does
+        // it answer one with its empty vote: DVCs are broadcast, so two barred
+        // replicas would answer each other's empty votes forever. The
+        // candidate's SVC retransmits keep soliciting the vote instead.
         if self.status.get() == Status::Recovering {
-            return self
-                .empty_do_view_change(plane, header.view)
-                .into_iter()
-                .collect();
+            return Vec::new();
         }
         let from_replica = header.replica;
         let msg_view = header.view;
@@ -3476,7 +3500,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 op: current_op,
                 commit,
                 suffix: self.local_dvc_suffix(),
-                log_untrusted: self.untrusted_log.get(),
+                untrusted_log: self.untrusted_log.get(),
             };
             dvc_record(
                 &mut self.do_view_change_from_all_replicas.borrow_mut(),
@@ -3491,9 +3515,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             op: msg_op,
             commit: msg_commit,
             suffix: msg_suffix,
-            log_untrusted: header.log_untrusted(),
+            untrusted_log: header.untrusted_log(),
         };
-        dvc_record(&mut self.do_view_change_from_all_replicas.borrow_mut(), dvc);
+        // A retransmit changes nothing the last merge did not already see.
+        if !dvc_record(&mut self.do_view_change_from_all_replicas.borrow_mut(), dvc) {
+            return actions;
+        }
 
         // `complete_view_change_as_primary` latches only once the merge decides,
         // so an undecidable quorum re-merges as each further DVC lands.
@@ -3851,6 +3878,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
+        self.rejoined_on_recovered_log.set(false);
         self.ceded_primaryship.set(false);
         // The view's log now comes from a settled primary, and repair fills this
         // replica's holes from it.
@@ -4235,6 +4263,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.invalidate_local_dvc_suffix();
 
         self.status.set(Status::Normal);
+        self.rejoined_on_recovered_log.set(false);
         self.ceded_primaryship.set(false);
         // Merged from a trusted quorum or from every replica, so no surviving log
         // was left out.
@@ -6461,7 +6490,7 @@ mod view_source_tests {
             op,
             commit,
             suffix: DvcSuffix::new(headers, 0, present),
-            log_untrusted: false,
+            untrusted_log: false,
         }
     }
 
@@ -6878,10 +6907,15 @@ mod recovery_election_tests {
         Message::<H>::new(HEADER_SIZE + body).transmute_header(|_, header: &mut H| fill(header))
     }
 
+    /// Messages one `Cluster::deliver` may carry before it counts as a loop:
+    /// orders of magnitude above what one tick of three replicas provokes.
+    const DELIVERIES_PER_ROUND_MAX: usize = 10_000;
+
     struct DeliveredDoViewChange {
         from: u8,
+        to: u8,
         view: u32,
-        log_untrusted: bool,
+        untrusted_log: bool,
     }
 
     struct Cluster {
@@ -6889,6 +6923,11 @@ mod recovery_election_tests {
         plane: PlaneKind,
         /// Every `DoViewChange` delivered.
         do_view_changes: Vec<DeliveredDoViewChange>,
+        /// Deliver each `DoViewChange` to every peer rather than to its target,
+        /// as the shard dispatches it.
+        broadcast_do_view_changes: bool,
+        /// Messages delivered so far.
+        delivered: usize,
     }
 
     impl Cluster {
@@ -6903,11 +6942,19 @@ mod recovery_election_tests {
             mut outbox: VecDeque<(u8, VsrAction)>,
             reachable: impl Fn(u8, u8) -> bool,
         ) {
+            let mut round = 0;
             while let Some((from, action)) = outbox.pop_front() {
                 for to in 0..REPLICA_COUNT {
                     if to == from || !reachable(from, to) {
                         continue;
                     }
+                    round += 1;
+                    assert!(
+                        round <= DELIVERIES_PER_ROUND_MAX,
+                        "unbounded message loop: {round} messages provoked in one round, \
+                         the last {action:?} from replica {from} to {to}"
+                    );
+                    self.delivered += 1;
                     for reply in self.receive(from, to, &action) {
                         outbox.push_back((to, reply));
                     }
@@ -6950,8 +6997,8 @@ mod recovery_election_tests {
                     commit,
                     group,
                     suffix,
-                    log_untrusted,
-                } if *target == to => {
+                    untrusted_log,
+                } if self.broadcast_do_view_changes || *target == to => {
                     let mut dvc =
                         message(suffix.encoded_len(), |header: &mut DoViewChangeHeader| {
                             header.command = Command::DoViewChange;
@@ -6964,8 +7011,8 @@ mod recovery_election_tests {
                             header.op = *op;
                             header.commit = *commit;
                             header.group = *group;
-                            if *log_untrusted {
-                                header.flags = DoViewChangeHeader::FLAG_LOG_UNTRUSTED;
+                            if *untrusted_log {
+                                header.flags = DoViewChangeHeader::FLAG_UNTRUSTED_LOG;
                             }
                             header.nack_bitset = suffix.nack_bitset();
                             header.present_bitset = suffix.present_bitset();
@@ -6973,8 +7020,9 @@ mod recovery_election_tests {
                     suffix.encode_into(&mut dvc.as_mut_slice()[HEADER_SIZE..]);
                     self.do_view_changes.push(DeliveredDoViewChange {
                         from,
+                        to,
                         view: *view,
-                        log_untrusted: *log_untrusted,
+                        untrusted_log: *untrusted_log,
                     });
                     self.replica(to).handle_do_view_change(
                         plane,
@@ -7131,6 +7179,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
         assert_eq!(
             cluster.replica(RESTARTED_PRIMARY).status(),
@@ -7167,6 +7217,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |_, _| true);
@@ -7188,6 +7240,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |from, to| from != SURVIVOR && to != SURVIVOR);
@@ -7222,6 +7276,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |_, _| true);
@@ -7248,6 +7304,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |_, _| true);
@@ -7264,7 +7322,7 @@ mod recovery_election_tests {
                 .do_view_changes
                 .iter()
                 .filter(|delivered| delivered.from == SURVIVOR)
-                .all(|delivered| delivered.log_untrusted),
+                .all(|delivered| delivered.untrusted_log),
             "an empty vote must never read as a trusted log"
         );
     }
@@ -7286,6 +7344,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         for tick in 0..TICKS {
@@ -7327,6 +7387,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
         let view = cluster.replica(SURVIVOR).view();
 
@@ -7364,6 +7426,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(2 * TICKS, |_, _| true);
@@ -7386,6 +7450,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |_, _| true);
@@ -7395,7 +7461,7 @@ mod recovery_election_tests {
             cluster
                 .do_view_changes
                 .iter()
-                .all(|delivered| delivered.from != SURVIVOR && !delivered.log_untrusted)
+                .all(|delivered| delivered.from != SURVIVOR && !delivered.untrusted_log)
         );
     }
 
@@ -7413,6 +7479,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |from, to| from != SURVIVOR && to != SURVIVOR);
@@ -7454,9 +7522,11 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
         let do_view_change =
-            |head: u64, commit: u64, log_untrusted: bool| VsrAction::SendDoViewChange {
+            |head: u64, commit: u64, untrusted_log: bool| VsrAction::SendDoViewChange {
                 view,
                 target: LAGGING_BACKUP,
                 log_view: OLD_VIEW,
@@ -7464,7 +7534,7 @@ mod recovery_election_tests {
                 commit,
                 group: group(),
                 suffix: suffix_all_present((commit..=head).rev().map(prepare).collect()),
-                log_untrusted,
+                untrusted_log,
             };
 
         cluster.receive(
@@ -7534,6 +7604,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
 
         cluster.run(TICKS, |from, to| from != SURVIVOR && to != SURVIVOR);
@@ -7542,7 +7614,7 @@ mod recovery_election_tests {
         assert!(cluster.replica(RESTARTED_PRIMARY).has_untrusted_log());
         for delivered in &cluster.do_view_changes {
             assert_eq!(
-                delivered.log_untrusted,
+                delivered.untrusted_log,
                 delivered.from == RESTARTED_PRIMARY,
                 "replica {} sent a DoViewChange misreporting its log",
                 delivered.from
@@ -7597,6 +7669,8 @@ mod recovery_election_tests {
             ],
             plane,
             do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
         };
         let svc = VsrAction::SendStartViewChange {
             view,
@@ -7604,7 +7678,7 @@ mod recovery_election_tests {
         };
         cluster.receive(SURVIVOR, LAGGING_BACKUP, &svc);
         let do_view_change =
-            |head: u64, commit: u64, log_untrusted: bool| VsrAction::SendDoViewChange {
+            |head: u64, commit: u64, untrusted_log: bool| VsrAction::SendDoViewChange {
                 view,
                 target: LAGGING_BACKUP,
                 log_view: OLD_VIEW,
@@ -7612,7 +7686,7 @@ mod recovery_election_tests {
                 commit,
                 group: group(),
                 suffix: suffix_all_present((commit..=head).rev().map(prepare).collect()),
-                log_untrusted,
+                untrusted_log,
             };
 
         cluster.receive(
@@ -7637,5 +7711,335 @@ mod recovery_election_tests {
             Some(RECOVERED_HEAD + 1),
             "the merge took the untrusted sender's longer log"
         );
+    }
+
+    fn barred(replica: u8, head: u64) -> VsrConsensus<NoopBus, LocalPipeline> {
+        let consensus = restarted(replica, head, false);
+        consensus.set_recovery_election_allowed(false);
+        consensus
+    }
+
+    /// Two replicas come back barred from electing. The shard broadcasts every
+    /// `DoViewChange`, so each hears the other's empty vote, and answering one
+    /// with its own would bounce empty votes between them forever. While the
+    /// third replica's view change cannot complete they stay quiet and
+    /// `Recovering`; once it can, the group settles.
+    #[test]
+    fn given_two_barred_replicas_when_do_view_changes_are_broadcast_should_not_answer_each_other() {
+        let plane = PlaneKind::Partitions;
+        let mut cluster = Cluster {
+            replicas: vec![
+                restarted(RESTARTED_PRIMARY, COMMITTED, false),
+                barred(LAGGING_BACKUP, LAGGING_HEAD),
+                barred(SURVIVOR, RECOVERED_HEAD),
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+            broadcast_do_view_changes: true,
+            delivered: 0,
+        };
+
+        // The electing replica's view-change traffic reaches the barred pair,
+        // their votes reach only each other.
+        cluster.run(TICKS, |from, to| {
+            from == RESTARTED_PRIMARY || to != RESTARTED_PRIMARY
+        });
+
+        assert!(
+            cluster.do_view_changes.iter().any(|delivered| {
+                delivered.from != RESTARTED_PRIMARY && delivered.to != RESTARTED_PRIMARY
+            }),
+            "no empty vote reached the other barred replica"
+        );
+        for index in [LAGGING_BACKUP, SURVIVOR] {
+            assert_eq!(cluster.replica(index).status(), Status::Recovering);
+        }
+        let quiet = cluster.delivered;
+        assert!(
+            quiet <= usize::try_from(TICKS).unwrap() * 8,
+            "{quiet} messages in {TICKS} ticks"
+        );
+
+        cluster.run(TICKS, |_, _| true);
+
+        cluster.assert_settled(COMMITTED);
+    }
+
+    /// Lagging backups that never restarted, then heard a newer view and
+    /// probed for it. With the third replica gone nobody answers, and the
+    /// fallback election must treat their logs as the intact ones they are:
+    /// marking them untrusted would halt a group that lost only one replica.
+    #[test]
+    fn given_replicas_that_never_restarted_when_a_runtime_probe_exhausts_should_elect_trusted_without_the_third()
+     {
+        let plane = PlaneKind::Partitions;
+        let probing = |replica: u8| {
+            let mut consensus = VsrConsensus::new(
+                1,
+                replica,
+                REPLICA_COUNT,
+                group(),
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.set_view(OLD_VIEW);
+            consensus.set_log_view(OLD_VIEW);
+            consensus.sequencer().set_sequence(COMMITTED);
+            consensus.restore_commit_state(COMMITTED - 1, COMMITTED - 1);
+            consensus.set_last_prepare_checksum(prepare(COMMITTED).checksum);
+            consensus.set_local_dvc_suffix(suffix_all_present(
+                (COMMITTED - 1..=COMMITTED).rev().map(prepare).collect(),
+            ));
+            consensus.set_recovered_log_complete(false);
+            consensus.init();
+            consensus.begin_view_probe();
+            consensus
+        };
+        let mut cluster = Cluster {
+            replicas: vec![
+                probing(RESTARTED_PRIMARY),
+                probing(LAGGING_BACKUP),
+                survivor_in_view_change(plane),
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
+        };
+
+        cluster.run(TICKS, |from, to| from != SURVIVOR && to != SURVIVOR);
+
+        for index in [RESTARTED_PRIMARY, LAGGING_BACKUP] {
+            let replica = cluster.replica(index);
+            assert_eq!(replica.status(), Status::Normal, "replica {index} halted");
+            assert!(replica.log_view() > OLD_VIEW);
+            assert!(!replica.has_untrusted_log());
+        }
+        assert!(
+            cluster
+                .do_view_changes
+                .iter()
+                .all(|delivered| !delivered.untrusted_log)
+        );
+    }
+
+    /// The two continuing replicas of a settled view probe at runtime with the
+    /// third gone. Both restarted earlier on logs that may lack acknowledged
+    /// ops, but a settled view vouched for them since, so the election must
+    /// treat their logs as trusted rather than halt.
+    fn assert_runtime_probe_elects_trusted_without_survivor(cluster: &mut Cluster) {
+        let settled_view = cluster.replica(RESTARTED_PRIMARY).view();
+        for index in [RESTARTED_PRIMARY, LAGGING_BACKUP] {
+            cluster.replica(index).begin_view_probe();
+        }
+        let elected_from = cluster.do_view_changes.len();
+
+        cluster.run(TICKS, |from, to| from != SURVIVOR && to != SURVIVOR);
+
+        for index in [RESTARTED_PRIMARY, LAGGING_BACKUP] {
+            let replica = cluster.replica(index);
+            assert_eq!(replica.status(), Status::Normal, "replica {index} halted");
+            assert!(replica.log_view() > settled_view);
+            assert!(!replica.has_untrusted_log());
+        }
+        assert!(
+            cluster.do_view_changes[elected_from..]
+                .iter()
+                .all(|delivered| !delivered.untrusted_log),
+            "a replica that settled after its restart still marked its log untrusted"
+        );
+    }
+
+    /// Restarted replicas whose probe a live primary answers adopt its
+    /// `StartView`, which vouches for their logs. A later runtime probe that
+    /// exhausts with that primary gone must elect them trusted.
+    #[test]
+    fn given_restarted_replicas_that_adopted_a_start_view_when_a_runtime_probe_exhausts_should_elect_trusted_without_the_third()
+     {
+        const SETTLED_VIEW: u32 = OLD_VIEW + 2;
+        let plane = PlaneKind::Partitions;
+        let mut primary = VsrConsensus::new(
+            1,
+            SURVIVOR,
+            REPLICA_COUNT,
+            group(),
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        primary.set_view(SETTLED_VIEW);
+        primary.set_log_view(SETTLED_VIEW);
+        primary.sequencer().set_sequence(COMMITTED);
+        primary.restore_commit_state(COMMITTED - 1, COMMITTED - 1);
+        primary.set_last_prepare_checksum(prepare(COMMITTED).checksum);
+        primary.set_local_dvc_suffix(suffix_all_present(
+            (COMMITTED - 1..=COMMITTED).rev().map(prepare).collect(),
+        ));
+        primary.init();
+        assert!(primary.is_primary());
+        let mut cluster = Cluster {
+            replicas: vec![
+                restarted(RESTARTED_PRIMARY, COMMITTED, false),
+                restarted(LAGGING_BACKUP, COMMITTED, false),
+                primary,
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
+        };
+
+        cluster.run(TICKS, |_, _| true);
+
+        cluster.assert_settled(COMMITTED);
+        assert_eq!(cluster.replica(SURVIVOR).view(), SETTLED_VIEW);
+        assert!(
+            cluster.do_view_changes.is_empty(),
+            "the probe was not answered"
+        );
+        assert_runtime_probe_elects_trusted_without_survivor(&mut cluster);
+    }
+
+    /// A full restart settles on untrusted logs once every replica reports: one
+    /// continuing replica starts the view as its primary, the other adopts its
+    /// `StartView`. A later runtime probe that exhausts with the third gone must
+    /// elect both trusted.
+    #[test]
+    fn given_full_restart_that_settled_when_a_runtime_probe_exhausts_should_elect_trusted_without_the_third()
+     {
+        let plane = PlaneKind::Partitions;
+        let mut cluster = Cluster {
+            replicas: vec![
+                restarted(RESTARTED_PRIMARY, COMMITTED, false),
+                restarted(LAGGING_BACKUP, COMMITTED, false),
+                restarted(SURVIVOR, COMMITTED, false),
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
+        };
+
+        cluster.run(TICKS, |_, _| true);
+
+        cluster.assert_settled(COMMITTED);
+        assert!(
+            cluster
+                .do_view_changes
+                .iter()
+                .any(|delivered| delivered.untrusted_log),
+            "the full restart elected without marking its logs"
+        );
+        assert!(
+            [RESTARTED_PRIMARY, LAGGING_BACKUP]
+                .iter()
+                .any(|index| cluster.replica(*index).is_primary()),
+            "the settled primary is the replica the runtime probe leaves out"
+        );
+        assert_runtime_probe_elects_trusted_without_survivor(&mut cluster);
+    }
+
+    /// An untrusted candidate can learn its view from a peer's `DoViewChange`
+    /// before enough `StartViewChange`s arrive to send its own. The vote it
+    /// records for itself must still say untrusted, so one trusted peer is not
+    /// a trusted quorum and it waits for every replica.
+    #[test]
+    fn given_untrusted_candidate_when_a_peer_do_view_change_brings_it_into_the_view_should_record_its_own_vote_untrusted()
+     {
+        let plane = PlaneKind::Partitions;
+        let candidate = restarted(LAGGING_BACKUP, LAGGING_HEAD, false);
+        while candidate.status() == Status::Recovering {
+            candidate.tick(plane);
+        }
+        assert!(candidate.has_untrusted_log());
+        let view = (candidate.view() + 1..=candidate.view() + u32::from(REPLICA_COUNT))
+            .find(|view| candidate.primary_index(*view) == LAGGING_BACKUP)
+            .expect("every replica leads one of any run of replica-count views");
+        let mut cluster = Cluster {
+            replicas: vec![
+                restarted(RESTARTED_PRIMARY, RECOVERED_HEAD, false),
+                candidate,
+                survivor_in_view_change(plane),
+            ],
+            plane,
+            do_view_changes: Vec::new(),
+            broadcast_do_view_changes: false,
+            delivered: 0,
+        };
+        let do_view_change =
+            |head: u64, commit: u64, untrusted_log: bool| VsrAction::SendDoViewChange {
+                view,
+                target: LAGGING_BACKUP,
+                log_view: OLD_VIEW,
+                op: head,
+                commit,
+                group: group(),
+                suffix: suffix_all_present((commit..=head).rev().map(prepare).collect()),
+                untrusted_log,
+            };
+
+        cluster.receive(
+            SURVIVOR,
+            LAGGING_BACKUP,
+            &do_view_change(COMMITTED, COMMITTED - 1, false),
+        );
+        let candidate = cluster.replica(LAGGING_BACKUP);
+        assert_eq!(candidate.view(), view);
+        assert!(
+            candidate.do_view_change_from_all_replicas.borrow()[usize::from(LAGGING_BACKUP)]
+                .as_ref()
+                .expect("the candidate recorded its own vote")
+                .untrusted_log
+        );
+        assert!(
+            !candidate.view_log_is_pending(),
+            "one trusted peer completed a quorum with the candidate's untrusted log"
+        );
+
+        cluster.receive(
+            RESTARTED_PRIMARY,
+            LAGGING_BACKUP,
+            &do_view_change(RECOVERED_HEAD, RECOVERED_HEAD - 1, true),
+        );
+        assert_eq!(
+            cluster
+                .replica(LAGGING_BACKUP)
+                .with_pending_view_log(|log| log.op_head),
+            Some(COMMITTED)
+        );
+    }
+
+    /// A barred replica votes only for a view it has not moved past and does
+    /// not lead.
+    #[test]
+    fn given_barred_replica_when_a_view_change_is_older_or_its_own_should_send_no_empty_vote() {
+        let plane = PlaneKind::Partitions;
+        let barred = barred(SURVIVOR, COMMITTED);
+        let older = OLD_VIEW - 2;
+        let led = OLD_VIEW + 2;
+        assert_ne!(barred.primary_index(older), SURVIVOR);
+        assert_eq!(barred.primary_index(led), SURVIVOR);
+        for (view, votes) in [
+            (older, false),
+            (OLD_VIEW, true),
+            (OLD_VIEW + 1, true),
+            (led, false),
+        ] {
+            let svc = message(0, |header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = 1;
+                header.size = u32::try_from(HEADER_SIZE).unwrap();
+                header.replica = RESTARTED_PRIMARY;
+                header.view = view;
+                header.group = group();
+            });
+            let actions = barred.handle_start_view_change(plane, svc.header());
+            assert_eq!(
+                actions.iter().any(VsrAction::is_empty_vote),
+                votes,
+                "view {view}: {actions:?}"
+            );
+            assert_eq!(barred.status(), Status::Recovering);
+            assert_eq!(barred.view(), OLD_VIEW);
+        }
     }
 }

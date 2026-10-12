@@ -11732,7 +11732,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 commit,
                 group,
                 suffix,
-                log_untrusted,
+                untrusted_log,
             } => {
                 let header_size = size_of::<DoViewChangeHeader>();
                 let total_size = header_size + suffix.encoded_len();
@@ -11752,8 +11752,8 @@ async fn dispatch_vsr_actions<B, P, J>(
                     h.op = *op;
                     h.commit = *commit;
                     h.group = *group;
-                    if *log_untrusted {
-                        h.flags |= DoViewChangeHeader::FLAG_LOG_UNTRUSTED;
+                    if *untrusted_log {
+                        h.flags |= DoViewChangeHeader::FLAG_UNTRUSTED_LOG;
                     }
                     h.nack_bitset = nack_bitset;
                     h.present_bitset = present_bitset;
@@ -13923,7 +13923,7 @@ mod untrusted_do_view_change_tests {
 
     const GROUP: u64 = 42;
 
-    fn do_view_change(op: u64, log_untrusted: bool) -> VsrAction {
+    fn do_view_change(op: u64, untrusted_log: bool) -> VsrAction {
         VsrAction::SendDoViewChange {
             view: 1,
             target: 1,
@@ -13932,7 +13932,7 @@ mod untrusted_do_view_change_tests {
             commit: 0,
             group: GROUP,
             suffix: DvcSuffix::empty(),
-            log_untrusted,
+            untrusted_log,
         }
     }
 
@@ -13957,12 +13957,12 @@ mod untrusted_do_view_change_tests {
                 IggyByteSize::from(1024 * 1024),
             ));
 
-        for log_untrusted in [true, false] {
+        for untrusted_log in [true, false] {
             sent.borrow_mut().clear();
             dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(
                 partition.consensus(),
                 &partition,
-                vec![do_view_change(0, log_untrusted)],
+                vec![do_view_change(0, untrusted_log)],
             )
             .await;
             let frames = sent.borrow();
@@ -13972,7 +13972,7 @@ mod untrusted_do_view_change_tests {
                     frame.as_slice(),
                 ))
                 .expect("a dispatched DoViewChange decodes");
-                assert_eq!(message.header().log_untrusted(), log_untrusted);
+                assert_eq!(message.header().untrusted_log(), untrusted_log);
                 assert_eq!(message.header().verify_frame(), Ok(()));
             }
         }
@@ -13991,10 +13991,28 @@ mod untrusted_do_view_change_tests {
             !sendable_while_awaiting_transfer(&do_view_change(0, false)),
             "a trusted vote vouches for a log the partition does not have"
         );
-        assert!(
-            !sendable_while_awaiting_transfer(&do_view_change(5, true)),
-            "a vote carrying a head vouches for history"
-        );
+        let flagged = |log_view: u32, commit: u64, suffix: DvcSuffix| VsrAction::SendDoViewChange {
+            view: 1,
+            target: 1,
+            log_view,
+            op: 0,
+            commit,
+            group: GROUP,
+            suffix,
+            untrusted_log: true,
+        };
+        let one_header = DvcSuffix::new(vec![PrepareHeader::default()], 0, 0);
+        for (vote, vouches_for) in [
+            (do_view_change(5, true), "a head"),
+            (flagged(1, 0, DvcSuffix::empty()), "a log_view"),
+            (flagged(0, 1, DvcSuffix::empty()), "a commit point"),
+            (flagged(0, 0, one_header), "suffix headers"),
+        ] {
+            assert!(
+                !sendable_while_awaiting_transfer(&vote),
+                "a vote carrying {vouches_for} vouches for history"
+            );
+        }
         assert!(!sendable_while_awaiting_transfer(
             &VsrAction::SendStartViewChange {
                 view: 1,

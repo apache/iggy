@@ -3866,7 +3866,8 @@ mod tests {
         }
     }
 
-    /// Each replica's count of partitions waiting on every replica to report.
+    /// Each replica's count of partitions waiting on a trusted quorum or every
+    /// replica to report.
     fn untrusted_log_gauges(sim: &Simulator, namespace: IggyNamespace) -> Vec<i64> {
         sim.replicas
             .iter()
@@ -3883,15 +3884,15 @@ mod tests {
     /// restart them. Every replica must settle on a log that still holds the
     /// acknowledged send, trusting it again, and a new send must commit.
     fn restart_keeps_acknowledged_send(durability: iggy_common::Durability, crashed: &[u8]) {
-        restart_keeps_acknowledged_send_losing(durability, crashed, None);
+        restart_keeps_acknowledged_send_losing(durability, crashed, &[]);
     }
 
-    /// [`restart_keeps_acknowledged_send`], with replica `lost` restarting
-    /// without the partition's log, so it may not elect on it.
+    /// [`restart_keeps_acknowledged_send`], with the replicas in `lost`
+    /// restarting without the partition's log, so they may not elect on it.
     fn restart_keeps_acknowledged_send_losing(
         durability: iggy_common::Durability,
         crashed: &[u8],
-        lost: Option<u8>,
+        lost: &[u8],
     ) {
         const PROGRESS_STEPS: usize = 4_000;
         const PAYLOAD: &[u8] = b"acknowledged-before-the-crash";
@@ -3925,7 +3926,7 @@ mod tests {
             sim.replica_crash(*replica);
         }
         for replica in crashed {
-            if lost == Some(*replica) {
+            if lost.contains(replica) {
                 sim.replica_restart_losing_partitions(*replica, &[namespace]);
             } else {
                 sim.replica_restart(*replica);
@@ -3978,7 +3979,8 @@ mod tests {
         assert_eq!(
             gauge_saw_halt,
             durability == iggy_common::Durability::Replicated,
-            "{durability:?}: only a restarted replicated log waits on every replica"
+            "{durability:?}: only a restarted replicated log waits on a trusted quorum or every \
+             replica"
         );
         for _ in 0..PROGRESS_STEPS / 10 {
             sim.step();
@@ -4033,8 +4035,145 @@ mod tests {
             iggy_common::Durability::Replicated,
             iggy_common::Durability::Persisted,
         ] {
-            restart_keeps_acknowledged_send_losing(durability, &[0, 1, 2], Some(2));
+            restart_keeps_acknowledged_send_losing(durability, &[0, 1, 2], &[2]);
         }
+    }
+
+    /// Every replica crashes and two come back without the partition's log.
+    /// Both cast empty votes, broadcast to every peer as production sends a
+    /// `DoViewChange`, and must not answer each other's: the group settles on
+    /// the one log left. `replicated` only, since `persisted` cannot vouch for a
+    /// lone disk and rightly halts.
+    #[test]
+    fn given_every_replica_restarts_with_two_partition_logs_lost_should_settle_and_accept_sends() {
+        restart_keeps_acknowledged_send_losing(
+            iggy_common::Durability::Replicated,
+            &[0, 1, 2],
+            &[1, 2],
+        );
+    }
+
+    /// Every replica crashes and the replicas in `awaiting` come back with the
+    /// partition awaiting a state transfer. The shard lets only their empty votes
+    /// out, broadcast like any `DoViewChange`, and the others must still start a
+    /// view on the acknowledged send. Catching the awaiting replicas up takes a
+    /// partition state transfer, which in-memory storage does not model, so this
+    /// stops at the view.
+    fn full_restart_awaiting_transfer_starts_a_view(awaiting: &[u8]) {
+        const PROGRESS_STEPS: usize = 4_000;
+        let (mut sim, client) = cluster(packet::PacketSimulatorOptions::default().seed);
+        sim.register_client_with_primary(&client);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.set_partition_durability(namespace, iggy_common::Durability::Replicated);
+        sim.seed_stream_topic_partition(namespace);
+        for replica in &sim.replicas {
+            materialise_partition(replica, namespace, sim.consumer_offsets_max);
+        }
+        let primary = (0..PROGRESS_STEPS)
+            .find_map(|_| {
+                sim.step();
+                (0..3).find(|replica| {
+                    sim.partition_consensus_state(usize::from(*replica), namespace)
+                        .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                })
+            })
+            .expect("the fresh partition elects a primary");
+        sim.discover_partition_contexts(&client);
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"acknowledged")]);
+        let committed = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+        assert_eq!(committed.header().status, 0);
+        let committed_op = committed.header().commit;
+        let old_view = sim
+            .partition_consensus_state(usize::from(primary), namespace)
+            .expect("primary hosts the partition")
+            .view;
+
+        for replica in 0..3 {
+            sim.replica_crash(replica);
+        }
+        for replica in 0..3 {
+            if awaiting.contains(&replica) {
+                sim.replica_restart_losing_partitions(replica, &[namespace]);
+            } else {
+                sim.replica_restart(replica);
+            }
+        }
+        for replica in awaiting {
+            let partitions = sim.replicas[usize::from(*replica)]
+                .partition_shard(namespace)
+                .plane
+                .partitions();
+            let partition = partitions
+                .get_mut_by_ns(&namespace)
+                .expect("a restarted replica rebuilds the partition");
+            partition.force_requires_state_transfer_for_test();
+            assert!(partition.requires_state_transfer());
+        }
+
+        let electing: Vec<u8> = (0..3)
+            .filter(|replica| !awaiting.contains(replica))
+            .collect();
+        let started = |sim: &Simulator| {
+            electing.iter().all(|replica| {
+                sim.replicas[usize::from(*replica)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .is_some_and(|partition| {
+                        let consensus = partition.consensus();
+                        consensus.status() == Status::Normal
+                            && consensus.view() > old_view
+                            && consensus.commit_max() >= committed_op
+                            && !consensus.has_untrusted_log()
+                    })
+            })
+        };
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                started(&sim)
+            }),
+            "replicas {awaiting:?} await a state transfer and replicas {electing:?} never \
+             started a view holding op {committed_op}: states={:?}",
+            (0..3)
+                .map(|replica| sim.partition_consensus_state(replica, namespace))
+                .collect::<Vec<_>>()
+        );
+        // The awaiting replicas stay `Recovering`, hearing each other's
+        // broadcast votes, so the vote traffic must die down with the view.
+        let do_view_changes =
+            |sim: &Simulator| sim.network.command_counts()[Command::DoViewChange as usize];
+        let at_start = do_view_changes(&sim);
+        for _ in 0..PROGRESS_STEPS / 4 {
+            sim.step();
+        }
+        let after_start = do_view_changes(&sim) - at_start;
+        assert!(
+            after_start <= 16,
+            "{after_start} DoViewChanges delivered after the view started"
+        );
+        for replica in awaiting {
+            let state = sim
+                .partition_consensus_state(usize::from(*replica), namespace)
+                .expect("the awaiting replica hosts the partition");
+            assert!(
+                !state.is_primary || state.status != Status::Normal,
+                "replica {replica} led a view while awaiting a state transfer"
+            );
+        }
+    }
+
+    #[test]
+    fn given_full_restart_when_one_replica_awaits_a_state_transfer_should_start_a_view_on_its_empty_vote()
+     {
+        full_restart_awaiting_transfer_starts_a_view(&[2]);
+    }
+
+    #[test]
+    fn given_full_restart_when_two_replicas_await_a_state_transfer_should_start_a_view_on_their_empty_votes()
+     {
+        full_restart_awaiting_transfer_starts_a_view(&[1, 2]);
     }
 
     fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {

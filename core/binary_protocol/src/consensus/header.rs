@@ -1530,7 +1530,7 @@ pub struct DoViewChangeHeader {
     pub group: u64,
     /// View when status was last normal (key for log selection).
     pub log_view: u32,
-    /// Bit 0, [`Self::FLAG_LOG_UNTRUSTED`]: the sender recovered a `replicated`
+    /// Bit 0, [`Self::FLAG_UNTRUSTED_LOG`]: the sender recovered a `replicated`
     /// log after a restart and has not adopted a settled view since, so ops past
     /// its head may be ones it acknowledged and lost. Such a log can neither be
     /// canonical nor nack anything while a quorum of trusted senders reports.
@@ -1538,6 +1538,10 @@ pub struct DoViewChangeHeader {
     /// Carved from the head of the former `reserved` region. Zero reads as
     /// "trusted", which is what a build predating the flag sends, so the
     /// protection holds once every replica runs a build that sets it.
+    ///
+    /// Every bit is must-understand: `validate` rejects one outside
+    /// [`Self::FLAGS_KNOWN`]. `reserved` is not checked, so a later field carved
+    /// from it must be one an older receiver can safely ignore.
     pub flags: u8,
     pub reserved: [u8; 67],
     /// Bit `i` set means the sender proves it never prepared suffix entry `i`, so
@@ -1663,14 +1667,14 @@ impl ConsensusHeader for DoViewChangeHeader {
 
 impl DoViewChangeHeader {
     /// See [`Self::flags`].
-    pub const FLAG_LOG_UNTRUSTED: u8 = 1;
+    pub const FLAG_UNTRUSTED_LOG: u8 = 1;
     /// Every flag bit this build understands.
-    pub const FLAGS_KNOWN: u8 = Self::FLAG_LOG_UNTRUSTED;
+    pub const FLAGS_KNOWN: u8 = Self::FLAG_UNTRUSTED_LOG;
 
     /// Whether the sender marked its log untrusted. See [`Self::flags`].
     #[must_use]
-    pub const fn log_untrusted(&self) -> bool {
-        self.flags & Self::FLAG_LOG_UNTRUSTED != 0
+    pub const fn untrusted_log(&self) -> bool {
+        self.flags & Self::FLAG_UNTRUSTED_LOG != 0
     }
 
     /// Number of `PrepareHeader`s in the body.
@@ -3093,11 +3097,11 @@ mod tests {
 
     #[test]
     fn given_untrusted_flag_when_round_tripped_should_keep_flag_and_field_offsets() {
-        let header = do_view_change(DoViewChangeHeader::FLAG_LOG_UNTRUSTED);
+        let header = do_view_change(DoViewChangeHeader::FLAG_UNTRUSTED_LOG);
         let mut frame = AlignedFrame([0u8; HEADER_SIZE]);
         frame.0.copy_from_slice(bytemuck::bytes_of(&header));
 
-        assert_eq!(frame.0[156], DoViewChangeHeader::FLAG_LOG_UNTRUSTED);
+        assert_eq!(frame.0[156], DoViewChangeHeader::FLAG_UNTRUSTED_LOG);
         assert_eq!(frame.0[128..136], 42u64.to_le_bytes());
         assert_eq!(frame.0[136..144], 40u64.to_le_bytes());
         assert_eq!(frame.0[144..152], 9u64.to_le_bytes());
@@ -3107,7 +3111,7 @@ mod tests {
         let decoded = bytemuck::checked::try_from_bytes::<DoViewChangeHeader>(&frame.0)
             .expect("a stamped header is a valid bit pattern");
         assert_eq!(*decoded, header);
-        assert!(decoded.log_untrusted());
+        assert!(decoded.untrusted_log());
         assert_eq!(decoded.verify_frame(), Ok(()));
         assert_eq!(decoded.validate(), Ok(()));
     }
@@ -3116,14 +3120,14 @@ mod tests {
     fn given_zero_flags_when_decoded_should_read_as_trusted() {
         // What a build predating the flag sends in the same bytes.
         let header = do_view_change(0);
-        assert!(!header.log_untrusted());
+        assert!(!header.untrusted_log());
         assert_eq!(header.validate(), Ok(()));
     }
 
     #[test]
     fn given_unknown_flag_bit_when_validating_should_reject() {
         for bit in 1..u8::BITS {
-            let header = do_view_change(DoViewChangeHeader::FLAG_LOG_UNTRUSTED | (1 << bit));
+            let header = do_view_change(DoViewChangeHeader::FLAG_UNTRUSTED_LOG | (1 << bit));
             assert!(
                 matches!(header.validate(), Err(ConsensusError::InvalidField(_))),
                 "flag bit {bit} has no meaning yet and must not be read past"

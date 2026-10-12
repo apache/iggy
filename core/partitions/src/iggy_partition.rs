@@ -2690,6 +2690,15 @@ where
         }
     }
 
+    /// Mark this partition's files lost, as boot does when it finds the
+    /// on-disk `materialization_missing` record, which in-memory storage has no
+    /// directory to hold.
+    #[cfg(feature = "fault-injection")]
+    pub fn force_requires_state_transfer_for_test(&mut self) {
+        self.materialization_missing = true;
+        self.ensure_materialization_recovery();
+    }
+
     /// Capture the ideal-storage simulator's durable state at process loss.
     #[cfg(any(test, feature = "simulator"))]
     pub fn take_retained_state(&mut self) -> crate::RetainedPartitionState {
@@ -12243,6 +12252,7 @@ mod tests {
     use iggy_binary_protocol::{
         Command, CommitHeader, ReplyHeader, StartViewHeader, WireConsumer, WireEncode, WireName,
     };
+    use iggy_common::Durability::{Persisted, Replicated};
     use journal::DurableAppend;
     use journal::durable_storage::DiskStorage;
     use message_bus::{BusMessage, SendError};
@@ -14096,7 +14106,6 @@ mod tests {
 
     #[test]
     fn given_topic_durability_when_installed_should_tell_consensus_whether_restarts_keep_acks() {
-        use iggy_common::Durability::{Persisted, Replicated};
         let mut partition = test_partition();
         assert!(
             !partition.consensus().recovered_log_complete(),

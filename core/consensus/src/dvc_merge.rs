@@ -407,7 +407,7 @@ fn committed_elsewhere(
 }
 
 /// Decide the new view's log from `DoViewChange`s whose senders may have lost
-/// ops they acknowledged, as a sender with [`StoredDvc::log_untrusted`] can.
+/// ops they acknowledged, as a sender with [`StoredDvc::untrusted_log`] can.
 ///
 /// Such a sender acknowledged prepares before writing them and then restarted,
 /// so its head can stop below ops it helped commit, and its `log_view` says
@@ -422,15 +422,16 @@ fn committed_elsewhere(
 ///   and a short head proves nothing when any sender may have lost its tail.
 ///
 /// Trusted senders alone may leave an op undecided that an untrusted sender's
-/// body would settle, so once every replica has reported the second rule gets
-/// its turn rather than waiting on DVCs that will never come.
+/// body would settle, so once every replica has reported, at least one of them
+/// untrusted, the second rule gets its turn rather than waiting on DVCs that
+/// will never come.
 ///
 /// `quorums.view_change` is the plain quorum and `quorums.absence_nacks` is
 /// ignored: both follow from which rule applies.
 #[must_use]
 pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> MergeOutcome {
     let received = dvc_count(quorum);
-    let trusted = dvc_iter(quorum).filter(|dvc| !dvc.log_untrusted).count();
+    let trusted = dvc_iter(quorum).filter(|dvc| !dvc.untrusted_log).count();
     if trusted >= quorums.view_change {
         let trusted_quorums = MergeQuorums {
             absence_nacks: true,
@@ -440,12 +441,17 @@ pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> Merg
             merge_dvc_quorum(quorum, trusted_quorums)
         } else {
             let mut trusted_only = dvc_quorum_array_empty();
-            for dvc in dvc_iter(quorum).filter(|dvc| !dvc.log_untrusted) {
+            for dvc in dvc_iter(quorum).filter(|dvc| !dvc.untrusted_log) {
                 dvc_record(&mut trusted_only, dvc.clone());
             }
             merge_dvc_quorum(&trusted_only, trusted_quorums)
         };
-        if matches!(outcome, MergeOutcome::Ready(_)) || received < quorums.replica_count {
+        // With every sender trusted the all-n merge differs only by dropping
+        // absence nacks, which would turn a detected deadlock into a guess.
+        if matches!(outcome, MergeOutcome::Ready(_))
+            || received < quorums.replica_count
+            || trusted == received
+        {
             return outcome;
         }
     } else if received < quorums.replica_count {
@@ -664,7 +670,7 @@ mod tests {
             op,
             commit,
             suffix,
-            log_untrusted: false,
+            untrusted_log: false,
         }
     }
 
@@ -1132,7 +1138,7 @@ mod tests {
 
     fn untrusted(dvc: StoredDvc) -> StoredDvc {
         StoredDvc {
-            log_untrusted: true,
+            untrusted_log: true,
             ..dvc
         }
     }
@@ -1253,6 +1259,67 @@ mod tests {
             panic!("the untrusted sender serves op 9");
         };
         assert_eq!(merged.op_head, 9);
+    }
+
+    #[test]
+    fn given_every_sender_trusted_when_the_merge_deadlocks_should_stay_deadlocked() {
+        // Two absent heads nack op 6, which replica 0 proves committed: a lie or
+        // a wrong bitset. Retrying without absence nacks would adopt the op and
+        // hide the contradiction, and no untrusted sender justifies that retry.
+        let mut quorum = dvc_quorum_array_empty();
+        dvc_record(
+            &mut quorum,
+            dvc(0, 1, 6, 6, suffix_all_present(suffix_headers(6, 6, 1))),
+        );
+        dvc_record(
+            &mut quorum,
+            dvc(1, 1, 4, 4, suffix_all_present(suffix_headers(4, 4, 1))),
+        );
+        dvc_record(
+            &mut quorum,
+            dvc(2, 1, 4, 4, suffix_all_present(suffix_headers(4, 4, 1))),
+        );
+        let without_absence_nacks = MergeQuorums {
+            view_change: 3,
+            absence_nacks: false,
+            ..quorums_r3()
+        };
+        assert!(
+            matches!(
+                merge_dvc_quorum(&quorum, without_absence_nacks),
+                MergeOutcome::Ready(_)
+            ),
+            "the all-replica rule must decide differently for this case to pin anything"
+        );
+
+        assert_eq!(
+            merge_view_change(&quorum, quorums_r3()),
+            MergeOutcome::Deadlocked { undecided_op: 6 }
+        );
+    }
+
+    #[test]
+    fn given_a_seated_empty_vote_when_the_same_replica_sends_its_log_should_replace_it() {
+        let mut quorum = dvc_quorum_array_empty();
+        assert!(dvc_record(&mut quorum, empty_vote(2)));
+        assert!(!dvc_record(&mut quorum, empty_vote(2)));
+
+        let real = untrusted(dvc(2, 1, 9, 4, suffix_all_present(suffix_headers(4, 9, 1))));
+        assert!(
+            dvc_record(&mut quorum, real),
+            "the replica's log was hidden behind its empty vote"
+        );
+        let seated = quorum[2].as_ref().expect("replica 2 reported");
+        assert_eq!(seated.op, 9);
+
+        assert!(!dvc_record(&mut quorum, empty_vote(2)));
+        assert!(!dvc_record(
+            &mut quorum,
+            dvc(2, 1, 5, 4, suffix_all_present(suffix_headers(4, 5, 1)))
+        ));
+        let seated = quorum[2].as_ref().expect("replica 2 reported");
+        assert_eq!(seated.op, 9, "a seated log was replaced");
+        assert_eq!(dvc_count(&quorum), 1);
     }
 
     #[test]

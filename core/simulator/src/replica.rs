@@ -20,7 +20,9 @@ use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerConfig;
-use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
+use consensus::{
+    ClientTable, ConsensusClock, JoinMode, LocalPipeline, Sequencer, VsrConsensus, VsrState,
+};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use journal::Journal;
@@ -275,10 +277,11 @@ pub fn new_shard(
         // backup.
         let restored_head = restored_op.unwrap_or(0);
         if !solo && (restored_head > 0 || recovered_state.is_some() || has_checkpoint) {
-            consensus.init_as_backup();
-            consensus.begin_view_probe();
+            consensus.join(JoinMode::ProbeAsBackup {
+                await_state_transfer: true,
+            });
         } else {
-            consensus.init();
+            consensus.join(JoinMode::Init);
         }
         if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
             let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);

@@ -629,7 +629,8 @@ impl ShardMetrics {
 
     /// Republished by every partition sweep: how many of this shard's
     /// partitions elected on a log that may lack acknowledged ops and are
-    /// waiting for every replica to report before they serve again.
+    /// waiting for a trusted quorum or every replica to report before they
+    /// serve again.
     pub fn set_partitions_untrusted_log(&self, count: usize) {
         self.partitions_untrusted_log
             .set(i64::try_from(count).unwrap_or(i64::MAX));
@@ -929,7 +930,7 @@ impl ShardMetrics {
         registry.register(
             "partitions_untrusted_log",
             "partitions electing on a log that may lack acknowledged ops; a view starts only \
-             from a quorum of trusted logs or with every replica reporting",
+             once a trusted quorum or every replica reports",
             self.partitions_untrusted_log.clone(),
         );
         registry.register(

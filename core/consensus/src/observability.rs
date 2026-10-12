@@ -318,6 +318,10 @@ pub struct ControlActionLogEvent {
     pub target_replica: Option<u8>,
     pub op: Option<u64>,
     pub commit: Option<u64>,
+    /// The flag a `DoViewChange` carries, which for an empty vote differs from
+    /// [`ReplicaLogContext::untrusted_log`]: a barred replica never elected, yet
+    /// its vote is untrusted.
+    pub untrusted_log: Option<bool>,
 }
 
 impl ControlActionLogEvent {
@@ -330,6 +334,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::SendStartViewChange { .. } => Self {
                 replica,
@@ -337,15 +342,21 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::SendDoViewChange {
-                target, op, commit, ..
+                target,
+                op,
+                commit,
+                untrusted_log,
+                ..
             } => Self {
                 replica,
                 action: ControlActionKind::SendDoViewChange,
                 target_replica: Some(target),
                 op: Some(op),
                 commit: Some(commit),
+                untrusted_log: Some(untrusted_log),
             },
             VsrAction::SendStartView { op, commit, .. } => Self {
                 replica,
@@ -353,6 +364,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: Some(op),
                 commit: Some(commit),
+                untrusted_log: None,
             },
             VsrAction::SendPrepareOk {
                 target, from_op, ..
@@ -362,6 +374,7 @@ impl ControlActionLogEvent {
                 target_replica: Some(target),
                 op: Some(from_op),
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::RetransmitPrepares { .. } => Self {
                 replica,
@@ -369,6 +382,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::RebuildPipeline { from_op, to_op, .. } => Self {
                 replica,
@@ -376,6 +390,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: Some(from_op),
                 commit: Some(to_op),
+                untrusted_log: None,
             },
             VsrAction::CommitJournal => Self {
                 replica,
@@ -383,6 +398,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::SendCommit { commit, .. } => Self {
                 replica,
@@ -390,6 +406,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: Some(commit),
+                untrusted_log: None,
             },
         }
     }
@@ -982,6 +999,7 @@ impl StructuredSimEvent for ControlActionLogEvent {
             target_replica = self.target_replica.unwrap_or_default(),
             op = self.op.unwrap_or_default(),
             action_commit = self.commit.unwrap_or_default(),
+            action_untrusted_log = self.untrusted_log.unwrap_or_default(),
         );
     }
 }
