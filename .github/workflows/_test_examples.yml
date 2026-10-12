@@ -59,7 +59,7 @@ jobs:
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Setup uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
