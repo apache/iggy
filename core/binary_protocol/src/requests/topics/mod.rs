@@ -20,7 +20,6 @@ pub mod create_topic_with_assignments;
 pub mod delete_topic;
 pub mod get_topic;
 pub mod get_topics;
-pub mod purge_topic;
 pub mod update_topic;
 
 pub use create_topic::CreateTopicRequest;
@@ -28,5 +27,4 @@ pub use create_topic_with_assignments::CreateTopicWithAssignmentsRequest;
 pub use delete_topic::DeleteTopicRequest;
 pub use get_topic::GetTopicRequest;
 pub use get_topics::GetTopicsRequest;
-pub use purge_topic::PurgeTopicRequest;
 pub use update_topic::UpdateTopicRequest;

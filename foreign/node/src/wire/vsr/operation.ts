@@ -35,14 +35,13 @@ export const Operation = {
   CompleteConsumerGroupRevocation: 67,
   TruncatePartition: 68,
   FinalizeSession: 70,
+  CompleteLifecycle: 71,
   CreateStream: 128,
   UpdateStream: 129,
   DeleteStream: 130,
-  PurgeStream: 131,
   CreateTopic: 132,
   UpdateTopic: 133,
   DeleteTopic: 134,
-  PurgeTopic: 135,
   CreatePartitions: 136,
   DeletePartitions: 137,
   DeleteSegments: 138,
@@ -60,7 +59,10 @@ export const Operation = {
   SendMessages: 160,
   StoreConsumerOffset: 161,
   DeleteConsumerOffset: 162,
-  RetireSession: 166
+  RetireSession: 166,
+  InstallConsumerGroupOwner: 167,
+  TransitionPartitionHistory: 168,
+  RetireConsumerGroupOwners: 169
 } as const;
 
 const INTERNAL_START = 64;
@@ -85,11 +87,9 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.CreateStream, Operation.CreateStream],
   [COMMAND_CODE.DeleteStream, Operation.DeleteStream],
   [COMMAND_CODE.UpdateStream, Operation.UpdateStream],
-  [COMMAND_CODE.PurgeStream, Operation.PurgeStream],
   [COMMAND_CODE.CreateTopic, Operation.CreateTopic],
   [COMMAND_CODE.DeleteTopic, Operation.DeleteTopic],
   [COMMAND_CODE.UpdateTopic, Operation.UpdateTopic],
-  [COMMAND_CODE.PurgeTopic, Operation.PurgeTopic],
   [COMMAND_CODE.CreatePartitions, Operation.CreatePartitions],
   [COMMAND_CODE.DeletePartitions, Operation.DeletePartitions],
   [COMMAND_CODE.DeleteSegments, Operation.DeleteSegments],
@@ -113,7 +113,10 @@ export const isKnownOperation = (operation: number): boolean =>
 /** Replica-only operations, never client-sent. */
 export const isInternal = (operation: number): boolean =>
   (operation >= INTERNAL_START && operation < METADATA_START) ||
-    operation === Operation.RetireSession;
+    operation === Operation.RetireSession ||
+    operation === Operation.InstallConsumerGroupOwner ||
+    operation === Operation.TransitionPartitionHistory ||
+    operation === Operation.RetireConsumerGroupOwners;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:

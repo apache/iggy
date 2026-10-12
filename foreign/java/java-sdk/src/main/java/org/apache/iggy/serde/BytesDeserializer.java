@@ -43,6 +43,7 @@ import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.SendConfirmation;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.Partition;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.stream.StreamBase;
@@ -132,6 +133,11 @@ public final class BytesDeserializer {
         return new TopicDetails(topic, partitions);
     }
 
+    public static PartitionContext readPartitionContext(ByteBuf response) {
+        return new PartitionContext(
+                readU64AsBigInteger(response), readU64AsBigInteger(response), readU64AsBigInteger(response));
+    }
+
     public static Partition readPartition(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
@@ -139,7 +145,14 @@ public final class BytesDeserializer {
         var currentOffset = readU64AsBigInteger(response);
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
-        return new Partition(partitionId, createdAt, segmentsCount, currentOffset, size.toString(), messagesCount);
+        return new Partition(
+                partitionId,
+                createdAt,
+                segmentsCount,
+                currentOffset,
+                size.toString(),
+                messagesCount,
+                readPartitionContext(response));
     }
 
     public static Topic readTopic(ByteBuf response) {
@@ -249,11 +262,15 @@ public final class BytesDeserializer {
         var partitionId = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
         var messagesCount = response.readUnsignedIntLE();
+        var context = readPartitionContext(response);
         var messages = new ArrayList<Message>();
         while (response.isReadable()) {
             readBatchRecord(response, messages);
         }
-        return new PolledMessages(partitionId, currentOffset, messagesCount, messages);
+        if (messages.size() != messagesCount) {
+            throw new IggyMalformedResponseException("Poll count does not match its messages");
+        }
+        return new PolledMessages(partitionId, currentOffset, messagesCount, messages, context);
     }
 
     /**

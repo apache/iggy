@@ -112,15 +112,6 @@ impl IggyService {
         request(self.client.delete_stream(&id(&stream_id)?).await)
     }
 
-    #[tool(description = "Purge stream")]
-    pub async fn purge_stream(
-        &self,
-        Parameters(PurgeStream { stream_id }): Parameters<PurgeStream>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_delete()?;
-        request(self.client.purge_stream(&id(&stream_id)?).await)
-    }
-
     #[tool(description = "Get topics")]
     pub async fn get_topics(
         &self,
@@ -233,22 +224,6 @@ impl IggyService {
         request(
             self.client
                 .delete_topic(&id(&stream_id)?, &id(&topic_id)?)
-                .await,
-        )
-    }
-
-    #[tool(description = "Purge topic")]
-    pub async fn purge_topic(
-        &self,
-        Parameters(PurgeTopic {
-            stream_id,
-            topic_id,
-        }): Parameters<PurgeTopic>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_delete()?;
-        request(
-            self.client
-                .purge_topic(&id(&stream_id)?, &id(&topic_id)?)
                 .await,
         )
     }

@@ -189,21 +189,30 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
     );
 }
 
-#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    consumer_group.rebalancing_timeout = "1s",
+))]
 async fn given_different_metadata_and_partition_primaries_when_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
     assert_group_auto_commit_routing(harness, TransportProtocol::Tcp).await;
 }
 
-#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    consumer_group.rebalancing_timeout = "1s",
+))]
 async fn given_different_metadata_and_partition_primaries_when_quic_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
     assert_group_auto_commit_routing(harness, TransportProtocol::Quic).await;
 }
 
-#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    consumer_group.rebalancing_timeout = "1s",
+))]
 async fn given_different_metadata_and_partition_primaries_when_websocket_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
@@ -325,6 +334,15 @@ async fn assert_group_offset_routing(
         .join_consumer_group(&stream, &topic, &group)
         .await
         .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        member,
+        &stream,
+        &topic,
+        &group,
+        1,
+        PRECONDITION_BUDGET,
+    )
+    .await;
     let before = member.get_me().await.unwrap();
     for offset in 0..GROUP_PAYLOADS.len() as u64 {
         timeout(
@@ -566,6 +584,15 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
         .join_consumer_group(&stream, &topic, &group)
         .await
         .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        &member,
+        &stream,
+        &topic,
+        &group,
+        1,
+        PRECONDITION_BUDGET,
+    )
+    .await;
     let membership = member
         .get_consumer_group(&stream, &topic, &group)
         .await
@@ -868,7 +895,7 @@ async fn assert_data_session_fences(
     data.bind_vsr_session(binding.identity.session)
         .await
         .unwrap();
-    data.send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+    data.send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
         .await
         .unwrap();
 
@@ -898,7 +925,7 @@ async fn assert_data_session_fences(
     .await
     .expect("the data node must observe the member leaving");
     let response = data
-        .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
         .await
         .unwrap();
     let polled = PolledMessages::from_bytes(response).unwrap();
@@ -918,8 +945,12 @@ async fn assert_data_session_fences(
     .to_bytes();
     assert!(
         matches!(
-            data.send_raw_with_response(STORE_CONSUMER_OFFSET_CODE, offset_write.clone())
-                .await,
+            data.send_raw_with_context(
+                STORE_CONSUMER_OFFSET_CODE,
+                offset_write.clone(),
+                route.context
+            )
+            .await,
             Err(IggyError::ConsumerGroupPartitionNotOwned(..))
         ),
         "a departed member must not commit through its attachment"
@@ -929,23 +960,35 @@ async fn assert_data_session_fences(
         .join_consumer_group(stream, topic, &consumer.id)
         .await
         .unwrap();
-    member
-        .poll_messages(
-            stream,
-            topic,
-            None,
-            consumer,
-            &PollingStrategy::next(),
-            1,
-            true,
-        )
-        .await
-        .unwrap();
-    let response = member
-        .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
-        .await
-        .unwrap();
-    let route = PollRoutingResponse::decode_from(&response).unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        member,
+        stream,
+        topic,
+        &consumer.id,
+        1,
+        PRECONDITION_BUDGET,
+    )
+    .await;
+    // The rejoining session can still appear as the draining old owner.
+    let replacement_route = timeout(PRECONDITION_BUDGET, async {
+        loop {
+            match member
+                .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+                .await
+            {
+                Ok(response) => break PollRoutingResponse::decode_from(&response).unwrap(),
+                Err(
+                    IggyError::ConsumerGroupPartitionNotOwned(..) | IggyError::TransientNotAccepted,
+                ) => {}
+                Err(error) => panic!("route discovery failed after rejoining: {error:?}"),
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("rejoining must install a pollable owner within the routing budget");
+    assert!(replacement_route.context.owner_generation > route.context.owner_generation);
+    let route = replacement_route;
     binding.identity = route.consumer_session;
     data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
         .await
@@ -954,7 +997,7 @@ async fn assert_data_session_fences(
     timeout(PRECONDITION_BUDGET, async {
         loop {
             let result = data
-                .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+                .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
                 .await;
             if matches!(result, Err(IggyError::Unauthenticated)) {
                 break;

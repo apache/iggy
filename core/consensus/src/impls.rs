@@ -27,16 +27,16 @@ use crate::{
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestStartViewHeader, RoutedRequestHeader, StartViewChangeHeader,
-    StartViewHeader, frame_body,
+    Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, Operation, PrepareHeader,
+    PrepareOkHeader, ReplyHeader, RequestStartViewHeader, RoutedRequestHeader,
+    StartViewChangeHeader, StartViewHeader, frame_body,
 };
 use iggy_common::IggyTimestamp;
 use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::poll::{AutoCommitReservation, PollHistoryId};
+use server_common::poll::AutoCommitReservation;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
@@ -308,11 +308,9 @@ impl PipelineEntry {
     }
 }
 
-/// Identity and capacity held by a pending automatic commit.
+/// Capacity held by a pending automatic commit.
 #[derive(Debug)]
 pub struct AutoCommitRequestContext {
-    /// History accepted with the poll, which must still match at promotion.
-    pub history: PollHistoryId,
     /// Keeps this request's consumer key occupied through promotion and staging.
     pub reservation: AutoCommitReservation,
 }
@@ -323,9 +321,6 @@ pub struct RequestEntry {
     pub local_order: Option<LocalRequestOrder>,
     /// Automatic commit context owned by this entry until promotion or removal.
     auto_commit: Option<AutoCommitRequestContext>,
-    /// Offset writes must not cross a reset of the owner's message history.
-    /// Explicit stores keep their overwrite and client-dedup behavior.
-    consumer_offset_history: Option<PollHistoryId>,
     pub message: Message<RoutedRequestHeader>,
     /// When the request was parked, in microseconds from the consensus-injected
     /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
@@ -373,22 +368,6 @@ impl RequestEntry {
         self.auto_commit.as_ref()
     }
 
-    /// Bind an explicit offset mutation to the history at owner admission.
-    /// `None` leaves other request kinds without an explicit-offset binding.
-    #[must_use]
-    pub const fn with_consumer_offset_history(mut self, history: Option<PollHistoryId>) -> Self {
-        self.consumer_offset_history = history;
-        self
-    }
-
-    /// History captured when an explicit offset mutation queues on its owner.
-    /// A mismatch at promotion rejects the mutation before it can affect replacement progress.
-    /// `None` means this entry has no explicit-offset history binding.
-    #[must_use]
-    pub const fn consumer_offset_history(&self) -> Option<PollHistoryId> {
-        self.consumer_offset_history
-    }
-
     /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
@@ -418,7 +397,6 @@ impl RequestEntry {
     ) -> Self {
         Self {
             auto_commit: None,
-            consumer_offset_history: None,
             local_order: None,
             message,
             received_at: 0,
@@ -1009,10 +987,6 @@ impl Pipeline for LocalPipeline {
 
     fn pop_request(&mut self) -> Option<Self::Request> {
         Self::pop_request(self)
-    }
-
-    fn request_head(&self) -> Option<&Self::Request> {
-        Self::request_head(self)
     }
 
     fn request_queue_len(&self) -> usize {
@@ -4376,6 +4350,34 @@ where
     type Consensus = VsrConsensus<B, P>;
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
+        let message = if matches!(
+            self.header().operation,
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+        ) {
+            let header = *self.header();
+            let payload_end = header.size as usize;
+            let total_size = payload_end
+                + iggy_binary_protocol::requests::consumer_offsets::PREPARED_OWNER_GENERATION_SIZE;
+            let mut prepared = if message_bus::is_auto_commit_client(header.client)
+                && self.as_slice().len() == total_size
+            {
+                self
+            } else {
+                let mut prepared = Self::new(total_size);
+                prepared.as_mut_slice()[size_of::<RoutedRequestHeader>()..payload_end]
+                    .copy_from_slice(self.body());
+                prepared
+            };
+            prepared.as_mut_slice()[payload_end..total_size]
+                .copy_from_slice(&header.owner_generation.to_le_bytes());
+            prepared.transmute_header(|_, expanded: &mut RoutedRequestHeader| {
+                *expanded = header;
+                expanded.size =
+                    u32::try_from(total_size).expect("admitted offset prepare fits u32");
+            })
+        } else {
+            self
+        };
         let op = consensus.sequencer.current_sequence() + 1;
         // Primary stamps the injected clock once at prepare-build (wall time
         // in production, virtual under the simulator); the value is
@@ -4394,13 +4396,13 @@ where
         // chain are sealed too, for both planes, by `seal_prepare_checksum` below;
         // they exclude `view`, which is what lets a restamp leave them valid.
         //
-        // Metadata plane only. A partition produce prepare already carries a verified
+        // A partition produce prepare already carries a verified
         // `batch_checksum` over the same bytes, so a second full-payload pass is pure
         // cost on the produce path, and it would describe the WRONG bytes:
         // `stamp_prepare_for_persistence` rewrites the command header INSIDE this
         // sealed region before the entry is journaled. Leaving those prepares at `0`
-        // is the designed "nothing to verify" sentinel: partition prepares
-        // leave message-body integrity to the batch checksums.
+        // is the designed "nothing to verify" sentinel for produce. Offset and
+        // control bodies include their fencing identities in this checksum.
         //
         // TODO(consensus): a partition prepare's `checksum` covers its header alone,
         // so two at one op with matching header fields are indistinguishable however
@@ -4420,16 +4422,16 @@ where
         //
         // Bounded by `size`, the range every verifier re-reads; the prepare
         // inherits it verbatim below.
-        let checksum_body = if consensus.group == METADATA_GROUP {
-            u128::from(calculate_checksum(frame_body(
-                self.as_slice(),
-                self.header().size,
-            )))
-        } else {
+        let checksum_body = if message.header().operation == Operation::SendMessages {
             0
+        } else {
+            u128::from(calculate_checksum(frame_body(
+                message.as_slice(),
+                message.header().size,
+            )))
         };
 
-        let prepared = self.transmute_header(|old, new| {
+        let prepared = message.transmute_header(|old, new| {
             *new = PrepareHeader {
                 cluster: consensus.cluster,
                 size: old.size,
@@ -4457,6 +4459,7 @@ where
                 // ops (and the authenticated user on Register), so the in-apply
                 // RBAC gate resolves the same identity on every backup.
                 user_id: old.user_id,
+                partition_incarnation: old.partition_incarnation,
                 ..Default::default()
             }
         });
@@ -4710,14 +4713,12 @@ mod request_queue_tests {
             reclaim_epoch,
             Rc::clone(&active_keys),
         ));
-        let history = PollHistoryId::default();
         let mut pipeline = LocalPipeline::new();
 
         // Each queued request holds its own guard for the same consumer key.
         // The queue stores these messages without interpreting their payloads.
         for request_number in 1..=2 {
             let context = AutoCommitRequestContext {
-                history,
                 reservation: token.acquire(),
             };
             pipeline
@@ -4735,7 +4736,6 @@ mod request_queue_tests {
             .take_auto_commit()
             .expect("context follows first request");
         assert_eq!(first_request.message.header().request, 1);
-        assert_eq!(first_context.history, history);
         drop(first_context);
         assert_eq!(token.active_count(), 1);
         assert_eq!(
@@ -5208,15 +5208,15 @@ mod timestamp_clamp_tests {
     }
 
     #[test]
-    fn given_partition_namespace_when_projecting_should_leave_the_body_unsealed() {
-        // The body seal is metadata-only. A partition produce prepare already carries a
+    fn given_partition_operation_when_projecting_should_seal_controls_but_not_batches() {
+        // A partition produce prepare already carries a
         // verified `batch_checksum` over the same bytes, so a second full-payload hash
         // is pure cost on the produce path, and it would describe bytes that never reach
         // the journal: `stamp_prepare_for_persistence` rewrites the command header
         // inside the sealed region. `0` is the designed "nothing to verify" sentinel, so
         // a durable partition journal skips verification rather than reading every entry
         // as corrupt.
-        let seal = |namespace: u64| -> u128 {
+        let seal = |namespace: u64, operation: Operation| -> u128 {
             // Fixed clock: `project` stamps the prepare timestamp, and Miri covers this
             // crate, where a real clock read is an unsupported syscall.
             let consensus = VsrConsensus::with_clock(
@@ -5239,18 +5239,20 @@ mod timestamp_clamp_tests {
             header.command = Command::Request;
             header.client = 1;
             header.request = 1;
-            header.operation = iggy_binary_protocol::Operation::SendMessages;
+            header.operation = operation;
             header.size = u32::try_from(header_size + body.len()).expect("fits u32");
             msg.project(&consensus).header().checksum_body
         };
 
         assert_ne!(
-            seal(METADATA_GROUP),
+            seal(METADATA_GROUP, Operation::CreateStream),
             0,
             "a metadata prepare must be sealed: the WAL scan verifies it after a crash"
         );
+        assert_ne!(seal(1, Operation::InstallConsumerGroupOwner), 0);
+        assert_ne!(seal(1, Operation::TransitionPartitionHistory), 0);
         assert_eq!(
-            seal(1),
+            seal(1, Operation::SendMessages),
             0,
             "a partition prepare must be left unsealed, since its sealed region is \
              rewritten before it is journaled"

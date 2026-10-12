@@ -27,11 +27,9 @@ async fn main() -> Result<(), IggyError> {
 
     // The builder simplifies the IggyProducer configuration.
     let config = IggyProducerConfig::builder()
-        // Set the stream identifier and name.
-        .stream_id(Identifier::from_str_value(stream)?)
+        // Set the stream name. The producer binds to the stream by this name.
         .stream_name(stream)
-        // Set the topic identifier and name
-        .topic_id(Identifier::from_str_value(topic)?)
+        // Set the topic name. The producer binds to the topic by this name.
         .topic_name(topic)
         // Sets the number of partitions to create for the topic.
         // The more clients are reading concurrently, the more partitions you should create.

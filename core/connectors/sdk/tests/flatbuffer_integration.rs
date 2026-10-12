@@ -78,10 +78,22 @@ async fn should_transform_with_real_schema_and_field_mapping() {
                     bytes.len() >= 4,
                     "FlatBuffer should have minimum header size"
                 );
+
+                // "id"/"name" are substrings of "user_id"/"full_name", so absence of the old keys is the reliable signal, not presence of the new ones.
+                assert!(!contains_bytes(&bytes, b"user_id"));
+                assert!(!contains_bytes(&bytes, b"full_name"));
+                assert!(contains_bytes(&bytes, b"email"));
+                assert!(contains_bytes(&bytes, b"Jane Smith"));
             }
             other => panic!("Expected FlatBuffer payload, got: {other:?}"),
         }
     }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 #[tokio::test]
@@ -225,6 +237,10 @@ async fn should_transform_json_to_flatbuffer_with_field_mappings() {
             Payload::FlatBuffer(bytes) => {
                 println!("Transformed FlatBuffer: {} bytes", bytes.len());
                 assert!(!bytes.is_empty(), "FlatBuffer should not be empty");
+                assert!(!contains_bytes(&bytes, b"user_id"));
+                assert!(!contains_bytes(&bytes, b"full_name"));
+                assert!(contains_bytes(&bytes, b"email"));
+                assert!(contains_bytes(&bytes, b"Jane Smith"));
             }
             other => panic!("Expected FlatBuffer payload, got: {other:?}"),
         }

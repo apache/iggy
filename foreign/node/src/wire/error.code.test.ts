@@ -23,11 +23,23 @@ it('translates the partitions capacity error', () => {
   assert.equal(translateErrorCode(2022), 'Partitions limit reached, raise [metadata] partitions_max');
 });
 
+it('translates the fixed-topic resize error', () => {
+  assert.equal(translateErrorCode(2023), 'Partition resizing is disabled for this fixed topic');
+});
+
 it('reports an unknown outcome for an aged-out request', () => {
   assert.equal(
     translateErrorCode(85),
     'Request is below the deduplication window; outcome unknown, resending may duplicate the write'
   );
+});
+
+it('translates the partition history refusal', () => {
+  assert.equal(translateErrorCode(87), 'The partition history is no longer available; this request cannot execute again');
+});
+
+it('translates the lifecycle refusal', () => {
+  assert.equal(translateErrorCode(88), 'A committed lifecycle operation prevents this mutation. Retry as a new request.');
 });
 
 it('translates the consumer-offset capacity error', () => {
@@ -70,5 +82,6 @@ it('translates the consumer-group error range', () => {
     translateErrorCode(5009),
     'Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress).'
   );
-  assert.equal(translateErrorCode(5010), 'error');
+  assert.equal(translateErrorCode(5010), 'Too many consumer groups');
+  assert.equal(translateErrorCode(5011), 'error');
 });

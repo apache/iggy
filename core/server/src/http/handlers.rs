@@ -49,13 +49,12 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
-    PurgeStreamRequest, UpdateStreamRequest,
+    UpdateStreamRequest,
 };
 use iggy_binary_protocol::requests::system::DescribeOptionsRequest;
 use iggy_binary_protocol::requests::system::GetStatsRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, PurgeTopicRequest,
-    UpdateTopicRequest,
+    CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
@@ -119,7 +118,9 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
-use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::partition::{
+    fence_poll_context, resolve_consumer_offset_request, resolve_poll_request,
+};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
@@ -902,27 +903,6 @@ pub(in crate::http) async fn delete_stream(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /streams/{stream_id}/purge`: drop a stream's messages. Returns 204.
-pub(in crate::http) async fn purge_stream(
-    State(state): State<HttpState>,
-    identity: Authenticated,
-    Path(stream_id): Path<String>,
-) -> Result<StatusCode, WriteError> {
-    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    let request = PurgeStreamRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-    };
-    let body = request.to_bytes();
-    SendWrapper::new(submit_write(
-        &state,
-        &identity.session,
-        Operation::PurgeStream,
-        body,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// `POST /streams/{stream_id}/topics`: create a topic under a stream and render
 /// the committed reply as the same `TopicDetails` JSON the legacy server returns.
 ///
@@ -1114,30 +1094,6 @@ pub(in crate::http) async fn delete_topic(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /streams/{stream_id}/topics/{topic_id}/purge`: drop a topic's
-/// messages. Returns 204.
-pub(in crate::http) async fn purge_topic(
-    State(state): State<HttpState>,
-    identity: Authenticated,
-    Path((stream_id, topic_id)): Path<(String, String)>,
-) -> Result<StatusCode, WriteError> {
-    let stream_id = Identifier::from_str_value(&stream_id).map_err(WriteError::Rejected)?;
-    let topic_id = Identifier::from_str_value(&topic_id).map_err(WriteError::Rejected)?;
-    let request = PurgeTopicRequest {
-        stream_id: identifier_to_wire(&stream_id).map_err(WriteError::Rejected)?,
-        topic_id: identifier_to_wire(&topic_id).map_err(WriteError::Rejected)?,
-    };
-    let body = request.to_bytes();
-    SendWrapper::new(submit_write(
-        &state,
-        &identity.session,
-        Operation::PurgeTopic,
-        body,
-    ))
-    .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 /// `POST /streams/{stream_id}/topics/{topic_id}/partitions`: add partitions to a
 /// topic. Returns 200 (this listener answers create routes 200, the
 /// legacy-majority parity). `partitions_count` comes from the JSON body; stream
@@ -1293,20 +1249,39 @@ pub(in crate::http) async fn poll_messages(
             // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
-    let reply = SendWrapper::new(
-        state
-            .shard
-            .partition_read(namespace, PartitionRead::Poll { consumer, args }),
-    )
+    let metadata = state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, None, HTTP_READ_CLIENT_ID)
+        .ok_or(ReadError::Rejected(IggyError::TransientNotAccepted))?;
+    let context = metadata.context(state.shard.plane.metadata().applied_frontier().get());
+    if let Some(requested) = query.strategy.context {
+        // TCP parity: a group poll already got the re-sync sentinel at resolve
+        // above, so this poll has no group and names group 0, as TCP does.
+        fence_poll_context(requested, context, 0, partition_id).map_err(ReadError::Rejected)?;
+    }
+    let reply = SendWrapper::new(state.shard.partition_read(
+        namespace,
+        PartitionRead::Poll {
+            consumer,
+            args,
+            metadata: Some(metadata),
+        },
+    ))
     .await;
     match reply {
         Some(PartitionReadReply::Poll {
+            context,
             fragments,
             current_offset,
         }) => {
             let body = build_polled_messages_body(
                 partition_id,
                 current_offset,
+                context,
                 fragments,
                 state.shard.plane.partitions().config().encryptor.as_deref(),
             )
@@ -1391,6 +1366,12 @@ fn consumer_offset_reply(
 /// legacy server accepts (partitioning + base64 messages); stream and topic
 /// come from the path.
 ///
+/// An optional `context` (the shape of the offset store's) fences the batch
+/// to the partition incarnation the caller saw, so a resend after a delete
+/// and recreate is refused with `HistoryUnavailable` instead of appending to
+/// the new partition. Without one, the batch is fenced with the context
+/// current when the write is captured.
+///
 /// The batch rides partition consensus under a server-generated request ID.
 /// Each caller POST is a new mutation; repeated POSTs do not automatically
 /// deduplicate. Awaited writes on one token queue behind the session's data
@@ -1441,6 +1422,7 @@ pub(in crate::http) async fn send_messages(
                 &identity.session,
                 Operation::SendMessages,
                 &body,
+                command.context,
             ))
             .await?;
             let policy = policy.map_or(iggy_common::Durability::Replicated, |policy| {
@@ -1455,7 +1437,13 @@ pub(in crate::http) async fn send_messages(
             Ok((StatusCode::CREATED, durability, Json(confirmations)).into_response())
         }
         ProduceAck::None => {
-            SendWrapper::new(produce_unacked(&state, &identity.session, body)).await?;
+            SendWrapper::new(produce_unacked(
+                &state,
+                &identity.session,
+                body,
+                command.context,
+            ))
+            .await?;
             Ok((
                 StatusCode::ACCEPTED,
                 [(DURABILITY_HEADER, HeaderValue::from_static(DURABILITY_NONE))],
@@ -1503,6 +1491,7 @@ pub(in crate::http) async fn store_consumer_offset(
         &identity.session,
         Operation::StoreConsumerOffset,
         &body,
+        command.context,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1546,6 +1535,7 @@ pub(in crate::http) async fn delete_consumer_offset(
         &identity.session,
         Operation::DeleteConsumerOffset,
         &body,
+        None,
     ))
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1877,9 +1867,72 @@ fn issue_identity(inner: &HttpInner, user_id: u32) -> Result<Json<IdentityInfo>,
 mod tests {
     use super::*;
 
+    use axum::body::to_bytes;
+    use iggy_binary_protocol::primitives::partition_history::PartitionContext;
     use iggy_binary_protocol::responses::messages::{
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
+    use serde_json::Value;
+
+    use crate::http::reply::classify_partition_reply;
+    use crate::http::wire::build_request_message;
+    use crate::reply_frame::build_deny_reply;
+
+    /// The produce extractor keeps the caller's context, so the write is fenced
+    /// with the incarnation the caller saw rather than the current one.
+    #[test]
+    fn given_send_body_with_context_when_extracting_should_keep_the_callers_context() {
+        const CONTEXT: PartitionContext = PartitionContext {
+            incarnation: 7,
+            owner_generation: 0,
+            metadata_op: 11,
+        };
+        let body = br#"{"partitioning":{"kind":"partition_id","value":"AgAAAA=="},"messages":[{"payload":"aGk="}],"context":{"incarnation":7,"owner_generation":0,"metadata_op":11}}"#;
+
+        let Json(command) =
+            Json::<SendMessages>::from_bytes(body).expect("a send body may carry a context");
+
+        assert_eq!(command.context, Some(CONTEXT));
+    }
+
+    /// A body without a context leaves the context to the write path, which
+    /// captures the current one, as every HTTP send did before the field.
+    #[test]
+    fn given_send_body_without_context_when_extracting_should_leave_the_capture_to_the_server() {
+        let body = br#"{"partitioning":{"kind":"partition_id","value":"AgAAAA=="},"messages":[{"payload":"aGk="}]}"#;
+
+        let Json(command) =
+            Json::<SendMessages>::from_bytes(body).expect("a legacy send body stays valid");
+
+        assert_eq!(command.context, None);
+    }
+
+    /// The partition primary refuses an incarnation that is not its own with a
+    /// header-only `HistoryUnavailable` deny. The SDK refreshes its context
+    /// only on this exact answer: a 400 whose `id` is 87.
+    #[tokio::test]
+    async fn given_stale_incarnation_deny_when_producing_should_answer_history_unavailable() {
+        const ERROR_BODY_LIMIT: usize = 1024;
+        let request = build_request_message(Operation::SendMessages, 42, 7, 1, &[]);
+        let deny = build_deny_reply(
+            request.header(),
+            42,
+            0,
+            9,
+            IggyError::HistoryUnavailable.as_code(),
+        );
+
+        let error = classify_partition_reply(&deny.into_generic().into_frozen())
+            .expect_err("a deny is never a commit");
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), ERROR_BODY_LIMIT)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], IggyError::HistoryUnavailable.as_code());
+    }
 
     /// Pins the produce response contract the SDKs decode: `snake_case` field
     /// names and a numeric `base_offset`.

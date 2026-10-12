@@ -39,7 +39,7 @@ env:
 jobs:
   check-auto-publish:
     name: Check auto-publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: ${{ !github.event.repository.fork }}
     outputs:
       docker_components: ${{ steps.check.outputs.docker_components }}
@@ -186,7 +186,7 @@ jobs:
       needs.check-auto-publish.outputs.crates_to_publish != '' ||
       needs.check-auto-publish.outputs.docker_components != '' ||
       needs.check-auto-publish.outputs.sdks_to_publish != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # Trusted publishers validate the top-level workflow identity. Dispatching
       # publish.yml keeps automatic and manual releases on the same identity.
