@@ -33,7 +33,7 @@ set -euo pipefail
 BASE="${1:-}"
 HEAD="${2:-}"
 ZERO="0000000000000000000000000000000000000000"
-GATES=(rust java csharp python php node go)
+GATES=(rust java csharp python php node go cpp)
 
 emit_all() {
   local gate
@@ -74,7 +74,8 @@ changed() {
 # iteration's paths.
 for gate in "${GATES[@]}"; do
   case "$gate" in
-    rust) paths=(core gateways Cargo.toml Cargo.lock rust-toolchain.toml .cargo) ;;
+    # .config holds the nextest and Cargo-Rail policy every Rust test run reads.
+    rust) paths=(core gateways Cargo.toml Cargo.lock rust-toolchain.toml .cargo .config) ;;
     java) paths=(foreign/java) ;;
     csharp) paths=(foreign/csharp) ;;
     python) paths=(foreign/python) ;;
@@ -82,6 +83,7 @@ for gate in "${GATES[@]}"; do
     node) paths=(foreign/node) ;;
     # The go job also runs the bdd/go suite with foreign/go in -coverpkg.
     go) paths=(foreign/go bdd/go) ;;
+    cpp) paths=(foreign/cpp) ;;
     *)
       echo "coverage-gate: no pathspecs defined for gate '$gate'" >&2
       exit 1

@@ -95,21 +95,22 @@ pub async fn load_consumer_offsets_with_storage<S: DurableStorage>(
 pub async fn load_consumer_group_offsets(
     path: &str,
 ) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
-    load_consumer_group_offsets_with_storage(&DiskStorage, path).await
+    load_group_offsets_with_storage(&DiskStorage, path, ConsumerKind::ConsumerGroup).await
 }
 
-/// Recover group records with the same cleanup and stranded file handling as
-/// [`load_consumer_offsets_with_storage`].
+/// Recover the records of a kind keyed by consumer group, `ConsumerGroup` or `ExternalGroup`,
+/// with the same cleanup and stranded file handling as [`load_consumer_offsets_with_storage`].
 ///
 /// # Errors
 /// Returns [`IggyError::CannotReadConsumerOffsets`] if the directory cannot be
 /// enumerated, including when it is missing, or if no file descriptor is free
 /// to read a record.
-pub async fn load_consumer_group_offsets_with_storage<S: DurableStorage>(
+pub async fn load_group_offsets_with_storage<S: DurableStorage>(
     storage: &S,
     path: &str,
+    kind: ConsumerKind,
 ) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
-    load_offsets(storage, path, ConsumerKind::ConsumerGroup, |offset| {
+    load_offsets(storage, path, kind, |offset| {
         (ConsumerGroupId(offset.consumer_id as usize), offset)
     })
     .await
@@ -198,6 +199,7 @@ const fn offset_kind_label(kind: ConsumerKind) -> &'static str {
     match kind {
         ConsumerKind::Consumer => "consumer offset",
         ConsumerKind::ConsumerGroup => "consumer group offset",
+        ConsumerKind::ExternalGroup => "external group offset",
     }
 }
 
@@ -364,7 +366,12 @@ mod tests {
             Err(IggyError::CannotReadConsumerOffsets(_))
         ));
         assert!(matches!(
-            load_consumer_group_offsets_with_storage(&NoReadDescriptorStorage, path).await,
+            load_group_offsets_with_storage(
+                &NoReadDescriptorStorage,
+                path,
+                ConsumerKind::ConsumerGroup
+            )
+            .await,
             Err(IggyError::CannotReadConsumerOffsets(_))
         ));
         assert!(
@@ -398,12 +405,12 @@ mod tests {
         assert!(dir.path().join("notes.tmp").exists());
         assert_eq!(consumers.entries.len(), 1);
         assert_eq!(consumers.entries[0].consumer_id, 9);
-        assert!(consumers.stranded_ids.is_empty());
+        assert_eq!(consumers.stranded_ids, [] as [u32; 0]);
         assert!(!dir.path().join("8").exists());
         assert!(!dir.path().join("10").exists());
         let groups = load_consumer_group_offsets(path).await.unwrap();
         assert_eq!(groups.entries.len(), 1);
         assert_eq!(groups.entries[0].0, ConsumerGroupId(9));
-        assert!(groups.stranded_ids.is_empty());
+        assert_eq!(groups.stranded_ids, [] as [u32; 0]);
     }
 }

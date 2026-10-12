@@ -18,7 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{consumer_to_wire, identifier_to_wire};
 use crate::{
-    BinaryClient, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError,
+    BinaryClient, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, ConsumerPosition, Identifier,
+    IggyError,
 };
 use iggy_binary_protocol::AckLevel;
 use iggy_binary_protocol::codec::WireEncode;
@@ -32,6 +33,31 @@ use iggy_binary_protocol::responses::consumer_offsets::get_consumer_offset::Cons
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerOffsetClient for B {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        fail_if_not_authenticated(self).await?;
+        self.send_offset_write_with_response(
+            STORE_CONSUMER_OFFSET_CODE,
+            StoreConsumerOffsetRequest {
+                consumer: consumer_to_wire(consumer)?,
+                stream_id: identifier_to_wire(stream_id)?,
+                topic_id: identifier_to_wire(topic_id)?,
+                partition_id: Some(position.partition_id),
+                offset: position.offset,
+                ack: AckLevel::Quorum,
+            }
+            .to_bytes(),
+            Some(position.context),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -55,6 +81,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
                 ack: AckLevel::Quorum,
             }
             .to_bytes(),
+            None,
         )
         .await?;
         Ok(())
@@ -111,6 +138,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
                 ack: AckLevel::Quorum,
             }
             .to_bytes(),
+            None,
         )
         .await?;
         Ok(())

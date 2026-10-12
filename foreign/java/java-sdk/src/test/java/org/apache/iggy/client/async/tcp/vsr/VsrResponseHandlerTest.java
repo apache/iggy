@@ -174,7 +174,7 @@ class VsrResponseHandlerTest {
     }
 
     @Test
-    void shouldMapEvictionReasonAndResetSession() {
+    void shouldMapEvictionReasonAndRetainSessionUntilBindIsRefused() {
         session.beginRegister();
         session.bind(42);
         CompletableFuture<ByteBuf> future = enqueue(VsrOperation.NON_REPLICATED, 7);
@@ -184,7 +184,7 @@ class VsrResponseHandlerTest {
         channel.writeInbound(frame);
 
         assertThat(rawErrorCode(future)).isEqualTo(42);
-        assertThat(session.isBound()).isFalse();
+        assertThat(session.isBound()).isTrue();
         assertThat(evictions).hasValue(1);
         // The reason reaches the listener, which has to tell an eviction the
         // server decided on from a transport-shaped one.
@@ -199,7 +199,7 @@ class VsrResponseHandlerTest {
 
         channel.writeInbound(frame);
 
-        assertThat(session.isBound()).isFalse();
+        assertThat(session.isBound()).isTrue();
         assertThat(evictions).hasValue(1);
         assertThat(lastEvictionReason).hasValue(VsrHeaders.ERROR_STALE_CLIENT);
         assertThat(frame.refCnt()).isZero();
@@ -288,6 +288,7 @@ class VsrResponseHandlerTest {
         CompletableFuture<ByteBuf> inFlight = new CompletableFuture<>();
         long beforeLoginId = registerEncodedSend(encoder, inFlight);
 
+        session.reset();
         ByteBuf loginPayload = loginUserPayload();
         encoder.encode(channel.alloc(), LOGIN_USER_CODE, loginPayload).release();
         loginPayload.release();

@@ -51,18 +51,39 @@ Codes absent from the SDK command table use `Operation::NonReplicated` and
 carry the command code in the request header's reserved field. The server
 remains authoritative for classifying or rejecting extension commands.
 
-Sends encode `Partitioning.PartitionId`, `Partitioning.Balanced` or
-`Partitioning.MessageKey` in the payload. The server resolves the target
-partition at admission.
+Sends always carry an explicit partition id. The client resolves
+`Partitioning.Balanced` round-robin and `Partitioning.MessageKey` as XXH32
+(seed 0) of the key modulo the topic's partition count, as the Rust SDK does.
+The count is cached per topic. The client reads it again after a refused send,
+and after the client deletes a stream or a topic or creates or deletes
+partitions. A raw `SendMessages` command without an explicit partition id
+fails with error code 5 before the client sends it.
+
+Partition commands carry a partition context: the partition incarnation, the
+owner generation and a metadata operation. To make a poll or an offset write
+fail instead of landing in a recreated partition, pass the `context` of the
+earlier poll reply. Without one, the client takes the context that its cached
+route reports. If another client deletes and recreates the partition, one such
+call can fail with error code 87 (5009 for a consumer group). The client then
+drops the route, and the next call routes again. On a cluster, polls and
+offset writes go to the partition primary with one attempt per route, as in the
+Rust SDK. They return a lifecycle refusal (error code 88) at once. The client
+retries an 88 for any other request as a new request until the request
+deadline. The pause starts at 50 ms and doubles up to 1 s.
 
 VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 
 VSR authentication translates the existing password and personal-access-token
-login APIs into the register handshake required by the consensus protocol. A
-disconnect or eviction invalidates the session, and later work must register a
-new session. Transient not-committed responses retry the exact encoded request
-within one bounded deadline. A disconnected mutation is never replayed under a
-new session.
+login APIs into the register handshake required by the consensus protocol.
+Transport loss clears local authentication but retains the logical session and
+its bind proof. Login with the same credentials first tries to bind that session;
+a confirmed ended session requires a new registration. Logout forgets the local
+session. Transient not-committed responses retry the exact encoded request within
+one bounded deadline. A disconnected mutation is never replayed under a new session.
+
+An established session has its own lifetime. Password or PAT changes and PAT
+expiry do not end it. Logout, session lease expiry, or user deactivation end the
+session and prevent its bind proof from restoring it.
 
 The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
@@ -89,7 +110,7 @@ try {
 }
 ```
 
-The client includes its npm package version and the binary protocol crate
+The client includes its npm package version and the binary wire protocol
 version in VSR registration. An incompatible server rejects registration with
 a protocol-version error instead of accepting a mismatched wire contract.
 
@@ -148,7 +169,7 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 
 Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
 and uses separate connections to partition primaries. It requires server support
-for binary commands 14, 103 and 104. Pause binary auto-commit consumers for the
+for binary commands 15 (`BindSession`), 103 and 104. Pause binary auto-commit consumers for the
 whole upgrade: upgrade every server first, then the SDKs, and restart consumers
 so they rejoin their groups. Older SDKs can lose membership when a backup refuses
 an offset commit; the new SDK does not fall back to legacy polling.

@@ -56,6 +56,7 @@ pub(crate) async fn build_iggy_producer(
     trace!("Build iggy producer");
     let mut builder = client
         .producer(stream, topic)?
+        .topic_durability(config.topic_durability())
         .partitioning(partitioning)
         .create_stream_if_not_exists()
         .send_retries(send_retries, send_retries_interval)

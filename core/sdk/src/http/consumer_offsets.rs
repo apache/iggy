@@ -23,10 +23,31 @@ use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerOffsetInfo};
+use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, ConsumerPosition};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        refuse_external_group(consumer)?;
+        self.put(
+            &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+            &StoreConsumerOffset {
+                consumer: consumer.clone(),
+                partition_id: Some(position.partition_id),
+                offset: position.offset,
+                context: Some(position.context),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -35,12 +56,14 @@ impl ConsumerOffsetClient for HttpClient {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
+        refuse_external_group(consumer)?;
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
                 consumer: consumer.clone(),
                 partition_id,
                 offset,
+                context: None,
             },
         )
         .await?;
@@ -54,6 +77,7 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
+        refuse_external_group(consumer)?;
         let response = self
             .get_with_query(
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -85,6 +109,7 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
+        refuse_external_group(consumer)?;
         let partition_id = partition_id
             .map(|id| format!("?partition_id={id}"))
             .unwrap_or_default();
@@ -100,4 +125,86 @@ impl ConsumerOffsetClient for HttpClient {
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/consumer-offsets")
+}
+
+/// The REST API cannot name a consumer kind, so an external group would land on a plain
+/// consumer's offset.
+pub(crate) fn refuse_external_group(consumer: &Consumer) -> Result<(), IggyError> {
+    if consumer.kind == ConsumerKind::ExternalGroup {
+        return Err(IggyError::FeatureUnavailable);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::{MessageClient, PartitionContext, PollingStrategy};
+
+    /// Nothing listens on this port, so a call that reached the network would fail with a
+    /// transport error instead.
+    const UNREACHABLE_API: &str = "http://127.0.0.1:1";
+
+    #[tokio::test]
+    async fn given_external_group_when_calling_over_http_should_refuse_before_sending() {
+        let client = HttpClient::new(UNREACHABLE_API).unwrap();
+        let group = Consumer::external_group(Identifier::numeric(1).unwrap());
+        let stream = Identifier::numeric(1).unwrap();
+        let topic = Identifier::numeric(1).unwrap();
+
+        assert!(matches!(
+            client
+                .store_consumer_offset(&group, &stream, &topic, Some(0), 5)
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .store_consumer_position(
+                    &group,
+                    &stream,
+                    &topic,
+                    ConsumerPosition {
+                        partition_id: 0,
+                        offset: 5,
+                        context: PartitionContext::default(),
+                    },
+                )
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .get_consumer_offset(&group, &stream, &topic, Some(0))
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .delete_consumer_offset(&group, &stream, &topic, Some(0))
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(matches!(
+            client
+                .poll_messages(
+                    &stream,
+                    &topic,
+                    Some(0),
+                    &group,
+                    &PollingStrategy::next(),
+                    1,
+                    false
+                )
+                .await,
+            Err(IggyError::FeatureUnavailable)
+        ));
+    }
+
+    #[test]
+    fn given_plain_consumer_when_guarded_should_pass() {
+        let consumer = Consumer::new(Identifier::numeric(1).unwrap());
+
+        assert!(refuse_external_group(&consumer).is_ok());
+    }
 }

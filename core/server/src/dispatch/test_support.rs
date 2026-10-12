@@ -193,6 +193,10 @@ impl ConnectionInstaller for SpyBus {
 pub const FIRST_BOOT: u128 = 0x5EED_0001;
 pub const SECOND_BOOT: u128 = 0x9E37_79B9_7F4A_7C15;
 
+/// `reserved_codes_remain_unknown` pins 131 as never reused, so a new
+/// operation cannot claim it.
+pub const UNDECLARED_OPERATION: u8 = 131;
+
 /// Shard 0 carrying a metadata consensus group of `replica_count`
 /// replicas in which this node is `replica`. No journal: every test using
 /// it either never proposes, or is a backup that cannot.
@@ -310,6 +314,8 @@ pub fn prepare_message(
             client,
             request,
             user_id: 0,
+            session: 1,
+            retry_capacity: u32::try_from(consensus::CLIENTS_TABLE_MAX).unwrap(),
             group: server_common::sharding::METADATA_GROUP,
             ..Default::default()
         };

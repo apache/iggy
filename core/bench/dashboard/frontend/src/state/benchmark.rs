@@ -48,15 +48,19 @@ impl BenchmarkState {
         selected_benchmark: &Option<BenchmarkReportLight>,
     ) {
         match selected_benchmark {
-            Some(bm) => log!(format!(
-                "Selected benchmark: kind={}, params={:?}",
-                format!("{:?}", selected_kind), // Explicitly format kind
-                bm.params
-            )),
-            None => log!(format!(
-                "No benchmark selected, kind is {}",
-                format!("{:?}", selected_kind)
-            )),
+            Some(bm) => {
+                log!(format!(
+                    "Selected benchmark: kind={}, params={:?}",
+                    format!("{:?}", selected_kind), // Explicitly format kind
+                    bm.params
+                ));
+            }
+            None => {
+                log!(format!(
+                    "No benchmark selected, kind is {}",
+                    format!("{:?}", selected_kind)
+                ));
+            }
         }
     }
 }

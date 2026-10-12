@@ -37,6 +37,11 @@ not. Before you open a PR you must be able to explain what every part of the cha
 and why, answer review questions about it yourself, and defend the design without going
 back to the tool for an answer. If you can't, the PR isn't ready.
 
+If an AI assistant helped you write the change, review it with the
+[`team-review-slim`](.claude/skills/team-review-slim/SKILL.md) skill before you open the PR.
+The skill can report false findings. Fix every finding that is correct and that applies to
+your change.
+
 While you're new to the project, please keep to **one open PR at a time**. Review takes
 longer than writing, so a queue of changes from one contributor holds up everyone else's.
 
@@ -63,6 +68,23 @@ for review.
 ### Single Purpose
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
+
+### Review Comments
+
+Respond to every review comment, so that the reviewer knows you read it. Any one of these
+is enough:
+
+- Resolve the conversation
+- React with 👍
+- Reply to the comment
+
+### Updating Your Branch
+
+Do not rebase your branch or merge `master` into it only to keep it up to date. Each push
+runs CI again on GitHub Actions runners that all Apache projects share. A maintainer
+updates the branch before the merge.
+
+If GitHub reports a merge conflict, or if a maintainer asks you to, update your branch.
 
 ### Quality Checks
 
@@ -162,6 +184,22 @@ chore(integration): remove streaming tests superseded by API-level coverage
 
 Keep subject under 72 chars. Use body for details if needed.
 
+A pull request that adds or amends an RFC under `rfcs/` uses the type `rfc`,
+as described in `rfcs/README.md`. If no scope in
+`.github/workflows/pr-title.yml` fits, add the RFC's feature name to that list
+in the same pull request.
+
+## Reviewing PRs
+
+Anyone can review a PR. You don't need to be a committer, and reviews from contributors
+are welcome. Read the change, run it locally if you can, and leave comments or a review.
+Questions count too. If something isn't clear to you, it probably isn't clear to the next
+reader either.
+
+A committer still has to approve and merge. If you're a returning contributor, your
+"Request changes" review moves the PR to `S-waiting-on-author`, and you can use `/author`
+to do the same.
+
 ## PR Triage Commands
 
 Move a PR around the review queue by posting a slash command on its own
@@ -174,6 +212,8 @@ line in a regular PR comment (not an inline review reply):
 | `/request-review @user-or-team ...` | author or maintainer                | request review from the listed `@user` / `@org/team` handles |
 | `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
 | `/unpin`                            | author or maintainer                | remove `pinned`                                              |
+
+A returning contributor is anyone who has had a commit merged into apache/iggy.
 
 Some labels move on their own. Opening a non-draft PR, or marking a draft
 ready, sets `S-waiting-on-review`. A "Request changes" review sets

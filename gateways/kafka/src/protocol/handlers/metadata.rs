@@ -530,7 +530,7 @@ mod tests {
         // malformed request - must decode to an empty list.
         let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
         let topics = decode_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
-        assert!(topics.is_empty());
+        assert_eq!(topics, [] as [StrBytes; 0]);
     }
 
     #[test]

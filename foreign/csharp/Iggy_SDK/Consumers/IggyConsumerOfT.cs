@@ -78,7 +78,7 @@ public class IggyConsumer<T> : IggyConsumer
 
             if (_typedConfig.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.Header.Offset, message.PartitionId, false, ct);
+                await StoreOffsetAsync(message.Header.Offset, message.PartitionId, message.Context, ct);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -120,6 +120,7 @@ public class IggyConsumer<T> : IggyConsumer
             UserHeaders = message.UserHeaders,
             CurrentOffset = message.Header.Offset,
             PartitionId = partitionId,
+            Context = rental.Context,
             Status = msgStatus,
             Error = deserError
         };

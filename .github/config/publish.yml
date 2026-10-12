@@ -47,6 +47,10 @@ components:
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
 
   # ── DockerHub images ───────────────────────────────────────────────────────
+  # Post-merge refreshes each image's :edge tag only when its row in
+  # .github/config/edge-image-variants.json selects it. Every dockerhub
+  # component needs a row that lists its dockerfile; the common checks run
+  # scripts/ci/edge-image-catalog.sh --check to enforce that.
   rust-server:
     tag_pattern: "^server-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
     registry: dockerhub
@@ -55,13 +59,6 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/server/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    # :edge refresh gate (scripts/ci/edge-affected-images.sh). Ships server + CLI
-    # with the web UI embedded at compile time, so web-only changes must rebuild
-    # it. crates: matched against `cargo rail plan`; paths: extra git pathspecs
-    # (the dockerfile: above is gated automatically).
-    gate:
-      crates: [server, iggy-cli]
-      paths: [web]
 
   rust-mcp:
     tag_pattern: "^mcp-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
@@ -71,8 +68,6 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/ai/mcp/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    gate:
-      crates: [iggy-mcp]
 
   rust-bench-dashboard:
     tag_pattern: "^bench-dashboard-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
@@ -82,11 +77,6 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/bench/dashboard/server/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    # Image bundles the server binary plus the built WASM frontend.
-    gate:
-      crates: [iggy-bench-dashboard-server, bench-dashboard-frontend]
-      paths:
-        - core/bench/dashboard/server/docker-entrypoint.sh
 
   rust-connectors:
     tag_pattern: "^connectors-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
@@ -96,9 +86,6 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/connectors/runtime/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
-    # Image ships only the runtime binary; plugin .so files are not bundled.
-    gate:
-      crates: [iggy-connectors]
 
   web-ui:
     tag_pattern: "^web-ui-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"
@@ -108,13 +95,6 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "web/package.json"
     version_regex: '"version"\s*:\s*"([^"]+)"'
-    # Not a cargo crate: path-gated only. The Dockerfile also COPYs two
-    # license scripts from scripts/ci/ into the build.
-    gate:
-      paths:
-        - web
-        - scripts/ci/third-party-licenses.sh
-        - scripts/ci/render-node-licenses.mjs
 
   # ── Other SDKs ─────────────────────────────────────────────────────────────
   sdk-python:

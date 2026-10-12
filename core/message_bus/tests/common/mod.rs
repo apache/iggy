@@ -94,6 +94,7 @@ pub fn set_replica_ctx(
     auth: Option<ReplicaAuth>,
 ) {
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: [0x5a; 32],
         cluster_id,
         self_id,
         replica_count,
@@ -112,6 +113,7 @@ pub fn set_replica_ctx_with_tls(
     tls: Rc<ReplicaTlsCtx>,
 ) {
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
+        binary_identity: [0x5a; 32],
         cluster_id,
         self_id,
         replica_count,

@@ -58,6 +58,7 @@ pub(in crate::boot) struct LocalClientAcceptFns {
 #[allow(clippy::too_many_arguments)]
 pub(in crate::boot) async fn start_tcp_runtime(
     shard: &Rc<ServerShard>,
+    session_liveness: Rc<std::cell::RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
     config: &ServerConfig,
     topology: &TcpTopology,
     roster: Rc<ClusterRoster>,
@@ -150,6 +151,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
         http::start(
             http,
             shard,
+            session_liveness,
             &config.http,
             config.metadata.clients_table_max,
             config.personal_access_token.max_tokens_per_user,

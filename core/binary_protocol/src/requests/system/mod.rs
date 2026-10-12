@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod attach_consumer_session;
+pub mod bind_session;
 pub mod describe_options;
+pub mod finalize_session;
 pub mod get_client;
 pub mod get_clients;
 pub mod get_cluster_metadata;
@@ -24,11 +25,13 @@ pub mod get_me;
 pub mod get_snapshot;
 pub mod get_stats;
 pub mod ping;
+pub mod retire_sessions;
 
-pub use attach_consumer_session::AttachConsumerSessionRequest;
+pub use bind_session::{BindSessionRequest, SessionIdentity};
 pub use describe_options::{
     DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
 };
+pub use finalize_session::FinalizeSessionRequest;
 pub use get_client::GetClientRequest;
 pub use get_clients::GetClientsRequest;
 pub use get_cluster_metadata::GetClusterMetadataRequest;
@@ -36,3 +39,4 @@ pub use get_me::GetMeRequest;
 pub use get_snapshot::GetSnapshotRequest;
 pub use get_stats::GetStatsRequest;
 pub use ping::PingRequest;
+pub use retire_sessions::{MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest};

@@ -32,7 +32,7 @@ public interface CommandCode {
         GET_STATS(10),
         GET_CLUSTER_METADATA(12),
         DESCRIBE_OPTIONS(13),
-        ATTACH_CONSUMER_SESSION(14),
+        BIND_SESSION(15),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
@@ -96,7 +96,8 @@ public interface CommandCode {
         POLL(100),
         SEND(101),
         GET_POLL_ROUTING(103),
-        POLL_ON_PRIMARY(104);
+        POLL_ON_PRIMARY(104),
+        GET_SEND_CONTEXT(105);
 
         private final int value;
 
@@ -112,7 +113,9 @@ public interface CommandCode {
 
     enum ConsumerOffset implements CommandCode {
         GET(120),
-        STORE(121);
+        STORE(121),
+        DELETE(122),
+        GET_ROUTING(123);
 
         private final int value;
 
@@ -150,8 +153,7 @@ public interface CommandCode {
         GET_ALL(301),
         CREATE(302),
         DELETE(303),
-        UPDATE(304),
-        PURGE(305);
+        UPDATE(304);
 
         private final int value;
 

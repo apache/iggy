@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { type Id } from '../identifier.utils.js';
+import { xxh32 } from '@node-rs/xxhash';
+import { idKey, type Id } from '../identifier.utils.js';
 import { serializeSendMessages, type CreateMessage } from './message.utils.js';
-import type { Partitioning } from './partitioning.utils.js';
-import type { CommandResponse } from '../../client/client.type.js';
-import { DeserializeError } from '../error.utils.js';
-import { wrapCommand } from '../command.utils.js';
+import { Partitioning, PartitionKind, serializeMessageKey } from './partitioning.utils.js';
+import type { ClientProvider, CommandResponse, RawClient } from '../../client/client.type.js';
+import { DeserializeError, ResponseError, responseError } from '../error.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+import { GET_TOPIC } from '../topic/get-topic.command.js';
 
 /** Size of the confirmation count prefixing the list. */
 const CONFIRMATIONS_COUNT_SIZE = 4;
@@ -120,9 +121,78 @@ export const SEND_MESSAGES = {
   deserialize: (r: CommandResponse) => deserializeSendMessages(r.data)
 };
 
+/** Rust `calculate_32` hashes message keys with XXH32 under this seed. */
+const MESSAGE_KEY_SEED = 0;
+const TOPIC_ID_NOT_FOUND = 2010;
+
+type TopicPartitions = { count?: number, cursor: number };
+
+const topicPartitions = new WeakMap<RawClient, Map<string, TopicPartitions>>();
+
+const getTopicPartitions = (client: RawClient, streamId: Id, topicId: Id): TopicPartitions => {
+  let topics = topicPartitions.get(client);
+  if (!topics) {
+    const created = new Map<string, TopicPartitions>();
+    topicPartitions.set(client, created);
+    // The client's own stream, topic or partition change can alter any
+    // count, as it drops the Rust SDK's topic discovery.
+    client.on('topicDiscoveryReset', () => {
+      for (const topic of created.values())
+        topic.count = undefined;
+    });
+    topics = created;
+  }
+  const key = `${idKey(streamId)}\0${idKey(topicId)}`;
+  let topic = topics.get(key);
+  if (!topic) {
+    topic = { cursor: 0 };
+    topics.set(key, topic);
+  }
+  return topic;
+};
+
+/**
+ * Resolves Balanced and MessageKey to an explicit partition id as the Rust SDK
+ * does, so the send carries that partition's incarnation.
+ */
+const resolvePartitioning = async (
+  client: RawClient,
+  { streamId, topicId, partition }: SendMessages
+): Promise<Partitioning> => {
+  if (partition?.kind === PartitionKind.PartitionId)
+    return partition;
+  const topic = getTopicPartitions(client, streamId, topicId);
+  topic.count ||= GET_TOPIC.deserialize(await client.sendCommand(
+    GET_TOPIC.code, GET_TOPIC.serialize({ streamId, topicId })
+  ))?.partitionsCount;
+  if (!topic.count)
+    throw responseError(COMMAND_CODE.SendMessages, TOPIC_ID_NOT_FOUND);
+  if (partition?.kind === PartitionKind.MessageKey)
+    return Partitioning.PartitionId(
+      xxh32(serializeMessageKey(partition.value), MESSAGE_KEY_SEED) % topic.count);
+  const index = topic.cursor % topic.count;
+  topic.cursor += 1;
+  return Partitioning.PartitionId(index);
+};
+
 /**
  * Executable send messages command function. Resolves to the commit
  * confirmations of the written partitions, empty against the legacy server.
  */
-export const sendMessages =
-  wrapCommand<SendMessages, SendMessagesResponse>(SEND_MESSAGES);
+export const sendMessages = (getClient: ClientProvider) =>
+  async (request: SendMessages): Promise<SendMessagesResponse> => {
+    const client = await getClient();
+    const release = client.hold?.();
+    try {
+      const partition = await resolvePartitioning(client, request);
+      return SEND_MESSAGES.deserialize(await client.sendCommand(
+        SEND_MESSAGES.code, SEND_MESSAGES.serialize({ ...request, partition })));
+    } catch (error) {
+      // A refusal can mean the topic changed shape since its count was read.
+      if (error instanceof ResponseError)
+        getTopicPartitions(client, request.streamId, request.topicId).count = undefined;
+      throw error;
+    } finally {
+      release?.();
+    }
+  };

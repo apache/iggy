@@ -45,6 +45,11 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
 
         WritePartitioning(writer, value.Partitioning);
         WriteMessages(writer, value.Messages, options);
+        if (value.Context is { } context)
+        {
+            writer.WritePropertyName("context");
+            JsonSerializer.Serialize(writer, context, options);
+        }
 
         writer.WriteEndObject();
     }

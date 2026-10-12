@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::permissioner::Permissioner;
-use crate::stm::StateHandler;
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
     DeletePersonalAccessTokenResult, DeleteUserResult, UpdatePermissionsResult, UpdateUserResult,
 };
 use crate::stm::snapshot::Snapshotable;
+use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -318,6 +318,7 @@ impl Users {
                     options: WireOptions::empty(),
                 },
                 IggyTimestamp::from(1),
+                ApplyContext::default(),
             ))
             .expect("root user bootstrap must run on the metadata writer");
     }
@@ -549,7 +550,10 @@ impl StateHandler for UpdateUserRequest {
         // Patch, never replace: keys the client did not send keep their
         // current value, so a client that predates a key cannot erase it.
         user.options.extend(updated_options);
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            revoked_user: (user.status != UserStatus::Active).then_some(user_id as UserId),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -590,7 +594,10 @@ impl StateHandler for DeleteUserRequest {
                 .permissioner
                 .delete_permissions_for_user(user_id as UserId);
         }
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            revoked_user: Some(user_id as UserId),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -958,6 +965,7 @@ impl UsersInner {
             personal_access_token_expiry_index,
             permissioner,
             last_result: None,
+            apply_context: ApplyContext::default(),
         }
     }
 }
@@ -1538,21 +1546,18 @@ mod tests {
 
         // The derived index is not serialized: every permissioner vec is empty.
         let snap = &snapshot.permissioner;
-        assert!(snap.users_permissions.is_empty());
-        assert!(snap.users_streams_permissions.is_empty());
-        assert!(
-            snap.users_that_can_poll_messages_from_all_streams
-                .is_empty()
+        assert_eq!(snap.users_permissions, []);
+        assert_eq!(snap.users_streams_permissions, []);
+        assert_eq!(
+            snap.users_that_can_poll_messages_from_all_streams,
+            [] as [u32; 0]
         );
-        assert!(snap.users_that_can_send_messages_to_all_streams.is_empty());
-        assert!(
-            snap.users_that_can_poll_messages_from_specific_streams
-                .is_empty()
+        assert_eq!(
+            snap.users_that_can_send_messages_to_all_streams,
+            [] as [u32; 0]
         );
-        assert!(
-            snap.users_that_can_send_messages_to_specific_streams
-                .is_empty()
-        );
+        assert_eq!(snap.users_that_can_poll_messages_from_specific_streams, []);
+        assert_eq!(snap.users_that_can_send_messages_to_specific_streams, []);
 
         let restored = Users::from_snapshot(snapshot).expect("snapshot restore");
         let (poll_ok, send_ok, in_poll_all, in_send_specific) = restored.read(|inner| {

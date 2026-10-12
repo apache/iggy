@@ -1512,6 +1512,8 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
 
     ASSERT_NO_THROW(client->join_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                                 make_numeric_identifier(group.id)));
+    ASSERT_TRUE(wait_for_consumer_group_assignment(client, make_numeric_identifier(stream.id),
+                                                   make_numeric_identifier(0), make_numeric_identifier(group.id), 1));
 
     auto group_after_join = client->get_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                                        make_numeric_identifier(group.id));

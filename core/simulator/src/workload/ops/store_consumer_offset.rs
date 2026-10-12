@@ -18,7 +18,7 @@
 //! `StoreConsumerOffset` op. Samples only `Success`. PRNG draw order:
 //!
 //! 1. namespace pick
-//! 2. `consumer_kind` boolean draw
+//! 2. `consumer_kind` range draw
 //! 3. `consumer_id` range draw
 //! 4. `offset` range draw
 //! 5. `ack` ratio draw

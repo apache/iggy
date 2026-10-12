@@ -30,6 +30,8 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (1, "Fetch", 4, 12),
     (2, "ListOffsets", 1, 6),
     (3, "Metadata", 0, 9),
+    (8, "OffsetCommit", 2, 9),
+    (9, "OffsetFetch", 1, 9),
     (10, "FindCoordinator", 0, 4),
     (11, "JoinGroup", 0, 9),
     (12, "Heartbeat", 0, 4),
@@ -37,7 +39,10 @@ pub const SCOPED_API_KEYS: &[(i16, &str, i16, i16)] = &[
     (14, "SyncGroup", 0, 5),
     (18, "ApiVersions", 0, 3),
     (19, "CreateTopics", 2, 5),
+    (20, "DeleteTopics", 1, 5),
     (22, "InitProducerId", 0, 5),
+    (32, "DescribeConfigs", 1, 4),
+    (33, "AlterConfigs", 0, 2),
 ];
 
 pub fn default_broker() -> BrokerAdvertise {

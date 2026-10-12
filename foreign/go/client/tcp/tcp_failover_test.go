@@ -35,8 +35,82 @@ import (
 )
 
 // The node a client signed in on dies; its next request has to complete on a
-// survivor the roster named, under the identity a fresh sign-in binds there.
+// survivor the roster named, under the retained logical identity.
 // Mirrors `core/integration/tests/cluster/failover_client_continuity.rs`.
+func TestReconnect_BindVerdictPreservesOrReplacesOnlyTheLogicalSession(t *testing.T) {
+	for _, refusal := range []uint32{0, 30, 40, 57, 58} {
+		t.Run(ierror.FromCode(ierror.Code(refusal)).Error(), func(t *testing.T) {
+			var server *testListener
+			var registrations atomic.Int32
+			var writes atomic.Int32
+			var bindStatus atomic.Uint32
+			bindStatus.Store(refusal)
+			server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+				switch {
+				case read.operation() == vsr.OperationRegister:
+					return registerReplyFrame(7, uint64(128+registrations.Add(1)))
+				case read.code() == uint32(command.BindSessionCode):
+					if status := bindStatus.Load(); status != 0 {
+						return statusReplyFrame(vsr.OperationNonReplicated, status, nil)
+					}
+					return bindReplyFrame(7, read.sessionID())
+				case read.code() == uint32(command.GetClusterMetadataCode):
+					return clusterMetadataFrame(t, 0, server.address())
+				case read.operation() == vsr.OperationCreateStream:
+					if writes.Add(1) == 1 {
+						return nil
+					}
+					return replyFrame(vsr.OperationCreateStream, resultSection())
+				default:
+					return replyFrame(vsr.OperationNonReplicated, nil)
+				}
+			})
+			client := newDialingClient(t, server.address(),
+				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			ctx := context.Background()
+			require.NoError(t, client.Connect(ctx))
+			original := client.session.ClientID()
+			secret := client.session.BindSecret()
+			_, err := client.do(ctx, &command.CreateStream{Name: "lost-reply"})
+			require.Error(t, err)
+			if refusal == uint32(ierror.TransientNotCommittedCode) || refusal == uint32(ierror.TransientNotAcceptedCode) {
+				require.ErrorIs(t, client.Connect(ctx), ierror.FromCode(ierror.Code(refusal)))
+				assert.Equal(t, original, client.session.ClientID())
+				assert.Equal(t, int32(1), registrations.Load())
+				bindStatus.Store(0)
+			}
+			require.NoError(t, client.Connect(ctx))
+			assert.Equal(t, int32(1), writes.Load(), "resume must not replay the uncertain mutation")
+			terminal := refusal == uint32(ierror.StaleClientCode) || refusal == uint32(ierror.UnauthenticatedCode)
+			if terminal {
+				assert.NotEqual(t, original, client.session.ClientID())
+				assert.Equal(t, int32(2), registrations.Load())
+			} else {
+				assert.Equal(t, original, client.session.ClientID())
+				assert.Equal(t, secret, client.session.BindSecret())
+				assert.Equal(t, int32(1), registrations.Load())
+			}
+			_, err = client.do(ctx, &command.CreateStream{Name: "explicit-new-write"})
+			require.NoError(t, err)
+			var mutations []request
+			for _, read := range server.recorded() {
+				if read.operation() == vsr.OperationCreateStream {
+					mutations = append(mutations, read)
+				}
+			}
+			require.Len(t, mutations, 2)
+			assert.NotEqual(t, mutations[0].payload, mutations[1].payload)
+			if terminal {
+				assert.NotEqual(t, mutations[0].clientID(), mutations[1].clientID())
+				assert.Equal(t, uint64(1), mutations[1].requestID())
+			} else {
+				assert.Equal(t, mutations[0].clientID(), mutations[1].clientID())
+				assert.Equal(t, mutations[0].requestID()+1, mutations[1].requestID())
+			}
+		})
+	}
+}
+
 func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 	var survivor *testListener
 	var primary *testListener
@@ -44,6 +118,8 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 
 	survivor = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			return clusterMetadataFrame(t, 1, primary.address(), survivor.address())
 		case read.operation() == vsr.OperationRegister:
@@ -60,6 +136,8 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 			return nil
 		}
 		switch {
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			// The primary leads, so the sign-in settles here and the roster is
 			// only remembered -- not acted on -- until the node dies.
@@ -97,14 +175,17 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 			registers++
 		}
 	}
-	assert.Equal(t, 1, registers,
-		"the remembered credentials signed in again on the survivor")
+	assert.Equal(t, 0, registers, "resume must not register another session")
+	assert.Equal(t, 1, requestCount(survivor.recorded(), command.BindSessionCode))
 }
 
 func TestFailover_WalksPastTwoRefusingReplicasToThePartitionPrimary(t *testing.T) {
 	var metadataLeader *testListener
 
 	partitionPrimary := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.code() == uint32(command.BindSessionCode) {
+			return bindReplyFrame(7, read.sessionID())
+		}
 		switch read.operation() {
 		case vsr.OperationRegister:
 			return registerReplyFrame(7, 384)
@@ -115,6 +196,9 @@ func TestFailover_WalksPastTwoRefusingReplicasToThePartitionPrimary(t *testing.T
 		}
 	})
 	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.code() == uint32(command.BindSessionCode) {
+			return bindReplyFrame(7, read.sessionID())
+		}
 		if read.operation() == vsr.OperationRegister {
 			return registerReplyFrame(7, 256)
 		}
@@ -123,6 +207,8 @@ func TestFailover_WalksPastTwoRefusingReplicasToThePartitionPrimary(t *testing.T
 	})
 	metadataLeader = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			return clusterMetadataFrame(t, 0, metadataLeader.address(),
 				follower.address(), partitionPrimary.address())
@@ -195,6 +281,9 @@ func TestFailover_ServerEvictionReplaysTheRememberedSignIn(t *testing.T) {
 	var evict atomic.Bool
 	var registers atomic.Int32
 	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.code() == uint32(command.BindSessionCode) {
+			return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil)
+		}
 		if read.operation() == vsr.OperationRegister {
 			registers.Add(1)
 			return registerReplyFrame(7, 128)
@@ -325,6 +414,8 @@ func TestFailover_ReLoginSurvivesALogoutTheOldPrimaryRefused(t *testing.T) {
 	// refuses it as not-admitted and points at the survivor.
 	follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			if demoted.Load() {
 				return clusterMetadataFrame(t, 1, follower.address(), leader.address())
@@ -342,6 +433,8 @@ func TestFailover_ReLoginSurvivesALogoutTheOldPrimaryRefused(t *testing.T) {
 	})
 	leader = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			return clusterMetadataFrame(t, 1, follower.address(), leader.address())
 		case read.operation() == vsr.OperationRegister:
