@@ -22,8 +22,6 @@ use thiserror::Error;
 pub(crate) enum CmdToolError {
     MissingCredentials,
     InvalidEncryptionKey,
-    #[cfg(feature = "login-session")]
-    MissingServerAddress,
 }
 
 impl Display for CmdToolError {
@@ -34,10 +32,6 @@ impl Display for CmdToolError {
             }
             Self::InvalidEncryptionKey => {
                 write!(f, "Invalid encryption key provided")
-            }
-            #[cfg(feature = "login-session")]
-            Self::MissingServerAddress => {
-                write!(f, "Missing iggy server address")
             }
         }
     }

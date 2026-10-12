@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts;
+
 namespace Apache.Iggy.Vsr;
 
 /// <summary>
-///     Per-connection cache of consumer-group assignments and topic partition counts, mirroring
+///     Per-connection cache of consumer-group assignments, topic partition counts and send contexts, mirroring
 ///     <c>core/common/src/consumer_group_client_state.rs</c>. The client resolves group polls and
 ///     balanced / message-key produce locally. The cursors have to survive
 ///     across calls, which is why this lives on the long-lived transport rather than on a request.
@@ -34,6 +36,7 @@ internal sealed class ConsumerGroupClientState
 #endif
     private readonly Dictionary<GroupKey, GroupIdentifiers> _joinedGroups = [];
     private readonly Dictionary<TopicKey, CachedPartitionCount> _partitionCounts = [];
+    private readonly Dictionary<TopicKey, Dictionary<uint, PartitionContext>> _sendContexts = [];
 
     /// <summary>Nothing tells this client when another one resizes a topic, so the count expires on its own.</summary>
     private const long PartitionCountTtlMs = 30_000;
@@ -41,15 +44,15 @@ internal sealed class ConsumerGroupClientState
     /// <summary>
     ///     How long a cached assignment is trusted before the next poll asks the coordinator again. A rebalance
     ///     that took a partition away shows up as a fenced poll long before this expires; the periodic re-sync
-    ///     catches what fencing cannot, such as a member holding zero partitions being handed one, which no poll
-    ///     of its own would ever reveal. Matches the Go SDK's <c>assignmentRefreshInterval</c>.
+    ///     catches what fencing cannot, such as a member being handed one more partition, which no poll of its
+    ///     own would ever reveal. Matches the Go SDK's <c>assignmentRefreshInterval</c>.
     /// </summary>
     internal static readonly long AssignmentRefreshMs = 5_000;
 
     /// <summary>
-    ///     True when a fresh assignment is cached for the group, even one holding zero partitions. Treating an
-    ///     empty assignment as missing would re-sync on every poll of a member that owns nothing; treating it as
-    ///     fresh forever would leave that member polling nothing until an unrelated heartbeat refreshed it.
+    ///     True when a fresh assignment holding at least one partition is cached for the group. As in the Rust SDK,
+    ///     an empty one is synced again on every poll: a join returns before the member owns anything, and it gets
+    ///     each partition only once that partition installs it as the owner.
     /// </summary>
     internal bool HasAssignment(GroupKey key)
     {
@@ -60,7 +63,9 @@ internal sealed class ConsumerGroupClientState
     {
         lock (_gate)
         {
-            return _assignments.TryGetValue(key, out var assignment) && now < assignment.RefreshAt;
+            return _assignments.TryGetValue(key, out var assignment)
+                   && assignment.Partitions.Count > 0
+                   && now < assignment.RefreshAt;
         }
     }
 
@@ -164,15 +169,57 @@ internal sealed class ConsumerGroupClientState
         }
     }
 
+    /// <summary>The context sends to the partition carry, or null when none is cached.</summary>
+    internal PartitionContext? SendContext(TopicKey key, uint partitionId)
+    {
+        lock (_gate)
+        {
+            return _sendContexts.TryGetValue(key, out var contexts)
+                   && contexts.TryGetValue(partitionId, out var context)
+                ? context
+                : null;
+        }
+    }
+
+    internal void SetSendContext(TopicKey key, uint partitionId, PartitionContext context)
+    {
+        lock (_gate)
+        {
+            if (!_sendContexts.TryGetValue(key, out var contexts))
+            {
+                contexts = [];
+                _sendContexts[key] = contexts;
+            }
+
+            contexts[partitionId] = context;
+        }
+    }
+
     /// <summary>
-    ///     Forgets a topic's cached partition count immediately, for the changes this client makes itself.
-    ///     Changes made by anyone else are covered by <see cref="PartitionCountTtlMs" />.
+    ///     Forgets a topic after a send to it was refused with status 87: another client deleted and recreated
+    ///     it, so every partition context and the partition count may be stale. Any other failure leaves both.
     /// </summary>
-    internal void InvalidatePartitionCount(TopicKey key)
+    internal void InvalidateTopic(TopicKey key)
     {
         lock (_gate)
         {
             _partitionCounts.Remove(key);
+            _sendContexts.Remove(key);
+        }
+    }
+
+    /// <summary>
+    ///     Forgets every topic after this client deleted a stream or a topic, or created or deleted partitions. The
+    ///     same topic can be cached under its name and under its numeric id, so the whole cache goes. Changes made
+    ///     by anyone else are covered by <see cref="PartitionCountTtlMs" /> and by the status 87 a stale send
+    ///     context gets.
+    /// </summary>
+    internal void InvalidateTopicDiscovery()
+    {
+        lock (_gate)
+        {
+            _partitionCounts.Clear();
+            _sendContexts.Clear();
         }
     }
 

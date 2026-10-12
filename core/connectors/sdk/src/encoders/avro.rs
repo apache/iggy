@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamEncoder, convert::owned_value_to_serde_json};
+use crate::{
+    Error, Payload, Schema, StreamEncoder,
+    convert::{apply_field_mappings, owned_value_to_serde_json},
+};
 use apache_avro::Schema as AvroSchema;
 use apache_avro::writer::datum::GenericDatumWriter;
 use base64::Engine;
@@ -118,35 +121,11 @@ impl AvroStreamEncoder {
         Ok(())
     }
 
-    fn apply_field_transformations(&self, payload: Payload) -> Result<Payload, Error> {
+    fn apply_field_transformations(&self, payload: Payload) -> Payload {
         if let Some(mappings) = &self.config.field_mappings {
-            match payload {
-                Payload::Json(json_value) => {
-                    if let simd_json::OwnedValue::Object(mut map) = json_value {
-                        let mut new_entries = Vec::new();
-
-                        for (key, value) in map.iter() {
-                            if let Some(new_key) = mappings.get(key) {
-                                new_entries.push((new_key.clone(), value.clone()));
-                            } else {
-                                new_entries.push((key.clone(), value.clone()));
-                            }
-                        }
-
-                        map.clear();
-                        for (key, value) in new_entries {
-                            map.insert(key, value);
-                        }
-
-                        Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                    } else {
-                        Ok(Payload::Json(json_value))
-                    }
-                }
-                other => Ok(other),
-            }
+            apply_field_mappings(payload, |key| mappings.get(&key).cloned().unwrap_or(key))
         } else {
-            Ok(payload)
+            payload
         }
     }
 
@@ -352,7 +331,7 @@ impl StreamEncoder for AvroStreamEncoder {
     }
 
     fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
-        let transformed_payload = self.apply_field_transformations(payload)?;
+        let transformed_payload = self.apply_field_transformations(payload);
 
         match transformed_payload {
             Payload::Json(json_value) => self.encode_json_to_avro(json_value),
@@ -373,6 +352,8 @@ impl Default for AvroStreamEncoder {
 
 #[cfg(test)]
 mod tests {
+    use apache_avro::reader::datum::GenericDatumReader;
+
     use super::*;
 
     fn create_test_schema_json() -> String {
@@ -428,7 +409,7 @@ mod tests {
         field_mappings.insert("full_name".to_string(), "name".to_string());
 
         let config = AvroEncoderConfig {
-            schema_json: Some(schema_json),
+            schema_json: Some(schema_json.clone()),
             field_mappings: Some(field_mappings),
             ..AvroEncoderConfig::default()
         };
@@ -444,6 +425,19 @@ mod tests {
         assert!(result.is_ok());
         let encoded_data = result.unwrap();
         assert!(!encoded_data.is_empty());
+
+        // Decode the real bytes and check the value; schema strictness alone isn't proof the rename worked.
+        let schema = AvroSchema::parse_str(&schema_json).unwrap();
+        let mut reader: &[u8] = &encoded_data;
+        let decoded = GenericDatumReader::builder(&schema)
+            .build()
+            .unwrap()
+            .read_value(&mut reader)
+            .unwrap();
+        let decoded_json = serde_json::Value::try_from(decoded).unwrap();
+
+        assert_eq!(decoded_json["name"], serde_json::json!("Alice"));
+        assert_eq!(decoded_json["age"], serde_json::json!(30));
     }
 
     #[test]

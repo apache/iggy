@@ -29,10 +29,10 @@ mod wire;
 use bytes::Bytes;
 
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
-    API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_NOT_CONTROLLER,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
-    handle_request, is_supported_version, supported_api_ranges,
+    API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS, API_KEY_FETCH,
+    API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST, ERROR_NONE,
+    ERROR_NOT_CONTROLLER, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_VERSION, handle_request, is_supported_version, supported_api_ranges,
 };
 
 use codec::Decoder;
@@ -40,9 +40,10 @@ use fixtures::load_fixture_body_or_skip;
 use scope::default_broker;
 use tcp::{build_metadata_legacy_request, build_produce_v3_body};
 use wire::{
-    build_api_versions_flexible_request, build_metadata_all_topics_legacy,
-    build_metadata_flexible_request, build_metadata_flexible_request_v10,
-    build_metadata_legacy_request_for_version, build_produce_legacy_request,
+    build_api_versions_flexible_request, build_delete_topics_request_with_name,
+    build_metadata_all_topics_legacy, build_metadata_flexible_request,
+    build_metadata_flexible_request_v10, build_metadata_legacy_request_for_version,
+    build_produce_legacy_request,
 };
 
 // ── ApiVersions ─────────────────────────────────────────────────────────────
@@ -806,6 +807,49 @@ async fn create_topics_decodes_request_with_real_topic_and_assignment() {
         "topic name must echo the request"
     );
     assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
+}
+
+/// Pins the `flexible = version >= 4` boundary `validate_delete_topics_shape` and
+/// `encode_delete_topics_response` both rely on, with a real (non-empty) topic name so the
+/// per-topic error code is actually observable in the response - an empty request's response
+/// has zero entries, so no error code in it is ever asserted anywhere else. v1 and v3 are
+/// legacy; v4 and v5 are flexible (v4 has no `error_message` field, v5 does).
+#[tokio::test]
+async fn delete_topics_stub_response_returns_not_controller_per_version_shape() {
+    for version in [1i16, 3, 4, 5] {
+        let body = build_delete_topics_request_with_name(version, "orders");
+        let resp = handle_request(API_KEY_DELETE_TOPICS, version, body, &default_broker())
+            .await
+            .expect_response("test request has acks != 0 and expects a response");
+        let flexible = version >= 4;
+        let mut d = Decoder::new(resp);
+        let _throttle = d.read_i32().unwrap();
+        if flexible {
+            let responses_plus_one = d.read_varint().unwrap();
+            assert_eq!(
+                responses_plus_one, 2,
+                "DeleteTopics v{version}: one response"
+            );
+            assert_eq!(
+                d.read_compact_nullable_string().unwrap(),
+                Some("orders".to_string()),
+                "DeleteTopics v{version}: name must echo the request"
+            );
+        } else {
+            let responses = d.read_i32().unwrap();
+            assert_eq!(responses, 1, "DeleteTopics v{version}: one response");
+            assert_eq!(
+                d.read_nullable_string().unwrap(),
+                Some("orders".to_string()),
+                "DeleteTopics v{version}: name must echo the request"
+            );
+        }
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_CONTROLLER,
+            "DeleteTopics v{version}"
+        );
+    }
 }
 
 // ── Produce acks=0 with a malformed body closes ──────

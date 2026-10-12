@@ -56,15 +56,11 @@ async fn print_sysinfo(shard: &Rc<ServerShard>) {
     let clients_count = shard.count_all_clients().await;
     let (messages_size_bytes, messages_count) = messages_totals(shard);
     let system = probe_system_stats();
-    let free_disk_space = system.free_disk_space;
-    let total_disk_space = system.total_disk_space;
     let line = SysinfoLine {
         system,
         messages_size_bytes,
         messages_count,
         clients_count,
-        free_disk_space,
-        total_disk_space,
     };
     info!("{line}");
 }
@@ -91,8 +87,6 @@ struct SysinfoLine {
     messages_size_bytes: u64,
     messages_count: u64,
     clients_count: usize,
-    free_disk_space: u64,
-    total_disk_space: u64,
 }
 
 impl SysinfoLine {
@@ -118,8 +112,8 @@ impl fmt::Display for SysinfoLine {
             IggyByteSize::from(system.memory_usage),
             IggyByteSize::from(system.total_memory.saturating_sub(system.available_memory)),
             IggyByteSize::from(system.total_memory),
-            IggyByteSize::from(self.free_disk_space),
-            IggyByteSize::from(self.total_disk_space),
+            IggyByteSize::from(system.free_disk_space),
+            IggyByteSize::from(system.total_disk_space),
             IggyByteSize::from(self.messages_size_bytes),
             self.clients_count,
             self.messages_count,
@@ -168,8 +162,6 @@ mod tests {
             messages_size_bytes: 0,
             messages_count: 42,
             clients_count: 3,
-            free_disk_space: 0,
-            total_disk_space: 0,
         }
     }
 

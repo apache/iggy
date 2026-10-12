@@ -33,9 +33,11 @@ class StreamsHttpClient implements StreamsClient {
 
     private static final String STREAMS = "/streams";
     private final InternalHttpClient httpClient;
+    private final SendContexts sendContexts;
 
-    public StreamsHttpClient(InternalHttpClient httpClient) {
+    public StreamsHttpClient(InternalHttpClient httpClient, SendContexts sendContexts) {
         this.httpClient = httpClient;
+        this.sendContexts = sendContexts;
     }
 
     @Override
@@ -68,6 +70,7 @@ class StreamsHttpClient implements StreamsClient {
     public void deleteStream(StreamId streamId) {
         var request = httpClient.prepareDeleteRequest(STREAMS + "/" + streamId);
         httpClient.execute(request);
+        sendContexts.clear();
     }
 
     record CreateStream(String name) {}

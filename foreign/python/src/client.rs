@@ -43,7 +43,7 @@ use crate::options::OptionSpec as PyOptionSpec;
 use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
 use crate::producer::{IggyProducer, ProducerMode, RetryInterval, u32_param as producer_u32_param};
-use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::receive_message::{PartitionContext, PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stats::Stats as PyStats;
 use crate::stream::{Stream, StreamDetails};
@@ -522,12 +522,10 @@ impl IggyClient {
     /// for the rest of `reestablish_after` (5 s by default). The sign-in made
     /// with `login_user` is dropped, so it must be repeated after reconnecting.
     /// A client configured with auto-login credentials signs in again on
-    /// `connect`. Over HTTP there is no connection to close and this call does
-    /// nothing.
-    ///
-    /// Known issue: unless reconnection is disabled, the heartbeat of a client
-    /// with auto-login credentials connects it again and signs in within one
-    /// heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+    /// `connect`. Until then, requests fail with `RuntimeError`, and nothing
+    /// connects the client again in the background, even with auto-login
+    /// credentials. Over HTTP there is no connection to close and this call
+    /// does nothing.
     ///
     /// Raises:
     ///     RuntimeError: If the connection cannot be closed.
@@ -708,6 +706,8 @@ impl IggyClient {
     ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
     ///     options: Additional option keys as `dict[str, str] | None`, sent
     ///         verbatim so a newer server key can be set from this build.
+    ///         `{"partition_resize_policy": "fixed"}` makes the server reject
+    ///         later partition creation and deletion on this topic.
     ///
     /// Every option left as `None` resolves against the server default at
     /// admission.
@@ -776,6 +776,7 @@ impl IggyClient {
                 .map(IggyByteSize::from),
             preallocate_segments,
             raw: options.unwrap_or_default(),
+            partition_resize_policy: None,
         };
 
         let stream = Identifier::try_from(stream)?;
@@ -1026,6 +1027,55 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             Ok(())
+        })
+    }
+
+    /// Delete the oldest sealed segments of a partition, including all messages
+    /// stored in them. The active segment is never deleted, and deletion stops at
+    /// the lowest offset any consumer or consumer group has committed on the
+    /// partition, so fewer than `segments_count` segments may be removed at first.
+    /// The server keeps the request and removes the remaining segments later, up
+    /// to the requested count, as consumers commit past them.
+    ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     topic_id: Topic identifier as `str | int`.
+    ///     partition_id: Partition ID as `int`.
+    ///     segments_count: Maximum number of segments to delete as `int`, starting
+    ///         from the oldest; `0` deletes nothing.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when deletion is accepted; segment
+    ///     files are removed asynchronously.
+    ///
+    /// Raises:
+    ///     ValueError: If an identifier is invalid.
+    ///     TypeError: If an integer identifier is outside the unsigned 32-bit range.
+    ///     OverflowError: If `partition_id` or `segments_count` is outside the
+    ///         unsigned 32-bit range.
+    ///     RuntimeError: If the client is not authenticated, lacks global
+    ///         `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+    ///         `manage_topics`, or per-topic `manage_topic` permission, the
+    ///         stream, topic, or partition does not exist, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_segments<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        topic_id: PyIdentifier,
+        partition_id: u32,
+        segments_count: u32,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let topic_id = Identifier::try_from(topic_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .delete_segments(&stream_id, &topic_id, partition_id, segments_count)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| py.None()))
         })
     }
 
@@ -1420,9 +1470,17 @@ impl IggyClient {
     /// Polls for messages from the specified topic on behalf of the given consumer.
     /// Omitting `partition_id` reads partition 0 for a regular consumer, and
     /// polls the member's assigned partitions for a consumer group.
+    /// `context` continues from a message received earlier, usually with
+    /// `PollingStrategy.Offset`: pass that message's `context()` and `partition_id()`.
+    /// The poll is then refused if the partition was deleted and created again, or if its
+    /// consumer group owner changed, instead of reading the new partition at that offset.
+    /// Without `context`, the poll takes the context its route reports. After another
+    /// client deleted and created the partition again, one such poll can fail with
+    /// `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
+    /// consumer group member. The failed route is dropped, and the next call routes again.
     /// Returns a list of received messages or a RuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (stream, topic, *, consumer, polling_strategy, count, auto_commit, partition_id = None))]
+    #[pyo3(signature = (stream, topic, *, consumer, polling_strategy, count, auto_commit, partition_id = None, context = None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(
         &self,
@@ -1434,11 +1492,18 @@ impl IggyClient {
         count: u32,
         auto_commit: bool,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "PartitionContext | None"))] context: Option<
+            &PartitionContext,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::try_from(consumer)?;
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
-        let strategy: RustPollingStrategy = polling_strategy.into();
+        let strategy = RustPollingStrategy::from(polling_strategy);
+        let strategy = match context {
+            Some(context) => strategy.with_context((*context).into()),
+            None => strategy,
+        };
 
         let inner = self.inner.clone();
 
@@ -1456,12 +1521,14 @@ impl IggyClient {
                 .await
                 .map_err(to_runtime_error)?;
             let partition_id = polled_messages.partition_id;
+            let context = PartitionContext::from(polled_messages.context);
             let messages = polled_messages
                 .messages
                 .into_iter()
                 .map(|m| ReceiveMessage {
                     inner: m,
                     partition_id,
+                    context,
                 })
                 .collect::<Vec<_>>();
             Ok(messages)

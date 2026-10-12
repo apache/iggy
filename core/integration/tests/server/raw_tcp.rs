@@ -66,6 +66,24 @@ pub(crate) async fn connect_to(addr: SocketAddr) -> TcpStream {
     TcpStream::connect(addr).await.unwrap()
 }
 
+pub(crate) async fn partition_context(
+    client: &IggyClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: u32,
+) -> PartitionContext {
+    client
+        .get_topic(stream_id, topic_id)
+        .await
+        .expect("discover partition context")
+        .expect("topic exists")
+        .partitions
+        .into_iter()
+        .find(|partition| partition.id == partition_id)
+        .expect("partition exists")
+        .context
+}
+
 pub(crate) fn request_header(
     operation: Operation,
     client: u128,

@@ -44,9 +44,19 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
 public class StreamsTcpClient implements StreamsClient {
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final Runnable topologyChanged;
 
     public StreamsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, () -> {});
+    }
+
+    /**
+     * @param topologyChanged runs after this client deletes a stream, when the
+     *     partition contexts cached for its topics no longer hold
+     */
+    StreamsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, Runnable topologyChanged) {
         this.connectionSupplier = connectionSupplier;
+        this.topologyChanged = topologyChanged;
     }
 
     private AsyncTcpConnection connection() {
@@ -109,6 +119,9 @@ public class StreamsTcpClient implements StreamsClient {
     public CompletableFuture<Void> deleteStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection().send(CommandCode.Stream.DELETE.getValue(), payload).thenAccept(ReferenceCounted::release);
+        return connection().send(CommandCode.Stream.DELETE.getValue(), payload).thenAccept(response -> {
+            response.release();
+            topologyChanged.run();
+        });
     }
 }

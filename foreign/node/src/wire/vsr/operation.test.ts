@@ -97,7 +97,9 @@ describe('VSR operation classification', () => {
     assert.equal(isKnownOperation(Operation.SendMessages), true);
     assert.equal(isKnownOperation(Operation.RetireSession), true);
     assert.equal(isKnownOperation(Operation.FinalizeSession), true);
-    for (const undeclared of [69, 127, 131, 135, 150, 159, 163, 164, 165, 167, 255])
+    assert.equal(isKnownOperation(Operation.RetireConsumerGroupOwners), true);
+    assert.equal(isInternal(Operation.RetireConsumerGroupOwners), true);
+    for (const undeclared of [69, 127, 131, 135, 150, 159, 163, 164, 165, 170, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });
