@@ -16,11 +16,66 @@
 // under the License.
 
 use iggy::prelude::{
-    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, GlobalPermissions, Identifier, IdentityInfo,
-    Permissions, StreamClient, UserClient, UserStatus,
+    ConsumerGroupClient, ConsumerGroupDetails, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
+    GlobalPermissions, Identifier, IdentityInfo, Permissions, StreamClient, UserClient, UserStatus,
 };
+use std::collections::HashSet;
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
 
 pub const USER_PASSWORD: &str = "secret";
+const ASSIGNMENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Wait for the expected assignment distribution, checking uniqueness during convergence.
+pub async fn wait_for_consumer_group_assignment(
+    client: &impl ConsumerGroupClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    group_id: &Identifier,
+    members_count: u32,
+    budget: Duration,
+) -> ConsumerGroupDetails {
+    let deadline = Instant::now() + budget;
+    loop {
+        let group = client
+            .get_consumer_group(stream_id, topic_id, group_id)
+            .await
+            .expect("read consumer group")
+            .expect("consumer group exists");
+        let mut assigned = HashSet::new();
+        for member in &group.members {
+            for partition in &member.partitions {
+                assert!(
+                    assigned.insert(*partition),
+                    "duplicate partition owner: {group:?}"
+                );
+            }
+        }
+        let fewest = group
+            .members
+            .iter()
+            .map(|member| member.partitions_count)
+            .min()
+            .unwrap_or(0);
+        let most = group
+            .members
+            .iter()
+            .map(|member| member.partitions_count)
+            .max()
+            .unwrap_or(0);
+        if group.members_count == members_count
+            && (members_count == 0 || assigned.len() == group.partitions_count as usize)
+            && most - fewest <= 1
+        {
+            return group;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ownership did not converge to {members_count} members within {budget:?}: {group:?}"
+        );
+        sleep(ASSIGNMENT_POLL_INTERVAL).await;
+    }
+}
 
 /// Login as root user.
 pub async fn login_root(client: &impl UserClient) -> Result<IdentityInfo, iggy_common::IggyError> {

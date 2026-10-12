@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { CommandResponse, ClientProvider } from '../client/client.type.js';
+import type { CommandResponse, ClientProvider, SendCommandOptions } from '../client/client.type.js';
 
 /**
  * Represents a command that can be sent to the Iggy server.
@@ -40,13 +40,14 @@ export type Command<I, O> = {
  * @typeParam I - Input type for the command arguments
  * @typeParam O - Output type for the command response
  * @param cmd - Command definition with code, serialize, and deserialize functions
+ * @param options - Send options taken from the command arguments
  * @returns A function that takes a ClientProvider and returns an async command executor
  */
-export function wrapCommand<I, O>(cmd: Command<I, O>) {
+export function wrapCommand<I, O>(cmd: Command<I, O>, options?: (arg: I) => SendCommandOptions) {
   return (getClient: ClientProvider) =>
     async (arg: I) => {
       const payload = cmd.serialize(arg);
       const client = await getClient();
-      return cmd.deserialize(await client.sendCommand(cmd.code, payload));
+      return cmd.deserialize(await client.sendCommand(cmd.code, payload, options?.(arg)));
     };
 };

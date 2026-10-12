@@ -30,7 +30,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::info;
 
-const POLL_ATTEMPTS_V3: usize = 100;
+// Each serial batch can wait for InfluxDB's default one-second WAL flush.
+const POLL_ATTEMPTS_V3: usize = 300;
 const POLL_INTERVAL_MS_V3: u64 = 50;
 
 pub struct InfluxDb3SinkFixture {
@@ -57,18 +58,22 @@ impl InfluxDb3SinkFixture {
     ) -> Result<usize, TestBinaryError> {
         let sql = format!("SELECT * FROM \"{measurement}\"");
         info!("V3 wait_for_points SQL: {sql}");
+        let mut observed = 0;
         for _ in 0..POLL_ATTEMPTS_V3 {
             match self.query_count(&sql).await {
                 Ok(n) if n >= expected => {
                     info!("Found {n} rows in InfluxDB 3 (expected {expected})");
                     return Ok(n);
                 }
-                Ok(_) | Err(_) => {}
+                Ok(count) => observed = count,
+                Err(_) => {}
             }
             sleep(Duration::from_millis(POLL_INTERVAL_MS_V3)).await;
         }
         Err(TestBinaryError::InvalidState {
-            message: format!("Expected at least {expected} rows after {POLL_ATTEMPTS_V3} attempts"),
+            message: format!(
+                "Expected at least {expected} rows after {POLL_ATTEMPTS_V3} attempts, observed {observed}"
+            ),
         })
     }
 
