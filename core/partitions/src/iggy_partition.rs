@@ -13005,13 +13005,15 @@ mod tests {
         let partition_dir = directory.path().to_string_lossy().into_owned();
         partition.set_partition_dir(partition_dir.clone());
         partition.runtime_options.durability = iggy_common::Durability::Persisted;
-        for kind in ["consumers", "groups"] {
+        for kind in ["consumers", "groups", "external_groups"] {
             std::fs::create_dir_all(directory.path().join("offsets").join(kind)).unwrap();
         }
         partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] =
             Some(format!("{partition_dir}/offsets/consumers"));
         partition.consumer_offset_dirs[ConsumerKind::ConsumerGroup.index()] =
             Some(format!("{partition_dir}/offsets/groups"));
+        partition.consumer_offset_dirs[ConsumerKind::ExternalGroup.index()] =
+            Some(format!("{partition_dir}/offsets/external_groups"));
         partition.open_persistence().await.unwrap();
         let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
         let prepare = checksummed_segment_prepare(1, 0, 0, b"durable");
