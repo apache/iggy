@@ -25,6 +25,9 @@ namespace Apache.Iggy.Contracts;
 /// </summary>
 public sealed class PartitionResponse
 {
+    /// <summary>Captured incarnation and ownership authority for these offsets.</summary>
+    public PartitionContext Context { get; init; }
+
     /// <summary>
     ///     Partition identifier.
     /// </summary>

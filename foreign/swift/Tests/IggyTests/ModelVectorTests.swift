@@ -52,6 +52,20 @@ struct ModelVectorTests {
         return writer.bytes
     }
 
+    @Test func partitionContext() throws {
+        let context = PartitionContext(incarnation: 17, ownerGeneration: 9, metadataOp: 52)
+        var writer = ByteWriter()
+        context.encode(into: &writer)
+        #expect(writer.bytes == golden.bytes("partition.context"))
+        var reader = ByteReader(writer.bytes)
+        #expect(try PartitionContext.decode(from: &reader) == context)
+        #expect(reader.isAtEnd)
+        for length in 0..<writer.bytes.count {
+            var truncated = ByteReader(Array(writer.bytes.prefix(length)))
+            #expect(throws: WireError.self) { try PartitionContext.decode(from: &truncated) }
+        }
+    }
+
     @Test func identifiers() throws {
         #expect(try encode(1) == golden.bytes("identifier.numeric.1"))
         #expect(try encode("my-stream") == golden.bytes("identifier.named.my-stream"))

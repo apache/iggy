@@ -118,7 +118,12 @@ public sealed class StreamPermissions
     ///             <see cref="Apache.Iggy.IggyClient.IIggyOffset.GetOffsetAsync" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyOffset.StoreOffsetAsync" />
+    ///             <see
+    ///                 cref="Apache.Iggy.IggyClient.IIggyOffset.StoreOffsetAsync(Consumer, Identifier, Identifier, ulong, uint?, CancellationToken)" />
+    ///         </item>
+    ///         <item>
+    ///             <see
+    ///                 cref="Apache.Iggy.IggyClient.IIggyOffset.StoreOffsetAsync(Consumer, Identifier, Identifier, ulong, uint, PartitionContext, CancellationToken)" />
     ///         </item>
     ///         <item>
     ///             <see cref="Apache.Iggy.IggyClient.IIggyOffset.DeleteOffsetAsync" />

@@ -502,7 +502,15 @@ pub async fn run(harness: &TestHarness) {
 
     match result {
         Ok(_) => {
-            let consumer_group = get_consumer_group(&client).await;
+            let consumer_group = integration::harness::wait_for_consumer_group_assignment(
+                &client,
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+                1,
+                TOPIC_CONVERGENCE_TIMEOUT,
+            )
+            .await;
             assert_eq!(consumer_group.id, consumer_group_id);
             assert_eq!(consumer_group.partitions_count, PARTITIONS_COUNT);
             assert_eq!(consumer_group.name, CONSUMER_GROUP_NAME);

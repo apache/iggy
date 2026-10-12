@@ -35,6 +35,7 @@ export const Operation = {
   CompleteConsumerGroupRevocation: 67,
   TruncatePartition: 68,
   FinalizeSession: 70,
+  CompleteLifecycle: 71,
   CreateStream: 128,
   UpdateStream: 129,
   DeleteStream: 130,
@@ -58,7 +59,10 @@ export const Operation = {
   SendMessages: 160,
   StoreConsumerOffset: 161,
   DeleteConsumerOffset: 162,
-  RetireSession: 166
+  RetireSession: 166,
+  InstallConsumerGroupOwner: 167,
+  TransitionPartitionHistory: 168,
+  RetireConsumerGroupOwners: 169
 } as const;
 
 const INTERNAL_START = 64;
@@ -109,7 +113,10 @@ export const isKnownOperation = (operation: number): boolean =>
 /** Replica-only operations, never client-sent. */
 export const isInternal = (operation: number): boolean =>
   (operation >= INTERNAL_START && operation < METADATA_START) ||
-    operation === Operation.RetireSession;
+    operation === Operation.RetireSession ||
+    operation === Operation.InstallConsumerGroupOwner ||
+    operation === Operation.TransitionPartitionHistory ||
+    operation === Operation.RetireConsumerGroupOwners;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:
