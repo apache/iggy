@@ -26,12 +26,30 @@
 //! every function some *other* binary uses as unused here.
 #![allow(dead_code)]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use kafka_protocol::protocol::{Decodable, Encodable};
 
 use super::codec::Encoder;
 
+/// Encodes any `kafka_protocol` request or response type at `version`.
+pub fn encode<M: Encodable>(message: &M, version: i16) -> Bytes {
+    let mut buf = BytesMut::new();
+    message.encode(&mut buf, version).expect("encode request");
+    buf.freeze()
+}
+
+/// Decodes any `kafka_protocol` request or response type at `version`.
+pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
+    let mut buf = body;
+    M::decode(&mut buf, version).expect("decode response")
+}
+
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(20, "DeleteTopics")];
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
+    (21, "DeleteRecords"),
+    (42, "DeleteGroups"),
+    (44, "IncrementalAlterConfigs"),
+];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
@@ -172,6 +190,47 @@ pub fn build_create_topics_empty_request(version: i16) -> Bytes {
     enc.freeze()
 }
 
+/// Empty `DeleteTopics` request (no topic names) for supported versions (v1-v5).
+pub fn build_delete_topics_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+
+    if flexible {
+        enc.write_varint(1); // empty topic_names compact array (N+1 = 1)
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_i32(5_000); // timeout_ms
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
+/// `DeleteTopics` request naming one topic, for supported versions (v1-v5).
+///
+/// Unlike [`build_delete_topics_empty_request`], this actually produces a per-topic result -
+/// an empty request's response has zero entries, so no error code in it is ever observed.
+pub fn build_delete_topics_request_with_name(version: i16, name: &str) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(32);
+
+    if flexible {
+        enc.write_varint(2); // one topic_names entry (N+1 = 2)
+        enc.write_compact_nullable_string(Some(name));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(name)).expect("name fits");
+    }
+    enc.write_i32(5_000); // timeout_ms
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
 /// Produce v2–v8 legacy request with optional transactional id and topic.
 pub fn build_produce_legacy_request(
     version: i16,
@@ -206,6 +265,41 @@ pub fn build_produce_flexible_empty_request(acks: i16) -> Bytes {
     enc.write_i32(1_000); // timeout_ms
     enc.write_varint(1); // empty topics compact array (N+1)
     enc.write_empty_tagged_fields();
+    enc.freeze()
+}
+
+/// `DescribeConfigs` with no resources. Flexible from v4. `include_documentation` exists from v3.
+pub fn build_describe_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // include_synonyms
+    if version >= 3 {
+        enc.write_bool(false); // include_documentation
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `AlterConfigs` with no resources. Flexible from v2.
+pub fn build_alter_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
     enc.freeze()
 }
 

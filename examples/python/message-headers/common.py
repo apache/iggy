@@ -22,7 +22,7 @@ import secrets
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 from apache_iggy import (
     Consumer,
@@ -50,7 +50,7 @@ HeadersBuilder = Callable[["Order"], PlainHeaders | TypedHeaders]
 MessageHandler = Callable[[ReceiveMessage], None]
 
 
-class OrderType(str, Enum):
+class OrderType(StrEnum):
     CREATED = "OrderCreated"
     CONFIRMED = "OrderConfirmed"
     REJECTED = "OrderRejected"

@@ -18,6 +18,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 using Microsoft.Extensions.Logging;
 
@@ -95,7 +96,7 @@ internal sealed class VsrConnection : IDisposable
     /// </summary>
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
-        bool retryTransient = true)
+        bool retryTransient = true, PartitionContext context = default)
     {
         var encoded = false;
         var requestStarted = false;
@@ -103,7 +104,7 @@ internal sealed class VsrConnection : IDisposable
 
         try
         {
-            VsrHeader.EncodeRequestHeader(_requestFrameBuffer, _session, code, body.Span);
+            VsrHeader.EncodeRequestHeader(_requestFrameBuffer, _session, code, body.Span, context);
 
             var frameSize = VsrHeader.HEADER_SIZE + body.Length;
             var coalesced = body.Length <= CoalescedBodyLimit;
@@ -147,7 +148,7 @@ internal sealed class VsrConnection : IDisposable
                     {
                         FromServer: true,
                         StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.UNAUTHORIZED or
-                            VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT
+                            VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT or VsrError.HISTORY_UNAVAILABLE
                     }
                         ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
                             "A later refusal does not resolve the original request outcome.")

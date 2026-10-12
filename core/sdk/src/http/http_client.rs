@@ -17,22 +17,34 @@
 
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyError, NonZeroIggyDuration};
+use crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
-    HttpMethod, IdentityInfo, TransportProtocol, validate_api_url,
+    ConnectionString, ConnectionStringUtils, ConsumerGroupClientState, DiagnosticEvent,
+    HttpConnectionStringOptions, HttpMethod, IdentityInfo, TransportProtocol, validate_api_url,
 };
 use reqwest::{Method, Response, StatusCode, Url};
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
+use reqwest_retry::{
+    DefaultRetryableStrategy, RetryTransientMiddleware, Retryable, RetryableStrategy,
+    policies::ExponentialBackoff,
+};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
+
+/// The first pause before a request refused with [`IggyError::LifecycleBusy`] is sent again.
+const LIFECYCLE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+/// No retry of a [`IggyError::LifecycleBusy`] refusal starts past this budget, which matches
+/// the time the binary transports wait for one reply.
+const LIFECYCLE_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 const PUBLIC_PATHS: &[&str] = &[
     "/",
@@ -49,8 +61,11 @@ pub struct HttpClient {
     /// The URL of the Iggy API.
     pub api_url: Url,
     pub(crate) heartbeat_interval: NonZeroIggyDuration,
-    client: ClientWithMiddleware,
+    client: reqwest::Client,
+    retry_policy: ExponentialBackoff,
     access_token: IggyRwLock<String>,
+    /// The contexts that fence sends to an explicit partition, read from the topic details.
+    pub(super) send_contexts: ConsumerGroupClientState,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
 }
 
@@ -95,15 +110,7 @@ impl HttpTransport for HttpClient {
     async fn get(&self, path: &str) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        let token = self.access_token.read().await;
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(token.deref())
-            .send()
-            .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        Self::handle_response(response).await
+        self.execute(Method::GET, url, |request| request).await
     }
 
     /// Invoke HTTP GET request to the Iggy API with query parameters.
@@ -114,16 +121,8 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        let token = self.access_token.read().await;
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(token.deref())
-            .query(query)
-            .send()
+        self.execute(Method::GET, url, |request| request.query(query))
             .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        Self::handle_response(response).await
     }
 
     /// Invoke HTTP POST request to the Iggy API.
@@ -134,16 +133,8 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        let token = self.access_token.read().await;
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(token.deref())
-            .json(payload)
-            .send()
+        self.execute(Method::POST, url, |request| request.json(payload))
             .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        Self::handle_response(response).await
     }
 
     /// Invoke HTTP PUT request to the Iggy API.
@@ -154,31 +145,15 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        let token = self.access_token.read().await;
-        let response = self
-            .client
-            .put(url)
-            .bearer_auth(token.deref())
-            .json(payload)
-            .send()
+        self.execute(Method::PUT, url, |request| request.json(payload))
             .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        Self::handle_response(response).await
     }
 
     /// Invoke HTTP DELETE request to the Iggy API.
     async fn delete(&self, path: &str) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        let token = self.access_token.read().await;
-        let response = self
-            .client
-            .delete(url)
-            .bearer_auth(token.deref())
-            .send()
-            .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        Self::handle_response(response).await
+        self.execute(Method::DELETE, url, |request| request).await
     }
 
     /// Invoke HTTP DELETE request to the Iggy API with query parameters.
@@ -189,16 +164,8 @@ impl HttpTransport for HttpClient {
     ) -> Result<Response, IggyError> {
         let url = self.get_url(path)?;
         self.fail_if_not_authenticated(path).await?;
-        let token = self.access_token.read().await;
-        let response = self
-            .client
-            .delete(url)
-            .bearer_auth(token.deref())
-            .query(query)
-            .send()
+        self.execute(Method::DELETE, url, |request| request.query(query))
             .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        Self::handle_response(response).await
     }
 
     async fn send_http_request(
@@ -210,16 +177,12 @@ impl HttpTransport for HttpClient {
         let method = Method::from_bytes(<&str>::from(method).as_bytes())
             .map_err(|_| IggyError::InvalidHttpRequest)?;
         let url = self.get_url(path)?;
-        let token = self.access_token.read().await;
-        let mut request = self.client.request(method, url).bearer_auth(token.deref());
-        if let Some(body) = body {
-            request = request.body(body);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| IggyError::InvalidHttpRequest)?;
-        let response = Self::handle_response(response).await?;
+        let response = self
+            .execute(method, url, |request| match &body {
+                Some(body) => request.body(body.clone()),
+                None => request,
+            })
+            .await?;
         response
             .bytes()
             .await
@@ -269,18 +232,16 @@ impl HttpClient {
         validate_api_url(&config.api_url)?;
         let api_url = Url::parse(&config.api_url).map_err(|_| IggyError::CannotParseUrl)?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.retries);
-        let client = ClientBuilder::new(reqwest::Client::new())
-            .with(TracingMiddleware::<SpanBackendWithUrl>::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
 
         let access_token = config.jwt.clone().unwrap_or_default();
 
         Ok(Self {
             api_url,
-            client,
+            client: reqwest::Client::new(),
+            retry_policy,
             heartbeat_interval: config.heartbeat_interval,
             access_token: IggyRwLock::new(access_token),
+            send_contexts: ConsumerGroupClientState::new(),
             events: broadcast(1000),
         })
     }
@@ -336,6 +297,60 @@ impl HttpClient {
         Ok(identity_info)
     }
 
+    /// Sends one request. Each [`IggyError::LifecycleBusy`] refusal commits, so the request is
+    /// sent again as a new one after a pause that doubles up to [`LIFECYCLE_RETRY_MAX_INTERVAL`],
+    /// until a retry would start past [`LIFECYCLE_RETRY_DEADLINE`].
+    async fn execute<F>(&self, method: Method, url: Url, decorate: F) -> Result<Response, IggyError>
+    where
+        F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
+    {
+        let uncertain_attempt = Arc::new(AtomicBool::new(false));
+        let client = self.retrying_client(&uncertain_attempt);
+        // Reads commit nothing, so only a write can leave an uncertain outcome behind.
+        let may_commit = method != Method::GET;
+        let deadline = Instant::now() + LIFECYCLE_RETRY_DEADLINE;
+        let mut pause = LIFECYCLE_RETRY_INTERVAL;
+        loop {
+            // The token is copied into the request, so no pause or slow reply holds its lock.
+            let request = {
+                let token = self.access_token.read().await;
+                decorate(
+                    client
+                        .request(method.clone(), url.clone())
+                        .bearer_auth(token.as_str()),
+                )
+            };
+            let response = request
+                .send()
+                .await
+                .map_err(|_| IggyError::InvalidHttpRequest)?;
+            let error = match Self::handle_response(response).await {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            let uncertain = may_commit && uncertain_attempt.load(Ordering::Relaxed);
+            match settle(error, uncertain) {
+                IggyError::LifecycleBusy if Instant::now() + pause < deadline => {
+                    sleep(pause).await;
+                    pause = (pause * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL);
+                }
+                error => return Err(error),
+            }
+        }
+    }
+
+    /// The retry middleware resends transient failures. It reports each of them to
+    /// `uncertain_attempt` unless the server provably never took the request.
+    fn retrying_client(&self, uncertain_attempt: &Arc<AtomicBool>) -> ClientWithMiddleware {
+        ClientBuilder::new(self.client.clone())
+            .with(TracingMiddleware::<SpanBackendWithUrl>::new())
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                self.retry_policy,
+                UncertainAttempts(Arc::clone(uncertain_attempt)),
+            ))
+            .build()
+    }
+
     async fn handle_response(response: Response) -> Result<Response, IggyError> {
         let status = response.status();
         match status.is_success() {
@@ -346,8 +361,8 @@ impl HttpClient {
                     StatusCode::UNAUTHORIZED => Err(IggyError::Unauthenticated),
                     StatusCode::FORBIDDEN => Err(IggyError::Unauthorized),
                     StatusCode::NOT_FOUND => Err(IggyError::ResourceNotFound(reason)),
-                    _ if is_request_too_old_body(&reason) => Err(IggyError::RequestTooOld),
-                    _ => Err(IggyError::HttpResponseError(status.as_u16(), reason)),
+                    _ => Err(typed_refusal(&reason)
+                        .unwrap_or_else(|| IggyError::HttpResponseError(status.as_u16(), reason))),
                 }
             }
         }
@@ -377,16 +392,60 @@ struct RefreshToken {
     token: String,
 }
 
-/// True when an error body is the server's JSON error whose `id` is the
-/// `RequestTooOld` code. The producer stops retrying on that error, so it must
-/// not reach the caller as a plain `HttpResponseError`.
-fn is_request_too_old_body(body: &str) -> bool {
+/// Marks the request uncertain when the middleware treats an attempt as transient and the
+/// attempt may have committed. A 503 can mean either, and only the body tells, so every
+/// transient answer counts except an admission refusal (429) and a failed connection.
+struct UncertainAttempts(Arc<AtomicBool>);
+
+impl RetryableStrategy for UncertainAttempts {
+    fn handle(&self, result: &Result<Response, reqwest_middleware::Error>) -> Option<Retryable> {
+        let retryable = DefaultRetryableStrategy.handle(result);
+        let never_taken = match result {
+            Ok(response) => response.status() == StatusCode::TOO_MANY_REQUESTS,
+            Err(reqwest_middleware::Error::Reqwest(error)) => error.is_connect(),
+            Err(reqwest_middleware::Error::Middleware(_)) => false,
+        };
+        if retryable == Some(Retryable::Transient) && !never_taken {
+            self.0.store(true, Ordering::Relaxed);
+        }
+        retryable
+    }
+}
+
+/// HTTP has no request dedup: a resend is a new request, so its refusal cannot tell whether an
+/// earlier attempt committed. Such a refusal reports an unknown outcome, which nothing refreshes
+/// or repeats.
+fn settle(error: IggyError, uncertain: bool) -> IggyError {
+    if uncertain
+        && matches!(
+            error,
+            IggyError::HistoryUnavailable
+                | IggyError::LifecycleBusy
+                | IggyError::Unauthorized
+                | IggyError::Unauthenticated
+        )
+    {
+        IggyError::TransientNotCommitted
+    } else {
+        error
+    }
+}
+
+/// Decodes the refusals the client acts on: a producer never repeats `RequestTooOld`, a send
+/// refreshes its context once on `HistoryUnavailable`, and `LifecycleBusy` is retried.
+fn typed_refusal(body: &str) -> Option<IggyError> {
     #[derive(Deserialize)]
     struct ErrorId {
         id: u32,
     }
-    serde_json::from_str::<ErrorId>(body)
-        .is_ok_and(|error| error.id == IggyError::RequestTooOld.as_code())
+    let id = serde_json::from_str::<ErrorId>(body).ok()?.id;
+    [
+        IggyError::RequestTooOld,
+        IggyError::HistoryUnavailable,
+        IggyError::LifecycleBusy,
+    ]
+    .into_iter()
+    .find(|error| error.as_code() == id)
 }
 
 /// Unit tests for HttpClient.
@@ -394,6 +453,131 @@ fn is_request_too_old_body(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::scripted_server::{Recorded, Reply, ScriptedServer};
+    use crate::prelude::{Identifier, StreamClient};
+    use std::iter;
+
+    /// The number of `LifecycleBusy` refusals scripted for a request retried until the deadline,
+    /// more than the retries that fit before it.
+    const REFUSALS_PAST_THE_DEADLINE: usize = 40;
+
+    fn pauses(requests: &[Recorded]) -> Vec<Duration> {
+        requests
+            .windows(2)
+            .map(|pair| pair[1].at - pair[0].at)
+            .collect()
+    }
+
+    fn stream_id() -> Identifier {
+        Identifier::numeric(1).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_lifecycle_busy_when_deleting_should_retry_as_new_requests_until_it_clears() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(400, &IggyError::LifecycleBusy),
+            Reply::error(400, &IggyError::LifecycleBusy),
+            Reply::empty(200),
+        ])
+        .await;
+
+        server.client().delete_stream(&stream_id()).await.unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            pauses(&requests),
+            [LIFECYCLE_RETRY_INTERVAL, LIFECYCLE_RETRY_INTERVAL * 2]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_lifecycle_busy_until_the_deadline_when_deleting_should_return_it() {
+        let server = ScriptedServer::start(
+            iter::repeat_with(|| Reply::error(400, &IggyError::LifecycleBusy))
+                .take(REFUSALS_PAST_THE_DEADLINE)
+                .collect(),
+        )
+        .await;
+
+        let busy = server.client().delete_stream(&stream_id()).await;
+
+        assert!(matches!(busy, Err(IggyError::LifecycleBusy)), "{busy:?}");
+        let requests = server.requests();
+        let pauses = pauses(&requests);
+        let doubling = iter::successors(Some(LIFECYCLE_RETRY_INTERVAL), |pause| {
+            Some((*pause * 2).min(LIFECYCLE_RETRY_MAX_INTERVAL))
+        });
+        assert_eq!(
+            pauses,
+            doubling.take(pauses.len()).collect::<Vec<_>>(),
+            "every pause doubles up to the cap"
+        );
+        let last = requests.last().unwrap().at;
+        assert!(last < LIFECYCLE_RETRY_DEADLINE, "{last:?}");
+        assert!(
+            last + LIFECYCLE_RETRY_MAX_INTERVAL >= LIFECYCLE_RETRY_DEADLINE,
+            "another retry fit before the deadline: {last:?}"
+        );
+    }
+
+    /// The first attempt may have committed and the resend is a new request, so the refusal
+    /// of the resend reports an unknown outcome that nothing retries.
+    #[tokio::test(start_paused = true)]
+    async fn given_resend_after_uncertain_attempt_when_refused_should_report_not_committed() {
+        for (status, refusal) in [
+            (400, IggyError::LifecycleBusy),
+            (403, IggyError::Unauthorized),
+            (401, IggyError::Unauthenticated),
+        ] {
+            let server = ScriptedServer::start(vec![
+                Reply::empty(503),
+                Reply::error(status, &refusal),
+                Reply::empty(200),
+            ])
+            .await;
+
+            let unknown = server.client().delete_stream(&stream_id()).await;
+
+            assert!(
+                matches!(unknown, Err(IggyError::TransientNotCommitted)),
+                "{refusal}: {unknown:?}"
+            );
+            assert_eq!(server.requests().len(), 2, "{refusal}");
+        }
+    }
+
+    /// A read commits nothing, so the refusal of its resend is definitive.
+    #[tokio::test(start_paused = true)]
+    async fn given_resend_of_a_read_when_refused_should_report_the_refusal() {
+        let server = ScriptedServer::start(vec![
+            Reply::empty(503),
+            Reply::error(403, &IggyError::Unauthorized),
+        ])
+        .await;
+
+        let refused = server.client().get_stream(&stream_id()).await;
+
+        assert!(
+            matches!(refused, Err(IggyError::Unauthorized)),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn typed_refusals_survive_http_decoding() {
+        for error in [
+            IggyError::RequestTooOld,
+            IggyError::HistoryUnavailable,
+            IggyError::LifecycleBusy,
+        ] {
+            let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
+            assert_eq!(typed_refusal(&body), Some(error));
+        }
+        for body in ["", "unavailable", r#"{"id":500}"#, r#"{"id":"87"}"#] {
+            assert_eq!(typed_refusal(body), None);
+        }
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {

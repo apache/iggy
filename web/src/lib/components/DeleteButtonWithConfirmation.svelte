@@ -20,7 +20,7 @@ under the License.
 <script lang="ts">
   import { run } from 'svelte/legacy';
 
-  import { tooltip } from '$lib/actions/tooltip';
+  import { tooltip } from '#lib/actions/tooltip.js';
   import { fade } from 'svelte/transition';
   import Button from './Button.svelte';
 

@@ -53,7 +53,10 @@ use crate::stm::user::UsersSnapshot;
 /// Version 8: streams persist the revision of their partition incarnations.
 ///
 /// Version 10: `PartitionSnapshot` dropped `purge_generation`.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 10;
+///
+/// Version 11: streams also persist pending lifecycle intents, and each
+/// `TopicSnapshot` the op of its last consumer group catalog change.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 11;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -78,6 +81,7 @@ const _: () = assert!(SNAPSHOT_WRITER_RELEASE > 0);
 
 #[derive(Debug)]
 pub enum SnapshotError {
+    InvalidState(&'static str),
     /// Serialization failed.
     Serialize(rmp_serde::encode::Error),
     /// Deserialization failed.
@@ -98,17 +102,25 @@ pub enum SnapshotError {
     /// The snapshot's integrity trailer does not match its payload: a torn or
     /// bit-rotted checkpoint. Refuse to restore from it rather than feed corrupt state
     /// into the state machine.
-    ChecksumMismatch { expected: u128, actual: u128 },
+    ChecksumMismatch {
+        expected: u128,
+        actual: u128,
+    },
     /// Snapshot integrity framing is absent or damaged.
     InvalidTrailer,
     /// Snapshot file is too short to contain a valid checksum.
-    Truncated { size: u64 },
+    Truncated {
+        size: u64,
+    },
     /// The snapshot was written in a format version this build does not read: a
     /// different build wrote it, on this disk or on a state-transfer peer. Refuse it
     /// rather than let msgpack read one field's bytes as another's. The version is
     /// peeked ahead of the rest of the payload, so this fires even when nothing past
     /// it is recognizable.
-    UnsupportedFormatVersion { found: u32, expected: u32 },
+    UnsupportedFormatVersion {
+        found: u32,
+        expected: u32,
+    },
     /// A state-transfer descriptor's frontiers contradict its artifacts: a
     /// `commit_op` below the snapshot the same offer ships, or a client-table
     /// frontier outside the snapshot-to-commit range. Both are impossible from a
@@ -142,6 +154,7 @@ pub enum PersistStage {
 impl fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidState(reason) => write!(f, "invalid snapshot state: {reason}"),
             Self::Serialize(e) => write!(f, "snapshot serialization failed: {e}"),
             Self::Deserialize(e) => write!(f, "snapshot deserialization failed: {e}"),
             Self::ClientTable(e) => write!(f, "snapshot client table is invalid: {e}"),
@@ -192,7 +205,8 @@ impl std::error::Error for SnapshotError {
             Self::Deserialize(e) => Some(e),
             Self::ClientTable(e) => Some(e),
             Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
-            Self::ChecksumMismatch { .. }
+            Self::InvalidState(..)
+            | Self::ChecksumMismatch { .. }
             | Self::MissingClientTable
             | Self::InvalidTrailer
             | Self::Truncated { .. }
@@ -303,7 +317,16 @@ impl MetadataSnapshot {
                 expected: SNAPSHOT_FORMAT_VERSION,
             });
         }
-        rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)
+        let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
+        if let Some(streams) = &self.streams {
+            streams.validate_ownership_history(self.sequence_number)?;
+        }
+        Ok(())
     }
 }
 
@@ -490,6 +513,7 @@ macro_rules! impl_fill_restore {
             ) -> Result<Self, $crate::stm::snapshot::SnapshotError> {
                 use serde::de::Error as _;
                 use $crate::stm::snapshot::{SnapshotError, Snapshotable};
+                snapshot.validate()?;
                 let snap = snapshot.$field.clone().ok_or_else(|| {
                     SnapshotError::Deserialize(rmp_serde::decode::Error::custom(format_args!(
                         "Snapshot Restore Error: {}",
@@ -510,6 +534,7 @@ macro_rules! impl_fill_restore {
                 use serde::de::Error as _;
                 use $crate::stm::snapshot::SnapshotError;
                 paste::paste! {
+                    snapshot.validate()?;
                     let snap = snapshot.$field.clone().ok_or_else(|| {
                         SnapshotError::Deserialize(rmp_serde::decode::Error::custom(
                             format_args!("Snapshot Restore Error: {}", stringify!($field)),
@@ -531,6 +556,7 @@ macro_rules! impl_fill_restore {
             ) -> Result<(), $crate::stm::snapshot::SnapshotError> {
                 use serde::de::Error as _;
                 use $crate::stm::snapshot::SnapshotError;
+                snapshot.validate()?;
                 if snapshot.$field.is_none() {
                     return Err(SnapshotError::Deserialize(
                         rmp_serde::decode::Error::custom(format_args!(
@@ -578,7 +604,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 10;
+        const PINNED_VERSION: u32 = 11;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -600,9 +626,9 @@ mod tests {
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 11;
+        const TOPIC_FIELD_COUNT: u32 = 12;
         const STREAM_FIELD_COUNT: u32 = 6;
-        const STREAMS_FIELD_COUNT: u32 = 3;
+        const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
@@ -640,6 +666,7 @@ mod tests {
             consumer_groups: Vec::new(),
             next_consumer_group_id: 0,
             options: ResourceOptions::new(),
+            consumer_group_catalog_op: 0,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -686,6 +713,7 @@ mod tests {
             items: vec![(0, stream)],
             revision: 1,
             namespace_revision: 1,
+            lifecycle_intents: std::collections::BTreeMap::default(),
         };
         let encoded = rmp_serde::to_vec(&streams).unwrap();
         assert_eq!(
@@ -827,6 +855,7 @@ mod tests {
 
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![(
@@ -868,6 +897,7 @@ mod tests {
                             // instead of matching a default.
                             next_consumer_group_id: 5,
                             options: ResourceOptions::default(),
+                            consumer_group_catalog_op: 7,
                         },
                     )],
                     options: ResourceOptions::default(),
@@ -898,6 +928,7 @@ mod tests {
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);
+        assert_eq!(topic.consumer_group_catalog_op, 7);
     }
 
     fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {
@@ -946,6 +977,7 @@ mod tests {
         };
 
         let streams_snap = StreamsSnapshot {
+            lifecycle_intents: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![

@@ -20,11 +20,14 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <gtest/gtest.h>
@@ -118,6 +121,44 @@ inline iggy::ffi::TopicCreateOptions make_topic_create_options(
     opts.has_max_topic_size        = true;
     opts.max_topic_size            = max_topic_size;
     return opts;
+}
+
+// Joining commits the membership at once, but a member owns its partitions only after every
+// affected partition installs it as owner. Until then group polls and group offset calls fail
+// with ConsumerGroupPartitionNotOwned (5009).
+inline ::testing::AssertionResult wait_for_consumer_group_assignment(iggy::ffi::Client *client,
+                                                                     const iggy::ffi::Identifier &stream_id,
+                                                                     const iggy::ffi::Identifier &topic_id,
+                                                                     const iggy::ffi::Identifier &group_id,
+                                                                     const std::uint32_t members_count) {
+    constexpr auto assignment_timeout       = std::chrono::seconds(10);
+    constexpr auto assignment_poll_interval = std::chrono::milliseconds(100);
+    const auto deadline                     = std::chrono::steady_clock::now() + assignment_timeout;
+    while (true) {
+        const auto group = client->get_consumer_group(stream_id, topic_id, group_id);
+        std::set<std::uint32_t> assigned;
+        std::uint32_t fewest = group.partitions_count;
+        std::uint32_t most   = 0;
+        for (const auto &member : group.members) {
+            for (const auto partition : member.partitions) {
+                if (!assigned.insert(partition).second) {
+                    return ::testing::AssertionFailure() << "partition " << partition << " has more than one owner";
+                }
+            }
+            fewest = std::min(fewest, member.partitions_count);
+            most   = std::max(most, member.partitions_count);
+        }
+        if (group.members_count == members_count && assigned.size() == group.partitions_count && most <= fewest + 1) {
+            return ::testing::AssertionSuccess();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return ::testing::AssertionFailure()
+                   << "consumer group did not converge to " << members_count << " members owning all "
+                   << group.partitions_count << " partitions within " << assignment_timeout.count() << " s; "
+                   << group.members_count << " members own " << assigned.size() << " partitions";
+        }
+        std::this_thread::sleep_for(assignment_poll_interval);
+    }
 }
 
 struct TrackedConsumerGroup {

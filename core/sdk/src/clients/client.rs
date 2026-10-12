@@ -21,6 +21,7 @@ use crate::clients::client_builder::IggyClientBuilder;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::EncryptorKind;
+use crate::prelude::Identifier;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
@@ -653,8 +654,8 @@ impl IggyClient {
             self.client.clone(),
             name.to_owned(),
             Consumer::new(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             Some(partition),
             self.encryptor.clone(),
             None,
@@ -723,9 +724,9 @@ impl IggyClient {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),
             name.to_owned(),
-            Consumer::group(name.try_into()?),
-            stream.try_into()?,
-            topic.try_into()?,
+            Consumer::group(Identifier::named(name)?),
+            Identifier::named(stream)?,
+            Identifier::named(topic)?,
             None,
             self.encryptor.clone(),
             None,
@@ -784,9 +785,9 @@ impl IggyClient {
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
-            stream.try_into()?,
+            Identifier::named(stream)?,
             stream.to_owned(),
-            topic.try_into()?,
+            Identifier::named(topic)?,
             topic.to_owned(),
             self.encryptor.clone(),
             self.partitioner.clone(),
@@ -839,6 +840,17 @@ impl IggyClient {
     /// The HTTP counterpart is
     /// [`send_http_request`](IggyClient::send_http_request).
     ///
+    /// Partition commands carry the partition context the typed API would send.
+    /// `SendMessages` with an explicit partition id captures one with
+    /// `GetSendContext` and caches it. `PollMessages`, `StoreConsumerOffset` and
+    /// `DeleteConsumerOffset` are routed like their typed calls and take the
+    /// context their route reports, so after another client deleted and
+    /// recreated the partition, one call can fail with
+    /// [`IggyError::HistoryUnavailable`]
+    /// ([`IggyError::ConsumerGroupPartitionNotOwned`] for a consumer group).
+    /// The failed route is dropped and the next call routes again. See
+    /// [`BinaryTransport::send_raw_with_response`].
+    ///
     /// # Examples
     ///
     /// Ping the server over the raw binary path. `PING_CODE` takes an empty
@@ -865,8 +877,13 @@ impl IggyClient {
     /// [`IggyError::InvalidCommand`] if `code` is one of the session-control
     /// codes (login, logout, and register). Use the typed `login_user` /
     /// `logout_user` methods so the SDK's session state stays correct.
+    /// The same error, before anything is sent, if the payload of a partition
+    /// command does not decode.
     /// [`IggyError::FeatureUnavailable`] on the HTTP transport, which has no
-    /// binary path.
+    /// binary path, and before anything is sent for `SendMessages` with
+    /// `Balanced` or `MessagesKey` partitioning. Use
+    /// [`send_messages`](crate::prelude::MessageClient::send_messages) or an
+    /// explicit partition id.
     ///
     /// [`iggy_binary_protocol`]: iggy_binary_protocol
     /// [`iggy_binary_protocol::codes`]: iggy_binary_protocol::codes

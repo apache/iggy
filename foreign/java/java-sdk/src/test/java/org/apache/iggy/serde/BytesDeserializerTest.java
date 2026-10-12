@@ -138,6 +138,7 @@ class BytesDeserializerTest {
         writeU64(buffer, BigInteger.valueOf(99)); // current offset
         writeU64(buffer, BigInteger.valueOf(200)); // size
         writeU64(buffer, BigInteger.valueOf(20)); // messages count
+        buffer.writeZero(24);
     }
 
     @Nested

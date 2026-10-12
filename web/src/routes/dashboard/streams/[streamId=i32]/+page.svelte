@@ -20,12 +20,12 @@ under the License.
 <script lang="ts">
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import Button from '$lib/components/Button.svelte';
-  import Icon from '$lib/components/Icon.svelte';
-  import { openModal } from '$lib/components/Modals/AppModals.svelte';
-  import SortableList from '$lib/components/SortableList.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
-  import type { StreamDetails } from '$lib/domain/StreamDetails';
+  import Button from '#lib/components/Button.svelte';
+  import Icon from '#lib/components/Icon.svelte';
+  import { openModal } from '#lib/components/Modals/AppModals.svelte';
+  import SortableList from '#lib/components/SortableList.svelte';
+  import { typedRoute } from '#lib/types/appRoutes.js';
+  import type { StreamDetails } from '#lib/domain/StreamDetails.js';
 
   interface Props {
     data: {
@@ -86,7 +86,7 @@ under the License.
   rowClass="grid grid-cols-[150px_3fr_2fr_2fr_2fr_2fr_3fr]"
   data={stream.topics}
   hrefBuilder={(topic) =>
-    resolve(typedRoute(`/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}`))}
+    resolve(typedRoute(`dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}`))}
   colNames={{
     id: 'ID',
     name: 'Name',

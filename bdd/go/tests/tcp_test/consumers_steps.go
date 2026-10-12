@@ -20,6 +20,7 @@ package tcp_test
 import (
 	"context"
 	"fmt"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -131,7 +132,21 @@ func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId u
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
-	consumer, err := client.GetConsumerGroup(context.Background(), streamIdentifier, topicIdentifier, groupIdentifier)
+	const assignmentTimeout = 5 * time.Second
+	const assignmentPollInterval = 10 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), assignmentTimeout)
+	defer cancel()
+	ticker := time.NewTicker(assignmentPollInterval)
+	defer ticker.Stop()
+	consumer, err := client.GetConsumerGroup(ctx, streamIdentifier, topicIdentifier, groupIdentifier)
+	for err == nil && consumer != nil && (len(consumer.Members) != 1 || consumer.Members[0].PartitionsCount != 2) {
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-ticker.C:
+			consumer, err = client.GetConsumerGroup(ctx, streamIdentifier, topicIdentifier, groupIdentifier)
+		}
+	}
 
 	ginkgo.It("should join consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())

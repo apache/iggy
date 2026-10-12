@@ -300,6 +300,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
     shard.set_repair_gap_debounce_ticks(repair_gap_debounce_ticks(config));
     shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
+    shard.set_partition_io_timeout(
+        config
+            .cluster
+            .superblock_wedged_fatal_timeout
+            .get_duration(),
+    );
     shard.set_served_segment_cache_bytes_max(
         config
             .partition
@@ -417,7 +423,7 @@ fn superblock_window_to_failures(window: Duration) -> u64 {
     if window.is_zero() {
         return 0;
     }
-    // `write_superblock_inner` records failure N and only then arms the wait
+    // `accept_superblock` records failure N and only then arms the wait
     // that follows it, so failure N ARRIVES at the sum of the N-1 waits before
     // it -- the first arrives at zero. The loop sums forward until the window is
     // covered, and the count that satisfies it is one past the last wait summed.

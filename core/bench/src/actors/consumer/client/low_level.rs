@@ -88,7 +88,10 @@ impl ConsumerClient for LowLevelConsumerClient {
         let polled = match polled {
             Ok(p) => p,
             Err(e) => {
-                if matches!(e, IggyError::TopicIdNotFound(_, _)) {
+                if matches!(
+                    e,
+                    IggyError::TopicIdNotFound(_, _) | IggyError::TransientNotAccepted
+                ) {
                     return Ok(None);
                 }
                 return Err(e);

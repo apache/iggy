@@ -47,6 +47,7 @@ internal static class CommandCodes
     internal const int SEND_MESSAGES_CODE = 101;
     internal const int GET_POLL_ROUTING_CODE = 103;
     internal const int POLL_MESSAGES_ON_PRIMARY_CODE = 104;
+    internal const int GET_SEND_CONTEXT_CODE = 105;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;

@@ -37,6 +37,7 @@ import org.apache.iggy.message.PartitioningKind;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.TopicDetails;
@@ -81,16 +82,17 @@ public class MessagesTcpClient implements MessagesClient {
      */
     private static final Duration ROUTING_CACHE_REFRESH = Duration.ofSeconds(5);
 
-    private final Supplier<AsyncTcpConnection> connectionSupplier;
     private final ClientRoutingState routingState;
     private final TopicsClient topicsClient;
     private final ConsumerGroupsClient consumerGroupsClient;
     private final PollRouter pollRouter;
     private final Supplier<CompletableFuture<Boolean>> clustered;
+    private final PartitionContexts sendContexts;
+    private final PartitionContexts pollContexts;
 
     /**
      * Creates a low-level client on the supplied connection without primary routing.
-     * Use {@code Iggy.tcpClientBuilder()} for clustered auto-commit polling so the
+     * Use {@code Iggy.tcpClientBuilder()} for clustered polling so the
      * coordinator retains group membership while data connections reach primaries.
      */
     public MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
@@ -106,16 +108,31 @@ public class MessagesTcpClient implements MessagesClient {
             ClientRoutingState routingState,
             PollRouter pollRouter,
             Supplier<CompletableFuture<Boolean>> clustered) {
-        this.connectionSupplier = connectionSupplier;
+        this(connectionSupplier, routingState, pollRouter, clustered, PartitionContexts.forSends(connectionSupplier));
+    }
+
+    /**
+     * @param sendContexts the owning client's send-context cache, shared with its
+     *     raw requests and dropped when it deletes a stream or a topic, or creates
+     *     or deletes partitions
+     */
+    MessagesTcpClient(
+            Supplier<AsyncTcpConnection> connectionSupplier,
+            ClientRoutingState routingState,
+            PollRouter pollRouter,
+            Supplier<CompletableFuture<Boolean>> clustered,
+            PartitionContexts sendContexts) {
         this.routingState = routingState;
         this.topicsClient = new TopicsTcpClient(connectionSupplier);
         this.consumerGroupsClient = new ConsumerGroupsTcpClient(connectionSupplier);
         this.pollRouter = pollRouter;
         this.clustered = clustered;
-    }
-
-    private AsyncTcpConnection connection() {
-        return connectionSupplier.get();
+        this.sendContexts = sendContexts;
+        this.pollContexts = new PartitionContexts(
+                connectionSupplier,
+                CommandCode.Messages.GET_POLL_ROUTING.getValue(),
+                PollRouter.ATTACHMENT_BYTES,
+                false);
     }
 
     @Override
@@ -174,7 +191,7 @@ public class MessagesTcpClient implements MessagesClient {
         payload.writeByte(autoCommit ? 1 : 0);
 
         // Send async request and transform response
-        CompletableFuture<ByteBuf> sent = sendPoll(payload, autoCommit);
+        CompletableFuture<ByteBuf> sent = sendPoll(payload, strategy.context());
         CompletableFuture<PolledMessages> result = sent.thenApply(response -> {
             try {
                 return BytesDeserializer.readPolledMessages(response);
@@ -190,9 +207,9 @@ public class MessagesTcpClient implements MessagesClient {
         return result;
     }
 
-    private CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, boolean autoCommit) {
-        if (!autoCommit || pollRouter == null) {
-            return connection().send(CommandCode.Messages.POLL.getValue(), payload);
+    CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, Optional<PartitionContext> context) {
+        if (pollRouter == null) {
+            return sendPlainPoll(payload, context);
         }
         PollCancellation cancellation = new PollCancellation();
         CompletableFuture<ByteBuf> result = clustered
@@ -203,9 +220,8 @@ public class MessagesTcpClient implements MessagesClient {
                         return CompletableFuture.<ByteBuf>failedFuture(
                                 error != null ? error : new CancellationException());
                     }
-                    CompletableFuture<ByteBuf> sent = isClustered
-                            ? pollRouter.poll(payload)
-                            : connection().send(CommandCode.Messages.POLL.getValue(), payload);
+                    CompletableFuture<ByteBuf> sent =
+                            isClustered ? pollRouter.poll(payload, context) : sendPlainPoll(payload, context);
                     cancellation.track(sent);
                     return sent;
                 })
@@ -216,6 +232,15 @@ public class MessagesTcpClient implements MessagesClient {
             }
         });
         return result;
+    }
+
+    private CompletableFuture<ByteBuf> sendPlainPoll(ByteBuf payload, Optional<PartitionContext> context) {
+        return pollContexts.send(
+                CommandCode.Messages.POLL.getValue(),
+                payload,
+                payload.retainedDuplicate(),
+                payload.readableBytes() - PollRouter.POLL_PARAMETERS_BYTES,
+                context);
     }
 
     @Override
@@ -257,7 +282,12 @@ public class MessagesTcpClient implements MessagesClient {
             writeAndRelease(payload, toBytes(partitioning));
             payload.writeIntLE(messages.size());
             encodeMessagesBatchInto(payload, messages);
-            sent = connection().send(CommandCode.Messages.SEND.getValue(), payload);
+            var contextPayload = Unpooled.buffer();
+            writeAndRelease(contextPayload, toBytes(streamId));
+            writeAndRelease(contextPayload, toBytes(topicId));
+            contextPayload.writeBytes(partitioning.value());
+            sent = sendContexts.send(
+                    CommandCode.Messages.SEND.getValue(), payload, contextPayload, contextPayload.readableBytes());
         } catch (RuntimeException | Error error) {
             payload.release();
             throw error;
@@ -291,7 +321,9 @@ public class MessagesTcpClient implements MessagesClient {
      * generation fence (the re-sync sentinel or a partition-not-owned error)
      * drop the cached assignment and retry. The attempt budget allows one
      * re-sync after the coordinator rejects a stale assignment, then one
-     * retry; an exhausted budget is an empty poll, not an error.
+     * retry; an exhausted budget is an empty poll, not an error. A
+     * partition-not-owned error under a caller context is returned instead,
+     * as the Rust SDK does.
      */
     @SuppressWarnings("checkstyle:ParameterNumber")
     private CompletableFuture<PolledMessages> pollGroupMessages(
@@ -348,10 +380,9 @@ public class MessagesTcpClient implements MessagesClient {
                         return CompletableFuture.completedFuture(polled);
                     })
                     .exceptionallyCompose(error -> {
-                        if (!isPartitionNotOwned(error)) {
+                        if (!retriesAfterFence(error, groupKey, strategy)) {
                             return CompletableFuture.failedFuture(error);
                         }
-                        routingState.invalidateAssignment(groupKey);
                         return pollGroupMessages(
                                 streamId,
                                 topicId,
@@ -368,7 +399,11 @@ public class MessagesTcpClient implements MessagesClient {
     private CompletableFuture<Void> ensureFreshAssignment(
             StreamId streamId, TopicId topicId, Consumer consumer, ClientRoutingState.GroupKey groupKey) {
         var cached = routingState.assignment(groupKey);
-        if (cached.isPresent() && System.nanoTime() - cached.get().syncedAtNanos() < ROUTING_CACHE_REFRESH.toNanos()) {
+        // As in the Rust SDK, an empty assignment is synced again on every poll:
+        // a member gets its partitions only as each one installs the new owner.
+        if (cached.isPresent()
+                && !cached.get().partitions().isEmpty()
+                && System.nanoTime() - cached.get().syncedAtNanos() < ROUTING_CACHE_REFRESH.toNanos()) {
             return CompletableFuture.completedFuture(null);
         }
         return consumerGroupsClient
@@ -387,6 +422,19 @@ public class MessagesTcpClient implements MessagesClient {
                 });
     }
 
+    /**
+     * Drops the cached assignment once a poll was refused as not owned, and says
+     * whether the poll retries on a fresh assignment. A poll with a caller context
+     * does not: the retry would carry the same context, which the server refuses again.
+     */
+    private boolean retriesAfterFence(Throwable error, ClientRoutingState.GroupKey groupKey, PollingStrategy strategy) {
+        if (!isPartitionNotOwned(error)) {
+            return false;
+        }
+        routingState.invalidateAssignment(groupKey);
+        return strategy.context().isEmpty();
+    }
+
     private static boolean isPartitionNotOwned(Throwable error) {
         return unwrapCompletion(error) instanceof IggyServerException serverError
                 && serverError.getRawErrorCode() == PARTITION_NOT_OWNED_ERROR_CODE;
@@ -397,7 +445,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     private static PolledMessages emptyPolledMessages() {
-        return new PolledMessages(0L, BigInteger.ZERO, 0L, List.of());
+        return new PolledMessages(0L, BigInteger.ZERO, 0L, List.of(), PartitionContext.EMPTY);
     }
 
     private CompletableFuture<Partitioning> resolvePartitioning(
