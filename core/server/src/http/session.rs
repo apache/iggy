@@ -476,7 +476,7 @@ mod tests {
             table.insert(session.key.clone(), session);
         }
         let torn = sweep_expired(&mut table, 100);
-        assert!(torn.is_empty());
+        assert_eq!(torn, []);
         assert_eq!(table.len(), 8, "no live session is evicted to make room");
         assert_eq!(registries.len(), table.len());
     }
@@ -505,7 +505,7 @@ mod tests {
         assert!(live_entry(&table, &session.key, 100).is_some());
         assert!(registry.end_session(session.client_id, session.user_id, session.session, 2));
         assert!(live_entry(&table, &session.key, 100).is_none());
-        assert!(sweep_expired(&mut table, 100).is_empty());
+        assert_eq!(sweep_expired(&mut table, 100), []);
         assert!(table.is_empty());
     }
 

@@ -47,6 +47,13 @@ public sealed class ReceivedRentedMessage : IDisposable
     public uint PartitionId { get; init; }
 
     /// <summary>
+    ///     The partition incarnation and owner of the poll that delivered this message. Pass it to
+    ///     <see cref="IggyConsumer.StoreOffsetAsync(ulong, uint, PartitionContext, CancellationToken)" /> to commit
+    ///     the message after later polls.
+    /// </summary>
+    public PartitionContext Context { get; init; }
+
+    /// <summary>
     ///     The status of the message. The rented path performs no deserialization or decryption, so this is
     ///     always <see cref="MessageStatus.Success" />.
     /// </summary>
@@ -92,6 +99,9 @@ public sealed class RentedBatchHandle : IDisposable
     {
         _rental = rental;
     }
+
+    /// <summary>The partition incarnation and owner of the poll that produced the batch.</summary>
+    public PartitionContext Context => _rental.Context;
 
     /// <summary>
     ///     Releases one reference on the underlying rental. Equivalent to <see cref="Release" />.

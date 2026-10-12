@@ -18,6 +18,8 @@
 //! Workload-emittable server commands. Variant order is part of the
 //! determinism contract; the first three positions lock the hash baseline.
 //! Append only; never reorder or insert.
+//!
+//! Removing a variant changes the op trace, so pinned seeds need a re-scan.
 
 use strum::{EnumCount, EnumIter};
 
@@ -30,11 +32,9 @@ pub enum Action {
     StoreConsumerOffset,
     DeleteStream,
     UpdateStream,
-    PurgeStream,
     CreateTopic,
     UpdateTopic,
     DeleteTopic,
-    PurgeTopic,
     CreatePartitions,
     DeletePartitions,
     DeleteSegments,

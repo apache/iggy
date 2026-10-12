@@ -22,14 +22,12 @@ use crate::poll_plan::SealedSegmentHandle;
 use crate::segment::Segment;
 use iggy_common::IggyByteSize;
 use journal::Journal;
-use ringbuffer::AllocRingBuffer;
 use server_common::SegmentStorage;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
 
 const SEGMENTS_CAPACITY: usize = 1024;
-const ACCESS_MAP_CAPACITY: usize = 8;
 /// Max sealed segments per partition that keep a resident read handle (fd +
 /// sparse index). Without a cap every sealed segment a reader ever touched pins
 /// one fd for the partition's lifetime; the server-wide budget is this cap times
@@ -138,10 +136,6 @@ where
     J: Debug + Journal,
 {
     journal: JournalState<J>,
-    // Ring buffer tracking recently accessed segment indices for cleanup optimization.
-    // A background task uses this to identify and close file descriptors for unused segments.
-    _access_map: AllocRingBuffer<usize>,
-    _cache: (),
     segments: Vec<Segment>,
     indexes: Vec<Option<IggyIndexCache>>,
     storage: Vec<SegmentStorage>,
@@ -166,8 +160,6 @@ where
     fn default() -> Self {
         Self {
             journal: JournalState::default(),
-            _access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
-            _cache: (),
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
             indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
@@ -277,12 +269,12 @@ where
     /// cleared, handle untracked) and reset the sealed LRU. In-flight polls
     /// hold `Rc` clones of these handles, so clearing the slots (not just
     /// dropping the pump's references) is what a suspended walk observes: its
-    /// next segment resolve re-opens by path and sees the current files. Purge
-    /// needs this because it recreates segment files at the paths it just
-    /// unlinked; a stale cached fd would keep serving the purged inodes as
-    /// live data. Retention retirement deliberately skips this: retired paths
-    /// are never recreated, so a cached fd reading the unlinked inode stays
-    /// consistent (see [`Self::retire_front`]).
+    /// next segment resolve re-opens by path and sees the current files.
+    /// Install and converge need this because they recreate segment files at
+    /// the paths they just unlinked; a stale cached fd would keep serving the
+    /// replaced inodes as live data. Retention retirement deliberately skips
+    /// this: retired paths are never recreated, so a cached fd reading the
+    /// unlinked inode stays consistent (see [`Self::retire_front`]).
     pub fn invalidate_sealed_read_state(&mut self) {
         for handle in &self.sealed_read_state {
             handle.tracked.set(false);
@@ -616,8 +608,8 @@ mod tests {
         assert!(log.sealed_lru.is_empty());
         assert!(!log.sealed_read_state()[0].tracked.get());
 
-        // Out-of-range slot (the purge drain window empties the vec across
-        // awaits): must be a no-op, not a panic.
+        // Out-of-range slot (segment removal shrinks the vec across awaits):
+        // must be a no-op, not a panic.
         log.touch_sealed_read_state(1);
         assert!(log.sealed_lru.is_empty());
     }
@@ -643,8 +635,8 @@ mod tests {
         assert!(log.sealed_lru.contains(&5), "other slots are untouched");
         assert!(log.sealed_read_state()[0].index.borrow().is_none());
 
-        // Out-of-range slot (the purge drain window empties the vec across
-        // awaits): a no-op, not a panic.
+        // Out-of-range slot (segment removal shrinks the vec across awaits):
+        // a no-op, not a panic.
         log.reset_read_state(2);
     }
 

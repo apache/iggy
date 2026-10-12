@@ -64,10 +64,6 @@ impl Permissioner {
         self.manage_stream(user_id, stream_id)
     }
 
-    pub fn purge_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
-        self.manage_stream(user_id, stream_id)
-    }
-
     fn manage_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && global_permissions.manage_streams

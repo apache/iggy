@@ -160,6 +160,7 @@ impl From<PartitionResponse> for Partition {
             current_offset: w.current_offset,
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
+            context: w.context,
         }
     }
 }

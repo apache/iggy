@@ -64,7 +64,7 @@ impl MessagesWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if let Some(preallocate_size) = preallocate_size {
-            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64());
+            preallocate_file(&file, Path::new(file_path), preallocate_size.as_bytes_u64()).await;
         }
 
         if file_exists {
@@ -103,7 +103,7 @@ impl MessagesWriter {
         })
     }
 
-    /// Appends a batch of frozen message buffers at the current write cursor
+    /// Writes frozen message buffers at a captured file position
     /// and returns how many bytes landed. The cursor is left where it was: the
     /// caller advances it with `advance` once the companion index save has
     /// also succeeded.
@@ -111,20 +111,27 @@ impl MessagesWriter {
     /// # Errors
     ///
     /// Returns an error if any chunk cannot be written or synced to disk.
-    pub(crate) async fn save_frozen_batches<const ALIGN: usize>(
+    pub(crate) async fn save_frozen_batches_at<const ALIGN: usize>(
         &self,
         buffers: &[Frozen<ALIGN>],
+        position: u64,
+        completes_save: bool,
     ) -> Result<IggyByteSize, IggyError> {
-        let messages_size: u64 = buffers.iter().map(|buffer| buffer.len() as u64).sum();
+        let messages_size = buffers
+            .iter()
+            .try_fold(0_u64, |size, buffer| size.checked_add(buffer.len() as u64))
+            .ok_or(IggyError::CannotWriteToFile)?;
+        position
+            .checked_add(messages_size)
+            .ok_or(IggyError::CannotWriteToFile)?;
 
         if messages_size == 0 {
             return Ok(IggyByteSize::from(0));
         }
 
-        let position = self.messages_size_bytes.load(Ordering::Relaxed);
         write_frozen_chunked(&self.file, &self.file_path, position, buffers).await?;
 
-        if self.fsync {
+        if self.fsync && completes_save {
             self.fsync().await?;
         }
 
@@ -136,6 +143,10 @@ impl MessagesWriter {
     /// once both halves have succeeded.
     pub(crate) fn advance(&self, bytes: u64) {
         self.messages_size_bytes.fetch_add(bytes, Ordering::Release);
+    }
+
+    pub(crate) fn position(&self) -> u64 {
+        self.messages_size_bytes.load(Ordering::Relaxed)
     }
 
     #[must_use]

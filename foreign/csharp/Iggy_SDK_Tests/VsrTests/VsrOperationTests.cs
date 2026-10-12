@@ -38,11 +38,9 @@ public sealed class VsrOperationTests
     [InlineData(CommandCodes.CREATE_STREAM_CODE, (byte)VsrOperation.CreateStream)]
     [InlineData(CommandCodes.DELETE_STREAM_CODE, (byte)VsrOperation.DeleteStream)]
     [InlineData(CommandCodes.UPDATE_STREAM_CODE, (byte)VsrOperation.UpdateStream)]
-    [InlineData(CommandCodes.PURGE_STREAM_CODE, (byte)VsrOperation.PurgeStream)]
     [InlineData(CommandCodes.CREATE_TOPIC_CODE, (byte)VsrOperation.CreateTopic)]
     [InlineData(CommandCodes.DELETE_TOPIC_CODE, (byte)VsrOperation.DeleteTopic)]
     [InlineData(CommandCodes.UPDATE_TOPIC_CODE, (byte)VsrOperation.UpdateTopic)]
-    [InlineData(CommandCodes.PURGE_TOPIC_CODE, (byte)VsrOperation.PurgeTopic)]
     [InlineData(CommandCodes.CREATE_PARTITIONS_CODE, (byte)VsrOperation.CreatePartitions)]
     [InlineData(CommandCodes.DELETE_PARTITIONS_CODE, (byte)VsrOperation.DeletePartitions)]
     [InlineData(CommandCodes.DELETE_SEGMENTS_CODE, (byte)VsrOperation.DeleteSegments)]
@@ -116,6 +114,8 @@ public sealed class VsrOperationTests
     public void IsKnown_RejectsUndefinedDiscriminants()
     {
         Assert.True(VsrOperations.IsKnown((byte)VsrOperation.SendMessages));
+        Assert.False(VsrOperations.IsKnown(131));
+        Assert.False(VsrOperations.IsKnown(135));
         Assert.False(VsrOperations.IsKnown(163));
         Assert.False(VsrOperations.IsKnown(164));
         Assert.False(VsrOperations.IsKnown(165));
@@ -127,11 +127,9 @@ public sealed class VsrOperationTests
     [InlineData((byte)VsrOperation.CreateStream)]
     [InlineData((byte)VsrOperation.UpdateStream)]
     [InlineData((byte)VsrOperation.DeleteStream)]
-    [InlineData((byte)VsrOperation.PurgeStream)]
     [InlineData((byte)VsrOperation.CreateTopic)]
     [InlineData((byte)VsrOperation.UpdateTopic)]
     [InlineData((byte)VsrOperation.DeleteTopic)]
-    [InlineData((byte)VsrOperation.PurgeTopic)]
     [InlineData((byte)VsrOperation.CreatePartitions)]
     [InlineData((byte)VsrOperation.DeletePartitions)]
     [InlineData((byte)VsrOperation.CreateConsumerGroup)]

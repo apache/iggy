@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { authStore } from '$lib/auth/authStore.svelte';
+import { authStore } from '#lib/auth/authStore.svelte.js';
 
 // Initialize auth store when the app loads
 authStore.initialize();

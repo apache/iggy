@@ -162,7 +162,6 @@ result_enum!(UpdateStreamResult {
     InvalidOptionValue = 4042,
 });
 result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
-result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
 
 // Topics.
 result_enum!(CreateTopicResult {
@@ -177,13 +176,10 @@ result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
+    UnsupportedOptionKey = 4041,
     InvalidOptionValue = 4042,
 });
 result_enum!(DeleteTopicResult {
-    StreamNotFound = 1009,
-    TopicNotFound = 2010,
-});
-result_enum!(PurgeTopicResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
 });
@@ -196,12 +192,14 @@ result_enum!(CreatePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
+    PartitionResizeDisabled = 2023,
     PartitionIdSpaceExhausted = 3013,
 });
 result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
+    PartitionResizeDisabled = 2023,
 });
 // `TruncatePartition` is the committed form of a client `DeleteSegments`; an
 // unresolvable target commits as a rejection so the request sequence stays
@@ -210,6 +208,7 @@ result_enum!(TruncatePartitionResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     PartitionNotFound = 3007,
+    HistoryChanged = 3014,
 });
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`
@@ -250,6 +249,7 @@ result_enum!(CreateConsumerGroupResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     NameAlreadyExists = 5004,
+    TooManyConsumerGroups = 5010,
 });
 // Delete/Join/Leave resolve stream -> topic -> group inside the apply (the
 // authz gate passes a resolution miss through), so their codes mirror the
@@ -278,36 +278,39 @@ result_enum!(LeaveConsumerGroupResult {
 
 /// `IggyError::Unauthorized`. Any control-plane op can commit as an in-apply
 /// authorization no-op, so this code is valid for every op regardless of its
-/// own result enum. Pinned to the wire discriminant in
+/// own result enum. Pinned, like the two codes below, to the wire discriminant in
 /// [`tests::given_result_discriminants_then_match_iggy_error_codes`].
 const UNAUTHORIZED_CODE: u32 = 41;
+/// `IggyError::LifecycleBusy`, committed by the lifecycle apply gates.
+const LIFECYCLE_BUSY_CODE: u32 = 88;
+/// `IggyError::InvalidCommand`, committed by the lifecycle apply paths.
+const INVALID_COMMAND_CODE: u32 = 3;
 
 /// True if `code` is one this op's result enum declares (`Ok = 0` included), or
-/// the global `UNAUTHORIZED_CODE`.
+/// one of the global codes `UNAUTHORIZED_CODE`, `LIFECYCLE_BUSY_CODE` and
+/// `INVALID_COMMAND_CODE`.
 ///
 /// The state machine only commits codes from the op's own enum, plus the
-/// in-apply authorization gate's global `Unauthorized` denial, so an
+/// global in-apply denials of the authorization and lifecycle gates, so an
 /// unrecognized one is a server bug, not a race (a race still yields a declared
 /// code). Enriched internal ops map to their client-op enum; ops with no result
 /// section (partition plane) return `true`.
 #[must_use]
 pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
-    // The in-apply RBAC gate can deny any control-plane op, committing an
-    // `Unauthorized` no-op, so accept it globally rather than per-op enum.
-    if code == UNAUTHORIZED_CODE {
+    // The in-apply RBAC and lifecycle gates can deny any control-plane op,
+    // committing a no-op, so accept their codes globally rather than per-op enum.
+    if code == UNAUTHORIZED_CODE || code == LIFECYCLE_BUSY_CODE || code == INVALID_COMMAND_CODE {
         return true;
     }
     match operation {
         Operation::CreateStream => CreateStreamResult::from_u32(code).is_some(),
         Operation::UpdateStream => UpdateStreamResult::from_u32(code).is_some(),
         Operation::DeleteStream => DeleteStreamResult::from_u32(code).is_some(),
-        Operation::PurgeStream => PurgeStreamResult::from_u32(code).is_some(),
         Operation::CreateTopic | Operation::CreateTopicWithAssignments => {
             CreateTopicResult::from_u32(code).is_some()
         }
         Operation::UpdateTopic => UpdateTopicResult::from_u32(code).is_some(),
         Operation::DeleteTopic => DeleteTopicResult::from_u32(code).is_some(),
-        Operation::PurgeTopic => PurgeTopicResult::from_u32(code).is_some(),
         Operation::CreatePartitions | Operation::CreatePartitionsWithAssignments => {
             CreatePartitionsResult::from_u32(code).is_some()
         }
@@ -400,13 +403,13 @@ mod tests {
             Operation::CreateTopicWithAssignments,
             u32::from(CreateTopicResult::NameAlreadyExists),
         ));
-        // Undeclared codes fail, even a real code from another op. `PurgeStream`
-        // has no `TopicNotFound`: the explicit arm rejects it where the prior
-        // `_ => true` default would have passed any code.
+        // Undeclared codes fail, even a real code from another op. `DeleteStream`
+        // has no `TopicNotFound`: its explicit arm rejects it where the
+        // `_ => true` fallback would pass any code.
         assert!(!result_code_recognized(Operation::CreateStream, 9999));
         assert!(!result_code_recognized(
-            Operation::PurgeStream,
-            u32::from(PurgeTopicResult::TopicNotFound),
+            Operation::DeleteStream,
+            u32::from(DeleteTopicResult::TopicNotFound),
         ));
         // Partition-plane ops carry no result section, so any code is accepted.
         assert!(result_code_recognized(Operation::SendMessages, 12345));
@@ -423,6 +426,16 @@ mod tests {
         assert!(result_code_recognized(
             Operation::CreateConsumerGroup,
             UNAUTHORIZED_CODE
+        ));
+        // The lifecycle apply gates commit `LifecycleBusy` for ops whose enums do
+        // not declare it.
+        assert!(result_code_recognized(
+            Operation::DeleteTopic,
+            IggyError::LifecycleBusy.as_code()
+        ));
+        assert!(result_code_recognized(
+            Operation::JoinConsumerGroup,
+            IggyError::LifecycleBusy.as_code()
         ));
     }
 
@@ -449,10 +462,6 @@ mod tests {
             stream_not_found
         );
         assert_eq!(
-            u32::from(PurgeStreamResult::StreamNotFound),
-            stream_not_found
-        );
-        assert_eq!(
             u32::from(CreateTopicResult::StreamNotFound),
             stream_not_found
         );
@@ -462,10 +471,6 @@ mod tests {
         );
         assert_eq!(
             u32::from(DeleteTopicResult::StreamNotFound),
-            stream_not_found
-        );
-        assert_eq!(
-            u32::from(PurgeTopicResult::StreamNotFound),
             stream_not_found
         );
         assert_eq!(
@@ -496,7 +501,6 @@ mod tests {
         let topic_not_found = IggyError::TopicIdNotFound(id(), id()).as_code();
         assert_eq!(u32::from(UpdateTopicResult::TopicNotFound), topic_not_found);
         assert_eq!(u32::from(DeleteTopicResult::TopicNotFound), topic_not_found);
-        assert_eq!(u32::from(PurgeTopicResult::TopicNotFound), topic_not_found);
         assert_eq!(
             u32::from(CreatePartitionsResult::TopicNotFound),
             topic_not_found
@@ -681,8 +685,15 @@ mod tests {
             partition_id_space_exhausted,
             IggyError::TooManyPartitions.as_code(),
         );
+        assert_eq!(
+            u32::from(TruncatePartitionResult::HistoryChanged),
+            IggyError::PartitionHistoryChanged.as_code(),
+        );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.
         assert_eq!(UNAUTHORIZED_CODE, IggyError::Unauthorized.as_code());
+        // LifecycleBusy (88) and InvalidCommand (3) - the global lifecycle gate codes.
+        assert_eq!(LIFECYCLE_BUSY_CODE, IggyError::LifecycleBusy.as_code());
+        assert_eq!(INVALID_COMMAND_CODE, IggyError::InvalidCommand.as_code());
     }
 }

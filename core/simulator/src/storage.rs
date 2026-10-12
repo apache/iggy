@@ -674,4 +674,4 @@ fn missing() -> io::Error {
 mod tests;
 
 #[cfg(test)]
-mod purge;
+mod bookmark_recovery;
