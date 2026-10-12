@@ -372,12 +372,31 @@ fn given_a_fenced_window_wider_than_a_repair_chunk_when_the_old_primary_rejoins_
     );
 }
 
-/// Each proof that breaks drops the stale suffix above the break, so several
-/// stale entries take several rounds of proof and refetch. Every round must
-/// re-request at once instead of waiting out the repair retry timer.
+/// A proof that breaks cuts the stale suffix from the broken op, and the cut
+/// window must be re-requested at once instead of waiting out the repair retry
+/// timer. Two re-request sites exist: the `RepairDone` of a request already in
+/// flight, and the stall sweep when nothing is in flight. Seed `0x5EED_57A2`
+/// takes the first, seed `0x2` the second.
 #[test]
-fn given_an_old_primary_holding_several_stale_prepares_when_it_rejoins_should_catch_up() {
-    let (mut sim, client) = cluster(0x5EED_57A2);
+fn given_an_old_primary_holding_a_stale_prepare_when_the_proof_cuts_it_should_refetch_the_window_at_once()
+ {
+    for seed in [0x5EED_57A2, 0x2] {
+        let steps = cut_to_catch_up(seed).unwrap_or_else(|| {
+            panic!("seed {seed:#x} left the old primary no stale prepare for the proof to cut")
+        });
+        assert!(
+            steps < usize::try_from(partitions::REPAIR_RETRY_TICKS).unwrap(),
+            "seed {seed:#x}: catching up took {steps} steps after the cut, so the refetch \
+             waited out the repair retry timer"
+        );
+    }
+}
+
+/// Runs the stale-prepare rejoin under `seed` and returns how many steps the
+/// old primary took to catch up after its proof cut the held run, or `None`
+/// when no cut happened (the isolated primary journaled nothing stale).
+fn cut_to_catch_up(seed: u64) -> Option<usize> {
+    let (mut sim, client) = cluster(seed);
     let namespace = IggyNamespace::new(1, 1, 0);
     sim.init_partition(namespace);
     sim.register_client_with_primary(&client);
@@ -420,39 +439,84 @@ fn given_an_old_primary_holding_several_stale_prepares_when_it_rejoins_should_ca
     let (_, _, majority_commit, _) = group_state(&sim, new_primary, namespace);
 
     isolate(&mut sim, OLD_PRIMARY, false);
-    // Timed from the adoption, not the heal: how long the old primary takes to
-    // learn of the new view is the view probe's business, not the proof's.
+    // The adoption, not the heal, starts the clock: how long the old primary
+    // takes to learn of the new view is the view probe's business.
     (0..SETTLE_STEPS)
         .find(|_| {
             sim.step();
             group_state(&sim, OLD_PRIMARY, namespace).1 >= new_view
         })
         .expect("the old primary never adopted the new view");
-    let caught_up = (0..SETTLE_STEPS).find(|_| {
+    // The held run only shrinks when a proof breaks and cuts it. Within the
+    // step of the cut a re-request may already have gone out, so the request
+    // is either still pending (`None`) or starts at or below the cut.
+    let mut held = held_through(&sim, OLD_PRIMARY, namespace);
+    let mut cut_at = None;
+    let mut caught_up = None;
+    for step in 0..SETTLE_STEPS {
         if group_state(&sim, OLD_PRIMARY, namespace).2 >= majority_commit {
-            return true;
+            caught_up = Some(step);
+            break;
         }
+        let now_held = held_through(&sim, OLD_PRIMARY, namespace);
+        if now_held < held && cut_at.is_none() {
+            cut_at = Some(step);
+            let requested =
+                repair_session(&sim, OLD_PRIMARY, namespace).map(|session| session.requested_from);
+            assert!(
+                requested.is_some_and(|from| from.is_none_or(|from| from <= now_held + 1)),
+                "seed {seed:#x}: the cut left held entries through {now_held} but the \
+                 repair request stands at {requested:?}"
+            );
+        }
+        held = now_held;
         sim.step();
-        false
+    }
+    let caught_up = caught_up.unwrap_or_else(|| {
+        panic!("seed {seed:#x}: the old primary never caught up to {majority_commit}")
     });
-    let caught_up =
-        caught_up.unwrap_or_else(|| panic!("the old primary never caught up to {majority_commit}"));
-    assert!(
-        caught_up < usize::try_from(partitions::REPAIR_RETRY_TICKS).unwrap(),
-        "catching up took {caught_up} steps: a broken proof waited out the repair retry timer"
-    );
+    for _ in 0..SETTLE_STEPS {
+        sim.step();
+    }
     let reference = polled(&mut sim, new_primary, namespace);
     let rejoined = polled(&mut sim, OLD_PRIMARY, namespace);
     assert!(
         !reference
             .iter()
             .any(|(_, payload)| payload.starts_with("stale")),
-        "the new view committed the isolated primary's requests: {reference:?}"
+        "seed {seed:#x}: the new view committed the isolated primary's requests: {reference:?}"
     );
     assert_eq!(
         rejoined, reference,
-        "the rejoined replica serves a committed log that differs from the view's"
+        "seed {seed:#x}: the rejoined replica serves a committed log that differs from the view's"
     );
+    cut_at.map(|cut_at| caught_up - cut_at)
+}
+
+/// Highest op through which `replica` holds every entry above its commit point.
+fn held_through(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> u64 {
+    sim.replicas[usize::from(replica)]
+        .partition_shard(namespace)
+        .plane
+        .partitions()
+        .get_by_ns(&namespace)
+        .expect("replica hosts the group")
+        .held_through()
+}
+
+/// `replica`'s repair session for the group, if one is armed.
+fn repair_session(
+    sim: &Simulator,
+    replica: u8,
+    namespace: IggyNamespace,
+) -> Option<partitions::RepairSession> {
+    sim.replicas[usize::from(replica)]
+        .partition_shard(namespace)
+        .plane
+        .partitions()
+        .get_by_ns(&namespace)
+        .expect("replica hosts the group")
+        .repair
 }
 
 fn primary_of(sim: &Simulator, replica: u8, namespace: IggyNamespace, view: u32) -> u8 {

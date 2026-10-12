@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The rolling SIGKILL schedule reported on PR #4433, without Docker: three
-//! local server processes, a persisted topic, producers that retry every batch
-//! until it is acked, and each node killed and restarted in turn under load.
-//! Every acked message must be readable afterwards.
+//! A rolling SIGKILL schedule without Docker: three local server processes, a
+//! persisted topic, producers that retry every batch until it is acked, and
+//! each node killed and restarted in turn under load. Every acked message must
+//! be readable afterwards.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -57,7 +57,7 @@ struct Counters {
 }
 
 #[iggy_harness(cluster_nodes = 3)]
-#[ignore = "long-running reproduction of the PR #4433 rolling SIGKILL report"]
+#[ignore = "long-running rolling SIGKILL reproduction"]
 async fn given_load_on_a_persisted_topic_when_every_node_is_sigkilled_in_turn_should_keep_every_acked_message(
     harness: &mut TestHarness,
 ) {
@@ -118,31 +118,12 @@ async fn given_load_on_a_persisted_topic_when_every_node_is_sigkilled_in_turn_sh
     for (node, kill_at, restart_at) in SCHEDULE {
         sleep_until(start, kill_at).await;
         harness.kill_node(node).expect("SIGKILL node");
-        eprintln!(
-            "REPRO t={:?} killed node {node} (acked batches so far {})",
-            start.elapsed(),
-            counters.acked_batches.load(Ordering::Relaxed)
-        );
         sleep_until(start, restart_at).await;
-        eprintln!(
-            "REPRO t={:?} restarting node {node} (acked batches so far {})",
-            start.elapsed(),
-            counters.acked_batches.load(Ordering::Relaxed)
-        );
         harness.restart_node(node).expect("restart node");
-        eprintln!("REPRO t={:?} restarted node {node}", start.elapsed());
     }
     tokio::task::spawn_blocking(move || load.join().unwrap())
         .await
         .unwrap();
-    eprintln!(
-        "REPRO t={:?} load done: acked batches {}, unacked batches {}, send errors {}, max ack latency {} ms",
-        start.elapsed(),
-        counters.acked_batches.load(Ordering::Relaxed),
-        counters.unacked_batches.load(Ordering::Relaxed),
-        counters.send_errors.load(Ordering::Relaxed),
-        counters.max_latency_ms.load(Ordering::Relaxed),
-    );
 
     let acked = acked.lock().await;
     let mut lost = 0usize;
@@ -151,24 +132,16 @@ async fn given_load_on_a_persisted_topic_when_every_node_is_sigkilled_in_turn_sh
         let expected = acked.get(&partition).cloned().unwrap_or_default();
         total += expected.len();
         let present = read_partition(&addresses, partition).await;
-        let missing = expected.difference(&present).count();
-        eprintln!(
-            "REPRO partition {partition}: {} acked, {} readable, {missing} acked missing",
-            expected.len(),
-            present.len()
-        );
-        lost += missing;
+        lost += expected.difference(&present).count();
     }
     assert_eq!(
         counters.unacked_batches.load(Ordering::Relaxed),
         0,
-        "some batches were never acked"
+        "some batches were never acked (send errors {}, max ack latency {} ms)",
+        counters.send_errors.load(Ordering::Relaxed),
+        counters.max_latency_ms.load(Ordering::Relaxed),
     );
     assert_eq!(lost, 0, "{lost} of {total} acked messages are not readable");
-    assert!(
-        std::env::var_os("REPRO_KEEP_LOGS").is_none(),
-        "REPRO_KEEP_LOGS is set: failing on purpose so the harness keeps server logs"
-    );
 }
 
 async fn sleep_until(start: Instant, at_secs: u64) {

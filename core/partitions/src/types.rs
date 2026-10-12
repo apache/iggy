@@ -312,12 +312,17 @@ pub struct RepairSession {
     /// floor are neither locally durable nor repaired (state-transfer
     /// territory), and the floor must be refused.
     pub first_batch_offset: Option<u64>,
-    /// Ticks since the stream last made progress; at
-    /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
+    /// Ticks since the stream last made progress. At [`REPAIR_RETRY_TICKS`],
+    /// or at once while [`Self::requested_from`] is `None`, the remaining
+    /// window is re-requested and the count restarts.
     pub idle_ticks: u32,
     /// First op of the latest request. The next chunk is pulled once the held
     /// run reaches it, which works while a fenced commit point cannot move.
-    pub requested_from: u64,
+    ///
+    /// `None` after a proof dropped held entries, so the next sweep asks for
+    /// the cut window from the held run without waiting out
+    /// [`REPAIR_RETRY_TICKS`].
+    pub requested_from: Option<u64>,
 }
 
 /// How a repair-window commit walk concluded, decided by

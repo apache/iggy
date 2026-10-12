@@ -899,10 +899,19 @@ where
 
     /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
     pub fn held_through(&self, floor: u64) -> u64 {
+        self.held_through_until(floor, u64::MAX)
+    }
+
+    /// [`Self::held_through`] capped at `top`, walking only the resident ops at
+    /// or below it.
+    pub fn held_through_until(&self, floor: u64, top: u64) -> u64 {
+        if floor >= top {
+            return floor;
+        }
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         let mut through = floor;
         for op in op_to_storage_offset
-            .range(floor.saturating_add(1)..)
+            .range(floor + 1..=top)
             .map(|(op, _)| *op)
         {
             if op != through + 1 {
@@ -1623,6 +1632,23 @@ mod tests {
         }
 
         assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn given_a_run_past_the_top_when_capping_held_through_should_stop_at_the_top() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1, 2, 3, 4, 6] {
+            journal
+                .append(build_prepare(op, HEADER_SIZE + 16).into_frozen())
+                .await
+                .expect("append");
+        }
+
+        assert_eq!(journal.held_through(0), 4);
+        assert_eq!(journal.held_through_until(0, 2), 2);
+        assert_eq!(journal.held_through_until(0, 6), 4);
+        assert_eq!(journal.held_through_until(3, 3), 3);
+        assert_eq!(journal.held_through_until(5, 3), 5);
     }
 
     #[compio::test]

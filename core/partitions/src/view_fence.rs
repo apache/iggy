@@ -20,8 +20,10 @@
 
 use iggy_binary_protocol::{CHECKSUM_UNSEALED, PrepareHeader};
 
-/// An unproven window `(commit_min, through]` installed in `view` and, once known,
-/// that view's header at `through + 1`, whose `parent` the window must chain into.
+/// An unproven window `(floor, through]` installed in `view` and, once known, that
+/// view's header at `through + 1`, whose `parent` the window must chain into. The
+/// floor is `IggyPartition::fence_floor`: the higher of `commit_min` and the
+/// commit point recovered from the WAL, which the fenced walk may still reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewFence {
     pub view: u32,

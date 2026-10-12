@@ -1922,7 +1922,7 @@ mod tests {
                     peer: 1,
                     first_batch_offset: None,
                     idle_ticks: 0,
-                    requested_from: 1,
+                    requested_from: Some(1),
                 });
                 let reply =
                     Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
@@ -1995,7 +1995,7 @@ mod tests {
             peer: 0,
             first_batch_offset: None,
             idle_ticks: 0,
-            requested_from: 1,
+            requested_from: Some(1),
         });
         assert_eq!(
             partition.complete_repair(partitions.config()).await,
@@ -2641,7 +2641,7 @@ mod tests {
                 peer: 0,
                 first_batch_offset: None,
                 idle_ticks: 0,
-                requested_from: 1,
+                requested_from: Some(1),
             });
             owner.plane.partitions().insert(namespace, partition);
 

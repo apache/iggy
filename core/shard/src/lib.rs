@@ -5803,7 +5803,7 @@ where
                             repaired_through,
                             live.fetch_to_op,
                         )?;
-                        live.requested_from = from_op;
+                        live.requested_from = Some(from_op);
                         Some((live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
@@ -7940,19 +7940,23 @@ where
                         return None;
                     }
                     session.idle_ticks += 1;
-                    // 0 marks a proof that dropped held entries: refetch at once.
-                    if session.requested_from != 0 && session.idle_ticks < repair_retry_ticks {
+                    if !partition_repair_retry_due(
+                        session.requested_from,
+                        session.idle_ticks,
+                        repair_retry_ticks,
+                    ) {
                         return None;
                     }
                     session.idle_ticks = 0;
-                    session.requested_from = journal.held_through(commit_min).saturating_add(1);
-                    if session.requested_from > session.fetch_to_op {
+                    let from_op = journal.held_through(commit_min).saturating_add(1);
+                    session.requested_from = Some(from_op);
+                    if from_op > session.fetch_to_op {
                         return None;
                     }
                     Some((
                         session.peer,
                         session.nonce,
-                        session.requested_from,
+                        from_op,
                         session.fetch_to_op,
                         cluster,
                         self_id,
@@ -9107,7 +9111,7 @@ where
             peer,
             first_batch_offset: None,
             idle_ticks: 0,
-            requested_from: from_op,
+            requested_from: Some(from_op),
         });
         tracing::info!(
             shard = self.id,
@@ -9194,7 +9198,7 @@ where
             peer,
             first_batch_offset: None,
             idle_ticks: 0,
-            requested_from: from_op,
+            requested_from: Some(from_op),
         });
         tracing::info!(
             shard = self.id,
@@ -11097,11 +11101,24 @@ fn partition_repair_fetch_to_op(
 /// `from_op > to_op` fails `RequestPreparesHeader::validate` on the serving
 /// peer, which drops the frame as unparsable.
 fn partition_repair_next_chunk(
-    requested_from: u64,
+    requested_from: Option<u64>,
     held_through: u64,
     fetch_to_op: u64,
 ) -> Option<u64> {
-    (held_through >= requested_from && held_through < fetch_to_op).then_some(held_through + 1)
+    (requested_from.is_none_or(|from_op| held_through >= from_op) && held_through < fetch_to_op)
+        .then_some(held_through + 1)
+}
+
+/// Whether the stall sweep re-requests a session's remaining window this tick.
+/// A session whose held entries a proof just dropped has nothing in flight for
+/// the cut window, so waiting out the retry timer only stalls the fenced
+/// replica's catch-up.
+const fn partition_repair_retry_due(
+    requested_from: Option<u64>,
+    idle_ticks: u32,
+    retry_ticks: u32,
+) -> bool {
+    requested_from.is_none() || idle_ticks >= retry_ticks
 }
 
 /// Highest adopted suffix op whose bodies are not all present above `commit_max`.
@@ -12254,14 +12271,27 @@ mod repair_scope_tests {
 
     #[test]
     fn given_a_walk_at_the_fetch_ceiling_when_repair_done_lands_should_not_request_a_chunk() {
-        assert_eq!(super::partition_repair_next_chunk(4, 7, 8), Some(8));
+        assert_eq!(super::partition_repair_next_chunk(Some(4), 7, 8), Some(8));
         // A held run short of the requested chunk leaves the remainder to the
         // stall retry, so a peer with nothing new to serve is not re-asked at once.
-        assert_eq!(super::partition_repair_next_chunk(8, 7, 9), None);
+        assert_eq!(super::partition_repair_next_chunk(Some(8), 7, 9), None);
         // Progress that reached the ceiling has nothing left to ask for: the
         // sweep closes the session, and `9..=8` is not a range.
-        assert_eq!(super::partition_repair_next_chunk(7, 8, 8), None);
-        assert_eq!(super::partition_repair_next_chunk(7, 9, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(Some(7), 8, 8), None);
+        assert_eq!(super::partition_repair_next_chunk(Some(7), 9, 8), None);
+    }
+
+    #[test]
+    fn given_a_cut_window_when_repair_done_lands_should_pull_from_the_held_run() {
+        assert_eq!(super::partition_repair_next_chunk(None, 2, 8), Some(3));
+        assert_eq!(super::partition_repair_next_chunk(None, 8, 8), None);
+    }
+
+    #[test]
+    fn given_a_cut_window_when_the_sweep_runs_should_re_request_before_the_retry_timer() {
+        assert!(super::partition_repair_retry_due(None, 1, 10));
+        assert!(!super::partition_repair_retry_due(Some(3), 9, 10));
+        assert!(super::partition_repair_retry_due(Some(3), 10, 10));
     }
 
     #[test]
