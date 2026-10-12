@@ -211,6 +211,9 @@ pub struct StoredDvc {
     /// The sender's uncommitted suffix. Empty from a silent sender, which counts
     /// toward the quorum and `max(commit)` but neither nacks nor offers bodies.
     pub suffix: DvcSuffix,
+    /// The sender's log may lack ops it acknowledged before a restart. See
+    /// `DoViewChangeHeader::flags` and `merge_view_change`.
+    pub log_untrusted: bool,
 }
 
 /// Array type for storing DVC messages from all replicas.

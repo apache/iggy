@@ -919,6 +919,9 @@ where
             partition.log.journal().inner.set_repair_retention(false);
         }
         partition
+            .consensus
+            .set_recovered_log_complete(partition.acknowledges_only_written_prepares());
+        partition
     }
 
     /// Record the metadata incarnation this partition was built for.
@@ -2676,6 +2679,17 @@ where
         self.offset_space.append_live
     }
 
+    /// The frontier a pending quarantine records for the rebuild, if one is
+    /// pending.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub const fn quarantine_frontier(&self) -> Option<u64> {
+        match &self.transition {
+            Some(PendingPartitionTransition::Quarantine { frontier, .. }) => Some(*frontier),
+            _ => None,
+        }
+    }
+
     /// Capture the ideal-storage simulator's durable state at process loss.
     #[cfg(any(test, feature = "simulator"))]
     pub fn take_retained_state(&mut self) -> crate::RetainedPartitionState {
@@ -2907,6 +2921,23 @@ where
         } else {
             0
         }
+    }
+
+    /// [`Self::offset_frontier`] as it stood once every op below `op` was
+    /// applied, read off the stamped entries this replica still holds.
+    ///
+    /// `None` when an applied op from `op` up to the first one that minted
+    /// offsets is no longer retained, so the frontier there cannot be known.
+    #[must_use]
+    pub fn offset_frontier_before(&self, op: u64) -> Option<u64> {
+        let journal = &self.log.journal().inner;
+        for applied in op..=self.consensus.commit_min() {
+            let entry = journal.repair_entry(applied)?;
+            if let Some(batch) = materialization_batch_meta(&entry, None).ok()? {
+                return Some(batch.base_offset);
+            }
+        }
+        Some(self.offset_frontier())
     }
 
     /// The offset the next mint will take, which is where the segment chain has
@@ -3305,8 +3336,17 @@ where
 
     /// Install this topic's runtime knobs, as resolved at topic admission.
     /// Unset fields keep the shard-wide configured values.
-    pub const fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
+    pub fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
         self.runtime_options = runtime_options;
+        self.consensus
+            .set_recovered_log_complete(self.acknowledges_only_written_prepares());
+    }
+
+    /// Whether every prepare this replica acknowledges is on stable storage
+    /// first, so a restart recovers all of them. `replicated` acknowledges once
+    /// the write is queued, and either policy covers some of the log.
+    const fn acknowledges_only_written_prepares(&self) -> bool {
+        self.durability().is_persisted() && self.consumer_offset_durability().is_persisted()
     }
 
     #[must_use]
@@ -6342,6 +6382,15 @@ where
 
     pub(crate) fn invalidate_workerless_offset_files(&self) {
         self.workerless_offset_files.clear();
+    }
+
+    /// Checksum of the prepare accepted into this replica's WAL at `op`, readable after
+    /// the journal has evicted the header and until a checkpoint reclaims it.
+    #[must_use]
+    pub fn wal_checksum(&self, op: u64) -> Option<u128> {
+        self.persistence
+            .as_ref()
+            .and_then(|persistence| persistence.checksum(op))
     }
 
     /// The commit fault that fenced this partition, if one has.
@@ -14043,6 +14092,33 @@ mod tests {
         persistence.drain_with_timeout().await.unwrap();
         assert!(persistence.failure().is_none());
         assert_eq!(persistence.checkpoint_op(), 2);
+    }
+
+    #[test]
+    fn given_topic_durability_when_installed_should_tell_consensus_whether_restarts_keep_acks() {
+        use iggy_common::Durability::{Persisted, Replicated};
+        let mut partition = test_partition();
+        assert!(
+            !partition.consensus().recovered_log_complete(),
+            "the default `replicated` policy acknowledges before the write"
+        );
+        for (durability, consumer_offset_durability, complete) in [
+            (Persisted, Persisted, true),
+            (Replicated, Persisted, false),
+            (Persisted, Replicated, false),
+            (Replicated, Replicated, false),
+        ] {
+            partition.set_runtime_options(TopicRuntimeOptions {
+                durability,
+                consumer_offset_durability,
+                ..TopicRuntimeOptions::default()
+            });
+            assert_eq!(
+                partition.consensus().recovered_log_complete(),
+                complete,
+                "{durability:?} messages, {consumer_offset_durability:?} offsets"
+            );
+        }
     }
 
     pub(super) fn test_partition() -> IggyPartition<IggyMessageBus> {

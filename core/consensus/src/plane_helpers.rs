@@ -1105,7 +1105,8 @@ mod tests {
             commit,
             group: 0,
             log_view: 0,
-            reserved: [0; 68],
+            flags: 0,
+            reserved: [0; 67],
             nack_bitset: 0,
             present_bitset: 0,
         };
@@ -1503,7 +1504,8 @@ mod tests {
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            flags: 0,
+            reserved: [0; 67],
             nack_bitset: 0,
             present_bitset: present,
         };
@@ -1538,7 +1540,8 @@ mod tests {
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            flags: 0,
+            reserved: [0; 67],
             nack_bitset: 0,
             present_bitset: 0,
         };

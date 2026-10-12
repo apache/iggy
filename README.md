@@ -284,6 +284,17 @@ When config file is not found, the default values from embedded `config.toml` fi
 
 Topic creation accepts two independent policies: `durability` for message acknowledgments and `consumer_offset_durability` for explicit offset stores and deletes. Both default to `replicated`. This means VSR quorum commit without waiting for stable storage. `persisted` also requires recoverable stable-storage copies on the replication quorum. Both policies normally store data on disk. Poll auto-commit remains asynchronous and is not covered by the poll response's completion.
 
+What each policy survives in a cluster of `2f+1` replicas. A partition gets the `persisted` guarantees only when both `durability` and `consumer_offset_durability` are `persisted`. If either is `replicated`, the `replicated` rules below apply to the whole partition.
+
+- `persisted` keeps every acknowledged write through any pattern of crashes and restarts, including power loss of the whole cluster. Use it when an acknowledged write must survive any single crash.
+- `replicated` keeps every acknowledged write as long as a majority of replicas never lose unflushed writes at the same time.
+- Graceful restarts flush the WAL first and lose nothing, one at a time or all together. A crash (SIGKILL, OOM kill) loses the WAL writes not yet handed to the OS, and power loss also loses what the OS had not written to disk. Under `replicated`, more than `f` such crashes at once can lose the most recently acknowledged writes.
+- A restarted `replicated` replica accepts no writes and acknowledges no prepares until it joins a settled view: one a running primary sends it, or one that an election starts. Until then writes and binary polls sent to it fail with `TransientNotAccepted`, which clients retry. HTTP polls are answered from the node's local copy and can return older data.
+  When no primary answers, the restarted replicas hold an election and mark their logs as possibly incomplete. A new view starts only from a majority of replicas whose logs are not marked, or once every replica has reported, and the partition stays unavailable until then.
+  After a full-cluster restart that means every replica must be back. A replica whose partition awaits a state transfer still reports without a log, but a replica that never returns halts the partition indefinitely (no operator override yet).
+  Older builds neither mark their logs nor honor the mark, so during a rolling upgrade these guarantees hold only once every replica runs a build that does.
+- When a replica adopts a view whose headers contradict partition history it already applied, it sets that partition's local files aside in `.fenced.N` and fetches it again from a peer instead of stopping the node. A contradiction outside the headers the view carries, and a WAL append whose parent check fails, still stop the node.
+
 The data directory is configured with `path` or `IGGY_PATH`. The layout beneath it is `streams/<stream>/topics/<topic>/partitions/<partition>`, with fixed directory names.
 
 The HTTP `Iggy-Durability` header reports `replicated` or `persisted` for awaited writes, and `none` for early dispatch acceptance.

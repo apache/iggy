@@ -230,6 +230,8 @@ pub struct ReplicaLogContext {
     pub commit: u64,
     pub status: Status,
     pub role: ReplicaRole,
+    /// See [`VsrConsensus::has_untrusted_log`].
+    pub untrusted_log: bool,
 }
 
 impl ReplicaLogContext {
@@ -255,6 +257,7 @@ impl ReplicaLogContext {
             commit: consensus.commit_max(),
             status: consensus.status(),
             role,
+            untrusted_log: consensus.has_untrusted_log(),
         }
     }
 }
@@ -519,6 +522,7 @@ fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -557,6 +561,7 @@ fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -595,6 +600,7 @@ fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -633,6 +639,7 @@ fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -671,6 +678,7 @@ fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -772,6 +780,7 @@ pub fn emit_replica_event(sim_event: SimEventKind, ctx: &ReplicaLogContext) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
     );
 }
 
@@ -797,6 +806,7 @@ pub fn emit_namespace_progress_event(
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         op,
         pipeline_depth,
     );
@@ -821,6 +831,7 @@ impl StructuredSimEvent for RequestLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             client_id = self.client_id,
             request_id = self.request_id,
             operation = operation_as_str(self.operation),
@@ -847,6 +858,7 @@ impl StructuredSimEvent for PrepareLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             op = self.op,
             parent_checksum = self.parent_checksum,
             prepare_checksum = self.prepare_checksum,
@@ -877,6 +889,7 @@ impl StructuredSimEvent for AckLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             op = self.op,
             prepare_checksum = self.prepare_checksum,
             ack_from_replica = self.ack_from_replica,
@@ -906,6 +919,7 @@ impl StructuredSimEvent for CommitLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             op = self.op,
             client_id = self.client_id,
             request_id = self.request_id,
@@ -936,6 +950,7 @@ impl StructuredSimEvent for ViewChangeLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             old_view = self.old_view,
             new_view = self.new_view,
             reason = self.reason.as_str(),
@@ -962,6 +977,7 @@ impl StructuredSimEvent for ControlActionLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             action = self.action.as_str(),
             target_replica = self.target_replica.unwrap_or_default(),
             op = self.op.unwrap_or_default(),
