@@ -1385,22 +1385,25 @@ impl TcpClient {
     /// failover unauthenticated. The public [`Client::disconnect`] wraps this
     /// and forgets them first.
     async fn disconnect_transport(&self) -> Result<(), IggyError> {
-        match self.get_state().await {
-            ClientState::Disconnected => return Ok(()),
-            // Preserve the stream a concurrent reconnect is installing.
-            // A `Connecting` that no sweep owns, such as one left by an aborted
-            // heartbeat, is torn down like any other state.
-            ClientState::Connecting if self.connect_coordinator.is_active() => {
-                trace!("Not disconnecting; a connect is already in flight.");
-                return Ok(());
-            }
-            _ => {}
+        // Preserve the stream a concurrent reconnect is installing.
+        // A `Connecting` that no sweep owns, such as one left by an aborted
+        // heartbeat, is torn down like any other state.
+        if self.get_state().await == ClientState::Connecting && self.connect_coordinator.is_active()
+        {
+            trace!("Not disconnecting; a connect is already in flight.");
+            return Ok(());
+        }
+        // Taken before the state is read: a teardown aborted after it set
+        // `Disconnected` can leave the stream installed.
+        let stream = self.stream.lock().await.take();
+        if stream.is_none() && self.get_state().await == ClientState::Disconnected {
+            return Ok(());
         }
 
         let client_address = self.get_client_address_value().await;
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
-        self.stream.lock().await.take();
+        drop(stream);
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!("{NAME} client: {client_address} has disconnected from server at: {now}.");
@@ -3877,17 +3880,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_disconnect_during_a_reconnect_sweep_ends_the_sweep() {
-        let (listener, address) = live_endpoint().await;
-        let accepts = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&accepts);
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                counted.fetch_add(1, Ordering::SeqCst);
-                // Accept, then hang up: every sign-in fails on the socket, so
-                // with unlimited retries the sweep only ends on a disconnect.
-                drop(stream);
-            }
-        });
+        // Every sign-in fails on the socket, so with unlimited retries the
+        // sweep only ends on a disconnect.
+        let (address, accepts) = counted_endpoint_that_hangs_up().await;
         let client = Arc::new(auto_login_client(address));
         let sweep = tokio::spawn({
             let client = Arc::clone(&client);

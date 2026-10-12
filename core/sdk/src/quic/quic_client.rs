@@ -1073,7 +1073,10 @@ impl QuicClient {
     }
 
     async fn disconnect_transport(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Disconnected {
+        // Taken before the state is read: a teardown aborted after it set
+        // `Disconnected` can leave the connection installed.
+        let connection = self.connection.lock().await.take();
+        if connection.is_none() && self.get_state().await == ClientState::Disconnected {
             return Ok(());
         }
 
@@ -1082,7 +1085,7 @@ impl QuicClient {
             self.config.client_address
         );
         self.set_state(ClientState::Disconnected).await;
-        self.connection.lock().await.take();
+        drop(connection);
         self.endpoint.wait_idle().await;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -2173,5 +2176,37 @@ mod tests {
             matches!(reconnect, Err(IggyError::NotConnected)),
             "got {reconnect:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_teardown_cut_short_after_the_state_change_is_finished_by_the_next_one() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        // What an abort leaves between the state change and the cleanup.
+        client.set_state(ClientState::Disconnected).await;
+
+        client.disconnect_transport().await.unwrap();
+
+        assert!(client.connection.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), peer.closed())
+            .await
+            .expect("the live connection must be closed");
     }
 }

@@ -1153,15 +1153,17 @@ impl WebSocketClient {
     }
 
     async fn disconnect_transport(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Disconnected {
+        // Taken before the state is read: a teardown aborted after it set
+        // `Disconnected` can leave the stream installed.
+        let stream = self.stream.lock().await.take();
+        if stream.is_none() && self.get_state().await == ClientState::Disconnected {
             return Ok(());
         }
 
         let client_address = self.get_client_address_value().await;
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
-
-        self.stream.lock().await.take();
+        drop(stream);
 
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
