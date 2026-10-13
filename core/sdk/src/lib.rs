@@ -296,6 +296,7 @@ pub mod client_provider;
 pub mod client_wrappers;
 pub mod clients;
 pub mod consumer_ext;
+mod diagnostic_events;
 pub mod http;
 mod leader_aware;
 mod poll_routing;

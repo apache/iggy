@@ -48,7 +48,14 @@ pub trait Client:
     /// If the client is already connected, it will do nothing.
     async fn connect(&self) -> Result<(), IggyError>;
 
-    /// Disconnect from the server. If the client is not connected, it will do nothing.
+    /// Disconnect from the server. Repeated calls are safe.
+    ///
+    /// On TCP, QUIC and WebSocket, the disconnect holds until the next `connect()`,
+    /// also on a client that was not connected: nothing reconnects the client on
+    /// its own, even with auto-login credentials. Until then, a request that needs
+    /// a session fails with `IggyError::Disconnected`, and any other request with
+    /// `IggyError::NotConnected`. A connection that drops without this call can
+    /// still reconnect on its own. Over HTTP this call does nothing.
     async fn disconnect(&self) -> Result<(), IggyError>;
 
     /// Shut down the client and release all the resources. Repeated calls are safe.
@@ -60,5 +67,16 @@ pub trait Client:
     async fn shutdown(&self) -> Result<(), IggyError>;
 
     /// Subscribe to diagnostic events.
+    ///
+    /// The event channel is bounded. When it is full, the client drops the
+    /// oldest event, so publishing never waits for a subscriber. A subscriber
+    /// that falls behind loses old events, not the newest ones.
+    ///
+    /// After a loss, the next `recv()` returns `RecvError::Overflowed` with the
+    /// number of lost events, and the calls after it return the events that are
+    /// left. Thus, after `Overflowed`, call `recv()` again, or read the receiver
+    /// with `StreamExt::next()`, which skips that error.
+    ///
+    /// HTTP keeps no connection, so it publishes no events.
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent>;
 }

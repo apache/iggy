@@ -1077,7 +1077,9 @@ pub fn validate_sync_group_shape(version: i16, body: &Bytes, max_frame_size: usi
     Ok(())
 }
 
-/// Mirrors the field order `OffsetCommitRequest::decode` walks.
+/// Mirrors the field order `DescribeGroupsRequest::decode` , `OffsetCommitRequest::decode` walks.
+///
+/// Group ids are echoed, so their lengths count toward the projected response.
 ///
 /// # Errors
 ///
@@ -1198,6 +1200,70 @@ pub fn validate_offset_fetch_shape(
         let _require_stable = c.read_bool()?;
     }
     if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
+/// Mirrors the field order `DescribeGroupsRequest::decode` walks.
+///
+/// Group ids are echoed, so their lengths count toward the projected response.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_describe_groups_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 5;
+    let groups_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..groups_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+    }
+    if version >= 3 {
+        let _include_authorized_operations = c.read_bool()?;
+    }
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+/// Mirrors the field order `ListGroupsRequest::decode` walks.
+///
+/// The response is the coordinator's group list, not an echo of this body, so filter strings are
+/// walked only to reject a length that cannot fit the frame.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string length cannot fit in the bytes remaining in the
+/// frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_list_groups_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    if version >= 4 {
+        let states_count = c.compact_array_count()?;
+        for _ in 0..states_count {
+            c.compact_string(false)?;
+        }
+    }
+    if version >= 5 {
+        let types_count = c.compact_array_count()?;
+        for _ in 0..types_count {
+            c.compact_string(false)?;
+        }
+    }
+    if version >= 3 {
         c.tagged_fields()?;
     }
     Ok(())
@@ -1420,7 +1486,10 @@ fn walk_offset_fetch_topics(
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
-    use kafka_protocol::messages::{LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest};
+    use kafka_protocol::messages::{
+        DescribeGroupsRequest, LeaveGroupRequest, ListGroupsRequest, OffsetCommitRequest,
+        OffsetFetchRequest,
+    };
 
     use super::*;
     use crate::protocol::handlers::decode_exhaustive;
@@ -1982,6 +2051,58 @@ mod tests {
     fn alter_configs_v2_huge_compact_count_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]); // u32::MAX, 5-byte varint
         assert!(validate_alter_configs_shape(2, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn describe_groups_v5_huge_group_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_describe_groups_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    #[test]
+    fn describe_groups_v0_one_group_accepted() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // groups: 1
+            0x00, 0x01, b'g', // group id
+        ]);
+        assert!(validate_describe_groups_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<DescribeGroupsRequest>(0, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn describe_groups_v5_one_group_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // groups: 1
+            0x02, b'g', // group id
+            0x00, // include_authorized_operations
+            0x00, // tagged fields
+        ]);
+        assert!(validate_describe_groups_shape(5, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<DescribeGroupsRequest>(5, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn list_groups_v0_empty_body_accepted() {
+        let body = Bytes::new();
+        assert!(validate_list_groups_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<ListGroupsRequest>(0, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn list_groups_v5_empty_filters_accepted() {
+        let body = Bytes::from_static(&[
+            0x01, // states_filter: empty
+            0x01, // types_filter: empty
+            0x00, // tagged fields
+        ]);
+        assert!(validate_list_groups_shape(5, &body, TEST_MAX_FRAME_SIZE).is_ok());
+        decode_exhaustive::<ListGroupsRequest>(5, body).expect("body matches the schema");
+    }
+
+    #[test]
+    fn list_groups_v4_huge_states_filter_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_list_groups_shape(4, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

@@ -30,8 +30,8 @@ use std::str::FromStr;
 /// - `id`: the unique identifier of the consumer.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
 pub struct Consumer {
-    /// The type of consumer.
-    #[serde(skip)]
+    /// The type of consumer. It can be either `Consumer`, `ConsumerGroup` or `ExternalGroup`.
+    #[serde(rename = "consumer_kind", default)]
     pub kind: ConsumerKind,
     /// The unique identifier of the consumer.
     #[serde(rename = "consumer_id")]
@@ -96,8 +96,7 @@ impl Consumer {
     ///
     /// For offset calls only: no membership check, no range check, never polled, and no hold on
     /// retention. Deleting the group deletes its offsets. A poll with it returns
-    /// [`IggyError::FeatureUnavailable`], and so does every call over HTTP, because the REST API
-    /// cannot name a consumer kind.
+    /// [`IggyError::FeatureUnavailable`].
     pub fn external_group(id: Identifier) -> Self {
         Self {
             kind: ConsumerKind::ExternalGroup,
