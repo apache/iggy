@@ -18,7 +18,7 @@
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use comfy_table::Table;
+use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
 use iggy_common::Identifier;
 use iggy_common::IggyExpiry;
@@ -99,6 +99,44 @@ impl CliCommand for GetTopicCmd {
             "Partitions count",
             format!("{}", topic.partitions_count).as_str(),
         ]);
+
+        if !topic.partitions.is_empty() {
+            let mut partitions_table = Table::new();
+            partitions_table.load_style(ASCII_NO_BORDERS);
+            partitions_table.set_header(vec![
+                "Partition id",
+                "Created",
+                "Segments count",
+                "Current offset",
+                "Size",
+                "Messages count",
+            ]);
+
+            for partition in &topic.partitions {
+                partitions_table.add_row(vec![
+                    partition.id.to_string(),
+                    partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
+                    partition.segments_count.to_string(),
+                    partition.current_offset.to_string(),
+                    partition.size.to_string(),
+                    partition.messages_count.to_string(),
+                ]);
+            }
+            table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
+        }
+
+        if !topic.options.is_empty() {
+            let mut options_table = Table::new();
+            options_table.load_style(ASCII_NO_BORDERS);
+            options_table.set_header(vec!["Option", "Value"]);
+            for (key, option) in &topic.options {
+                options_table.add_row(vec![
+                    String::from_utf8_lossy(key.as_bytes()).into_owned(),
+                    option.value.to_string_value(),
+                ]);
+            }
+            table.add_row(vec!["Options", options_table.to_string().as_str()]);
+        }
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");
 
