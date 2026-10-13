@@ -361,7 +361,7 @@ impl Mapping {
             symbols: Vec::new(),
             columns: Vec::with_capacity(field_count),
             payload: None,
-            headers: Vec::new(),
+            headers: Vec::with_capacity(header_count),
             timestamp: PreparedTimestamp::Now,
         };
 
@@ -417,7 +417,6 @@ impl Mapping {
         if self.include_headers
             && let Some(headers) = message.headers.as_ref()
         {
-            row.headers.reserve(headers.len());
             for (key, value) in headers {
                 let column = format!("header_{}", key.to_string_value());
                 // `to_string_value` Debug-formats a `Raw` value, which would

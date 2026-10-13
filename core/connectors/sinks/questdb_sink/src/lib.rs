@@ -220,7 +220,7 @@ impl QuestDbSink {
                 .map(|duration| *duration)
                 .unwrap_or_else(|_| {
                     warn!(
-                        "Invalid flush_timeout for {CONNECTOR_NAME} ID: {id}, defaulting to {}",
+                        "Invalid flush_timeout {raw:?} for {CONNECTOR_NAME} ID: {id}, defaulting to {}",
                         humantime::format_duration(DEFAULT_FLUSH_TIMEOUT)
                     );
                     DEFAULT_FLUSH_TIMEOUT
@@ -952,14 +952,15 @@ impl Sink for QuestDbSink {
     async fn close(&mut self) -> Result<(), Error> {
         if let Some(db) = self.db.take() {
             // Dropping the pool drains what it still holds, bounded by the
-            // connect string's `close_flush_timeout`, and discards the rest.
+            // connect string's `close_flush_timeout_millis`, and discards the
+            // rest.
             //
             // There is no useful wait to add here. `borrow_sender` rebases the
             // new lease onto the connection's current published frame number,
             // so a wait on it returns at once and proves nothing about the
             // frames earlier batches left queued. The drop is the drain:
             // `Drop for QuestDb` walks every idle store-and-forward connection
-            // under one shared `close_flush_timeout` deadline. What it cannot
+            // under one shared `close_flush_timeout_millis` deadline. What it cannot
             // deliver it reports through the `log` crate, which the connectors
             // runtime does not bridge, so that warning never reaches an
             // operator. Set `sf_dir` in the connect string for a tail that
@@ -1583,10 +1584,13 @@ mod tests {
     fn given_a_long_payload_when_previewing_should_truncate_and_report_the_size() {
         let text = "a".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES * 2);
         let preview = payload_preview(&Payload::Text(text.clone()));
-        assert!(preview.len() < text.len(), "{preview}");
-        assert!(
-            preview.ends_with(&format!("({} bytes total)", text.len())),
-            "{preview}"
+        assert_eq!(
+            preview,
+            format!(
+                "{}… ({} bytes total)",
+                "a".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES),
+                text.len()
+            )
         );
     }
 
@@ -1618,8 +1622,9 @@ mod tests {
     fn given_a_multibyte_boundary_when_previewing_should_not_split_a_character() {
         // Three bytes per character puts the boundaries on multiples of three.
         // The cut is at 512, which is not one of them, so it has to round down
-        // to a character boundary rather than slicing a character in half. A two-byte character
-        // would not test this: every boundary would be even, and so is the cut.
+        // to a character boundary rather than slicing a character in half. A
+        // two-byte character would not test this: every boundary would be
+        // even, and so is the cut.
         assert_ne!(
             REJECTED_PAYLOAD_PREVIEW_BYTES % "€".len(),
             0,
@@ -1672,10 +1677,11 @@ mod tests {
         let mut config = config();
         config.timestamp_source = Some("payload".to_owned());
         let mut sink = QuestDbSink::new(1, config);
-        assert!(matches!(
-            sink.open().await,
-            Err(Error::InvalidConfigValue(_))
-        ));
+        let result = sink.open().await;
+        assert!(
+            matches!(&result, Err(Error::InvalidConfigValue(reason)) if reason.contains("timestamp_field")),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]
