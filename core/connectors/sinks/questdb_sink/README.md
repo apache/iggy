@@ -88,8 +88,10 @@ rows reaches it. The 1 MB default leaves room, because the buffer size is an
 estimate and a frame can also carry the symbol dictionary. If you raise it, also
 raise `sf_max_segment_bytes` in the connect string.
 
-The check runs before each row is added, so a single message larger than the
-frame cap still fails its flush, together with the rows buffered with it.
+The check runs before each row is added. A message larger than the frame cap
+minus `max_flush_bytes` can therefore push one frame over the cap. That flush
+fails, and the connector does not write the rows buffered with the message or
+the rest of its chunk. It logs their offsets.
 
 ## Store-and-forward
 
@@ -220,20 +222,23 @@ Use one source per table.
 
 ## Delivery semantics
 
-Delivery is at-least-once when `sf_dir` is set. A reconnect, a failover or a
-store-and-forward replay can send rows again. Declare
+Rows in a flush that QuestDB accepted are delivered at least once. A reconnect,
+a failover or a store-and-forward replay can send them again, with or without
+`sf_dir`. Rows the sink does not write, such as a rejected record or a failed
+chunk, are lost, as the rest of this section describes. Declare
 [`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
 
-Without `sf_dir`, unacknowledged frames are kept only in memory. A crash, or a
-shutdown that outlasts `close_flush_timeout`, loses them even though `consume()`
-already reported success.
+Without `sf_dir`, the queue of unacknowledged frames is kept only in memory. A
+crash, or a shutdown that outlasts `close_flush_timeout`, loses it even though
+`consume()` already reported success.
 
 A batch fails when:
 
 - QuestDB rejects a frame terminally. The client reports some rejections after
   the flush that caused them returned, without saying which topic sent the
-  frame. Such a rejection fails the next batch of any topic on this connector.
+  frame. Such a rejection fails the next batch, of any topic on this connector,
+  that has no error of its own.
 - A chunk fails to write. If the cause is the connection, the connector skips
   the remaining chunks of the batch. It logs the offsets and message ids of the
   messages it did not write.

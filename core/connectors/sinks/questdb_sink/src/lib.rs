@@ -17,7 +17,6 @@
 
 mod mapping;
 
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -990,7 +989,8 @@ struct BatchOutcome {
     rows_written: usize,
     rejected_rows: usize,
     /// Flushes whose acknowledgement had not arrived before the timeout. The
-    /// rows are persisted and still being delivered; this is lag, not loss.
+    /// rows stay queued and are still being delivered, so this is lag, not
+    /// loss. The queue survives a crash only when `sf_dir` is set.
     pending_acks: usize,
     last_rejection: Option<String>,
 }
@@ -1009,9 +1009,7 @@ impl BatchOutcome {
 /// Renders a rejected payload for the log, truncated on a char boundary so a
 /// large or binary message cannot blow up the log line.
 fn payload_preview(payload: &Payload) -> String {
-    // A text payload is borrowed rather than copied, because the common case is
-    // a payload short enough to need no truncation at all.
-    let rendered: Cow<'_, str> = match payload {
+    match payload {
         // Rendered through a writer that keeps only the preview's worth of
         // bytes, so a large rejected document is never held as one string.
         Payload::Json(value) => {
@@ -1019,14 +1017,13 @@ fn payload_preview(payload: &Payload) -> String {
             if simd_json::to_writer(&mut capped, value).is_err() {
                 return "<unrenderable>".to_owned();
             }
-            return capped.into_preview();
+            capped.into_preview()
         }
-        Payload::Text(text) | Payload::Proto(text) => Cow::Borrowed(text.as_str()),
+        Payload::Text(text) | Payload::Proto(text) => truncate_preview(text, text.len()),
         Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
-            Cow::Owned(format!("<{} bytes>", bytes.len()))
+            format!("<{} bytes>", bytes.len())
         }
-    };
-    truncate_preview(&rendered, rendered.len())
+    }
 }
 
 /// Cuts `head` to the preview limit on a char boundary. `total` is the full
@@ -1035,10 +1032,7 @@ fn truncate_preview(head: &str, total: usize) -> String {
     if total <= REJECTED_PAYLOAD_PREVIEW_BYTES {
         return head.to_owned();
     }
-    let mut end = REJECTED_PAYLOAD_PREVIEW_BYTES.min(head.len());
-    while end > 0 && !head.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = head.floor_char_boundary(REJECTED_PAYLOAD_PREVIEW_BYTES);
     format!("{}… ({total} bytes total)", &head[..end])
 }
 
@@ -1776,8 +1770,10 @@ mod tests {
             }
             let sink = QuestDbSink::new(1, config);
             assert!(
-                matches!(sink.init_error, Some(Error::InvalidConfigValue(_))),
-                "{field} should reject {value}"
+                matches!(&sink.init_error, Some(Error::InvalidConfigValue(reason))
+                    if reason.contains(field) && reason.contains(value)),
+                "{field} should reject {value} and name both, got {:?}",
+                sink.init_error
             );
         }
     }

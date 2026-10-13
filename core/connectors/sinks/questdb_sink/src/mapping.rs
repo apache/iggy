@@ -113,6 +113,11 @@ impl TimestampUnit {
 /// from as an ordinary rejection.
 pub(crate) const MAX_NAME_LEN: usize = 127;
 
+/// How many metadata columns the connector can write itself. The array in
+/// [`Mapping::reserved_columns_with_flags`] is typed with this length, so the
+/// two cannot disagree.
+const RESERVED_COLUMNS: usize = 4;
+
 /// Where a rounded integer came from, which decides what the warning tells the
 /// operator to do. An array element and a value past `i64::MAX` have no exact
 /// QuestDB form, so pointing them at `integer_columns` would be wrong: that
@@ -343,8 +348,10 @@ impl Mapping {
         // less than hashing a lowercased copy of every name, and it copies no
         // name on a path that runs for every field of every row.
         let field_count = fields.map_or(0, |fields| fields.len());
-        let mut seen: Vec<&str> = self.reserved_columns().collect();
-        seen.reserve(field_count);
+        let mut seen: Vec<&str> = Vec::with_capacity(RESERVED_COLUMNS + field_count);
+        for reserved in self.reserved_columns() {
+            seen.push(reserved);
+        }
 
         let mut row = PreparedRow {
             symbols: Vec::new(),
@@ -452,7 +459,7 @@ impl Mapping {
     pub(crate) fn reserved_columns_with_flags(
         &self,
     ) -> impl Iterator<Item = (&'static str, &'static str)> {
-        [
+        let all: [(&'static str, &'static str, bool); RESERVED_COLUMNS] = [
             (
                 "stream",
                 "include_stream_column",
@@ -469,9 +476,9 @@ impl Mapping {
                 "include_offset_column",
                 self.include_offset_column,
             ),
-        ]
-        .into_iter()
-        .filter_map(|(name, flag, included)| included.then_some((name, flag)))
+        ];
+        all.into_iter()
+            .filter_map(|(name, flag, included)| included.then_some((name, flag)))
     }
 
     /// Records that `name` will occupy a column, rejecting a case-insensitive
