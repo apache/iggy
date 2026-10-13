@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
-import { base, resolve } from '$app/paths';
-import { authStore } from '$lib/auth/authStore.svelte';
-import { checkIfPathnameIsPublic, typedRoute } from '$lib/types/appRoutes';
+import { resolve } from '$app/paths';
+import type { Path } from '$app/types';
+import { authStore } from '#lib/auth/authStore.svelte.js';
+import { checkIfPathnameIsPublic, typedRoute } from '#lib/types/appRoutes.js';
 import type { LayoutLoad } from './$types';
 
 // Enable client-side rendering for SPA mode
@@ -35,23 +36,25 @@ export const load: LayoutLoad = async ({ url }) => {
   const isPublicPath = checkIfPathnameIsPublic(pathname);
   const isAuthenticated = authStore.getAccessToken() !== null;
 
+  // Entry URLs without pages are absent from the generated route types.
+  const rootPath = resolve('' as Path);
   const authRedirects = [
-    base,
-    `${base}/`,
-    `${base}/dashboard`,
-    `${base}/dashboard/`,
-    `${base}/auth`,
-    `${base}/auth/sign-in`
+    rootPath.replace(/\/$/, ''),
+    rootPath,
+    `${rootPath}dashboard`,
+    `${rootPath}dashboard/`,
+    `${rootPath}auth`,
+    resolve(typedRoute('auth/sign-in'))
   ];
 
   if (browser) {
     if (!isAuthenticated && !isPublicPath) {
-      goto(resolve(typedRoute('/auth/sign-in')));
+      goto(resolve(typedRoute('auth/sign-in')));
       return { isAuthenticated: false };
     }
 
     if (isAuthenticated && authRedirects.includes(pathname)) {
-      goto(resolve(typedRoute('/dashboard/overview')));
+      goto(resolve(typedRoute('dashboard/overview')));
       return { isAuthenticated: true };
     }
   }

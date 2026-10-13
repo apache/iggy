@@ -162,10 +162,10 @@ func deserializeOptions(payload []byte, position int) (map[string]iggcon.HeaderV
 	return options, consumed, nil
 }
 
-// pollPrefixLength covers [partition_id u32][current_offset u64][count u32].
-const pollPrefixLength = 16
+// pollPrefixLength includes partition, offset, count and the captured context.
+const pollPrefixLength = 16 + iggcon.PartitionContextSize
 
-// DeserializeFetchMessagesResponse decodes a poll reply: the 16-byte prefix
+// DeserializeFetchMessagesResponse decodes a poll reply: the 40-byte prefix
 // followed by batch records ([256-byte batch header][frames]) walked by their
 // batch length, with each frame's deltas resolved to absolute values. A
 // truncated body is a decode error rather than a shorter batch: silently
@@ -188,6 +188,10 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	messagesCount := binary.LittleEndian.Uint32(payload[12:16])
+	var partitionContext iggcon.PartitionContext
+	if err := partitionContext.UnmarshalBinary(payload[16:pollPrefixLength]); err != nil {
+		return nil, err
+	}
 	position := pollPrefixLength
 
 	// The declared count is server-controlled; the allocation hint is capped
@@ -268,6 +272,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 		CurrentOffset: currentOffset,
 		Messages:      messages,
 		MessageCount:  messagesCount,
+		Context:       partitionContext,
 	}, nil
 }
 
@@ -375,7 +380,10 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 	length := len(payload)
 
 	for position < length {
-		partition, readBytes := DeserializePartition(payload, position)
+		partition, readBytes, err := DeserializePartition(payload, position)
+		if err != nil {
+			return nil, err
+		}
 		partitions = append(partitions, partition)
 		position += readBytes
 	}
@@ -457,16 +465,25 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	return topic, readBytes, nil
 }
 
-func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int) {
+func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int, error) {
+	const partitionSize = 40 + iggcon.PartitionContextSize
+	if position < 0 || position > len(payload) || len(payload)-position < partitionSize {
+		return iggcon.PartitionContract{}, 0, fmt.Errorf("truncated partition response")
+	}
+	var partitionContext iggcon.PartitionContext
+	if err := partitionContext.UnmarshalBinary(payload[position+40 : position+partitionSize]); err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	segmentsCount := binary.LittleEndian.Uint32(payload[position+12 : position+16])
 	currentOffset := binary.LittleEndian.Uint64(payload[position+16 : position+24])
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	messagesCount := binary.LittleEndian.Uint64(payload[position+32 : position+40])
-	readBytes := 4 + 4 + 8 + 8 + 8 + 8
+	readBytes := partitionSize
 
 	partition := iggcon.PartitionContract{
+		Context:       partitionContext,
 		Id:            id,
 		CreatedAt:     createdAt,
 		SegmentsCount: segmentsCount,
@@ -475,7 +492,7 @@ func DeserializePartition(payload []byte, position int) (iggcon.PartitionContrac
 		MessagesCount: messagesCount,
 	}
 
-	return partition, readBytes
+	return partition, readBytes, nil
 }
 
 func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {

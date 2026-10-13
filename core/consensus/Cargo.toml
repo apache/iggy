@@ -30,6 +30,7 @@ publish = false
 
 [dependencies]
 bit-set = { workspace = true }
+blake3 = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 clock = { workspace = true }

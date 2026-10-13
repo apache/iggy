@@ -748,6 +748,11 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .await
         .expect("send_messages: send_messages should work");
 
+    assert_unauthorized(
+        client.get_topic(&stream_id, &topic_id).await,
+        "send_messages: get_topic",
+    );
+
     // Cannot poll messages
     assert_unauthorized(
         client
@@ -2624,9 +2629,9 @@ async fn test_live_permission_revocation(harness: &TestHarness, root_client: &Ig
 // =============================================================================
 // Test: Deleting a user with a live session denies that session's next read.
 // A read_servers grant makes the pre-delete read a real Ok (get_stats is not
-// enumeration-safe), so the post-delete denial is unambiguous. The binary
-// transports may answer Unauthenticated (session eviction) rather than
-// Unauthorized, so accept either.
+// enumeration-safe), so the post-delete denial is unambiguous. Session eviction
+// may trigger SDK reauthentication, which returns InvalidCredentials for the
+// deleted user.
 // =============================================================================
 
 async fn test_deleted_user_session_denied(harness: &TestHarness, root_client: &IggyClient) {
@@ -2658,8 +2663,9 @@ async fn test_deleted_user_session_denied(harness: &TestHarness, root_client: &I
     assert!(
         matches!(&result, Err(e)
             if e.as_code() == IggyError::Unauthorized.as_code()
-                || e.as_code() == IggyError::Unauthenticated.as_code()),
-        "deleted user's live session must be denied (Unauthorized or Unauthenticated), got {result:?}"
+                || e.as_code() == IggyError::Unauthenticated.as_code()
+                || e.as_code() == IggyError::InvalidCredentials.as_code()),
+        "deleted user's live session or automatic reauthentication must be denied, got {result:?}"
     );
 }
 
@@ -2888,7 +2894,7 @@ fn assert_error_code<T: std::fmt::Debug>(
 
 /// The `id` field of an HTTP `ErrorResponse` body is the wire `IggyError` code,
 /// so a status-collapsed `HttpResponseError` can still be matched exactly.
-fn http_error_id(body: &str) -> Option<u32> {
+pub(crate) fn http_error_id(body: &str) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     value.get("id")?.as_u64().map(|id| id as u32)
 }

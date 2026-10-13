@@ -39,6 +39,7 @@ use message_bus::replica::auth::{self, HandshakeStatus, ReplicaAuth};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBusConfig};
 use server_common::Message;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,71 @@ async fn authenticated_handshake_registers_verified_peer() {
 
     dialer.shutdown(Duration::from_secs(2)).await;
     acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
+#[compio::test]
+async fn acceptor_refuses_incompatible_build_with_and_without_auth() {
+    for authenticated in [false, true] {
+        let acceptor = Rc::new(IggyMessageBus::new(0));
+        let addr =
+            spawn_acceptor(&acceptor, authenticated.then(|| ReplicaAuth::new(SECRET_A))).await;
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let nonce = auth::random_nonce().expect("nonce");
+        let hello = build_hello(CLUSTER, 0, authenticated.then_some(&nonce)).transmute_header(
+            |old, header: &mut GenericHeader| {
+                *header = old;
+                header.reserved_command[auth::IDENTITY_OFFSET] ^= 1;
+            },
+        );
+        framing::write_message(&mut stream, hello)
+            .await
+            .expect("write hello");
+        let response = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+            .await
+            .expect("read refusal");
+        assert_eq!(
+            auth::read_status(&response.header().reserved_command),
+            HandshakeStatus::IncompatibleBuild
+        );
+        assert!(!acceptor.replicas().contains(0));
+        acceptor.shutdown(Duration::from_secs(2)).await;
+    }
+}
+
+#[compio::test]
+async fn dialer_refuses_incompatible_build_with_and_without_auth() {
+    for authenticated in [false, true] {
+        let (listener, addr) = bind(loopback()).await.expect("bind");
+        let responded = Rc::new(Cell::new(false));
+        let observed = Rc::clone(&responded);
+        let peer = compio::runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let hello = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+                .await
+                .expect("read hello");
+            assert_eq!(hello.header().command, Command::ReplicaHello);
+            let challenge = build_raw(CLUSTER, 1, Command::ReplicaChallenge);
+            framing::write_message(&mut stream, challenge)
+                .await
+                .expect("write incompatible challenge");
+            observed.set(true);
+        });
+        let dialer = Rc::new(IggyMessageBus::new(0));
+        spawn_dialer(
+            &dialer,
+            authenticated.then(|| ReplicaAuth::new(SECRET_A)),
+            addr,
+        )
+        .await;
+        settle().await;
+        assert!(
+            responded.get(),
+            "dialer must have received the incompatible challenge"
+        );
+        assert!(!dialer.replicas().contains(1));
+        peer.await.expect("peer task");
+        dialer.shutdown(Duration::from_secs(2)).await;
+    }
 }
 
 #[compio::test]
@@ -307,6 +373,8 @@ fn build_hello(
         h.cluster = cluster_id;
         h.replica = replica_id;
         h.size = HEADER_SIZE as u32;
+        h.reserved_command[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+            .copy_from_slice(&[0x5a; auth::IDENTITY_LEN]);
         if let Some(nonce) = nonce {
             h.reserved_command[..auth::NONCE_LEN].copy_from_slice(nonce);
         }

@@ -383,7 +383,7 @@ async fn given_two_batches_in_one_blob_when_handled_should_answer_invalid_record
         produce(&state, 3, 1, TOPIC, &entries).await,
         vec![(0, ERROR_INVALID_RECORD, -1)]
     );
-    assert!(stored(&server, 0, 10).await.is_empty());
+    assert_eq!(stored(&server, 0, 10).await, []);
 }
 
 #[tokio::test]

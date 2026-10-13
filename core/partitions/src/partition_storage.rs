@@ -123,6 +123,9 @@ pub async fn read_created_revision(partition_dir: &str) -> std::io::Result<Optio
 
 /// Durably replace the 8-byte little-endian record `name` in `directory`: write
 /// a temporary sibling, sync it, rename it over the record, sync the directory.
+///
+/// # Errors
+/// Returns the underlying open, write, rename, or synchronization error.
 pub async fn write_revision_record(
     directory: &str,
     name: &str,
@@ -148,6 +151,9 @@ pub async fn write_revision_record(
 
 /// Read the 8-byte little-endian record `name` in `directory`, `None` when it
 /// is absent.
+///
+/// # Errors
+/// Returns an I/O error or `InvalidData` if the record is not exactly eight bytes.
 pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Result<Option<u64>> {
     let path = Path::new(directory).join(name);
     match compio::fs::read(&path)
@@ -428,9 +434,8 @@ fn seed_recovered_offset<B: MessageBus>(
 
 /// Provision an initial segment + writers for a partition that has none.
 ///
-/// No-op when `partition.log.has_segments()` already returns `true`
-/// (recovery hydrated existing segments), so callers can invoke this
-/// unconditionally.
+/// With WAL-owned messages, restore the deterministic empty tail when the
+/// recovered last segment already reached its size limit.
 ///
 /// # Errors
 ///
@@ -443,6 +448,11 @@ pub async fn ensure_initial_segment<B: MessageBus>(
     wal_owned_messages: bool,
 ) -> Result<(), PartitionRecoveryError> {
     if partition.log.has_segments() {
+        if wal_owned_messages
+            && partition.log.active_segment().size >= partition.log.active_segment().max_size
+        {
+            partition.rotate_segment(config).await?;
+        }
         return Ok(());
     }
     let stream_id = namespace.stream_id();

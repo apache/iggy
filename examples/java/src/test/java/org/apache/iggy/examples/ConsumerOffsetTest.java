@@ -40,6 +40,7 @@ import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -107,8 +108,8 @@ class ConsumerOffsetTest {
                         if (failFirstProcessing && requestedOffsets.size() == 1) {
                             var message = retained.retained.get(0);
                             var invalid = new Message(message.header(), null, message.userHeaders());
-                            return CompletableFuture.completedFuture(
-                                    new PolledMessages(0L, message.header().offset(), 1L, List.of(invalid)));
+                            return CompletableFuture.completedFuture(new PolledMessages(
+                                    0L, message.header().offset(), 1L, List.of(invalid), PartitionContext.EMPTY));
                         }
                         return CompletableFuture.completedFuture(retained.pollMessages(
                                 streamId, topicId, partitionId, consumer, strategy, count, autoCommit));
@@ -193,7 +194,11 @@ class ConsumerOffsetTest {
             delivered.addAll(
                     batch.stream().map(message -> message.header().offset()).toList());
             return new PolledMessages(
-                    0L, retained.get(retained.size() - 1).header().offset(), (long) batch.size(), batch);
+                    0L,
+                    retained.get(retained.size() - 1).header().offset(),
+                    (long) batch.size(),
+                    batch,
+                    PartitionContext.EMPTY);
         }
 
         @Override

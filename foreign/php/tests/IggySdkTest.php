@@ -21,6 +21,7 @@ declare(strict_types=1);
 use Iggy\AutoCommit;
 use Iggy\AutoCommitWhen;
 use Iggy\Client as IggyClient;
+use Iggy\PartitionContext;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
 use Iggy\SendMessage;
@@ -401,6 +402,47 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('A poll continues at an offset under the partition context of the message that preceded it')]
+    public function testPollContinuesUnderTheCapturedPartitionContext(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('context-stream');
+        $topicName = unique_name('context-topic');
+        $partitionId = 0;
+        $messages = ['context-first', 'context-second'];
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
+
+            $first = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 1, false)[0];
+            $context = $first->context();
+            assert_true($context->incarnation > 0, 'a poll must capture the partition incarnation');
+
+            $position = $first->position();
+            assert_same($partitionId, $position->partition_id);
+            assert_same($first->offset(), $position->offset);
+            assert_same($context->incarnation, $position->context->incarnation);
+
+            $next = PollingStrategy::offset($first->offset() + 1);
+            $continued = $client->pollMessages($streamName, $topicName, $partitionId, $next->withContext($context), 1, false);
+            assert_same([$messages[1]], collect_payloads($continued));
+
+            $recreated = new PartitionContext($context->incarnation + 1, $context->owner_generation, $context->metadata_op);
+            assert_throws(
+                static fn () => $client->pollMessages($streamName, $topicName, $partitionId, $next->withContext($recreated), 1, false),
+                'partition history is no longer available',
+            );
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('Creating the same stream twice raises an error')]
     public function testDuplicateStreamCreation(): void
     {
@@ -712,6 +754,60 @@ final class IggySdkTest extends TestCase
 
             assert_same(range(0, count($messages) - 1), $keys);
             assert_same($messages, $received);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A consumer stores the position of a message after it consumed later messages')]
+    public function testConsumerStoresTheDeliveredPosition(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-position');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+        $partitionId = 0;
+        $messages = ['position-first', 'position-second'];
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
+
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                $partitionId,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+            $received = [];
+            $consumer->consumeMessages(
+                static function (ReceiveMessage $message) use (&$received): void {
+                    $received[] = $message;
+                },
+                count($messages),
+            );
+            assert_count(count($messages), $received);
+
+            $first = $received[0];
+            assert_true($first->context()->incarnation > 0, 'a consumed message must keep its partition incarnation');
+            $consumer->storePosition($first->position());
+
+            assert_same($first->offset(), $consumer->getLastStoredOffset($first->partitionId()));
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

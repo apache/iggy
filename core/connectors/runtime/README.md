@@ -47,6 +47,10 @@ IGGY_CONNECTORS_CONFIG_PATH=connectors.toml cargo run --bin iggy-connectors
 
 Supported scalar fields and indexed list entries use environment variables with nested keys joined by underscores, for example `IGGY_CONNECTORS_IGGY_USERNAME`. Header and URL-template maps are configured in TOML. The runtime loads the first `.env` file found in the working directory or its parents, or the file specified by `IGGY_CONNECTORS_ENV_PATH`.
 
+Run `iggy-connectors --list-config-env-vars` to print the supported names and templates without loading configuration or plugins. `<N>` is a stream-vector index from 0 through 255. `<KEY>` is the uppercased connector key and applies only to the local provider.
+
+`<FIELD>` sets one lowercased top-level `plugin_config` key with underscores preserved (`A_B` becomes `a_b`, not nested `a.b`); nested plugin configuration keys cannot be set through environment variables. `FORMAT` is reserved and listed separately as `..._PLUGIN_CONFIG_FORMAT`.
+
 Source destination topics must persist every acknowledged batch before the runtime checkpoints the source or invokes its Ack hook. Missing topics are therefore created with `durability = "persisted"` and `messages_required_to_save = 1`. An existing topic must use `durability = "persisted"`; its save threshold may differ because persisted acknowledgments already wait for durable storage.
 
 ## State storage

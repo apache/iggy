@@ -23,8 +23,10 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -169,21 +171,61 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldReArmWithFreshClientIdOnSecondLogin() {
+    void shouldStampPartitionContextAtTheRequestHeaderOffsets() {
+        session.beginRegister();
+        session.bind(42);
+        PartitionContext context =
+                new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(52));
+
+        ByteBuf payload = sendMessagesPayload(2, 3, 4);
+        ByteBuf frame = encoder.encode(alloc, SEND_MESSAGES_CODE, payload, context);
+        payload.release();
+        try {
+            // Literal offsets pin the Rust RequestHeader layout, so a wrong VsrHeaders constant fails here.
+            assertThat(frame.getLongLE(200)).isEqualTo(17);
+            assertThat(frame.getLongLE(208)).isEqualTo(9);
+            assertThat(frame.getLongLE(216)).isEqualTo(52);
+            byte[] reservedTail = new byte[32];
+            frame.getBytes(224, reservedTail);
+            assertThat(reservedTail).isEqualTo(new byte[32]);
+        } finally {
+            frame.release();
+        }
+    }
+
+    @Test
+    void shouldRetainClientIdAndSecretWhenRegistrationIsRepeated() {
         ByteBuf firstLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, firstLogin).release();
         firstLogin.release();
         long firstLow = session.clientIdLow();
         long firstHigh = session.clientIdHigh();
+        byte[] firstSecret = session.bindSecret();
         session.bind(7);
+        long firstGeneration = session.generation();
 
         ByteBuf secondLogin = loginUserPayload();
         encoder.encode(alloc, LOGIN_USER_CODE, secondLogin).release();
         secondLogin.release();
 
-        assertThat(session.isBound()).isFalse();
-        assertThat(session.clientIdLow() != firstLow || session.clientIdHigh() != firstHigh)
-                .isTrue();
+        assertThat(session.isBound()).isTrue();
+        assertThat(session.clientIdLow()).isEqualTo(firstLow);
+        assertThat(session.clientIdHigh()).isEqualTo(firstHigh);
+        assertThat(session.bindSecret()).isEqualTo(firstSecret);
+        assertThat(session.generation()).isEqualTo(firstGeneration);
+    }
+
+    @Test
+    void shouldKeepUnsignedSharedEpochInEncodedRequest() {
+        byte[] secret = session.bindSecret();
+        session.bindShared(new ConsensusSession(), 1, 2, Long.MIN_VALUE, secret);
+        ByteBuf frame = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(Long.MIN_VALUE);
+            assertThat(session.bindSecret(1, 2, Long.MIN_VALUE)).isEqualTo(secret);
+        } finally {
+            frame.release();
+        }
     }
 
     private static ByteBuf loginUserPayload() {

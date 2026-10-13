@@ -28,7 +28,7 @@ static NEXT_POLL_HISTORY_ID: AtomicU64 = AtomicU64::new(0);
 /// A process counter gives each new history a unique value, even if a rebuilt
 /// partition reuses its namespace and offsets. Polls copy the value without
 /// accessing the counter. `Default` creates a fresh identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PollHistoryId(u64);
 
 impl Default for PollHistoryId {
@@ -44,7 +44,7 @@ impl PollHistoryId {
     fn allocate(counter: &AtomicU64) -> Self {
         // The counter provides uniqueness, not publication of partition state.
         let id = counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
             })
             .expect("poll history ID counter exhausted");

@@ -1,0 +1,63 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "bigquery"
+enabled = true
+version = 0
+name = "BigQuery sink"
+path = "target/release/libiggy_connector_bigquery_sink"
+verbose = false
+
+[[streams]]
+stream = "example_stream"
+topics = ["example_topic"]
+schema = "json"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "bigquery_sink_connector"
+
+[plugin_config]
+project_id = "my-project"
+dataset = "iggy"
+table = "events"
+
+# "mapped" (default): top-level JSON fields map to table columns by name.
+# "raw": the whole payload goes into payload_column (JSON, STRING or BYTES).
+mode = "mapped"
+# payload_column = "payload"
+
+# Credentials: a key file, an inline key, or neither for Application
+# Default Credentials (GOOGLE_APPLICATION_CREDENTIALS, gcloud, metadata server).
+# credentials_path = "/secrets/bigquery-writer.json"
+# credentials_json = "{...}"
+
+# Writes iggy_stream, iggy_topic, iggy_partition_id, iggy_offset,
+# iggy_timestamp and iggy_id. The table must have these columns.
+include_metadata = true
+# Writes message headers into an iggy_headers JSON or STRING column.
+include_headers = false
+
+# Columns no row in a request sets: "default" (column default, else NULL) or "null".
+missing_value = "default"
+
+max_request_bytes = 8388608
+max_retries = 3
+retry_delay = "1s"
+max_retry_delay = "30s"
+timeout = "30s"
+verbose_logging = false

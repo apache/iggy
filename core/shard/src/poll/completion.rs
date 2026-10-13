@@ -86,7 +86,7 @@ impl PollCompletionLane {
         if self
             .state
             .reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 (reserved < self.state.capacity).then_some(reserved + 1)
             })
             .is_err()
@@ -499,11 +499,7 @@ mod tests {
             .build_poll_snapshot(
                 &namespace(),
                 PollingConsumer::Consumer(consumer_id, partition_id),
-                &PollingArgs {
-                    strategy: PollingStrategy::next(),
-                    count: 0,
-                    auto_commit: true,
-                },
+                &PollingArgs::new(PollingStrategy::next(), 0, true),
             )
             .expect("partition has a read snapshot")
             .execute_resident()

@@ -67,18 +67,6 @@ public interface IIggyStream
     Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default);
 
     /// <summary>
-    ///     Purges all messages from all topics in a stream, deleting the stream data but not the stream itself.
-    /// </summary>
-    /// <remarks>
-    ///     This operation removes all messages from all topics and partitions within the stream.
-    ///     The stream structure remains intact, allowing new messages to be published afterwards.
-    /// </remarks>
-    /// <param name="streamId">The identifier of the stream to purge (numeric ID or name).</param>
-    /// <param name="token">The cancellation token to cancel the operation.</param>
-    /// <returns>A task that represents the asynchronous operation.</returns>
-    Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default);
-
-    /// <summary>
     ///     Deletes an existing stream and all its associated topics and messages.
     /// </summary>
     /// <param name="streamId">The identifier of the stream to delete (numeric ID or name).</param>

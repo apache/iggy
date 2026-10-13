@@ -18,8 +18,8 @@ under the License.
 -->
 
 <script lang="ts">
-  import type { StreamDetails } from '$lib/domain/StreamDetails';
-  import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { StreamDetails } from '#lib/domain/StreamDetails.js';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
   import { z } from 'zod';
   import Button from '../Button.svelte';
   import Icon from '../Icon.svelte';
@@ -27,14 +27,14 @@ under the License.
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
   import { zod4 } from 'sveltekit-superforms/adapters';
-  import { fetchRouteApi } from '$lib/api/fetchRouteApi';
+  import { fetchRouteApi } from '#lib/api/fetchRouteApi.js';
   import { goto } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
-  import { browser } from '$app/environment';
+  import { typedRoute } from '#lib/types/appRoutes.js';
+  import { browser } from '$app/env';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
-  import { arraySum } from '$lib/utils/arraySum';
+  import { arraySum } from '#lib/utils/arraySum.js';
   import { resolve } from '$app/paths';
 
   interface Props {
@@ -135,7 +135,7 @@ under the License.
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(resolve(typedRoute('/dashboard/streams')));
+          await goto(resolve(typedRoute('dashboard/streams')));
           await customInvalidateAll();
           showToast({
             type: 'success',

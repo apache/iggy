@@ -25,15 +25,17 @@ use crate::leader_aware::{node_address, transport_port};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
-    ATTACH_CONSUMER_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
-    GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+    BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
+    GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
 };
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
-use iggy_binary_protocol::requests::system::AttachConsumerSessionRequest;
+use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
+use iggy_common::ClientState;
 use iggy_common::{
     BinaryClient, ClusterNode, Credentials, IdKind, Identifier, IggyError, TransportProtocol,
 };
@@ -56,7 +58,7 @@ pub(crate) const ROSTER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const fn is_poll_routing_code(code: u32) -> bool {
     matches!(
         code,
-        ATTACH_CONSUMER_SESSION_CODE
+        BIND_SESSION_CODE
             | GET_POLL_ROUTING_CODE
             | POLL_MESSAGES_ON_PRIMARY_CODE
             | GET_CONSUMER_OFFSET_ROUTING_CODE
@@ -71,7 +73,17 @@ pub(crate) trait PollTransport: BinaryClient + Send + Sync + Sized {
 
     /// One exchange on this connection, with no node movement or automatic
     /// replay of an ambiguous outcome, including replicated offset writes.
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        self.send_poll_request_with_context(code, payload, PartitionContext::default())
+            .await
+    }
+
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError>;
 
     async fn send_poll_control(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
         let result = self.send_poll_request(code, payload.clone()).await;
@@ -87,13 +99,14 @@ pub(crate) trait PollTransport: BinaryClient + Send + Sync + Sized {
 struct PollRoute {
     generation: u64,
     endpoint: String,
-    consumer_session: AttachConsumerSessionRequest,
+    consumer_session: SessionIdentity,
+    context: PartitionContext,
 }
 
 #[derive(Debug)]
 struct PollConnection<T> {
     client: T,
-    consumer_session: Option<AttachConsumerSessionRequest>,
+    consumer_session: Option<SessionIdentity>,
     usable: bool,
 }
 
@@ -160,7 +173,7 @@ impl<T> PollRouter<T> {
             .take();
     }
 
-    pub(crate) fn credentials(&self) -> Option<Credentials> {
+    pub(crate) fn remembered_credentials(&self) -> Option<Credentials> {
         self.credentials
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -203,20 +216,22 @@ impl<T: PollTransport> PollRouter<T> {
         &self,
         coordinator: &T,
         request: &PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        if !request.auto_commit || !self.is_clustered(coordinator).await? {
-            return coordinator
-                .send_raw_with_response(POLL_MESSAGES_CODE, request.to_bytes())
-                .await;
-        }
         let payload = request.to_bytes();
         let parameters_size = request.strategy.encoded_size() + size_of::<u32>() + size_of::<u8>();
         let key = (
             GET_POLL_ROUTING_CODE,
             payload.slice(..payload.len() - parameters_size),
         );
-        self.send_routed(coordinator, POLL_MESSAGES_ON_PRIMARY_CODE, key, payload)
-            .await
+        self.send_routed(
+            coordinator,
+            POLL_MESSAGES_ON_PRIMARY_CODE,
+            key,
+            payload,
+            context,
+        )
+        .await
     }
 
     pub(crate) async fn write_offset(
@@ -224,17 +239,16 @@ impl<T: PollTransport> PollRouter<T> {
         coordinator: &T,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        if !self.is_clustered(coordinator).await? {
-            return coordinator.send_raw_with_response(code, payload).await;
-        }
         let (_, route_size) =
             GetConsumerOffsetRequest::decode(&payload).map_err(|_| IggyError::InvalidCommand)?;
         let key = (
             GET_CONSUMER_OFFSET_ROUTING_CODE,
             payload.slice(..route_size),
         );
-        self.send_routed(coordinator, code, key, payload).await
+        self.send_routed(coordinator, code, key, payload, context)
+            .await
     }
 
     pub(crate) async fn is_clustered(&self, coordinator: &T) -> Result<bool, IggyError> {
@@ -262,11 +276,14 @@ impl<T: PollTransport> PollRouter<T> {
         code: u32,
         key: RouteKey,
         payload: Bytes,
+        mut context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
+        let clustered = self.is_clustered(coordinator).await?;
         let now = Instant::now();
         let deadline = now + POLL_TIMEOUT;
         let result = timeout_at(deadline, async {
-            let heartbeat_due = {
+            // A standalone server serves the exchange on the coordinator connection itself.
+            let heartbeat_due = clustered && {
                 let mut next = self
                     .next_heartbeat
                     .lock()
@@ -284,7 +301,13 @@ impl<T: PollTransport> PollRouter<T> {
             }
             let mut retry_interval = ROUTING_RETRY_INTERVAL;
             loop {
-                let result = self.poll_once(coordinator, code, &key, &payload).await;
+                let result = if clustered {
+                    self.poll_once(coordinator, code, &key, &payload, &mut context)
+                        .await
+                } else {
+                    self.send_to_coordinator(coordinator, code, &key, &payload, &mut context)
+                        .await
+                };
                 if !matches!(result, Err(IggyError::TransientNotAccepted)) {
                     return result;
                 }
@@ -312,14 +335,38 @@ impl<T: PollTransport> PollRouter<T> {
         }
     }
 
+    async fn send_to_coordinator(
+        &self,
+        coordinator: &T,
+        code: u32,
+        key: &RouteKey,
+        payload: &Bytes,
+        context: &mut Option<PartitionContext>,
+    ) -> Result<Bytes, IggyError> {
+        let route = self.route(coordinator, key, payload).await?;
+        let captured = *context.get_or_insert(route.context);
+        let result = coordinator
+            .send_raw_with_context(code, payload.clone(), captured)
+            .await;
+        if result.is_err() {
+            self.routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(key);
+        }
+        result
+    }
+
     async fn poll_once(
         &self,
         coordinator: &T,
         code: u32,
         key: &RouteKey,
         payload: &Bytes,
+        context: &mut Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
         let route = self.route(coordinator, key, payload).await?;
+        let captured = *context.get_or_insert(route.context);
         let slot = {
             let mut connections = self
                 .connections
@@ -372,20 +419,32 @@ impl<T: PollTransport> PollRouter<T> {
                 || session.session != route.consumer_session.session
                 || session.metadata_watermark < route.consumer_session.metadata_watermark
         }) {
-            connection
+            let response = connection
                 .client
                 .send_poll_request(
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    route.consumer_session.to_bytes(),
+                    BIND_SESSION_CODE,
+                    BindSessionRequest {
+                        version_info: iggy_common::rust_sdk_version_info(
+                            coordinator.sdk_version(),
+                        )?,
+                        identity: route.consumer_session,
+                        bind_secret: coordinator.session_bind_secret().await?,
+                    }
+                    .to_bytes(),
                 )
                 .await
                 .map_err(unaccepted_data_error)?;
+            coordinator.decode_session_binding(route.consumer_session, &response)?;
+            connection
+                .client
+                .set_state(ClientState::Authenticated)
+                .await;
             connection.consumer_session = Some(route.consumer_session);
         }
         self.validate_route(&route)?;
         let result = connection
             .client
-            .send_poll_request(code, payload.clone())
+            .send_poll_request_with_context(code, payload.clone(), captured)
             .await;
         connection.usable = !result.as_ref().is_err_and(poll_connection_failed);
         if matches!(result, Err(IggyError::TransientNotAccepted)) {
@@ -452,6 +511,7 @@ impl<T: PollTransport> PollRouter<T> {
             generation,
             endpoint: node_address(&node, port),
             consumer_session: response.consumer_session,
+            context: response.context,
         });
         let mut routes = self
             .routes
@@ -514,18 +574,22 @@ fn unaccepted_data_error(error: IggyError) -> IggyError {
 mod tests {
     use super::*;
     use iggy_binary_protocol::AckLevel;
-    use iggy_binary_protocol::codes::{DELETE_CONSUMER_OFFSET_CODE, STORE_CONSUMER_OFFSET_CODE};
+    use iggy_binary_protocol::codes::{
+        DELETE_CONSUMER_OFFSET_CODE, GET_SEND_CONTEXT_CODE, SEND_MESSAGES_CODE,
+        STORE_CONSUMER_OFFSET_CODE,
+    };
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
     use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterNodeResponse;
     use iggy_binary_protocol::{
-        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier,
+        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier, WireName,
         WirePollingStrategy,
     };
     use iggy_common::{
         BinaryTransport, Client, ClientState, ConsumerGroupClientState, DiagnosticEvent,
-        NonZeroIggyDuration, VsrSessionControl, VsrSessionSealed,
+        Identifier, IggyMessage, MessageClient, NonZeroIggyDuration, Partitioning,
+        VsrSessionControl, VsrSessionSealed,
     };
     use std::collections::VecDeque;
     use std::str::FromStr;
@@ -558,7 +622,10 @@ mod tests {
     struct Script {
         exchanges: Mutex<VecDeque<Exchange>>,
         route_queries: AtomicUsize,
-        attachments: Mutex<Vec<AttachConsumerSessionRequest>>,
+        attachments: Mutex<Vec<SessionIdentity>>,
+        contexts: Mutex<Vec<(u32, PartitionContext)>>,
+        send_payloads: Mutex<Vec<Bytes>>,
+        state: Arc<ConsumerGroupClientState>,
         connections: AtomicUsize,
         pause: Mutex<Option<Arc<Pause>>>,
     }
@@ -607,12 +674,22 @@ mod tests {
             ) {
                 self.script.route_queries.fetch_add(1, Ordering::Relaxed);
             }
-            if code == ATTACH_CONSUMER_SESSION_CODE {
-                self.script
-                    .attachments
-                    .lock()
-                    .unwrap()
-                    .push(AttachConsumerSessionRequest::decode_from(payload).unwrap());
+            if code == BIND_SESSION_CODE {
+                let identity = BindSessionRequest::decode_from(payload).unwrap().identity;
+                self.script.attachments.lock().unwrap().push(identity);
+                return result.map(|bytes| {
+                    assert!(
+                        bytes.is_empty(),
+                        "scripted binding supplies its typed result"
+                    );
+                    iggy_binary_protocol::responses::users::LoginRegisterResponse {
+                        user_id: 1,
+                        session: identity.session,
+                        server_protocol_version: iggy_binary_protocol::IGGY_PROTOCOL_VERSION,
+                        server_version: WireName::new("0.11.0").unwrap(),
+                    }
+                    .to_bytes()
+                });
             }
             result
         }
@@ -639,6 +716,23 @@ mod tests {
 
     #[async_trait]
     impl VsrSessionControl for Transport {
+        async fn session_bind_secret(
+            &self,
+        ) -> Result<iggy_binary_protocol::requests::users::login_register::BindSecret, IggyError>
+        {
+            Ok(
+                iggy_binary_protocol::requests::users::login_register::BindSecret::new(Box::new(
+                    [0x5a; 32],
+                )),
+            )
+        }
+        async fn session_identity(&self) -> Result<SessionIdentity, IggyError> {
+            Ok(SessionIdentity {
+                client_id: 7,
+                session: 11,
+                metadata_watermark: 11,
+            })
+        }
         async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
             Ok(())
         }
@@ -652,6 +746,42 @@ mod tests {
 
     #[async_trait]
     impl BinaryTransport for Transport {
+        async fn send_offset_write_with_response(
+            &self,
+            code: u32,
+            payload: Bytes,
+            context: Option<PartitionContext>,
+        ) -> Result<Bytes, IggyError> {
+            PollRouter::default()
+                .write_offset(self, code, payload, context)
+                .await
+        }
+
+        async fn send_poll_with_response(
+            &self,
+            request: &PollMessagesRequest,
+            context: Option<PartitionContext>,
+        ) -> Result<Bytes, IggyError> {
+            PollRouter::default().poll(self, request, context).await
+        }
+
+        async fn send_raw_with_context(
+            &self,
+            code: u32,
+            payload: Bytes,
+            context: PartitionContext,
+        ) -> Result<Bytes, IggyError> {
+            self.script.contexts.lock().unwrap().push((code, context));
+            if code == SEND_MESSAGES_CODE {
+                self.script
+                    .send_payloads
+                    .lock()
+                    .unwrap()
+                    .push(payload.clone());
+            }
+            self.send_raw_with_response(code, payload).await
+        }
+
         async fn get_state(&self) -> ClientState {
             ClientState::Authenticated
         }
@@ -668,7 +798,7 @@ mod tests {
             NonZeroIggyDuration::from_str("5s").unwrap()
         }
         fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
-            Arc::default()
+            self.script.state.clone()
         }
     }
 
@@ -683,7 +813,13 @@ mod tests {
                 script: Arc::clone(&self.script),
             })
         }
-        async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        async fn send_poll_request_with_context(
+            &self,
+            code: u32,
+            payload: Bytes,
+            context: PartitionContext,
+        ) -> Result<Bytes, IggyError> {
+            self.script.contexts.lock().unwrap().push((code, context));
             let result = self.exchange(self.channel, code, &payload);
             self.script.pause_at(PausePoint::Reply(code)).await;
             result
@@ -705,17 +841,13 @@ mod tests {
             for point in [
                 PausePoint::Reply(routing_code),
                 PausePoint::Connect,
-                PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE),
+                PausePoint::Reply(BIND_SESSION_CODE),
             ] {
                 let mut replacement = PollRoutingResponse::decode_from(&routing()).unwrap();
                 replacement.consumer_session.session = 2;
                 let mut exchanges = vec![(Channel::Coordinator, routing_code, Ok(routing()))];
-                if point == PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE) {
-                    exchanges.push((
-                        Channel::Data,
-                        ATTACH_CONSUMER_SESSION_CODE,
-                        Ok(Bytes::new()),
-                    ));
+                if point == PausePoint::Reply(BIND_SESSION_CODE) {
+                    exchanges.push((Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())));
                 }
                 exchanges.extend([
                     (
@@ -723,11 +855,7 @@ mod tests {
                         routing_code,
                         Ok(replacement.to_bytes()),
                     ),
-                    (
-                        Channel::Data,
-                        ATTACH_CONSUMER_SESSION_CODE,
-                        Ok(Bytes::new()),
-                    ),
+                    (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                     (Channel::Data, code, Ok(Bytes::from_static(b"resumed"))),
                     (Channel::Data, code, Ok(Bytes::from_static(b"warm"))),
                 ]);
@@ -764,7 +892,7 @@ mod tests {
                 replacement.consumer_session.metadata_watermark = 11;
                 assert_eq!(
                     *coordinator.script.attachments.lock().unwrap(),
-                    if point == PausePoint::Reply(ATTACH_CONSUMER_SESSION_CODE) {
+                    if point == PausePoint::Reply(BIND_SESSION_CODE) {
                         vec![
                             PollRoutingResponse::decode_from(&routing())
                                 .unwrap()
@@ -804,22 +932,14 @@ mod tests {
             replacement.consumer_session.session = 2;
             let (router, coordinator, request) = fixture([
                 (Channel::Coordinator, routing_code, Ok(routing())),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, code, Ok(Bytes::from_static(b"in flight"))),
                 (
                     Channel::Coordinator,
                     routing_code,
                     Ok(replacement.to_bytes()),
                 ),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, code, Ok(Bytes::from_static(b"queued"))),
             ]);
             let pause = Arc::new(Pause {
@@ -854,14 +974,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_new_route_when_retrying_a_continuation_should_preserve_its_incarnation_and_owner()
+     {
+        let context = PartitionContext {
+            incarnation: 7,
+            owner_generation: 5,
+            metadata_op: 11,
+        };
+        let mut original_route = PollRoutingResponse::decode_from(&routing()).unwrap();
+        original_route.context = context;
+        let mut newer_route = original_route.clone();
+        newer_route.context.incarnation += 1;
+        newer_route.context.owner_generation += 1;
+        newer_route.context.metadata_op += 1;
+        let (router, coordinator, request) = fixture([
+            (
+                Channel::Coordinator,
+                GET_POLL_ROUTING_CODE,
+                Ok(original_route.to_bytes()),
+            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
+            (
+                Channel::Data,
+                POLL_MESSAGES_ON_PRIMARY_CODE,
+                Err(IggyError::TransientNotAccepted),
+            ),
+            (
+                Channel::Coordinator,
+                GET_POLL_ROUTING_CODE,
+                Ok(newer_route.to_bytes()),
+            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
+            (
+                Channel::Data,
+                POLL_MESSAGES_ON_PRIMARY_CODE,
+                Err(IggyError::HistoryUnavailable),
+            ),
+        ]);
+        assert!(matches!(
+            router.poll(&coordinator, &request, Some(context)).await,
+            Err(IggyError::HistoryUnavailable)
+        ));
+        let contexts: Vec<_> = coordinator
+            .script
+            .contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(code, _)| *code == POLL_MESSAGES_ON_PRIMARY_CODE)
+            .map(|(_, context)| *context)
+            .collect();
+        assert_eq!(contexts, vec![context, context]);
+        assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn offset_writes_reuse_the_data_session_with_their_own_route_fence() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -882,15 +1053,11 @@ mod tests {
                 GET_CONSUMER_OFFSET_ROUTING_CODE,
                 Ok(routing()),
             ),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (Channel::Data, STORE_CONSUMER_OFFSET_CODE, Ok(Bytes::new())),
             (Channel::Data, DELETE_CONSUMER_OFFSET_CODE, Ok(Bytes::new())),
         ]);
-        router.poll(&coordinator, &request).await.unwrap();
+        router.poll(&coordinator, &request, None).await.unwrap();
         let store = StoreConsumerOffsetRequest {
             consumer: request.consumer.clone(),
             stream_id: request.stream_id.clone(),
@@ -901,7 +1068,7 @@ mod tests {
         }
         .to_bytes();
         router
-            .write_offset(&coordinator, STORE_CONSUMER_OFFSET_CODE, store)
+            .write_offset(&coordinator, STORE_CONSUMER_OFFSET_CODE, store, None)
             .await
             .unwrap();
         let delete = DeleteConsumerOffsetRequest {
@@ -913,7 +1080,7 @@ mod tests {
         }
         .to_bytes();
         router
-            .write_offset(&coordinator, DELETE_CONSUMER_OFFSET_CODE, delete)
+            .write_offset(&coordinator, DELETE_CONSUMER_OFFSET_CODE, delete, None)
             .await
             .unwrap();
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
@@ -930,11 +1097,7 @@ mod tests {
                     GET_CONSUMER_OFFSET_ROUTING_CODE,
                     Ok(routing()),
                 ),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, STORE_CONSUMER_OFFSET_CODE, Err(error)),
             ]);
             let store = StoreConsumerOffsetRequest {
@@ -948,7 +1111,7 @@ mod tests {
             .to_bytes();
             assert!(matches!(
                 router
-                    .write_offset(&coordinator, STORE_CONSUMER_OFFSET_CODE, store)
+                    .write_offset(&coordinator, STORE_CONSUMER_OFFSET_CODE, store, None)
                     .await,
                 Err(IggyError::TransientNotCommitted)
             ));
@@ -973,16 +1136,12 @@ mod tests {
                     GET_CONSUMER_OFFSET_ROUTING_CODE,
                     Ok(routing()),
                 ),
-                (
-                    Channel::Data,
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    Ok(Bytes::new()),
-                ),
+                (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                 (Channel::Data, code, Err(error)),
             ]);
             let error = routed_request(&router, &coordinator, &request, code)
                 .await
-                .expect_err("obsolete offset mutations must be returned to the caller");
+                .expect_err("terminal offset errors must be returned to the caller");
             assert_eq!(error.as_code(), expected_code);
             assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
             assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
@@ -993,22 +1152,14 @@ mod tests {
     async fn acknowledged_metadata_changes_refresh_cached_routes_and_attachments() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
                 Ok(Bytes::from_static(b"first")),
             ),
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1020,10 +1171,13 @@ mod tests {
                 Ok(Bytes::from_static(b"warm")),
             ),
         ]);
-        assert_eq!(router.poll(&coordinator, &request).await.unwrap(), "first");
+        assert_eq!(
+            router.poll(&coordinator, &request, None).await.unwrap(),
+            "first"
+        );
         let metadata_reply = ReplyHeader {
             command: Command::Reply,
-            operation: Operation::PurgeTopic,
+            operation: Operation::DeleteTopic,
             size: u32::try_from(HEADER_SIZE).unwrap(),
             commit: 11,
             ..Default::default()
@@ -1033,10 +1187,13 @@ mod tests {
             bytemuck::bytes_of(&metadata_reply).try_into().unwrap(),
         );
         assert_eq!(
-            router.poll(&coordinator, &request).await.unwrap(),
+            router.poll(&coordinator, &request, None).await.unwrap(),
             "after metadata"
         );
-        assert_eq!(router.poll(&coordinator, &request).await.unwrap(), "warm");
+        assert_eq!(
+            router.poll(&coordinator, &request, None).await.unwrap(),
+            "warm"
+        );
         assert_eq!(
             coordinator
                 .script
@@ -1073,30 +1230,92 @@ mod tests {
                 GET_CLUSTER_METADATA_CODE,
                 Ok(metadata),
             ),
+            (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
             (
                 Channel::Recovery,
-                POLL_MESSAGES_CODE,
+                POLL_MESSAGES_ON_PRIMARY_CODE,
                 Ok(Bytes::from_static(b"standalone")),
             ),
             (
                 Channel::Recovery,
-                POLL_MESSAGES_CODE,
+                POLL_MESSAGES_ON_PRIMARY_CODE,
                 Ok(Bytes::from_static(b"warm")),
             ),
         ]);
         router.roster_size.store(0, Ordering::Release);
         assert!(matches!(
-            router.poll(&coordinator, &request).await,
+            router.poll(&coordinator, &request, None).await,
             Err(IggyError::InvalidCommand)
         ));
         assert_eq!(router.roster_size.load(Ordering::Acquire), 0);
         assert_eq!(
-            router.poll(&coordinator, &request).await.unwrap(),
+            router.poll(&coordinator, &request, None).await.unwrap(),
             "standalone"
         );
-        assert_eq!(router.poll(&coordinator, &request).await.unwrap(), "warm");
+        assert_eq!(
+            router.poll(&coordinator, &request, None).await.unwrap(),
+            "warm"
+        );
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 0);
         assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_standalone_server_when_not_accepted_should_retry_with_the_first_context() {
+        let mut first_route = PollRoutingResponse::decode_from(&routing()).unwrap();
+        first_route.context.incarnation = 7;
+        let mut newer_route = first_route.clone();
+        newer_route.context.incarnation += 1;
+        for code in [POLL_MESSAGES_ON_PRIMARY_CODE, STORE_CONSUMER_OFFSET_CODE] {
+            let routing_code = if code == POLL_MESSAGES_ON_PRIMARY_CODE {
+                GET_POLL_ROUTING_CODE
+            } else {
+                GET_CONSUMER_OFFSET_ROUTING_CODE
+            };
+            let (router, coordinator, request) = fixture([
+                (
+                    Channel::Coordinator,
+                    routing_code,
+                    Err(IggyError::TransientNotAccepted),
+                ),
+                (
+                    Channel::Coordinator,
+                    routing_code,
+                    Ok(first_route.to_bytes()),
+                ),
+                (
+                    Channel::Recovery,
+                    code,
+                    Err(IggyError::TransientNotAccepted),
+                ),
+                (
+                    Channel::Coordinator,
+                    routing_code,
+                    Ok(newer_route.to_bytes()),
+                ),
+                (Channel::Recovery, code, Ok(Bytes::from_static(b"accepted"))),
+            ]);
+            router.roster_size.store(1, Ordering::Release);
+
+            assert_eq!(
+                routed_request(&router, &coordinator, &request, code)
+                    .await
+                    .unwrap(),
+                "accepted",
+                "{code}"
+            );
+            let contexts: Vec<_> = coordinator
+                .script
+                .contexts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(sent, _)| *sent == code)
+                .map(|(_, context)| *context)
+                .collect();
+            assert_eq!(contexts, [first_route.context, first_route.context]);
+            assert!(coordinator.script.exchanges.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1114,11 +1333,7 @@ mod tests {
                 }
                 vec![
                     (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-                    (
-                        Channel::Data,
-                        ATTACH_CONSUMER_SESSION_CODE,
-                        Ok(Bytes::new()),
-                    ),
+                    (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
                     (
                         Channel::Data,
                         POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1129,7 +1344,7 @@ mod tests {
             let (router, coordinator, request) = fixture(exchanges);
             let started = Instant::now();
             assert!(matches!(
-                router.poll(&coordinator, &request).await,
+                router.poll(&coordinator, &request, None).await,
                 Err(IggyError::TransientNotAccepted)
             ));
             let queries = coordinator.script.route_queries.load(Ordering::Relaxed);
@@ -1150,11 +1365,7 @@ mod tests {
     async fn complete_error_replies_preserve_the_attached_connection() {
         let (router, coordinator, request) = fixture([
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1168,11 +1379,11 @@ mod tests {
             ),
         ]);
         assert!(matches!(
-            router.poll(&coordinator, &request).await,
+            router.poll(&coordinator, &request, None).await,
             Err(IggyError::TooManyConsumerOffsets)
         ));
         assert_eq!(
-            router.poll(&coordinator, &request).await.unwrap(),
+            router.poll(&coordinator, &request, None).await.unwrap(),
             "resumed"
         );
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
@@ -1200,22 +1411,14 @@ mod tests {
             ),
             (Channel::Recovery, PING_CODE, Ok(Bytes::new())),
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
                 Err(IggyError::Disconnected),
             ),
             (Channel::Coordinator, GET_POLL_ROUTING_CODE, Ok(routing())),
-            (
-                Channel::Data,
-                ATTACH_CONSUMER_SESSION_CODE,
-                Ok(Bytes::new()),
-            ),
+            (Channel::Data, BIND_SESSION_CODE, Ok(Bytes::new())),
             (
                 Channel::Data,
                 POLL_MESSAGES_ON_PRIMARY_CODE,
@@ -1223,12 +1426,12 @@ mod tests {
             ),
         ]);
         assert!(matches!(
-            router.poll(&coordinator, &request).await,
+            router.poll(&coordinator, &request, None).await,
             Err(IggyError::TransientNotCommitted)
         ));
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 1);
         assert_eq!(
-            router.poll(&coordinator, &request).await.unwrap(),
+            router.poll(&coordinator, &request, None).await.unwrap(),
             "resumed"
         );
         assert_eq!(coordinator.script.connections.load(Ordering::Relaxed), 2);
@@ -1242,7 +1445,7 @@ mod tests {
         code: u32,
     ) -> Result<Bytes, IggyError> {
         let payload = match code {
-            POLL_MESSAGES_ON_PRIMARY_CODE => return router.poll(coordinator, request).await,
+            POLL_MESSAGES_ON_PRIMARY_CODE => return router.poll(coordinator, request, None).await,
             STORE_CONSUMER_OFFSET_CODE => StoreConsumerOffsetRequest {
                 consumer: request.consumer.clone(),
                 stream_id: request.stream_id.clone(),
@@ -1262,7 +1465,120 @@ mod tests {
             .to_bytes(),
             _ => panic!("unexpected routed command: {code}"),
         };
-        router.write_offset(coordinator, code, payload).await
+        router.write_offset(coordinator, code, payload, None).await
+    }
+
+    #[tokio::test]
+    async fn given_stale_send_context_when_refused_should_refresh_once_and_preserve_batch() {
+        let old = PartitionContext::default();
+        let current = PartitionContext {
+            metadata_op: 42,
+            ..old
+        };
+        let (_, transport, _) = fixture([
+            (
+                Channel::Recovery,
+                SEND_MESSAGES_CODE,
+                Err(IggyError::HistoryUnavailable),
+            ),
+            (
+                Channel::Recovery,
+                GET_SEND_CONTEXT_CODE,
+                Ok(current.to_bytes()),
+            ),
+            (Channel::Recovery, SEND_MESSAGES_CODE, Ok(Bytes::new())),
+        ]);
+        let stream = Identifier::numeric(1).unwrap();
+        let topic = Identifier::numeric(2).unwrap();
+        transport
+            .script
+            .state
+            .set_partition_context(&stream, &topic, 0, old);
+        let mut messages = [IggyMessage::from("payload")];
+        transport
+            .send_messages(
+                &stream,
+                &topic,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .unwrap();
+        assert_ne!(messages[0].header.id, 0);
+        assert_eq!(
+            *transport.script.contexts.lock().unwrap(),
+            vec![(SEND_MESSAGES_CODE, old), (SEND_MESSAGES_CODE, current)]
+        );
+        let payloads = transport.script.send_payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0], payloads[1]);
+        assert!(transport.script.exchanges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_send_refusals_when_repeated_or_uncertain_should_stop_refreshing() {
+        for uncertain in [false, true] {
+            let current = PartitionContext::default();
+            let expected = if uncertain {
+                IggyError::TransientNotCommitted
+            } else {
+                IggyError::HistoryUnavailable
+            };
+            let mut exchanges =
+                vec![(Channel::Recovery, SEND_MESSAGES_CODE, Err(expected.clone()))];
+            if !uncertain {
+                exchanges.extend([
+                    (
+                        Channel::Recovery,
+                        GET_SEND_CONTEXT_CODE,
+                        Ok(current.to_bytes()),
+                    ),
+                    (Channel::Recovery, SEND_MESSAGES_CODE, Err(expected.clone())),
+                ]);
+            }
+            let (_, transport, _) = fixture(exchanges);
+            let stream = Identifier::numeric(1).unwrap();
+            let topic = Identifier::numeric(2).unwrap();
+            transport
+                .script
+                .state
+                .set_partition_context(&stream, &topic, 0, current);
+            let mut messages = [IggyMessage::from("payload")];
+            let result = transport
+                .send_messages(
+                    &stream,
+                    &topic,
+                    &Partitioning::partition_id(0),
+                    &mut messages,
+                )
+                .await;
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(
+                transport.script.contexts.lock().unwrap().len(),
+                if uncertain { 1 } else { 2 }
+            );
+            assert!(transport.script.exchanges.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn given_malformed_send_context_when_decoded_should_report_invalid_format() {
+        let (_, transport, _) = fixture([(
+            Channel::Recovery,
+            GET_SEND_CONTEXT_CODE,
+            Ok(Bytes::from_static(b"bad")),
+        )]);
+        let mut messages = [IggyMessage::from("payload")];
+        let result = transport
+            .send_messages(
+                &Identifier::numeric(1).unwrap(),
+                &Identifier::numeric(2).unwrap(),
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await;
+        assert_eq!(result.unwrap_err(), IggyError::InvalidFormat);
+        assert!(transport.script.contexts.lock().unwrap().is_empty());
     }
 
     fn fixture(
@@ -1295,7 +1611,8 @@ mod tests {
 
     fn routing() -> Bytes {
         PollRoutingResponse {
-            consumer_session: AttachConsumerSessionRequest {
+            context: Default::default(),
+            consumer_session: SessionIdentity {
                 client_id: 7,
                 session: 1,
                 metadata_watermark: 1,

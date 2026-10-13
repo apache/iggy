@@ -35,6 +35,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 
+import static org.apache.iggy.TestConstants.PERSISTED_TOPIC_OPTIONS;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -81,7 +82,13 @@ class MessagesTcpClientTest extends MessagesClientBaseTest {
         trackStream(stream.id());
         client.topics()
                 .createTopic(
-                        streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicId.getName());
+                        streamId,
+                        1L,
+                        CompressionAlgorithm.None,
+                        BigInteger.ZERO,
+                        BigInteger.ZERO,
+                        topicId.getName(),
+                        PERSISTED_TOPIC_OPTIONS);
         String text = "wiadomość 世界 😀";
 
         // when
