@@ -506,6 +506,35 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
+    public async Task given_unsent_poll_when_its_session_is_replaced_should_report_not_accepted()
+    {
+        using var cluster = new PollCluster();
+        var binding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        cluster.OnPrimaryAttachment = request =>
+        {
+            binding.SetResult();
+            release.Task.GetAwaiter().GetResult();
+            return BindingReply(request);
+        };
+        using var client = await cluster.ConnectAsync();
+        var pending = PollAsync(client);
+        try
+        {
+            await binding.Task.WaitAsync(TestContext.Current.CancellationToken);
+            await client.LogoutUserAsync(TestContext.Current.CancellationToken);
+            await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
+            Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+            Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Requests(CommandCodes.POLL_MESSAGES_CODE)));
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+    }
+
+    [Fact]
     public async Task given_new_coordinator_session_when_polling_should_retire_old_data_connections()
     {
         using var cluster = new PollCluster();

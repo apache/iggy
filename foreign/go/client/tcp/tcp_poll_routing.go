@@ -48,6 +48,7 @@ type singlePollExchange struct{}
 type capturedPartitionContext struct{}
 
 type pollExchangeState struct {
+	stamped  bool
 	written  bool
 	reusable bool
 	replay   bool
@@ -212,7 +213,7 @@ func (c *IggyTcpClient) sendRouted(caller context.Context, code command.Code, qu
 		if requestParent != nil && !c.matchesPollParent(*requestParent) {
 			return nil, ierror.ErrUnauthenticated
 		}
-		state := pollExchangeState{replay: isPartitionMutation(code)}
+		state := pollExchangeState{stamped: stamped, replay: isPartitionMutation(code)}
 		route, err := c.consumerRoute(ctx, query)
 		if err == nil {
 			if requestParent != nil && (requestParent.client != route.parent.client || requestParent.session != route.parent.session) {
@@ -231,19 +232,17 @@ func (c *IggyTcpClient) sendRouted(caller context.Context, code command.Code, qu
 				if snapshot == nil || snapshot.parent.client != route.parent.client || snapshot.parent.session != route.parent.session {
 					return nil, ierror.ErrUnauthenticated
 				}
-				if err := vsr.StampRequestHeader(snapshot.session, uint32(code), frame); err != nil {
-					return nil, err
-				}
-				stamped = true
 				parent := route.parent
 				requestParent = &parent
 			}
 			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), route.context)
 			if c.clustered.Load() {
 				response, err = c.pollOnRoute(ctx, code, key, frame, route, &state)
+				stamped = state.stamped
 			} else {
 				state.parent = requestParent
-				response, _, _, err = c.attempt(context.WithValue(ctx, singlePollExchange{}, &state), uint32(code), frame, true, time.Now(), time.Now().Add(responseReadTimeout))
+				exchangeCtx := context.WithValue(ctx, capturedPartitionContext{}, route.context)
+				response, stamped, _, err = c.attempt(context.WithValue(exchangeCtx, singlePollExchange{}, &state), uint32(code), frame, stamped, time.Now(), time.Now().Add(responseReadTimeout))
 				if state.written && !state.reusable && err != nil {
 					err = ierror.ErrTransientNotCommitted
 				}
@@ -404,8 +403,10 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, code command.Code, key 
 	if !c.pollParentCurrent(route.parent) {
 		return nil, ierror.ErrTransientNotAccepted
 	}
-	response, _, _, err := slot.client.attempt(context.WithValue(exchangeCtx, singlePollExchange{}, state),
-		uint32(code), frame, true, time.Now(), time.Now().Add(responseReadTimeout))
+	exchangeCtx = context.WithValue(exchangeCtx, capturedPartitionContext{}, route.context)
+	response, stamped, _, err := slot.client.attempt(context.WithValue(exchangeCtx, singlePollExchange{}, state),
+		uint32(code), frame, state.stamped, time.Now(), time.Now().Add(responseReadTimeout))
+	state.stamped = stamped
 	err = slot.exchangeError(ctx, *state, err)
 	if errors.Is(err, ierror.ErrTransientNotAccepted) {
 		slot.attached = false

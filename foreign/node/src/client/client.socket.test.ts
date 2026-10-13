@@ -266,7 +266,7 @@ const singleNodeHandler = (port: number): FrameHandler =>
       return;
     }
     if (code === COMMAND_CODE.GetPartitionRoute) {
-      socket.write(replyFrame(Operation.NonReplicated, routingBody(1n)));
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n)));
       return;
     }
     socket.write(replyFrame(operation));
@@ -365,7 +365,7 @@ const startPollCluster = async (
       return;
     }
     if (code === COMMAND_CODE.GetPartitionRoute) {
-      socket.write(replyFrame(Operation.NonReplicated, routingBody(1n)));
+      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n)));
       return;
     }
     singleNodeHandler(coordinator.port)(frame, socket);
@@ -545,6 +545,49 @@ describe('unified partition routing', () => {
     }
   });
 
+  for (const command of [COMMAND_CODE.PollMessages, COMMAND_CODE.GetOffset]) {
+    it(`refreshes cached history after observing a newer metadata commit for ${command}`, async () => {
+      let watermark = 1n;
+      let incarnation = 7n;
+      const histories: bigint[] = [];
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== command)
+          return false;
+        histories.push(stampedContext(frame).incarnation);
+        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0)));
+        return true;
+      }, (frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.UpdateUser) {
+          watermark = 19n;
+          incarnation = 8n;
+          const response = replyFrame(Operation.UpdateUser, metadataResult(0));
+          response.writeBigUInt64LE(watermark, REPLY_OFFSET.commit);
+          socket.write(response);
+          return true;
+        }
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute)
+          return false;
+        socket.write(replyFrame(Operation.NonReplicated, routingBody(watermark, incarnation)));
+        return true;
+      });
+      try {
+        const payload = command === COMMAND_CODE.PollMessages
+          ? groupPollPayload() : GET_OFFSET.serialize({ streamId: 1, topicId: 2,
+            consumer: { kind: ConsumerKind.Single, id: 1 }, partitionId: 3 });
+        await cluster.client.sendCommand(command, payload);
+        await cluster.client.sendCommand(COMMAND_CODE.UpdateUser, Buffer.alloc(0));
+        await cluster.client.sendCommand(command, payload);
+        assert.deepEqual(histories, [7n, 8n]);
+        assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 2);
+        const lookups = cluster.coordinator.frames.filter((frame) =>
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute);
+        assert.equal(stampedContext(lookups[1]).metadataOp, watermark);
+      } finally {
+        await cluster.close();
+      }
+    });
+  }
+
   it('shares one route and request counter across all five partition commands', async () => {
     const cluster = await startPollCluster((frame, socket) => {
       const operation = frame[REQUEST_OFFSET.operation];
@@ -685,7 +728,7 @@ describe('primary auto-commit polling', () => {
       const attachments = cluster.primary.frames.filter((frame) =>
         frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
       assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [1n, 15n]);
-      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 2);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 3);
       await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       const replacement = cluster.primary.frames.filter((frame) =>
@@ -3056,7 +3099,7 @@ describe('VSR client socket', () => {
     });
   }
 
-  it('reuses standalone routes across unrelated metadata commits', async () => {
+  it('refreshes standalone routes after metadata commits', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.CreateStream) {
         const reply = replyFrame(Operation.CreateStream, metadataResult(0));
@@ -3077,7 +3120,7 @@ describe('VSR client socket', () => {
       await client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
       await client.sendCommand(POLL_MESSAGES.code, groupPollPayload(false));
       await client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
-      assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), 2);
+      assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), 4);
     } finally {
       client.destroy();
       await server.close();

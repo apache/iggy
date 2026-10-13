@@ -852,7 +852,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         routes.incrementAndGet();
                         return Response.success(
-                                OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, Math.max(1, request.metadataOp()), primarySocket.getLocalPort()));
                     }
                     if (request.operation() == OPERATION_CREATE_STREAM) {
                         return Response.committed(
@@ -896,7 +897,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     assertThat(attachments).containsExactly(1L, 11L);
                     assertThat(pollWatermarks)
                             .containsExactlyElementsOf(holdAttachment ? List.of(11L) : List.of(1L, 11L));
-                    assertThat(routes).hasValue(1);
+                    assertThat(routes).hasValue(2);
                 } finally {
                     release.complete(null);
                     client.close().get(5, TimeUnit.SECONDS);
@@ -1052,7 +1053,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                             pollRoute(
                                     request,
                                     1,
-                                    1,
+                                    Math.max(1, request.metadataOp()),
                                     partition(request) == 0
                                             ? firstSocket.getLocalPort()
                                             : secondSocket.getLocalPort()));
@@ -1109,7 +1110,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS);
                 poll(client, Optional.of(0L), false).get(5, TimeUnit.SECONDS);
                 assertThat(attachedWatermarks).containsExactly(1L, 1L, 11L);
-                assertThat(routes).hasValue(2);
+                assertThat(routes).hasValue(3);
                 assertThat(firstPolls).hasValue(5);
                 assertThat(ordinaryPolls).hasValue(0);
                 assertThat(logins).hasValue(1);
@@ -1149,7 +1150,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     }
                     if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         return Response.success(
-                                OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, Math.max(1, request.metadataOp()), primarySocket.getLocalPort()));
                     }
                     if (request.operation() == UPDATE_USER_OPERATION
                             || request.operation() == CHANGE_PASSWORD_OPERATION) {

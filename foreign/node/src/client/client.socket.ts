@@ -502,7 +502,7 @@ export class CommandResponseStream extends EventEmitter {
 
   private async _lookupRoute(partition: PartitionTarget, deadline: number): Promise<PartitionRoute> {
     const cached = this.partitionRoutes.get(partition.key);
-    if (cached)
+    if (cached && cached.context.metadataOp >= this.metadataWatermark)
       return cached;
     const response = await this._routingControl(partition, deadline);
     return deserializePartitionRoute(response.data);

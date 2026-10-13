@@ -19,6 +19,10 @@
 
 package org.apache.iggy.cluster;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import com.fasterxml.jackson.annotation.Nulls;
+
 /**
  * A single node in the cluster roster.
  *
@@ -30,7 +34,9 @@ package org.apache.iggy.cluster;
  * @param status    the node status
  */
 public record ClusterNode(
+        @JsonProperty(value = "replica_id", required = true) @JsonSetter(nulls = Nulls.FAIL)
         int replicaId,
+
         String name,
         String ip,
         TransportEndpoints endpoints,

@@ -62,8 +62,8 @@ class PollRouterTest {
     private static final int PARTITION_KEY_BYTES = 16;
     private static final PartitionContext ROUTE_CONTEXT =
             new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.valueOf(ROUTE_WATERMARK));
-    // Attachment validation reads the watermark, then the send checks it again.
-    private static final int SEND_CHECK_WATERMARK_READ = 2;
+    // Fire after route freshness checks, at the final attachment check before send.
+    private static final int SEND_CHECK_WATERMARK_READ = 6;
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
     private static final Duration NEVER = Duration.ofDays(1);
 
@@ -103,6 +103,33 @@ class PollRouterTest {
             assertThat(caller.isAlive()).isFalse();
             assertThat(timeout.isAlive()).isFalse();
             assertThat(primary.sentContexts).containsExactly(ROUTE_CONTEXT, ROUTE_CONTEXT);
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRefreshCachedHistoryBeforeANewPollAfterMetadataAdvances() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            Primary primary = new Primary(group);
+            primary.holdAfterFirst = false;
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            coordinator.watermark = ROUTE_WATERMARK + 1;
+            coordinator.context = new PartitionContext(
+                    BigInteger.valueOf(INCARNATION + 1), BigInteger.ZERO, BigInteger.valueOf(coordinator.watermark));
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            assertThat(primary.sentContexts).containsExactly(ROUTE_CONTEXT, coordinator.context);
+            assertThat(coordinator.routes).isEqualTo(2);
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         } finally {
             timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
             group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
@@ -180,6 +207,9 @@ class PollRouterTest {
 
     private static final class Coordinator extends OfflineConnection {
         private final EventLoop timers;
+        private long watermark;
+        private PartitionContext context = ROUTE_CONTEXT;
+        private int routes;
         private final AtomicInteger watermarkReadsLeft = new AtomicInteger();
         private volatile Runnable watermarkHook = () -> {};
 
@@ -209,7 +239,7 @@ class PollRouterTest {
             if (watermarkReadsLeft.decrementAndGet() == 0) {
                 watermarkHook.run();
             }
-            return super.metadataWatermark();
+            return watermark;
         }
 
         @Override
@@ -231,6 +261,7 @@ class PollRouterTest {
                         PRIMARY_PORT + 1, PRIMARY_PORT, PRIMARY_PORT + 1));
             }
             assertThat(commandCode).isEqualTo(CommandCode.Messages.GET_PARTITION_ROUTE.getValue());
+            routes++;
             Request routing = new Request(
                     OPERATION_NON_REPLICATED,
                     GET_PARTITION_ROUTE_CODE,
@@ -242,8 +273,12 @@ class PollRouterTest {
                     0,
                     new byte[0],
                     0);
-            return CompletableFuture.completedFuture(
-                    pollRoute(routing, SESSION, ROUTE_WATERMARK, PRIMARY_PORT, INCARNATION));
+            return CompletableFuture.completedFuture(pollRoute(
+                    routing,
+                    SESSION,
+                    context.metadataOp().longValue(),
+                    PRIMARY_PORT,
+                    context.incarnation().longValue()));
         }
     }
 
@@ -251,6 +286,7 @@ class PollRouterTest {
     private static final class Primary extends OfflineConnection {
         private final List<PartitionContext> sentContexts = new CopyOnWriteArrayList<>();
         private final CompletableFuture<ByteBuf> unanswered = new CompletableFuture<>();
+        private boolean holdAfterFirst = true;
 
         Primary(IoEventLoopGroup group) {
             super(group);
@@ -269,7 +305,9 @@ class PollRouterTest {
                 return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
             }
             sentContexts.add(state.context());
-            return sentContexts.size() == 1 ? CompletableFuture.completedFuture(emptyPoll(0)) : unanswered;
+            return !holdAfterFirst || sentContexts.size() == 1
+                    ? CompletableFuture.completedFuture(emptyPoll(0))
+                    : unanswered;
         }
 
         @Override

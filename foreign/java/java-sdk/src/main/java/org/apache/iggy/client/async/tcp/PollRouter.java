@@ -410,7 +410,9 @@ final class PollRouter {
 
     private synchronized boolean routeIsCurrent(Route route) {
         AsyncTcpConnection parent = coordinator.get();
-        return route.parent == parent && route.generation == parent.sessionGeneration();
+        return route.parent == parent
+                && route.generation == parent.sessionGeneration()
+                && Long.compareUnsigned(route.attachment.watermark, parent.metadataWatermark()) >= 0;
     }
 
     private CompletableFuture<ByteBuf> enqueue(Route route, Poll poll) {

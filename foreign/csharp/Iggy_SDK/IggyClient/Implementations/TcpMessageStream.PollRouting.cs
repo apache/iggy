@@ -186,7 +186,7 @@ public sealed partial class TcpMessageStream
                     captured ??= route.Route.Context;
                     if (generation is not null && generation != route.Generation)
                     {
-                        throw new VsrRequestOutcomeUnknownException(new NotConnectedException());
+                        throw PollNotAccepted();
                     }
                     generation ??= route.Generation;
                     frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
@@ -213,7 +213,8 @@ public sealed partial class TcpMessageStream
                     VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY)
                 {
                     RemovePartitionRoute(target.Key);
-                    if (Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
+                    if ((generation is not null && generation != _consensusSession.Generation)
+                        || Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
                     {
                         throw;
                     }

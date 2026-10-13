@@ -1500,3 +1500,51 @@ func TestSingleNodeQueuedPartitionRequestCannotUseAReplacementSession(t *testing
 		assert.Equal(t, 1, requestCount(server.recorded(), command.PollMessagesCode))
 	})
 }
+
+func TestQueuedPartitionRequestAllocatesIdentityAfterConnectionAdmission(t *testing.T) {
+	for _, clustered := range []bool{false, true} {
+		t.Run(fmt.Sprint(clustered), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client, serverConn := newPipeClient(t)
+				servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+					return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(0))
+				})
+				stream, topic, group := groupConsumer(t)
+				consumer := iggcon.NewSingleConsumer(group.Id)
+				poll := func() error {
+					_, err := client.PollMessages(context.Background(), stream, topic, consumer,
+						iggcon.NextPollingStrategy(), 1, false, nil)
+					return err
+				}
+				require.NoError(t, poll())
+				gate := client.exchangeGate
+				if clustered {
+					data, peer := newPipeClient(t)
+					serve(peer, func(_ int, _ request) []byte {
+						return replyFrame(vsr.OperationNonReplicated, emptyBatchBody(0))
+					})
+					data.session = client.session.Fork()
+					lifetime, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					gate = make(chan struct{}, 1)
+					for _, route := range client.polls.routes {
+						client.polls.connections = map[string]*pollConnection{route.endpoint: {
+							gate: gate, ctx: lifetime, cancel: cancel, conn: data.conn,
+							client: data, parent: route.parent, attached: true,
+						}}
+					}
+					client.clustered.Store(true)
+				}
+				gate <- struct{}{}
+				before := client.session.CurrentRequestID()
+				completed := make(chan error, 1)
+				go func() { completed <- poll() }()
+				synctest.Wait()
+				assert.Equal(t, before, client.session.CurrentRequestID(), "a queued request must not age the shared replay window")
+				<-gate
+				require.NoError(t, <-completed)
+				assert.Equal(t, before+1, client.session.CurrentRequestID())
+			})
+		})
+	}
+}

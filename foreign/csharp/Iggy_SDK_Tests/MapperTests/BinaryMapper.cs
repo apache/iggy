@@ -18,6 +18,8 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Encryption;
@@ -39,6 +41,36 @@ namespace Apache.Iggy.Tests.MapperTests;
 
 public sealed class BinaryMapper
 {
+    [Theory]
+    [InlineData(null)]
+    [InlineData("null")]
+    [InlineData("0")]
+    [InlineData("7")]
+    [InlineData("255")]
+    public void given_cluster_json_when_reading_replica_identity_should_require_an_explicit_id(string? replica)
+    {
+        var identity = replica is null ? "" : $",\"replica_id\":{replica}";
+        var json = """
+                   {"name":"node","ip":"127.0.0.1","endpoints":{"tcp":8090,"quic":8080,"http":3000,"web_socket":8092},
+                    "role":"leader","status":"healthy"
+                   """ + identity + "}";
+        var options = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
+        };
+        if (replica is null or "null")
+        {
+            Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<ClusterNode>(json, options));
+        }
+        else
+        {
+            var node = JsonSerializer.Deserialize<ClusterNode>(json, options);
+            Assert.NotNull(node);
+            Assert.Equal(byte.Parse(replica), node.ReplicaId);
+        }
+    }
+
     [Fact]
     public void MapPersonalAccessTokens_ReturnsValidPersonalAccessTokenResponse()
     {
