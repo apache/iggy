@@ -104,7 +104,6 @@ impl CliCommand for GetClusterMetadataCmd {
                 cluster_metadata.nodes.iter().for_each(|node| {
                     event!(target: PRINT_TARGET, Level::INFO,
                         "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                        node.replica_id,
                         node.name,
                         node.ip,
                         node.endpoints.tcp,
@@ -112,7 +111,8 @@ impl CliCommand for GetClusterMetadataCmd {
                         node.endpoints.http,
                         node.endpoints.websocket,
                         node.role,
-                        node.status
+                        node.status,
+                        node.replica_id
                     );
                 });
             }

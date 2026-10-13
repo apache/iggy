@@ -80,8 +80,7 @@ impl IggyCmdTestCase for TestClusterMetadataCmd {
                     .success()
                     .stdout(starts_with("Executing get cluster metadata in list mode\n"))
                     .stdout(contains("Cluster name:"))
-                    .stdout(contains("leader"))
-                    .stdout(contains("healthy"));
+                    .stdout(contains("|leader|healthy|0\n"));
             }
         }
     }
