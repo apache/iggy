@@ -579,7 +579,8 @@ struct PendingCommit {
     /// The offset table's entry count and emptied-at op once the accepted
     /// effects publish.
     offset_count: usize,
-    emptied_at: u64,
+    initial_emptied_at: u64,
+    emptied_at: Option<u64>,
     incarnation: crate::PartitionIncarnation,
     poll_history: PollHistoryId,
     applied_floor: u64,
@@ -9805,7 +9806,8 @@ where
                 },
                 |effect| effect.state,
             );
-        let mut plan = self.plan_consumer_offset_effect(offset, tracked, pending.emptied_at);
+        let emptied_at = pending.emptied_at.unwrap_or(pending.initial_emptied_at);
+        let mut plan = self.plan_consumer_offset_effect(offset, tracked, emptied_at);
         if matches!(offset.mutation, PendingConsumerOffsetMutation::Delete) {
             // Only a delete of the last key the table holds empties it. An
             // absent key may be one whose file boot lost, and a stranded file
@@ -9816,7 +9818,7 @@ where
             // deletes the last key it holds, even one stored after the boot.
             // A receiver that missed that delete then drops the lost keys too.
             // A non-empty offer from that donor already drops them the same way.
-            plan.emptied_at = (pending.emptied_at == 0
+            plan.emptied_at = (emptied_at == 0
                 && tracked.is_some()
                 && pending.offset_count == 1
                 && ConsumerKind::ALL
@@ -10021,7 +10023,7 @@ where
         pending.offset_count = (pending.offset_count + usize::from(effect.state.is_some()))
             .saturating_sub(usize::from(plan.tracked.is_some()));
         if let Some(emptied_at) = plan.emptied_at {
-            pending.emptied_at = emptied_at;
+            pending.emptied_at = Some(emptied_at);
         }
         pending.offset_effects.push(effect);
         pending.next_entry += 1;
@@ -10114,7 +10116,8 @@ where
                 .into_iter()
                 .map(|kind| self.durable_consumer_offsets.count(kind))
                 .sum(),
-            emptied_at: self.durable_consumer_offsets.emptied_at(),
+            initial_emptied_at: self.durable_consumer_offsets.emptied_at(),
+            emptied_at: None,
             incarnation: self.incarnation,
             poll_history: self.poll_history,
             applied_floor,
@@ -10203,8 +10206,9 @@ where
             self.publish_consumer_offset_effect(*effect);
             self.apply_consumer_offset_commit(effect.pending);
         }
-        self.durable_consumer_offsets
-            .set_emptied_at(pending.emptied_at);
+        if let Some(emptied_at) = pending.emptied_at {
+            self.durable_consumer_offsets.set_emptied_at(emptied_at);
+        }
         let mut retirements = pending.retirements.into_iter().peekable();
         let mut committed = Vec::with_capacity(entries.len());
         let mut offset_keys = HashSet::new();
@@ -23189,13 +23193,21 @@ mod tests {
     /// The node-local store skips the commit walk, and it too retires the marker
     /// before its file lands.
     #[compio::test]
-    async fn given_emptied_marker_when_a_no_ack_offset_is_stored_should_remove_the_marker() {
+    async fn given_no_ack_store_in_flight_when_a_send_is_queued_should_keep_the_emptied_marker_cleared()
+     {
+        let config = repair_config();
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition();
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
         set_offset_dirs_under(&mut partition, directory.path());
         commit_external_store_then_delete(&mut partition).await;
         assert_eq!(emptied_marker_op(directory.path()), Some(2));
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
         let store = store_offset_request(
             MESSAGE_LESS_CLIENT_ID,
             3,
@@ -23214,12 +23226,35 @@ mod tests {
                 None,
             )
             .await;
+        assert!(matches!(partition.drive_no_ack(), NoAckStep::Progress));
+        let store_job = partition.capture_no_ack_phase().unwrap();
+
+        let send = history_send_request(&partition, 1, partition.required_metadata_frontier);
+        partition.on_request(send, None).await;
+        partition.consensus().advance_commit_max(3);
+        assert_eq!(partition.select_persistable_commits(&config), []);
+        partition.accept_no_ack_phase(store_job.execute().await);
 
         assert_eq!(
             partition.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
             Some(MESSAGE_LESS_EXTERNAL_OFFSET)
         );
         assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(partition.durable_consumer_offsets.emptied_at(), 0);
+
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus().commit_min(), 3);
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(partition.durable_consumer_offsets.emptied_at(), 0);
+        assert!(matches!(
+            partition.state_transfer_offer(&config).await,
+            Err(crate::state_transfer::PartitionTransferUnavailable::FlushPending)
+        ));
+        settle_partition_io(&mut partition, &config).await;
+        let offer = partition.state_transfer_offer(&config).await.unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire::decode(&offer.offsets.1).unwrap();
+        assert_eq!(offsets.emptied_at, 0);
     }
 
     /// A stranded file may hold an offset the table never loaded, so a delete of
