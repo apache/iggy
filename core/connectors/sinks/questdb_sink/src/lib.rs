@@ -1650,7 +1650,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_durable_acks_without_the_connect_string_flag_when_opened_should_fail() {
-        // QuestDB refuses `AckLevel::Durable` unless the connect string asked
+        // The QuestDB client refuses `AckLevel::Durable` unless the connect string asked
         // for it, which would otherwise fail every batch while the rows landed
         // anyway, reading to an operator as total data loss.
         let mut config = config();

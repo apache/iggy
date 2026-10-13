@@ -227,7 +227,7 @@ Use one source per table.
 
 ## Delivery semantics
 
-Rows in a flush that QuestDB accepted are delivered at least once. A reconnect,
+Delivery is at least once, except in the loss cases listed below. A reconnect,
 a failover or a replay of queued frames can send the same rows again. Declare
 [`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
