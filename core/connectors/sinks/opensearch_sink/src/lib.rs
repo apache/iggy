@@ -26,12 +26,13 @@ use iggy_connector_sdk::{
     sink_connector,
 };
 use opensearch::{
-    BulkParts, OpenSearch,
+    OpenSearch,
     auth::Credentials,
     cluster::ClusterHealthParts,
     http::{
-        StatusCode,
-        headers::RETRY_AFTER,
+        Method, StatusCode,
+        headers::{HeaderMap, RETRY_AFTER},
+        response::Response,
         transport::{SingleNodeConnectionPool, TransportBuilder},
     },
     indices::{IndicesCreateParts, IndicesExistsParts},
@@ -677,14 +678,13 @@ impl OpenSearchSink {
         let mut retries = 0u32;
 
         loop {
-            let request = client.bulk(BulkParts::None).body(vec![body.clone()]);
-            let request = match self.config.refresh {
-                Some(refresh) => request.refresh(refresh),
-                None => request,
-            };
-
             let mut retry_after = None;
-            let failure = match tokio::time::timeout(self.config.timeout, request.send()).await {
+            let failure = match tokio::time::timeout(
+                self.config.timeout,
+                self.send_bulk(client, &body),
+            )
+            .await
+            {
                 Ok(Ok(response)) => {
                     let status = response.status_code();
                     if !status.is_success() {
@@ -736,8 +736,11 @@ impl OpenSearchSink {
                                     });
 
                                     let rejected = retry_set.len();
+                                    let unchanged = rejected == pending.len();
                                     pending = retry_set;
-                                    body = build_bulk_body(&self.config.index, &pending)?;
+                                    if !unchanged {
+                                        body = build_bulk_body(&self.config.index, &pending)?;
+                                    }
                                     format!(
                                         "{rejected} document(s) rejected with a transient status"
                                     )
@@ -804,6 +807,36 @@ impl OpenSearchSink {
             )
             .await;
         }
+    }
+
+    /// Sends the prebuilt NDJSON body as is. `Bulk::body` wraps it in the
+    /// crate's newline-delimited body type, which the transport copies into a
+    /// fresh buffer on every request, while a `Bytes` body is passed through as
+    /// a refcount clone.
+    async fn send_bulk(
+        &self,
+        client: &OpenSearch,
+        body: &Bytes,
+    ) -> Result<Response, opensearch::Error> {
+        #[derive(Serialize)]
+        struct BulkQuery {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            refresh: Option<Refresh>,
+        }
+
+        client
+            .transport()
+            .send(
+                Method::Post,
+                "/_bulk",
+                HeaderMap::new(),
+                Some(&BulkQuery {
+                    refresh: self.config.refresh,
+                }),
+                Some(body.clone()),
+                None,
+            )
+            .await
     }
 
     /// Waits out the backoff for an already-incremented `retries`. The first
