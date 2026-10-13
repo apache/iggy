@@ -1277,10 +1277,15 @@ fn inject_metadata(
         upsert_metadata_field(id, document, field, value);
     }
 
-    if let Some(headers) = &message.headers
-        && !headers.is_empty()
-    {
-        upsert_metadata_field(id, document, "iggy_headers", headers_to_json(headers));
+    match &message.headers {
+        Some(headers) if !headers.is_empty() => {
+            upsert_metadata_field(id, document, "iggy_headers", headers_to_json(headers));
+        }
+        // A leftover payload value would pin `iggy_headers` to its own type on
+        // first write, so later documents with real headers fail to index.
+        _ => {
+            document.remove("iggy_headers");
+        }
     }
 }
 
@@ -1940,6 +1945,26 @@ mod tests {
             .expect("prepare document");
 
         assert!(prepared.document.get("iggy_headers").is_none());
+    }
+
+    #[test]
+    fn given_payload_iggy_headers_without_real_headers_should_drop_it() {
+        let sink = sink_with_config(base_config());
+
+        for headers in [None, Some(BTreeMap::new())] {
+            let mut message = message(Payload::Json(simd_json::json!({
+                "name": "Alice",
+                "iggy_headers": "spoofed"
+            })));
+            message.headers = headers;
+
+            let prepared = sink
+                .prepare_document(&topic_metadata(), &messages_metadata(), message)
+                .expect("prepare document");
+
+            assert_eq!(prepared.document["name"], "Alice");
+            assert!(prepared.document.get("iggy_headers").is_none());
+        }
     }
 
     #[test]
