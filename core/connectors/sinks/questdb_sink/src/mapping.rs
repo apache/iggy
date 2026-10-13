@@ -340,16 +340,15 @@ impl Mapping {
         // differ only in case are one column and the second value would be
         // dropped without a word. The claimed names are borrowed and compared in
         // place: a row carries a handful of columns, so scanning that list costs
-        // less than hashing a lowercased copy of every name, and it allocates
-        // nothing on a path that runs for every field of every row.
-        let mut seen: Vec<&str> = Vec::new();
-        for reserved in self.reserved_columns() {
-            seen.push(reserved);
-        }
+        // less than hashing a lowercased copy of every name, and it copies no
+        // name on a path that runs for every field of every row.
+        let field_count = fields.map_or(0, |fields| fields.len());
+        let mut seen: Vec<&str> = self.reserved_columns().collect();
+        seen.reserve(field_count);
 
         let mut row = PreparedRow {
             symbols: Vec::new(),
-            columns: Vec::new(),
+            columns: Vec::with_capacity(field_count),
             payload: None,
             headers: Vec::new(),
             timestamp: PreparedTimestamp::Now,

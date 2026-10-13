@@ -57,7 +57,7 @@ verbose_logging = false
 | `table` | required | Target table. |
 | `timestamp_source` | `message` | `message`, `origin`, `payload`, or `server`. |
 | `timestamp_field` | none | Payload field holding the timestamp. Required when `timestamp_source = "payload"`. |
-| `timestamp_unit` | `auto` | `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers the unit from the magnitude. |
+| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`. |
 | `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or array in one of these fields is rejected. |
 | `uuid_columns` | `[]` | Payload fields holding RFC-4122 strings, stored as `UUID`. A record with a non-string value there is rejected. |
 | `integer_columns` | `[]` | Payload fields stored as `LONG` while `numbers_as_double` is on. A fractional value there is rejected. |
@@ -87,6 +87,9 @@ rejected with all of its rows. `max_flush_bytes` flushes before a batch of wide
 rows reaches it. The 1 MB default leaves room, because the buffer size is an
 estimate and a frame can also carry the symbol dictionary. If you raise it, also
 raise `sf_max_segment_bytes` in the connect string.
+
+The check runs before each row is added, so a single message larger than the
+frame cap still fails its flush, together with the rows buffered with it.
 
 ## Store-and-forward
 
@@ -217,14 +220,20 @@ Use one source per table.
 
 ## Delivery semantics
 
-Delivery is at-least-once. A reconnect, a failover or a store-and-forward replay
-can send rows again. Declare
+Delivery is at-least-once when `sf_dir` is set. A reconnect, a failover or a
+store-and-forward replay can send rows again. Declare
 [`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
 
+Without `sf_dir`, unacknowledged frames are kept only in memory. A crash, or a
+shutdown that outlasts `close_flush_timeout`, loses them even though `consume()`
+already reported success.
+
 A batch fails when:
 
-- QuestDB rejects a frame terminally.
+- QuestDB rejects a frame terminally. The client reports some rejections after
+  the flush that caused them returned, without saying which topic sent the
+  frame. Such a rejection fails the next batch of any topic on this connector.
 - A chunk fails to write. If the cause is the connection, the connector skips
   the remaining chunks of the batch. It logs the offsets and message ids of the
   messages it did not write.
