@@ -57,32 +57,40 @@ record TcpConnectionString(String host, int port, String username, String passwo
         if (credentialsAndServer.length != 2) {
             throw invalid("expected exactly one '@' between the credentials and the server address");
         }
-
-        String[] credentials = credentialsAndServer[0].split(":", -1);
-        if (credentials.length == 1) {
-            throw invalid("personal access tokens are not supported, use <username>:<password>");
-        }
-        if (credentials.length != 2 || credentials[0].isEmpty() || credentials[1].isEmpty()) {
-            throw invalid("credentials must be <username>:<password>");
-        }
+        String[] credentials = parseCredentials(credentialsAndServer[0]);
 
         String[] addressAndOptions = credentialsAndServer[1].split("\\?", -1);
         if (addressAndOptions.length > 2) {
             throw invalid("expected at most one '?' before the options");
         }
-
-        Matcher address = ADDRESS.matcher(addressAndOptions[0]);
-        if (!address.matches()) {
-            throw invalid("server address must be <host>:<port> or [<ipv6>]:<port>");
-        }
+        Matcher address = parseAddress(addressAndOptions[0]);
         String host = address.group(1) != null ? address.group(1) : address.group(2);
         int port = Integer.parseInt(address.group(3));
-        if (port > MAX_PORT) {
-            throw invalid("port must be at most " + MAX_PORT);
-        }
 
         boolean tls = addressAndOptions.length == 2 && parseTlsOption(addressAndOptions[1]);
         return new TcpConnectionString(host, port, credentials[0], credentials[1], tls);
+    }
+
+    private static String[] parseCredentials(String credentials) {
+        String[] usernameAndPassword = credentials.split(":", -1);
+        if (usernameAndPassword.length == 1) {
+            throw invalid("personal access tokens are not supported, use <username>:<password>");
+        }
+        if (usernameAndPassword.length != 2 || usernameAndPassword[0].isEmpty() || usernameAndPassword[1].isEmpty()) {
+            throw invalid("credentials must be <username>:<password>");
+        }
+        return usernameAndPassword;
+    }
+
+    private static Matcher parseAddress(String serverAddress) {
+        Matcher address = ADDRESS.matcher(serverAddress);
+        if (!address.matches()) {
+            throw invalid("server address must be <host>:<port> or [<ipv6>]:<port>");
+        }
+        if (Integer.parseInt(address.group(3)) > MAX_PORT) {
+            throw invalid("port must be at most " + MAX_PORT);
+        }
+        return address;
     }
 
     private static void parseScheme(String scheme) {
