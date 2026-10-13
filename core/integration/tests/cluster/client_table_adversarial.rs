@@ -599,4 +599,5 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
 fn is_transient(code: u32) -> bool {
     code == IggyError::TransientNotCommitted.as_code()
         || code == IggyError::TransientNotAccepted.as_code()
+        || code == IggyError::NotPrimary.as_code()
 }

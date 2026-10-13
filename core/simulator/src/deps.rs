@@ -113,6 +113,8 @@ pub struct SimJournal<S: Storage> {
     /// `SnapshotCoordinator::should_checkpoint` gates on `remaining_capacity`, so
     /// unbounded means no checkpoint ever. A test wanting one sets a small count.
     slot_count: Cell<Option<usize>>,
+    #[cfg(test)]
+    fail_next_truncate: Cell<bool>,
     /// Debug-only single-accessor tripwire. `entry` / `append` hold a
     /// [`JournalAccessGuard`] across their whole body, including the storage
     /// `.await`, so if a suspending storage tier ever let a second task touch
@@ -132,6 +134,8 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             last_op: Cell::new(None),
             snapshot_op: Cell::new(0),
             slot_count: Cell::new(None),
+            #[cfg(test)]
+            fail_next_truncate: Cell::new(false),
             #[cfg(debug_assertions)]
             accessing: Cell::new(false),
         }
@@ -212,6 +216,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     /// view reconciles the way a real one does. Mirrors
     /// `PrepareJournal::truncate_from`, whose watermark stays put; here it never moves.
     async fn truncate_from(&self, from_op: u64) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if self.fail_next_truncate.replace(false) {
+            return Err(std::io::Error::other("injected journal truncation failure"));
+        }
         if from_op == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -447,6 +455,11 @@ impl SimJournal<MemStorage> {
         let _guard = JournalAccessGuard::new(&self.accessing);
         let offsets = unsafe { &mut *self.offsets.get() };
         offsets.remove(&op).is_some()
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_truncate(&self) {
+        self.fail_next_truncate.set(true);
     }
 
     /// The committed watermark to restore after a restart, mirroring

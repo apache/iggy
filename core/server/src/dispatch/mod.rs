@@ -43,7 +43,6 @@ pub mod submit;
 #[cfg(test)]
 pub mod test_support;
 
-use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::dispatch::failure::{
     FrameChannel, send_deny_reply, send_eviction, send_host_frame, send_pre_consensus_deny,
     send_unbound_deny_reply, send_undeclared_operation_deny,
@@ -53,17 +52,17 @@ use crate::dispatch::reads::handle_non_replicated_request;
 use crate::dispatch::session_ops::{handle_login_register_request, handle_logout_request};
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
 use crate::reply_frame::build_raw_pat_reply;
-use crate::rewrite::{RewriteDeny, RewriteStage, tcp_chain};
+use crate::rewrite::{RewriteDeny, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::wire::verify_request_checksum;
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
+    BIND_SESSION_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
 };
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
@@ -76,12 +75,14 @@ use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use secrecy::ExposeSecret;
 use server_common::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::mem::offset_of;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Poll, Waker};
 use tracing::{debug, warn};
 
 type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHeader>>>>>;
@@ -89,18 +90,20 @@ type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHea
 /// Requests one client may have queued behind a request this shard has not
 /// answered yet.
 ///
-/// The drain loop below serves one frame per client at a time, and a frame can
-/// legitimately hold it for a while: a metadata write awaits consensus, and a
-/// read can be HELD for the read-your-writes budget (see
-/// `crate::dispatch::reads`). Without a cap, a client that keeps pipelining
-/// through such a stall grows its queue - and this node's memory - unbounded.
+/// The drain loop below serves the frames of one client in arrival order, and
+/// a frame it must finish before the next one can hold it for a while: a login
+/// or a logout awaits consensus, a `BIND_SESSION` can be HELD for the
+/// read-your-writes budget (see `crate::dispatch::reads`), and any frame can
+/// wait for room under the in-flight cap or for the metadata lane of
+/// [`ClientDrain`]. Without a cap, a client that keeps pipelining through such
+/// a stall grows its queue - and this node's memory - unbounded.
 ///
 /// Overflow is ANSWERED, not dropped: `TransientNotAccepted` is the honest
 /// code, since the frame provably never entered any pipeline, so the SDK may
 /// re-issue it anywhere, including here once the queue drains. Sized far above
 /// any SDK's in-flight window, so it only ever fires under a genuine stall.
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
-type ActiveClientRequests = Rc<RefCell<AHashSet<u128>>>;
+type ActiveClientRequests = Rc<RefCell<AHashMap<u128, Rc<ClientDrain>>>>;
 
 // BindSession authenticates with the registered secret, never with the
 // public client id and epoch alone. It retains the original retry identity;
@@ -136,9 +139,14 @@ fn enqueue_client_request<B, MJ, S, SB>(
         }
         queue.push_back(message);
     }
-    if !active.borrow_mut().insert(client_id) {
+    let running = active.borrow().get(&client_id).cloned();
+    if let Some(drain) = running {
+        // A drain with requests in flight parks on an empty queue.
+        drain.wake();
         return;
     }
+    let drain = Rc::new(ClientDrain::new(server_config));
+    active.borrow_mut().insert(client_id, Rc::clone(&drain));
 
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
@@ -149,7 +157,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
         let _slot = ActiveDrainSlot { active, client_id };
         // The handle is set once the shard is built. A frame that beats it
         // stays queued and the client's next frame drains both, which needs
-        // the slot released on this path too - the guard above does it.
+        // the entry removed on this path too - the guard above does it.
         let Some(shard) = upgrade_shard_handle(&shard_handle) else {
             return;
         };
@@ -159,6 +167,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             server_config,
             max_tokens_per_user,
             queues,
+            &drain,
             client_id,
         )
         .await;
@@ -222,13 +231,13 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
     });
 }
 
-/// Holds a client's one drain slot for as long as its drain task lives.
+/// Holds a client's one drain entry for as long as its drain task lives.
 ///
-/// Releasing from the task's own `Drop` covers every exit, the panic compio
-/// catches included: a slot left taken with no live drain queues every later
-/// frame for that client forever. It also keeps the release out of the
+/// Removing it from the task's own `Drop` covers every exit, the panic compio
+/// catches included: an entry left with no live drain queues every later
+/// frame for that client forever. It also keeps the removal out of the
 /// connection-lost hook, which fires from the transport task and could
-/// otherwise clear the slot under a drain suspended at an `.await`.
+/// otherwise remove the entry under a drain suspended at an `.await`.
 struct ActiveDrainSlot {
     active: ActiveClientRequests,
     client_id: u128,
@@ -240,6 +249,122 @@ impl Drop for ActiveDrainSlot {
     }
 }
 
+/// The state that the drain task of one connection shares with the requests
+/// it spawned.
+///
+/// The drain takes the frames of the connection in arrival order and runs the
+/// prologue of each. It finishes a frame that later frames depend on before it
+/// takes the next one: a login, a logout, a `BIND_SESSION`, the rewrite of a
+/// metadata write, or a partition admission. A `PING` finishes there too,
+/// because it never waits. Every other read, every poll and every wait for a
+/// metadata commit runs in a task of its own, so a held frame does not stall
+/// the frames behind it.
+///
+/// `capacity` caps those tasks at `message_bus.client_queue_capacity`, the
+/// outbound queue size of a connection, so their replies never overflow that
+/// queue. A metadata write, a segment delete, a login and a logout also take
+/// the metadata lane, which holds one of them at a time. The metadata client
+/// table keeps one pending write per client and refuses a lower request id
+/// after a higher one committed, so a second write in flight would fail with
+/// `TransientNotAccepted` or `RequestTooOld`. The lane also runs the rewrite of
+/// a write after the previous write replied, because the rewrite reads state
+/// that the previous write can change.
+///
+/// At the cap or the lane the drain waits, and the frames behind it queue up
+/// to [`MAX_QUEUED_CLIENT_REQUESTS`]. While tasks run, the drain outlives its
+/// queue, so the cap and the lane still count them when the next frame
+/// arrives.
+pub(in crate::dispatch) struct ClientDrain {
+    capacity: usize,
+    in_flight: Cell<usize>,
+    /// Whether a frame holds the metadata lane.
+    metadata_write: Cell<bool>,
+    /// The drain task, while it waits for a frame or for room to admit one.
+    parked: Cell<Option<Waker>>,
+}
+
+/// What a frame waits for before [`ClientDrain::admit`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Room under the in-flight cap.
+    Cap,
+    /// Room under the cap and a free metadata lane.
+    MetadataLane,
+}
+
+impl ClientDrain {
+    pub(in crate::dispatch) const fn new(server_config: &ServerConfig) -> Self {
+        Self {
+            capacity: server_config.message_bus.client_queue_capacity,
+            in_flight: Cell::new(0),
+            metadata_write: Cell::new(false),
+            parked: Cell::new(None),
+        }
+    }
+
+    /// Count one more request task, after waiting for what `admission` needs.
+    #[allow(clippy::future_not_send)]
+    async fn admit(self: &Rc<Self>, admission: Admission) -> InFlight {
+        let metadata_write = admission == Admission::MetadataLane;
+        poll_fn(|cx| {
+            if self.in_flight.get() < self.capacity
+                && !(metadata_write && self.metadata_write.get())
+            {
+                return Poll::Ready(());
+            }
+            self.parked.set(Some(cx.waker().clone()));
+            Poll::Pending
+        })
+        .await;
+        self.in_flight.set(self.in_flight.get() + 1);
+        if metadata_write {
+            self.metadata_write.set(true);
+        }
+        InFlight {
+            drain: Rc::clone(self),
+            metadata_write,
+        }
+    }
+
+    /// Wait until a frame arrives or a request task ends.
+    #[allow(clippy::future_not_send)]
+    async fn park(&self) {
+        let mut parked = false;
+        poll_fn(|cx| {
+            if parked {
+                return Poll::Ready(());
+            }
+            parked = true;
+            self.parked.set(Some(cx.waker().clone()));
+            Poll::Pending
+        })
+        .await;
+    }
+
+    fn wake(&self) {
+        if let Some(waker) = self.parked.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// One request task counted by its [`ClientDrain`]. The task owns it, so the
+/// count drops when the task ends or the runtime drops it.
+struct InFlight {
+    drain: Rc<ClientDrain>,
+    metadata_write: bool,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.drain.in_flight.set(self.drain.in_flight.get() - 1);
+        if self.metadata_write {
+            self.drain.metadata_write.set(false);
+        }
+        self.drain.wake();
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
@@ -247,6 +372,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
     server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
     queues: ClientRequestQueues,
+    drain: &Rc<ClientDrain>,
     client_id: u128,
 ) where
     B: ShellBus,
@@ -256,18 +382,22 @@ async fn drain_client_requests<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     loop {
-        let Some(message) = pop_next_client_request(&queues, client_id) else {
+        if let Some(message) = pop_next_client_request(&queues, client_id) {
+            handle_client_request(
+                &shard,
+                &sessions,
+                &server_config,
+                max_tokens_per_user,
+                drain,
+                client_id,
+                message,
+            )
+            .await;
+        } else if drain.in_flight.get() == 0 {
             return;
-        };
-        handle_client_request(
-            &shard,
-            &sessions,
-            &server_config,
-            max_tokens_per_user,
-            client_id,
-            message,
-        )
-        .await;
+        } else {
+            drain.park().await;
+        }
     }
 }
 
@@ -435,6 +565,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
     max_tokens_per_user: u32,
+    drain: &Rc<ClientDrain>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
 ) where
@@ -557,25 +688,48 @@ async fn handle_client_request<B, MJ, S, SB>(
             // (`submit_register_local_or_forward`). Every other non-replicated
             // code MUST go through Register first, which binds the acting user
             // the per-op authz gates resolve.
-            handle_non_replicated_request(
-                shard,
-                sessions,
-                server_config,
-                transport_client_id,
-                request,
-                ConnectionContext {
-                    bound,
-                    user_id,
-                    address: client_address,
-                    metadata_watermark,
-                },
-            )
-            .await;
+            let context = ConnectionContext {
+                bound,
+                user_id,
+                address: client_address,
+                metadata_watermark,
+            };
+            // `ClientDrain` says which frames stay on the drain.
+            if matches!(non_replicated_code(header), PING_CODE | BIND_SESSION_CODE) {
+                handle_non_replicated_request(
+                    shard,
+                    sessions,
+                    server_config,
+                    transport_client_id,
+                    request,
+                    context,
+                )
+                .await;
+                return;
+            }
+            let in_flight = drain.admit(Admission::Cap).await;
+            let task_shard = Rc::clone(shard);
+            let task_sessions = Rc::clone(sessions);
+            let task_config = Arc::clone(server_config);
+            shard.bus.spawn(async move {
+                let _in_flight = in_flight;
+                handle_non_replicated_request(
+                    &task_shard,
+                    &task_sessions,
+                    &task_config,
+                    transport_client_id,
+                    request,
+                    context,
+                )
+                .await;
+            });
         }
         RequestClass::LoginRegister => {
+            let _in_flight = drain.admit(Admission::MetadataLane).await;
             handle_login_register_request(shard, sessions, transport_client_id, request).await;
         }
         RequestClass::Logout => {
+            let _in_flight = drain.admit(Admission::MetadataLane).await;
             handle_logout_request(shard, sessions, transport_client_id, request).await;
         }
         RequestClass::UnboundReplicated => {
@@ -615,7 +769,13 @@ async fn handle_client_request<B, MJ, S, SB>(
             // `TruncatePartition` is replicated through metadata (Option A). Each
             // replica's reconciler trims to the committed watermark. `classify`
             // names it ahead of the partition and metadata classes.
-            handle_delete_segments_request(shard, transport_client_id, bound, &request).await;
+            let in_flight = drain.admit(Admission::MetadataLane).await;
+            let task_shard = Rc::clone(shard);
+            shard.bus.spawn(async move {
+                let _in_flight = in_flight;
+                handle_delete_segments_request(&task_shard, transport_client_id, bound, &request)
+                    .await;
+            });
         }
         RequestClass::Partition => {
             // `bound` is Some here: `classify` sends unbound transports to
@@ -659,6 +819,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             // stamps the consensus client / session / group over the header,
             // and a pre-consensus deny still has to echo what the client sent.
             let header = *header;
+            let in_flight = drain.admit(Admission::MetadataLane).await;
             let request =
                 request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
                     *new_header = header;
@@ -686,85 +847,77 @@ async fn handle_client_request<B, MJ, S, SB>(
                     return;
                 }
             };
-            // Attach the authenticated member identity to consumer-group
-            // Join/Leave before replication; see `crate::consumer_group`.
-            let request = match maybe_rewrite_consumer_group_request(request) {
-                Ok(rewritten) => rewritten,
-                Err(error) => {
-                    send_pre_consensus_deny(
-                        shard,
-                        transport_client_id,
-                        &header,
-                        &error,
-                        RewriteStage::ConsumerGroup,
-                    )
-                    .await;
-                    return;
-                }
-            };
             let request_header = *request.header();
             // Replicated request: run consensus on the metadata owner (shard 0) and
             // bring the committed reply back here. This shard owns the connection,
             // so it writes the reply to the socket via the transport client id --
             // shard 0 can't route by the consensus client id (no home-shard bits).
-            let Some(reply) = submit_client_request_on_owner(shard, request).await else {
-                // No verdict came back, for example because the inbox of
-                // shard 0 refused the forward. The outcome is unknown, so
-                // only a replay of this request id is safe. A silent drop
-                // leaves the client waiting for its whole read timeout.
-                warn!(
-                    transport_client_id,
-                    operation = ?header.operation,
-                    "replicated request has no metadata verdict; client replays"
-                );
-                send_deny_reply(
-                    shard,
-                    transport_client_id,
-                    &header,
-                    IggyError::TransientNotCommitted.as_code(),
-                )
-                .await;
-                return;
-            };
-            // Recorded before the reply reaches the socket, so a read the client
-            // sends the instant it decodes this frame already sees the mark.
-            if let Some(commit) = committed_reply_commit(&reply) {
-                sessions
-                    .borrow_mut()
-                    .record_metadata_watermark(transport_client_id, commit);
-            }
-            // The raw PAT token never enters consensus (it is non-deterministic
-            // and secret), so the committed reply body is empty. Substitute the
-            // raw-token response here, on the minting client's home shard, using
-            // the confirmed commit position from the committed reply.
-            let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
-                Ok(reply) => reply,
-                Err(error) => {
+            // The wait for the commit runs off the drain, and its task holds the
+            // metadata lane until the reply is out.
+            let task_shard = Rc::clone(shard);
+            let task_sessions = Rc::clone(sessions);
+            shard.bus.spawn(async move {
+                let _in_flight = in_flight;
+                let (shard, sessions) = (&task_shard, &task_sessions);
+                let Some(reply) = submit_client_request_on_owner(shard, request).await else {
+                    // No verdict came back, for example because the inbox of
+                    // shard 0 refused the forward. The outcome is unknown, so
+                    // only a replay of this request id is safe. A silent drop
+                    // leaves the client waiting for its whole read timeout.
                     warn!(
                         transport_client_id,
-                        error = %error,
-                        "failed to build raw PAT reply"
+                        operation = ?header.operation,
+                        "replicated request has no metadata verdict; client replays"
                     );
-                    // The op COMMITTED; only the reply could not be
-                    // rendered. A typed deny is still the right frame:
-                    // silence wedges the lockstep connection on a
-                    // request that succeeded server-side. The raw
-                    // token is unrecoverable either way -- it lives in
-                    // that one reply and a retry dedups to the empty
-                    // committed body -- so the caller must delete the
-                    // token and mint a new one.
-                    send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+                    send_deny_reply(
+                        shard,
+                        transport_client_id,
+                        &header,
+                        IggyError::TransientNotCommitted.as_code(),
+                    )
+                    .await;
                     return;
+                };
+                // Recorded before the reply reaches the socket, so a read the client
+                // sends the instant it decodes this frame already sees the mark.
+                if let Some(commit) = committed_reply_commit(&reply) {
+                    sessions
+                        .borrow_mut()
+                        .record_metadata_watermark(transport_client_id, commit);
                 }
-            };
-            send_host_frame(
-                &shard.bus,
-                transport_client_id,
-                reply.into_frozen(),
-                FrameChannel::Reply,
-                "committed_reply",
-            )
-            .await;
+                // The raw PAT token never enters consensus (it is non-deterministic
+                // and secret), so the committed reply body is empty. Substitute the
+                // raw-token response here, on the minting client's home shard, using
+                // the confirmed commit position from the committed reply.
+                let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        warn!(
+                            transport_client_id,
+                            error = %error,
+                            "failed to build raw PAT reply"
+                        );
+                        // The op COMMITTED; only the reply could not be
+                        // rendered. A typed deny is still the right frame:
+                        // silence wedges the lockstep connection on a
+                        // request that succeeded server-side. The raw
+                        // token is unrecoverable either way -- it lives in
+                        // that one reply and a retry dedups to the empty
+                        // committed body -- so the caller must delete the
+                        // token and mint a new one.
+                        send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+                        return;
+                    }
+                };
+                send_host_frame(
+                    &shard.bus,
+                    transport_client_id,
+                    reply.into_frozen(),
+                    FrameChannel::Reply,
+                    "committed_reply",
+                )
+                .await;
+            });
         }
     }
 }
@@ -880,13 +1033,20 @@ mod tests {
     use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
-        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE,
+        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, POLL_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::system::BindSessionRequest;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
     };
-    use iggy_binary_protocol::{EvictionHeader, ReplyHeader};
+    use iggy_binary_protocol::{
+        AckLevel, ClientVersionInfo, EvictionHeader, IGGY_PROTOCOL_VERSION, ReplyHeader,
+        WireConsumer,
+    };
     use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_common::Identifier;
     use journal::prepare_journal::PrepareJournal;
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::IggyMetadata;
@@ -976,6 +1136,125 @@ mod tests {
                 assert!(sessions.borrow().get_session(TRANSPORT).is_none());
             }
         }
+    }
+
+    /// A read carries the metadata op of the client's last write, and the
+    /// connection floor can be older. The read must wait for that op, or a
+    /// client could miss its own write.
+    #[compio::test]
+    async fn given_read_above_the_frontier_when_dispatched_should_wait_for_its_metadata_op() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let server_config = Arc::new(ServerConfig::default());
+
+        handle_client_request(
+            &shard,
+            &sessions,
+            &server_config,
+            1,
+            &Rc::new(ClientDrain::new(&server_config)),
+            ROOT_TRANSPORT,
+            held_get_me(1, UNAPPLIED_OP),
+        )
+        .await;
+        settle().await;
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "the read must wait for op {UNAPPLIED_OP}"
+        );
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 1).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(reply_status(&replies[0].1), 0);
+    }
+
+    const ROOT_CLIENT: u128 = 1;
+    const ROOT_TRANSPORT: u128 = 2;
+    const ROOT_SESSION: u64 = 1;
+    const ROOT_SECRET: [u8; 32] = [0x5a; 32];
+    /// The op of a write the root client was told committed. The frontier
+    /// stays below it until a test applies it.
+    const UNAPPLIED_OP: u64 = ROOT_SESSION + 1;
+
+    /// Commit a session of `ROOT_CLIENT` for the root user straight into the
+    /// client table, and apply the frontier up to it.
+    fn commit_root_session(shard: &TestShard) {
+        let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                ROOT_CLIENT,
+                0,
+                bind_verifier(ROOT_CLIENT, 0, &ROOT_SECRET),
+                register_reply(ROOT_CLIENT, ROOT_SESSION),
+            )
+            .unwrap();
+        metadata.applied_frontier().advance(ROOT_SESSION);
+    }
+
+    /// Record `ROOT_TRANSPORT` as an open connection, as its first frame does
+    /// on a bus that knows the peer.
+    fn connect_root(sessions: &Rc<RefCell<SessionManager>>) {
+        sessions.borrow_mut().ensure_connection(
+            ROOT_TRANSPORT,
+            "127.0.0.1:34567".parse().unwrap(),
+            ClientTransportKind::Tcp,
+        );
+    }
+
+    /// Bind `ROOT_TRANSPORT` to the session of [`commit_root_session`].
+    async fn bind_root_session(shard: &Rc<TestShard>, sessions: &Rc<RefCell<SessionManager>>) {
+        connect_root(sessions);
+        complete_session_binding(
+            shard,
+            sessions,
+            ROOT_TRANSPORT,
+            SessionIdentity {
+                client_id: ROOT_CLIENT,
+                session: ROOT_SESSION,
+                metadata_watermark: ROOT_SESSION,
+            },
+            BindSecret::new(Box::new(ROOT_SECRET)),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A header-only read of `code` from the root session.
+    fn root_read(code: u32, request: u64) -> Message<RequestHeader> {
+        let mut read = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &[],
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&code.to_le_bytes());
+        read
+    }
+
+    /// A `GET_ME` that waits until the frontier applies `metadata_op`.
+    fn held_get_me(request: u64, metadata_op: u64) -> Message<GenericHeader> {
+        let mut read = root_read(GET_ME_CODE, request);
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .minimum_metadata_op = metadata_op;
+        read.into_generic()
     }
 
     #[compio::test]
@@ -1434,6 +1713,7 @@ mod tests {
                 &sessions,
                 &server_config,
                 1,
+                &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 metadata_read(),
             )
@@ -1517,6 +1797,15 @@ mod tests {
     fn reply_status(frame: &[u8]) -> u32 {
         const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
         u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap())
+    }
+
+    fn reply_request(frame: &[u8]) -> u64 {
+        const REQUEST_OFFSET: usize = std::mem::offset_of!(ReplyHeader, request);
+        u64::from_le_bytes(
+            frame[REQUEST_OFFSET..REQUEST_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// The classifier is the funnel's probe chain as data: every row pins
@@ -1685,6 +1974,7 @@ mod tests {
                 &sessions,
                 &server_config,
                 1,
+                &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 non_replicated_request(TRANSPORT, code),
             )
@@ -1725,6 +2015,7 @@ mod tests {
             &sessions,
             &server_config,
             1,
+            &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
         )
@@ -1760,6 +2051,7 @@ mod tests {
             &sessions,
             &server_config,
             1,
+            &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             non_replicated_request(TRANSPORT, PING_CODE),
         )
@@ -1803,6 +2095,7 @@ mod tests {
             &sessions,
             &server_config,
             1,
+            &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             message.into_generic(),
         )
@@ -1832,6 +2125,44 @@ mod tests {
     /// Yield so the drain task the enqueue spawned on the bus can run.
     async fn run_spawned_tasks() {
         compio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    /// Rounds of [`run_spawned_tasks`] in [`settle`], more than any task chain
+    /// here needs to reach its next wait.
+    const SETTLE_ROUNDS: usize = 10;
+
+    async fn settle() {
+        for _ in 0..SETTLE_ROUNDS {
+            run_spawned_tasks().await;
+        }
+    }
+
+    /// Run spawned tasks until `bus` holds `count` replies, or for 500 rounds.
+    async fn await_replies(bus: &SpyBus, count: usize) {
+        for _ in 0..500 {
+            if bus.client_replies.borrow().len() >= count {
+                return;
+            }
+            run_spawned_tasks().await;
+        }
+    }
+
+    /// A host over a fresh shard with [`commit_root_session`] done. No
+    /// connection is bound to the session yet.
+    fn root_host(
+        server_config: ServerConfig,
+    ) -> (
+        SpyBus,
+        Rc<TestShard>,
+        ServerHost<SpyBus, PrepareJournal, IggySnapshot>,
+    ) {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let shard_handle = unset_shard_handle();
+        *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        (bus, shard, host)
     }
 
     /// One host per shard means one connection-lost hook on its bus: a
@@ -1895,6 +2226,284 @@ mod tests {
         }
     }
 
+    /// A read held for the metadata frontier runs in its own task, so a `PING`
+    /// behind it on the same connection gets its reply first.
+    #[compio::test]
+    async fn given_a_held_read_when_a_ping_follows_on_one_connection_should_answer_the_ping_first()
+    {
+        const READ_REQUEST: u64 = 1;
+        const PING_REQUEST: u64 = 2;
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+
+        host.on_client_request(ROOT_TRANSPORT, held_get_me(READ_REQUEST, UNAPPLIED_OP));
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            root_read(PING_CODE, PING_REQUEST).into_generic(),
+        );
+        await_replies(&bus, 1).await;
+        {
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "the ping must not wait for the held read");
+            assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
+            assert_eq!(reply_status(&replies[0].1), 0);
+        }
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 2).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2, "the read must answer once its op applies");
+        assert_eq!(reply_request(&replies[1].1), READ_REQUEST);
+        assert_eq!(reply_status(&replies[1].1), 0);
+    }
+
+    /// At the in-flight cap the drain waits for a request task to end, and so
+    /// does every frame behind it.
+    #[compio::test]
+    async fn given_a_full_in_flight_cap_when_another_frame_arrives_should_serve_it_after_a_slot_frees()
+     {
+        const CAPACITY: usize = 2;
+        const HELD_READS: u64 = CAPACITY as u64 + 1;
+        const PING_REQUEST: u64 = HELD_READS + 1;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = CAPACITY;
+        let (bus, shard, host) = root_host(server_config);
+        bind_root_session(&shard, host.sessions()).await;
+
+        for request in 1..=HELD_READS {
+            host.on_client_request(ROOT_TRANSPORT, held_get_me(request, UNAPPLIED_OP));
+        }
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            root_read(PING_CODE, PING_REQUEST).into_generic(),
+        );
+        settle().await;
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "the read past the cap and the ping behind it must wait"
+        );
+
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 4).await;
+        let replies = bus.client_replies.borrow();
+        let mut requests: Vec<u64> = replies
+            .iter()
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        requests.sort_unstable();
+        assert_eq!(requests, [1, 2, HELD_READS, PING_REQUEST]);
+        assert!(replies.iter().all(|(_, frame)| reply_status(frame) == 0));
+    }
+
+    /// The bus hook of a lost connection drops its queue but not its drain.
+    /// The drain admits the frame it holds, then goes after its last request
+    /// task ends.
+    #[compio::test]
+    async fn given_a_lost_connection_when_requests_are_in_flight_should_remove_the_drain_after_they_end()
+     {
+        const LATER_OP: u64 = UNAPPLIED_OP + 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let shard_handle = unset_shard_handle();
+        *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let mut server_config = ServerConfig::default();
+        server_config.message_bus.client_queue_capacity = 1;
+        let server_config = Arc::new(server_config);
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let enqueue = |message| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                1,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                message,
+            );
+        };
+
+        // The first read takes the only place under the cap, the second waits
+        // for it on the drain, and the ping waits in the queue.
+        enqueue(held_get_me(1, UNAPPLIED_OP));
+        enqueue(held_get_me(2, LATER_OP));
+        enqueue(root_read(PING_CODE, 3).into_generic());
+        settle().await;
+        assert!(queues.borrow().contains_key(&ROOT_TRANSPORT));
+
+        // What the `ServerHost` hook does when the bus loses the connection.
+        queues.borrow_mut().remove(&ROOT_TRANSPORT);
+        sessions.borrow_mut().remove_connection(ROOT_TRANSPORT);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(UNAPPLIED_OP);
+        await_replies(&bus, 1).await;
+        settle().await;
+        assert!(
+            active.borrow().contains_key(&ROOT_TRANSPORT),
+            "the drain must stay while its second read runs"
+        );
+
+        frontier.advance(LATER_OP);
+        for _ in 0..500 {
+            if active.borrow().is_empty() {
+                break;
+            }
+            run_spawned_tasks().await;
+        }
+        assert!(
+            active.borrow().is_empty(),
+            "the drain must go after its last request task"
+        );
+        let replies = bus.client_replies.borrow();
+        let mut requests: Vec<u64> = replies
+            .iter()
+            .map(|(_, frame)| reply_request(frame))
+            .collect();
+        requests.sort_unstable();
+        assert_eq!(
+            requests,
+            [1, 2],
+            "both reads run, and the dropped ping does not"
+        );
+    }
+
+    /// `BIND_SESSION` runs on the drain, so the replicated frame behind it is
+    /// served on the session it binds, not evicted for a missing session.
+    #[compio::test]
+    async fn given_a_bind_session_when_a_replicated_frame_follows_should_serve_it_bound() {
+        const MISSING_STREAM: u32 = 404;
+        let (bus, _shard, host) = root_host(ServerConfig::default());
+        connect_root(host.sessions());
+        let bind = BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("test-sdk").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            identity: SessionIdentity {
+                client_id: ROOT_CLIENT,
+                session: ROOT_SESSION,
+                metadata_watermark: ROOT_SESSION,
+            },
+            bind_secret: BindSecret::new(Box::new(ROOT_SECRET)),
+        }
+        .to_bytes();
+        let mut bind = wire_request(Operation::NonReplicated, ROOT_CLIENT, 0, 1, &bind);
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut bind.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&BIND_SESSION_CODE.to_le_bytes());
+        let store = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::Numeric(1)),
+            stream_id: WireIdentifier::Numeric(MISSING_STREAM),
+            topic_id: WireIdentifier::Numeric(1),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let store = wire_request(
+            Operation::StoreConsumerOffset,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            2,
+            &store,
+        );
+
+        host.on_client_request(ROOT_TRANSPORT, bind.into_generic());
+        host.on_client_request(ROOT_TRANSPORT, store.into_generic());
+        await_replies(&bus, 2).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(reply_status(&replies[0].1), 0, "the bind must succeed");
+        assert_eq!(
+            frame_command(&replies[1].1),
+            Command::Reply as u8,
+            "a frame after the bind must not be evicted"
+        );
+        assert_eq!(
+            reply_status(&replies[1].1),
+            IggyError::StreamIdNotFound(Identifier::numeric(MISSING_STREAM).unwrap()).as_code()
+        );
+    }
+
+    /// The metadata lane admits one metadata write of a connection at a time,
+    /// and a read passes it under the cap.
+    #[compio::test]
+    async fn given_a_metadata_write_in_flight_when_another_admits_should_wait_until_the_first_drops()
+     {
+        let drain = Rc::new(ClientDrain::new(&ServerConfig::default()));
+        let first = drain.admit(Admission::MetadataLane).await;
+        let read = drain.admit(Admission::Cap);
+        futures::pin_mut!(read);
+        assert!(
+            futures::poll!(read.as_mut()).is_ready(),
+            "a read takes no lane"
+        );
+        let second = drain.admit(Admission::MetadataLane);
+        futures::pin_mut!(second);
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        drop(first);
+        assert!(futures::poll!(second.as_mut()).is_ready());
+    }
+
+    /// A logout waits for the metadata lane while a write of its connection is
+    /// in flight, so it cannot overtake that write in the metadata client
+    /// table.
+    #[compio::test]
+    async fn given_a_metadata_write_in_flight_when_logout_arrives_should_wait_for_the_write() {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        bind_root_session(&shard, host.sessions()).await;
+        let create = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+
+        // The test shard has no journal, so the write never commits.
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            wire_request(
+                Operation::CreateStream,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                1,
+                &create,
+            )
+            .into_generic(),
+        );
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            wire_request(Operation::Logout, ROOT_CLIENT, ROOT_SESSION, 2, &[]).into_generic(),
+        );
+        settle().await;
+
+        assert!(
+            bus.client_replies.borrow().is_empty(),
+            "the logout must wait for the write"
+        );
+        assert_eq!(
+            host.sessions().borrow().get_session(ROOT_TRANSPORT),
+            Some((ROOT_CLIENT, ROOT_SESSION)),
+            "the logout must not unbind the connection under the write"
+        );
+    }
+
     /// The two frames differ only in the operation byte. A declared one gets
     /// the retryable deny, and an undeclared one gets `InvalidCommand`,
     /// because no retry of that frame can succeed.
@@ -1949,67 +2558,129 @@ mod tests {
         }
     }
 
-    /// A home shard other than 0 forwards a metadata write to shard 0. A full
-    /// inbox there drops the forward, so no verdict comes back. A silent drop
-    /// left the client waiting for its whole read timeout.
-    #[compio::test]
-    async fn given_full_owner_inbox_when_metadata_write_is_forwarded_should_deny_transient_not_committed()
-     {
-        const TRANSPORT: u128 = 95;
-        const CLIENT: u128 = 1;
-        const SESSION: u64 = 1;
+    const HOME_TRANSPORT: u128 = 95;
+    const HOME_CLIENT: u128 = 1;
+    const HOME_SESSION: u64 = 1;
+
+    /// Dispatch `request` on shard 1 from `HOME_TRANSPORT`, bound to a session
+    /// of `HOME_CLIENT`, and wait for one reply. Shard 1 forwards a metadata
+    /// write that passes the pre-consensus chain to `owner`, the inbox of the
+    /// metadata owner shard 0.
+    async fn dispatch_on_home_shard(
+        bus: &SpyBus,
+        owner: shard::TaggedSender,
+        request: Message<RequestHeader>,
+    ) {
         const USER: u32 = 0;
-        let bus = SpyBus::default();
-        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
-        let (owner, _owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
-        owner
-            .try_send(reply_lane_forward(TRANSPORT))
-            .expect("owner inbox has one slot");
+        let mut shard = test_shard(bus, 0, 1, FIRST_BOOT);
         let (home, _, _) = shard_channel(1, 1, 1);
         shard.id = 1;
         shard.attach_senders(vec![owner, home]);
         let attachment = {
             let mut client_table = shard.plane.metadata().client_table.borrow_mut();
             client_table
-                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, SESSION))
+                .commit_register(
+                    HOME_CLIENT,
+                    USER,
+                    [0x5a; 32],
+                    register_reply(HOME_CLIENT, HOME_SESSION),
+                )
                 .unwrap();
-            client_table.attach_session(CLIENT, SESSION, USER).unwrap()
+            client_table
+                .attach_session(HOME_CLIENT, HOME_SESSION, USER)
+                .unwrap()
         };
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         sessions.borrow_mut().ensure_connection(
-            TRANSPORT,
+            HOME_TRANSPORT,
             "127.0.0.1:34567".parse().unwrap(),
             ClientTransportKind::Tcp,
         );
         sessions
             .borrow_mut()
-            .bind_authenticated_connection(TRANSPORT, CLIENT, SESSION, USER, attachment, SESSION)
+            .bind_authenticated_connection(
+                HOME_TRANSPORT,
+                HOME_CLIENT,
+                HOME_SESSION,
+                USER,
+                attachment,
+                HOME_SESSION,
+            )
             .unwrap();
-        let body = DeleteUserRequest {
-            user_id: WireIdentifier::numeric(1),
-        }
-        .to_bytes();
-        let request = wire_request(Operation::DeleteUser, CLIENT, SESSION, 1, &body);
+        let server_config = Arc::new(ServerConfig::default());
 
         handle_client_request(
             &Rc::new(shard),
             &sessions,
-            &Arc::new(ServerConfig::default()),
+            &server_config,
             1,
-            TRANSPORT,
+            &Rc::new(ClientDrain::new(&server_config)),
+            HOME_TRANSPORT,
             request.into_generic(),
         )
         .await;
+        await_replies(bus, 1).await;
+    }
+
+    /// A home shard other than 0 forwards a metadata write to shard 0. A full
+    /// inbox there drops the forward, so no verdict comes back. A silent drop
+    /// left the client waiting for its whole read timeout.
+    #[compio::test]
+    async fn given_full_owner_inbox_when_metadata_write_is_forwarded_should_deny_transient_not_committed()
+     {
+        let bus = SpyBus::default();
+        let (owner, _owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        owner
+            .try_send(reply_lane_forward(HOME_TRANSPORT))
+            .expect("owner inbox has one slot");
+        let body = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(1),
+        }
+        .to_bytes();
+        let request = wire_request(Operation::DeleteUser, HOME_CLIENT, HOME_SESSION, 1, &body);
+
+        dispatch_on_home_shard(&bus, owner, request).await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(replies.len(), 1, "a lost forward must still answer");
         let (client, reply) = &replies[0];
-        assert_eq!(*client, TRANSPORT);
+        assert_eq!(*client, HOME_TRANSPORT);
         assert_eq!(frame_command(reply), Command::Reply as u8);
         assert_eq!(
             reply_status(reply),
             IggyError::TransientNotCommitted.as_code(),
             "only a replay of the same request id is safe"
+        );
+    }
+
+    /// The group rewrite is the last step of the pre-consensus chain. A join
+    /// whose body does not decode must be denied there, before the home
+    /// shard forwards it to the metadata owner.
+    #[compio::test]
+    async fn given_malformed_join_when_dispatching_should_deny_invalid_command_before_consensus() {
+        // Shorter than any join encoding, so the decoder fails on length.
+        const TRUNCATED_BODY: &[u8] = &[0x01];
+        let bus = SpyBus::default();
+        let (owner, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let request = wire_request(
+            Operation::JoinConsumerGroup,
+            HOME_CLIENT,
+            HOME_SESSION,
+            1,
+            TRUNCATED_BODY,
+        );
+
+        dispatch_on_home_shard(&bus, owner, request).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "a malformed join must be answered");
+        let (client, reply) = &replies[0];
+        assert_eq!(*client, HOME_TRANSPORT);
+        assert_eq!(frame_command(reply), Command::Reply as u8);
+        assert_eq!(reply_status(reply), IggyError::InvalidCommand.as_code());
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "a denied join must never reach the metadata owner"
         );
     }
 

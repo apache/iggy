@@ -113,24 +113,27 @@ where
         {
             return Err(IggyError::TransientNotAccepted);
         }
-        let admissible = self
-            .plane
+        self.plane
             .partitions()
             .with_partition(&namespace, |partition| {
                 let consensus = partition.consensus();
-                !partition.requires_state_transfer()
+                if consensus.is_normal_backup() {
+                    return Err(IggyError::NotPrimary);
+                }
+                let admissible = !partition.requires_state_transfer()
                     && consensus.is_primary()
                     && consensus.is_normal()
                     && !consensus.is_transferring()
                     && attachment
                         .metadata
-                        .matches_partition(self.shards_table.epoch_for(namespace))
+                        .matches_partition(self.shards_table.epoch_for(namespace));
+                if admissible {
+                    Ok(())
+                } else {
+                    Err(IggyError::TransientNotAccepted)
+                }
             })
-            .unwrap_or(false);
-        if !admissible {
-            return Err(IggyError::TransientNotAccepted);
-        }
-        Ok(())
+            .unwrap_or(Err(IggyError::TransientNotAccepted))
     }
 
     /// Execute a routed read on the partition owner's pump.
@@ -160,7 +163,22 @@ where
         }
         let rejection = partitions
             .with_partition(&namespace, |partition| {
+                if matches!(read, PartitionRead::PollOnPrimary { .. })
+                    && partition.consensus().is_normal_backup()
+                {
+                    return Some(IggyError::NotPrimary);
+                }
                 if partition.requires_state_transfer() || partition.read_history_is_changing() {
+                    return Some(IggyError::TransientNotAccepted);
+                }
+                // The merged log of a new view can hold an offset store that the
+                // old view acknowledged. The new primary applies it only after
+                // the view starts, so until then its stored offset can be older.
+                // The head is current only on the primary that started the view.
+                if read.reads_stored_offset()
+                    && partition.consensus().is_primary()
+                    && !partition.consensus().applied_view_start()
+                {
                     return Some(IggyError::TransientNotAccepted);
                 }
                 if let PartitionRead::PollOnPrimary {
@@ -240,12 +258,16 @@ where
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();
+                    let view = consensus.view();
                     if consensus.is_normal()
                         && !consensus.is_transferring()
                         && !(consensus.has_ceded_primaryship()
-                            && consensus.primary_index(consensus.view()) == consensus.replica())
+                            && consensus.primary_index(view) == consensus.replica())
                     {
-                        PartitionReadReply::Primary(consensus.primary_index(consensus.view()))
+                        PartitionReadReply::Primary {
+                            view,
+                            primary: consensus.primary_index(view),
+                        }
                     } else {
                         PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
                     }
@@ -424,6 +446,7 @@ where
 /// node's metadata can lag an install the partition already applied, for
 /// example on a new primary after a view change, and the partition commits a
 /// read's progress under the installed owner.
+#[allow(clippy::cast_possible_truncation)]
 fn group_owner_rejection(
     namespace: IggyNamespace,
     group_id: u64,
@@ -440,7 +463,9 @@ fn group_owner_rejection(
         return Some(IggyError::TransientNotAccepted);
     }
     Some(IggyError::ConsumerGroupPartitionNotOwned(
-        u32::try_from(group_id).unwrap_or(u32::MAX),
+        // Truncated like the server's poll fences: a minted id carries its boot
+        // nonce from bit 48 up, so saturating would hide which client it is.
+        metadata.client_id() as u32,
         u32::try_from(namespace.partition_id()).unwrap_or(u32::MAX),
     ))
 }

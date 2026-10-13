@@ -48,6 +48,9 @@ pub enum Action {
     CreatePersonalAccessToken,
     DeletePersonalAccessToken,
     DeleteConsumerOffset,
+    ReplaceFixtureTopic,
+    JoinFixtureGroup,
+    LeaveFixtureGroup,
 }
 
 // Lock the discriminants of the first three variants. Inserting a new variant before

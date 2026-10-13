@@ -206,9 +206,9 @@ where
     }))
 }
 
-/// Reject a consumer-group read whose parent stream/topic is absent with the
-/// legacy typed error naming the level that missed; the group itself missing
-/// stays the shared not-found reply (empty over TCP, 404 over HTTP).
+/// Reject a request whose parent stream/topic is absent with the legacy typed
+/// error naming the level that missed. For a consumer-group read, a missing
+/// group itself stays the shared not-found reply (empty over TCP, 404 over HTTP).
 pub fn ensure_topic_exists<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
@@ -308,22 +308,20 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    let streams = shard.plane.metadata().mux_stm.streams();
     let partition_id = match &header.partitioning {
-        WirePartitioning::PartitionId(partition_id) => *partition_id,
-        WirePartitioning::Balanced => shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .next_balanced_partition(&header.stream_id, &header.topic_id)
-            .ok_or(IggyError::InvalidIdentifier)?,
-        WirePartitioning::MessagesKey(key) => shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .partition_by_messages_key(&header.stream_id, &header.topic_id, key)
-            .ok_or(IggyError::InvalidIdentifier)?,
+        WirePartitioning::PartitionId(partition_id) => Some(*partition_id),
+        WirePartitioning::Balanced => {
+            streams.next_balanced_partition(&header.stream_id, &header.topic_id)
+        }
+        WirePartitioning::MessagesKey(key) => {
+            streams.partition_by_messages_key(&header.stream_id, &header.topic_id, key)
+        }
+    };
+    let Some(partition_id) = partition_id else {
+        ensure_topic_exists(shard, &header.stream_id, &header.topic_id)?;
+        // The topic exists but has no partition to pick.
+        return Err(IggyError::InvalidIdentifier);
     };
     resolve_partition_namespace(
         shard,

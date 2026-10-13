@@ -43,7 +43,8 @@ use tracing::warn;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::offset_storage::{
     OffsetFilePermit, PersistedOffset, delete_persisted_offset,
-    delete_persisted_offset_with_storage, persist_offset, persist_offset_retained, read_offset_max,
+    delete_persisted_offset_with_storage, persist_emptied_marker_with_storage, persist_offset,
+    persist_offset_retained, read_offset_max,
 };
 use crate::{IggyIndexWriter, MessagesWriter, Segment};
 
@@ -409,10 +410,15 @@ pub enum TransferFileJob {
         active: bool,
     },
     CommitOffsets(Vec<String>),
+    EmptiedMarker {
+        path: String,
+        emptied_at: u64,
+    },
     ClearMissing(String),
     Converge {
         directory: String,
         offset_directories: [Option<String>; ConsumerKind::COUNT],
+        emptied_marker: Option<String>,
         // Keep recovery-only snapshots out of every file job's inline state.
         stranded_offsets: Box<[HashSet<u32>; ConsumerKind::COUNT]>,
         segment: SegmentIoJob,
@@ -455,6 +461,8 @@ pub struct OffsetIoJob {
     pub(crate) owner: OffsetFileOwner,
     pub(crate) file: Option<File>,
     pub(crate) permit: Option<Rc<OffsetFilePermit>>,
+    /// The emptied-table marker this store removes before it writes.
+    pub(crate) retired_marker: Option<String>,
 }
 
 pub struct OffsetIoResult {
@@ -468,6 +476,9 @@ pub struct OffsetIoResult {
 
 pub struct OffsetDeleteIoJob {
     pub(crate) path: String,
+    /// The emptied-table marker this delete writes after the unlink, and the
+    /// delete's op it names.
+    pub(crate) emptied_marker: Option<(String, u64)>,
 }
 
 pub struct OffsetDirectoriesIoJob {
@@ -1055,6 +1066,16 @@ impl TransferFileJob {
                     results.into_iter().try_for_each(std::convert::identity),
                 )
             }
+            Self::EmptiedMarker { path, emptied_at } => TransferFileResult::Finished(
+                persist_emptied_marker_with_storage(&DiskStorage, &path, emptied_at)
+                    .await
+                    .map_err(|source| {
+                        crate::state_transfer::PartitionInstallError::OffsetPersistence {
+                            path,
+                            source,
+                        }
+                    }),
+            ),
             Self::ClearMissing(path) => TransferFileResult::Finished(
                 crate::state_transfer::clear_materialization_missing(&path)
                     .await
@@ -1068,6 +1089,7 @@ impl TransferFileJob {
             Self::Converge {
                 directory,
                 offset_directories,
+                emptied_marker,
                 mut stranded_offsets,
                 segment,
             } => {
@@ -1075,6 +1097,11 @@ impl TransferFileJob {
                 let mut released =
                     Vec::with_capacity(stranded_offsets.iter().map(HashSet::len).sum());
                 let outcome = async {
+                    // First, because convergence discards the history the marker
+                    // describes, and an emptied table must not keep it.
+                    if let Some(marker) = &emptied_marker {
+                        persist_emptied_marker_with_storage(&DiskStorage, marker, 0).await?;
+                    }
                     for (kind, path) in offset_directories.into_iter().enumerate() {
                         let Some(path) = path else {
                             continue;
@@ -1243,14 +1270,23 @@ impl<SB: SuperblockStore> SuperblockIoJob<SB> {
 impl OffsetIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(mut self) -> OffsetIoResult {
-        let value = if self.fold_max {
-            read_offset_max(&self.path, self.offset).await
-        } else {
-            Ok(PersistedOffset {
-                offset: self.offset,
-                written: true,
-            })
-        };
+        let value = async {
+            // First only as defense in depth. WAL replay of a lost store, boot
+            // dropping a marker beside any offset file and the transfer bound
+            // `emptied_at <= commit_op` carry the crash safety.
+            if let Some(marker) = &self.retired_marker {
+                persist_emptied_marker_with_storage(&DiskStorage, marker, 0).await?;
+            }
+            if self.fold_max {
+                read_offset_max(&self.path, self.offset).await
+            } else {
+                Ok(PersistedOffset {
+                    offset: self.offset,
+                    written: true,
+                })
+            }
+        }
+        .await;
         let mut write_error = None;
         let outcome = match value {
             Ok(value) if value.written => match self.owner {
@@ -1300,7 +1336,14 @@ impl OffsetIoJob {
 impl OffsetDeleteIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(self) -> Result<bool, IggyError> {
-        delete_persisted_offset(&self.path).await
+        let removed = delete_persisted_offset(&self.path).await?;
+        // After the unlink only as defense in depth. WAL replay of the delete,
+        // boot dropping a marker beside any offset file and the transfer bound
+        // `emptied_at <= commit_op` carry the crash safety.
+        if let Some((marker, op)) = &self.emptied_marker {
+            persist_emptied_marker_with_storage(&DiskStorage, marker, *op).await?;
+        }
+        Ok(removed)
     }
 }
 
@@ -1468,6 +1511,12 @@ mod tests {
         std::os::unix::fs::symlink(&preserved, &replacement_symlink).unwrap();
         let stale_segment = directory.path().join("stale.log");
         std::fs::write(&stale_segment, b"stale").unwrap();
+        let emptied_marker = directory.path().join("emptied");
+        std::fs::write(
+            &emptied_marker,
+            crate::offset_storage::encode_offset_record(1),
+        )
+        .unwrap();
         let segment_symlink = directory.path().join("linked.log");
         std::os::unix::fs::symlink(&preserved, &segment_symlink).unwrap();
         let mut offset_directories = std::array::from_fn(|_| None);
@@ -1487,6 +1536,7 @@ mod tests {
         let result = TransferFileJob::Converge {
             directory: directory.path().to_string_lossy().into_owned(),
             offset_directories,
+            emptied_marker: Some(emptied_marker.to_string_lossy().into_owned()),
             stranded_offsets,
             segment: SegmentIoJob {
                 messages_path: messages_path.to_string_lossy().into_owned(),
@@ -1519,6 +1569,7 @@ mod tests {
         assert!(replacement_symlink.is_symlink());
         assert_eq!(std::fs::read(&preserved).unwrap(), b"preserved");
         assert!(!stale_segment.exists());
+        assert!(!emptied_marker.exists());
         assert!(!segment_symlink.exists());
         assert!(messages_path.is_file());
         assert!(index_path.is_file());

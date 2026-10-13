@@ -903,6 +903,62 @@ where
         .await
 }
 
+/// Find a held entry below a view's suffix that the new history does not prove.
+///
+/// `canonical` is ordered by descending op. Entries above the local commit floor
+/// survive only if their parent chain reaches its lowest header, or a prepare's
+/// commit stamp proves them through the uninterrupted local chain. This runs once
+/// per installed log, before repair starts filling any resulting gap.
+#[must_use]
+pub fn first_unproven_op(
+    commit_floor: u64,
+    canonical: &[PrepareHeader],
+    op_head: u64,
+    last_op: Option<u64>,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+) -> Option<u64> {
+    let last_op = last_op?;
+    let proven = locally_proven_commit(commit_floor, &header_at);
+    let (mut op, mut parent) = canonical.last().map_or((op_head, None), |lowest| {
+        (lowest.op.saturating_sub(1), Some(lowest.parent))
+    });
+    while op > proven {
+        match header_at(op) {
+            Some(local)
+                if local.checksum != CHECKSUM_UNSEALED && Some(local.checksum) == parent =>
+            {
+                parent = Some(local.parent);
+                op -= 1;
+            }
+            _ => break,
+        }
+    }
+    (proven.checked_add(1)?..=op.min(last_op)).find(|&held| header_at(held).is_some())
+}
+
+fn locally_proven_commit(
+    commit_floor: u64,
+    header_at: &impl Fn(u64) -> Option<PrepareHeader>,
+) -> u64 {
+    let mut proven = commit_floor;
+    let mut op = commit_floor;
+    let mut parent = None;
+    while let Some(next_op) = op.checked_add(1) {
+        let Some(local) = header_at(next_op) else {
+            break;
+        };
+        if local.checksum == CHECKSUM_UNSEALED
+            || parent.is_some_and(|checksum| local.parent != checksum)
+        {
+            break;
+        }
+        proven = proven.max(local.commit.min(op));
+        parent = Some(local.checksum);
+        op = next_op;
+    }
+    proven
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,7 +1161,8 @@ mod tests {
             commit,
             group: 0,
             log_view: 0,
-            reserved: [0; 68],
+            reserved: [0; 60],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: 0,
         };
@@ -1503,7 +1560,8 @@ mod tests {
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            reserved: [0; 60],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: present,
         };
@@ -1538,7 +1596,8 @@ mod tests {
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            reserved: [0; 60],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: 0,
         };
@@ -1593,7 +1652,8 @@ mod tests {
             replica,
             reserved_frame: [0; 66],
             group: 0,
-            reserved: [0; 120],
+            partition_incarnation: 0,
+            reserved: [0; 112],
         }
     }
 
@@ -1905,6 +1965,34 @@ mod tests {
     }
 
     #[test]
+    fn given_a_started_view_when_its_head_is_unapplied_should_report_the_view_start_unapplied() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(
+            consensus.applied_view_start(),
+            "a replica that started no view has nothing to apply"
+        );
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(3);
+        install_local_suffix(&consensus, 3, 2, 0);
+        let _ = consensus.handle_start_view_change(PlaneKind::Partitions, &svc_header(1, 3));
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, 3, 2);
+        let _ = consensus.handle_do_view_change(PlaneKind::Partitions, &dvc, &body);
+        let _ = consensus.start_pending_view(PlaneKind::Partitions);
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!((consensus.commit_min(), consensus.commit_max()), (2, 2));
+        assert!(
+            !consensus.applied_view_start(),
+            "op 3 can be a write that the old view acknowledged, and \
+             commit_min == commit_max does not cover it"
+        );
+
+        consensus.advance_commit_max(3);
+        consensus.advance_commit_min(3);
+        assert!(consensus.applied_view_start());
+    }
+
+    #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
@@ -1997,7 +2085,8 @@ mod tests {
             op,
             commit,
             group: 0,
-            reserved: [0; 88],
+            partition_incarnation: 0,
+            reserved: [0; 80],
             incarnation: 0,
         };
         (header, body)
@@ -2492,5 +2581,55 @@ mod tests {
         let update = repaired_frontier_update(169, |op| headers.get(&op).copied());
 
         assert_eq!(update, Some((172, 1720)));
+    }
+
+    #[test]
+    fn given_view_suffix_when_proving_local_history_should_keep_only_supported_entries() {
+        let chain = |ops: std::ops::RangeInclusive<u64>, mut parent, committed: u64| {
+            ops.map(|op| {
+                let header = PrepareHeader {
+                    op,
+                    parent,
+                    commit: committed.min(op - 1),
+                    checksum: u128::from(op),
+                    ..Default::default()
+                };
+                parent = header.checksum;
+                header
+            })
+            .collect::<Vec<_>>()
+        };
+        let local = chain(3..=5, 2, 2);
+        let canonical = chain(6..=6, 5, 5);
+        let proof = |floor, entries: &[PrepareHeader], canonical: &[PrepareHeader]| {
+            let held: BTreeMap<_, _> = entries.iter().map(|header| (header.op, *header)).collect();
+            first_unproven_op(floor, canonical, 6, held.keys().last().copied(), |op| {
+                held.get(&op).copied()
+            })
+        };
+        assert_eq!(proof(2, &local, &canonical), None, "matching parent chain");
+        assert_eq!(
+            proof(2, &local[..2], &canonical),
+            Some(3),
+            "gap below suffix"
+        );
+        let mut stamped = local.clone();
+        stamped[2].commit = 4;
+        assert_eq!(proof(2, &stamped, &[]), Some(5), "durable commit stamp");
+        let mut replaced = local.clone();
+        replaced[1].checksum += 1;
+        assert_eq!(
+            proof(2, &replaced, &canonical),
+            Some(3),
+            "broken parent link"
+        );
+        assert_eq!(proof(2, &local, &[]), Some(3), "empty canonical suffix");
+        assert_eq!(proof(5, &local, &[]), None, "no uncommitted entries");
+        stamped[1].checksum = CHECKSUM_UNSEALED;
+        assert_eq!(
+            proof(2, &stamped, &[]),
+            Some(3),
+            "unsealed chain proves no stamp"
+        );
     }
 }

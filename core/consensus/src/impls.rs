@@ -1180,6 +1180,8 @@ where
     replica: u8,
     replica_count: u8,
     group: u64,
+    /// Metadata creation revision for a partition group; zero for metadata.
+    partition_incarnation: Cell<u64>,
 
     view: Cell<u32>,
 
@@ -1214,6 +1216,11 @@ where
     /// on [`Self::recovery_barrier`] gives up. Armed together with the barrier;
     /// `ZERO` when no suffix is pending (barrier `0`), which no waiter reads.
     recovery_deadline: Cell<Duration>,
+    /// Op head of the last view this replica started as primary, `0` before
+    /// the first start. The merged log can hold ops above the merged commit
+    /// that an older view committed and acknowledged, so a read of applied
+    /// state misses them until `commit_min` reaches this head.
+    view_start_head: Cell<u64>,
     /// True while this replica declines the primaryship its (stale) recovered
     /// view assigns it (see `init_as_backup`). `is_primary()` is pure view
     /// math, so without this flag a restarted view-N primary would still pass
@@ -1310,6 +1317,9 @@ where
     /// this replica prepares and announces nothing. Cleared by
     /// [`VsrConsensus::start_pending_view`], or by `reset_view_change_state`.
     pending_view_log: RefCell<Option<MergedLog>>,
+    /// The installed view must prove the local suffix before it can be applied.
+    /// Survives election resets until the plane successfully reconciles its journal.
+    view_log_unproven: Cell<bool>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -1645,8 +1655,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             view_durable: Cell::new(0),
             log_view_durable: Cell::new(0),
             incarnation: Cell::new(0),
+            partition_incarnation: Cell::new(0),
             recovery_barrier: Cell::new(0),
             recovery_deadline: Cell::new(Duration::ZERO),
+            view_start_head: Cell::new(0),
             ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
             state_transfer_stage: Cell::new(StateTransferStage::Idle),
@@ -1668,6 +1680,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             local_dvc_suffix: RefCell::new(None),
             journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
+            view_log_unproven: Cell::new(false),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
@@ -2027,6 +2040,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.recovery_deadline.set(deadline);
     }
 
+    /// Whether `commit_min` reached the op head of the view this replica last
+    /// started as primary. See `view_start_head`.
+    #[must_use]
+    pub const fn applied_view_start(&self) -> bool {
+        self.commit_min.get() >= self.view_start_head.get()
+    }
+
     pub fn set_view(&mut self, view: u32) {
         self.view.set(view);
     }
@@ -2348,6 +2368,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn group(&self) -> u64 {
         self.group
+    }
+
+    /// Set the partition's metadata creation revision before serving its group.
+    pub fn set_partition_incarnation(&self, partition_incarnation: u64) {
+        self.partition_incarnation.set(partition_incarnation);
+    }
+
+    #[must_use]
+    pub const fn partition_incarnation(&self) -> u64 {
+        self.partition_incarnation.get()
     }
 
     #[must_use]
@@ -3666,6 +3696,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // it: the new primary's numbers are at least as fresh as any probe
         // answer.
         self.finish_view_probe();
+        let needs_reconciliation = self.view_log_unproven.get()
+            || self.status.get() != Status::Normal
+            || self.log_view.get() != msg_view;
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
@@ -3674,6 +3707,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.reset_view_change_state();
 
         // Stale pipeline entries from the old view must be discarded
+        self.view_log_unproven.set(needs_reconciliation);
         self.pipeline.borrow_mut().clear();
 
         // Cross-check the announced head against the headers published with it: a
@@ -3894,6 +3928,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let new_op = merged.op_head;
         self.advance_commit_max(max_commit);
         *self.pending_view_log.borrow_mut() = Some(merged);
+        self.view_log_unproven.set(true);
 
         // Stale pipeline entries are invalid in new view; reconciliation
         // replays from journal.
@@ -3953,6 +3988,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub fn pending_view_log(&self) -> Option<MergedLog> {
         self.pending_view_log.borrow().clone()
+    }
+
+    #[must_use]
+    pub const fn view_log_unproven(&self) -> bool {
+        self.view_log_unproven.get()
+    }
+
+    pub fn settle_view_log_proof(&self) {
+        self.view_log_unproven.set(false);
     }
 
     /// Whether a merge is parked, without cloning it.
@@ -4049,6 +4093,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.set(Status::Normal);
         self.ceded_primaryship.set(false);
         self.sequencer.set_sequence(new_op);
+        self.view_start_head.set(new_op);
         // Only place a promotion learns what the merge did to a gated suffix.
         self.redecide_recovery_barrier(new_op);
         if let Some(head) = merged.headers.first() {
@@ -4429,7 +4474,7 @@ where
                 // ops (and the authenticated user on Register), so the in-apply
                 // RBAC gate resolves the same identity on every backup.
                 user_id: old.user_id,
-                partition_incarnation: old.partition_incarnation,
+                partition_incarnation: consensus.partition_incarnation(),
                 ..Default::default()
             }
         });
@@ -5329,6 +5374,8 @@ mod timestamp_clamp_tests {
                     )
                     .is_empty()
             );
+            assert!(consensus.view_log_unproven());
+            consensus.settle_view_log_proof();
             // Journaled and acked above the adopted head, as `on_replicate` does.
             consensus.sequencer().set_sequence(HEAD);
             consensus.advance_commit_max(COMMIT);
@@ -5362,6 +5409,7 @@ mod timestamp_clamp_tests {
                     "a duplicate StartView with a newer commit must apply it without adopting its head"
                 );
                 assert_eq!(consensus.commit_max(), commit);
+                assert!(!consensus.view_log_unproven());
                 assert_eq!(consensus.sequencer().current_sequence(), HEAD);
                 assert_eq!(consensus.view(), VIEW);
                 assert_eq!(consensus.status(), Status::Normal);
@@ -5378,7 +5426,49 @@ mod timestamp_clamp_tests {
                 "a backup behind the primary must still adopt its head",
             );
             assert_eq!(consensus.sequencer().current_sequence(), HEAD + 1);
+            assert!(!consensus.view_log_unproven());
         }
+    }
+
+    #[test]
+    fn given_unreconciled_start_view_when_head_grows_and_times_out_should_keep_commit_fenced() {
+        const VIEW: u32 = 4;
+        const FIRST_HEAD: u64 = 20;
+        const NEXT_HEAD: u64 = FIRST_HEAD + 1;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        let primary = u8::try_from(VIEW % 3).unwrap();
+
+        for head in [FIRST_HEAD, NEXT_HEAD] {
+            let start_view = make_start_view(VIEW, head, head, primary, 0);
+            assert!(
+                !consensus
+                    .handle_start_view(PlaneKind::Metadata, start_view.header(), &[])
+                    .is_empty()
+            );
+            assert!(consensus.view_log_unproven());
+            assert_eq!(consensus.commit_max(), head);
+        }
+
+        assert!(
+            !consensus
+                .handle_normal_heartbeat_timeout(PlaneKind::Metadata)
+                .is_empty()
+        );
+        assert_eq!(consensus.status(), Status::ViewChange);
+        assert_eq!(consensus.view(), VIEW + 1);
+        assert!(consensus.view_log_unproven());
+        assert_eq!(consensus.commit_max(), NEXT_HEAD);
+
+        consensus.settle_view_log_proof();
+        assert!(!consensus.view_log_unproven());
     }
 
     /// The split-brain gate's predicate: `view` and `log_view` each independently
@@ -6497,7 +6587,8 @@ mod probe_answer_tests {
             replica: PROBER,
             reserved_frame: [0; 66],
             group: METADATA_GROUP,
-            reserved: [0; 104],
+            partition_incarnation: 0,
+            reserved: [0; 96],
             incarnation: 0,
         }
     }

@@ -23,7 +23,11 @@
 //! actual consensus property: two replicas that both committed op N must have
 //! committed the same op N.
 //!
-//! Keeps one canonical commit chain and asserts every replica agrees with it
+//! Keeps a canonical metadata chain and a partition chain per incarnation.
+//! The partition chains survive fixture deletion, so a lagging replica is checked
+//! against commits witnessed before its peers replaced that incarnation.
+//!
+//! The metadata chain asserts every replica agrees with it
 //! wherever they overlap, in BOTH directions of `(commit_a == commit_b) ==
 //! (checksum_a == checksum_b)`: same op implies same prepare, and same prepare
 //! implies same op, the second of which catches one prepare committing at two log
@@ -47,7 +51,7 @@ struct CanonicalCommit {
     /// arriving header's `parent` must equal the canonical previous op's `checksum`,
     /// so keeping each entry's own parent would record a value nothing reads.
     checksum: u128,
-    /// Replicas observed committing this op, each against the metadata incarnation
+    /// Replicas observed committing this op, each against the replica boot incarnation
     /// it held at the time, so the check can prove it compared something rather
     /// than passing over an empty chain.
     ///
@@ -59,7 +63,14 @@ struct CanonicalCommit {
     witnesses: BTreeMap<u8, u128>,
 }
 
-/// Canonical committed metadata chain, accumulated across ticks.
+#[derive(Debug)]
+struct PartitionProgress {
+    incarnation: u64,
+    replica_incarnation: u128,
+    committed: u64,
+}
+
+/// Canonical committed metadata and partition chains, accumulated across ticks.
 #[derive(Debug, Default)]
 pub struct StateChecker {
     commits: BTreeMap<u64, CanonicalCommit>,
@@ -85,6 +96,8 @@ pub struct StateChecker {
     /// is not the bytes already compared. Lowering the mark alone misses this: a
     /// replica recovering the SAME point leaves an empty range to walk.
     incarnations: BTreeMap<u8, u128>,
+    partition_commits: BTreeMap<(IggyNamespace, u64, u64), CanonicalCommit>,
+    partition_verified_upto: BTreeMap<(u8, IggyNamespace), PartitionProgress>,
 }
 
 impl StateChecker {
@@ -138,6 +151,71 @@ impl StateChecker {
             }
             // Recorded verbatim, NOT maxed: see the field doc.
             self.verified_upto.insert(replica_idx, committed);
+        }
+    }
+
+    /// Compare a live replica's new partition commits, retaining earlier
+    /// incarnations after their journals disappear. Missing headers are allowed
+    /// because the partition repair ring evicts its oldest committed entries.
+    ///
+    /// # Panics
+    /// If one partition incarnation commits different entries at the same op.
+    pub(crate) fn check_partition(
+        &mut self,
+        sim: &Simulator,
+        replica_idx: u8,
+        namespace: IggyNamespace,
+        seed: u64,
+    ) {
+        let idx = usize::from(replica_idx);
+        let (Some(state), Some(incarnation)) = (
+            sim.partition_consensus_state(idx, namespace),
+            sim.partition_incarnation(idx, namespace),
+        ) else {
+            self.partition_verified_upto
+                .remove(&(replica_idx, namespace));
+            return;
+        };
+        let replica_incarnation = sim.replicas[idx].metadata_incarnation;
+        let previous = self.partition_verified_upto.insert(
+            (replica_idx, namespace),
+            PartitionProgress {
+                incarnation,
+                replica_incarnation,
+                committed: state.commit_min,
+            },
+        );
+        // Recheck the head even without progress, and the retained prefix after a
+        // restart, replacement or lower recovered commit point.
+        let first = previous
+            .filter(|previous| {
+                previous.incarnation == incarnation
+                    && previous.replica_incarnation == replica_incarnation
+                    && previous.committed <= state.commit_min
+            })
+            .map_or(1, |previous| previous.committed.max(1));
+        let Some(headers) =
+            sim.partition_journaled_headers(idx, namespace, first..=state.commit_min)
+        else {
+            return;
+        };
+        for (op, header) in headers {
+            let identity = header.identity_checksum();
+            let canonical = self
+                .partition_commits
+                .entry((namespace, incarnation, op))
+                .or_insert_with(|| CanonicalCommit {
+                    checksum: identity,
+                    witnesses: BTreeMap::new(),
+                });
+            assert_eq!(
+                identity, canonical.checksum,
+                "replica {replica_idx} and witnesses {:?} disagree on committed partition \
+                 op {op} of ns {namespace:?} incarnation {incarnation}: \
+                 {identity:#x} vs {:#x} (seed={seed:#x})",
+                canonical.witnesses, canonical.checksum,
+            );
+            canonical.witnesses.insert(replica_idx, replica_incarnation);
         }
     }
 
@@ -329,9 +407,8 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
 
 /// Assert every live replica's committed partition prefix agrees, op for op.
 ///
-/// Partition-plane counterpart of [`assert_committed_prefixes_agree`], and the only
-/// check comparing what replicas committed on this plane rather than how much. The
-/// quiesce oracle otherwise bounds only that no backup committed past its leader.
+/// Partition-plane counterpart of [`assert_committed_prefixes_agree`]. Unlike the
+/// incremental per-tick check, this rechecks the entire retained prefix.
 ///
 /// Two differences from the metadata twin, both from the partition journal evicting
 /// its committed prefix as it flushes to segments:
@@ -343,6 +420,9 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
 ///   view change lands.
 /// * Identity, not the sealed checksum. `restamp_prepare_view` rewrites the view on
 ///   retransmit, so `identity_checksum` compares the entry, not the delivery.
+///
+/// Replicas are compared only on one partition incarnation: a recreated topic
+/// keeps its namespaces and starts a new log under them.
 ///
 /// Returns ops witnessed by more than one replica, summed over every namespace.
 ///
@@ -356,14 +436,17 @@ pub fn assert_partition_prefixes_agree(
 ) -> usize {
     let mut compared = 0;
     for &namespace in namespaces {
-        let mut canonical: BTreeMap<u64, (u128, u8)> = BTreeMap::new();
-        let mut witnesses: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut canonical: BTreeMap<(u64, u64), (u128, u8)> = BTreeMap::new();
+        let mut witnesses: BTreeMap<(u64, u64), usize> = BTreeMap::new();
         for replica_idx in 0..sim.replica_count {
             if sim.is_crashed(replica_idx) {
                 continue;
             }
             let idx = usize::from(replica_idx);
-            let Some(state) = sim.partition_consensus_state(idx, namespace) else {
+            let (Some(state), Some(incarnation)) = (
+                sim.partition_consensus_state(idx, namespace),
+                sim.partition_incarnation(idx, namespace),
+            ) else {
                 continue;
             };
             let Some(headers) =
@@ -373,17 +456,17 @@ pub fn assert_partition_prefixes_agree(
             };
             for (op, header) in headers {
                 let identity = header.identity_checksum();
-                if let Some(&(expected, owner)) = canonical.get(&op) {
+                if let Some(&(expected, owner)) = canonical.get(&(incarnation, op)) {
                     assert_eq!(
                         identity, expected,
-                        "at quiesce replica {replica_idx} and replica {owner} disagree on \
-                         committed partition op {op} of ns {namespace:?}: {identity:#x} vs \
-                         {expected:#x} (seed={seed:#x})",
+                        "replica {replica_idx} and replica {owner} disagree on \
+                         committed partition op {op} of ns {namespace:?} incarnation \
+                         {incarnation}: {identity:#x} vs {expected:#x} (seed={seed:#x})",
                     );
-                    *witnesses.entry(op).or_insert(1) += 1;
+                    *witnesses.entry((incarnation, op)).or_insert(1) += 1;
                 } else {
-                    canonical.insert(op, (identity, replica_idx));
-                    witnesses.insert(op, 1);
+                    canonical.insert((incarnation, op), (identity, replica_idx));
+                    witnesses.insert((incarnation, op), 1);
                 }
             }
         }
@@ -421,6 +504,9 @@ mod tests {
     use super::*;
     use crate::client::SimClient;
     use crate::packet::PacketSimulatorOptions;
+    use crate::workload::Workload;
+    use crate::workload::invariants::Invariants;
+    use crate::workload::options::WorkloadOptions;
     use consensus::PartitionsHandle;
 
     const SEED: u64 = 0x5C11;
@@ -594,6 +680,126 @@ mod tests {
             compared > 0,
             "no committed partition op was witnessed by more than one replica after \
              the flush, so the check passed over an empty set"
+        );
+
+        let mut checker = StateChecker::new();
+        for replica_idx in 0..sim.replica_count {
+            checker.check_partition(&sim, replica_idx, namespace, SEED);
+        }
+        assert!(
+            checker
+                .partition_commits
+                .values()
+                .any(|commit| commit.witnesses.len() > 1),
+            "the per-tick checker compared no flushed partition op"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "disagree on committed partition op")]
+    fn given_a_partition_commit_when_its_replica_disappears_should_still_reject_a_later_divergence()
+    {
+        const DIVERGED: u8 = 1;
+        let (mut sim, namespace) = cluster_with_flushed_partition_ops();
+        let workload = Workload::new(WorkloadOptions::new(
+            SEED,
+            sim.replica_count,
+            vec![namespace],
+        ));
+        let mut invariants = Invariants::new();
+        invariants.check(&sim, &workload);
+        assert!(!invariants.state_checker().partition_commits.is_empty());
+        for replica in 0..sim.replica_count {
+            if replica != DIVERGED {
+                sim.replica_crash(replica);
+            }
+        }
+        let committed = sim
+            .partition_consensus_state(usize::from(DIVERGED), namespace)
+            .expect("the backup hosts the partition")
+            .commit_min;
+        change_partition_entry(&sim, DIVERGED, namespace, committed);
+
+        invariants.check(&sim, &workload);
+    }
+
+    #[test]
+    fn given_two_partition_incarnations_when_their_commits_differ_should_keep_separate_histories() {
+        const NEXT: u8 = 1;
+        let (sim, namespace) = cluster_with_flushed_partition_ops();
+        let mut checker = StateChecker::new();
+        checker.check_partition(&sim, NEXT, namespace, SEED);
+        let previous = sim
+            .partition_incarnation(usize::from(NEXT), namespace)
+            .expect("the backup hosts the partition");
+        let committed = sim
+            .partition_consensus_state(usize::from(NEXT), namespace)
+            .expect("the backup hosts the partition")
+            .commit_min;
+        sim.replicas[usize::from(NEXT)]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the backup hosts the partition")
+            .set_created_revision(previous + 1);
+        change_partition_entry(&sim, NEXT, namespace, committed);
+
+        checker.check_partition(&sim, NEXT, namespace, SEED);
+
+        assert!(
+            checker
+                .partition_commits
+                .contains_key(&(namespace, previous, committed))
+        );
+        assert!(
+            checker
+                .partition_commits
+                .contains_key(&(namespace, previous + 1, committed))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "disagree on committed partition op")]
+    fn given_a_checked_partition_when_it_restarts_should_recheck_its_retained_prefix() {
+        const RESTARTED: u8 = 1;
+        const RECOVERY_TICKS: usize = 400;
+        const DAMAGED_OP: u64 = 1;
+        let (mut sim, namespace) = cluster_with_flushed_partition_ops();
+        let mut checker = StateChecker::new();
+        checker.check_partition(&sim, RESTARTED, namespace, SEED);
+        assert!(checker.partition_verified_upto[&(RESTARTED, namespace)].committed > DAMAGED_OP);
+        sim.replica_crash(RESTARTED);
+        sim.replica_restart(RESTARTED);
+        for _ in 0..RECOVERY_TICKS {
+            sim.step();
+        }
+        change_partition_entry(&sim, RESTARTED, namespace, DAMAGED_OP);
+
+        checker.check_partition(&sim, RESTARTED, namespace, SEED);
+    }
+
+    fn change_partition_entry(sim: &Simulator, replica: u8, namespace: IggyNamespace, op: u64) {
+        let partition = sim.replicas[usize::from(replica)]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the replica hosts the partition");
+        let journal = &partition.log.journal().inner;
+        let mut entry = journal
+            .repair_entry(op)
+            .expect("the committed entry is retained")
+            .as_slice()
+            .to_vec();
+        let header_bytes = &mut entry[..size_of::<PrepareHeader>()];
+        let mut header: PrepareHeader = bytemuck::checked::pod_read_unaligned(header_bytes);
+        header.timestamp += 1;
+        header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
+        journal.clear_all();
+        journal.restore_checkpoint_prepare(
+            op,
+            server_common::iobuf::Owned::copy_from_slice(&entry).into(),
         );
     }
 
