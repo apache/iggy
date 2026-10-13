@@ -79,13 +79,13 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
     @Test
     void shouldCreateClientFromConnectionString() {
         // Given: Builder configured from a connection string
-        IggyTcpClient client = Iggy.tcpClientBuilder()
+        try (IggyTcpClient client = Iggy.tcpClientBuilder()
                 .fromConnectionString("iggy://iggy:iggy@" + serverHost() + ":" + serverTcpPort())
-                .buildAndLogin();
-
-        // Then: Should be logged in and able to fetch system info
-        List<ClientInfo> clients = client.system().getClients();
-        assertThat(clients).isNotNull();
+                .buildAndLogin()) {
+            // Then: Should be logged in and able to fetch system info
+            List<ClientInfo> clients = client.system().getClients();
+            assertThat(clients).isNotNull();
+        }
     }
 
     @Test
