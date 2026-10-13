@@ -45,6 +45,7 @@ table = "iggy_events"
 timestamp_source = "message"
 # Required only when timestamp_source = "payload".
 # timestamp_field = "event_time"
+# Used only when timestamp_source = "payload".
 # auto | seconds | millis | micros | nanos
 timestamp_unit = "auto"
 

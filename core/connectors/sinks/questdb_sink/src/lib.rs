@@ -18,7 +18,7 @@
 mod mapping;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
@@ -188,19 +188,30 @@ impl QuestDbSink {
 
         let timestamp_source = TimestampSource::parse(config.timestamp_source.as_deref())
             .unwrap_or_else(|| {
-                reject(Error::InvalidConfigValue("timestamp_source".to_owned()));
+                reject(Error::InvalidConfigValue(format!(
+                    "timestamp_source {:?} is not one of message, origin, payload, server",
+                    config.timestamp_source.as_deref().unwrap_or_default()
+                )));
                 TimestampSource::default()
             });
         let timestamp_unit =
             TimestampUnit::parse(config.timestamp_unit.as_deref()).unwrap_or_else(|| {
-                reject(Error::InvalidConfigValue("timestamp_unit".to_owned()));
+                reject(Error::InvalidConfigValue(format!(
+                    "timestamp_unit {:?} is not one of auto, seconds, millis, micros, nanos",
+                    config.timestamp_unit.as_deref().unwrap_or_default()
+                )));
                 TimestampUnit::default()
             });
         if timestamp_source == TimestampSource::Payload && config.timestamp_field.is_none() {
-            reject(Error::InvalidConfigValue("timestamp_field".to_owned()));
+            reject(Error::InvalidConfigValue(
+                "timestamp_field is required when timestamp_source is \"payload\"".to_owned(),
+            ));
         }
         let ack_level = parse_ack_level(config.ack_level.as_deref()).unwrap_or_else(|| {
-            reject(Error::InvalidConfigValue("ack_level".to_owned()));
+            reject(Error::InvalidConfigValue(format!(
+                "ack_level {:?} is not one of ok, durable",
+                config.ack_level.as_deref().unwrap_or_default()
+            )));
             AckLevel::Ok
         });
 
@@ -273,6 +284,16 @@ impl QuestDbSink {
         };
         if let Err(error) = validate_column_overlap(&mapping) {
             reject(error);
+        }
+        if config.batch_size == Some(0) {
+            warn!(
+                "batch_size = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_BATCH_SIZE}"
+            );
+        }
+        if config.max_flush_bytes == Some(0) {
+            warn!(
+                "max_flush_bytes = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_MAX_FLUSH_BYTES}"
+            );
         }
 
         Self {
@@ -741,7 +762,7 @@ impl Sink for QuestDbSink {
         &self,
         topic_metadata: &TopicMetadata,
         messages_metadata: MessagesMetadata,
-        mut messages: Vec<ConsumedMessage>,
+        messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
         let Some(db) = self.db.as_ref() else {
             return Err(Error::InitError(
@@ -779,6 +800,7 @@ impl Sink for QuestDbSink {
         // handler counts each of them on the client's thread, so each has to
         // be retired or it goes on to fail a later healthy batch.
         let mut rejections_to_retire = 0i64;
+        let mut messages = VecDeque::from(messages);
         while !messages.is_empty() {
             let take = self.batch_size.min(messages.len());
             let chunk: Vec<ConsumedMessage> = messages.drain(..take).collect();
@@ -831,7 +853,7 @@ impl Sink for QuestDbSink {
                             topic_metadata,
                             messages_metadata.partition_id,
                             "abandoned without a write attempt after a connection failure",
-                            MessageRange::of(&messages),
+                            MessageRange::of(messages.make_contiguous()),
                             &error,
                         );
                         failure.get_or_insert(error);
@@ -990,22 +1012,69 @@ fn payload_preview(payload: &Payload) -> String {
     // A text payload is borrowed rather than copied, because the common case is
     // a payload short enough to need no truncation at all.
     let rendered: Cow<'_, str> = match payload {
+        // Rendered through a writer that keeps only the preview's worth of
+        // bytes, so a large rejected document is never held as one string.
         Payload::Json(value) => {
-            Cow::Owned(simd_json::to_string(value).unwrap_or_else(|_| "<unrenderable>".to_owned()))
+            let mut capped = CappedWriter::default();
+            if simd_json::to_writer(&mut capped, value).is_err() {
+                return "<unrenderable>".to_owned();
+            }
+            return capped.into_preview();
         }
         Payload::Text(text) | Payload::Proto(text) => Cow::Borrowed(text.as_str()),
         Payload::Raw(bytes) | Payload::FlatBuffer(bytes) | Payload::Avro(bytes) => {
             Cow::Owned(format!("<{} bytes>", bytes.len()))
         }
     };
-    if rendered.len() <= REJECTED_PAYLOAD_PREVIEW_BYTES {
-        return rendered.into_owned();
+    truncate_preview(&rendered, rendered.len())
+}
+
+/// Cuts `head` to the preview limit on a char boundary. `total` is the full
+/// rendered length, which `head` may already have been cut short of.
+fn truncate_preview(head: &str, total: usize) -> String {
+    if total <= REJECTED_PAYLOAD_PREVIEW_BYTES {
+        return head.to_owned();
     }
-    let mut end = REJECTED_PAYLOAD_PREVIEW_BYTES;
-    while end > 0 && !rendered.is_char_boundary(end) {
+    let mut end = REJECTED_PAYLOAD_PREVIEW_BYTES.min(head.len());
+    while end > 0 && !head.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}… ({} bytes total)", &rendered[..end], rendered.len())
+    format!("{}… ({total} bytes total)", &head[..end])
+}
+
+/// Keeps the first preview's worth of what is written to it and counts the
+/// rest.
+#[derive(Default)]
+struct CappedWriter {
+    head: Vec<u8>,
+    total: usize,
+}
+
+impl CappedWriter {
+    fn into_preview(self) -> String {
+        // The cap can split a multi-byte character, so only the valid prefix
+        // is kept.
+        let head = match std::str::from_utf8(&self.head) {
+            Ok(text) => text,
+            Err(error) => {
+                std::str::from_utf8(&self.head[..error.valid_up_to()]).unwrap_or_default()
+            }
+        };
+        truncate_preview(head, self.total)
+    }
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let room = REJECTED_PAYLOAD_PREVIEW_BYTES.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&bytes[..room.min(bytes.len())]);
+        self.total += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn parse_ack_level(raw: Option<&str>) -> Option<AckLevel> {
@@ -1521,6 +1590,30 @@ mod tests {
             preview.ends_with(&format!("({} bytes total)", text.len())),
             "{preview}"
         );
+    }
+
+    #[test]
+    fn given_a_long_json_payload_when_previewing_should_keep_only_the_head_and_report_the_size() {
+        let value: simd_json::OwnedValue = simd_json::json!({
+            "note": "é".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES)
+        });
+        let full = simd_json::to_string(&value).expect("render");
+        let preview = payload_preview(&Payload::Json(value));
+        assert!(preview.starts_with("{\"note\":\"é"), "{preview}");
+        assert!(
+            preview.ends_with(&format!("({} bytes total)", full.len())),
+            "{preview}"
+        );
+        assert!(
+            preview.len() < REJECTED_PAYLOAD_PREVIEW_BYTES + 64,
+            "{preview}"
+        );
+    }
+
+    #[test]
+    fn given_a_short_json_payload_when_previewing_should_render_it_whole() {
+        let preview = payload_preview(&Payload::Json(simd_json::json!({"price": 1.5})));
+        assert_eq!(preview, "{\"price\":1.5}");
     }
 
     #[test]
