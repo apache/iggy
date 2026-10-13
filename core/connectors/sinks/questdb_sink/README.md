@@ -60,7 +60,7 @@ verbose_logging = false
 | `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`, but an invalid value is rejected with any source. |
 | `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or array in one of these fields is rejected. |
 | `uuid_columns` | `[]` | Payload fields holding RFC-4122 strings, stored as `UUID`. A record with a non-string value there is rejected. |
-| `integer_columns` | `[]` | Payload fields stored as `LONG`. A fractional or non-numeric value there is rejected. |
+| `integer_columns` | `[]` | Payload fields stored as `LONG`. A fractional, non-numeric or out-of-range value there is rejected. |
 | `include_stream_column` | `true` | Write the stream name as a `SYMBOL` column named `stream`. |
 | `include_topic_column` | `true` | Write the topic name as a `SYMBOL` column named `topic`. |
 | `include_partition_column` | `false` | Write `partition_id` as a `LONG`. |
@@ -87,7 +87,8 @@ frame over the cap with all of its rows. `max_flush_bytes` flushes before a
 batch of wide rows reaches it. The 1 MB default leaves room, because the buffer
 size is an estimate and a frame can also carry the symbol dictionary. The cap
 is the smaller of `max_buf_size` and `sf_max_segment_bytes` in the connect
-string, so to raise it, raise both.
+string, so to raise it, raise both. The server's own maximum batch size still
+applies.
 
 The check runs before each row is added. A message larger than the frame cap
 minus `max_flush_bytes` can therefore push one frame over the cap. That flush
@@ -194,7 +195,8 @@ integer_columns = ["trade_id", "event_nanos"]
 ```
 
 A whole value written as `20.0` is accepted in an `integer_columns` field. A
-fractional value or a non-number there is rejected. When the connector rounds a
+fractional value, a non-number or a value outside the `LONG` range there is
+rejected. When the connector rounds a
 number past 2^53 to a `DOUBLE`, it logs one warning per kind of value with the
 column name.
 
