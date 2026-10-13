@@ -332,10 +332,10 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         .storage
                         .open(&reference.path(&self.directory), OpenMode::Create)
                         .await?;
-                    file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
-                        .await?;
                     self.storage
                         .charge_allocation((prepare.len() - size_of::<PrepareHeader>()) as u64);
+                    file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
+                        .await?;
                     file.sync().await?;
                     Some(reference)
                 }
@@ -425,12 +425,12 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
                 bodies.next();
             }
-            let allocated = self.newly_allocated(first.position, end);
+            self.storage
+                .charge_allocation(self.newly_allocated(first.position, end));
             self.segment_writing_file(first)
                 .await?
                 .write_frozen_vectored(first.position, buffers)
                 .await?;
-            self.storage.charge_allocation(allocated);
         }
         Ok(())
     }
@@ -441,7 +441,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         prepare: &Frozen<4096>,
     ) -> io::Result<()> {
         let end = reference.position + (prepare.len() - size_of::<PrepareHeader>()) as u64;
-        let allocated = self.newly_allocated(reference.position, end);
+        self.storage
+            .charge_allocation(self.newly_allocated(reference.position, end));
         self.segment_writing_file(reference)
             .await?
             .write_frozen(
@@ -449,7 +450,6 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 prepare.slice(size_of::<PrepareHeader>()..),
             )
             .await?;
-        self.storage.charge_allocation(allocated);
         Ok(())
     }
 

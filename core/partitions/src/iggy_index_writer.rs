@@ -131,12 +131,12 @@ impl IggyIndexWriter {
 
         let len = indexes.len();
         let file = &self.file;
+        DISK_USAGE.charge(len as u64);
         (&*file)
             .write_all_at(indexes, position)
             .await
             .0
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
-        DISK_USAGE.charge(len as u64);
 
         trace!(
             target: "iggy.partitions.storage",

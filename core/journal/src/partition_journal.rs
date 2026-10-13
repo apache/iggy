@@ -860,9 +860,9 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         self.poisoned = true;
         self.write_segment_bodies(prepares, &records).await?;
         self.retain_segment_inodes(&records).await?;
-        let extent_bytes = extent.as_slice().len() as u64;
+        self.storage
+            .charge_allocation(extent.as_slice().len() as u64);
         self.file.write_aligned(self.state.length, extent).await?;
-        self.storage.charge_allocation(extent_bytes);
         for (op, record, _) in records {
             self.entries.insert(op, record);
         }
@@ -1390,8 +1390,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 encoded.as_mut_slice(),
             )?;
             let length = encoded.as_slice().len();
-            file.write_aligned(0, encoded).await?;
             self.storage.charge_allocation(length as u64);
+            file.write_aligned(0, encoded).await?;
             entries.insert(
                 checkpoint,
                 StoredPrepare {
@@ -1464,8 +1464,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 )?;
             }
             let length = encoded.as_slice().len();
-            file.write_aligned(state.length, encoded).await?;
             self.storage.charge_allocation(length as u64);
+            file.write_aligned(state.length, encoded).await?;
             entries.insert(
                 op,
                 StoredPrepare {

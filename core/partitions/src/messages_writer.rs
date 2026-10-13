@@ -199,6 +199,8 @@ async fn write_frozen_chunked<const ALIGN: usize>(
     for chunk in buffers.chunks(IOV_MAX) {
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
+        let end = position + chunk_size as u64;
+        DISK_USAGE.charge(end.saturating_sub(position.max(reserved_end)));
 
         let (result, _) = (&*file)
             .write_vectored_all_at(chunk_vec, position)
@@ -214,8 +216,6 @@ async fn write_frozen_chunked<const ALIGN: usize>(
             );
             IggyError::CannotWriteToFile
         })?;
-        let end = position + chunk_size as u64;
-        DISK_USAGE.charge(end.saturating_sub(position.max(reserved_end)));
 
         position = end;
     }

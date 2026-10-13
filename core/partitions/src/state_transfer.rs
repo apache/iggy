@@ -5024,9 +5024,9 @@ async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()
     let mut file = compio::fs::File::create(path)
         .await
         .note_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
+    DISK_USAGE.charge(len);
     let (result, _) = file.write_all_at(payload, 0).await.into();
     result?;
-    DISK_USAGE.charge(len);
     file.sync_data().await?;
     Ok(())
 }

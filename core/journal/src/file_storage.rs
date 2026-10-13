@@ -127,6 +127,7 @@ impl FileStorage {
         self.write_offset.set(offset + len);
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &mut *self.file.get() };
+        DISK_USAGE.charge(len);
         let (result, _buf) = file.write_all_at(buf, offset).await.into();
         if let Err(error) = result {
             if self.write_offset.get() == offset + len {
@@ -134,7 +135,6 @@ impl FileStorage {
             }
             return Err(error);
         }
-        DISK_USAGE.charge(len);
         Ok(offset)
     }
 
