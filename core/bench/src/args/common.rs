@@ -68,8 +68,8 @@ pub struct IggyBenchArgs {
     pub rate_limit: Option<IggyByteSize>,
 
     /// Warmup time in human readable format, e.g. "1s", "2m", "3h".
-    /// After the warmup, consumer-only runs read the topic again from the start,
-    /// and group members delete the offsets that the warmup committed.
+    /// After the warmup, consumer-only runs read the topic again from offset zero,
+    /// including consumer group members.
     #[arg(long, short = 'w', verbatim_doc_comment, default_value_t = IggyDuration::from_str(DEFAULT_WARMUP_TIME).unwrap())]
     pub warmup_time: IggyDuration,
 
