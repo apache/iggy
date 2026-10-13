@@ -115,6 +115,11 @@ pub struct TcpClient {
     /// connection that drops without a `disconnect()` call leaves it clear, so
     /// that loss still heals.
     disconnected_by_caller: AtomicBool,
+    /// Set when `shutdown()` finishes its cleanup. The state turns `Shutdown`
+    /// before that cleanup and stays there, so it cannot tell a finished
+    /// shutdown from a cancelled one: a cancelled `shutdown()` leaves the
+    /// cleanup to the next call.
+    shutdown_complete: AtomicBool,
     /// The session and the sign-in, shared with the poll router and the
     /// poll clients it dials.
     session_owner: Arc<SessionOwner>,
@@ -542,6 +547,7 @@ impl TcpClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             disconnected_by_caller: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
             session_owner,
             skip_auto_login_once: Mutex::new(false),
             routing_lock: Mutex::new(()),
@@ -1318,7 +1324,7 @@ impl TcpClient {
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Shutdown {
+        if self.shutdown_complete.load(Ordering::SeqCst) {
             return Ok(());
         }
 
@@ -1333,6 +1339,7 @@ impl TcpClient {
         }
         self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Shutdown).await;
+        self.shutdown_complete.store(true, Ordering::SeqCst);
         info!("{NAME} TCP client: {client_address} has been shutdown.");
         Ok(())
     }
@@ -3984,5 +3991,45 @@ mod tests {
                 .is_err(),
             "the sweep must not dial after the shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_shutdown_is_finished_by_the_next_call() {
+        let (listener, address) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: address,
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        let (accepted, connected) = tokio::join!(listener.accept(), TcpClient::connect(&client));
+        connected.expect("connect");
+        let (mut peer, _) = accepted.expect("accept");
+        let mut events = client.subscribe_events().await;
+        {
+            let _transport = client.link.lock().await;
+            // The shutdown waits for the transport lock, and its caller gives up.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), Client::shutdown(&client))
+                    .await
+                    .is_err()
+            );
+        }
+
+        Client::shutdown(&client).await.unwrap();
+
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
+        assert!(client.link.lock().await.is_none());
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .expect("the peer must see the connection close");
+        assert!(matches!(read, Ok(0) | Err(_)), "got {read:?}");
+        let mut shutdowns = 0;
+        while let Ok(event) = events.try_recv() {
+            if event == DiagnosticEvent::Shutdown {
+                shutdowns += 1;
+            }
+        }
+        assert_eq!(shutdowns, 1);
     }
 }

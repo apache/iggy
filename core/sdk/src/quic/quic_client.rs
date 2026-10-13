@@ -110,6 +110,11 @@ pub struct QuicClient {
     /// connection that drops without a `disconnect()` call leaves it clear, so
     /// that loss still heals.
     disconnected_by_caller: AtomicBool,
+    /// Set when `shutdown()` finishes its cleanup. The state turns `Shutdown`
+    /// before that cleanup and stays there, so it cannot tell a finished
+    /// shutdown from a cancelled one: a cancelled `shutdown()` leaves the
+    /// cleanup to the next call.
+    shutdown_complete: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -679,6 +684,7 @@ impl QuicClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             disconnected_by_caller: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -1067,7 +1073,7 @@ impl QuicClient {
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Shutdown {
+        if self.shutdown_complete.load(Ordering::SeqCst) {
             return Ok(());
         }
 
@@ -1083,6 +1089,7 @@ impl QuicClient {
         self.endpoint.wait_idle().await;
         self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Shutdown).await;
+        self.shutdown_complete.store(true, Ordering::SeqCst);
         info!("{NAME} QUIC client has been shutdown.");
         Ok(())
     }
@@ -2481,5 +2488,53 @@ mod tests {
                 .is_err(),
             "the sweep must not dial after the shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_shutdown_is_finished_by_the_next_call() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        let mut events = client.subscribe_events().await;
+        {
+            let _transport = client.link.lock().await;
+            // The shutdown waits for the transport lock, and its caller gives up.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), Client::shutdown(&client))
+                    .await
+                    .is_err()
+            );
+        }
+
+        Client::shutdown(&client).await.unwrap();
+
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
+        assert!(client.link.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), peer.closed())
+            .await
+            .expect("the live connection must be closed");
+        let mut shutdowns = 0;
+        while let Ok(event) = events.try_recv() {
+            if event == DiagnosticEvent::Shutdown {
+                shutdowns += 1;
+            }
+        }
+        assert_eq!(shutdowns, 1);
     }
 }
