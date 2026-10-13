@@ -102,11 +102,19 @@ credentials authenticated, so the connector logs a warning and continues. A
 documents must be objects. `Payload::Raw` bytes are parsed as JSON when
 possible, otherwise indexed as `{data: <base64>, data_type: "raw",
 data_encoding: "base64"}`. `Payload::Text` is indexed as `{text, data_type:
-"text"}`. Unsupported payload schemas (Protobuf, FlatBuffer, Avro) are
-dropped with a warning and counted as sink errors. This matches the
-connector runtime's per-record drop convention, and because the sink returns
-success after dropping such a record, the runtime commits the consumer
-offset for it. There is no dead-letter queue for these drops.
+"text"}`. `Payload::Proto` holds text, for example from a `proto_convert`
+transform on a stream. If the text is a JSON document it is indexed like
+`Payload::Json`, otherwise like `Payload::Text`. `Payload::FlatBuffer` and
+`Payload::Avro` are unsupported: they are dropped with a warning and counted
+as sink errors. This matches the connector runtime's per-record drop
+convention, and because the sink returns success after dropping such a
+record, the runtime commits the consumer offset for it. There is no
+dead-letter queue for these drops.
+
+The sink acts on the payload variant it receives after decoding and
+transforms, not on the stream's configured schema. A stream with a `json`
+schema can therefore deliver `Payload::Proto` when a `proto_convert`
+transform is applied.
 
 ### Document ID
 
