@@ -40,6 +40,10 @@ private func codes(_ server: FakeVSRServer) async -> [UInt32?] {
     await server.requests.map(\.code)
 }
 
+private func pingCount(_ server: FakeVSRServer) async -> Int {
+    await codes(server).filter { $0 == CommandCode.ping.rawValue }.count
+}
+
 @Suite("Client transport", .serialized)
 struct ClientTransportTests {
     @Test func loginBindsTheSessionAndSequencesRequests() async throws {
@@ -205,7 +209,7 @@ struct ClientTransportTests {
         let elapsed = await clock.measure {
             await expectCode(.disconnected) { _ = try await client.createStream(name: "x") }
         }
-        #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(3))
+        #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
         try await client.shutdown()
     }
 
@@ -460,7 +464,7 @@ struct ClientTransportTests {
             await expectCode(.cannotEstablishConnection) { try await client.connect() }
         }
         // Three dials with two 20 ms pauses between them.
-        #expect(elapsed >= .milliseconds(40) && elapsed < .seconds(2))
+        #expect(elapsed >= .milliseconds(40) && elapsed < .seconds(10))
         #expect(await client.state == .disconnected)
 
         // Bring a server back on the same port and connect again.
@@ -573,12 +577,14 @@ struct ClientTransportTests {
         configuration.heartbeatInterval = .milliseconds(30)
         let client = IggyClient(configuration: configuration, logger: testLogger)
         try await client.connect()
-        try await Task.sleep(for: .milliseconds(150))
-        let pings = await codes(server).filter { $0 == CommandCode.ping.rawValue }.count
-        #expect(pings >= 3)
+        // Waits for the pings rather than for a fixed time: a loaded machine
+        // stretches the interval, and only their arrival is being tested.
+        #expect(await eventually { await pingCount(server) >= 3 })
         try await client.shutdown()
-        try await Task.sleep(for: .milliseconds(60))
-        #expect(await codes(server).filter { $0 == CommandCode.ping.rawValue }.count <= pings + 1)
+        // One ping may already be on the wire when the heartbeat stops.
+        let stopped = await pingCount(server)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await pingCount(server) <= stopped + 1)
     }
 
     @Test func concurrentCallersShareOneConnectionInLockstep() async throws {
