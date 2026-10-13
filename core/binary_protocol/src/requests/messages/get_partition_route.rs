@@ -21,7 +21,7 @@ use crate::codec::{WireDecode, WireEncode, read_u32_le};
 use crate::{WireError, WireIdentifier};
 
 /// Route lookup for one partition, authorized by send or poll permission on its
-/// topic, without exposing topic details. The reply is a
+/// topic. The reply includes the partition count, view and primary in a
 /// [`PartitionRouteResponse`](crate::responses::messages::PartitionRouteResponse).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetPartitionRouteRequest {

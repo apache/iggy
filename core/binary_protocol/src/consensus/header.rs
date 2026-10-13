@@ -44,9 +44,16 @@
 //! Older replicas cannot report live sessions to a new primary, which would
 //! expire their consumer-group memberships after the configured timeout.
 //!
-//! `Prepare`, `Request`, `Reply`, and `Eviction` are unaffected. Prepares keep
-//! `checksum` as their view-independent identity, and the three client-facing
-//! headers are sealed on neither side, so SDKs are untouched.
+//! Session retirement progress (31), forwarding completion (32), and the
+//! partition incarnation fields in control headers also require matching
+//! replicas. The incarnation occupies bytes older builds treated as reserved;
+//! a mixed cluster cannot safely identify the partition history of a frame.
+//!
+//! Frame sealing does not change `Prepare`, `Request`, `Reply`, or `Eviction`.
+//! Prepares keep `checksum` as their view-independent identity, and the three
+//! client-facing headers are sealed on neither side. Separate client protocol
+//! changes, including partition routes and replica IDs in cluster metadata,
+//! require a coordinated SDK upgrade as well.
 
 use super::{Command, ConsensusError, Operation};
 use crate::WireIdentifier;
