@@ -34,7 +34,8 @@
 #   - `cluster.nodes[*].ip` must be a literal IP, so nodes get static
 #     addresses on a dedicated network.
 #   - Ports come from the roster, so each node uses its own port set and the
-#     host mappings match what the cluster advertises.
+#     host mappings match what the cluster advertises. The shared listener
+#     addresses only choose the bind interface.
 #   - Clients reached through a published port are handed
 #     IGGY_ADVERTISED_ADDRESS. Containers on the cluster network get an
 #     address from the .128/25 half of the subnet and are handed the node's
@@ -66,6 +67,10 @@ x-cluster-roster: &cluster-roster
   IGGY_SHARDING_PIN_CORES: "false"
   RUST_LOG: ${RUST_LOG:-info}
   IGGY_PATH: local_data
+  IGGY_TCP_ADDRESS: 0.0.0.0:8090
+  IGGY_QUIC_ADDRESS: 0.0.0.0:8080
+  IGGY_HTTP_ADDRESS: 0.0.0.0:3000
+  IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8070
 
   IGGY_CLUSTER_NODES_0_NAME: iggy-node-0
   IGGY_CLUSTER_NODES_0_IP: ${IGGY_SUBNET:-10.29.0}.10
@@ -108,12 +113,7 @@ services:
     <<: *iggy-node
     container_name: iggy-node-0
     command: [ "--replica-id", "0" ]
-    environment:
-      <<: *cluster-roster
-      IGGY_TCP_ADDRESS: 0.0.0.0:8090
-      IGGY_QUIC_ADDRESS: 0.0.0.0:8080
-      IGGY_HTTP_ADDRESS: 0.0.0.0:3000
-      IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8070
+    environment: *cluster-roster
     healthcheck:
       test: [ "CMD", "iggy", "--tcp-server-address", "${IGGY_SUBNET:-10.29.0}.10:8090", "ping" ]
       interval: 5s
@@ -135,15 +135,7 @@ services:
     <<: *iggy-node
     container_name: iggy-node-1
     command: [ "--replica-id", "1" ]
-    depends_on:
-      iggy-node-0:
-        condition: service_healthy
-    environment:
-      <<: *cluster-roster
-      IGGY_TCP_ADDRESS: 0.0.0.0:8091
-      IGGY_QUIC_ADDRESS: 0.0.0.0:8081
-      IGGY_HTTP_ADDRESS: 0.0.0.0:3001
-      IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8071
+    environment: *cluster-roster
     healthcheck:
       test: [ "CMD", "iggy", "--tcp-server-address", "${IGGY_SUBNET:-10.29.0}.11:8091", "ping" ]
       interval: 5s
@@ -165,15 +157,7 @@ services:
     <<: *iggy-node
     container_name: iggy-node-2
     command: [ "--replica-id", "2" ]
-    depends_on:
-      iggy-node-0:
-        condition: service_healthy
-    environment:
-      <<: *cluster-roster
-      IGGY_TCP_ADDRESS: 0.0.0.0:8092
-      IGGY_QUIC_ADDRESS: 0.0.0.0:8082
-      IGGY_HTTP_ADDRESS: 0.0.0.0:3002
-      IGGY_WEBSOCKET_ADDRESS: 0.0.0.0:8072
+    environment: *cluster-roster
     healthcheck:
       test: [ "CMD", "iggy", "--tcp-server-address", "${IGGY_SUBNET:-10.29.0}.12:8092", "ping" ]
       interval: 5s
