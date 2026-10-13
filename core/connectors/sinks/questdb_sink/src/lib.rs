@@ -115,7 +115,7 @@ pub struct QuestDbSinkConfig {
     pub timestamp_unit: Option<String>,
     pub symbol_columns: Option<Vec<String>>,
     pub uuid_columns: Option<Vec<String>>,
-    /// Payload fields to store as `LONG` while `numbers_as_double` is on.
+    /// Payload fields to store as `LONG`, whatever `numbers_as_double` says.
     pub integer_columns: Option<Vec<String>>,
     pub include_stream_column: Option<bool>,
     pub include_topic_column: Option<bool>,
@@ -286,26 +286,18 @@ impl QuestDbSink {
         }
         // Zero would make the chunking loop take nothing on every pass and never
         // finish, holding the FFI call open for good.
-        let batch_size = match config.batch_size {
-            None => DEFAULT_BATCH_SIZE,
-            Some(0) => {
-                warn!(
-                    "batch_size = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_BATCH_SIZE}"
-                );
-                DEFAULT_BATCH_SIZE
-            }
-            Some(rows) => rows,
-        };
-        let max_flush_bytes = match config.max_flush_bytes {
-            None => DEFAULT_MAX_FLUSH_BYTES,
-            Some(0) => {
-                warn!(
-                    "max_flush_bytes = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_MAX_FLUSH_BYTES}"
-                );
-                DEFAULT_MAX_FLUSH_BYTES
-            }
-            Some(bytes) => bytes,
-        };
+        let batch_size = nonzero_or_default(
+            id,
+            "batch_size",
+            config.batch_size.map(|rows| rows as usize),
+            DEFAULT_BATCH_SIZE as usize,
+        );
+        let max_flush_bytes = nonzero_or_default(
+            id,
+            "max_flush_bytes",
+            config.max_flush_bytes,
+            DEFAULT_MAX_FLUSH_BYTES,
+        );
 
         Self {
             id,
@@ -313,7 +305,7 @@ impl QuestDbSink {
             mapping: Arc::new(mapping),
             ack_level,
             flush_timeout,
-            batch_size: batch_size as usize,
+            batch_size,
             max_flush_bytes,
             verbose: config.verbose_logging.unwrap_or(false),
             log_rejected_payload: config.log_rejected_payload.unwrap_or(false),
@@ -1053,12 +1045,11 @@ impl CappedWriter {
     fn into_preview(self) -> String {
         // The cap can split a multi-byte character, so only the valid prefix
         // is kept.
-        let head = match std::str::from_utf8(&self.head) {
-            Ok(text) => text,
-            Err(error) => {
-                std::str::from_utf8(&self.head[..error.valid_up_to()]).unwrap_or_default()
-            }
-        };
+        let head = self
+            .head
+            .utf8_chunks()
+            .next()
+            .map_or("", |chunk| chunk.valid());
         truncate_preview(head, self.total)
     }
 }
@@ -1073,6 +1064,18 @@ impl std::io::Write for CappedWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// The configured size, or the default with a warning when it is zero.
+fn nonzero_or_default(id: u32, field: &str, value: Option<usize>, default: usize) -> usize {
+    match value {
+        None => default,
+        Some(0) => {
+            warn!("{field} = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {default}");
+            default
+        }
+        Some(value) => value,
     }
 }
 

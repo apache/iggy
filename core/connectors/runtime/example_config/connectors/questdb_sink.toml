@@ -56,7 +56,8 @@ symbol_columns = []
 # Payload fields holding RFC-4122 strings to store as UUID.
 uuid_columns = []
 # Payload fields to store as LONG, for integers above 2^53 such as nanosecond
-# epochs, snowflake ids and hashes. A fractional value here is rejected.
+# epochs, snowflake ids and hashes. A fractional, non-numeric or out-of-range
+# value here is rejected.
 integer_columns = []
 
 include_stream_column = true
