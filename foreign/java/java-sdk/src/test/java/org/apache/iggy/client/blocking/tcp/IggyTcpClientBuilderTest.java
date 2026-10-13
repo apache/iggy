@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.Iggy;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.config.RetryPolicy;
@@ -71,6 +72,18 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // When: Try to access system info (auto-login should have happened)
         // Then: Should succeed without explicit login
+        List<ClientInfo> clients = client.system().getClients();
+        assertThat(clients).isNotNull();
+    }
+
+    @Test
+    void shouldCreateClientFromConnectionString() {
+        // Given: Builder configured from a connection string
+        IggyTcpClient client = Iggy.tcpClientBuilder()
+                .fromConnectionString("iggy://iggy:iggy@" + serverHost() + ":" + serverTcpPort())
+                .buildAndLogin();
+
+        // Then: Should be logged in and able to fetch system info
         List<ClientInfo> clients = client.system().getClients();
         assertThat(clients).isNotNull();
     }
