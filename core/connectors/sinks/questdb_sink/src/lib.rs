@@ -284,16 +284,28 @@ impl QuestDbSink {
         if let Err(error) = validate_column_overlap(&mapping) {
             reject(error);
         }
-        if config.batch_size == Some(0) {
-            warn!(
-                "batch_size = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_BATCH_SIZE}"
-            );
-        }
-        if config.max_flush_bytes == Some(0) {
-            warn!(
-                "max_flush_bytes = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_MAX_FLUSH_BYTES}"
-            );
-        }
+        // Zero would make the chunking loop take nothing on every pass and never
+        // finish, holding the FFI call open for good.
+        let batch_size = match config.batch_size {
+            None => DEFAULT_BATCH_SIZE,
+            Some(0) => {
+                warn!(
+                    "batch_size = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_BATCH_SIZE}"
+                );
+                DEFAULT_BATCH_SIZE
+            }
+            Some(rows) => rows,
+        };
+        let max_flush_bytes = match config.max_flush_bytes {
+            None => DEFAULT_MAX_FLUSH_BYTES,
+            Some(0) => {
+                warn!(
+                    "max_flush_bytes = 0 for {CONNECTOR_NAME} ID: {id}, defaulting to {DEFAULT_MAX_FLUSH_BYTES}"
+                );
+                DEFAULT_MAX_FLUSH_BYTES
+            }
+            Some(bytes) => bytes,
+        };
 
         Self {
             id,
@@ -301,16 +313,8 @@ impl QuestDbSink {
             mapping: Arc::new(mapping),
             ack_level,
             flush_timeout,
-            // Zero would make the chunking loop take nothing on every pass and
-            // never finish, holding the FFI call open for good.
-            batch_size: config
-                .batch_size
-                .filter(|rows| *rows > 0)
-                .unwrap_or(DEFAULT_BATCH_SIZE) as usize,
-            max_flush_bytes: config
-                .max_flush_bytes
-                .filter(|bytes| *bytes > 0)
-                .unwrap_or(DEFAULT_MAX_FLUSH_BYTES),
+            batch_size: batch_size as usize,
+            max_flush_bytes,
             verbose: config.verbose_logging.unwrap_or(false),
             log_rejected_payload: config.log_rejected_payload.unwrap_or(false),
             init_error,
@@ -1592,15 +1596,15 @@ mod tests {
             "note": "é".repeat(REJECTED_PAYLOAD_PREVIEW_BYTES)
         });
         let full = simd_json::to_string(&value).expect("render");
+        // `{"note":"` is 9 bytes and `é` is 2, so an odd remainder puts the cap
+        // inside an `é` and makes the writer drop the half character.
+        let prefix = "{\"note\":\"";
+        assert_eq!((REJECTED_PAYLOAD_PREVIEW_BYTES - prefix.len()) % 2, 1);
+        let kept = (REJECTED_PAYLOAD_PREVIEW_BYTES - prefix.len()) / 2;
         let preview = payload_preview(&Payload::Json(value));
-        assert!(preview.starts_with("{\"note\":\"é"), "{preview}");
-        assert!(
-            preview.ends_with(&format!("({} bytes total)", full.len())),
-            "{preview}"
-        );
-        assert!(
-            preview.len() < REJECTED_PAYLOAD_PREVIEW_BYTES + 64,
-            "{preview}"
+        assert_eq!(
+            preview,
+            format!("{prefix}{}… ({} bytes total)", "é".repeat(kept), full.len())
         );
     }
 
@@ -1613,8 +1617,8 @@ mod tests {
     #[test]
     fn given_a_multibyte_boundary_when_previewing_should_not_split_a_character() {
         // Three bytes per character puts the boundaries on multiples of three.
-        // The cut is at 512, which is not one of them, so the walk has to step
-        // back rather than slicing a character in half. A two-byte character
+        // The cut is at 512, which is not one of them, so it has to round down
+        // to a character boundary rather than slicing a character in half. A two-byte character
         // would not test this: every boundary would be even, and so is the cut.
         assert_ne!(
             REJECTED_PAYLOAD_PREVIEW_BYTES % "€".len(),

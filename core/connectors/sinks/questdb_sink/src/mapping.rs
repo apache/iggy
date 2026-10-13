@@ -348,7 +348,11 @@ impl Mapping {
         // less than hashing a lowercased copy of every name, and it copies no
         // name on a path that runs for every field of every row.
         let field_count = fields.map_or(0, |fields| fields.len());
-        let mut seen: Vec<&str> = Vec::with_capacity(RESERVED_COLUMNS + field_count);
+        let header_count = match &message.headers {
+            Some(headers) if self.include_headers => headers.len(),
+            _ => 0,
+        };
+        let mut seen: Vec<&str> = Vec::with_capacity(RESERVED_COLUMNS + field_count + header_count);
         for reserved in self.reserved_columns() {
             seen.push(reserved);
         }
