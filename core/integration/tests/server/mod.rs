@@ -39,7 +39,7 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
-// /metrics carries per-topic size and message count (#4473).
+// /metrics carries per-topic size and message count.
 mod topic_metrics_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
