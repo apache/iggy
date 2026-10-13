@@ -103,6 +103,8 @@ cd examples/rust/src/sink-data-producer
 IGGY_CONNECT_IMAGE=iggy-connect:fat-local docker compose up -d --build
 ```
 
+IMPORTANT: make sure you have pulled the code from the latest master to ensure connectors and server protocol compatibility. The incompatibility causes obscure errors coming from the connectors' client due to frequent changes done to the protocol at the moment.
+
 The configuration used by the example lives in `examples/rust/src/sink-data-producer/config/`.
 
 ## Runtime
