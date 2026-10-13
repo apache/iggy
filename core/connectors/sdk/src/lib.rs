@@ -46,7 +46,7 @@ pub mod sink;
 pub mod source;
 pub mod transforms;
 
-pub use convert::owned_value_to_serde_json;
+pub use convert::{owned_value_into_serde_json, owned_value_to_serde_json};
 pub use log::LogCallback;
 pub use transforms::Transform;
 

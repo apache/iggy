@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::Bytes;
-use iggy_connector_sdk::convert::owned_value_to_serde_json;
+use iggy_connector_sdk::convert::owned_value_into_serde_json;
 use iggy_connector_sdk::retry::{parse_duration, retry_backoff};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
@@ -896,7 +896,7 @@ fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Erro
     let payload = payload.into_json_document();
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
-            value: owned_value_to_serde_json(&value),
+            value: owned_value_into_serde_json(value),
             encoding: ENCODING_JSON,
         }),
         Payload::Text(text) | Payload::Proto(text) => Ok(PayloadDocument {
@@ -912,7 +912,7 @@ fn build_auto_payload_document(payload: Payload) -> Result<PayloadDocument, Erro
 fn build_json_payload_document(payload: Payload) -> Result<PayloadDocument, Error> {
     match payload {
         Payload::Json(value) => Ok(PayloadDocument {
-            value: owned_value_to_serde_json(&value),
+            value: owned_value_into_serde_json(value),
             encoding: ENCODING_JSON,
         }),
         _ => {
@@ -1649,6 +1649,15 @@ mod tests {
     #[test]
     fn given_json_payload_format_should_parse_raw_json() {
         let payload = Payload::Raw(br#"{"count":3}"#.to_vec());
+        let document = build_json_payload_document(payload).expect("Failed to build payload");
+
+        assert_eq!(document.encoding, ENCODING_JSON);
+        assert_eq!(document.value, json!({"count": 3}));
+    }
+
+    #[test]
+    fn given_json_payload_format_should_convert_a_json_payload_directly() {
+        let payload = json_payload(json!({"count": 3}));
         let document = build_json_payload_document(payload).expect("Failed to build payload");
 
         assert_eq!(document.encoding, ENCODING_JSON);
