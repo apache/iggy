@@ -704,7 +704,7 @@ impl Sink for QuestDbSink {
         {
             return Err(Error::InvalidConfigValue(
                 "ack_level is \"durable\" but the connection string does not set \
-                 request_durable_ack=on, which QuestDB requires for durable acknowledgement"
+                 request_durable_ack=on, which the QuestDB client requires for durable acknowledgement"
                     .to_owned(),
             ));
         }
