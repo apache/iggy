@@ -883,12 +883,6 @@ impl Sink for QuestDbSink {
         };
         drop(state);
 
-        // One unacknowledged flush is lag. A run of them means the server has
-        // stopped acknowledging altogether, and reporting every one of those
-        // batches as a success would leave the runtime's metrics showing a
-        // healthy connector while nothing is being committed. Escalate so the
-        // error counter moves; the rows stay queued either way, and the runtime
-        // does not replay a failed batch, so nothing is lost by saying so.
         if let Some(error) = failure {
             // Each chunk that failed on a server rejection reported it through
             // its own error, and the handler counts the same event. Retire
@@ -915,6 +909,12 @@ impl Sink for QuestDbSink {
         if let Some(error) = self.unclaimed_rejection(db) {
             return Err(error);
         }
+        // One unacknowledged flush is lag. A run of them means the server has
+        // stopped acknowledging altogether, and reporting every one of those
+        // batches as a success would leave the runtime's metrics showing a
+        // healthy connector while nothing is being committed. Escalate so the
+        // error counter moves; the rows stay queued either way, and the runtime
+        // does not replay a failed batch, so nothing is lost by saying so.
         if should_escalate_stall(stalled) {
             return Err(Error::PermanentHttpError(format!(
                 "{CONNECTOR_NAME} ID: {}: the last {stalled} batches were flushed without QuestDB acknowledging them at ack_level {:?}; the frames are queued but nothing is being committed",
