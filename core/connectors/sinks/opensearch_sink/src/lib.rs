@@ -719,7 +719,13 @@ impl OpenSearchSink {
                         match response.json::<BulkResponseBody>().await {
                             Ok(payload) => match parse_bulk_response(&payload, pending.len()) {
                                 Ok(attempt) => {
-                                    let retry_set = documents_at(&pending, &attempt.retryable);
+                                    // `parse_bulk_response` rejects a response whose item count differs
+                                    // from `pending`, so every position is in range.
+                                    let retry_set: Vec<&PreparedDocument> = attempt
+                                        .retryable
+                                        .iter()
+                                        .map(|&position| pending[position])
+                                        .collect();
 
                                     if retry_set.is_empty() || retries >= self.config.max_retries {
                                         outcome.merge(attempt.into_outcome());
@@ -932,30 +938,20 @@ impl Sink for OpenSearchSink {
         let messages_count = messages.len();
         let mut documents = Vec::with_capacity(messages_count);
         let mut invalid_records = 0usize;
-        let mut preparation_errors = 0usize;
         for message in messages {
+            // One message failing preparation must not discard the documents
+            // already built from earlier messages in this batch.
             match self.prepare_document(topic_metadata, &messages_metadata, message) {
                 Ok(document) => documents.push(document),
-                Err(Error::InvalidRecordValue(reason)) => {
-                    invalid_records += 1;
-                    self.log_invalid_record(&reason);
-                }
-                // A single message's preparation failing must not discard the
-                // documents already built from earlier messages in this batch.
                 Err(error) => {
-                    preparation_errors += 1;
-                    error!(
-                        "Failed to prepare OpenSearch sink document for connector ID: {}, error: {}",
-                        self.id, error
-                    );
+                    invalid_records += 1;
+                    self.log_invalid_record(&error.to_string());
                 }
             }
         }
-        if invalid_records > 0 || preparation_errors > 0 {
-            self.errors_count.fetch_add(
-                (invalid_records + preparation_errors) as u64,
-                Ordering::Relaxed,
-            );
+        if invalid_records > 0 {
+            self.errors_count
+                .fetch_add(invalid_records as u64, Ordering::Relaxed);
         }
 
         if documents.is_empty() {
@@ -1148,20 +1144,6 @@ fn retain_last_per_id(documents: &mut Vec<PreparedDocument>) {
     keep.reverse();
     let mut keep = keep.into_iter();
     documents.retain(|_| keep.next().unwrap_or(true));
-}
-
-/// Maps server-echoed item positions back to the documents that were sent.
-/// Out-of-range positions are dropped: a response carrying more items than
-/// were sent would otherwise panic, and a panic crossing the plugin's
-/// `extern "C"` boundary aborts the whole connectors runtime process.
-fn documents_at<'a>(
-    pending: &[&'a PreparedDocument],
-    positions: &[usize],
-) -> Vec<&'a PreparedDocument> {
-    positions
-        .iter()
-        .filter_map(|&position| pending.get(position).copied())
-        .collect()
 }
 
 /// Only the fields this sink reads are typed, so `serde_json` skips the rest without allocating.
@@ -2794,36 +2776,6 @@ mod tests {
         assert_eq!(action_line["index"]["_id"], document.id);
     }
 
-    #[test]
-    fn given_retryable_positions_should_select_matching_documents() {
-        let documents = [prepared("a"), prepared("b"), prepared("c")];
-        let pending: Vec<&PreparedDocument> = documents.iter().collect();
-
-        let selected = documents_at(&pending, &[0, 2]);
-
-        assert_eq!(
-            selected
-                .iter()
-                .map(|document| document.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "c"]
-        );
-    }
-
-    // A response echoing more items than were sent must not panic: a panic
-    // crossing the plugin's FFI boundary aborts every connector in the runtime.
-    #[test]
-    fn given_out_of_range_positions_should_drop_them_instead_of_panicking() {
-        let documents = [prepared("a")];
-        let pending: Vec<&PreparedDocument> = documents.iter().collect();
-
-        let selected = documents_at(&pending, &[0, 7]);
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].id, "a");
-        assert!(documents_at(&pending, &[3, 4]).is_empty());
-    }
-
     fn fast_retry_config(max_open_retries: u32) -> OpenSearchSinkConfig {
         let mut config = base_config();
         config.max_open_retries = Some(max_open_retries);
@@ -2902,7 +2854,7 @@ mod tests {
         assert_eq!(sink.errors_count.load(Ordering::Relaxed), 0);
     }
 
-    async fn mock_health_sink(server: &MockServer, base_path: &str) -> OpenSearchSink {
+    fn mock_health_sink(server: &MockServer, base_path: &str) -> OpenSearchSink {
         let mut config = fast_retry_config(1);
         config.url = format!("{}{base_path}", server.uri());
         sink_with_config(config)
@@ -2913,7 +2865,7 @@ mod tests {
         sink.create_client(&normalized).expect("build client")
     }
 
-    async fn mock_bulk_sink(server: &MockServer, max_retries: u32) -> OpenSearchSink {
+    fn mock_bulk_sink(server: &MockServer, max_retries: u32) -> OpenSearchSink {
         let mut config = fast_retry_config(1);
         config.url = server.uri();
         config.max_retries = Some(max_retries);
@@ -2938,7 +2890,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let sink = mock_health_sink(&server, "").await;
+        let sink = mock_health_sink(&server, "");
         let client = mock_client(&sink);
 
         sink.check_connectivity(&client)
@@ -2954,7 +2906,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
-        let sink = mock_health_sink(&server, "").await;
+        let sink = mock_health_sink(&server, "");
         let client = mock_client(&sink);
 
         let error = sink
@@ -2976,7 +2928,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let sink = mock_health_sink(&server, "/opensearch").await;
+        let sink = mock_health_sink(&server, "/opensearch");
         let client = mock_client(&sink);
 
         sink.check_connectivity(&client)
@@ -2987,7 +2939,7 @@ mod tests {
     #[tokio::test]
     async fn given_transient_item_failure_should_retry_only_rejected_documents() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 2).await;
+        let sink = mock_bulk_sink(&server, 2);
         let client = mock_client(&sink);
         let documents = [prepared("a"), prepared("b")];
         let full_body = build_bulk_body(&sink.config.index, &[&documents[0], &documents[1]])
@@ -3033,7 +2985,7 @@ mod tests {
     #[tokio::test]
     async fn given_transient_bulk_status_should_resend_full_chunk() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 2).await;
+        let sink = mock_bulk_sink(&server, 2);
         let client = mock_client(&sink);
         let documents = [prepared("a"), prepared("b")];
         let full_body = build_bulk_body(&sink.config.index, &[&documents[0], &documents[1]])
@@ -3123,7 +3075,7 @@ mod tests {
     #[tokio::test]
     async fn given_retry_after_header_exceeding_max_retry_delay_should_be_capped() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 1).await;
+        let sink = mock_bulk_sink(&server, 1);
         let client = mock_client(&sink);
         let documents = [prepared("a")];
         let body = build_bulk_body(&sink.config.index, &[&documents[0]]).expect("build body");
@@ -3166,7 +3118,7 @@ mod tests {
     #[tokio::test]
     async fn given_bulk_retries_exhausted_should_return_ok_with_partial_outcome() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 1).await;
+        let sink = mock_bulk_sink(&server, 1);
         let client = mock_client(&sink);
         let documents = [prepared("a")];
 
@@ -3190,7 +3142,7 @@ mod tests {
     #[tokio::test]
     async fn given_permanent_bulk_status_should_fail_without_retry() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 3).await;
+        let sink = mock_bulk_sink(&server, 3);
         let client = mock_client(&sink);
         let documents = [prepared("a")];
 
@@ -3224,7 +3176,7 @@ mod tests {
     #[tokio::test]
     async fn given_permanent_bulk_status_after_partial_retry_should_keep_earlier_indexed_count() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 2).await;
+        let sink = mock_bulk_sink(&server, 2);
         let client = mock_client(&sink);
         let documents = [prepared("a"), prepared("b")];
         let full_body = build_bulk_body(&sink.config.index, &[&documents[0], &documents[1]])
@@ -3269,7 +3221,7 @@ mod tests {
     #[tokio::test]
     async fn given_unparsable_bulk_response_body_should_be_retried_as_transient() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 1).await;
+        let sink = mock_bulk_sink(&server, 1);
         let client = mock_client(&sink);
         let documents = [prepared("a")];
 
@@ -3307,7 +3259,7 @@ mod tests {
     #[tokio::test]
     async fn given_bulk_response_missing_items_should_be_retried_as_transient() {
         let server = MockServer::start().await;
-        let sink = mock_bulk_sink(&server, 1).await;
+        let sink = mock_bulk_sink(&server, 1);
         let client = mock_client(&sink);
         let documents = [prepared("a")];
 
@@ -3602,7 +3554,7 @@ mod tests {
     #[tokio::test]
     async fn given_index_creation_should_send_header_template_body() {
         let server = MockServer::start().await;
-        let sink = mock_health_sink(&server, "").await;
+        let sink = mock_health_sink(&server, "");
         let client = mock_client(&sink);
 
         Mock::given(method("PUT"))
@@ -3623,7 +3575,7 @@ mod tests {
     #[tokio::test]
     async fn given_concurrent_index_creation_should_not_fail_open() {
         let server = MockServer::start().await;
-        let sink = mock_health_sink(&server, "").await;
+        let sink = mock_health_sink(&server, "");
         let client = mock_client(&sink);
 
         Mock::given(method("PUT"))
