@@ -93,14 +93,6 @@ impl Replacements {
     pub const fn may_replace(self, sampled: Self) -> bool {
         self.started > sampled.settled
     }
-
-    /// Whether a success of a request that recorded `sampled` belongs to the
-    /// current incarnation. A delete replies before its fences install, so the
-    /// success of an earlier request can belong to the deleted one.
-    #[must_use]
-    pub const fn unchanged_since(self, sampled: Self) -> bool {
-        sampled.started == sampled.settled && sampled.started == self.started
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,9 +146,9 @@ struct FixtureGroup {
     /// newest such join. `None` when the fate of a join is unknown, which can
     /// still commit on any later incarnation.
     ///
-    /// Never cleared: until its successor installs, an owner that left can still
-    /// commit, and a join sampled before a replacement can commit on the deleted
-    /// incarnation.
+    /// Membership history only: until its successor installs, an owner that left
+    /// can still commit. The partition state checker validates the ordered install
+    /// barrier separately, so this history does not authorize a stale owner.
     joined_at: HashMap<u128, Option<u64>>,
     /// The metadata ops at which the deletes of the topic were reached, oldest
     /// first. A delete drops the group with its members, so a join counts only on
@@ -450,6 +442,25 @@ impl Shadow {
             .iter()
             .find(|fixture| fixture.namespaces.contains(&namespace))
             .map_or_else(Replacements::default, |fixture| fixture.replacements)
+    }
+
+    /// A pending delete can still refuse, so retain committed effects until its
+    /// success clears them. After a successful delete, late replies belong to the
+    /// old history until the replacement settles.
+    #[must_use]
+    pub fn effect_is_current(&self, namespace: IggyNamespace, sampled: Replacements) -> bool {
+        self.fixtures
+            .iter()
+            .find(|fixture| fixture.namespaces.contains(&namespace))
+            .is_none_or(|fixture| {
+                sampled.settled == fixture.replacements.settled
+                    && matches!(
+                        fixture.state,
+                        FixtureState::Live
+                            | FixtureState::Deleting { .. }
+                            | FixtureState::DeleteUnknown
+                    )
+            })
     }
 
     /// Replacement counts summed over every fixture topic.

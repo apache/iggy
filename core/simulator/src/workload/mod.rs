@@ -762,10 +762,7 @@ impl Workload {
         // sampled across a fixture replacement can belong to the deleted
         // incarnation, whose state the shadow dropped with it.
         let current = header.operation.is_metadata()
-            || self
-                .shadow
-                .replacements(namespace)
-                .unchanged_since(entry.replacements);
+            || self.shadow.effect_is_current(namespace, entry.replacements);
         let effect = if current {
             ops::predicted_effect(&entry.input, &classified)
         } else {
@@ -843,8 +840,8 @@ impl Workload {
     /// Fail the run if a group offset write committed from a client that never
     /// joined the group on an incarnation the write could reach. Only a member
     /// becomes an owner, and the write binds only an owner of its own client and
-    /// session. A past join on the same incarnation suffices: until its successor
-    /// installs, an owner that left can still commit.
+    /// session. This is only the membership check; the partition state checker
+    /// compares each offset with the preceding owner installation in its log.
     fn assert_group_writer_joined(&self, entry: &InFlight, header: &ReplyHeader) {
         let (namespace, group_id) = match &entry.input {
             InFlightInput::StoreConsumerOffset(input)
@@ -2621,6 +2618,40 @@ mod tests {
 
         let unavailable = IggyError::HistoryUnavailable.as_code();
         let _ = workload.on_reply(&reply_to(&send, unavailable, &[]));
+    }
+
+    #[test]
+    fn given_a_send_committed_during_a_fixture_delete_when_delete_refuses_should_keep_its_effect() {
+        let fixture = IggyNamespace::new(1, 1, 0);
+        let (_, mut workload, send) = sample_only(Action::SendMessages, vec![fixture]);
+        let delete = sample_toggle(&mut workload, &bound_client(2));
+        let _ = workload.on_reply(&reply_to(&send, 0, &[]));
+        let committed_messages = workload.shadow.sends_committed(fixture);
+        assert!(
+            committed_messages > 0,
+            "the pending delete must not erase a committed send"
+        );
+
+        let busy = ApplyReply::err(IggyError::LifecycleBusy.as_code());
+        let _ = workload.on_reply(&reply_to(&delete, 0, &busy.to_reply_body()));
+        assert_eq!(workload.shadow.sends_committed(fixture), committed_messages);
+    }
+
+    #[test]
+    fn given_a_send_committed_during_a_fixture_delete_when_delete_succeeds_should_clear_its_effect()
+    {
+        let fixture = IggyNamespace::new(1, 1, 0);
+        let (_, mut workload, send) = sample_only(Action::SendMessages, vec![fixture]);
+        let delete = sample_toggle(&mut workload, &bound_client(2));
+        let _ = workload.on_reply(&reply_to(&send, 0, &[]));
+        assert!(workload.shadow.sends_committed(fixture) > 0);
+
+        let _ = workload.on_reply(&reply_to(
+            &delete,
+            0,
+            &ApplyReply::default().to_reply_body(),
+        ));
+        assert_eq!(workload.shadow.sends_committed(fixture), 0);
     }
 
     /// A send sampled before a fixture replacement can commit on the deleted

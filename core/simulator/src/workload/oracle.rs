@@ -48,6 +48,7 @@ use crate::workload::{
 use crate::{Simulator, rebalancing_timeout_micros};
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, Status};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_common::ConsumerKind;
 use metadata::impls::metadata::StreamsFrontend;
 use server_common::sharding::IggyNamespace;
 use std::collections::{BTreeMap, BTreeSet};
@@ -562,6 +563,7 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
     let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
 
     let owners_compared = assert_settled_owners_installed(sim, workload, leader, seed);
+    assert_partition_offsets_agree(sim, workload, &live, seed);
     assert_no_stale_revocations(sim, leader, seed);
 
     let report = ConvergenceReport {
@@ -765,8 +767,8 @@ fn assert_committed_metadata_agrees(sim: &Simulator, live: &[usize], seed: u64) 
     compared
 }
 
-/// Require the partition primary of every workload namespace to hold each owner
-/// that leader metadata settled there. Returns how many owners it compared.
+/// Require the partition primary to hold each owner that leader metadata settled,
+/// and equally committed replicas to agree. Returns how many owners it compared.
 ///
 /// Metadata settles an owner only after a partition installed it, so a settled
 /// owner the primary lacks was lost or never installed. Metadata names no owner
@@ -820,10 +822,80 @@ fn assert_settled_owners_installed(
                  ns {ns:?}, but partition primary {primary} installed {installed:?} \
                  (seed={seed:#x})",
             );
+            let primary_state = sim.partition_consensus_state(usize::from(primary), ns);
+            for replica in 0..sim.replica_count {
+                let index = usize::from(replica);
+                if sim.is_crashed(replica)
+                    || sim.partition_incarnation(index, ns)
+                        != sim.partition_incarnation(usize::from(primary), ns)
+                    || sim
+                        .partition_consensus_state(index, ns)
+                        .map(|state| state.commit_min)
+                        != primary_state.as_ref().map(|state| state.commit_min)
+                {
+                    continue;
+                }
+                assert_eq!(
+                    sim.installed_group_owner(index, ns, group_id),
+                    installed,
+                    "replica {replica} and primary {primary} installed different owners at the same committed prefix \
+                     (ns={ns:?}, group={group_id}, seed={seed:#x})",
+                );
+            }
             compared += 1;
         }
     }
     compared
+}
+
+fn assert_partition_offsets_agree(sim: &Simulator, workload: &Workload, live: &[usize], seed: u64) {
+    for &namespace in &workload.options.namespaces {
+        let mut committed = BTreeMap::new();
+        for &replica in live {
+            let Some(partition) = sim.replicas[replica]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+            else {
+                continue;
+            };
+            let mut offsets = BTreeMap::new();
+            for kind in ConsumerKind::ALL {
+                for (consumer, offset) in partition.retained_consumer_offsets(kind) {
+                    offsets.insert((kind.as_code(), consumer), offset);
+                }
+            }
+            let prefix = (
+                partition.created_revision(),
+                partition.consensus().commit_min(),
+            );
+            if let Some((other, expected)) = committed.get(&prefix) {
+                assert_eq!(
+                    &offsets, expected,
+                    "replicas {replica} and {other} have different consumer offsets at committed prefix {prefix:?} \
+                     (ns={namespace:?}, seed={seed:#x})"
+                );
+            }
+            if workload.strict_outcome_oracle()
+                && workload.options.ack_quorum_ratio >= 1.0
+                && sim.primary_index(namespace).map(usize::from) == Some(replica)
+            {
+                let expected: BTreeMap<_, _> = workload
+                    .shadow
+                    .consumer_offsets
+                    .iter()
+                    .filter(|((ns, _, _), _)| *ns == namespace)
+                    .map(|((_, kind, consumer), offset)| ((*kind, *consumer), *offset))
+                    .collect();
+                assert_eq!(
+                    offsets, expected,
+                    "consumer offsets differ from the serial acknowledged shadow (ns={namespace:?}, seed={seed:#x})"
+                );
+            }
+            committed.insert(prefix, (replica, offsets));
+        }
+    }
 }
 
 /// Fail if a revocation pending in the metadata of replica `leader` aged past
@@ -904,5 +976,85 @@ fn shadow_metadata(shadow: &Shadow) -> CommittedMetadata {
         topics: shadow.topic_names.iter().cloned().collect(),
         users: shadow.user_names.iter().cloned().collect(),
         consumer_groups: shadow.consumer_group_names.iter().cloned().collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::PacketSimulatorOptions;
+    use crate::workload::effect::Effect;
+    use crate::workload::options::WorkloadOptions;
+
+    const SEED: u64 = 0x000F_F5E7;
+    const CONSUMER: u32 = 7;
+    const OFFSET: u64 = 9;
+
+    fn namespace() -> IggyNamespace {
+        IggyNamespace::new(1, 1, 0)
+    }
+
+    fn offset_fixture() -> (Simulator, Workload) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::new(
+            3,
+            std::iter::once(1),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: SEED,
+                ..Default::default()
+            },
+        );
+        sim.init_partition(namespace());
+        let workload = Workload::new(WorkloadOptions::new(SEED, 3, vec![namespace()]));
+        (sim, workload)
+    }
+
+    fn seed_offset(sim: &Simulator, replica: usize) {
+        sim.replicas[replica]
+            .partition_shard(namespace())
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .seed_recovered_consumer_offset(ConsumerKind::Consumer, CONSUMER, OFFSET, OFFSET);
+    }
+
+    #[test]
+    #[should_panic(expected = "different consumer offsets at committed prefix")]
+    fn given_a_backup_offset_divergence_when_quiesced_should_fail_the_oracle() {
+        let (sim, workload) = offset_fixture();
+        seed_offset(&sim, 1);
+        assert_partition_offsets_agree(&sim, &workload, &[0, 1, 2], SEED);
+    }
+
+    #[test]
+    #[should_panic(expected = "consumer offsets differ from the serial acknowledged shadow")]
+    fn given_an_unacknowledged_offset_effect_when_quiesced_should_fail_the_shadow_oracle() {
+        let (sim, mut workload) = offset_fixture();
+        workload.options.ack_quorum_ratio = 1.0;
+        for replica in 0..3 {
+            seed_offset(&sim, replica);
+        }
+        assert_partition_offsets_agree(&sim, &workload, &[0, 1, 2], SEED);
+    }
+
+    #[test]
+    fn given_matching_acknowledged_offsets_when_quiesced_should_pass_the_oracle() {
+        let (sim, mut workload) = offset_fixture();
+        workload.options.ack_quorum_ratio = 1.0;
+        for replica in 0..3 {
+            seed_offset(&sim, replica);
+        }
+        workload.shadow.apply(Effect::OffsetStored {
+            key: (namespace(), ConsumerKind::Consumer.as_code(), CONSUMER),
+            value: OFFSET,
+        });
+        assert_partition_offsets_agree(&sim, &workload, &[0, 1, 2], SEED);
     }
 }

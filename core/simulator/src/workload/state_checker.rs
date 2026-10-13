@@ -36,8 +36,16 @@
 //! non-vacuous: a chain nothing was compared against passes silently.
 
 use crate::Simulator;
-use iggy_binary_protocol::PrepareHeader;
+use consensus::PartitionsHandle;
+use iggy_binary_protocol::primitives::consumer::KIND_CONSUMER_GROUP;
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::consumer_offsets::{
+    GetConsumerOffsetRequest, split_prepared_offset,
+};
+use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_binary_protocol::{HEADER_SIZE, Operation, PrepareHeader, WireDecode};
 use journal::Journal;
+use message_bus::is_auto_commit_client;
 use server_common::sharding::IggyNamespace;
 use std::collections::BTreeMap;
 
@@ -68,6 +76,7 @@ struct PartitionProgress {
     incarnation: u64,
     replica_incarnation: u128,
     committed: u64,
+    owners: BTreeMap<u64, ConsumerGroupOwner>,
 }
 
 /// Canonical committed metadata and partition chains, accumulated across ticks.
@@ -177,23 +186,25 @@ impl StateChecker {
             return;
         };
         let replica_incarnation = sim.replicas[idx].metadata_incarnation;
-        let previous = self.partition_verified_upto.insert(
-            (replica_idx, namespace),
-            PartitionProgress {
-                incarnation,
-                replica_incarnation,
-                committed: state.commit_min,
-            },
-        );
+        let previous = self
+            .partition_verified_upto
+            .remove(&(replica_idx, namespace));
         // Recheck the head even without progress, and the retained prefix after a
         // restart, replacement or lower recovered commit point.
+        let previous = previous.filter(|previous| {
+            previous.incarnation == incarnation
+                && previous.replica_incarnation == replica_incarnation
+                && previous.committed <= state.commit_min
+        });
         let first = previous
-            .filter(|previous| {
-                previous.incarnation == incarnation
-                    && previous.replica_incarnation == replica_incarnation
-                    && previous.committed <= state.commit_min
-            })
+            .as_ref()
             .map_or(1, |previous| previous.committed.max(1));
+        let mut progress = PartitionProgress {
+            incarnation,
+            replica_incarnation,
+            committed: state.commit_min,
+            owners: previous.map_or_else(BTreeMap::new, |previous| previous.owners),
+        };
         let Some(headers) =
             sim.partition_journaled_headers(idx, namespace, first..=state.commit_min)
         else {
@@ -216,7 +227,34 @@ impl StateChecker {
                 canonical.witnesses, canonical.checksum,
             );
             canonical.witnesses.insert(replica_idx, replica_incarnation);
+            if matches!(
+                header.operation,
+                Operation::InstallConsumerGroupOwner
+                    | Operation::StoreConsumerOffset
+                    | Operation::DeleteConsumerOffset
+            ) {
+                let partition = sim.replicas[idx]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .expect("a journaled partition is hosted");
+                let prepare = partition
+                    .log
+                    .journal()
+                    .inner
+                    .repair_entry(op)
+                    .expect("a retained prepare header has its body");
+                check_partition_owner(
+                    &mut progress.owners,
+                    &header,
+                    &prepare.as_slice()[HEADER_SIZE..],
+                    seed,
+                );
+            }
         }
+        self.partition_verified_upto
+            .insert((replica_idx, namespace), progress);
     }
 
     /// Fold one replica's op into the canonical chain, or prove its absence
@@ -340,6 +378,53 @@ impl StateChecker {
                 );
             }
         }
+    }
+}
+
+/// Membership is metadata state; the partition's ordered install barrier is
+/// what fences a departed member's later offset writes.
+fn check_partition_owner(
+    owners: &mut BTreeMap<u64, ConsumerGroupOwner>,
+    header: &PrepareHeader,
+    body: &[u8],
+    seed: u64,
+) {
+    if header.operation == Operation::InstallConsumerGroupOwner {
+        let install = InstallConsumerGroupOwnerRequest::decode_from(body)
+            .expect("a committed owner installation decodes");
+        owners.insert(install.group_id, install.owner);
+        return;
+    }
+    if is_auto_commit_client(header.client) {
+        return;
+    }
+    let (request, generation) =
+        split_prepared_offset(body).expect("a committed offset has its owner token");
+    let (request, _) =
+        GetConsumerOffsetRequest::decode(request).expect("a committed offset prefix decodes");
+    if request.consumer.kind != KIND_CONSUMER_GROUP {
+        return;
+    }
+    let group_id = u64::from(
+        request
+            .consumer
+            .id
+            .as_u32()
+            .expect("a prepared group id is numeric"),
+    );
+    // The repair ring may have evicted the install before this checker started.
+    if let Some(owner) = owners.get(&group_id) {
+        assert!(
+            !owner.is_unassigned()
+                && owner.client_id == header.client
+                && owner.session == header.session
+                && owner.generation == generation,
+            "group offset committed past its owner fence: group={group_id}, owner={owner:?}, \
+             client={}, session={}, generation={generation}, op={}, seed={seed:#x}",
+            header.client,
+            header.session,
+            header.op,
+        );
     }
 }
 
@@ -507,9 +592,66 @@ mod tests {
     use crate::workload::Workload;
     use crate::workload::invariants::Invariants;
     use crate::workload::options::WorkloadOptions;
-    use consensus::PartitionsHandle;
+    use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::{AckLevel, WireConsumer, WireEncode, WireIdentifier};
 
     const SEED: u64 = 0x5C11;
+
+    #[test]
+    #[should_panic(expected = "group offset committed past its owner fence")]
+    fn given_a_successor_install_when_the_departed_owner_commits_should_fail_the_oracle() {
+        let mut owners = BTreeMap::new();
+        let original = ConsumerGroupOwner {
+            client_id: 1,
+            session: 2,
+            generation: 3,
+        };
+        let successor = ConsumerGroupOwner {
+            client_id: 4,
+            session: 5,
+            generation: 6,
+        };
+        let request = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer_group(WireIdentifier::numeric(0)),
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(1),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        };
+        let mut body = request.to_bytes().to_vec();
+        body.extend_from_slice(&original.generation.to_le_bytes());
+        for (op, owner) in [(1, original), (3, successor)] {
+            let install = InstallConsumerGroupOwnerRequest {
+                incarnation: 1,
+                group_id: 0,
+                owner,
+                metadata_op: op,
+            };
+            check_partition_owner(
+                &mut owners,
+                &PrepareHeader {
+                    operation: Operation::InstallConsumerGroupOwner,
+                    op,
+                    ..Default::default()
+                },
+                &install.to_bytes(),
+                SEED,
+            );
+            check_partition_owner(
+                &mut owners,
+                &PrepareHeader {
+                    operation: Operation::StoreConsumerOffset,
+                    client: original.client_id,
+                    session: original.session,
+                    op: op + 1,
+                    ..Default::default()
+                },
+                &body,
+                SEED,
+            );
+        }
+    }
 
     /// A three-replica cluster with six committed metadata ops behind it.
     fn cluster_with_committed_ops() -> Simulator {
