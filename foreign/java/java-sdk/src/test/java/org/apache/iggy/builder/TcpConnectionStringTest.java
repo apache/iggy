@@ -86,6 +86,15 @@ class TcpConnectionStringTest {
     }
 
     @Test
+    void shouldNotEchoMalformedTransport() {
+        assertThatThrownBy(() -> TcpConnectionString.parse("iggy+user:s3cret@localhost:8090?x=a://b"))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("Invalid connection string")
+                .message()
+                .doesNotContain("s3cret");
+    }
+
+    @Test
     void shouldRejectPersonalAccessToken() {
         assertInvalid("iggy://some-token@localhost:8090", "personal access tokens are not supported");
     }
@@ -115,6 +124,9 @@ class TcpConnectionStringTest {
                 "iggy://iggy:iggy@2001:db8::1:8090",
                 "iggy://iggy:iggy@localhost:8090:9090",
                 "iggy://iggy:iggy@localhost:8090?tls=true?tls=false",
+                "iggy://iggy:iggy@local host:8090",
+                "iggy://iggy:iggy@local\thost:8090",
+                "iggy://iggy:iggy@[::1 ]:8090",
             })
     void shouldRejectInvalidServerAddress(String connectionString) {
         assertInvalid(connectionString, "Invalid connection string");
