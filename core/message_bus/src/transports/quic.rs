@@ -510,6 +510,9 @@ impl StreamContext<'_> {
         if let Err(e) = send.finish() {
             debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
         }
+        // Keep the reply alive through graceful shutdown until the peer has
+        // acknowledged it. Closing the connection after FIN alone can discard it.
+        let _ = send.stopped().await;
         ControlFlow::Continue(())
     }
 }
@@ -563,7 +566,7 @@ impl TransportConn for QuicTransportConn {
         let Self {
             connection,
             reply_backstop,
-            ..
+            close_grace,
         } = self;
         let ActorContext {
             in_tx,
@@ -589,11 +592,11 @@ impl TransportConn for QuicTransportConn {
         // The stream credit of the connection bounds this set.
         let mut streams = FuturesUnordered::new();
 
-        loop {
+        let drain = loop {
             futures::select! {
                 () = shutdown_fut.as_mut() => {
                     debug!(%label, %peer, "quic: shutdown observed");
-                    break;
+                    break true;
                 }
                 accepted = connection.accept_bi().fuse() => match accepted {
                     Ok((send, recv)) => {
@@ -606,24 +609,43 @@ impl TransportConn for QuicTransportConn {
                                 VarInt::from_u32(QUIC_PROTOCOL_VIOLATION),
                                 b"0-RTT not permitted",
                             );
-                            break;
+                            break false;
                         }
                         streams.push(context.serve(send, recv));
                     }
                     Err(e) => {
                         debug!(%label, %peer, error = ?e, "quic: accept_bi failed (connection closed)");
-                        break;
+                        break false;
                     }
                 },
                 frame = rx.recv().fuse() => if let Ok(frame) = frame {
                     router.borrow_mut().route(frame);
                 } else {
                     debug!(%label, %peer, "quic: mailbox closed");
-                    break;
+                    break false;
                 },
                 served = streams.select_next_some() => if served.is_break() {
-                    break;
+                    break false;
                 },
+            }
+        };
+
+        if drain {
+            let pending = async {
+                while !streams.is_empty() {
+                    futures::select! {
+                        frame = rx.recv().fuse() => match frame {
+                            Ok(frame) => router.borrow_mut().route(frame),
+                            Err(_) => break,
+                        },
+                        served = streams.select_next_some() => if served.is_break() {
+                            break;
+                        },
+                    }
+                }
+            };
+            if compio::time::timeout(close_grace, pending).await.is_err() {
+                warn!(%label, %peer, "quic: close grace expired with streams in flight");
             }
         }
 
@@ -1183,23 +1205,55 @@ mod tests {
         let _cfg = transport_config_from(&tuning);
     }
 
-    /// `with_close_grace` plumbs the override into the field that
-    /// `run`'s joint drain timeout consumes. The full timeout-bound
-    /// behaviour is exercised end-to-end by the existing
-    /// `request_reply_round_trip` (which goes through the default
-    /// `close_grace` path); deterministic wedge testing of the elapsed
-    /// arm requires a non-cancel-safe QUIC read state that cannot be
-    /// reliably constructed in-process.
-    #[test]
-    fn with_close_grace_overrides_default() {
-        // `QuicTransportConn` requires an actual `Connection`; constructing
-        // one outside an async context is not feasible here, so we exercise
-        // the builder via direct field replacement on a default-constructed
-        // tuning struct that mirrors the field type.
-        let custom = Duration::from_millis(123);
-        // Sanity: the default is non-zero (would otherwise immediately
-        // elapse every close drain) and our override differs from it.
-        assert_ne!(DEFAULT_CLOSE_GRACE, custom);
-        assert!(DEFAULT_CLOSE_GRACE > Duration::ZERO);
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_pending_reply_when_shutdown_starts_should_deliver_it_before_closing() {
+        let (conn, client, _endpoints) = connect(ONE_STREAM).await;
+        let (outbound, inbound, shutdown, mut server) = drive(conn.with_close_grace(TEST_WAIT));
+        let mut response = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        shutdown.trigger();
+        assert!(
+            compio::time::timeout(SHORT_BACKSTOP, &mut server)
+                .await
+                .is_err(),
+            "shutdown must keep an admitted request alive during the grace"
+        );
+        outbound
+            .send(reply(FIRST_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_answer(&mut response).await.header().command,
+            Command::Reply
+        );
+        compio::time::timeout(TEST_WAIT, server)
+            .await
+            .expect("the acknowledged reply releases the drain")
+            .expect("the server exits normally");
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_missing_reply_when_shutdown_grace_expires_should_close_within_the_bound() {
+        let (conn, client, _endpoints) = connect(ONE_STREAM).await;
+        let (_outbound, inbound, shutdown, server) = drive(conn.with_close_grace(SHORT_BACKSTOP));
+        let mut response = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        shutdown.trigger();
+        compio::time::timeout(TEST_WAIT, server)
+            .await
+            .expect("shutdown must not wait for the 60-second reply backstop")
+            .expect("the server exits normally");
+        let result = compio::time::timeout(
+            TEST_WAIT,
+            framing::read_message(&mut response, framing::MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect("the abandoned stream closes");
+        assert!(
+            result.is_err(),
+            "a request without a reply must not succeed"
+        );
     }
 }
