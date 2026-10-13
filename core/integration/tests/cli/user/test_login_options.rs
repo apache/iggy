@@ -29,6 +29,9 @@ enum UseCredentials {
     #[default]
     CliOptions,
     StdinInput,
+    CliOptionsWithEnvToken,
+    StdinInputWithEnvCredentials,
+    EmptyEnvToken,
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +52,21 @@ impl IggyCmdTestCase for TestLoginOptions {
     fn get_command(&self) -> IggyCmdCommand {
         match self.use_credentials {
             UseCredentials::CliOptions => IggyCmdCommand::new().with_cli_credentials().arg("me"),
+            UseCredentials::CliOptionsWithEnvToken => IggyCmdCommand::new()
+                .with_cli_credentials()
+                .env("IGGY_TOKEN", "invalid-token")
+                .arg("me"),
+            UseCredentials::StdinInputWithEnvCredentials => IggyCmdCommand::new()
+                .opt("--username")
+                .opt(DEFAULT_ROOT_USERNAME)
+                .env("IGGY_TOKEN", "invalid-token")
+                .env("IGGY_USERNAME", "wrong-username")
+                .env("IGGY_PASSWORD", "wrong-password")
+                .arg("me"),
+            UseCredentials::EmptyEnvToken => IggyCmdCommand::new()
+                .with_env_credentials()
+                .env("IGGY_TOKEN", "")
+                .arg("me"),
             UseCredentials::StdinInput => IggyCmdCommand::new()
                 .opt("--username")
                 .opt(DEFAULT_ROOT_USERNAME)
@@ -58,7 +76,9 @@ impl IggyCmdTestCase for TestLoginOptions {
 
     fn provide_stdin_input(&self) -> Option<Vec<String>> {
         match self.use_credentials {
-            UseCredentials::StdinInput => Some(vec![DEFAULT_ROOT_PASSWORD.to_string()]),
+            UseCredentials::StdinInput | UseCredentials::StdinInputWithEnvCredentials => {
+                Some(vec![DEFAULT_ROOT_PASSWORD.to_string()])
+            }
             _ => None,
         }
     }
@@ -87,10 +107,48 @@ pub async fn should_be_successful() {
         .await;
 }
 
+#[tokio::test]
+#[parallel]
+pub async fn should_use_stdin_password_despite_environment_credentials() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptions::new(
+            UseCredentials::StdinInputWithEnvCredentials,
+        ))
+        .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_prefer_cli_credentials_over_environment_token() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptions::new(
+            UseCredentials::CliOptionsWithEnvToken,
+        ))
+        .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_use_environment_pair_with_empty_token() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptions::new(UseCredentials::EmptyEnvToken))
+        .await;
+}
+
 #[derive(Debug)]
 enum EnvTokenScenario {
     // Only IGGY_TOKEN is set, holding a valid personal access token.
     TokenOnly,
+    TokenOnlyStreamList,
     // IGGY_TOKEN holds an invalid token and --token a valid one: the flag wins.
     FlagTokenOverridesEnvToken,
     // IGGY_TOKEN holds a valid token and the IGGY_USERNAME/IGGY_PASSWORD pair
@@ -146,6 +204,10 @@ impl IggyCmdTestCase for TestLoginOptionsWithEnvToken {
             EnvTokenScenario::TokenOnly => IggyCmdCommand::new()
                 .env("IGGY_TOKEN", valid_token)
                 .arg("me"),
+            EnvTokenScenario::TokenOnlyStreamList => IggyCmdCommand::new()
+                .env("IGGY_TOKEN", valid_token)
+                .arg("stream")
+                .arg("list"),
             EnvTokenScenario::FlagTokenOverridesEnvToken => IggyCmdCommand::new()
                 .env("IGGY_TOKEN", "invalid-token")
                 .opts(vec!["--token".to_string(), valid_token])
@@ -166,7 +228,14 @@ impl IggyCmdTestCase for TestLoginOptionsWithEnvToken {
     fn verify_command(&self, command_state: Assert) {
         match self.scenario {
             EnvTokenScenario::InvalidEnvTokenOverridesEnvCredentials => {
-                command_state.failure();
+                command_state
+                    .failure()
+                    .stderr(contains("Problem with server login with token"));
+            }
+            EnvTokenScenario::TokenOnlyStreamList => {
+                command_state
+                    .success()
+                    .stdout(starts_with("Executing list streams in table mode"));
             }
             _ => {
                 command_state
@@ -195,6 +264,12 @@ pub async fn should_resolve_iggy_token_with_documented_precedence() {
         .execute_test(TestLoginOptionsWithEnvToken::new(
             EnvTokenScenario::TokenOnly,
             "env-token-only",
+        ))
+        .await;
+    iggy_cmd_test
+        .execute_test(TestLoginOptionsWithEnvToken::new(
+            EnvTokenScenario::TokenOnlyStreamList,
+            "env-token-stream-list",
         ))
         .await;
     iggy_cmd_test

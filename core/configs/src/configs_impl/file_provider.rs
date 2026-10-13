@@ -458,6 +458,13 @@ mod tests {
     }
 
     #[test]
+    fn given_cli_token_when_checking_then_only_the_exact_name_should_be_allowed() {
+        let unknown = server_unknown_env_names(&["IGGY_TOKEN", "IGGY_TOKEN_TYPO"]);
+
+        assert_eq!(unknown, vec!["IGGY_TOKEN_TYPO"]);
+    }
+
+    #[test]
     fn given_another_configs_prefix_when_matching_then_should_report_none() {
         let found = relocated_env_vars(
             names(&["IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC"]).into_iter(),

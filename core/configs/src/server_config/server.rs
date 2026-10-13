@@ -62,6 +62,7 @@ pub const SERVER_PROCESS_ENV_VARS: &[&str] = &[
     "IGGY_HOME",
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
+    "IGGY_TOKEN",
 ];
 
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
