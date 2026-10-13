@@ -86,6 +86,9 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.raw = raw
     }
 
+    /// The default partition count when none is given.
+    public static let defaultPartitionsCount: UInt32 = 1
+
     func toResourceOptions() throws -> ResourceOptions {
         var options = try TopicUpdateOptions(
             compressionAlgorithm: compressionAlgorithm, messageExpiry: messageExpiry, maxTopicSize: maxTopicSize, raw: raw
