@@ -22,10 +22,20 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy::prelude::Durability;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::TopicCreateOptions;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
+
+struct ExpectedPartitionRow {
+    id: u32,
+    created_at: String,
+    segments_count: u32,
+    current_offset: u64,
+    size: String,
+    messages_count: u64,
+}
 
 struct TestTopicGetCmd {
     stream_id: u32,
@@ -34,6 +44,9 @@ struct TestTopicGetCmd {
     topic_name: String,
     using_stream_id: TestStreamId,
     using_topic_id: TestTopicId,
+    partitions_count: u32,
+    durability: Durability,
+    expected_partitions: Vec<ExpectedPartitionRow>,
 }
 
 impl TestTopicGetCmd {
@@ -52,7 +65,16 @@ impl TestTopicGetCmd {
             topic_name,
             using_stream_id,
             using_topic_id,
+            partitions_count: 1,
+            durability: Durability::Replicated,
+            expected_partitions: Vec::new(),
         }
+    }
+
+    fn with_topic_options(mut self, partitions_count: u32, durability: Durability) -> Self {
+        self.partitions_count = partitions_count;
+        self.durability = durability;
+        self
     }
 
     fn to_args(&self) -> Vec<String> {
@@ -81,13 +103,36 @@ impl IggyCmdTestCase for TestTopicGetCmd {
                 &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
                 &TopicCreateOptions {
-                    partitions_count: Some(1),
+                    partitions_count: Some(self.partitions_count),
                     message_expiry: Some(IggyExpiry::NeverExpire),
+                    durability: self.durability,
                     ..TopicCreateOptions::default()
                 },
             )
             .await;
         assert!(topic.is_ok());
+
+        let details = client
+            .get_topic(
+                &self.stream_name.clone().try_into().unwrap(),
+                &self.topic_name.clone().try_into().unwrap(),
+            )
+            .await
+            .expect("topic details should be retrievable")
+            .expect("created topic should exist");
+        self.expected_partitions = details
+            .partitions
+            .iter()
+            .map(|partition| ExpectedPartitionRow {
+                id: partition.id,
+                created_at: partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
+                segments_count: partition.segments_count,
+                current_offset: partition.current_offset,
+                size: partition.size.to_string(),
+                messages_count: partition.messages_count,
+            })
+            .collect();
+        assert_eq!(self.expected_partitions.len(), self.partitions_count as usize);
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -112,7 +157,7 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         let start_message =
             format!("Executing get topic with ID: {topic_id} from stream with ID: {stream_id}");
 
-        command_state
+        let mut assertion = command_state
             .success()
             .stdout(starts_with(start_message))
             .stdout(contains("Topic id            | 0"))
@@ -124,7 +169,37 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             .stdout(contains("Message expiry      | unlimited"))
             .stdout(contains("Max topic size      | unlimited"))
             .stdout(contains("Topic message count | 0"))
-            .stdout(contains("Partitions count    | 1"));
+            .stdout(contains(format!(
+                "Partitions count    | {}",
+                self.partitions_count
+            )))
+            .stdout(contains("Partition id"))
+            .stdout(contains("Created"))
+            .stdout(contains("Segments count"))
+            .stdout(contains("Current offset"))
+            .stdout(contains("Size"))
+            .stdout(contains("Messages count"))
+            .stdout(contains("durability"))
+            .stdout(
+                predicates::str::is_match(format!(r"durability\s+{}", self.durability))
+                    .expect("valid durability regex"),
+            );
+
+        for partition in &self.expected_partitions {
+            // Check every field in every row against the topic details returned by the server.
+            let row = format!(
+                r"\b{}\s+{}\s+{}\s+{}\s+{}\s+{}\b",
+                partition.id,
+                partition.created_at,
+                partition.segments_count,
+                partition.current_offset,
+                partition.size,
+                partition.messages_count,
+            );
+            assertion = assertion
+                .stdout(predicates::str::is_match(row).expect("valid partition row regex"));
+        }
+        assertion.stdout(contains("Options"));
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
@@ -188,6 +263,26 @@ pub async fn should_be_successful() {
             TestStreamId::Named,
             TestTopicId::Named,
         ))
+        .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_show_multiple_partitions_and_persisted_durability() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(
+            TestTopicGetCmd::new(
+                7,
+                String::from("durable-stream"),
+                4,
+                String::from("multi-partition-topic"),
+                TestStreamId::Named,
+                TestTopicId::Named,
+            )
+            .with_topic_options(3, Durability::Persisted),
+        )
         .await;
 }
 
