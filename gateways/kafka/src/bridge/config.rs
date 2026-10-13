@@ -244,6 +244,21 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use crate::auth::IggyAuthenticator;
+
+    #[test]
+    fn given_the_iggy_tls_variables_should_be_listed_by_every_reader() {
+        for var in IggyTls::KNOWN_ENV_VARS {
+            assert!(
+                IggyBridgeConfig::KNOWN_ENV_VARS.contains(var),
+                "{var} is read by the bridge and must be in its list"
+            );
+            assert!(
+                IggyAuthenticator::KNOWN_ENV_VARS.contains(var),
+                "{var} is read by the SASL credential check and must be in its list"
+            );
+        }
+    }
 
     fn test_config() -> IggyBridgeConfig {
         IggyBridgeConfig {

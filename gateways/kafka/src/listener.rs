@@ -288,12 +288,18 @@ fn split_entry<'a>(var: &str, entry: &'a str) -> Result<(SecurityProtocol, &'a s
 }
 
 /// Splits `host:port`, with `[v6]:port` for an IPv6 literal, into a bracket-free host and the
-/// port text.
+/// port text. An unbracketed host containing `:` is refused, since its port cannot be told apart.
 fn split_host_port(address: &str) -> Option<(&str, &str)> {
-    let (host, port) = address.rsplit_once(':')?;
-    let host = host
-        .strip_prefix('[')
-        .map_or(host, |inner| inner.strip_suffix(']').unwrap_or(host));
+    let (host, port) = if let Some(bracketed) = address.strip_prefix('[') {
+        let (host, rest) = bracketed.split_once(']')?;
+        (host, rest.strip_prefix(':')?)
+    } else {
+        let (host, port) = address.rsplit_once(':')?;
+        if host.contains(':') {
+            return None;
+        }
+        (host, port)
+    };
     if host.is_empty() {
         return None;
     }
@@ -387,6 +393,24 @@ mod tests {
                 "'{raw}' rejection must name the variable, got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn given_an_unbracketed_ipv6_advertised_host_should_refuse() {
+        let mut listeners = parse_listeners("SSL://0.0.0.0:9094").expect("valid");
+        for raw in ["SSL://fe80::1", "SSL://fe80::1:9094", "SSL://[fe80::1]9094"] {
+            let error = apply_advertised_listeners(&mut listeners, raw)
+                .err()
+                .unwrap_or_else(|| panic!("'{raw}' must be rejected"))
+                .to_string();
+            assert!(
+                error.contains("IGGY_KAFKA_ADVERTISED_LISTENERS"),
+                "'{raw}' rejection must name the variable, got: {error}"
+            );
+        }
+        apply_advertised_listeners(&mut listeners, "SSL://[fe80::1]:9094")
+            .expect("a bracketed IPv6 literal is valid");
+        assert_eq!(listeners[0].advertised_host.as_deref(), Some("fe80::1"));
     }
 
     #[test]

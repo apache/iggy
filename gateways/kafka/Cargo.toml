@@ -48,6 +48,7 @@ kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"
 libc = { workspace = true }
 lz4 = { workspace = true }
 regex = { workspace = true }
+regex-syntax = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

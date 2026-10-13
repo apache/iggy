@@ -173,6 +173,14 @@ pub async fn connect_tls(
     config: Arc<ClientConfig>,
 ) -> Result<TlsStream<TcpStream>, std::io::Error> {
     let tcp = TcpStream::connect(addr).await?;
+    connect_tls_over(tcp, config).await
+}
+
+/// Runs the client handshake over a socket the caller already connected.
+pub async fn connect_tls_over(
+    tcp: TcpStream,
+    config: Arc<ClientConfig>,
+) -> Result<TlsStream<TcpStream>, std::io::Error> {
     let server_name = ServerName::try_from("localhost").expect("valid server name");
     TlsConnector::from(config).connect(server_name, tcp).await
 }

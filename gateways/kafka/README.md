@@ -45,18 +45,18 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `IGGY_KAFKA_LISTENERS` | unset | Kafka-style listener list, `PROTOCOL://ip:port` entries separated by commas, one per security protocol: `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`. Takes precedence over the three single-listener address variables below (the image bakes `IGGY_KAFKA_BIND_ADDR` in, so they are ignored with a warning) and is refused beside `IGGY_KAFKA_SASL_ENABLED`, since the listener protocols say where SASL runs. See [Listeners and TLS](#listeners-and-tls-4510) |
-| `IGGY_KAFKA_ADVERTISED_LISTENERS` | bind address of each listener | `PROTOCOL://host:port` per listener, the address clients are pointed back at. Required for any listener bound to `0.0.0.0`/`::` |
+| `IGGY_KAFKA_LISTENERS` | unset | Kafka-style listener list, `PROTOCOL://ip:port` entries separated by commas, one per security protocol: `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT`, `SASL_SSL`. An IPv6 address is bracketed: `SSL://[::1]:9094`. Takes precedence over `IGGY_KAFKA_BIND_ADDR`, which the image bakes in and which is ignored with a warning. Refused beside `IGGY_KAFKA_ADVERTISED_HOST`, `IGGY_KAFKA_ADVERTISED_PORT` (advertise through `IGGY_KAFKA_ADVERTISED_LISTENERS` instead) and `IGGY_KAFKA_SASL_ENABLED` (the listener protocols say where SASL runs). See [Listeners and TLS](#listeners-and-tls-4510) |
+| `IGGY_KAFKA_ADVERTISED_LISTENERS` | bind address of each listener | `PROTOCOL://host:port` per listener, the address clients are pointed back at. An IPv6 host is bracketed: `SSL://[2001:db8::1]:9094`. Required for any listener bound to `0.0.0.0`/`::` |
 | `IGGY_KAFKA_BIND_ADDR` | `127.0.0.1:9093` | Single-listener form: TCP address to listen on |
 | `IGGY_KAFKA_ADVERTISED_HOST` | bind IP | Single-listener form: hostname/IP clients use to reach this broker (required when binding to `0.0.0.0`/`::`) |
 | `IGGY_KAFKA_ADVERTISED_PORT` | bind port | Single-listener form: port advertised in Metadata responses |
 | `IGGY_KAFKA_TLS_CERT_FILE` | unset | PEM certificate chain for every `SSL` and `SASL_SSL` listener, leaf first. Required when one exists, refused when none does |
 | `IGGY_KAFKA_TLS_KEY_FILE` | unset | PEM private key for the certificate (PKCS#8, PKCS#1 or SEC1) |
-| `IGGY_KAFKA_TLS_CLIENT_AUTH` | `none` | Kafka's `ssl.client.auth`: `none`, `requested` or `required`. On an `SSL` listener a verified client certificate names the Iggy user; on `SASL_SSL` it only gates the transport |
+| `IGGY_KAFKA_TLS_CLIENT_AUTH` | `none` | Kafka's `ssl.client.auth`: `none`, `requested` or `required`. Applies to `SSL` listeners, where a verified client certificate names the Iggy user. A `SASL_SSL` listener never asks for a client certificate, Kafka's default there. Refused without an `SSL` listener |
 | `IGGY_KAFKA_TLS_CLIENT_CA_FILE` | unset | PEM roots client certificates must chain to. Required with `requested` or `required`, refused with `none` |
 | `IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES` | `DEFAULT` | Kafka's `ssl.principal.mapping.rules`, turning a client certificate's subject into an Iggy username. Only with client authentication on an `SSL` listener |
 | `IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS` | `60` | How often the certificate, key and client CA files are re-read; a change goes live for new connections without a restart. `0` never re-reads them |
-| `IGGY_KAFKA_MAX_CONNECTIONS` | `1024` | Maximum concurrent connections before new ones are rejected |
+| `IGGY_KAFKA_MAX_CONNECTIONS` | `1024` | Maximum concurrent connections per listener before new ones are rejected. Each listener has its own allowance, so idle clients on one cannot lock clients out of another. Open connections can therefore reach the number of listeners times this value; size the file-descriptor limit (`ulimit -n`) for that |
 | `IGGY_KAFKA_MAX_FRAME_SIZE` | `8388608` | Maximum accepted request frame size in bytes |
 | `IGGY_KAFKA_IDLE_TIMEOUT_SECS` | `600` | Seconds a connection may sit idle before the next frame's length prefix arrives |
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
@@ -262,11 +262,21 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://0.0.0.0:9094,SASL_SSL://0.
   cargo run -p iggy-gateway-kafka
 ```
 
+Each security protocol can be bound once, since the protocol is also the listener's name.
+
 TLS is rustls. One certificate serves every `SSL` and `SASL_SSL` listener, and the files are
 re-read every `IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS`: a rotated certificate takes effect for new
-connections without a restart, a half-written rotation or a key that does not match leaves the
-previous material serving and logs an error. There is no self-signed mode; mint a certificate
-(`docs/MANUAL_TESTING.md` has an `openssl` recipe) and give the Kafka client the CA.
+connections without a restart, a key that does not match leaves the previous material serving and
+logs an error. Rotate by writing the new files elsewhere and renaming them into place: a chain
+written in place can be read half written, and if what was read still parses and matches the key,
+the truncated chain serves until the next interval. There is no self-signed mode; mint a
+certificate (`docs/MANUAL_TESTING.md` has an `openssl` recipe) and give the Kafka client the CA.
+
+The certificate's subject alternative names must cover every host in
+`IGGY_KAFKA_ADVERTISED_LISTENERS`: a client verifies the name of each broker address Metadata
+hands it, so a host missing from the certificate fails the client's next connection, not the
+first. Client certificates are checked against the CA only; there is no CRL or OCSP revocation
+checking, so revoke access by deleting or deactivating the Iggy user a certificate maps to.
 
 ```bash
 kcat -b kafka.example.com:9094 -X security.protocol=SSL -X ssl.ca.location=ca.pem -L
@@ -276,23 +286,36 @@ kcat -b kafka.example.com:9095 -X security.protocol=SASL_SSL -X ssl.ca.location=
 
 ### Client certificates (mTLS)
 
-`IGGY_KAFKA_TLS_CLIENT_AUTH=required` (or `requested`) makes every TLS listener verify client
-certificates against `IGGY_KAFKA_TLS_CLIENT_CA_FILE`. What a verified certificate means depends on
-the listener, as it does on a Kafka broker:
+`IGGY_KAFKA_TLS_CLIENT_AUTH=required` (or `requested`) makes every `SSL` listener verify client
+certificates against `IGGY_KAFKA_TLS_CLIENT_CA_FILE`, and the certificate names the principal
+there. Its subject, rendered the way Java does (`CN=alice,OU=eng,O=Example`), goes through
+`IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES`, and the result must be the name of an active Iggy user.
+The gateway looks the user up through the bridge's own session, so the bridge is required and its
+Iggy user needs `read_users`. A certificate whose subject no rule maps, or that names no such user,
+is closed after the handshake, with the subject or name in the gateway's log at `warn`.
 
-- On an `SSL` listener the certificate names the principal. Its subject, rendered the way Java
-  does (`CN=alice,OU=eng,O=Example`), goes through `IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES`, and
-  the result must be the name of an active Iggy user. The gateway looks the user up through the
-  bridge's own session, so the bridge is required and its Iggy user needs `read_users`. A
-  certificate naming no such user is closed after the handshake, with the name in the gateway's
-  log at `warn`. With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS`
-  principal and is served as the bridge's user, exactly as on a plaintext listener.
-- On a `SASL_SSL` listener the certificate only gates the transport. SASL names the principal and
-  the subject is never mapped.
+A `SASL_SSL` listener never asks for a client certificate, which is Kafka's default for that
+protocol: SASL names the principal there.
+
+With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which
+holds no permissions. Once any listener names principals (a SASL listener, or an `SSL` listener
+with client authentication), every connection that proved no identity is `ANONYMOUS`, on a
+`PLAINTEXT` listener beside it too. The requests the gateway checks against a principal,
+`DeleteTopics` and `AlterConfigs`, need `manage_topics` and are refused for it; everything else is
+served as the bridge's user. A gateway whose listeners name nobody serves every request as the
+bridge's user.
 
 The rules are Kafka's syntax, tried in order: `RULE:pattern/replacement/[LU]` applies when the
-pattern matches the whole subject, `DEFAULT` keeps the subject as is. A raw subject is not a valid
-Iggy username, so a deployment that maps identities sets at least one rule:
+pattern matches the whole subject, `DEFAULT` keeps the subject as is. Iggy accepts any username of
+3 to 50 characters, but a raw subject is usually longer than that, and is rarely the name the
+operator created, so a deployment that maps identities sets at least one rule. Patterns are a
+Java-compatible subset: `\d \s \w` match ASCII only and `.` stops at Java's line terminators, as on
+a broker, while `(?i)`, the `u` and `U` flags, `\p{..}`, POSIX classes and `\b` are refused at
+startup ([docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) says why). A replacement that
+names a group the pattern does not have is refused at startup. That is stricter than Kafka, which
+writes such a `$N` literally: `RULE:^CN=(.*)$/$2/` maps to `$2` on a broker. The reverse case,
+`/$1\$2/`, makes Kafka throw while the gateway maps `alice` to `alice$2`, which is harmless because
+that Iggy user must still exist:
 
 ```bash
 IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES='RULE:^CN=([^,]+),OU=services.*$/svc-$1/L,RULE:^CN=([^,]+).*$/$1/'

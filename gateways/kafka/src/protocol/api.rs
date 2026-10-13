@@ -483,8 +483,9 @@ pub async fn handle_request_bounded(
 
 /// [`handle_request_bounded`] for one request of `connection`.
 ///
-/// `principal` is `None` when SASL is off, or for a key the connection reached before
-/// authenticating - only `crate::server::route_frame` ever has a principal to pass.
+/// `principal` is `None` when no listener of the gateway names principals, or for a key the
+/// connection reached before authenticating. Only `crate::server::route_frame` ever has a
+/// principal to pass.
 pub async fn handle_connection_request(
     state: &GatewayState,
     connection: &ConnectionState,

@@ -23,13 +23,14 @@
 //! certificate path against a real one is in `kafka_client_e2e_tests.rs`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::SemaphorePermit;
 
 use iggy_gateway_kafka::auth::{
@@ -51,7 +52,7 @@ mod server;
 #[path = "common/tcp.rs"]
 mod tcp;
 
-use certs::{Issued, TestPki, connect_tls};
+use certs::{Issued, TestPki, connect_tls, connect_tls_over};
 use codec::{Decoder, Encoder};
 use server::{listener, spawn_gateway};
 use tcp::{
@@ -141,6 +142,43 @@ impl PrincipalResolver for KnownUsers {
                 permissions_known: true,
             })
             .ok_or(AuthError::Rejected)
+    }
+}
+
+/// Answers every lookup the same way, or never answers.
+#[derive(Debug)]
+enum BrokenResolver {
+    Unavailable,
+    Hangs,
+}
+
+#[async_trait]
+impl PrincipalResolver for BrokenResolver {
+    async fn resolve(&self, _username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
+        match self {
+            Self::Unavailable => Err(AuthError::Unavailable),
+            Self::Hangs => std::future::pending().await,
+        }
+    }
+}
+
+/// Knows every user, after a fixed delay, and counts the lookups it started.
+#[derive(Debug)]
+struct SlowUsers {
+    delay: Duration,
+    started: AtomicUsize,
+}
+
+#[async_trait]
+impl PrincipalResolver for SlowUsers {
+    async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.delay).await;
+        Ok(AuthenticatedPrincipal {
+            username: username.to_string(),
+            permissions: topic_reader(),
+            permissions_known: true,
+        })
     }
 }
 
@@ -539,7 +577,8 @@ async fn given_requested_client_auth_when_no_certificate_is_presented_should_ser
 }
 
 #[tokio::test]
-async fn given_a_sasl_ssl_listener_with_client_auth_should_take_the_principal_from_sasl() {
+async fn given_client_auth_when_a_client_without_a_certificate_uses_sasl_ssl_should_authenticate_by_sasl()
+ {
     let pki = Pki::new();
     let users = KnownUsers::with("certificate-user", topic_reader());
     let resolver = Arc::clone(&users);
@@ -550,18 +589,20 @@ async fn given_a_sasl_ssl_listener_with_client_auth_should_take_the_principal_fr
                 .with_principal_resolver(resolver)
         },
         quick_config(
-            vec![SecurityProtocol::SaslSsl],
+            vec![SecurityProtocol::Ssl, SecurityProtocol::SaslSsl],
             Some(
                 pki.tls_with_client_auth(ClientAuth::Required)
                     .with_principal_mapping("RULE:^CN=([^,]+).*$/$1/".parse().expect("valid")),
             ),
         ),
     );
+    let [ssl, sasl_ssl] = addrs[..] else {
+        panic!("two listeners")
+    };
 
-    let certificate = pki.authority.client_cert("certificate-user", "Example");
-    let mut stream = connect_tls(addrs[0], pki.authority.client_config(Some(&certificate)))
+    let mut stream = connect_tls(sasl_ssl, pki.authority.client_config(None))
         .await
-        .expect("mTLS handshake");
+        .expect("SASL_SSL asks for no client certificate, as on a Kafka broker");
     assert_eq!(
         sasl_plain(&mut stream, USERNAME, PASSWORD).await,
         ERROR_NONE
@@ -569,13 +610,166 @@ async fn given_a_sasl_ssl_listener_with_client_auth_should_take_the_principal_fr
     let (code, body) = describe_acls(&mut stream).await;
     assert_eq!(code, ERROR_NONE);
     assert!(
-        mentions(&body, &format!("User:{USERNAME}")) && !mentions(&body, "certificate-user"),
-        "with SASL the certificate gates the transport only, as on a Kafka SASL_SSL listener"
+        mentions(&body, &format!("User:{USERNAME}")),
+        "the SASL principal is the one described"
     );
     assert!(
         users.asked().is_empty(),
-        "the certificate's subject is never looked up on a SASL listener"
+        "nothing is looked up by certificate on a SASL listener"
     );
+
+    let Ok(mut refused) = connect_tls(ssl, pki.authority.client_config(None)).await else {
+        return;
+    };
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 1, Some("anonymous"), &[]);
+    let _ = refused.write_all(&frame).await;
+    assert_eq!(
+        read_byte_with_timeout(&mut refused, Duration::from_secs(5)).await,
+        ByteRead::Closed,
+        "the SSL listener beside it still requires a certificate"
+    );
+}
+
+#[tokio::test]
+async fn given_a_large_response_when_the_tls_client_reads_slowly_should_deliver_all_of_it() {
+    let pki = Pki::new();
+    // Small fixed buffers on both ends turn off autotuning, so the gateway's socket is full
+    // whenever rustls hands it the end of the response.
+    let socket = bind_listener("127.0.0.1:0").expect("bind");
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(16 * 1024)
+        .expect("send buffer");
+    let addr = socket.local_addr().expect("local addr");
+    let (_shutdown, rx) = tokio::sync::broadcast::channel(1);
+    let config = GatewayConfig {
+        write_timeout: Duration::from_secs(30),
+        ..quick_config(vec![SecurityProtocol::Ssl], Some(pki.tls()))
+    };
+    tokio::spawn(KafkaGateway::new(config).run(
+        vec![BoundListener::new(listener(SecurityProtocol::Ssl), socket)],
+        rx,
+    ));
+    let client = TcpSocket::new_v4().expect("socket");
+    client
+        .set_recv_buffer_size(16 * 1024)
+        .expect("receive buffer");
+    let tcp = client.connect(addr).await.expect("connect");
+    let mut stream = connect_tls_over(tcp, pki.authority.client_config(None))
+        .await
+        .expect("TLS handshake");
+
+    // The stub echoes every requested topic name back, so the answer is about as large as the
+    // request.
+    let name = "t".repeat(16 * 1024);
+    let names: Vec<&str> = std::iter::repeat_n(name.as_str(), 128).collect();
+    let request = build_metadata_legacy_request(&names);
+    let frame = build_request_frame(API_KEY_METADATA, 0, 7, Some("tls-test"), &request);
+    stream.write_all(&frame).await.expect("write request");
+
+    let read = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut prefix = [0u8; 4];
+        stream.read_exact(&mut prefix).await.expect("length prefix");
+        let frame_len = usize::try_from(i32::from_be_bytes(prefix)).expect("positive length");
+        let mut chunk = vec![0u8; 16 * 1024];
+        let mut received = 0;
+        while received < frame_len {
+            let read = stream.read(&mut chunk).await.expect("read");
+            assert_ne!(read, 0, "closed after {received} of {frame_len} bytes");
+            received += read;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        frame_len
+    })
+    .await;
+    let frame_len = read.expect("the whole response arrives; its tail must not wait for a flush");
+    assert!(frame_len > 2 * 1024 * 1024, "got only {frame_len} bytes");
+}
+
+#[tokio::test]
+async fn given_required_client_auth_when_no_rule_maps_the_subject_should_close() {
+    let pki = Pki::new();
+    let users = KnownUsers::with(USERNAME, topic_reader());
+    let resolver = Arc::clone(&users);
+    let (addrs, _shutdown) = spawn_gateway(
+        move |config| KafkaGateway::new(config).with_principal_resolver(resolver),
+        quick_config(
+            vec![SecurityProtocol::Ssl],
+            Some(
+                pki.tls_with_client_auth(ClientAuth::Required)
+                    .with_principal_mapping(
+                        "RULE:^CN=([^,]+),O=Allowed$/$1/".parse().expect("valid"),
+                    ),
+            ),
+        ),
+    );
+
+    let unmapped = pki.authority.client_cert(USERNAME, "Example");
+    let mut stream = connect_tls(addrs[0], pki.authority.client_config(Some(&unmapped)))
+        .await
+        .expect("the CA signed the certificate, so the handshake succeeds");
+    let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 1, Some("unmapped"), &[]);
+    let _ = stream.write_all(&frame).await;
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(5)).await,
+        ByteRead::Closed,
+        "a subject no rule maps names nobody, and is not served as anonymous"
+    );
+    assert!(users.asked().is_empty(), "nothing was looked up");
+}
+
+#[tokio::test]
+async fn given_a_client_that_never_starts_the_handshake_should_close_it_within_the_budget() {
+    let pki = Pki::new();
+    let (addrs, _shutdown) = spawn_gateway(
+        KafkaGateway::new,
+        GatewayConfig {
+            pre_auth_timeout: Duration::from_millis(300),
+            ..quick_config(vec![SecurityProtocol::Ssl], Some(pki.tls()))
+        },
+    );
+
+    let mut stream = TcpStream::connect(addrs[0]).await.expect("connect");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(3)).await,
+        ByteRead::Closed,
+        "a silent client must not hold a connection slot past the pre-authentication budget"
+    );
+}
+
+#[tokio::test]
+async fn given_a_lookup_that_fails_or_hangs_should_close_the_certificate_connection() {
+    for resolver in [BrokenResolver::Unavailable, BrokenResolver::Hangs] {
+        let pki = Pki::new();
+        let label = format!("{resolver:?}");
+        let resolver = Arc::new(resolver);
+        let (addrs, _shutdown) = spawn_gateway(
+            move |config| KafkaGateway::new(config).with_principal_resolver(resolver),
+            GatewayConfig {
+                pre_auth_timeout: Duration::from_millis(300),
+                ..quick_config(
+                    vec![SecurityProtocol::Ssl],
+                    Some(
+                        pki.tls_with_client_auth(ClientAuth::Required)
+                            .with_principal_mapping(
+                                "RULE:^CN=([^,]+).*$/$1/".parse().expect("valid"),
+                            ),
+                    ),
+                )
+            },
+        );
+
+        let certificate = pki.authority.client_cert(USERNAME, "Example");
+        let mut stream = connect_tls(addrs[0], pki.authority.client_config(Some(&certificate)))
+            .await
+            .expect("mTLS handshake");
+        let frame = build_request_frame(API_KEY_API_VERSIONS, 1, 1, Some("lookup"), &[]);
+        let _ = stream.write_all(&frame).await;
+        assert_eq!(
+            read_byte_with_timeout(&mut stream, Duration::from_secs(3)).await,
+            ByteRead::Closed,
+            "{label}: an identity that cannot be confirmed admits nothing"
+        );
+    }
 }
 
 #[tokio::test]
@@ -659,6 +853,106 @@ async fn given_certificate_identities_without_a_lookup_should_refuse_to_start() 
         error.contains("IGGY_KAFKA_BRIDGE_ENABLED"),
         "a certificate names an Iggy user only a bridge session can look up, got: {error}"
     );
+}
+
+#[tokio::test]
+async fn given_a_lookup_queued_behind_another_should_get_its_own_budget_once_it_holds_the_slot() {
+    // Each lookup fits the budget alone, but the queued one's wait plus its own lookup does not:
+    // it is served only if the budget restarts when the slot is acquired.
+    let budget = Duration::from_millis(1000);
+    let pki = Pki::new();
+    let users = Arc::new(SlowUsers {
+        delay: Duration::from_millis(800),
+        started: AtomicUsize::new(0),
+    });
+    let resolver = Arc::clone(&users);
+    let (addrs, _shutdown) = spawn_gateway(
+        move |config| KafkaGateway::new(config).with_principal_resolver(resolver),
+        GatewayConfig {
+            pre_auth_timeout: budget,
+            max_concurrent_authentications: 1,
+            ..quick_config(
+                vec![SecurityProtocol::Ssl],
+                Some(
+                    pki.tls_with_client_auth(ClientAuth::Required)
+                        .with_principal_mapping("RULE:^CN=([^,]+).*$/$1/".parse().expect("valid")),
+                ),
+            )
+        },
+    );
+    let certificate = pki.authority.client_cert(USERNAME, "Example");
+    let client_config = pki.authority.client_config(Some(&certificate));
+
+    let mut first = connect_tls(addrs[0], Arc::clone(&client_config))
+        .await
+        .expect("first mTLS handshake");
+    while users.started.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut queued = connect_tls(addrs[0], client_config)
+        .await
+        .expect("queued mTLS handshake");
+
+    let (first_rows, queued_rows) =
+        tokio::join!(api_versions(&mut first), api_versions(&mut queued));
+    assert!(advertises(&first_rows, API_KEY_DESCRIBE_ACLS));
+    assert!(
+        advertises(&queued_rows, API_KEY_DESCRIBE_ACLS),
+        "the queued lookup must not inherit what the wait left of a shared deadline"
+    );
+}
+
+#[tokio::test]
+async fn given_one_listener_at_its_connection_limit_should_still_serve_another_listener() {
+    let (addrs, _shutdown) = spawn_gateway(
+        KafkaGateway::new,
+        GatewayConfig {
+            max_connections: 1,
+            ..quick_config(
+                vec![SecurityProtocol::Plaintext, SecurityProtocol::Plaintext],
+                None,
+            )
+        },
+    );
+
+    let mut held = TcpStream::connect(addrs[0]).await.expect("connect");
+    assert!(advertises(&api_versions(&mut held).await, API_KEY_METADATA));
+    let mut refused = TcpStream::connect(addrs[0]).await.expect("connect");
+    assert_eq!(
+        read_byte_with_timeout(&mut refused, Duration::from_secs(3)).await,
+        ByteRead::Closed,
+        "the first listener is full"
+    );
+
+    let mut other = TcpStream::connect(addrs[1]).await.expect("connect");
+    assert!(
+        advertises(&api_versions(&mut other).await, API_KEY_METADATA),
+        "each listener has its own connection pool"
+    );
+}
+
+#[tokio::test]
+async fn given_client_auth_without_an_ssl_listener_should_refuse_to_start() {
+    let pki = Pki::new();
+    let socket = bind_listener("127.0.0.1:0").expect("bind");
+    let (_tx, rx) = tokio::sync::broadcast::channel(1);
+    let config = quick_config(
+        vec![SecurityProtocol::SaslSsl],
+        Some(pki.tls_with_client_auth(ClientAuth::Required)),
+    );
+    let error = KafkaGateway::new(config)
+        .with_authenticator(Arc::new(FixedCredentials))
+        .run(
+            vec![BoundListener::new(
+                listener(SecurityProtocol::SaslSsl),
+                socket,
+            )],
+            rx,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no SSL listener"), "got: {error}");
 }
 
 /// Kept for the suites that pin the single-listener shape: a `SASL_PLAINTEXT` listener on an

@@ -227,24 +227,41 @@ Iggy password is capped at 100 bytes with a `u8` length prefix on the wire
 
 ## Client certificates
 
-`IGGY_KAFKA_TLS_CLIENT_AUTH` is Kafka's `ssl.client.auth`: `none`, `requested` or `required`. With it on,
-every TLS listener verifies the client certificate against `IGGY_KAFKA_TLS_CLIENT_CA_FILE` during the
-handshake, and what a verified certificate means follows the listener, as it does on a Kafka broker.
+`IGGY_KAFKA_TLS_CLIENT_AUTH` is Kafka's `ssl.client.auth`: `none`, `requested` or `required`. It applies
+to `SSL` listeners, which verify the client certificate against `IGGY_KAFKA_TLS_CLIENT_CA_FILE` during the
+handshake, and is refused when no `SSL` listener exists.
 
-On a `SASL_SSL` listener the certificate gates the transport only. SASL names the principal, and the
-subject is never mapped: Kafka does the same, and a deployment that wants certificate identities uses
-`SSL`.
+A `SASL_SSL` listener never asks for a client certificate. Kafka applies `ssl.client.auth` to a
+`SASL_SSL` listener only when that listener overrides it, and leaves it at `none` otherwise; SASL names
+the principal there. A deployment that wants certificate identities uses `SSL`.
 
 On an `SSL` listener the certificate names the principal, in three steps the connection takes before its
 first frame:
 
 1. **Render the subject** the way Java's `X500Principal.getName()` does, RFC 2253 with the most specific
    RDN first and no spaces: `CN=alice,OU=eng,O=Example`. Operators write mapping rules against Java's
-   rendering, so the gateway matches it, keyword set and escaping included.
+   rendering, so the gateway follows JDK 11 to 21's `AVA.toRFC2253String`: its keyword set, its escaping
+   (NUL as `\00`), Latin-1 for `PrintableString`, `IA5String` and `GeneralString`, and hex for the string
+   types Java does not decode, `UniversalString` among them. Malformed UTF-8 or BMP values are the one case
+   not checked against Java.
 2. **Map it** through `IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES`, Kafka's `ssl.principal.mapping.rules`
    syntax: `RULE:pattern/replacement/[LU]` applies when the pattern matches the whole subject, `DEFAULT`
-   keeps it, the first match wins, and a subject no rule matches closes the connection. The default is
-   `DEFAULT`, which is not a valid Iggy username, so a deployment sets at least one rule.
+   keeps it, the first match wins, and a subject no rule matches closes the connection with the subject in
+   the log at `warn`. The default is `DEFAULT`. Iggy only requires a username of 3 to 50 characters, but a
+   raw subject is usually longer than that and is rarely the name the operator created, so a deployment
+   sets at least one rule. A replacement with a bare `$`, or a `${name}` with no such named group, is
+   refused at startup, where Kafka would fail the first handshake it applies to. One that names a group
+   the pattern lacks is refused too, which is stricter than Kafka: a broker writes it literally, so
+   `RULE:^CN=(.*)$/$2/` maps to `$2`. The reverse case, `/$1\$2/`, makes Kafka throw while the gateway
+   maps `alice` to `alice$2`, which is harmless because that Iggy user must still exist. The replacement is applied as Java's `replaceAll`, to every match in the subject, so
+   `RULE:(.*)/$1@x/` maps `alice` to `alice@x@x` as it does on a broker. Patterns are the subset of
+   Java's regex syntax whose meaning the gateway can reproduce: `\d \s \w` and their negations match
+   ASCII only, and `.` outside `(?s)` stops at `\r`, U+0085, U+2028 and U+2029 as well as `\n`, both as
+   in Java. Rust would read them over Unicode, so a CA-signed `CN=\u212Aafka` (Kelvin sign) would match
+   `\w+` and lowercase to `kafka`. Case-insensitive matching (`(?i)`), the `u` and `U` flags, `\p{..}`
+   and `\P{..}`, POSIX classes such as `[[:alpha:]]`, and word boundaries (`\b`, `\B`) are refused at
+   startup with the construct named: each has no faithful translation. Non-ASCII names still map, so
+   `CN=Zoë` under `RULE:^CN=([^,]+).*$/$1/` maps to `Zoë` as on a broker.
 3. **Look the name up** through the bridge's own session. The user must exist and be active, or the
    connection is closed after the handshake with the name in the log at `warn`: a certificate the CA signed
    for an account that does not exist is a provisioning mistake, not something the client can correct. The
@@ -252,9 +269,15 @@ first frame:
    lookup, including one refused for want of that permission, closes the connection too and never admits
    the name unchecked.
 
-With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal: served as the
-bridge's user, the way a plaintext listener serves everyone, and described by `DescribeAcls` as holding
-nothing. With `required`, rustls fails the handshake instead.
+With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` principal, which holds no
+permissions: `DescribeAcls` describes it as holding nothing, and `DeleteTopics` and `AlterConfigs`, which
+need `manage_topics`, are refused. Everything else is served as the bridge's user. With `required`, rustls
+fails the handshake instead.
+
+The same holds on every listener that names nobody once any listener names principals: a `PLAINTEXT`
+listener beside a `SASL_SSL` or mTLS one serves `ANONYMOUS`, so it cannot do what an authenticated user
+without `manage_topics` cannot. Only a gateway whose listeners all name nobody leaves those requests
+ungated.
 
 The principal a certificate yields is the same `AuthenticatedPrincipal` a SASL login yields, with its
 permissions read at admission, so everything written about the SASL identity above holds: it is a snapshot,

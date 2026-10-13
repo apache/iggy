@@ -202,7 +202,8 @@ done
 ```
 
 Then a gateway with every listener, bridged (the bridge looks certificate identities up), with client
-certificates requested and the common name as the Iggy username:
+certificates requested on the `SSL` listener and the common name as the Iggy username. The `SASL_SSL`
+listener asks for no client certificate whatever `IGGY_KAFKA_TLS_CLIENT_AUTH` says:
 
 ```bash
 IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://127.0.0.1:9095 \
@@ -303,9 +304,9 @@ func main() {
 }
 ```
 
-Run it four ways, with `CA_FILE=/tmp/certs/ca.pem` exported: `go run . 127.0.0.1:19094`,
-`SASL_USER=iggy SASL_PASS=iggy go run . 127.0.0.1:19095`,
-`go run . 127.0.0.1:19094 /tmp/certs/iggy.pem /tmp/certs/iggy.key` and the same with
+Run it four ways, with `CA_FILE=/tmp/certs/ca.pem` exported: `go run . 127.0.0.1:9094`,
+`SASL_USER=iggy SASL_PASS=iggy go run . 127.0.0.1:9095`,
+`go run . 127.0.0.1:9094 /tmp/certs/iggy.pem /tmp/certs/iggy.key` and the same with
 `nobody.pem`/`nobody.key`. The first three print the one broker on the port they dialed, the SASL
 and certificate runs also list `User:iggy`'s bindings, and the last reports the broker closing the
 connection during `ApiVersions`.

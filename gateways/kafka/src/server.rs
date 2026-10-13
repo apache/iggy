@@ -25,7 +25,7 @@ use kafka_protocol::messages::RequestHeader;
 use kafka_protocol::protocol::Decodable;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, broadcast};
+use tokio::sync::{Semaphore, SemaphorePermit, broadcast};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -42,7 +42,6 @@ use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{ListenerConfig, SecurityProtocol};
-use crate::protocol::acl::PrincipalPermissions;
 use crate::protocol::api::{
     API_KEY_DESCRIBE_ACLS, API_KEY_SASL_AUTHENTICATE, API_KEY_SASL_HANDSHAKE, BrokerAdvertise,
     ConnectionState, DEFAULT_KAFKA_PORT, ERROR_ILLEGAL_SASL_STATE, ERROR_INVALID_REQUEST,
@@ -55,16 +54,12 @@ use crate::protocol::api::{
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
-    PlainCredentials, SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState,
-    parse_plain,
+    SASL_AUTHENTICATE_MAX_VERSION, SASL_HANDSHAKE_VERSION, SaslAction, SaslState, parse_plain,
 };
-use crate::tls::{TlsConfig, TlsState};
+use crate::tls::{IdentityError, TlsConfig, TlsState};
 
 const READ_CHUNK: usize = 65536;
 const GATEWAY_LOG_TARGET: &str = env!("CARGO_CRATE_NAME");
-
-/// Kafka's name for a client that proved no identity, as `DescribeAcls` renders it.
-const ANONYMOUS_PRINCIPAL: &str = "ANONYMOUS";
 
 /// Builds the log filter, forcing the Iggy SDK quiet unless the operator asked otherwise.
 ///
@@ -117,7 +112,8 @@ pub struct GatewayConfig {
     /// Required exactly when one of those exists.
     pub tls: Option<TlsConfig>,
     pub max_frame_size: usize,
-    /// Maximum concurrent connections accepted before new ones are rejected.
+    /// Maximum concurrent connections each listener accepts before rejecting new ones. Every
+    /// listener has its own allowance, so clients of one cannot use up another's.
     pub max_connections: usize,
     /// Bound on how long an accepted connection may sit idle before sending the next
     /// frame's length prefix. Kafka brokers default `connections.max.idle.ms` to 10 minutes;
@@ -344,6 +340,10 @@ struct Listener {
     /// Whether this listener names a principal, by SASL or by a verified client certificate.
     /// Decides whether `DescribeAcls` is advertised and answered.
     acls_enabled: bool,
+    /// Whether a connection here that names no principal is served as
+    /// [`AuthenticatedPrincipal::anonymous`]. True on every listener without SASL once any
+    /// listener of the gateway names principals, so the permission gates hold there too.
+    anonymous_without_principal: bool,
 }
 
 impl Listener {
@@ -421,7 +421,7 @@ impl KafkaGateway {
         listeners: Vec<BoundListener>,
         mut shutdown: broadcast::Receiver<()>,
     ) -> Result<()> {
-        self.check_sasl_wiring()?;
+        self.check_sasl_wiring(&listeners)?;
         let tls = self.check_tls_wiring(&listeners)?;
         if listeners.is_empty() {
             return Err(KafkaProtocolError::InvalidConfig(
@@ -436,6 +436,12 @@ impl KafkaGateway {
         let acls_by_certificate = tls
             .as_ref()
             .is_some_and(|tls| tls.config().client_auth.is_enabled());
+        let names_principals = |protocol: SecurityProtocol| {
+            protocol.uses_sasl() || (protocol.authenticates_by_certificate() && acls_by_certificate)
+        };
+        let any_names_principals = listeners
+            .iter()
+            .any(|listener| names_principals(listener.config.protocol));
 
         let mut bound = Vec::with_capacity(listeners.len());
         for BoundListener { config, socket } in listeners {
@@ -454,8 +460,8 @@ impl KafkaGateway {
                 Arc::new(Listener {
                     protocol,
                     broker,
-                    acls_enabled: protocol.uses_sasl()
-                        || (protocol.authenticates_by_certificate() && acls_by_certificate),
+                    acls_enabled: names_principals(protocol),
+                    anonymous_without_principal: any_names_principals && !protocol.uses_sasl(),
                 }),
                 socket,
             ));
@@ -478,7 +484,6 @@ impl KafkaGateway {
             self.config.max_concurrent_authentications,
         ));
         let tracker = TaskTracker::new();
-        let conn_limiter = Arc::new(Semaphore::new(self.config.max_connections));
         let drain_timeout = self.config.shutdown_drain_timeout;
 
         if let Some(tls) = &tls {
@@ -495,7 +500,7 @@ impl KafkaGateway {
                 state: Arc::clone(&state),
                 auth: Arc::clone(&shared_auth),
                 tracker: tracker.clone(),
-                conn_limiter: Arc::clone(&conn_limiter),
+                conn_limiter: Arc::new(Semaphore::new(self.config.max_connections)),
                 cancel: cancel.clone(),
                 tls: tls.clone(),
             }));
@@ -521,14 +526,18 @@ impl KafkaGateway {
                 Err(join_error) => Err(io::Error::other(join_error).into()),
             },
         };
-        drain(&tracker, &cancel, drain_timeout).await;
+        // The accept loops stop first, so no connection is spawned after the drain starts waiting.
+        cancel.cancel();
         accept_loops.shutdown().await;
+        drain(&tracker, &cancel, drain_timeout).await;
         outcome
     }
 
     /// Refuses to start when the SASL listeners and the configured authenticator disagree.
-    fn check_sasl_wiring(&self) -> Result<()> {
-        let sasl_enabled = self.config.sasl_enabled();
+    fn check_sasl_wiring(&self, listeners: &[BoundListener]) -> Result<()> {
+        let sasl_enabled = listeners
+            .iter()
+            .any(|listener| listener.config.protocol.uses_sasl());
         if !sasl_enabled && self.authenticator.is_some() {
             // The mirror of the guard below, and the quieter mistake: a verifier attached while no
             // listener runs SASL means every connection is served unauthenticated, with nothing
@@ -576,11 +585,20 @@ impl KafkaGateway {
                     .into(),
             ));
         }
-        let maps_identities = tls_config.client_auth.is_enabled()
-            && listeners
-                .iter()
-                .any(|listener| listener.config.protocol.authenticates_by_certificate());
-        if maps_identities && self.principal_resolver.is_none() && self.bridge.is_none() {
+        let has_ssl_listener = listeners
+            .iter()
+            .any(|listener| listener.config.protocol.authenticates_by_certificate());
+        if tls_config.client_auth.is_enabled() && !has_ssl_listener {
+            return Err(KafkaProtocolError::InvalidConfig(format!(
+                "client authentication is '{}' but no SSL listener is configured; it applies to \
+                 SSL listeners only, and a SASL_SSL listener asks for no client certificate",
+                tls_config.client_auth
+            )));
+        }
+        if tls_config.client_auth.is_enabled()
+            && self.principal_resolver.is_none()
+            && self.bridge.is_none()
+        {
             // A certificate names an Iggy user, and only an Iggy session can say whether that
             // user exists. Admitting the name unchecked would let any certificate from the CA
             // claim any account.
@@ -615,10 +633,13 @@ async fn accept_loop(this: AcceptLoop) -> Result<()> {
             () = this.cancel.cancelled() => return Ok(()),
             accepted = this.socket.accept() => accepted,
         };
+        if this.cancel.is_cancelled() {
+            return Ok(());
+        }
         match accepted {
             Ok((stream, peer)) => {
                 let Ok(permit) = Arc::clone(&this.conn_limiter).try_acquire_owned() else {
-                    warn!(%peer, max_connections = this.config.max_connections, "connection limit reached, rejecting");
+                    warn!(%peer, protocol = %this.listener.protocol, max_connections = this.config.max_connections, "listener connection limit reached, rejecting");
                     continue;
                 };
                 if let Err(e) = stream.set_nodelay(true) {
@@ -677,9 +698,16 @@ async fn serve_connection(stream: TcpStream, connection: Connection) {
         // unfinished handshake holds a `max_connections` permit.
         let handshake = timeout(
             connection.config.pre_auth_timeout,
-            tls.acceptor().accept(stream),
+            tls.acceptor(connection.listener.protocol).accept(stream),
         );
-        let tls_stream = match handshake.await {
+        let handshake = tokio::select! {
+            () = connection.cancel.cancelled() => {
+                debug!(%peer, "TLS handshake abandoned by shutdown");
+                return;
+            }
+            handshake = handshake => handshake,
+        };
+        let tls_stream = match handshake {
             Ok(Ok(tls_stream)) => tls_stream,
             Ok(Err(error)) => {
                 // debug!, not warn!: a plaintext client on the TLS port, an untrusted client
@@ -695,6 +723,12 @@ async fn serve_connection(stream: TcpStream, connection: Connection) {
         let certificate_name = if connection.listener.protocol.authenticates_by_certificate() {
             match tls.principal_name(tls_stream.get_ref().1) {
                 Ok(name) => name,
+                // warn!: the CA signed this certificate, so a subject no rule maps is a mapping
+                // rule the operator has to fix.
+                Err(IdentityError::NoMatchingRule { subject }) => {
+                    warn!(%peer, subject, "client certificate subject matches no principal mapping rule; closing");
+                    return;
+                }
                 Err(error) => {
                     debug!(%peer, %error, "client certificate names no principal; closing");
                     return;
@@ -937,6 +971,8 @@ where
             return Ok(());
         };
         Some(resolved)
+    } else if listener.anonymous_without_principal {
+        Some(AuthenticatedPrincipal::anonymous())
     } else {
         None
     };
@@ -1020,30 +1056,31 @@ async fn resolve_certificate_principal(
         error!(%peer, "a client certificate named a principal but nothing can look it up");
         return None;
     };
+    // The lookup is an Iggy call per handshake, so it shares the authentication slots with SASL.
+    let lookup = within_auth_budget(ctx, "certificate identity lookup", |slot| async move {
+        let _slot = slot;
+        resolver.resolve(username).await
+    });
     let outcome = tokio::select! {
         () = ctx.cancel.cancelled() => {
             debug!(%peer, "certificate identity lookup abandoned by shutdown");
             return None;
         }
-        outcome = timeout(ctx.config.pre_auth_timeout, resolver.resolve(username)) => outcome,
+        outcome = lookup => outcome?,
     };
     match outcome {
-        Ok(Ok(principal)) => {
+        Ok(principal) => {
             debug!(%peer, username, "client certificate authenticated");
             Some(principal)
         }
-        Ok(Err(AuthError::Rejected)) => {
+        Err(AuthError::Rejected) => {
             // warn!, not debug!: the certificate chained to the trusted CA, so this is an account
             // the operator meant to exist, or a mapping rule that produced the wrong name.
             warn!(%peer, username, "client certificate names no active Iggy user; closing");
             None
         }
-        Ok(Err(AuthError::Unavailable)) => {
+        Err(AuthError::Unavailable) => {
             warn!(%peer, username, "could not look up the certificate's Iggy user; closing");
-            None
-        }
-        Err(_elapsed) => {
-            warn!(%peer, username, "certificate identity lookup did not finish within the pre-authentication budget");
             None
         }
     }
@@ -1097,7 +1134,9 @@ async fn authenticate_token(
             debug!(%peer, "SASL authentication abandoned by shutdown");
             return (HandleOutcome::Close, None);
         }
-        verified = verify_within_budget(ctx, authenticator, &credentials) => verified,
+        verified = within_auth_budget(ctx, "SASL authentication", |slot| {
+            authenticator.authenticate(&credentials, slot)
+        }) => verified,
     };
 
     let Some(result) = verified else {
@@ -1138,9 +1177,9 @@ async fn authenticate_token(
 ///
 /// Only reachable on a listener that names principals: elsewhere the key is not advertised and
 /// falls through to ordinary dispatch, which refuses it. On a SASL listener the SASL gate refuses
-/// every key but one before a principal exists, so a missing principal there is a gateway fault.
-/// On an `SSL` listener that only requests a certificate, a client that presented none is
-/// Kafka's anonymous principal, and is described as holding nothing.
+/// every key but one before a principal exists, and every other such listener starts each
+/// connection with a principal, anonymous when no certificate named one. A missing principal
+/// is therefore a gateway fault.
 fn describe_acls(
     ctx: &ConnectionContext<'_>,
     principal: Option<&AuthenticatedPrincipal>,
@@ -1148,26 +1187,14 @@ fn describe_acls(
     body: Bytes,
 ) -> HandleOutcome {
     let peer = ctx.peer;
-    let anonymous;
-    let principal = match principal {
-        Some(principal) => principal,
-        None if ctx.listener.protocol.uses_sasl() => {
-            // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching
-            // this means the routing guards above disagree with each other, which is a gateway
-            // fault and not something a client can provoke.
-            error!(%peer, "DescribeAcls reached a connection with no authenticated principal");
-            // Not `encode_error_for_key`: key 29 is absent from `SUPPORTED_RANGES`, so that helper
-            // always returns `Close` here and the code would read as if it answers when it cannot.
-            return respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, true);
-        }
-        None => {
-            anonymous = AuthenticatedPrincipal {
-                username: ANONYMOUS_PRINCIPAL.to_string(),
-                permissions: PrincipalPermissions::default(),
-                permissions_known: true,
-            };
-            &anonymous
-        }
+    let Some(principal) = principal else {
+        // `error!` rather than `debug!` on purpose, unlike every other refusal here: reaching
+        // this means the routing guards above disagree with each other, which is a gateway
+        // fault and not something a client can provoke.
+        error!(%peer, "DescribeAcls reached a connection with no authenticated principal");
+        // Not `encode_error_for_key`: key 29 is absent from `SUPPORTED_RANGES`, so that helper
+        // always returns `Close` here and the code would read as if it answers when it cannot.
+        return respond_describe_acls_error(api_version, ERROR_ILLEGAL_SASL_STATE, true);
     };
     // The firewall table cannot cover this key: it is kept out of `SUPPORTED_RANGES` on purpose,
     // so the advertised range would otherwise be enforced only by whatever `kafka_protocol`'s
@@ -1199,32 +1226,37 @@ fn describe_acls(
     }
 }
 
-/// Waits for an authentication slot, then verifies, each within the pre-authentication budget.
+/// Waits for an authentication slot, then runs `work` holding it, each within the
+/// pre-authentication budget. `None` means a budget ran out.
 ///
 /// Two budgets rather than one shared deadline. The wait needs its own bound so a queued
 /// connection cannot hold a `max_connections` permit for as long as the backlog takes to drain,
-/// which is the invariant `pre_auth_timeout` is documented to enforce. The verification's budget
-/// starts once the slot is held, because cutting a verification short does not stop the login it
-/// started inside Iggy: a verification that inherited whatever the queue left of a shared deadline
-/// would be abandoned mid-hash and hand its slot to the next one while Iggy is still working.
-async fn verify_within_budget(
-    ctx: &ConnectionContext<'_>,
-    authenticator: &dyn SaslAuthenticator,
-    credentials: &PlainCredentials,
-) -> Option<std::result::Result<AuthenticatedPrincipal, AuthError>> {
+/// which is the invariant `pre_auth_timeout` is documented to enforce. The work's budget starts
+/// once the slot is held, because cutting it short does not stop the call it started inside Iggy:
+/// work that inherited whatever the queue left of a shared deadline would be abandoned mid-hash
+/// and hand its slot to the next one while Iggy is still working.
+async fn within_auth_budget<'a, T, Work, Fut>(
+    ctx: &ConnectionContext<'a>,
+    operation: &'static str,
+    work: Work,
+) -> Option<T>
+where
+    Work: FnOnce(SemaphorePermit<'a>) -> Fut,
+    Fut: Future<Output = T>,
+{
     let peer = ctx.peer;
     let budget = ctx.config.pre_auth_timeout;
     let Ok(acquired) = timeout(budget, ctx.auth_slots.acquire()).await else {
-        warn!(%peer, "no authentication slot came free within the pre-authentication budget");
+        warn!(%peer, operation, "no authentication slot came free within the pre-authentication budget");
         return None;
     };
     // Acquire fails only once the semaphore is closed, which this gateway never does.
     let Ok(slot) = acquired else {
-        error!(%peer, "authentication slots unavailable");
+        error!(%peer, operation, "authentication slots unavailable");
         return None;
     };
-    let Ok(result) = timeout(budget, authenticator.authenticate(credentials, slot)).await else {
-        warn!(%peer, "authentication did not complete within the pre-authentication budget");
+    let Ok(result) = timeout(budget, work(slot)).await else {
+        warn!(%peer, operation, "did not complete within the pre-authentication budget");
         return None;
     };
     Some(result)
@@ -1379,11 +1411,11 @@ async fn close_gracefully<S: AsyncRead + AsyncWrite + Unpin>(
     budget: Duration,
     cancel: &CancellationToken,
 ) {
-    if stream.shutdown().await.is_err() {
-        return;
-    }
     let mut discard = [0u8; 4096];
     let drain_input = async {
+        if stream.shutdown().await.is_err() {
+            return;
+        }
         while let Ok(read) = stream.read(&mut discard).await {
             if read == 0 {
                 break;
@@ -1427,7 +1459,13 @@ async fn send_response<S: AsyncWrite + Unpin>(
         prefix.put_u8(0); // empty tagged fields
     }
     let mut frame = prefix.freeze().chain(body);
-    timeout(write_timeout, stream.write_all_buf(&mut frame))
+    // The flush matters on TLS: the stream reports a write done once rustls holds the record,
+    // and the tail of a large response would otherwise sit unsent until the next write.
+    let write = async {
+        stream.write_all_buf(&mut frame).await?;
+        stream.flush().await
+    };
+    timeout(write_timeout, write)
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timeout"))??;
     Ok(())

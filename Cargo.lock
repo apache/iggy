@@ -7123,6 +7123,7 @@ dependencies = [
  "lz4",
  "rcgen",
  "regex",
+ "regex-syntax",
  "rustls",
  "secrecy",
  "serde",

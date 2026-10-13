@@ -215,6 +215,23 @@ pub struct AuthenticatedPrincipal {
     pub permissions_known: bool,
 }
 
+impl AuthenticatedPrincipal {
+    /// Kafka's name for a client that proved no identity, as `DescribeAcls` renders it.
+    pub const ANONYMOUS: &'static str = "ANONYMOUS";
+
+    /// A connection that proved no identity on a gateway that authenticates somewhere: it holds
+    /// nothing, and that is a real answer rather than a failed read. It is "authenticated" only in
+    /// the sense that the connection's identity has been decided.
+    #[must_use]
+    pub fn anonymous() -> Self {
+        Self {
+            username: Self::ANONYMOUS.to_string(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: true,
+        }
+    }
+}
+
 /// Verifies Kafka-supplied credentials.
 ///
 /// A trait rather than a concrete type so the protocol tests can drive the whole SASL exchange
@@ -246,7 +263,7 @@ pub trait SaslAuthenticator: Send + Sync + std::fmt::Debug {
 /// over its own session; the protocol tests drive the certificate path without an Iggy server
 /// through a stub.
 #[async_trait]
-pub trait PrincipalResolver: Send + Sync {
+pub trait PrincipalResolver: Send + Sync + std::fmt::Debug {
     /// Returns the principal when `username` names an active Iggy user.
     ///
     /// # Errors

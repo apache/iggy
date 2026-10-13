@@ -264,6 +264,12 @@ async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeE
     Ok(client)
 }
 
+impl std::fmt::Debug for IggyBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IggyBridge").finish_non_exhaustive()
+    }
+}
+
 /// The bridge's own session answers for the users client certificates name. It runs as the
 /// bridge's Iggy user, so that account needs `read_users` for any certificate to be admitted.
 #[async_trait]

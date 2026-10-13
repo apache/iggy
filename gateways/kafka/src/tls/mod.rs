@@ -35,10 +35,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::error::{KafkaProtocolError, Result};
+use crate::listener::SecurityProtocol;
 
 pub mod identity;
 
-pub use identity::{IdentityError, PrincipalMappingRules, subject_distinguished_name};
+pub use identity::{
+    IdentityError, MappingRuleError, PrincipalMappingRules, ReplacementError,
+    subject_distinguished_name,
+};
 
 /// How often the certificate files are re-read when nothing else is configured.
 ///
@@ -97,6 +101,10 @@ impl fmt::Display for ClientAuth {
 }
 
 /// TLS material and policy shared by every `SSL` and `SASL_SSL` listener.
+///
+/// `client_auth` applies to `SSL` listeners only. A `SASL_SSL` listener never asks for a client
+/// certificate, as Kafka leaves `ssl.client.auth` at `none` there unless that listener
+/// overrides it.
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     /// PEM certificate chain, leaf first.
@@ -146,7 +154,7 @@ impl TlsConfig {
 }
 
 /// The bytes last read from disk, kept so a reload can tell whether anything changed.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Material {
     certificate: Vec<u8>,
     key: Vec<u8>,
@@ -165,12 +173,51 @@ impl Material {
                 .transpose()?,
         })
     }
+
+    async fn read_async(config: &TlsConfig) -> Result<Self> {
+        let client_ca = match config.client_ca_file.as_deref() {
+            Some(path) => Some(read_file_async(path).await?),
+            None => None,
+        };
+        Ok(Self {
+            certificate: read_file_async(&config.cert_file).await?,
+            key: read_file_async(&config.key_file).await?,
+            client_ca,
+        })
+    }
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
-    fs::read(path).map_err(|error| {
-        KafkaProtocolError::InvalidConfig(format!("cannot read {}: {error}", path.display()))
-    })
+    fs::read(path).map_err(|error| unreadable(path, &error))
+}
+
+async fn read_file_async(path: &Path) -> Result<Vec<u8>> {
+    tokio::fs::read(path)
+        .await
+        .map_err(|error| unreadable(path, &error))
+}
+
+fn unreadable(path: &Path, error: &std::io::Error) -> KafkaProtocolError {
+    KafkaProtocolError::InvalidConfig(format!("cannot read {}: {error}", path.display()))
+}
+
+/// The two server configurations one set of material builds: `SSL` listeners verify client
+/// certificates as `client_auth` says, `SASL_SSL` listeners never ask for one.
+struct ServerConfigs {
+    ssl: Arc<ServerConfig>,
+    sasl_ssl: Arc<ServerConfig>,
+}
+
+impl ServerConfigs {
+    fn build(config: &TlsConfig, material: &Material) -> Result<Self> {
+        let ssl = Arc::new(build_server_config(config, config.client_auth, material)?);
+        let sasl_ssl = if config.client_auth.is_enabled() {
+            Arc::new(build_server_config(config, ClientAuth::None, material)?)
+        } else {
+            Arc::clone(&ssl)
+        };
+        Ok(Self { ssl, sasl_ssl })
+    }
 }
 
 /// The live TLS configuration, swapped under running listeners when the files change.
@@ -180,7 +227,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 /// lock in the accept path: the swap is an atomic pointer exchange.
 pub struct TlsState {
     config: TlsConfig,
-    current: ArcSwap<ServerConfig>,
+    current: ArcSwap<ServerConfigs>,
     loaded: Mutex<Material>,
 }
 
@@ -210,10 +257,10 @@ impl TlsState {
             )));
         }
         let material = Material::read(&config)?;
-        let server_config = build_server_config(&config, &material)?;
+        let server_configs = ServerConfigs::build(&config, &material)?;
         Ok(Self {
             config,
-            current: ArcSwap::from_pointee(server_config),
+            current: ArcSwap::from_pointee(server_configs),
             loaded: Mutex::new(material),
         })
     }
@@ -223,30 +270,38 @@ impl TlsState {
         &self.config
     }
 
-    /// An acceptor over the configuration current right now.
+    /// An acceptor over the configuration current right now, for a listener speaking
+    /// `protocol`. Only an `SSL` listener asks for a client certificate.
     #[must_use]
-    pub fn acceptor(&self) -> TlsAcceptor {
-        TlsAcceptor::from(self.current.load_full())
+    pub fn acceptor(&self, protocol: SecurityProtocol) -> TlsAcceptor {
+        let current = self.current.load();
+        let config = if protocol.authenticates_by_certificate() {
+            &current.ssl
+        } else {
+            &current.sasl_ssl
+        };
+        TlsAcceptor::from(Arc::clone(config))
     }
 
     /// Re-reads the files and swaps the configuration if they changed.
     ///
     /// Returns `Ok(true)` when new material went live. A read or build failure leaves the current
     /// material serving: a rotation that is half written, or a certificate that does not match
-    /// its key, must not take the listener down.
+    /// its key, must not take the listener down. Material that failed to build is retried on every
+    /// call, so each tick reports the failure until the files are fixed.
     ///
     /// # Errors
     ///
     /// The same conditions as [`Self::load`].
-    pub fn reload(&self) -> Result<bool> {
-        let material = Material::read(&self.config)?;
-        let unchanged = *self.loaded.lock().unwrap_or_else(PoisonError::into_inner) == material;
-        if unchanged {
+    pub async fn reload(&self) -> Result<bool> {
+        let material = Material::read_async(&self.config).await?;
+        if *self.loaded.lock().unwrap_or_else(PoisonError::into_inner) == material {
             return Ok(false);
         }
-        let server_config = build_server_config(&self.config, &material)?;
-        self.current.store(Arc::new(server_config));
+        let server_configs = ServerConfigs::build(&self.config, &material)?;
+        // Recorded only after a successful build, so a failed build is retried every tick.
         *self.loaded.lock().unwrap_or_else(PoisonError::into_inner) = material;
+        self.current.store(Arc::new(server_configs));
         Ok(true)
     }
 
@@ -261,7 +316,7 @@ impl TlsState {
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep(interval) => {}
             }
-            match self.reload() {
+            match self.reload().await {
                 Ok(true) => info!(
                     cert_file = %self.config.cert_file.display(),
                     "TLS certificate reloaded; new connections use the new material"
@@ -306,7 +361,11 @@ impl TlsState {
     }
 }
 
-fn build_server_config(config: &TlsConfig, material: &Material) -> Result<ServerConfig> {
+fn build_server_config(
+    config: &TlsConfig,
+    client_auth: ClientAuth,
+    material: &Material,
+) -> Result<ServerConfig> {
     // Named explicitly rather than taken from the process default: the Iggy SDK installs its own
     // provider lazily on its first TLS dial, and a listener that came up first would otherwise
     // decide for it, or panic because neither had chosen yet.
@@ -327,11 +386,7 @@ fn build_server_config(config: &TlsConfig, material: &Material) -> Result<Server
     let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
         .map_err(|error| KafkaProtocolError::InvalidConfig(error.to_string()))?;
-    let builder = match (
-        config.client_auth,
-        &material.client_ca,
-        &config.client_ca_file,
-    ) {
+    let builder = match (client_auth, &material.client_ca, &config.client_ca_file) {
         (ClientAuth::None, _, _) => builder.with_no_client_auth(),
         (mode, Some(ca_pem), Some(ca_file)) => {
             let mut roots = RootCertStore::empty();
@@ -430,18 +485,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn given_a_certificate_and_key_should_load_and_report_no_change_on_reload() {
+    #[tokio::test]
+    async fn given_a_certificate_and_key_should_load_and_report_no_change_on_reload() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (cert, key) = self_signed("first");
         let cert_file = write(dir.path(), "cert.pem", &cert);
         let key_file = write(dir.path(), "key.pem", &key);
         let state = TlsState::load(TlsConfig::new(cert_file, key_file)).expect("loads");
-        assert!(!state.reload().expect("reload reads the same files"));
+        assert!(!state.reload().await.expect("reload reads the same files"));
     }
 
-    #[test]
-    fn given_rotated_files_should_swap_and_keep_the_old_material_on_a_broken_rotation() {
+    #[tokio::test]
+    async fn given_rotated_files_should_swap_and_keep_the_old_material_on_a_broken_rotation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (cert, key) = self_signed("first");
         let cert_file = write(dir.path(), "cert.pem", &cert);
@@ -454,6 +509,7 @@ mod tests {
         fs::write(&cert_file, &next_cert).expect("rotate certificate");
         let error = state
             .reload()
+            .await
             .expect_err("a certificate that does not match the key must not go live");
         assert!(error.to_string().contains("pair"), "got: {error}");
         assert!(
@@ -462,9 +518,34 @@ mod tests {
         );
 
         fs::write(&key_file, &next_key).expect("rotate key");
-        assert!(state.reload().expect("the completed rotation loads"));
+        assert!(state.reload().await.expect("the completed rotation loads"));
         assert!(!Arc::ptr_eq(&before, &state.current.load_full()));
-        assert!(!state.reload().expect("nothing changed since"));
+        assert!(!state.reload().await.expect("nothing changed since"));
+    }
+
+    #[tokio::test]
+    async fn given_a_broken_rotation_should_report_it_on_every_reload_until_fixed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert, key) = self_signed("first");
+        let cert_file = write(dir.path(), "cert.pem", &cert);
+        let key_file = write(dir.path(), "key.pem", &key);
+        let state = TlsState::load(TlsConfig::new(&cert_file, &key_file)).expect("loads");
+
+        let (next_cert, next_key) = self_signed("second");
+        fs::write(&cert_file, &next_cert).expect("rotate certificate");
+        for attempt in 1..=2 {
+            let error = state
+                .reload()
+                .await
+                .expect_err("a mismatched pair must fail on every reload, not only the first");
+            assert!(
+                error.to_string().contains("pair"),
+                "attempt {attempt}: {error}"
+            );
+        }
+
+        fs::write(&key_file, &next_key).expect("rotate key");
+        assert!(state.reload().await.expect("the fixed rotation loads"));
     }
 
     #[test]
