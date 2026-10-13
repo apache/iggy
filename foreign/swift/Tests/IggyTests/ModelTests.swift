@@ -131,7 +131,7 @@ struct OptionsBlockTests {
     /// as truncation, even when the length would not fit a 32-bit `Int`.
     @Test func prefixedBlocksAreBoundsChecked() {
         var reader = ByteReader([0xFF, 0xFF, 0xFF, 0xFF, 1, 2])
-        #expect(throws: WireError.truncated(offset: 4, need: 4_294_967_295, have: 2)) { try OptionsBlock.readPrefixed(from: &reader) }
+        #expect(throws: WireError.truncated(offset: 4, need: 4_294_967_295, have: 2)) { try reader.readPrefixedBytes() }
     }
 
     @Test func rejectsNonStringAndDuplicateKeys() throws {
@@ -149,11 +149,11 @@ struct OptionsBlockTests {
         writer.write(UInt32(block.count))
         writer.write(block)
         var reader = ByteReader(writer.bytes)
-        let decoded = try OptionsBlock.decode(try OptionsBlock.readPrefixed(from: &reader), explicit: true)
+        let decoded = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
         #expect(decoded == options)
         #expect(reader.isAtEnd)
         var truncated = ByteReader(Array(writer.bytes.dropLast()))
-        #expect(throws: WireError.self) { try OptionsBlock.readPrefixed(from: &truncated) }
+        #expect(throws: WireError.self) { try truncated.readPrefixedBytes() }
     }
 
     @Test func derivedEntriesAreNotSentAndExplicitWinsOnMerge() throws {
@@ -244,7 +244,7 @@ struct IggyMessageTests {
     }
 
     @Test func descriptionShowsABoundedPreview() throws {
-        let short = try IggyMessage("hello")
+        let short = try IggyMessage(String("hello"))
         #expect(short.description == "[0] ID:0 'hello'")
         // 46 ASCII bytes then a two-byte "é" straddling the 47-byte cut.
         let straddling = try IggyMessage(String(repeating: "a", count: 46) + "éé" + String(repeating: "b", count: 20))

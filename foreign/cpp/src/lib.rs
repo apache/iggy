@@ -62,6 +62,16 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
+    /// Partition incarnation and consumer-group owner captured by a read or a
+    /// poll. Commit an offset under the context that delivered it, so a
+    /// delayed commit fails instead of landing on a recreated partition or
+    /// under a newer owner.
+    struct PartitionContext {
+        incarnation: u64,
+        owner_generation: u64,
+        metadata_op: u64,
+    }
+
     struct Partition {
         id: u32,
         created_at: u64,
@@ -69,6 +79,9 @@ mod ffi {
         current_offset: u64,
         size_bytes: u64,
         messages_count: u64,
+        /// The owner generation is zero: topic details belong to no consumer
+        /// group.
+        context: PartitionContext,
     }
 
     struct TopicDetails {
@@ -172,6 +185,10 @@ mod ffi {
         current_offset: u64,
         count: u32,
         messages: Vec<IggyMessagePolled>,
+        /// Context of the accepted poll. Pass it to `store_consumer_position`
+        /// with an offset from this batch, or to `poll_messages_with_context`
+        /// to continue from one.
+        context: PartitionContext,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.
@@ -582,7 +599,27 @@ mod ffi {
             consumer_kind: String,
             consumer_id: Identifier,
         ) -> Result<()>;
+        /// Stores `offset` under `context`, normally the one returned with the
+        /// polled batch. Every retry keeps it, so a deleted or recreated
+        /// partition fails with HistoryUnavailable (87) and a lost
+        /// consumer-group owner with ConsumerGroupPartitionNotOwned (5009).
+        #[allow(clippy::too_many_arguments)]
+        fn store_consumer_position(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
+            offset: u64,
+            context: PartitionContext,
+        ) -> Result<()>;
 
+        /// The poll takes the context its cached route reports. After another
+        /// client deleted and recreated the partition, one call can fail with
+        /// HistoryUnavailable (87), or ConsumerGroupPartitionNotOwned (5009)
+        /// for a consumer group. The failed route is dropped and the next call
+        /// routes again.
         #[allow(clippy::too_many_arguments)]
         fn poll_messages(
             self: &Client,
@@ -595,6 +632,22 @@ mod ffi {
             polling_strategy_value: u64,
             count: u32,
             auto_commit: bool,
+        ) -> Result<PolledMessages>;
+        /// Polls under `context`, normally the one returned with the offset the
+        /// poll continues from. Every retry keeps it.
+        #[allow(clippy::too_many_arguments)]
+        fn poll_messages_with_context(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
+            polling_strategy_kind: String,
+            polling_strategy_value: u64,
+            count: u32,
+            auto_commit: bool,
+            context: PartitionContext,
         ) -> Result<PolledMessages>;
 
         fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;

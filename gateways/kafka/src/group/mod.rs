@@ -19,8 +19,8 @@
 //!
 //! [`GroupCoordinator`] owns every group this gateway instance coordinates and is the only
 //! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup`/
-//! `OffsetCommit` handlers translate wire messages into the request types here, and `state` holds
-//! the synchronous state machine those requests drive.
+//! `DescribeGroups`/`ListGroups`/`OffsetCommit` handlers translate wire messages into the request types here,
+//! and `state` holds the synchronous state machine those requests drive.
 //!
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
 //! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
@@ -43,6 +43,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::group::state::{GroupState, Step};
 use crate::protocol::api::{ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
+
+/// `DescribeGroups` / `ListGroups` state string for a group with no joined members.
+pub const GROUP_STATE_EMPTY: &str = "Empty";
+/// `DescribeGroups` / `ListGroups` state string for a group preparing a rebalance.
+pub const GROUP_STATE_PREPARING_REBALANCE: &str = "PreparingRebalance";
+/// `DescribeGroups` / `ListGroups` state string for a group waiting on `SyncGroup`.
+pub const GROUP_STATE_COMPLETING_REBALANCE: &str = "CompletingRebalance";
+/// `DescribeGroups` / `ListGroups` state string for a group whose assignment is in effect.
+pub const GROUP_STATE_STABLE: &str = "Stable";
+
+/// v6 `error_message` when one `DescribeGroups` group does not fit the response budget.
+///
+/// `UNKNOWN_SERVER_ERROR` is not retried by `kafka-consumer-groups.sh`, so the tool prints this
+/// for the groups that did not fit and still shows the ones that did. A retriable code would
+/// send the same describe-all request back until the client timed out.
+pub const DESCRIBE_RESPONSE_TOO_LARGE: &str = "Group description exceeds the response size limit.";
 
 /// Kafka's own `group.min.session.timeout.ms` default.
 const DEFAULT_MIN_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
@@ -324,6 +340,40 @@ impl LeaveResult {
     }
 }
 
+/// One member as `DescribeGroups` reports it.
+#[derive(Debug, Clone)]
+pub struct MemberDescription {
+    pub member_id: StrBytes,
+    pub group_instance_id: Option<StrBytes>,
+    /// Subscription metadata for the group's selected protocol. Empty until a protocol is chosen.
+    pub metadata: Bytes,
+    pub assignment: Bytes,
+}
+
+/// One group as `ListGroups` reports it. Member blobs stay on the coordinator.
+#[derive(Debug, Clone)]
+pub struct GroupListing {
+    pub group_id: StrBytes,
+    pub protocol_type: StrBytes,
+    pub state: &'static str,
+}
+
+/// One group the coordinator currently holds, as `DescribeGroups` reports it.
+#[derive(Debug, Clone)]
+pub struct GroupDescription {
+    pub group_id: StrBytes,
+    /// `ERROR_NONE`, or `ERROR_UNKNOWN_SERVER_ERROR` when this group does not fit the response.
+    /// A non-zero code is encoded as an empty group: the other fields are not put on the wire.
+    pub error: i16,
+    /// One of the `GROUP_STATE_*` strings.
+    pub state: &'static str,
+    pub protocol_type: StrBytes,
+    /// Selected protocol name. `None` until the group is `Stable`, and `None` when the group is
+    /// described without member metadata.
+    pub protocol_name: Option<StrBytes>,
+    pub members: Vec<MemberDescription>,
+}
+
 /// The answer for one `LeavingMember`.
 #[derive(Debug, Clone)]
 pub struct LeftMember {
@@ -492,6 +542,28 @@ impl GroupCoordinator {
         state::leave_step(&mut groups, request, Instant::now())
     }
 
+    /// Snapshot of each distinct group, in first-seen order. `None` means the group is not here.
+    ///
+    /// Ids are deduped before the lock is taken. Under the lock each remaining group is ticked
+    /// once and snapshotted once. A group that does not fit is returned with
+    /// `UNKNOWN_SERVER_ERROR` instead of failing the whole response. Encoding happens
+    /// after this returns.
+    pub async fn describe_groups(
+        &self,
+        group_ids: &[StrBytes],
+        version: i16,
+        max_frame_size: usize,
+    ) -> Vec<Option<GroupDescription>> {
+        let mut groups = self.groups.lock().await;
+        state::describe_groups(
+            &mut groups,
+            group_ids,
+            version,
+            max_frame_size,
+            Instant::now(),
+        )
+    }
+
     /// Whether `request` may commit offsets for its group. A member's commit also refreshes its
     /// session. Never parks.
     pub async fn validate_commit(&self, request: &CommitRequest) -> i16 {
@@ -509,6 +581,15 @@ impl GroupCoordinator {
         };
         let groups = self.groups.lock().await;
         state::offset_hold(&groups, member, hold, Instant::now())
+    }
+    /// Every group currently in the map, ordered by group id.
+    ///
+    /// Does not tick. A list names no group, and sweeping here would open rebalances as a side
+    /// effect of reading. Groups whose sessions and pending ids are already past `now` are left
+    /// out, which is the same membership `DescribeGroups` would see after it did tick.
+    pub async fn list_groups(&self) -> Vec<GroupListing> {
+        let groups = self.groups.lock().await;
+        state::list_groups(&groups, Instant::now())
     }
 
     /// Sleeps until the group changes or `wake_at` passes. `false` means the gateway is draining.

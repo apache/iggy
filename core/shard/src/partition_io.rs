@@ -188,6 +188,7 @@ pub struct PartitionIoLane<SB> {
     ready: Rc<ReadyPartitions>,
     interrupted: Rc<Cell<bool>>,
     closed: Cell<bool>,
+    timeout: Cell<Duration>,
     counters: Rc<IoCounters>,
     #[cfg(test)]
     execution_gate: RefCell<Option<futures::channel::oneshot::Receiver<()>>>,
@@ -206,6 +207,7 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             }),
             interrupted: Rc::new(Cell::new(false)),
             closed: Cell::new(false),
+            timeout: Cell::new(Duration::ZERO),
             counters: Rc::new(IoCounters {
                 fenced: metrics.partition_io_fenced_counter(),
                 timeouts: metrics.partition_io_timeouts_counter(),
@@ -525,16 +527,28 @@ impl<SB: SuperblockStore> PartitionIoLane<SB> {
             })
     }
 
+    pub(crate) fn set_timeout(&self, timeout: Duration) {
+        self.timeout.set(timeout);
+    }
+
     pub(crate) fn tick(&self) {
-        // Count the injected pump ticks so the simulator uses the same deadline.
+        let timeout = self.timeout.get();
+        if timeout.is_zero() {
+            return;
+        }
+        // Count injected pump ticks, not wall time, so tests drive the deadline
+        // deterministically. The simulator never sets it, so it stays disabled there.
         // A timed-out writer keeps its lease and allocation charge until shutdown.
         for slot in self.slots.borrow().iter().flatten() {
             if slot.state.get() != SlotState::Running {
                 continue;
             }
-            let elapsed = slot.elapsed.get() + crate::CONSENSUS_TICK_INTERVAL;
+            let elapsed = slot
+                .elapsed
+                .get()
+                .saturating_add(crate::CONSENSUS_TICK_INTERVAL);
             slot.elapsed.set(elapsed);
-            if elapsed >= partitions::PARTITION_IO_DRAIN_TIMEOUT {
+            if elapsed >= timeout {
                 tracing::error!(
                     namespace_raw = slot.namespace.inner(),
                     "partition file job timed out; fencing its owner"
@@ -769,8 +783,8 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, LocalPipeline, PartitionsHandle, Pipeline, Sequencer, StateArtifact,
-        StateTransferStage, VsrConsensus, artifact_kind,
+        ArtifactProgress, Consensus, LocalPipeline, PartitionsHandle, Pipeline, Sequencer,
+        StateArtifact, StateTransferStage, VsrConsensus, artifact_kind,
     };
     use futures::FutureExt;
     use futures::channel::oneshot;
@@ -2182,6 +2196,7 @@ mod tests {
         });
         let bus = Rc::new(IggyMessageBus::new(0));
         let (owner, _sender) = test_owner(&bus, Some(&store));
+        owner.set_partition_io_timeout(partitions::PARTITION_IO_DRAIN_TIMEOUT);
         let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
         let (slot, captured) = capture_first_write(&owner).await;
         let identity = captured.identity;
@@ -2468,6 +2483,172 @@ mod tests {
                 .bytes_max()
                 >= minimum
         );
+    }
+
+    #[compio::test]
+    async fn given_configured_wedge_window_when_file_job_is_slow_should_keep_running() {
+        // Default `[cluster] superblock_wedged_fatal_timeout` in core/server/config.toml.
+        const WEDGE_WINDOW_DEFAULT: Duration = Duration::from_secs(120);
+        const SLOW_JOB: Duration = Duration::from_secs(31);
+        for timeout in [Duration::ZERO, WEDGE_WINDOW_DEFAULT] {
+            let store = Rc::new(HeldSuperblock {
+                entered: RefCell::new(None),
+                held: RefCell::new(None),
+            });
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let (owner, _sender) = test_owner(&bus, Some(&store));
+            owner.set_partition_io_timeout(timeout);
+            let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
+            let (slot, captured) = capture_first_write(&owner).await;
+            let identity = captured.identity;
+            owner.partition_io.dispatch(slot, captured, &captured_bus);
+            let mut elapsed = Duration::ZERO;
+            while elapsed < SLOW_JOB {
+                owner.partition_io.tick();
+                elapsed += crate::CONSENSUS_TICK_INTERVAL;
+            }
+            let mut scratch = Vec::new();
+            assert!(
+                owner.tick_partitions(&mut scratch).await.is_none(),
+                "a {SLOW_JOB:?} file job stopped the server with timeout {timeout:?}"
+            );
+            let completion = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
+            completion.await;
+            let token = owner
+                .partition_io
+                .try_recv()
+                .expect("the slow job result must reach its owner");
+            owner.accept_partition_io_completion(token);
+            let partition = owner
+                .plane
+                .partitions()
+                .get_io_owner(&identity.namespace)
+                .unwrap();
+            assert!(partition.fatal().is_none());
+        }
+    }
+
+    #[compio::test]
+    async fn given_deleted_owner_when_file_job_times_out_should_stop_the_node() {
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (mut owner, _sender) = test_owner(&bus, Some(&store));
+        owner.partition_io = super::PartitionIoLane::new(
+            super::PartitionIoLimits::new(1, None).unwrap(),
+            &owner.metrics,
+        );
+        owner.set_partition_io_timeout(partitions::PARTITION_IO_DRAIN_TIMEOUT);
+        let captured_bus = crate::poll::timeout_tests::PollTestBus::default();
+        let (slot, captured) = capture_first_write(&owner).await;
+        let identity = captured.identity;
+        let charge = owner.partition_io.charged.get();
+        owner.partition_io.dispatch(slot, captured, &captured_bus);
+        let partitions = owner.plane.partitions();
+        let other = IggyNamespace::new(0, 0, 1);
+        let other_incarnation = partitions.get_by_ns(&other).unwrap().incarnation();
+
+        // `tear_down_owned_partition` tombstones before draining the writer.
+        let teardown = partitions.capture_teardown(&identity.namespace).unwrap();
+        partitions.tombstone(identity.namespace);
+        owner.shards_table.remove(&identity.namespace);
+        let drain = teardown.drain().fuse();
+        futures::pin_mut!(drain);
+        assert!(futures::poll!(&mut drain).is_pending());
+
+        let mut elapsed = Duration::ZERO;
+        while elapsed + crate::CONSENSUS_TICK_INTERVAL < partitions::PARTITION_IO_DRAIN_TIMEOUT {
+            owner.partition_io.tick();
+            elapsed += crate::CONSENSUS_TICK_INTERVAL;
+        }
+        let mut scratch = Vec::new();
+        let fault = owner.tick_partitions(&mut scratch).await;
+
+        assert!(
+            partitions
+                .get_io_owner(&identity.namespace)
+                .unwrap()
+                .fatal()
+                .is_some(),
+            "the timeout fences the deleted owner"
+        );
+        assert!(
+            matches!(futures::poll!(&mut drain), std::task::Poll::Ready(Err(_))),
+            "the pending delete fails once the writer is interrupted"
+        );
+        assert!(
+            partitions
+                .capture_teardown(&identity.namespace)
+                .unwrap()
+                .drain()
+                .await
+                .is_err(),
+            "a retried delete fails at once and keeps the files"
+        );
+        let late = captured_bus.spawned_tasks.borrow_mut().pop().unwrap();
+        late.await;
+        assert!(owner.partition_io.try_recv().is_none());
+        owner.partition_io.release(slot);
+        assert_eq!(owner.partition_io.charged.get(), charge);
+        assert!(
+            owner
+                .partition_io
+                .try_reserve(other, other_incarnation, charge)
+                .is_none(),
+            "the interrupted slot stays held while the node runs on"
+        );
+        assert!(
+            fault.is_some(),
+            "a timed-out writer on a deleted owner must stop the node"
+        );
+    }
+
+    #[compio::test]
+    async fn given_scheduled_transfer_when_repair_catches_up_should_cancel_only_caught_up_rearms() {
+        for (commit_max, repair_finished) in [(0, false), (0, true), (1, false)] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let (owner, _sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let consensus = VsrConsensus::new(
+                1,
+                1,
+                3,
+                namespace.inner(),
+                bus.clone(),
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            consensus.advance_commit_max(commit_max);
+            let mut partition = IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(SEGMENT_BYTES),
+            );
+            partition.transfer_rearm = Some(partitions::state_transfer::PendingTransferRearm {
+                peer: 0,
+                after_ticks: u32::from(repair_finished),
+            });
+            partition.repair = repair_finished.then_some(partitions::RepairSession {
+                nonce: 1,
+                view: 0,
+                commit_to_op: commit_max,
+                fetch_to_op: commit_max,
+                floor: None,
+                peer: 0,
+                first_batch_offset: None,
+                idle_ticks: 0,
+            });
+            owner.plane.partitions().insert(namespace, partition);
+
+            assert!(owner.tick_partitions(&mut Vec::new()).await.is_none());
+
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            assert_eq!(partition.consensus().is_transferring(), commit_max > 0);
+            assert_eq!(partition.transfer.is_some(), commit_max > 0);
+            assert!(partition.transfer_rearm.is_none());
+        }
     }
 
     #[allow(clippy::future_not_send)]

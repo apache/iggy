@@ -87,6 +87,7 @@ pub fn sample(
         Outcome::PartitionIdSpaceExhausted => {
             unreachable!("create_partitions does not target PartitionIdSpaceExhausted")
         }
+        Outcome::PartitionResizeDisabled => None,
     }
 }
 

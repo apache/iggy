@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::diagnostic_events::diagnostic_event_channel;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
@@ -29,13 +30,14 @@ use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
-use crate::vsr::retain_replay_header;
-use async_broadcast::{Receiver, Sender, broadcast};
+use crate::vsr::{RetainedRequest, retain_replay_header};
+use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
 };
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 #[cfg(test)]
 use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
@@ -110,6 +112,11 @@ pub struct TcpClient {
     /// Set once a sign-in on this client has gone looking for the roster, so
     /// that read happens once (see [`TcpClient::learn_roster_once`]).
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Credentials a sign-in on this client succeeded with, so a reconnect --
     /// onto this node or, after a failover, another one -- can re-establish
     /// the session instead of surfacing `Unauthenticated`. Cleared on logout.
@@ -168,10 +175,12 @@ impl Default for TcpClient {
 #[async_trait]
 impl Client for TcpClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         TcpClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
         // An explicit disconnect is caller intent, like a logout: the session
         // it ends must not be resurrected by the next reconnect, so the
         // remembered sign-in goes with it. Involuntary drops (a dead socket,
@@ -196,15 +205,19 @@ impl BinaryTransport for TcpClient {
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.write_offset(self, code, payload).await
+        self.poll_router
+            .write_offset(self, code, payload, context)
+            .await
     }
 
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.poll(self, request).await
+        self.poll_router.poll(self, request, context).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -220,16 +233,29 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
+        if let Err(error) = self.events.0.try_broadcast(event) {
             error!("Failed to send a TCP diagnostic event: {error}");
         }
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        if is_poll_routing_code(code) {
-            return self.send_poll_request(code, payload).await;
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
+        if self.caller_disconnected() {
+            return Err(match self.get_state().await {
+                ClientState::Shutdown => IggyError::ClientShutdown,
+                _ => IggyError::NotConnected,
+            });
         }
-        let mut header = None;
+        if is_poll_routing_code(code) {
+            return self
+                .send_poll_request_with_context(code, payload, context)
+                .await;
+        }
+        let mut header = RetainedRequest::new(context);
         let result = self
             .send_raw_retaining_header(
                 code,
@@ -525,10 +551,22 @@ impl PollTransport for TcpClient {
         Ok(client)
     }
 
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
         let now = tokio::time::Instant::now();
         let (_, result) = self
-            .send_raw_vsr_attempt(code, payload, None, now, now + RESPONSE_READ_TIMEOUT, false)
+            .send_raw_vsr_attempt(
+                code,
+                payload,
+                RetainedRequest::new(context),
+                now,
+                now + RESPONSE_READ_TIMEOUT,
+                false,
+            )
             .await;
         if matches!(result, Err(IggyError::Disconnected | IggyError::TcpError)) {
             self.set_state(ClientState::Disconnected).await;
@@ -589,12 +627,13 @@ impl TcpClient {
             client_address: Mutex::new(None),
             stream: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
-            events: broadcast(1000),
+            events: diagnostic_event_channel(),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             configured_password: Mutex::new(None),
             configured_username: Mutex::new(None),
             session_credentials: Mutex::new(None),
@@ -606,7 +645,7 @@ impl TcpClient {
         })
     }
 
-    async fn connect(&self) -> Result<(), IggyError> {
+    pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         self.connect_with_settlement(false).await
     }
 
@@ -658,6 +697,10 @@ impl TcpClient {
                         trace!("Client is already connecting.");
                         return Ok(());
                     }
+                    _ if self.caller_disconnected() => {
+                        trace!("Cannot connect. The caller disconnected the client.");
+                        return Err(IggyError::NotConnected);
+                    }
                     _ => *state = ClientState::Connecting,
                 }
             }
@@ -701,8 +744,19 @@ impl TcpClient {
                     sleep(remaining.get_duration()).await;
                 }
 
+                if self.caller_disconnected() {
+                    self.fail_connect().await;
+                    return Err(IggyError::NotConnected);
+                }
+
                 info!("{NAME} client is connecting to server: {server_address}...");
                 match self.establish_bounded(&server_address, &candidates).await {
+                    // Dropped before it is installed: the caller disconnected
+                    // while it was being dialed.
+                    Ok(_) if self.caller_disconnected() => {
+                        self.fail_connect().await;
+                        return Err(IggyError::NotConnected);
+                    }
                     Ok(connection) => {
                         let dialed = server_address.clone();
                         // The endpoint that answered is where this client now
@@ -760,6 +814,11 @@ impl TcpClient {
                     continue;
                 }
                 candidate = 0;
+
+                if self.caller_disconnected() {
+                    self.fail_connect().await;
+                    return Err(IggyError::NotConnected);
+                }
 
                 // An unreadable CA file, a domain that will not parse: no
                 // endpoint answered and at least one said why in a way that a
@@ -1269,6 +1328,13 @@ impl TcpClient {
         self.publish_event(DiagnosticEvent::Disconnected).await;
     }
 
+    /// A reconnect sweep checks this before each dial, before each retry pause
+    /// and before it signs in: once the caller disconnects, nothing in the
+    /// sweep may bring the client back.
+    fn caller_disconnected(&self) -> bool {
+        self.disconnected_by_caller.load(Ordering::SeqCst)
+    }
+
     /// [`Self::establish`], bounded while other endpoints are queued behind
     /// this one (see `FAILOVER_DIAL_TIMEOUT`). The bound covers the handshake
     /// as well as the connect: a peer that accepts TCP and then never answers
@@ -1320,20 +1386,25 @@ impl TcpClient {
     /// failover unauthenticated. The public [`Client::disconnect`] wraps this
     /// and forgets them first.
     async fn disconnect_transport(&self) -> Result<(), IggyError> {
-        match self.get_state().await {
-            ClientState::Disconnected => return Ok(()),
-            // Preserve the stream a concurrent reconnect is installing.
-            ClientState::Connecting => {
-                trace!("Not disconnecting; a connect is already in flight.");
-                return Ok(());
-            }
-            _ => {}
+        // Preserve the stream a concurrent reconnect is installing.
+        // A `Connecting` that no sweep owns, such as one left by an aborted
+        // heartbeat, is torn down like any other state.
+        if self.get_state().await == ClientState::Connecting && self.connect_coordinator.is_active()
+        {
+            trace!("Not disconnecting; a connect is already in flight.");
+            return Ok(());
+        }
+        // Taken before the state is read: a teardown aborted after it set
+        // `Disconnected` can leave the stream installed.
+        let stream = self.stream.lock().await.take();
+        if stream.is_none() && self.get_state().await == ClientState::Disconnected {
+            return Ok(());
         }
 
         let client_address = self.get_client_address_value().await;
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
-        self.stream.lock().await.take();
+        drop(stream);
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!("{NAME} client: {client_address} has disconnected from server at: {now}.");
@@ -1362,7 +1433,7 @@ impl TcpClient {
         &self,
         code: u32,
         payload: Bytes,
-        header: &mut Option<iggy_binary_protocol::RequestHeader>,
+        header: &mut RetainedRequest,
         previous_error: &IggyError,
     ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
@@ -1412,7 +1483,7 @@ impl TcpClient {
                     true,
                 )
                 .await;
-            *header = encoded.or(*header);
+            header.header = encoded.or(header.header);
             match result {
                 Err(IggyError::TransientNotAccepted)
                     if tokio::time::Instant::now() < overall_deadline
@@ -1545,7 +1616,7 @@ impl TcpClient {
         &self,
         code: u32,
         payload: Bytes,
-        preencoded: Option<iggy_binary_protocol::consensus::RequestHeader>,
+        mut preencoded: RetainedRequest,
         transient_deadline: tokio::time::Instant,
         read_deadline: tokio::time::Instant,
         retry_transient: bool,
@@ -1553,15 +1624,66 @@ impl TcpClient {
         Option<iggy_binary_protocol::consensus::RequestHeader>,
         Result<Bytes, IggyError>,
     ) {
+        let mut retry_outcome = crate::vsr::RetryOutcome::default();
+        let mut lifecycle_retry_interval = NOT_READY_RETRY_INTERVAL;
+        loop {
+            let (request_header, result) = self
+                .send_raw_vsr_exchange(
+                    code,
+                    payload.clone(),
+                    preencoded,
+                    transient_deadline,
+                    read_deadline,
+                    retry_transient,
+                    &mut retry_outcome,
+                )
+                .await;
+            match result {
+                // The refusal committed under this request id, so the retry is a
+                // new request. The pause holds no stream lock, and the next
+                // exchange takes its id only once it holds the stream, above any
+                // id another request sent during the pause.
+                Err(IggyError::LifecycleBusy)
+                    if retry_transient
+                        && tokio::time::Instant::now() + lifecycle_retry_interval
+                            < read_deadline =>
+                {
+                    preencoded.header = None;
+                    tokio::time::sleep(lifecycle_retry_interval).await;
+                    lifecycle_retry_interval = (lifecycle_retry_interval * 2)
+                        .min(crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL);
+                }
+                result => return (request_header, result),
+            }
+        }
+    }
+
+    /// The part of [`Self::send_raw_vsr_attempt`] that holds the stream lock.
+    /// `retry_outcome` carries over between the exchanges of one attempt.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_raw_vsr_exchange(
+        &self,
+        code: u32,
+        payload: Bytes,
+        mut preencoded: RetainedRequest,
+        transient_deadline: tokio::time::Instant,
+        read_deadline: tokio::time::Instant,
+        retry_transient: bool,
+        retry_outcome: &mut crate::vsr::RetryOutcome,
+    ) -> (
+        Option<iggy_binary_protocol::consensus::RequestHeader>,
+        Result<Bytes, IggyError>,
+    ) {
         let stream = self.stream.clone();
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
+        let mut outcome_so_far = std::mem::take(retry_outcome);
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         let joined = tokio::spawn(async move {
             let mut stream_guard = stream.lock().await;
             let Some(stream) = stream_guard.as_mut() else {
                 error!("Cannot send data. Client is not connected.");
-                return (None, Err(IggyError::NotConnected));
+                return (None, Err(IggyError::NotConnected), outcome_so_far);
             };
             // Encode the request header ONCE per session: `next_request_id`
             // advances here, so a transient replay must reuse the same id for
@@ -1572,39 +1694,23 @@ impl TcpClient {
             // pipeline-full / view-change cancel) lets us resend the SAME
             // request on the SAME connection with no reconnect and the session
             // intact.
-            let request_header = match preencoded {
-                Some(header) => {
-                    let Ok(session) = consensus_session.lock() else {
-                        return (Some(header), Err(IggyError::InvalidConfiguration));
-                    };
-                    if let Err(error) = crate::vsr::validate_retained_header(&header, &session) {
-                        return (Some(header), Err(error));
-                    }
-                    header
-                }
-                None => {
-                    let encoded = {
-                        let Ok(mut consensus_session) = consensus_session.lock() else {
-                            return (None, Err(IggyError::InvalidConfiguration));
-                        };
-                        crate::vsr::encode_request_header(&mut consensus_session, code, &payload)
-                    };
-                    match encoded {
-                        Ok((header, request_size)) => {
-                            trace!(
-                                "Sending a TCP VSR request of size {request_size} with code: {code}"
-                            );
-                            header
-                        }
-                        Err(error) => return (None, Err(error)),
-                    }
+            let request_header = {
+                let Ok(mut session) = consensus_session.lock() else {
+                    return (
+                        preencoded.header,
+                        Err(IggyError::InvalidConfiguration),
+                        outcome_so_far,
+                    );
+                };
+                match preencoded.encode(&mut session, code, &payload) {
+                    Ok(header) => header,
+                    Err(error) => return (preencoded.header, Err(error), outcome_so_far),
                 }
             };
-            let header_bytes = bytemuck::bytes_of(&request_header);
             let mut frame_complete = false;
-            let mut retry_outcome = crate::vsr::RetryOutcome::default();
             let outcome = async {
                 loop {
+                    let header_bytes = bytemuck::bytes_of(&request_header);
                     frame_complete = false;
                     stream.write(header_bytes).await?;
                     if !payload.is_empty() {
@@ -1673,7 +1779,7 @@ impl TcpClient {
                     frame_complete = true;
                     crate::vsr::observe_metadata_reply(&metadata_watermark, &response_header);
                     match crate::vsr::decode_response_split(&response_header, body)
-                        .map_err(|error| retry_outcome.observe(error))
+                        .map_err(|error| outcome_so_far.observe(error))
                     {
                         Err(error) if !retry_transient => return Err(error),
                         // `TransientNotCommitted`: the op's outcome is unknown
@@ -1711,11 +1817,14 @@ impl TcpClient {
             if !frame_complete {
                 stream_guard.take();
             }
-            (Some(request_header), outcome)
+            (Some(request_header), outcome, outcome_so_far)
         })
         .await;
         match joined {
-            Ok(result) => result,
+            Ok((request_header, outcome, outcome_so_far)) => {
+                *retry_outcome = outcome_so_far;
+                (request_header, outcome)
+            }
             Err(e) => {
                 error!("Task execution failed during TCP request: {}", e);
                 (None, Err(IggyError::TcpError))
@@ -1753,8 +1862,12 @@ fn tls_server_name(server_address: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic_events::DIAGNOSTIC_EVENT_CAPACITY;
     use crate::vsr::replay_after_session_reset_is_safe;
-    use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::codes::{
+        GET_ME_CODE, JOIN_CONSUMER_GROUP_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
+    };
+    use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
     use iggy_binary_protocol::requests::system::BindSessionRequest;
     use iggy_binary_protocol::responses::users::LoginRegisterResponse;
     use iggy_binary_protocol::{
@@ -1762,6 +1875,7 @@ mod tests {
         WireDecode, WireEncode, WireName,
     };
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
@@ -1959,7 +2073,11 @@ mod tests {
             });
             let result = tokio::time::timeout(
                 TEST_BUDGET,
-                client.send_raw_with_response(SEND_MESSAGES_CODE, Bytes::from_static(b"lost-send")),
+                client.send_raw_with_context(
+                    SEND_MESSAGES_CODE,
+                    Bytes::from_static(b"lost-send"),
+                    PartitionContext::default(),
+                ),
             )
             .await
             .expect("resume must finish without waiting for the ordinary write retry budget");
@@ -1983,9 +2101,10 @@ mod tests {
                     );
                     assert_eq!(
                         client
-                            .send_raw_with_response(
+                            .send_raw_with_context(
                                 SEND_MESSAGES_CODE,
-                                Bytes::from_static(b"explicit-new-send")
+                                Bytes::from_static(b"explicit-new-send"),
+                                PartitionContext::default()
                             )
                             .await
                             .unwrap(),
@@ -2033,7 +2152,7 @@ mod tests {
             .send_raw_vsr_attempt(
                 SEND_MESSAGES_CODE,
                 Bytes::from_static(b"send"),
-                None,
+                crate::vsr::RetainedRequest::default(),
                 deadline,
                 deadline,
                 false,
@@ -2079,7 +2198,10 @@ mod tests {
         let attempt = client.send_raw_vsr_attempt(
             SEND_MESSAGES_CODE,
             payload,
-            Some(retained),
+            RetainedRequest {
+                header: Some(retained),
+                context: PartitionContext::default(),
+            },
             deadline,
             deadline,
             false,
@@ -2113,16 +2235,19 @@ mod tests {
         Client::connect(&*client).await.unwrap();
         client.bind_vsr_session(1).await.unwrap();
         let payload = Bytes::from_static(b"uncertain-send");
-        let mut retained = Some(
-            crate::vsr::encode_request_header(
-                &mut client.consensus_session.lock().unwrap(),
-                SEND_MESSAGES_CODE,
-                &payload,
-            )
-            .unwrap()
-            .0,
-        );
-        let original = retained.unwrap();
+        let mut retained = RetainedRequest {
+            header: Some(
+                crate::vsr::encode_request_header(
+                    &mut client.consensus_session.lock().unwrap(),
+                    SEND_MESSAGES_CODE,
+                    &payload,
+                )
+                .unwrap()
+                .0,
+            ),
+            context: PartitionContext::default(),
+        };
+        let original = retained.header.unwrap();
         let peer_client = Arc::clone(&client);
         let (finished, mut finish) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
@@ -2176,7 +2301,196 @@ mod tests {
             "an ambiguous send was reissued under a new identity"
         );
         assert_eq!(result.unwrap_err(), IggyError::TransientNotCommitted);
-        assert_eq!(retained.unwrap().client, original.client);
+        assert_eq!(retained.header.unwrap().client, original.client);
+    }
+
+    #[tokio::test]
+    async fn given_committed_lifecycle_refusal_when_retried_should_use_a_fresh_request_id() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let (listener, address) = live_endpoint().await;
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let context = PartitionContext {
+            incarnation: 17,
+            owner_generation: 3,
+            metadata_op: 4,
+        };
+        let payload = Bytes::from_static(b"join-body");
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (first, body) = read_test_request(&mut stream).await;
+            assert_eq!(first.operation, Operation::JoinConsumerGroup);
+            assert_eq!(body, b"join-body");
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            answer_test_request(&mut stream, &first, 0, &rejection).await;
+            let (second, retry_body) = read_test_request(&mut stream).await;
+            assert_ne!(second.request, first.request);
+            assert_eq!(second.client, first.client);
+            assert_eq!(second.session, first.session);
+            assert_eq!(second.partition_incarnation, first.partition_incarnation);
+            assert_eq!(second.owner_generation, first.owner_generation);
+            assert_eq!(second.minimum_metadata_op, first.minimum_metadata_op);
+            assert_eq!(first.partition_incarnation, context.incarnation);
+            assert_eq!(first.owner_generation, context.owner_generation);
+            assert_eq!(first.minimum_metadata_op, context.metadata_op);
+            assert_eq!(retry_body, body);
+            let mut success = 0u32.to_le_bytes().to_vec();
+            success.extend_from_slice(b"joined");
+            answer_test_request(&mut stream, &second, 0, &success).await;
+        });
+        let deadline = tokio::time::Instant::now() + TEST_BUDGET;
+        let (_, result) = tokio::time::timeout(
+            TEST_BUDGET,
+            client.send_raw_vsr_attempt(
+                JOIN_CONSUMER_GROUP_CODE,
+                payload,
+                RetainedRequest {
+                    header: None,
+                    context,
+                },
+                deadline,
+                deadline,
+                true,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), Bytes::from_static(b"joined"));
+        peer.await.unwrap();
+        Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_lasting_lifecycle_refusal_when_retried_should_back_off() {
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        // A pause doubling from 50 ms fits five attempts into the budget, a fixed one twenty.
+        const MAX_ATTEMPTS: usize = 5;
+        let (listener, address) = live_endpoint().await;
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            let mut attempts = 0;
+            let mut header = [0; HEADER_SIZE];
+            while stream.read_exact(&mut header).await.is_ok() {
+                attempts += 1;
+                let request: RequestHeader =
+                    bytemuck::checked::try_pod_read_unaligned(&header).unwrap();
+                answer_test_request(&mut stream, &request, 0, &rejection).await;
+            }
+            attempts
+        });
+        let client = client_with(&address);
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let deadline = tokio::time::Instant::now() + RETRY_BUDGET;
+
+        let (_, result) = client
+            .send_raw_vsr_attempt(
+                JOIN_CONSUMER_GROUP_CODE,
+                Bytes::new(),
+                RetainedRequest::default(),
+                deadline,
+                deadline,
+                true,
+            )
+            .await;
+
+        Client::shutdown(&client).await.unwrap();
+        assert_eq!(result.unwrap_err(), IggyError::LifecycleBusy);
+        let attempts = peer.await.unwrap();
+        assert!(
+            attempts <= MAX_ATTEMPTS,
+            "{attempts} retries each committed another lifecycle refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_lifecycle_refusal_when_retried_should_not_block_other_requests() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let (listener, address) = live_endpoint().await;
+        let client = Arc::new(client_with(&address));
+        Client::connect(&*client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let (refused, first_refusal) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            let mut refused = Some(refused);
+            let mut other = None;
+            loop {
+                let (request, _) = read_test_request(&mut stream).await;
+                if request.operation == Operation::SendMessages {
+                    answer_test_request(&mut stream, &request, 0, b"sent").await;
+                    other = Some(request);
+                } else if let Some(other) = other {
+                    // The server accepts only request ids above its watermark.
+                    assert!(
+                        request.request > other.request,
+                        "a retry must take its request id after the requests sent during its pause"
+                    );
+                    let mut success = 0u32.to_le_bytes().to_vec();
+                    success.extend_from_slice(b"joined");
+                    answer_test_request(&mut stream, &request, 0, &success).await;
+                    return;
+                } else {
+                    answer_test_request(&mut stream, &request, 0, &rejection).await;
+                    if let Some(refused) = refused.take() {
+                        refused.send(()).unwrap();
+                    }
+                }
+            }
+        });
+        let join = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+                client
+                    .send_raw_vsr_attempt(
+                        JOIN_CONSUMER_GROUP_CODE,
+                        Bytes::new(),
+                        RetainedRequest::default(),
+                        deadline,
+                        deadline,
+                        true,
+                    )
+                    .await
+                    .1
+            })
+        };
+        first_refusal.await.unwrap();
+        // Start inside the first pause, so a retry that took its request id
+        // before the pause would reach the peer below this request's id.
+        tokio::time::sleep(NOT_READY_RETRY_INTERVAL / 2).await;
+
+        let deadline = tokio::time::Instant::now() + TEST_BUDGET;
+        let (_, sent) = tokio::time::timeout(
+            TEST_BUDGET,
+            client.send_raw_vsr_attempt(
+                SEND_MESSAGES_CODE,
+                Bytes::from_static(b"send-body"),
+                RetainedRequest::default(),
+                deadline,
+                deadline,
+                true,
+            ),
+        )
+        .await
+        .expect("a request must not wait out the lifecycle retries of another request");
+        assert_eq!(sent.unwrap(), Bytes::from_static(b"sent"));
+        tokio::time::timeout(TEST_BUDGET, peer)
+            .await
+            .unwrap()
+            .unwrap();
+        let joined = tokio::time::timeout(TEST_BUDGET, join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.unwrap(), Bytes::from_static(b"joined"));
+        Client::shutdown(&*client).await.unwrap();
     }
 
     #[tokio::test]
@@ -2226,7 +2540,7 @@ mod tests {
                 client.send_raw_vsr_attempt(
                     SEND_MESSAGES_CODE,
                     Bytes::new(),
-                    None,
+                    RetainedRequest::default(),
                     now,
                     now + READ_BUDGET,
                     true,
@@ -2262,7 +2576,7 @@ mod tests {
         let mut exchange = Box::pin(client.send_raw_vsr_attempt(
             GET_ME_CODE,
             Bytes::new(),
-            None,
+            RetainedRequest::default(),
             tokio::time::Instant::now(),
             deadline,
             false,
@@ -2563,6 +2877,33 @@ mod tests {
             ),
             "a second connect has to dial again rather than report success"
         );
+    }
+
+    // Each failed connect publishes `Disconnected`, and nothing reads the
+    // receiver the client keeps. A server that stays down must not fill the
+    // event channel and wedge the next connect, nor every call queued behind it.
+    #[tokio::test]
+    async fn failed_connects_past_the_event_capacity_do_not_wedge_the_client() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: dead_endpoint().await,
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        for attempt in 1..=DIAGNOSTIC_EVENT_CAPACITY + 1 {
+            let connect = tokio::time::timeout(Duration::from_secs(5), TcpClient::connect(&client))
+                .await
+                .unwrap_or_else(|_| panic!("connect {attempt} hung"));
+
+            assert!(
+                matches!(connect, Err(IggyError::CannotEstablishConnection)),
+                "connect {attempt}: {connect:?}"
+            );
+        }
     }
 
     // An endpoint that accepts TCP but fails the TLS handshake is not where
@@ -3526,6 +3867,112 @@ mod tests {
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = TcpClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
+        );
+    }
+
+    fn auto_login_client(server_address: String) -> TcpClient {
+        TcpClient::create(Arc::new(TcpClientConfig {
+            server_address,
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "iggy".into(),
+            )),
+            reconnection: TcpClientReconnectionConfig {
+                enabled: true,
+                max_retries: None,
+                interval: NonZeroIggyDuration::from_str("50ms").expect("duration"),
+                // The sweep checks the disconnect between pauses, so a zero
+                // pause keeps this test about the check, not the pacing.
+                reestablish_after: IggyDuration::new(Duration::ZERO),
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client")
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_a_reconnect_sweep_ends_the_sweep() {
+        // Every sign-in fails on the socket, so with unlimited retries the
+        // sweep only ends on a disconnect.
+        let (address, accepts) = counted_endpoint_that_hangs_up().await;
+        let client = Arc::new(auto_login_client(address));
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { TcpClient::connect(&client).await }
+        });
+        while accepts.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        Client::disconnect(&*client).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), sweep)
+            .await
+            .expect("the sweep must end after the disconnect")
+            .expect("the sweep task must not panic");
+        let accepts_after_end = accepts.load(Ordering::SeqCst);
+        sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            matches!(result, Err(IggyError::NotConnected)),
+            "got {result:?}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            accepts_after_end,
+            "nothing may redial after the sweep ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_after_an_explicit_disconnect_fails_without_a_dial() {
+        let (listener, address) = live_endpoint().await;
+        let client = auto_login_client(address);
+        Client::disconnect(&client).await.unwrap();
+
+        let ping = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.send_raw_with_response(PING_CODE, Bytes::new()),
+        )
+        .await
+        .expect("a refused request must not wait");
+
+        assert!(matches!(ping, Err(IggyError::NotConnected)), "got {ping:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "the request must not dial"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_after_a_shutdown_keeps_reporting_the_shutdown() {
+        let client = auto_login_client("127.0.0.1:8090".to_string());
+        Client::shutdown(&client).await.unwrap();
+        Client::disconnect(&client).await.unwrap();
+
+        let ping = client.send_raw_with_response(PING_CODE, Bytes::new()).await;
+
+        assert!(
+            matches!(ping, Err(IggyError::ClientShutdown)),
+            "got {ping:?}"
         );
     }
 }

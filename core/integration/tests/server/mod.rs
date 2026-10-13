@@ -39,7 +39,7 @@ mod poll_semantics_vsr;
 mod topic_admission_vsr;
 // Stats aggregates the cross-shard connected-client count, not a hardcoded 0.
 mod stats_vsr;
-// /metrics carries per-topic size and message count (#4473).
+// /metrics carries per-topic size and message count.
 mod topic_metrics_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
@@ -92,6 +92,6 @@ mod message_retrieval;
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
 mod delete_segments;
-mod scenarios;
+pub(crate) mod scenarios;
 mod specific;
 mod telemetry;

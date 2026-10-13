@@ -54,7 +54,8 @@ fn main() -> Result<()> {
     let mut content = LICENSE.to_owned();
     f.read_to_string(&mut content)?;
     content = content.replacen("__all__ = [", "__all__ = [\n    \"Durability\",", 1);
-    content.push_str("\nclass Durability(str, enum.Enum):\n    REPLICATED = 'replicated'\n    PERSISTED = 'persisted'\n");
+    // The runtime creates a str-backed Enum, whose str() differs from StrEnum.
+    content.push_str("\nclass Durability(str, enum.Enum):  # noqa: UP042\n    REPLICATED = 'replicated'\n    PERSISTED = 'persisted'\n");
 
     let mut f = File::create(path)?;
     f.write_all(content.as_bytes())?;

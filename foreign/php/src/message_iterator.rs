@@ -53,10 +53,7 @@ impl MessageIterator {
             let mut inner = inner.lock().await;
 
             match inner.next().await {
-                Some(Ok(message)) => Ok(Some(ReceiveMessage {
-                    inner: message.message,
-                    partition_id: message.partition_id,
-                })),
+                Some(Ok(message)) => Ok(Some(ReceiveMessage::from(message))),
                 Some(Err(err)) => Err(to_php_exception(err)),
                 None => Ok(None),
             }
