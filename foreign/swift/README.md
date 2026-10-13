@@ -66,12 +66,12 @@ let client = IggyClient(address: "localhost:8090", autoLogin: .usernamePassword(
 try await client.connect()
 let stream = try await client.createStream(name: "orders")
 let topic = try await client.createTopic(streamID: "orders", name: "created", options: .init(partitionsCount: 3))
-try await client.shutdown()
+await client.shutdown()
 ```
 
 One client owns one connection and is safe to share between tasks: requests are
-serialized on the connection. `disconnect()` closes the connection and keeps the client
-usable, `shutdown()` is final.
+serialized on the connection. `disconnect()` closes the connection until the next
+`connect()`, `shutdown()` is final.
 
 ### Configuration
 
@@ -91,8 +91,8 @@ set, and against the host of the address unless `TLSOptions.domain` names anothe
 
 ### Reconnection
 
-A request that hits a dropped connection reconnects, signs in again, and is replayed
-only when it provably never reached the log: reads, pings, and requests the server
+A request that hits a dropped connection reconnects, signs in again, and is replayed,
+all within its `requestTimeout`, and only when it provably never reached the log: reads, pings, and requests the server
 never admitted. A replicated write whose outcome is unknown surfaces the error instead
 of being applied twice. In a cluster the client reads the roster after signing in and
 moves to the leader.

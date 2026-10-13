@@ -71,20 +71,24 @@ public final class IggyClient: Sendable {
     public func connect() async throws {
         try await core.connectByCaller()
         await core.startHeartbeat { [weak self] in
-            await self?.heartbeat()
+            guard let self else {
+                return false
+            }
+            await self.heartbeat()
+            return true
         }
     }
 
     /// Closes the connection and forgets the session. Requests fail with
     /// ``IggyErrorCode/notConnected`` until ``connect()`` is called again; no
     /// reconnect brings the client back on its own.
-    public func disconnect() async throws {
+    public func disconnect() async {
         await core.disconnect()
     }
 
     /// Closes the connection and releases every resource. The client cannot
     /// be used afterwards.
-    public func shutdown() async throws {
+    public func shutdown() async {
         await core.shutdown()
     }
 

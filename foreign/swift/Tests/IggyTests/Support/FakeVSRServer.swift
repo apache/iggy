@@ -75,6 +75,11 @@ final class FakeVSRServer: @unchecked Sendable {
         get async { await state.opened }
     }
 
+    /// Connections that are still open.
+    var openConnectionCount: Int {
+        get async { await state.openCount }
+    }
+
     /// Replaces the script; the default answers everything successfully.
     func respond(_ responder: @escaping Responder) async {
         await state.setResponder(responder)
@@ -225,6 +230,8 @@ actor FakeServerState {
     func connectionClosed(_ channel: Channel) {
         channels[ObjectIdentifier(channel)] = nil
     }
+
+    var openCount: Int { channels.count }
 
     func closeAll() {
         for channel in channels.values {

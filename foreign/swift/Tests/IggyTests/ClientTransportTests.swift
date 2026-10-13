@@ -21,15 +21,35 @@ import Testing
 
 private let rootLogin = Credentials.usernamePassword(username: "iggy", password: "iggy")
 
-/// A client on the fake server with fast reconnection and a short request
-/// timeout, so a stalled test fails in well under a second.
-private func makeClient(_ server: FakeVSRServer, autoLogin: Credentials? = rootLogin, reconnection: Bool = true, maxRetries: UInt32? = nil) -> IggyClient {
+/// A request timeout short enough for a test to wait it out.
+private let shortTimeout: Duration = .milliseconds(500)
+
+/// A client on the fake server with fast reconnection. The request timeout is
+/// generous unless the test is about running into it, so a slow machine does
+/// not cut a reconnect short.
+private func makeClient(
+    _ server: FakeVSRServer, autoLogin: Credentials? = rootLogin, reconnection: Bool = true, maxRetries: UInt32? = nil,
+    requestTimeout: Duration = .seconds(10), connector: any IggyConnector = NIOConnector()
+) -> IggyClient {
     var configuration = ClientConfiguration(address: server.address, autoLogin: autoLogin)
     configuration.reconnection = ReconnectionOptions(enabled: reconnection, maxRetries: maxRetries, interval: .milliseconds(20), reestablishAfter: .zero)
-    configuration.requestTimeout = .milliseconds(500)
-    configuration.connectTimeout = .milliseconds(500)
+    configuration.requestTimeout = requestTimeout
+    configuration.connectTimeout = .seconds(2)
     configuration.heartbeatInterval = .seconds(60)
-    return IggyClient(configuration: configuration, logger: testLogger)
+    return IggyClient(configuration: configuration, connector: connector, logger: testLogger)
+}
+
+/// A dialer that holds every dial until it is released, to stop a client in
+/// the middle of one.
+private struct GatedConnector: IggyConnector {
+    let released = Locked(false)
+
+    func connect(to endpoint: Endpoint, tls: TLSOptions?, timeout: Duration, noDelay: Bool) async throws -> any IggyConnection {
+        while !released.withLock({ $0 }) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        return try await NIOConnector().connect(to: endpoint, tls: tls, timeout: timeout, noDelay: noDelay)
+    }
 }
 
 private func operations(_ server: FakeVSRServer) async -> [ConsensusOperation] {
@@ -70,7 +90,7 @@ struct ClientTransportTests {
         #expect(requests.allSatisfy { $0.clientID == requests[0].clientID })
         #expect(await client.serverAddress == server.address)
         #expect(await client.clientAddress?.hasPrefix("127.0.0.1:") == true)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func manualLoginWithoutAutoLogin() async throws {
@@ -93,7 +113,7 @@ struct ClientTransportTests {
         #expect(await server.requests.last!.clientID != before)
         try await client.logout()
         #expect(await client.state == .connected)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func rejectedCredentialsAreNotRetried() async throws {
@@ -109,7 +129,7 @@ struct ClientTransportTests {
         // disconnected rather than half signed in.
         #expect(await client.state != .authenticated)
         #expect(await operations(server).filter { $0 == .register }.count == 1)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func committedRegisterRejectionIsTyped() async throws {
@@ -121,7 +141,7 @@ struct ClientTransportTests {
         let client = makeClient(server, autoLogin: nil)
         try await client.connect()
         await expectCode(.userInactive) { _ = try await client.login(username: "iggy", password: "iggy") }
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func preCommitDenialsAreTyped() async throws {
@@ -141,7 +161,7 @@ struct ClientTransportTests {
         // The session survives a denial: the next request still goes out.
         try await client.ping()
         #expect(await client.state == .authenticated)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func transientNotCommittedReplaysTheSameRequestID() async throws {
@@ -166,7 +186,7 @@ struct ClientTransportTests {
         #expect(Set(creates.map(\.requestID)).count == 1)
         #expect(Set(creates.map(\.connection)).count == 1)
         #expect(await server.connectionCount == 1)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func transientNotAcceptedReplaysOnASingleNode() async throws {
@@ -193,7 +213,7 @@ struct ClientTransportTests {
         #expect(sends.count == 4)
         #expect(Set(sends.map(\.requestID)).count == 1)
         #expect(await server.connectionCount == 1)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func transientReplayGivesUpAtTheDeadline() async throws {
@@ -203,17 +223,20 @@ struct ClientTransportTests {
             request.operation == .register
                 ? .ok(FakeVSRServer.registerBody()) : request.operation == .createStream ? .status(IggyErrorCode.transientNotCommitted.rawValue) : .ok([])
         }
-        let client = makeClient(server)
+        let client = makeClient(server, requestTimeout: shortTimeout)
         try await client.connect()
         let clock = ContinuousClock()
         let elapsed = await clock.measure {
             await expectCode(.disconnected) { _ = try await client.createStream(name: "x") }
         }
         #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
-        try await client.shutdown()
+        await client.shutdown()
     }
 
-    @Test func requestTimeoutClosesTheConnectionAndReconnects() async throws {
+    /// A reply that never comes spends the whole deadline, so the request
+    /// fails without waiting for a reconnect. The stream is at an unknown
+    /// boundary: the connection is dropped and the next request dials again.
+    @Test func requestTimeoutClosesTheConnectionAndTheNextRequestReconnects() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let stallOnce = Locked(true)
@@ -228,19 +251,77 @@ struct ClientTransportTests {
             }
             return .ok([])
         }
-        let client = makeClient(server)
+        let client = makeClient(server, requestTimeout: shortTimeout)
         try await client.connect()
-        // The timeout leaves the stream at an unknown boundary; a stats read
-        // is non-replicated, so it is replayed over a fresh connection.
         let clock = ContinuousClock()
         let elapsed = await clock.measure {
-            _ = try? await client.getStats()
+            await expectCode(.disconnected) { _ = try await client.getStats() }
         }
-        #expect(elapsed >= .milliseconds(450))
+        #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
+        #expect(await client.state == .disconnected)
+        #expect(await server.connectionCount == 1)
+        try await client.ping()
         #expect(await server.connectionCount == 2)
         #expect(await operations(server).filter { $0 == .register }.count == 2)
         #expect(await client.state == .authenticated)
-        try await client.shutdown()
+        await client.shutdown()
+    }
+
+    /// With unlimited retries a reconnect to a server that is gone never
+    /// ends. The request that started it still has to return at its deadline.
+    @Test func requestDeadlineCoversTheReconnect() async throws {
+        let server = try await FakeVSRServer.started()
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        try await client.connect()
+        await server.stop()
+        let clock = ContinuousClock()
+        let elapsed = await clock.measure {
+            await expectCode(.disconnected) { try await client.ping() }
+        }
+        #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
+        // No caller waits for the sweep any more, so it ends too.
+        #expect(await eventually { await client.state == .disconnected })
+        await client.shutdown()
+    }
+
+    /// An attempt answered with "not committed" may have committed. A later
+    /// "not accepted" for the same request does not prove otherwise, so it
+    /// must not send the request to the next node under a new session, where
+    /// the server cannot recognise it as a repeat.
+    @Test func uncertainOutcomeIsNotReissuedOnAnotherNode() async throws {
+        let first = try await FakeVSRServer.started()
+        let second = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await first.stop()
+                await second.stop()
+            }
+        }
+        let roster = FakeVSRServer.rosterBody([first.address, second.address], leaderIndex: 0)
+        let seen = Locked(0)
+        await first.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(roster) }
+            guard request.operation == .createStream else { return .ok([]) }
+            let count = seen.withLock {
+                $0 += 1; return $0
+            }
+            return .status((count == 1 ? IggyErrorCode.transientNotCommitted : .transientNotAccepted).rawValue)
+        }
+        await second.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(roster) }
+            return .ok([])
+        }
+        let client = makeClient(first, requestTimeout: ClientCore.transientFailoverCheckInterval + .seconds(1))
+        try await client.connect()
+        await #expect(throws: IggyError.self) { _ = try await client.createStream(name: "once") }
+        let attempts = await first.requests.filter { $0.operation == .createStream }
+        #expect(attempts.count > 1)
+        #expect(Set(attempts.map(\.requestID)).count == 1)
+        #expect(Set(attempts.map(\.clientID)).count == 1)
+        #expect(await second.requests.filter { $0.operation == .createStream }.isEmpty)
+        await client.shutdown()
     }
 
     @Test func misroutedReplyDesyncsAndReconnects() async throws {
@@ -263,7 +344,7 @@ struct ClientTransportTests {
         try await client.ping()
         #expect(await server.connectionCount == 2)
         #expect(await codes(server).filter { $0 == CommandCode.ping.rawValue }.count == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func evictionRestoresTheSessionAndReplaysSafeRequests() async throws {
@@ -290,7 +371,7 @@ struct ClientTransportTests {
         #expect(ops.filter { $0 == .register }.count == 2)
         #expect(ops.filter { $0 == .deleteStream }.count == 2)
         #expect(await server.connectionCount == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func staleClientEvictionReconnects() async throws {
@@ -312,7 +393,7 @@ struct ClientTransportTests {
         try await client.connect()
         try await client.ping()
         #expect(await server.connectionCount == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func incompatibleProtocolIsTerminal() async throws {
@@ -324,7 +405,7 @@ struct ClientTransportTests {
         let client = makeClient(server, autoLogin: nil)
         try await client.connect()
         await expectCode(.incompatibleProtocolVersion) { _ = try await client.login(username: "iggy", password: "iggy") }
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func replicatedRequestIsNotReplayedAfterAConnectionDrop() async throws {
@@ -351,7 +432,7 @@ struct ClientTransportTests {
         #expect(await client.state == .authenticated)
         #expect(await server.connectionCount == 2)
         try await client.ping()
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// The body of a login is built once, with the bind secret of the session
@@ -379,7 +460,7 @@ struct ClientTransportTests {
         let secrets = registers.compactMap { Self.bindSecret(in: $0.payload) }
         #expect(secrets.count == 2)
         #expect(secrets[0] == secrets[1])
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func nonReplicatedRequestIsReplayedAfterAConnectionDrop() async throws {
@@ -402,7 +483,7 @@ struct ClientTransportTests {
         _ = try? await client.getStats()
         #expect(await codes(server).filter { $0 == CommandCode.getStats.rawValue }.count == 2)
         #expect(await server.connectionCount == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func reconnectionDisabledSurfacesTheDrop() async throws {
@@ -417,7 +498,7 @@ struct ClientTransportTests {
         #expect(await client.state == .disconnected)
         #expect(await server.connectionCount == 1)
         await expectCode(.disconnected) { try await client.ping() }
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func withoutCredentialsNothingIsReplayed() async throws {
@@ -430,7 +511,7 @@ struct ClientTransportTests {
         try await client.connect()
         await expectCode(.disconnected) { try await client.ping() }
         #expect(await server.connectionCount == 1)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func serverInitiatedCloseIsRepairedByTheNextRequest() async throws {
@@ -444,7 +525,7 @@ struct ClientTransportTests {
         try await client.ping()
         #expect(await server.connectionCount == 2)
         #expect(await operations(server).filter { $0 == .register }.count == 2)
-        try await client.shutdown()
+        await client.shutdown()
         var seen: [DiagnosticEvent] = []
         for await event in events {
             seen.append(event)
@@ -474,7 +555,7 @@ struct ClientTransportTests {
         defer { Task { await revived.stop() } }
         try await client.connect()
         #expect(await client.state == .authenticated)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func passwordChangeUpdatesTheReconnectCredentials() async throws {
@@ -495,7 +576,7 @@ struct ClientTransportTests {
         #expect(secrets.count == 2)
         #expect(secrets[0] != secrets[1])
         #expect(!secrets.contains([UInt8](repeating: 0, count: Requests.bindSecretSize)))
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func userRenameUpdatesTheReconnectCredentials() async throws {
@@ -520,7 +601,7 @@ struct ClientTransportTests {
         let latest = await server.requests.filter { $0.operation == .register }.last!
         #expect(Self.username(in: latest.payload) == "renamed")
         #expect(Self.password(in: latest.payload) == "new-secret")
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func largeRepliesArriveInPieces() async throws {
@@ -534,7 +615,7 @@ struct ClientTransportTests {
         try await client.connect()
         let raw = try await client.sendRawRequest(code: CommandCode.getStats.rawValue, payload: [])
         #expect(raw == body)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func leaderRedirectionMovesTheClient() async throws {
@@ -567,7 +648,7 @@ struct ClientTransportTests {
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()
         #expect(await client.serverAddress == follower.address)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func heartbeatPingsPeriodically() async throws {
@@ -580,7 +661,7 @@ struct ClientTransportTests {
         // Waits for the pings rather than for a fixed time: a loaded machine
         // stretches the interval, and only their arrival is being tested.
         #expect(await eventually { await pingCount(server) >= 3 })
-        try await client.shutdown()
+        await client.shutdown()
         // One ping may already be on the wire when the heartbeat stops.
         let stopped = await pingCount(server)
         try await Task.sleep(for: .milliseconds(150))
@@ -612,7 +693,7 @@ struct ClientTransportTests {
         let creates = await server.requests.filter { $0.operation == .deleteStream }.map(\.requestID)
         #expect(creates.sorted() == Array(1...10))
         #expect(await server.connectionCount == 1)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// Every caller that was waiting on a dropped connection fails on it, but
@@ -645,7 +726,7 @@ struct ClientTransportTests {
         }
         #expect(await server.connectionCount == 2)
         #expect(await operations(server).filter { $0 == .register }.count == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// The replay after a reconnect can itself be refused for longer than the
@@ -679,7 +760,7 @@ struct ClientTransportTests {
         try await client.connect()
         _ = try await client.getStats()
         #expect(await server.connectionCount == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// The reply of an abandoned request could arrive later and be read as
@@ -713,7 +794,7 @@ struct ClientTransportTests {
         #expect(await server.connectionCount == 1)
         _ = try await client.getStats()
         #expect(await server.connectionCount == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// A request cancelled before it is written costs nothing.
@@ -731,7 +812,7 @@ struct ClientTransportTests {
         #expect(await server.requests.count == before)
         try await client.ping()
         #expect(await server.connectionCount == 1)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// An explicit disconnect is caller intent: neither a later request nor a
@@ -741,7 +822,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let client = makeClient(server)
         try await client.connect()
-        try await client.disconnect()
+        await client.disconnect()
         #expect(await client.state == .disconnected)
         await expectCode(.notConnected) { try await client.ping() }
         #expect(await server.connectionCount == 1)
@@ -749,7 +830,7 @@ struct ClientTransportTests {
         try await client.ping()
         #expect(await client.state == .authenticated)
         #expect(await server.connectionCount == 2)
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     @Test func explicitDisconnectEndsAConnectSweep() async throws {
@@ -760,10 +841,108 @@ struct ClientTransportTests {
         let client = makeClient(server)
         let connecting = Task { try await client.connect() }
         #expect(await eventually { await client.state == .connecting })
-        try await client.disconnect()
+        await client.disconnect()
         await expectCode(.notConnected) { try await connecting.value }
         #expect(await client.state == .disconnected)
-        try await client.shutdown()
+        await client.shutdown()
+    }
+
+    @Test func shutdownIsFinal() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        try await client.connect()
+        await client.shutdown()
+        // A teardown after the shutdown must not put the client back into a
+        // state it can connect from.
+        await client.disconnect()
+        #expect(await client.state == .shutdown)
+        await expectCode(.clientShutdown) { try await client.connect() }
+        await expectCode(.clientShutdown) { try await client.ping() }
+        #expect(await client.state == .shutdown)
+        #expect(await server.connectionCount == 1)
+        // Nothing is published after shutdown, so a late subscription ends
+        // at once instead of waiting for a first event.
+        var events = await client.events.makeAsyncIterator()
+        #expect(await events.next() == nil)
+    }
+
+    @Test func shutdownDuringADialDoesNotReviveTheClient() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let connector = GatedConnector()
+        let client = makeClient(server, connector: connector)
+        let connecting = Task { try await client.connect() }
+        #expect(await eventually { await client.state == .connecting })
+        await client.shutdown()
+        connector.released.withLock { $0 = true }
+        await expectCode(.clientShutdown) { try await connecting.value }
+        #expect(await client.state == .shutdown)
+        // The dial that finished late was dropped before any sign-in.
+        #expect(await eventually { await server.openConnectionCount == 0 })
+        #expect(await server.requests.isEmpty)
+    }
+
+    /// With unlimited retries a connect to a server that is gone never ends
+    /// by itself; cancelling the caller has to end it.
+    @Test func cancelledConnectEndsItsSweep() async throws {
+        let server = FakeVSRServer()
+        try await server.start()
+        let port = try Endpoint(parsing: server.address).port
+        await server.stop()
+        let client = makeClient(server)
+        let connecting = Task { try await client.connect() }
+        #expect(await eventually { await client.state == .connecting })
+        connecting.cancel()
+        await #expect(throws: CancellationError.self) { try await connecting.value }
+        #expect(await eventually { await client.state == .disconnected })
+        // The sweep left nothing behind: a later connect dials again.
+        try await server.startOn(port: port)
+        defer { Task { await server.stop() } }
+        try await client.connect()
+        #expect(await client.state == .authenticated)
+        await client.shutdown()
+    }
+
+    @Test func cancelledConnectDuringTheSignInLeavesNoHalfOpenState() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let stallOnce = Locked(true)
+        await server.respond { request in
+            guard request.operation == .register else { return .ok([]) }
+            let stall = stallOnce.withLock {
+                let stall = $0; $0 = false; return stall
+            }
+            return stall ? .stall : .ok(FakeVSRServer.registerBody())
+        }
+        let client = makeClient(server)
+        let connecting = Task { try await client.connect() }
+        #expect(await eventually { await operations(server).contains(.register) })
+        connecting.cancel()
+        await #expect(throws: CancellationError.self) { try await connecting.value }
+        #expect(await eventually { await client.state == .disconnected })
+        try await client.connect()
+        #expect(await client.state == .authenticated)
+        try await client.ping()
+        await client.shutdown()
+    }
+
+    /// A client dropped without a shutdown must not keep its socket or its
+    /// heartbeat.
+    @Test func droppedClientClosesItsConnection() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        do {
+            var configuration = ClientConfiguration(address: server.address, autoLogin: rootLogin)
+            configuration.heartbeatInterval = .milliseconds(20)
+            let client = IggyClient(configuration: configuration, logger: testLogger)
+            try await client.connect()
+            #expect(await eventually { await pingCount(server) >= 1 })
+        }
+        #expect(await eventually { await server.openConnectionCount == 0 })
+        let stopped = await pingCount(server)
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await pingCount(server) <= stopped + 1)
     }
 
     @Test func sessionControlCodesAreRefusedRaw() async throws {
@@ -773,7 +952,7 @@ struct ClientTransportTests {
         try await client.connect()
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.loginRegister.rawValue, payload: []) }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.logoutUser.rawValue, payload: []) }
-        try await client.shutdown()
+        await client.shutdown()
     }
 
     /// A reader placed after the version info of a register payload, with the

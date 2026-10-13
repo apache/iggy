@@ -39,6 +39,7 @@ let package = Package(
         .target(
             name: "Iggy",
             dependencies: [
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOTLS", package: "swift-nio"),
@@ -48,7 +49,12 @@ let package = Package(
         ),
         .testTarget(
             name: "IggyTests",
-            dependencies: ["Iggy"],
+            dependencies: [
+                "Iggy",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Logging", package: "swift-log"),
+            ],
             resources: [.copy("Fixtures")]
         ),
     ],

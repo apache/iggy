@@ -36,7 +36,8 @@ public struct ReconnectionOptions: Sendable, Hashable {
     /// Whether to reconnect at all. Off, a dropped connection fails the
     /// request that hit it and every later one until `connect()` is called.
     public var enabled: Bool
-    /// How many rounds over the known endpoints to attempt; nil means forever.
+    /// How many more rounds over the known endpoints to attempt after the
+    /// first one fails; nil means forever, and zero still makes one round.
     public var maxRetries: UInt32?
     /// Pause between rounds.
     public var interval: Duration

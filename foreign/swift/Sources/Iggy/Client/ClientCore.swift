@@ -47,7 +47,15 @@ actor ClientCore {
     let connector: any IggyConnector
     let logger: Logger
 
-    private(set) var state: ClientState = .disconnected
+    /// Shutdown is final: a teardown or a dial that finishes afterwards must
+    /// not make the client usable again, so no later write replaces it.
+    private(set) var state: ClientState = .disconnected {
+        didSet {
+            if oldValue == .shutdown {
+                state = .shutdown
+            }
+        }
+    }
     private var connection: (any IggyConnection)?
     /// Counts the connections installed so far, so a request that failed on
     /// an old one does not tear down the one that replaced it.
@@ -64,7 +72,6 @@ actor ClientCore {
     private var configuredUsername: String?
     private var connectedAt: ContinuousClock.Instant?
     private var redirects = 0
-    private var skipAutoLoginOnce = false
     /// Set by an explicit ``disconnect()`` and cleared by the caller's next
     /// ``connectByCaller()``: in between, nothing may bring the client back.
     private var disconnectedByCaller = false
@@ -85,15 +92,16 @@ actor ClientCore {
 
     var clientAddress: String? { connection?.localAddress }
     var serverAddress: String { currentAddress }
-    var isSignedIn: Bool { state == .authenticated }
-
-    private func setState(_ newState: ClientState) {
-        state = newState
-    }
 
     func subscribeEvents() -> AsyncStream<DiagnosticEvent> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<DiagnosticEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
+        guard state != .shutdown else {
+            // Nothing is published after shutdown, so the stream ends here
+            // instead of leaving its reader waiting for a first event.
+            continuation.finish()
+            return stream
+        }
         eventSubscribers[id] = continuation
         continuation.onTermination = { [weak self] _ in
             guard let self else { return }
@@ -115,7 +123,9 @@ actor ClientCore {
     // MARK: Exchange
 
     /// Sends a request and returns its reply body, reconnecting and replaying
-    /// when the failure is one a fresh connection recovers from.
+    /// when the failure is one a fresh connection recovers from. One deadline,
+    /// `requestTimeout` from now, covers the request, the reconnect, the
+    /// sign-in, the leader check, and the replay.
     ///
     /// A cancelled caller gets `CancellationError`. A request it already wrote
     /// takes the connection with it, since its reply can no longer be told
@@ -124,9 +134,11 @@ actor ClientCore {
         if disconnectedByCaller {
             throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
         }
+        let deadline = ContinuousClock.now + configuration.requestTimeout
+        var outcome = RetryOutcome()
         var failedEpoch = connectionEpoch
         do {
-            return try await sendRaw(code: code, payload: payload, epoch: &failedEpoch)
+            return try await sendRaw(code: code, payload: payload, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
         } catch let error as IggyError {
             // A cancelled caller cannot use a new connection: every exchange
             // it starts is abandoned at once.
@@ -151,7 +163,7 @@ actor ClientCore {
                 // relies on the client replaying it.
                 throw error
             }
-            if isLogin, await connectGate.isActive {
+            if isLogin, connectGate.isActive {
                 // The sign-in ran inside a connect sweep, which owns the
                 // endpoint walk; the sweep reports the failure itself.
                 throw error
@@ -160,33 +172,41 @@ actor ClientCore {
             // server deduplicates by (client, request). Replay only what
             // provably never reached the log.
             let replay = replayAfterSessionResetIsSafe(code: code, error: error)
-            await routingLock.lock()
-            // Another caller may have reconnected while this one waited for
-            // the lock; its connection is not the one that failed.
-            if failedEpoch == connectionEpoch {
-                await disconnectTransport()
-            }
-            if isLogin {
-                skipAutoLoginOnce = true
-            }
-            logger.info("Reconnecting to the server", metadata: ["server_address": "\(currentAddress)", "error": "\(error)"])
-            do {
-                try await connect()
-            } catch {
-                skipAutoLoginOnce = false
-                await routingLock.unlock()
+            guard ContinuousClock.now < deadline else {
+                // Nothing is left of the deadline to reconnect in; the next
+                // request does it.
                 throw error
             }
-            // Released before the replay, which takes the lock itself when the
-            // new connection keeps refusing the request.
-            await routingLock.unlock()
+            let epoch = failedEpoch
+            let reconnected: Void? = try await withDeadline(deadline) { [self] in
+                // The retried sign-in is the sign-in: the reconnect must not
+                // run another one ahead of it.
+                try await self.reconnect(failedEpoch: epoch, skipAutoLogin: isLogin, cause: error)
+            }
+            guard reconnected != nil else {
+                throw IggyError(error.code, context: "the request deadline passed while reconnecting after: \(error)")
+            }
             guard replay else {
                 logger.warning(
                     "Reconnected, but the outcome of command \(code) is unknown: replaying it could apply it twice, so the original error is returned instead")
                 throw error
             }
-            return try await sendRaw(code: code, payload: payload, epoch: &failedEpoch)
+            return try await sendRaw(code: code, payload: payload, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
         }
+    }
+
+    /// Replaces the connection a request failed on. Serialized, so callers
+    /// that failed together reconnect once.
+    private func reconnect(failedEpoch: UInt64, skipAutoLogin: Bool, cause: IggyError) async throws {
+        try await routingLock.lock()
+        defer { routingLock.unlock() }
+        // Another caller may have reconnected while this one waited for the
+        // lock; its connection is not the one that failed.
+        if failedEpoch == connectionEpoch {
+            await disconnectTransport()
+        }
+        logger.info("Reconnecting to the server", metadata: ["server_address": "\(currentAddress)", "error": "\(cause)"])
+        try await connect(skipAutoLogin: skipAutoLogin)
     }
 
     /// Whether replaying `code` after reconnecting with a new session cannot
@@ -205,39 +225,40 @@ actor ClientCore {
         return operation == .nonReplicated || operation == .logout
     }
 
-    /// One request against the current connection, bounded by one deadline
+    /// One request against the current connection, bounded by `deadline`
     /// across every same-connection replay and every leader failover. `epoch`
     /// reports the connection the last attempt ran on.
-    private func sendRaw(code: UInt32, payload: [UInt8], epoch: inout UInt64) async throws -> [UInt8] {
+    private func sendRaw(
+        code: UInt32, payload: [UInt8], deadline: ContinuousClock.Instant, epoch: inout UInt64, outcome: inout RetryOutcome
+    ) async throws -> [UInt8] {
         switch state {
         case .shutdown:
             throw IggyError(.clientShutdown)
         case .disconnected, .connecting:
-            throw IggyError(.notConnected)
+            throw outcome.observe(IggyError(.notConnected))
         default:
             break
         }
         let clock = ContinuousClock()
-        let overallDeadline = clock.now + configuration.requestTimeout
         let isLogin = CommandCode.isRegister(code)
         var request: VSRFrame.EncodedRequest?
-        var visited = Set<String>()
-        var walkingRoster = false
-        var checkedLeader = false
+        var walk = RosterWalk()
         while true {
-            let transientDeadline = isLogin ? overallDeadline : min(overallDeadline, clock.now + Self.transientFailoverCheckInterval)
-            let outcome = try await attempt(
-                code: code, payload: payload, request: &request, epoch: &epoch, transientDeadline: transientDeadline, readDeadline: overallDeadline)
-            switch outcome {
+            let transientDeadline = isLogin ? deadline : min(deadline, clock.now + Self.transientFailoverCheckInterval)
+            let attempted = try await attempt(
+                code: code, payload: payload, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
+                readDeadline: deadline)
+            switch attempted {
             case .success(let body):
                 return body
-            case .failure(let error):
-                guard error.code == .transientNotAccepted, !isLogin, clock.now < overallDeadline else {
-                    if error.code == .disconnected, epoch == connectionEpoch {
+            case .failure(let failure):
+                let error = outcome.observe(failure)
+                guard error.code == .transientNotAccepted, !isLogin, clock.now < deadline else {
+                    if error.code == .disconnected, epoch == connectionEpoch, state != .shutdown {
                         // The reply stream is at an unknown boundary; a late
                         // reply would desync framing for the next request.
                         connection = nil
-                        setState(.disconnected)
+                        state = .disconnected
                         publish(.disconnected)
                     }
                     throw error
@@ -249,34 +270,12 @@ actor ClientCore {
                 // cannot double-apply: keep the stamped id for same-session
                 // replays; a redirect registers again, so the frame is stamped
                 // afresh.
-                await routingLock.lock()
-                var moved = false
-                do {
-                    if !walkingRoster, !checkedLeader {
-                        checkedLeader = true
-                        visited.insert(currentAddress)
-                        if try await handleLeaderRedirection() {
-                            try await connect()
-                            moved = true
-                        }
-                    }
-                    if !moved, let next = nextRosterEndpoint(excluding: visited) {
-                        // The roster names this node as the metadata leader,
-                        // yet it keeps refusing: its replica of the target
-                        // partition group is not that group's primary. Walk
-                        // the roster instead of replaying into the same refusal.
-                        visited.insert(next)
-                        walkingRoster = true
-                        try await settle(on: next)
-                        try await connect(settleOffLeader: true)
-                        moved = true
-                    }
-                } catch {
-                    await routingLock.unlock()
+                let from = walk
+                guard let step = try await withDeadline(deadline, { [self] in try await self.failOver(from) }) else {
                     throw error
                 }
-                await routingLock.unlock()
-                if moved {
+                walk = step.walk
+                if step.moved {
                     request = nil
                 } else if rosterEndpoints.count <= 1 {
                     // A single node: partition materialisation can outlast the
@@ -289,29 +288,59 @@ actor ClientCore {
         }
     }
 
+    /// The cluster endpoints one request has already been refused on.
+    private struct RosterWalk: Sendable {
+        var visited = Set<String>()
+        var checkedLeader = false
+    }
+
+    /// Moves the connection for a request the current node keeps refusing to
+    /// admit: to the metadata leader once, then along the roster. Reports
+    /// whether the client moved.
+    private func failOver(_ from: RosterWalk) async throws -> (moved: Bool, walk: RosterWalk) {
+        var walk = from
+        try await routingLock.lock()
+        defer { routingLock.unlock() }
+        if !walk.checkedLeader {
+            walk.checkedLeader = true
+            walk.visited.insert(currentAddress)
+            if try await handleLeaderRedirection() {
+                try await connect()
+                return (true, walk)
+            }
+        }
+        guard let next = nextRosterEndpoint(excluding: walk.visited) else {
+            return (false, walk)
+        }
+        // The roster names this node as the metadata leader, yet it keeps
+        // refusing: its replica of the target partition group is not that
+        // group's primary. Walk the roster instead of replaying into the same
+        // refusal.
+        walk.visited.insert(next)
+        try await settle(on: next)
+        try await connect(settleOffLeader: true)
+        return (true, walk)
+    }
+
     /// Holds the exchange lock for one request, so the lockstep stream sees
     /// one request at a time. Throws only for a caller cancelled before its
     /// turn, which leaves the connection untouched.
     private func attempt(
-        code: UInt32, payload: [UInt8], request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, transientDeadline: ContinuousClock.Instant,
-        readDeadline: ContinuousClock.Instant
+        code: UInt32, payload: [UInt8], request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, outcome: inout RetryOutcome,
+        transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant
     ) async throws -> Result<[UInt8], IggyError> {
-        await exchangeLock.lock()
-        if Task.isCancelled {
-            await exchangeLock.unlock()
-            throw CancellationError()
-        }
-        let outcome = await exchangeLocked(
-            code: code, payload: payload, request: &request, epoch: &epoch, transientDeadline: transientDeadline, readDeadline: readDeadline)
-        await exchangeLock.unlock()
-        return outcome
+        try await exchangeLock.lock()
+        defer { exchangeLock.unlock() }
+        return await exchangeLocked(
+            code: code, payload: payload, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
+            readDeadline: readDeadline)
     }
 
     /// Stamps the request if it is not stamped yet and exchanges it, replaying
     /// in place while the server answers transiently.
     private func exchangeLocked(
-        code: UInt32, payload: [UInt8], request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, transientDeadline: ContinuousClock.Instant,
-        readDeadline: ContinuousClock.Instant
+        code: UInt32, payload: [UInt8], request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, outcome: inout RetryOutcome,
+        transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant
     ) async -> Result<[UInt8], IggyError> {
         guard let connection else {
             return .failure(IggyError(.notConnected))
@@ -356,7 +385,10 @@ actor ClientCore {
             }
             do {
                 return .success(Array(try VSRFrame.decodeReply(header: header, body: raw.body[...])))
-            } catch let error as IggyError {
+            } catch let refusal as IggyError {
+                // Once one attempt left the outcome unknown, a later refusal
+                // of the same request no longer proves it never committed.
+                let error = outcome.observe(refusal)
                 switch error.code {
                 case .transientNotCommitted where clock.now < readDeadline:
                     // The outcome is unknown; only a same-session replay of the
@@ -387,13 +419,39 @@ actor ClientCore {
         try await connect()
     }
 
-    func connect(settleOffLeader: Bool = false) async throws {
+    /// Connects unless a connection stands. Callers share one sweep; a caller
+    /// that is cancelled leaves it, and the sweep ends when none is left.
+    ///
+    /// `skipAutoLogin` belongs to the caller whose own request is the sign-in.
+    func connect(skipAutoLogin: Bool = false, settleOffLeader: Bool = false) async throws {
         try await connectGate.run { [self] in
-            try await self.connectInner(settleOffLeader: settleOffLeader)
+            try await self.connectInner(skipAutoLogin: skipAutoLogin, settleOffLeader: settleOffLeader)
         }
     }
 
-    private func connectInner(settleOffLeader: Bool) async throws {
+    private func connectInner(skipAutoLogin: Bool, settleOffLeader: Bool) async throws {
+        do {
+            try await sweep(skipAutoLogin: skipAutoLogin, settleOffLeader: settleOffLeader)
+        } catch {
+            // A sweep that ends early must not leave a half-open state behind.
+            // `.connecting` would make the next connect return at the top
+            // without dialing, and a connection whose sign-in was abandoned
+            // with its last caller is closed already.
+            switch state {
+            case .connecting:
+                failConnect()
+            case .connected, .authenticating:
+                if error is CancellationError {
+                    await disconnectTransport()
+                }
+            default:
+                break
+            }
+            throw error
+        }
+    }
+
+    private func sweep(skipAutoLogin: Bool, settleOffLeader: Bool) async throws {
         while true {
             switch state {
             case .shutdown:
@@ -404,7 +462,7 @@ actor ClientCore {
                 return
             case .disconnected:
                 try checkNotDisconnectedByCaller()
-                setState(.connecting)
+                state = .connecting
             }
 
             var candidates = dialCandidates()
@@ -413,9 +471,6 @@ actor ClientCore {
                 // The paced endpoint goes last; the others owe no cooldown.
                 candidates.append(candidates.removeFirst())
             }
-            let skipAutoLogin = skipAutoLoginOnce
-            skipAutoLoginOnce = false
-
             var retries: UInt32 = 0
             var candidateIndex = 0
             var configurationFault: IggyError?
@@ -423,26 +478,27 @@ actor ClientCore {
             var dialFailure: IggyError?
             var shouldRedirect = false
             sweep: while true {
-                try abandonSweepIfDisconnectedByCaller()
+                try endSweepIfStopped()
                 let address = candidates[candidateIndex]
                 if address == pacedEndpoint, let remaining = reestablishWait() {
                     logger.info("Trying to connect to the server \(address) in \(remaining)")
                     try await Task.sleep(for: remaining)
                 }
-                try abandonSweepIfDisconnectedByCaller()
+                try endSweepIfStopped()
                 logger.info("Connecting to server \(address)")
                 do {
                     let established = try await establishBounded(address, candidates: candidates)
-                    if disconnectedByCaller {
-                        // The caller disconnected while this was being dialed;
-                        // the check at the top of the sweep ends it.
+                    if state == .shutdown || disconnectedByCaller || Task.isCancelled {
+                        // The client was stopped while this was being dialed:
+                        // the connection is dropped before it is installed,
+                        // and the check at the top of the sweep ends it.
                         await established.close()
                         continue sweep
                     }
                     currentAddress = address
                     connection = established
                     connectionEpoch += 1
-                    setState(.connected)
+                    state = .connected
                     connectedAt = ContinuousClock().now
                     publish(.connected)
                     logger.info(
@@ -454,7 +510,7 @@ actor ClientCore {
                         if failure.connectionLost {
                             logger.warning("The sign-in on \(address) did not complete: \(failure.error)")
                             signInFailure = failure.error
-                            setState(.connecting)
+                            state = .connecting
                         } else {
                             // The connection stands and only the session is
                             // missing; no other endpoint would answer differently.
@@ -489,9 +545,6 @@ actor ClientCore {
                     let limit = maxRetries.map(String.init) ?? "unlimited"
                     logger.info("Retrying to connect (\(retries)/\(limit)), \(candidates.count) endpoint(s) in \(configuration.reconnection.interval)")
                     try await Task.sleep(for: configuration.reconnection.interval)
-                    if state == .shutdown {
-                        throw IggyError(.clientShutdown)
-                    }
                     continue
                 }
                 failConnect()
@@ -521,7 +574,7 @@ actor ClientCore {
             logger.info("Skipping automatic sign-in for a retried login request")
             return false
         }
-        setState(.authenticating)
+        state = .authenticating
         do {
             switch credentials {
             case .usernamePassword(let username, let password):
@@ -551,7 +604,7 @@ actor ClientCore {
         if connectionLost {
             await disconnectTransport()
         } else if state == .authenticating {
-            setState(.connected)
+            state = .connected
         }
         if error.isCredentialRejection {
             // A rejected credential does not become valid on the next reconnect
@@ -562,7 +615,7 @@ actor ClientCore {
     }
 
     private func failConnect() {
-        setState(.disconnected)
+        state = .disconnected
         publish(.disconnected)
     }
 
@@ -572,13 +625,15 @@ actor ClientCore {
         }
     }
 
-    /// A sweep checks this before each dial and before each retry pause: once
-    /// the caller disconnects, the sweep must not bring the client back.
-    private func abandonSweepIfDisconnectedByCaller() throws {
-        if disconnectedByCaller {
-            failConnect()
-            try checkNotDisconnectedByCaller()
+    /// A sweep checks this before each dial: once the client is shut down,
+    /// disconnected by its caller, or left without a caller waiting for it,
+    /// the sweep must not bring it back.
+    private func endSweepIfStopped() throws {
+        if state == .shutdown {
+            throw IggyError(.clientShutdown)
         }
+        try checkNotDisconnectedByCaller()
+        try Task.checkCancellation()
     }
 
     /// Endpoints to dial for one connect, likeliest first: where the client
@@ -614,7 +669,7 @@ actor ClientCore {
     /// a reconnect can restore the session.
     func disconnectTransport() async {
         switch state {
-        case .disconnected:
+        case .disconnected, .shutdown:
             return
         case .connecting:
             // A connect is already sweeping; tearing down under it would take
@@ -624,7 +679,7 @@ actor ClientCore {
             break
         }
         logger.info("Disconnecting from server \(currentAddress)")
-        setState(.disconnected)
+        state = .disconnected
         let old = connection
         connection = nil
         // A Register still in flight is retried on the next connection and
@@ -653,7 +708,7 @@ actor ClientCore {
         let old = connection
         connection = nil
         session.reset()
-        setState(.shutdown)
+        state = .shutdown
         await old?.close()
         publish(.shutdown)
         for continuation in eventSubscribers.values {
@@ -735,7 +790,7 @@ actor ClientCore {
         logger.debug(
             "Authenticated against iggy server",
             metadata: ["server_version": "\(response.serverVersion)", "server_protocol_version": "\(response.serverProtocolVersion)"])
-        setState(.authenticated)
+        state = .authenticated
         publish(.signedIn)
         return response
     }
@@ -747,7 +802,7 @@ actor ClientCore {
         _ = try await exchange(code: CommandCode.logoutUser.rawValue, payload: [])
         rememberedSignIn = nil
         session.reset()
-        setState(.connected)
+        state = .connected
         publish(.signedOut)
     }
 
@@ -821,9 +876,9 @@ actor ClientCore {
         }
         rosterLearned = true
         let endpoints =
-            await withTimeout(Self.rosterReadTimeout) { [self] in
+            (try? await withDeadline(ContinuousClock.now + Self.rosterReadTimeout) { [self] in
                 await self.readTransportEndpoints()
-            } ?? []
+            }) ?? []
         if !endpoints.isEmpty {
             logger.info("Learned \(endpoints.count) endpoint(s) to fail over to")
             rosterEndpoints = endpoints
@@ -918,10 +973,12 @@ actor ClientCore {
 
     // MARK: Heartbeat
 
-    func startHeartbeat(_ body: @escaping @Sendable () async -> Void) {
+    /// Runs `body` every heartbeat interval until it returns false, which is
+    /// how a client that was dropped without a shutdown ends its heartbeat.
+    func startHeartbeat(_ body: @escaping @Sendable () async -> Bool) {
         stopHeartbeat()
         let interval = configuration.heartbeatInterval
-        guard interval > .zero else {
+        guard interval > .zero, state != .shutdown else {
             return
         }
         heartbeatTask = Task {
@@ -930,7 +987,9 @@ actor ClientCore {
                 if Task.isCancelled {
                     return
                 }
-                await body()
+                guard await body() else {
+                    return
+                }
             }
         }
     }
@@ -941,16 +1000,28 @@ actor ClientCore {
     }
 }
 
-/// Runs `body` with a bound; nil when the bound elapses first.
-func withTimeout<T: Sendable>(_ timeout: Duration, _ body: @escaping @Sendable () async -> T) async -> T? {
-    await withTaskGroup(of: T?.self) { group in
-        group.addTask { await body() }
-        group.addTask {
-            try? await Task.sleep(for: timeout)
-            return nil
+/// Whether an earlier attempt of a request may have committed, a port of
+/// `RetryOutcome` in `core/sdk/src/vsr.rs`.
+///
+/// `transientNotCommitted` leaves the outcome unknown. A later refusal of the
+/// same request, on this node or the next, cannot establish that the earlier
+/// attempt did not commit, so it is reported as unknown too instead of as
+/// proof that re-issuing the request under a new session is safe.
+struct RetryOutcome {
+    private(set) var isUncertain = false
+
+    mutating func observe(_ error: IggyError) -> IggyError {
+        if error.code == .transientNotCommitted {
+            isUncertain = true
         }
-        let first = await group.next() ?? nil
-        group.cancelAll()
-        return first
+        guard isUncertain else {
+            return error
+        }
+        switch error.code {
+        case .transientNotAccepted, .historyUnavailable, .unauthorized, .unauthenticated, .staleClient, .notConnected, .cannotEstablishConnection:
+            return IggyError(.transientNotCommitted, context: "an earlier attempt may have committed, then: \(error)")
+        default:
+            return error
+        }
     }
 }

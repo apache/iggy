@@ -33,7 +33,6 @@ struct RawFrame: Sendable {
 /// read. The client serializes callers; the connection only moves bytes.
 protocol IggyConnection: AnyObject, Sendable {
     var localAddress: String? { get }
-    var remoteAddress: String? { get }
     /// Writes a frame and reads the reply, bounded by `timeout`. A timeout
     /// leaves the stream at an unknown boundary, so the connection closes
     /// itself and every later call fails.
@@ -60,13 +59,11 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
     private let channel: Channel
     private let handler: ExchangeHandler
     let localAddress: String?
-    let remoteAddress: String?
 
     private init(channel: Channel, handler: ExchangeHandler) {
         self.channel = channel
         self.handler = handler
         localAddress = channel.localAddress.map(Self.describe)
-        remoteAddress = channel.remoteAddress.map(Self.describe)
     }
 
     private static func describe(_ address: SocketAddress) -> String {
@@ -85,6 +82,8 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
             sslContext = nil
         }
         let handler = ExchangeHandler()
+        // One deadline bounds the whole dial, the TLS handshake included.
+        let deadline = ContinuousClock.now + timeout
         // TCP_NODELAY lives at the TCP level; the socket-level shorthand would
         // set SO_DEBUG instead, which Linux refuses without CAP_NET_ADMIN.
         let noDelayValue: ChannelOptions.Types.SocketOption.Value = noDelay ? 1 : 0
@@ -113,7 +112,7 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
             // it here means a failed handshake is reported by the dial rather
             // than by the first request.
             do {
-                try await handler.handshakeDone(on: channel)
+                try await handler.handshakeDone(on: channel, within: deadline - ContinuousClock.now)
             } catch {
                 try? await channel.close().get()
                 throw IggyError(.cannotEstablishConnection, context: "TLS handshake with \(endpoint) failed: \(error)")
@@ -142,6 +141,11 @@ final class TCPConnection: IggyConnection, @unchecked Sendable {
 
     func close() async {
         try? await channel.close().get()
+    }
+
+    /// A client dropped without a shutdown must not leave its socket open.
+    deinit {
+        channel.close(promise: nil)
     }
 }
 
@@ -180,6 +184,7 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     private var pending: CheckedContinuation<RawFrame, Error>?
     private var replyDeadline: Scheduled<Void>?
     private var handshake: CheckedContinuation<Void, Error>?
+    private var handshakeDeadline: Scheduled<Void>?
     private var handshakeComplete = false
     private var closed = false
     private var closeError: IggyError?
@@ -214,6 +219,7 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
             closeError = error
         }
         fail(with: error)
+        endHandshake(with: .failure(error))
         channel.close(promise: nil)
     }
 
@@ -224,18 +230,31 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
         pending = nil
     }
 
-    func handshakeDone(on channel: Channel) async throws {
+    /// Waits for the TLS handshake for at most `timeout`. A peer that accepts
+    /// the connection and never answers the ClientHello must not hold the
+    /// dial open.
+    func handshakeDone(on channel: Channel, within timeout: Duration) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            channel.eventLoop.execute {
-                if self.handshakeComplete {
+            channel.eventLoop.execute { [self] in
+                if handshakeComplete {
                     continuation.resume()
-                } else if self.closed {
-                    continuation.resume(throwing: self.closeError ?? IggyError(.disconnected))
+                } else if closed {
+                    continuation.resume(throwing: closeError ?? IggyError(.disconnected))
                 } else {
-                    self.handshake = continuation
+                    handshake = continuation
+                    handshakeDeadline = channel.eventLoop.scheduleTask(in: .nanoseconds(timeout.nanosecondsClamped)) { [self] in
+                        abort(with: IggyError(.disconnected, context: "the handshake did not complete in time"), on: channel)
+                    }
                 }
             }
         }
+    }
+
+    private func endHandshake(with result: Result<Void, Error>) {
+        handshakeDeadline?.cancel()
+        handshakeDeadline = nil
+        handshake?.resume(with: result)
+        handshake = nil
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -253,8 +272,7 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if case .handshakeCompleted = event as? TLSUserEvent {
             handshakeComplete = true
-            handshake?.resume()
-            handshake = nil
+            endHandshake(with: .success(()))
         }
         context.fireUserInboundEventTriggered(event)
     }
@@ -262,8 +280,7 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         let mapped = (error as? IggyError) ?? IggyError(.disconnected, context: "\(error)")
         closeError = mapped
-        handshake?.resume(throwing: mapped)
-        handshake = nil
+        endHandshake(with: .failure(mapped))
         fail(with: mapped)
         context.close(promise: nil)
     }
@@ -271,8 +288,7 @@ final class ExchangeHandler: ChannelInboundHandler, @unchecked Sendable {
     func channelInactive(context: ChannelHandlerContext) {
         closed = true
         let error = closeError ?? IggyError(.disconnected, context: "connection closed by the peer")
-        handshake?.resume(throwing: error)
-        handshake = nil
+        endHandshake(with: .failure(error))
         fail(with: error)
         context.fireChannelInactive()
     }
