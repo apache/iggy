@@ -47,7 +47,9 @@ use crate::dispatch::failure::{
     FrameChannel, send_deny_reply, send_eviction, send_host_frame, send_pre_consensus_deny,
     send_unbound_deny_reply, send_undeclared_operation_deny,
 };
-use crate::dispatch::partition::{dispatch_partition_request, handle_delete_segments_request};
+use crate::dispatch::partition::{
+    dispatch_partition_request, handle_delete_segments_request, progress_key,
+};
 use crate::dispatch::reads::handle_non_replicated_request;
 use crate::dispatch::session_ops::{handle_login_register_request, handle_logout_request};
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
@@ -56,7 +58,7 @@ use crate::rewrite::{RewriteDeny, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::wire::verify_request_checksum;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
@@ -104,6 +106,7 @@ type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHea
 /// any SDK's in-flight window, so it only ever fires under a genuine stall.
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<AHashMap<u128, Rc<ClientDrain>>>>;
+type ConsumerProgress = (u64, u8, usize);
 
 // BindSession authenticates with the registered secret, never with the
 // public client id and epoch alone. It retains the original retry identity;
@@ -253,12 +256,14 @@ impl Drop for ActiveDrainSlot {
 /// it spawned.
 ///
 /// The drain takes the frames of the connection in arrival order and runs the
-/// prologue of each. It finishes a frame that later frames depend on before it
-/// takes the next one: a login, a logout, a `BIND_SESSION`, the rewrite of a
-/// metadata write, or a partition admission. A `PING` finishes there too,
-/// because it never waits. Every other read, every poll and every wait for a
-/// metadata commit runs in a task of its own, so a held frame does not stall
-/// the frames behind it.
+/// prologue of each. Login, logout, `BIND_SESSION` and partition admission
+/// finish on the drain. Metadata commits run in tasks, but later non-PING
+/// frames wait in the queue until the metadata lane releases, before they
+/// capture session state or resolve a namespace. PING can pass that queue.
+/// Polls and explicit offset writes share a lane per resolved namespace and
+/// consumer until their reply. Independent requests can pass a queued conflict,
+/// but cannot pass a queued session or metadata barrier. A PING still waits
+/// behind a frame already suspended in admission or binding.
 ///
 /// `capacity` caps those tasks at `message_bus.client_queue_capacity`, the
 /// outbound queue size of a connection, so their replies never overflow that
@@ -279,6 +284,7 @@ pub(in crate::dispatch) struct ClientDrain {
     in_flight: Cell<usize>,
     /// Whether a frame holds the metadata lane.
     metadata_write: Cell<bool>,
+    progress: RefCell<AHashSet<ConsumerProgress>>,
     /// The drain task, while it waits for a frame or for room to admit one.
     parked: Cell<Option<Waker>>,
 }
@@ -293,11 +299,12 @@ enum Admission {
 }
 
 impl ClientDrain {
-    pub(in crate::dispatch) const fn new(server_config: &ServerConfig) -> Self {
+    pub(in crate::dispatch) fn new(server_config: &ServerConfig) -> Self {
         Self {
             capacity: server_config.message_bus.client_queue_capacity,
             in_flight: Cell::new(0),
             metadata_write: Cell::new(false),
+            progress: RefCell::default(),
             parked: Cell::new(None),
         }
     }
@@ -323,6 +330,17 @@ impl ClientDrain {
         InFlight {
             drain: Rc::clone(self),
             metadata_write,
+            progress: None,
+        }
+    }
+
+    fn admit_progress(self: &Rc<Self>, progress: ConsumerProgress) -> InFlight {
+        self.progress.borrow_mut().insert(progress);
+        self.in_flight.set(self.in_flight.get() + 1);
+        InFlight {
+            drain: Rc::clone(self),
+            metadata_write: false,
+            progress: Some(progress),
         }
     }
 
@@ -350,9 +368,10 @@ impl ClientDrain {
 
 /// One request task counted by its [`ClientDrain`]. The task owns it, so the
 /// count drops when the task ends or the runtime drops it.
-struct InFlight {
+pub struct InFlight {
     drain: Rc<ClientDrain>,
     metadata_write: bool,
+    progress: Option<ConsumerProgress>,
 }
 
 impl Drop for InFlight {
@@ -360,6 +379,9 @@ impl Drop for InFlight {
         self.drain.in_flight.set(self.drain.in_flight.get() - 1);
         if self.metadata_write {
             self.drain.metadata_write.set(false);
+        }
+        if let Some(progress) = self.progress {
+            self.drain.progress.borrow_mut().remove(&progress);
         }
         self.drain.wake();
     }
@@ -382,7 +404,19 @@ async fn drain_client_requests<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     loop {
-        if let Some(message) = pop_next_client_request(&queues, client_id) {
+        let next = pop_next_client_request(&queues, client_id, |message| {
+            if is_ping(message) {
+                return true;
+            }
+            if drain.metadata_write.get() {
+                return false;
+            }
+            progress_key(&shard, message).is_none_or(|key| {
+                drain.in_flight.get() < drain.capacity && !drain.progress.borrow().contains(&key)
+            })
+        });
+        if let Some(message) = next {
+            let progress = progress_key(&shard, &message).map(|key| drain.admit_progress(key));
             handle_client_request(
                 &shard,
                 &sessions,
@@ -391,6 +425,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
                 drain,
                 client_id,
                 message,
+                progress,
             )
             .await;
         } else if drain.in_flight.get() == 0 {
@@ -404,6 +439,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
 fn pop_next_client_request(
     queues: &ClientRequestQueues,
     client_id: u128,
+    ready: impl Fn(&Message<GenericHeader>) -> bool,
 ) -> Option<Message<GenericHeader>> {
     // Freed as soon as it drains empty. Keeping it would cost the connection
     // one `VecDeque` (at its peak depth, since `pop_front` never gives
@@ -413,11 +449,51 @@ fn pop_next_client_request(
     // process exit.
     let mut queues = queues.borrow_mut();
     let queue = queues.get_mut(&client_id)?;
-    let message = queue.pop_front();
+    let mut waiting = false;
+    let mut barrier = false;
+    let index = queue.iter().position(|message| {
+        if is_ping(message) {
+            return true;
+        }
+        if barrier {
+            return false;
+        }
+        let orders_followers = message
+            .try_as_typed::<RequestHeader>()
+            .map_or(true, |request| {
+                let header = request.header();
+                if header.operation == Operation::NonReplicated {
+                    header.reserved[..4] == BIND_SESSION_CODE.to_le_bytes()
+                } else {
+                    !header.operation.is_partition()
+                }
+            });
+        if waiting && orders_followers {
+            barrier = true;
+            return false;
+        }
+        if ready(message) {
+            return true;
+        }
+        waiting = true;
+        barrier = orders_followers;
+        false
+    })?;
+    let message = queue.remove(index);
     if queue.is_empty() {
         queues.remove(&client_id);
     }
     message
+}
+
+fn is_ping(message: &Message<GenericHeader>) -> bool {
+    message
+        .try_as_typed::<RequestHeader>()
+        .is_ok_and(|request| {
+            let header = request.header();
+            header.operation == Operation::NonReplicated
+                && header.reserved[..4] == PING_CODE.to_le_bytes()
+        })
 }
 
 /// Where the funnel routes a client request. Derived by [`classify`], which
@@ -559,7 +635,11 @@ where
     }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 async fn handle_client_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -568,6 +648,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     drain: &Rc<ClientDrain>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
+    progress: Option<InFlight>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -707,7 +788,10 @@ async fn handle_client_request<B, MJ, S, SB>(
                 .await;
                 return;
             }
-            let in_flight = drain.admit(Admission::Cap).await;
+            let in_flight = match progress {
+                Some(progress) => progress,
+                None => drain.admit(Admission::Cap).await,
+            };
             let task_shard = Rc::clone(shard);
             let task_sessions = Rc::clone(sessions);
             let task_config = Arc::clone(server_config);
@@ -811,6 +895,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 user_id,
                 consumer_session,
                 None,
+                progress,
             )
             .await;
         }
@@ -1158,6 +1243,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             ROOT_TRANSPORT,
             held_get_me(1, UNAPPLIED_OP),
+            None,
         )
         .await;
         settle().await;
@@ -1716,6 +1802,7 @@ mod tests {
                 &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 metadata_read(),
+                None,
             )
             .await;
             let replies = bus.client_replies.borrow();
@@ -1977,6 +2064,7 @@ mod tests {
                 &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 non_replicated_request(TRANSPORT, code),
+                None,
             )
             .await;
             let replies = bus.client_replies.borrow();
@@ -2018,6 +2106,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
+            None,
         )
         .await;
         let replies = bus.client_replies.borrow();
@@ -2054,6 +2143,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             non_replicated_request(TRANSPORT, PING_CODE),
+            None,
         )
         .await;
         let replies = bus.client_replies.borrow();
@@ -2098,6 +2188,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             message.into_generic(),
+            None,
         )
         .await;
         let replies = bus.client_replies.borrow();
@@ -2261,8 +2352,106 @@ mod tests {
         assert_eq!(reply_status(&replies[1].1), 0);
     }
 
-    /// At the in-flight cap the drain waits for a request task to end, and so
-    /// does every frame behind it.
+    #[compio::test]
+    async fn given_pending_metadata_when_read_and_ping_queue_should_answer_ping_then_wake_read() {
+        const READ_REQUEST: u64 = 1;
+        const PING_REQUEST: u64 = 2;
+        let config = Arc::new(ServerConfig::default());
+        let (bus, shard, host) = root_host((*config).clone());
+        bind_root_session(&shard, host.sessions()).await;
+        let drain = Rc::new(ClientDrain::new(&config));
+        let metadata = drain.admit(Admission::MetadataLane).await;
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
+            ROOT_TRANSPORT,
+            VecDeque::from([
+                held_get_me(READ_REQUEST, 0),
+                root_read(PING_CODE, PING_REQUEST).into_generic(),
+            ]),
+        )])));
+        let draining = drain_client_requests(
+            shard,
+            Rc::clone(host.sessions()),
+            config,
+            1,
+            queues,
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(draining);
+        assert!(futures::poll!(draining.as_mut()).is_pending());
+        {
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "the dependent read must remain queued");
+            assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
+        }
+        drop(metadata);
+        draining.await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            2,
+            "release must wake the read without another frame"
+        );
+        assert_eq!(reply_request(&replies[1].1), READ_REQUEST);
+    }
+
+    #[test]
+    fn given_queued_progress_conflict_when_session_barrier_follows_should_only_let_ping_pass() {
+        const BLOCKED: u64 = 1;
+        const BARRIER: u64 = 2;
+        const READ: u64 = 3;
+        const PING: u64 = 4;
+        for operation in [
+            Operation::Logout,
+            Operation::DeleteTopic,
+            Operation::NonReplicated,
+        ] {
+            let barrier = if operation == Operation::NonReplicated {
+                root_read(BIND_SESSION_CODE, BARRIER).into_generic()
+            } else {
+                wire_request(operation, ROOT_CLIENT, ROOT_SESSION, BARRIER, &[]).into_generic()
+            };
+            let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
+                ROOT_TRANSPORT,
+                VecDeque::from([
+                    wire_request(
+                        Operation::StoreConsumerOffset,
+                        ROOT_CLIENT,
+                        ROOT_SESSION,
+                        BLOCKED,
+                        &[],
+                    )
+                    .into_generic(),
+                    barrier,
+                    held_get_me(READ, 0),
+                    root_read(PING_CODE, PING).into_generic(),
+                ]),
+            )])));
+            let ready = |message: &Message<GenericHeader>| {
+                message
+                    .try_as_typed::<RequestHeader>()
+                    .unwrap()
+                    .header()
+                    .request
+                    != BLOCKED
+            };
+            let ping = pop_next_client_request(&queues, ROOT_TRANSPORT, ready).unwrap();
+            assert!(is_ping(&ping));
+            assert!(pop_next_client_request(&queues, ROOT_TRANSPORT, ready).is_none());
+            for expected in [BLOCKED, BARRIER, READ] {
+                let message = pop_next_client_request(&queues, ROOT_TRANSPORT, |_| true).unwrap();
+                assert_eq!(
+                    message
+                        .try_as_typed::<RequestHeader>()
+                        .unwrap()
+                        .header()
+                        .request,
+                    expected
+                );
+            }
+        }
+    }
+
     #[compio::test]
     async fn given_a_full_in_flight_cap_when_another_frame_arrives_should_serve_it_after_a_slot_frees()
      {
@@ -2617,6 +2806,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             HOME_TRANSPORT,
             request.into_generic(),
+            None,
         )
         .await;
         await_replies(bus, 1).await;
@@ -2699,13 +2889,13 @@ mod tests {
             .or_default()
             .push_back(non_replicated_request(CLIENT, PING_CODE));
 
-        assert!(pop_next_client_request(&queues, CLIENT).is_some());
+        assert!(pop_next_client_request(&queues, CLIENT, |_| true).is_some());
         assert!(
             queues.borrow().is_empty(),
             "the entry must be freed as soon as it drains empty"
         );
         assert!(
-            pop_next_client_request(&queues, CLIENT).is_none(),
+            pop_next_client_request(&queues, CLIENT, |_| true).is_none(),
             "a drained client has nothing left to pop"
         );
     }

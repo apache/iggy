@@ -163,10 +163,17 @@ where
         }
         let rejection = partitions
             .with_partition(&namespace, |partition| {
-                if matches!(read, PartitionRead::PollOnPrimary { .. })
-                    && partition.consensus().is_normal_backup()
-                {
-                    return Some(IggyError::NotPrimary);
+                if read.requires_primary() {
+                    let consensus = partition.consensus();
+                    if consensus.is_normal_backup() {
+                        return Some(IggyError::NotPrimary);
+                    }
+                    if !consensus.is_primary()
+                        || !consensus.is_normal()
+                        || consensus.is_transferring()
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
                 }
                 if partition.requires_state_transfer() || partition.read_history_is_changing() {
                     return Some(IggyError::TransientNotAccepted);
@@ -217,17 +224,21 @@ where
                 if let PartitionRead::Poll {
                     metadata: Some(metadata),
                     ..
-                } = &read
+                }
+                | PartitionRead::UnboundPollOnPrimary { metadata, .. } = &read
                     && (!metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
                         || !metadata.matches_partition(self.shards_table.epoch_for(namespace)))
                 {
                     return Some(IggyError::TransientNotAccepted);
                 }
-                (matches!(read, PartitionRead::Poll { .. }) && partition.history_deleted())
-                    .then_some(IggyError::HistoryUnavailable)
+                (matches!(
+                    read,
+                    PartitionRead::Poll { .. } | PartitionRead::UnboundPollOnPrimary { .. }
+                ) && partition.history_deleted())
+                .then_some(IggyError::HistoryUnavailable)
             })
             .unwrap_or_else(|| {
-                matches!(read, PartitionRead::PollOnPrimary { .. })
+                read.requires_primary()
                     .then_some(IggyError::TransientNotAccepted)
             });
         if let Some(error) = rejection {
@@ -250,9 +261,15 @@ where
             read => (read, None),
         };
         let result = match read {
-            PartitionRead::SessionRetired { identity } => partitions
+            PartitionRead::SessionRetired {
+                identity,
+                created_revision,
+            } => partitions
                 .with_partition(&namespace, |partition| {
-                    PartitionReadReply::SessionRetired(partition.session_retired(identity))
+                    PartitionReadReply::SessionRetired(
+                        partition.created_revision() == created_revision
+                            && partition.session_retired(identity),
+                    )
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Primary => partitions
@@ -274,7 +291,8 @@ where
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Poll { consumer, args, .. }
-            | PartitionRead::PollOnPrimary { consumer, args, .. } => {
+            | PartitionRead::PollOnPrimary { consumer, args, .. }
+            | PartitionRead::UnboundPollOnPrimary { consumer, args, .. } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
                     None => PartitionReadReply::NotFound,
                     Some(plan) if plan.needs_off_pump_io() => {
@@ -329,7 +347,8 @@ where
                     }
                 }
             }
-            PartitionRead::ConsumerOffset { consumer } => partitions
+            PartitionRead::ConsumerOffset { consumer }
+            | PartitionRead::ConsumerOffsetOnPrimary { consumer } => partitions
                 .consumer_offset_read(&namespace, consumer)
                 .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                     PartitionReadReply::ConsumerOffset {
@@ -337,7 +356,8 @@ where
                         current_offset,
                     }
                 }),
-            PartitionRead::ExternalGroupOffset { group_id } => partitions
+            PartitionRead::ExternalGroupOffset { group_id }
+            | PartitionRead::ExternalGroupOffsetOnPrimary { group_id } => partitions
                 .external_group_offset_read(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                     PartitionReadReply::ConsumerOffset {

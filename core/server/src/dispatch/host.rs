@@ -24,9 +24,10 @@
 //! connection out. All connections installed on the shard dispatch through
 //! the same instance, which keeps disconnect cleanup equal across transports:
 //! the destination shard installs it on delegated TCP/WS/TCP-TLS/WSS
-//! connections, and shard 0 also on its local QUIC connections. A drain runs
-//! the frames that later frames depend on in arrival order, and every other
-//! read in a task of its own (see `crate::dispatch::ClientDrain`).
+//! connections, and shard 0 also on its local QUIC connections. A drain orders
+//! session changes and partition admissions. Later non-PING frames wait for a
+//! preceding metadata commit; independent reads run in their own tasks (see
+//! `crate::dispatch::ClientDrain`).
 //!
 //! The host also owns a clone of the bus, so every adapter the bus installs,
 //! on client and replica connections alike, keeps the bus alive: accepted,

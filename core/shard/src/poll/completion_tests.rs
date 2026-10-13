@@ -29,6 +29,7 @@ use consensus::{
     encode_state_manifest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::{
     AckLevel, ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader,
@@ -65,6 +66,45 @@ use crate::{
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+
+#[compio::test]
+async fn given_deleted_history_when_retirement_read_names_old_incarnation_should_refuse_replacement()
+ {
+    const ORIGINAL_REVISION: u64 = 7;
+    const REPLACEMENT_REVISION: u64 = 8;
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let config = partitions_config();
+    let metadata = PollTestMetadata::new((Users::default(), (StreamsInner::default().into(), ())));
+    let (owner, _sender) = owner_with_metadata(&bus, config.clone(), namespace, metadata);
+    let identity = SessionIdentity {
+        client_id: 1,
+        session: 1,
+        metadata_watermark: 100,
+    };
+    for revision in [ORIGINAL_REVISION, REPLACEMENT_REVISION] {
+        let (mut partition, _) =
+            partition_with_messages_at_revision(&bus, namespace, &["message"], revision).await;
+        delete_history(&mut partition, &config, 10).await;
+        owner.plane.partitions().remove(&namespace);
+        owner.plane.partitions().insert(namespace, partition);
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(
+                namespace,
+                PartitionRead::SessionRetired {
+                    identity,
+                    created_revision: ORIGINAL_REVISION,
+                },
+                reply,
+            )
+            .await;
+        assert!(matches!(
+            replies.try_recv().unwrap(),
+            PartitionReadReply::SessionRetired(retired) if retired == (revision == ORIGINAL_REVISION)
+        ));
+    }
+}
 
 #[compio::test]
 #[allow(clippy::too_many_lines)]
@@ -490,23 +530,31 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
                 .poll_metadata(namespace, None, BOUND_CLIENT)
                 .expect("metadata names the partition"),
         };
-        let (reply, replies) = channel(1);
-        owner
-            .on_partition_read(
-                namespace,
-                PartitionRead::PollOnPrimary {
-                    consumer: PollingConsumer::Consumer(1, 0),
-                    args: PollingArgs::new(PollingStrategy::first(), 1, true),
-                    attachment,
-                },
-                reply,
-            )
-            .await;
-        let reply = replies.try_recv().expect("the owner answers the read");
-        assert!(
-            matches!(&reply, PartitionReadReply::Rejected(error) if *error == expected),
-            "transferring {transferring}: expected {expected:?}, got {reply:?}"
-        );
+        let metadata = attachment.metadata;
+        for read in [
+            PartitionRead::PollOnPrimary {
+                consumer: PollingConsumer::Consumer(1, 0),
+                args: PollingArgs::new(PollingStrategy::first(), 1, true),
+                attachment,
+            },
+            PartitionRead::UnboundPollOnPrimary {
+                consumer: PollingConsumer::Consumer(1, 0),
+                args: PollingArgs::new(PollingStrategy::next(), 1, false),
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: PollingConsumer::Consumer(1, 0),
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary { group_id: 1 },
+        ] {
+            let (reply, replies) = channel(1);
+            owner.on_partition_read(namespace, read, reply).await;
+            let reply = replies.try_recv().expect("the owner answers the read");
+            assert!(
+                matches!(&reply, PartitionReadReply::Rejected(error) if *error == expected),
+                "transferring {transferring}: expected {expected:?}, got {reply:?}"
+            );
+        }
 
         let attachment = ConsumerAttachment {
             session: table.attach_session(BOUND_CLIENT, 1, BOUND_USER).unwrap(),

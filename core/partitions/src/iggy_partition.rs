@@ -947,8 +947,8 @@ where
         self.consensus.partition_incarnation()
     }
 
-    /// A report covers only an applied barrier on a serving replica. WAL replay
-    /// or the paired checkpoint must restore this floor before admission.
+    /// A report covers an applied retirement barrier or terminal history fence
+    /// on a serving replica. Replay or a checkpoint must restore that proof.
     /// Retirement barriers require persistence at every durability level.
     #[must_use]
     pub fn session_retired(&self, identity: SessionIdentity) -> bool {
@@ -957,8 +957,11 @@ where
             && self.consensus.is_normal()
             && !self.consensus.is_transferring()
             && self.consensus.pending_request(identity.client_id).is_none()
-            && self.required_metadata_frontier >= identity.metadata_watermark
-            && self.dedup.get_epoch(identity.client_id) != Some(identity.session)
+            && (self
+                .history_transition
+                .is_some_and(|history| history.partition_op <= self.consensus.commit_min())
+                || (self.required_metadata_frontier >= identity.metadata_watermark
+                    && self.dedup.get_epoch(identity.client_id) != Some(identity.session)))
     }
 
     fn pending_session_retirement(&self, client_id: u128, session: u64) -> bool {
@@ -11941,9 +11944,9 @@ where
         Ok(())
     }
 
-    /// Admission and queue promotion share this rule. Session retirement
-    /// carries no incarnation, and a lifecycle fence names its incarnation in
-    /// its body, which admission checks.
+    /// Retirement requests name sessions rather than histories; their prepares
+    /// carry this partition's incarnation. A lifecycle fence names its
+    /// incarnation in its body, which admission checks.
     fn request_history_available(&self, header: &RoutedRequestHeader) -> bool {
         header.operation == Operation::RetireSession
             || header.operation.is_partition_lifecycle()
@@ -11951,7 +11954,8 @@ where
     }
 
     const fn prepare_history_available(&self, header: &PrepareHeader) -> bool {
-        header.partition_incarnation == self.created_revision() && !self.history_deleted()
+        header.partition_incarnation == self.created_revision()
+            && (matches!(header.operation, Operation::RetireSession) || !self.history_deleted())
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
@@ -15317,6 +15321,102 @@ mod tests {
                 "a retirement of the hosted incarnation must still enter the journal"
             );
         }
+    }
+
+    #[compio::test]
+    async fn given_deleted_history_when_retirement_is_replicated_or_repaired_should_commit_it() {
+        const FENCE_OP: u64 = 1;
+        const RETIREMENT_OP: u64 = 2;
+        let config = repair_config();
+        let directory = tempfile::tempdir().unwrap();
+        let (mut primary, _) = recording_partition_at(0, 3);
+        primary.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        let transition = TransitionPartitionHistoryRequest {
+            incarnation: primary.created_revision(),
+            metadata_op: 10,
+        };
+        primary
+            .on_request(
+                partition_control_request(
+                    &primary,
+                    Operation::TransitionPartitionHistory,
+                    &transition.to_bytes(),
+                    transition.metadata_op,
+                ),
+                None,
+            )
+            .await;
+        primary.consensus.advance_commit_max(FENCE_OP);
+        primary.commit_journal(&config).await;
+        assert!(primary.history_deleted());
+        let bytes = primary.log.journal().inner.repair_entry(FENCE_OP).unwrap();
+        let fence =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(bytes.as_slice())).unwrap();
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 20,
+        };
+        assert!(primary.session_retired(identity));
+        primary
+            .on_request(retire_session_request(primary.namespace(), identity), None)
+            .await;
+        let bytes = primary
+            .log
+            .journal()
+            .inner
+            .repair_entry(RETIREMENT_OP)
+            .expect("retirement must remain journaled after the terminal fence");
+        let retirement =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(bytes.as_slice())).unwrap();
+
+        for repaired in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut backup, _) = recording_partition_at(1, 3);
+            backup.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            backup.on_replicate(fence.clone()).await;
+            backup.consensus.advance_commit_max(FENCE_OP);
+            backup.commit_journal(&config).await;
+            assert!(backup.history_deleted());
+            if repaired {
+                backup.repair = Some(armed_session(RETIREMENT_OP, 0));
+                backup.apply_repaired_prepare(retirement.clone()).await;
+            } else {
+                backup.on_replicate(retirement.clone()).await;
+            }
+            assert!(
+                backup.log.journal().inner.holds_op(RETIREMENT_OP),
+                "retirement after the delete fence must reach the backup, repaired={repaired}"
+            );
+            backup.consensus.advance_commit_max(RETIREMENT_OP);
+            backup.commit_journal(&config).await;
+            assert_eq!(backup.consensus.commit_min(), RETIREMENT_OP);
+            assert!(backup.session_retired(identity));
+            assert!(backup.fatal().is_none());
+        }
+    }
+
+    #[compio::test]
+    async fn given_unpublished_delete_fence_when_checking_retirement_should_wait_for_commit() {
+        let mut partition = test_partition();
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 20,
+        };
+        partition
+            .apply_history_transition(
+                TransitionPartitionHistoryRequest {
+                    incarnation: partition.created_revision(),
+                    metadata_op: 10,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(!partition.session_retired(identity));
+        partition.consensus.advance_commit_max(1);
+        partition.consensus.advance_commit_min(1);
+        assert!(partition.session_retired(identity));
     }
 
     #[compio::test]

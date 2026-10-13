@@ -96,10 +96,6 @@ const SEND_BUDGET: Duration = Duration::from_secs(20);
 /// the state this test needs before it can observe anything.
 const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_POLL: Duration = Duration::from_millis(500);
-/// How long a backup gets to relay its requests to a frozen partition primary
-/// before the primary dies under them. Far below `cluster.heartbeat_timeout`
-/// (5s by default), so no election ends while they are in flight.
-const RELAY_IN_FLIGHT: Duration = Duration::from_secs(1);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
@@ -538,13 +534,20 @@ async fn given_split_primaries_when_http_calls_a_partition_backup_should_serve_o
         StatusCode::NO_CONTENT,
         "store on a backup"
     );
-    let response = http
-        .client
-        .get(&offset)
-        .bearer_auth(&http.token)
-        .send()
-        .await
-        .expect("get offset request");
+    pause_node(harness, partition_primary, true);
+    let (response, poll_response, ()) = tokio::join!(
+        http.client.get(&offset).bearer_auth(&http.token).send(),
+        http.client.get(&poll).bearer_auth(&http.token).send(),
+        async {
+            wait_for_queued_relays(harness, partition_primary, 2).await;
+            pause_node(harness, partition_primary, false);
+        },
+    );
+    let poll_response = poll_response.expect("relayed poll request");
+    assert_eq!(poll_response.status(), StatusCode::OK);
+    let relayed: PolledMessages = poll_response.json().await.expect("decode relayed poll");
+    assert_eq!(relayed.messages.len(), expected.len());
+    let response = response.expect("relayed get offset request");
     assert_eq!(response.status(), StatusCode::OK, "get on a backup");
     let info: ConsumerOffsetInfo = response.json().await.expect("decode ConsumerOffsetInfo");
     assert_eq!(info.stored_offset, store.offset);
@@ -690,26 +693,27 @@ async fn given_split_primaries_when_a_relayed_read_loses_its_primary_should_rese
     let get = |url: String| http.client.get(url).bearer_auth(&http.token).send();
 
     // A frozen primary takes the relayed requests and never answers them.
-    let pid = harness
-        .node(partition_primary)
-        .pid()
-        .expect("the partition primary is running");
-    // SAFETY: a plain syscall on a child this harness spawned and has not reaped.
-    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+    pause_node(harness, partition_primary, true);
     let offset = format!("{offsets}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}");
     let (offset_read, read, auto_commit, ()) = tokio::join!(
         get(offset.clone()),
         get(poll(false)),
         get(poll(true)),
         async {
-            sleep(RELAY_IN_FLIGHT).await;
+            wait_for_queued_relays(harness, partition_primary, 3).await;
             harness
                 .kill_node(partition_primary)
                 .expect("kill the frozen partition primary");
         },
     );
 
-    let (status, body) = status_and_body(read.expect("poll without auto_commit")).await;
+    let response = read.expect("poll without auto_commit");
+    let response = if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        until_primary_resolved(|| async { get(poll(false)).await.expect("read-only poll") }).await
+    } else {
+        response
+    };
+    let (status, body) = status_and_body(response).await;
     assert_eq!(status, StatusCode::OK, "poll without auto_commit: {body}");
     let polled: PolledMessages = serde_json::from_str(&body).expect("decode PolledMessages");
     assert_eq!(polled.messages.len(), GROUP_PAYLOADS.len());
@@ -736,6 +740,60 @@ async fn given_split_primaries_when_a_relayed_read_loses_its_primary_should_rese
     assert_eq!(status, StatusCode::OK, "offset read: {body}");
     let info: ConsumerOffsetInfo = serde_json::from_str(&body).expect("decode ConsumerOffsetInfo");
     assert_eq!(info.stored_offset, store.offset);
+}
+
+fn pause_node(harness: &TestHarness, node: usize, paused: bool) {
+    let pid = harness.node(node).pid().expect("the node is running");
+    let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+    // SAFETY: the signal targets a child this harness owns and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+}
+
+/// The stopped HTTP listener cannot consume bytes. Nonempty receive queues
+/// prove the relay requests reached it before it is resumed or killed.
+async fn wait_for_queued_relays(harness: &TestHarness, node: usize, expected: usize) {
+    const TCP_ESTABLISHED: &str = "01";
+    let port = harness
+        .node(node)
+        .http_addr()
+        .expect("node HTTP address")
+        .port();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let queued = ["/proc/net/tcp", "/proc/net/tcp6"]
+                .into_iter()
+                .map(|path| {
+                    std::fs::read_to_string(path)
+                        .expect("read the kernel TCP connection table")
+                        .lines()
+                        .skip(1)
+                        .filter(|line| {
+                            let fields: Vec<_> = line.split_whitespace().collect();
+                            fields.get(3) == Some(&TCP_ESTABLISHED)
+                                && fields
+                                    .get(1)
+                                    .and_then(|address| address.rsplit_once(':'))
+                                    .and_then(|(_, port)| u16::from_str_radix(port, 16).ok())
+                                    == Some(port)
+                                && fields
+                                    .get(4)
+                                    .and_then(|queues| queues.split_once(':'))
+                                    .and_then(|(_, received)| {
+                                        usize::from_str_radix(received, 16).ok()
+                                    })
+                                    .is_some_and(|received| received > 0)
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            if queued >= expected {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every HTTP relay must reach the paused partition primary");
 }
 
 async fn status_and_body(response: reqwest::Response) -> (StatusCode, String) {

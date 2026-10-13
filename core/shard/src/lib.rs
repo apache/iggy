@@ -365,6 +365,7 @@ pub enum PartitionRead {
     Primary,
     SessionRetired {
         identity: iggy_binary_protocol::requests::system::SessionIdentity,
+        created_revision: u64,
     },
     /// A bound poll. A group read is served only to the partition's installed
     /// owner.
@@ -372,6 +373,12 @@ pub enum PartitionRead {
         consumer: PollingConsumer,
         args: PollingArgs,
         attachment: poll::ConsumerAttachment,
+    },
+    /// An HTTP poll with no bound session, served only by the primary.
+    UnboundPollOnPrimary {
+        consumer: PollingConsumer,
+        args: PollingArgs,
+        metadata: metadata::stm::stream::PollMetadata,
     },
     /// A read with no owner check. In production only plain consumers use it.
     /// Tests and the simulator also read groups through it.
@@ -383,8 +390,14 @@ pub enum PartitionRead {
     ConsumerOffset {
         consumer: PollingConsumer,
     },
+    ConsumerOffsetOnPrimary {
+        consumer: PollingConsumer,
+    },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffset {
+        group_id: u32,
+    },
+    ExternalGroupOffsetOnPrimary {
         group_id: u32,
     },
     /// Cooperative-rebalance classification: the group's last-polled and
@@ -403,12 +416,27 @@ pub enum PartitionRead {
 }
 
 impl PartitionRead {
+    pub(crate) const fn requires_primary(&self) -> bool {
+        matches!(
+            self,
+            Self::PollOnPrimary { .. }
+                | Self::UnboundPollOnPrimary { .. }
+                | Self::ConsumerOffsetOnPrimary { .. }
+                | Self::ExternalGroupOffsetOnPrimary { .. }
+        )
+    }
+
     /// Whether the read returns a stored consumer offset, or polls from one.
     #[must_use]
     pub(crate) const fn reads_stored_offset(&self) -> bool {
         match self {
-            Self::ConsumerOffset { .. } | Self::ExternalGroupOffset { .. } => true,
-            Self::PollOnPrimary { args, .. } | Self::Poll { args, .. } => {
+            Self::ConsumerOffset { .. }
+            | Self::ConsumerOffsetOnPrimary { .. }
+            | Self::ExternalGroupOffset { .. }
+            | Self::ExternalGroupOffsetOnPrimary { .. } => true,
+            Self::PollOnPrimary { args, .. }
+            | Self::UnboundPollOnPrimary { args, .. }
+            | Self::Poll { args, .. } => {
                 matches!(args.kind, PollingKind::Next)
             }
             Self::Primary
@@ -4934,7 +4962,6 @@ where
                 && let Some(from_op) =
                     partition_view_divergence_from(self.id, partition, pending.as_ref())
             {
-                partition.consensus().settle_view_log_proof();
                 partition.defer_view_truncation(from_op, actions, Some(header.replica));
                 return;
             }
@@ -6080,7 +6107,6 @@ where
                 partition_view_divergence_from(self.id, partition, Some(&pending))
             {
                 if partition.has_io_dispatcher() {
-                    partition.consensus().settle_view_log_proof();
                     partition.defer_view_truncation(from_op, Vec::new(), None);
                     return;
                 }

@@ -1271,9 +1271,8 @@ impl OffsetIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(mut self) -> OffsetIoResult {
         let value = async {
-            // First only as defense in depth. WAL replay of a lost store, boot
-            // dropping a marker beside any offset file and the transfer bound
-            // `emptied_at <= commit_op` carry the crash safety.
+            // A lost store file must not leave an older marker claiming the
+            // table is empty. Keep marker removal strict before writing it.
             if let Some(marker) = &self.retired_marker {
                 persist_emptied_marker_with_storage(&DiskStorage, marker, 0).await?;
             }
@@ -1337,11 +1336,13 @@ impl OffsetDeleteIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(self) -> Result<bool, IggyError> {
         let removed = delete_persisted_offset(&self.path).await?;
-        // After the unlink only as defense in depth. WAL replay of the delete,
-        // boot dropping a marker beside any offset file and the transfer bound
-        // `emptied_at <= commit_op` carry the crash safety.
-        if let Some((marker, op)) = &self.emptied_marker {
-            persist_emptied_marker_with_storage(&DiskStorage, marker, *op).await?;
+        // A missing marker after restart loses empty-table transfer proof, not
+        // the committed delete. Replay may find the key already absent and
+        // cannot be relied on to recreate the marker.
+        if let Some((marker, op)) = &self.emptied_marker
+            && let Err(error) = persist_emptied_marker_with_storage(&DiskStorage, marker, *op).await
+        {
+            warn!(%marker, op, %error, "could not persist emptied offset table marker");
         }
         Ok(removed)
     }
@@ -1466,6 +1467,69 @@ mod tests {
         async fn remove_tree(&self, path: &Path) -> std::io::Result<()> {
             DiskStorage.remove_tree(path).await
         }
+    }
+
+    #[compio::test]
+    async fn given_failed_emptied_marker_when_offset_delete_succeeds_should_preserve_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let offset = directory.path().join("offset");
+        let marker = directory.path().join("emptied");
+        std::fs::write(&offset, crate::offset_storage::encode_offset_record(7)).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        let job = OffsetDeleteIoJob {
+            path: offset.to_str().unwrap().to_owned(),
+            emptied_marker: Some((marker.to_str().unwrap().to_owned(), 9)),
+        };
+
+        assert_eq!(job.execute().await, Ok(true));
+        assert!(!offset.exists());
+        assert!(marker.is_dir());
+    }
+
+    #[compio::test]
+    async fn given_failed_marker_clear_when_storing_should_preserve_error_without_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let offset = directory.path().join("offset");
+        let marker = directory.path().join("emptied");
+        std::fs::create_dir(&marker).unwrap();
+        let marker_path = marker.to_str().unwrap().to_owned();
+        let job = OffsetIoJob {
+            path: offset.to_str().unwrap().to_owned(),
+            offset: 7,
+            fold_max: false,
+            persisted: true,
+            owner: OffsetFileOwner::Uncached,
+            file: None,
+            permit: None,
+            retired_marker: Some(marker_path.clone()),
+        };
+
+        assert_eq!(
+            job.execute().await.outcome,
+            Err(IggyError::CannotDeleteConsumerOffsetFile(marker_path))
+        );
+        assert!(!offset.exists());
+        assert!(marker.is_dir());
+    }
+
+    #[compio::test]
+    async fn given_failed_offset_delete_when_executing_should_preserve_error_without_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let offset = directory.path().join("offset");
+        let marker = directory.path().join("emptied");
+        std::fs::create_dir(&offset).unwrap();
+        let path = offset.to_str().unwrap().to_owned();
+        let job = OffsetDeleteIoJob {
+            path: path.clone(),
+            emptied_marker: Some((marker.to_str().unwrap().to_owned(), 9)),
+        };
+
+        assert_eq!(
+            job.execute().await,
+            Err(IggyError::CannotDeleteConsumerOffsetFile(path))
+        );
+        assert!(offset.is_dir());
+        assert!(!marker.exists());
     }
 
     #[compio::test]

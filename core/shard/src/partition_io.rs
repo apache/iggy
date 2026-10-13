@@ -705,6 +705,7 @@ where
                 }
             }
             partitions::PartitionIoStep::ViewApplied { actions, peer } => {
+                partition.consensus().settle_view_log_proof();
                 if let Some(peer) = peer {
                     self.finish_partition_view_adoption(namespace, peer, actions)
                         .await;
@@ -4196,6 +4197,73 @@ mod tests {
         assert_eq!(partition.consensus().commit_min(), APPLIED);
         assert!(!partition.log.journal().inner.holds_op(APPLIED + 1));
         assert!(!partition.consensus().view_log_unproven());
+    }
+
+    #[compio::test]
+    async fn given_deferred_view_truncation_when_resuming_should_settle_proof_only_after_success() {
+        const APPLIED: u64 = 2;
+        const LOCAL_HEAD: u64 = 4;
+        const NEW_HEAD: u64 = 6;
+        const NEW_VIEW: u32 = 3;
+        for truncate_fails in [false, true] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let (owner, _sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
+            let mut partition =
+                repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+            partition.repair = None;
+            for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
+                partition.on_replicate(prepare.clone()).await;
+            }
+            partition.consensus().advance_commit_max(APPLIED);
+            partition
+                .commit_journal(owner.plane.partitions().config())
+                .await;
+            let partitions = owner.plane.partitions();
+            partitions.remove(&namespace).unwrap();
+            partitions.insert(namespace, partition);
+            partitions.set_io_notifier(
+                owner.partition_io.notifier(),
+                owner.partition_io.limits.bytes_max(),
+            );
+            owner
+                .on_start_view(start_view_suffix(
+                    namespace,
+                    NEW_VIEW,
+                    NEW_HEAD,
+                    NEW_HEAD,
+                    &[*prepares.last().unwrap().header()],
+                ))
+                .await;
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            assert!(partition.view_truncation_pending());
+            assert!(partition.consensus().view_log_unproven());
+            if truncate_fails {
+                partition.log.active_segment_mut().size = IggyByteSize::from(u64::MAX);
+            }
+
+            for _ in 0..crate::router::COOPERATIVE_EVENT_BUDGET {
+                owner.service_partition_io().await;
+                if !partitions
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .view_truncation_pending()
+                {
+                    break;
+                }
+            }
+
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            assert!(!partition.view_truncation_pending());
+            assert_eq!(partition.consensus().view_log_unproven(), truncate_fails);
+            partition.commit_journal(partitions.config()).await;
+            assert_eq!(partition.consensus().commit_min(), APPLIED);
+            assert_eq!(
+                partition.log.journal().inner.holds_op(APPLIED + 1),
+                truncate_fails
+            );
+        }
     }
 
     #[compio::test]

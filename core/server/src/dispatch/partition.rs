@@ -30,6 +30,7 @@ use crate::dispatch::failure::{
     send_non_replicated_deny, send_result_rejection,
 };
 use crate::dispatch::submit::submit_client_request_on_owner;
+use crate::dispatch::{ConsumerProgress, InFlight};
 use crate::namespace::{resolve_partition_namespace, resolve_partition_request_namespace};
 use crate::reply_frame::{
     build_consumer_offset_body, build_polled_messages_reply, current_metadata_commit,
@@ -40,16 +41,21 @@ use bytes::Bytes;
 use consensus::client_table::SessionAttachment;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
+use iggy_binary_protocol::codes::{
+    GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
+};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
-use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
+};
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::responses::messages::poll_messages::PollMessagesResponseHeader;
 use iggy_binary_protocol::{
-    KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation, RoutedRequestHeader,
-    WireDecode, WireEncode, WireIdentifier,
+    GenericHeader, KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation,
+    RequestHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier,
 };
 use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
 use journal::superblock::SuperblockStore;
@@ -105,6 +111,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     acting_user_id: Option<u32>,
     consumer_session: Option<(u128, SessionAttachment)>,
     resolved_namespace: Option<u64>,
+    progress: Option<InFlight>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -290,6 +297,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         transport_client_id,
         &header,
         attachment,
+        progress,
     )
     .await;
 }
@@ -310,6 +318,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     transport_client_id: u128,
     header: &RoutedRequestHeader,
     attachment: Option<ConsumerAttachment>,
+    progress: Option<InFlight>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -337,6 +346,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     // Through the bus, not the runtime directly: the simulator supplies its
     // own executor and virtual clock.
     shard.bus.clone().spawn(async move {
+        let _progress = progress;
         let Some(reply) = shard.await_partition_submit(ticket).await else {
             // Abandoned or expired. Deliberately silent: the outcome is
             // unknown, and a synthesized failure could contradict a write that
@@ -367,6 +377,71 @@ async fn relay_partition_reply<B, MJ, S, SB>(
             }
         }
     });
+}
+
+/// The offset key shared by polls and explicit progress writes on a connection.
+/// Failed resolution is left to the normal handler's authorization and error path.
+pub(super) fn progress_key<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    message: &Message<GenericHeader>,
+) -> Option<ConsumerProgress>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let request = message.try_as_typed::<RequestHeader>().ok()?;
+    let wire = match request.header().operation {
+        Operation::NonReplicated
+            if request.header().reserved[..4] == GET_CONSUMER_OFFSET_CODE.to_le_bytes() =>
+        {
+            GetConsumerOffsetRequest::decode_from(request.body()).ok()?
+        }
+        Operation::NonReplicated
+            if request.header().reserved[..4] == POLL_MESSAGES_CODE.to_le_bytes()
+                || request.header().reserved[..4]
+                    == POLL_MESSAGES_ON_PRIMARY_CODE.to_le_bytes() =>
+        {
+            let poll = PollMessagesRequest::decode_from(request.body()).ok()?;
+            GetConsumerOffsetRequest {
+                consumer: poll.consumer,
+                stream_id: poll.stream_id,
+                topic_id: poll.topic_id,
+                partition_id: poll.partition_id,
+            }
+        }
+        Operation::StoreConsumerOffset => {
+            let store = StoreConsumerOffsetRequest::decode_from(request.body()).ok()?;
+            GetConsumerOffsetRequest {
+                consumer: store.consumer,
+                stream_id: store.stream_id,
+                topic_id: store.topic_id,
+                partition_id: store.partition_id,
+            }
+        }
+        Operation::DeleteConsumerOffset => {
+            let delete = DeleteConsumerOffsetRequest::decode_from(request.body()).ok()?;
+            GetConsumerOffsetRequest {
+                consumer: delete.consumer,
+                stream_id: delete.stream_id,
+                topic_id: delete.topic_id,
+                partition_id: delete.partition_id,
+            }
+        }
+        _ => return None,
+    };
+    let (namespace, _, read) = resolve_consumer_offset_request(shard, &wire).ok()??;
+    let (kind, consumer_id) = match read {
+        PartitionRead::ConsumerOffset { consumer } => match consumer {
+            PollingConsumer::Consumer(id, _) => (KIND_CONSUMER, id),
+            PollingConsumer::ConsumerGroup(id, _) => (KIND_CONSUMER_GROUP, id),
+        },
+        PartitionRead::ExternalGroupOffset { group_id } => (KIND_EXTERNAL_GROUP, group_id as usize),
+        _ => return None,
+    };
+    Some((namespace.inner(), kind, consumer_id))
 }
 
 pub fn capture_offset_attachment(
@@ -720,10 +795,8 @@ pub(super) fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
 /// denies with a nonzero status instead, so an addressing typo cannot read
 /// back as a fresh consumer. A read that its owner does not answer in time, or
 /// whose owner does not hold the partition, denies with `TransientNotAccepted`.
-// TODO(hubcio): plain local partition_read with no primary gate, so a
-// follower answers from its own (possibly lagging) offset state. Needs the
-// same is-caught-up-primary gate the auto-commit path has, or an explicit
-// read-from-follower contract.
+// TODO(hubcio): primary-gate binary offset reads when the active Rust clients
+// route GET_CONSUMER_OFFSET to the partition primary.
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -1734,6 +1807,7 @@ mod tests {
             Some(DEFAULT_ROOT_USER_ID),
             None,
             Some(namespace),
+            None,
         )
         .await;
         let _ = updater.await;
@@ -1978,6 +2052,7 @@ mod tests {
                 1,
                 91,
                 Some(DEFAULT_ROOT_USER_ID),
+                None,
                 None,
                 None,
             )
@@ -2919,6 +2994,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
             None,
             None,
         )

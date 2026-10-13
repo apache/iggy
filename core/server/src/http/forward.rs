@@ -48,8 +48,8 @@
 //!   primary's pipeline: a connect-phase failure, and for a metadata relay a
 //!   503 whose body carries the `TransientNotAccepted` or `NotPrimary` code or
 //!   a 307 from a stale target, for a partition relay a 503 carrying
-//!   `NotPrimary`. Every
-//!   other outcome - including a 503 carrying `TransientNotCommitted`, whose op
+//!   `NotPrimary`. Every other outcome - including a 503 carrying
+//!   `TransientNotCommitted`, whose op
 //!   may still commit - is relayed as-is, because re-issuing it under a fresh
 //!   session would defeat the consensus dedup and double-apply the op.
 //! - A partition read changes no state, so a transport failure after its send
@@ -702,15 +702,23 @@ async fn attempt(
         classify_forwarded_reply(response, method, kind).await
     };
     match compio::time::timeout(timeout, attempt).await {
-        // Elapsed: the request may be mid-commit on the primary. Outcome
-        // unknown, so never retried - 504, same contract as a local commit
-        // wait that timed out.
-        Err(_elapsed) => AttemptOutcome::Relay(gateway_timeout_response(
-            "forward_timeout",
-            "the primary did not answer the forwarded request in time; the outcome is unknown",
-        )),
+        Err(_elapsed) => AttemptOutcome::Relay(forward_timeout(kind)),
         Ok(outcome) => outcome,
     }
+}
+
+fn forward_timeout(kind: RelayKind) -> Response {
+    if kind == RelayKind::Partition(PartitionEffect::Read) {
+        return with_retry_after(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forward_timeout",
+            "the primary did not answer the forwarded read in time; retry",
+        ));
+    }
+    gateway_timeout_response(
+        "forward_timeout",
+        "the primary did not answer the forwarded request in time; the outcome is unknown",
+    )
 }
 
 async fn classify_forwarded_reply(
@@ -1073,6 +1081,19 @@ mod tests {
     use super::*;
 
     use std::io::{Read, Write};
+
+    #[test]
+    fn given_relay_timeout_when_request_is_read_only_should_report_retryable_unavailability() {
+        let response = forward_timeout(RelayKind::Partition(PartitionEffect::Read));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        for kind in [
+            RelayKind::Metadata,
+            RelayKind::Partition(PartitionEffect::Write),
+        ] {
+            assert_eq!(forward_timeout(kind).status(), StatusCode::GATEWAY_TIMEOUT);
+        }
+    }
 
     #[test]
     fn linearizable_query_detected_only_on_exact_pair() {

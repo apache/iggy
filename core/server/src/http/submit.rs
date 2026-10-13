@@ -483,6 +483,7 @@ async fn partition_write(
                 Some(session.user_id),
                 Some((session.client_id, attachment)),
                 Some(namespace),
+                None,
             )
             .await;
             if let Some(dispatched) = dispatched.take() {

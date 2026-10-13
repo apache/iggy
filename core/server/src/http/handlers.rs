@@ -1337,10 +1337,10 @@ pub(in crate::http) async fn poll_messages(
         .map_err(ReadError::Rejected)?;
     let reply = SendWrapper::new(state.shard.partition_read(
         namespace,
-        PartitionRead::Poll {
+        PartitionRead::UnboundPollOnPrimary {
             consumer,
             args,
-            metadata: Some(metadata),
+            metadata,
         },
     ))
     .await;
@@ -1445,6 +1445,15 @@ pub(in crate::http) async fn get_consumer_offset(
     {
         return Ok(response);
     }
+    let read = match read {
+        PartitionRead::ConsumerOffset { consumer } => {
+            PartitionRead::ConsumerOffsetOnPrimary { consumer }
+        }
+        PartitionRead::ExternalGroupOffset { group_id } => {
+            PartitionRead::ExternalGroupOffsetOnPrimary { group_id }
+        }
+        _ => return Err(ReadError::Rejected(IggyError::InvalidCommand)),
+    };
     let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
     consumer_offset_reply(partition_id, reply).map(IntoResponse::into_response)
 }

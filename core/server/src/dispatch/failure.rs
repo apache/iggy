@@ -650,6 +650,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             frame,
+            None,
         )
         .await;
 
@@ -896,6 +897,7 @@ mod tests {
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             request.into_generic(),
+            None,
         )
         .await;
 
