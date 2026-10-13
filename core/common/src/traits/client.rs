@@ -90,6 +90,11 @@ pub trait Client:
     /// operation stays retained. An operation that is not retained gives
     /// `OperationNotRetained(op)`. A client that retains no operations
     /// returns `FeatureUnavailable`.
+    ///
+    /// A session reset drops retained operations without settling them.
+    /// `OperationNotRetained(op)` after a reset means the outcome is still
+    /// unknown and can no longer be recovered through this client.
+    #[doc(hidden)]
     async fn resolve_operation(&self, _op: u64, _deadline: Instant) -> Result<(), IggyError> {
         Err(IggyError::FeatureUnavailable)
     }
@@ -98,6 +103,7 @@ pub trait Client:
     /// of `op` stays unknown. An operation that is not retained gives
     /// `OperationNotRetained(op)`. A client that retains no operations
     /// returns `FeatureUnavailable`.
+    #[doc(hidden)]
     async fn abandon_operation(&self, _op: u64) -> Result<(), IggyError> {
         Err(IggyError::FeatureUnavailable)
     }

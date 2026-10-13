@@ -48,7 +48,8 @@ pub(crate) enum LaneKey {
 impl LaneKey {
     /// The lane of `code`. A write to a partition takes the lane of the
     /// incarnation that its context carries. Reads, Register and Logout take
-    /// no lane.
+    /// no lane. This includes auto-commit polls: their offset effect does not
+    /// acquire a client mutation lane.
     pub(crate) fn of(code: u32, context: &PartitionContext, partition_id: u32) -> Option<Self> {
         match operation_for_code(code) {
             Operation::NonReplicated | Operation::Register | Operation::Logout => None,

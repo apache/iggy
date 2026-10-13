@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The operation driver sends every request of a binary client. One deadline
+//! The operation driver coordinates a request across replica links. One deadline
 //! bounds the lane wait, the lookups, the attempts and the pauses of a call.
 //! A frame that can have taken effect is never frozen again, so a retry never
 //! applies a request twice.
@@ -38,7 +38,7 @@ use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
-use iggy_common::{ClientState, IggyError, RequestTarget};
+use iggy_common::{ClientState, Identifier, IggyError};
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::time::{Instant, timeout_at};
@@ -51,6 +51,23 @@ pub(crate) use poll_router::{
     PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code,
 };
 pub(crate) use route_cache::PartitionKey;
+
+/// Where a binary client sends one request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RequestTarget<'a> {
+    Metadata,
+    Partition(PartitionTarget<'a>),
+}
+
+/// A partition request as its caller spelled the partition.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartitionTarget<'a> {
+    pub(crate) stream_id: &'a Identifier,
+    pub(crate) topic_id: &'a Identifier,
+    pub(crate) partition_id: u32,
+    /// `None` captures the route context. Retries retain the first context sent.
+    pub(crate) context: Option<PartitionContext>,
+}
 
 /// Sends the requests of one client over its replica links.
 pub(crate) struct OperationDriver {
@@ -681,7 +698,6 @@ mod tests {
         CREATE_STREAM_CODE, GET_CLUSTER_METADATA_CODE, GET_STREAMS_CODE, POLL_MESSAGES_CODE,
         STORE_CONSUMER_OFFSET_CODE,
     };
-    use iggy_common::{Identifier, PartitionTarget};
     use std::iter::repeat_n;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};

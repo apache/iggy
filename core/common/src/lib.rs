@@ -81,7 +81,6 @@ pub use iggy_binary_protocol::responses::messages::{
 };
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
-pub use traits::binary_transport::{PartitionTarget, RequestTarget};
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;

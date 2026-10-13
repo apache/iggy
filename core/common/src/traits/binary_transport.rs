@@ -33,27 +33,6 @@ use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use std::sync::Arc;
 
-/// Where a binary client sends one request.
-#[derive(Debug, Clone, Copy)]
-pub enum RequestTarget<'a> {
-    /// The metadata primary.
-    Metadata,
-    /// The primary of one partition.
-    Partition(PartitionTarget<'a>),
-}
-
-/// A partition request as its caller spelled the partition.
-#[derive(Debug, Clone, Copy)]
-pub struct PartitionTarget<'a> {
-    pub stream_id: &'a Identifier,
-    pub topic_id: &'a Identifier,
-    pub partition_id: u32,
-    /// The context of the poll reply that the request continues. `None`
-    /// takes the context of the route. Every retry keeps the context that
-    /// the first attempt sent.
-    pub context: Option<PartitionContext>,
-}
-
 #[async_trait]
 pub trait BinaryTransport {
     /// Gets the state of the client.

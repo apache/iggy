@@ -23,8 +23,10 @@
 use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_common::wire_conversions::identifier_to_wire;
-use iggy_common::{Identifier, IggyError, PartitionTarget};
+use iggy_common::{Identifier, IggyError};
 use std::collections::HashMap;
+
+use super::PartitionTarget;
 
 /// The most routes that one client keeps. A new route beyond it evicts the
 /// oldest lookup.
