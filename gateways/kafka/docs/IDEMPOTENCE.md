@@ -100,11 +100,11 @@ refused with `RequestTooOld`.
 
 ## Decision
 
-Allocate only, and defer the pool.
+Allocate only, and defer deduplication.
 
-Rejecting the stock producer to avoid the pool trades away the one requirement the maintainers
+Rejecting the stock producer to avoid that work trades away the one requirement the maintainers
 named. It buys a guarantee nobody is asking for yet. Allocating costs about a day, leaves
-delivery where it already is, and blocks nothing the pool later needs.
+delivery where it already is, and blocks nothing deduplication later needs.
 
 ## Behavior
 
@@ -136,11 +136,13 @@ uptime, or the clock stepped back across the restart. A clock that reads before 
 seeds 0 and replays from the bottom. 2^47 milliseconds leaves the counter space thousands of years
 from running out.
 
-Nothing is persisted for this, so the clock seed narrows the replay window without closing it. That
-is harmless while no code path reads the producer id. It stops being harmless once one does:
-[#3535](https://github.com/apache/iggy/issues/3535) must first either persist a high-water mark
-and seed the counter above it, or bump `producer_epoch` on every gateway start. Either one makes a
-replayed `(producer_id, producer_epoch)` pair impossible rather than unlikely.
+Nothing is persisted for this, so the clock seed narrows the replay window without closing it.
+Produce reads the id as a pool key, and only an id this run handed out: any other id keys by
+connection. A replayed pair therefore makes two producers of one user share a session and send one
+at a time, and nothing more. It stops being harmless once deduplication reads the id. That work
+must first either persist a high-water mark and seed the counter above it, or bump
+`producer_epoch` on every gateway start. Either one makes a replayed
+`(producer_id, producer_epoch)` pair impossible rather than unlikely.
 
 `IGGY_KAFKA_INSTANCE_ID` defaults to 0 so a single gateway needs no configuration. Two gateways
 left on the default draw from the same 47-bit space and can hand out identical ids, on the first
@@ -176,7 +178,8 @@ for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly
 
 Produce:
 
-- accept `producer_id`, `producer_epoch` and `base_sequence` on the request and ignore them
+- accept `producer_id`, `producer_epoch` and `base_sequence` on the request. The id picks the
+  producer's session when this run handed it out. The epoch and the sequence are ignored
 - never answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) or `DUPLICATE_SEQUENCE_NUMBER` (46)
 - reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
   level, keeping the connection open. Under `acks=0` there is no response to carry 35, so the

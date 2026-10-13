@@ -408,8 +408,8 @@ InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
-      transactional request is refused. The producer-id-keyed connection pool that would make
-      retries deduplicated is deferred - delivery stays at-least-once
+      transactional request is refused
+- [ ] Deduplicate an idempotent producer's retries. Delivery stays at-least-once until then
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).

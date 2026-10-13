@@ -333,10 +333,11 @@ pub struct GatewayState {
     /// the process, not for the connection that asked for it.
     pub producer_ids: ProducerIdAllocator,
     /// `PRODUCE_CAPS` partition caps, in frame bytes, that Produce may hold decoded at once. Caps
-    /// its memory. A request takes what its largest partition may decode.
-    pub(crate) produce_memory: Semaphore,
+    /// its memory. A request takes what its largest partition may decode, and a send that
+    /// outlives the request keeps it while it owns the decoded partition.
+    pub(crate) produce_memory: Arc<Semaphore>,
     /// `PRODUCE_LARGE` slots a large Produce request takes before its memory. Small ones skip it.
-    pub(crate) produce_large: Semaphore,
+    pub(crate) produce_large: Arc<Semaphore>,
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
@@ -347,15 +348,15 @@ pub struct GatewayState {
     pub(crate) probe_board: ProbeBoard,
 }
 
-/// Partition caps Produce may hold decoded at once, about 160 MB at the default 8 MiB frame.
-///
-/// Counted in bytes, not requests: a small request takes a small share, so it does not queue
-/// behind a few large ones.
-const PRODUCE_CAPS: usize = 4;
-
 /// Large Produce requests that decode and send at once. More at once only contend for the
 /// gateway's workers and for Iggy: at full load they cost CPU and gave no throughput.
 const PRODUCE_LARGE: usize = 4;
+
+/// Partition caps Produce may hold decoded at once, about 200 MB at the default 8 MiB frame.
+///
+/// Counted in bytes, not requests, so a small request takes a small share. One cap more than the
+/// large slots: large requests can hold a cap each, and the small ones still have one.
+const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
 impl GatewayState {
     #[must_use]
@@ -373,12 +374,12 @@ impl GatewayState {
             max_frame_size,
             sasl_enabled,
             producer_ids: ProducerIdAllocator::new(instance_id),
-            produce_memory: Semaphore::new(
+            produce_memory: Arc::new(Semaphore::new(
                 PRODUCE_CAPS
                     .saturating_mul(max_frame_size)
                     .min(Semaphore::MAX_PERMITS),
-            ),
-            produce_large: Semaphore::const_new(PRODUCE_LARGE),
+            )),
+            produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
             probe_board: ProbeBoard::default(),
@@ -415,7 +416,7 @@ pub struct ConnectionState {
     /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
     /// session, since its next heartbeat waits behind the call.
     heartbeat_member: Mutex<Option<GroupMember>>,
-    /// Keys the Produce session of a producer that sends no producer id.
+    /// Keys the Produce session of a producer without a producer id that this gateway gave out.
     id: ConnectionId,
 }
 

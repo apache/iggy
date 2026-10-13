@@ -17,6 +17,7 @@
 
 //! Produce (API key 0).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,9 +26,10 @@ use kafka_protocol::messages::produce_request::PartitionProduceData;
 use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{ProduceRequest, ProduceResponse};
 use kafka_protocol::protocol::StrBytes;
-use tokio::sync::{AcquireError, SemaphorePermit};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit};
 
-use crate::bridge::{BridgeError, IggyBridge, ProduceSession, Producer, TopicTarget};
+use crate::auth::AuthenticatedPrincipal;
+use crate::bridge::{BridgeError, IggyBridge, ProduceTurn, Producer, TopicTarget};
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_RECORD,
@@ -43,8 +45,8 @@ use crate::protocol::handlers::{
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::records::{
-    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, declared_records,
-    decode_batch, is_compressed, producer_id, to_iggy,
+    Allowance, DecompressionBudget, RecordCodecError, TimestampWindow, Zstd, decode_batch,
+    is_compressed, producer_id, record_slots, to_iggy,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -86,6 +88,7 @@ const RESPONSE_BASE_BYTES: usize = 512;
 pub async fn handle(
     state: &GatewayState,
     connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
     api_version: i16,
     body: Bytes,
 ) -> HandleOutcome {
@@ -162,13 +165,16 @@ pub async fn handle(
 
     // Before planning, not after: the client waits through decompression too.
     let deadline = Deadline::new(request.timeout_ms);
-    let cost = decode_cost(&request, state.max_frame_size);
-    let Ok(Ok(_admission)) = tokio::time::timeout_at(deadline.at, admit(state, cost)).await else {
-        tracing::debug!("Produce deadline passed while waiting to decode");
+    // The turn before the memory: a request that waits behind its producer's stuck send then
+    // holds none, and no large slot.
+    let producer = producer_of(state, connection, principal, &request);
+    let Some(turn) = bridge.produce_turn(producer, deadline.at).await else {
+        tracing::debug!("Produce deadline passed while waiting for the producer's earlier send");
         return timed_out(api_version, &request);
     };
-    let Some(session) = bridge.produce_session(producer_of(&request, connection)) else {
-        tracing::warn!("every Produce session is busy");
+    let cost = decode_cost(&request, state.max_frame_size);
+    let Ok(Ok(admission)) = tokio::time::timeout_at(deadline.at, admit(state, cost)).await else {
+        tracing::debug!("Produce deadline passed while waiting to decode");
         return timed_out(api_version, &request);
     };
     let partition = Allowance {
@@ -181,8 +187,8 @@ pub async fn handle(
     } else {
         Zstd::Refused
     };
-    let board = &state.probe_board;
-    let responses = write_request(bridge, &session, board, &request, budget, zstd, deadline).await;
+    let (board, held) = (&state.probe_board, (turn, admission));
+    let responses = write_request(bridge, held, board, &request, budget, zstd, deadline).await;
 
     // Kafka closes an `acks=0` connection on any error, so the client refreshes metadata.
     if request.acks == ACKS_NONE {
@@ -224,54 +230,84 @@ fn timed_out(api_version: i16, request: &ProduceRequest) -> HandleOutcome {
 /// What the request may hold decoded, in frame bytes, at most one partition cap.
 ///
 /// Partitions decode one at a time, so the largest counts. Uncompressed, a partition holds its own
-/// bytes or a record slot per declared record, whichever is more. Compressed, it may fill the cap.
+/// bytes or its record slots, whichever is more. Compressed, it may fill the cap.
 fn decode_cost(request: &ProduceRequest, max_frame_size: usize) -> usize {
-    let largest = request
-        .topic_data
-        .iter()
-        .flat_map(|topic| &topic.partition_data)
-        .filter_map(|partition| partition.records.as_deref())
-        .map(|blob| {
-            if is_compressed(blob) {
-                max_frame_size
-            } else {
-                let slots = declared_records(blob).unwrap_or(0);
-                blob.len().max(slots.saturating_mul(FRAME_BYTES_PER_RECORD))
-            }
-        })
-        .max()
-        .unwrap_or(0);
-    largest.min(max_frame_size)
+    let blobs = || {
+        request
+            .topic_data
+            .iter()
+            .flat_map(|topic| &topic.partition_data)
+            .filter_map(|partition| partition.records.as_deref())
+    };
+    let cap_slots = max_frame_size / FRAME_BYTES_PER_RECORD;
+    // Only an uncompressed partition under the cap needs its slots counted.
+    let counted = |blob: &[u8]| !is_compressed(blob) && blob.len() < max_frame_size;
+    let cost = |blob: &[u8]| {
+        if counted(blob) {
+            let slots = record_slots(blob, cap_slots);
+            blob.len().max(slots.saturating_mul(FRAME_BYTES_PER_RECORD))
+        } else {
+            max_frame_size
+        }
+    };
+    // Counting reads every record, so a large partition counts off the worker, as it decodes.
+    let heavy = blobs().any(|blob| counted(blob) && blob.len() >= CODEC_OFF_WORKER_BYTES);
+    off_worker(heavy, || blobs().map(cost).max().unwrap_or(0)).min(max_frame_size)
 }
 
-/// A large slot when the request is large, and its decode memory.
-type Admission<'a> = (Option<SemaphorePermit<'a>>, SemaphorePermit<'a>);
+/// What a request holds from before its first decode: a large slot when it is large, and its
+/// decode memory.
+///
+/// A send that outlives the request keeps it for as long as it owns the decoded partition: until
+/// it ends, or until the bridge gives up on it.
+struct Admission {
+    _large: Option<OwnedSemaphorePermit>,
+    _memory: OwnedSemaphorePermit,
+}
+
+/// The producer's turn and the request's admission. They travel together through every send.
+type Held = (ProduceTurn, Admission);
 
 /// Waits for the request's decode memory. A large request, `CODEC_OFF_WORKER_BYTES` or more,
-/// first waits for a large slot, so while it waits its turn it holds no memory.
-async fn admit(
-    state: &GatewayState,
-    cost: usize,
-) -> std::result::Result<Admission<'_>, AcquireError> {
+/// first waits for a large slot, and holds no memory while it does.
+async fn admit(state: &GatewayState, cost: usize) -> std::result::Result<Admission, AcquireError> {
     let large = if cost >= CODEC_OFF_WORKER_BYTES {
-        Some(state.produce_large.acquire().await?)
+        Some(Arc::clone(&state.produce_large).acquire_owned().await?)
     } else {
         None
     };
     let permits = u32::try_from(cost).unwrap_or(u32::MAX);
-    let memory = state.produce_memory.acquire_many(permits).await?;
-    Ok((large, memory))
+    let memory = Arc::clone(&state.produce_memory)
+        .acquire_many_owned(permits)
+        .await?;
+    Ok(Admission {
+        _large: large,
+        _memory: memory,
+    })
 }
 
-/// The producer id of the request's first batch, or the connection when that batch has none.
-fn producer_of(request: &ProduceRequest, connection: &ConnectionState) -> Producer {
+/// The producer id of the request's first batch, when this gateway gave that id out. Otherwise
+/// the connection: an id a client made up must not pick a session, or open one per id.
+fn producer_of(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    principal: Option<&AuthenticatedPrincipal>,
+    request: &ProduceRequest,
+) -> Producer {
     request
         .topic_data
         .iter()
         .flat_map(|topic| &topic.partition_data)
         .find_map(|partition| partition.records.as_deref())
         .and_then(producer_id)
-        .map_or_else(|| Producer::Connection(connection.id()), Producer::Id)
+        .filter(|id| state.producer_ids.issued(*id))
+        .map_or_else(
+            || Producer::Connection(connection.id()),
+            |id| Producer::Id {
+                id,
+                user: principal.map(|principal| principal.username.clone()),
+            },
+        )
 }
 
 /// When a request stops writing.
@@ -326,10 +362,11 @@ impl From<RecordCodecError> for Refusal {
 /// Only one partition's messages live at a time. The budget is owned here and borrowed only in
 /// sync calls: a borrow held across an await makes the connection task `!Send`.
 ///
-/// Sequential: the producer's session sends one at a time, so its sends reach Iggy in order.
+/// Sequential, and `held` carries the producer's turn, so its sends reach Iggy in order. A send
+/// that outlives the deadline keeps `held`, and the partitions after it answer 7.
 async fn write_request(
     bridge: &IggyBridge,
-    session: &ProduceSession,
+    held: Held,
     board: &ProbeBoard,
     request: &ProduceRequest,
     budget: DecompressionBudget,
@@ -337,6 +374,7 @@ async fn write_request(
     deadline: Deadline,
 ) -> Vec<TopicProduceResponse> {
     let max_send = bridge.max_send_bytes();
+    let mut held = Some(held);
     let mut topics = Vec::with_capacity(request.topic_data.len());
     for topic in &request.topic_data {
         let name = topic.name.as_str();
@@ -344,22 +382,23 @@ async fn write_request(
         let mut responses = Vec::with_capacity(topic.partition_data.len());
         let mut wrote = false;
         for partition in &topic.partition_data {
-            let outcome = match &target {
-                // Skip the decode. The answer is 7 either way.
-                Ok(_) if deadline.passed() => Err(ERROR_REQUEST_TIMED_OUT.into()),
-                Ok(target) => {
-                    let planned = plan(&budget, zstd, name, partition, max_send);
-                    match planned {
+            let (outcome, kept) = match (&target, held.take()) {
+                (Ok(target), Some(kept)) if !deadline.passed() => {
+                    match plan(&budget, zstd, name, partition, max_send) {
                         Ok((id, messages)) => {
-                            send_by(bridge, session, target, name, id, messages, deadline)
-                                .await
-                                .map_err(Refusal::from)
+                            let (sent, kept) =
+                                send_by(bridge, kept, target, name, id, messages, deadline).await;
+                            (sent.map_err(Refusal::from), kept)
                         }
-                        Err(refusal) => Err(refusal),
+                        Err(refusal) => (Err(refusal), Some(kept)),
                     }
                 }
-                Err(error) => Err(refusal_code(name, error).into()),
+                // Skip the decode. The answer is 7 either way: the deadline passed, or a send
+                // that outlived it kept the memory this decode would need.
+                (Ok(_), kept) => (Err(ERROR_REQUEST_TIMED_OUT.into()), kept),
+                (Err(error), kept) => (Err(refusal_code(name, error).into()), kept),
             };
+            held = kept;
             wrote |= outcome.is_ok();
             responses.push(partition_outcome(partition.index, outcome));
             // Planning is sync CPU work. Let other connections on this worker run.
@@ -478,22 +517,23 @@ fn request_timeout(timeout_ms: i32) -> Duration {
         .min(REQUEST_DEADLINE)
 }
 
-/// Sends one partition's messages, or answers 7 once the deadline has passed.
+/// Sends one partition's messages, or answers 7 once the deadline has passed. Hands `held` back,
+/// unless the send still runs and keeps it.
 ///
 /// 7 means nothing was written, or the send may still land and a retry duplicate it.
 async fn send_by(
     bridge: &IggyBridge,
-    session: &ProduceSession,
+    (turn, admission): Held,
     target: &TopicTarget,
     kafka_topic: &str,
     partition_id: u32,
     messages: Vec<IggyMessage>,
     deadline: Deadline,
-) -> std::result::Result<Option<u64>, i16> {
-    match bridge
-        .send_records(session, target, partition_id, messages, deadline.at)
-        .await
-    {
+) -> (std::result::Result<Option<u64>, i16>, Option<Held>) {
+    let (sent, held) = bridge
+        .send_records(turn, admission, target, partition_id, messages, deadline.at)
+        .await;
+    let sent = match sent {
         Ok(base_offset) => Ok(base_offset),
         Err(BridgeError::Timeout) => {
             // The client picks `timeout_ms`, so its expiry is no signal to the operator.
@@ -513,7 +553,8 @@ async fn send_by(
             Err(ERROR_REQUEST_TIMED_OUT)
         }
         Err(error) => Err(refusal_code(kafka_topic, &error)),
-    }
+    };
+    (sent, held)
 }
 
 /// The Kafka code for a bridge refusal, logged at a level that matches who can fix it.
@@ -644,11 +685,15 @@ mod tests {
     use kafka_protocol::indexmap::IndexMap;
     use kafka_protocol::messages::TopicName;
     use kafka_protocol::messages::produce_request::TopicProduceData;
+    use kafka_protocol::protocol::{Decodable, Encodable};
     use kafka_protocol::records::{
         Compression, NO_PARTITION_LEADER_EPOCH, NO_PRODUCER_EPOCH, NO_PRODUCER_ID, NO_SEQUENCE,
         Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
     };
+    use tokio_util::sync::CancellationToken;
 
+    use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+    use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::BrokerAdvertise;
     use crate::records::encode_batch;
 
@@ -776,29 +821,74 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn given_an_idempotent_batch_when_keyed_should_take_its_producer_id() {
+    /// The default frame.
+    const FRAME: usize = 8 * 1024 * 1024;
+    /// Long enough for an admission that is free to complete. Time is paused in these tests.
+    const WAIT: Duration = Duration::from_millis(50);
+
+    /// A one-record batch that carries `producer_id`.
+    fn batch_of(producer_id: i64) -> Bytes {
         let mut records = [record(0, b"v")];
-        records[0].producer_id = 7;
+        records[0].producer_id = producer_id;
         records[0].producer_epoch = 0;
         records[0].sequence = 0;
-        let request = request_of(vec![entry(
-            0,
-            Some(compressed_batch(&records, Compression::None)),
-        )]);
+        compressed_batch(&records, Compression::None)
+    }
 
-        let producer = producer_of(&request, &ConnectionState::default());
-        assert_eq!(producer, Producer::Id(7));
+    fn principal(username: &str) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal {
+            username: username.to_string(),
+            permissions: PrincipalPermissions::default(),
+            permissions_known: true,
+        }
+    }
+
+    #[test]
+    fn given_a_producer_id_this_gateway_gave_out_when_keyed_should_take_it_with_its_user() {
+        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let id = state.producer_ids.allocate().expect("an id");
+        let request = request_of(vec![entry(0, Some(batch_of(id)))]);
+        let connection = ConnectionState::default();
+
+        assert_eq!(
+            producer_of(&state, &connection, None, &request),
+            Producer::Id { id, user: None }
+        );
+        assert_eq!(
+            producer_of(&state, &connection, Some(&principal("ann")), &request),
+            Producer::Id {
+                id,
+                user: Some("ann".to_string())
+            },
+            "another user's request with this id gets another session"
+        );
+    }
+
+    #[test]
+    fn given_a_producer_id_a_client_made_up_when_keyed_should_take_the_connection() {
+        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
+        let connection = ConnectionState::default();
+        let issued = state.producer_ids.allocate().expect("an id");
+
+        for made_up in [7, issued + 1] {
+            let request = request_of(vec![entry(0, Some(batch_of(made_up)))]);
+            assert_eq!(
+                producer_of(&state, &connection, None, &request),
+                Producer::Connection(connection.id()),
+                "{made_up} picks no session, and opens none of its own"
+            );
+        }
     }
 
     #[test]
     fn given_a_batch_without_a_producer_id_when_keyed_should_take_the_connection() {
+        let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
         let batch = compressed_batch(&[record(0, b"v")], Compression::None);
         let request = request_of(vec![entry(0, Some(batch))]);
         let connection = ConnectionState::default();
 
         assert_eq!(
-            producer_of(&request, &connection),
+            producer_of(&state, &connection, None, &request),
             Producer::Connection(connection.id())
         );
         assert_ne!(
@@ -807,11 +897,6 @@ mod tests {
             "each connection keys a session of its own"
         );
     }
-
-    /// The default frame.
-    const FRAME: usize = 8 * 1024 * 1024;
-    /// Long enough for an admission that is free to complete. Time is paused in these tests.
-    const WAIT: Duration = Duration::from_millis(50);
 
     fn cost_of(partitions: Vec<PartitionProduceData>, max_frame_size: usize) -> usize {
         decode_cost(&request_of(partitions), max_frame_size)
@@ -834,6 +919,33 @@ mod tests {
         assert_eq!(
             cost_of(vec![entry(0, Some(batch))], FRAME),
             100 * FRAME_BYTES_PER_RECORD
+        );
+    }
+
+    #[test]
+    fn given_records_with_many_headers_when_costed_should_take_the_slots_the_decode_charges() {
+        let mut heavy = record(0, b"v");
+        heavy.headers = (0..300)
+            .map(|index| (StrBytes::from_string(format!("h{index}")), None))
+            .collect();
+        let batch = encode_batch(&mut [heavy]).unwrap();
+        let cost = cost_of(vec![entry(0, Some(batch.clone()))], FRAME);
+
+        // One slot for the record and one for each three headers.
+        assert_eq!(cost, 101 * FRAME_BYTES_PER_RECORD);
+        assert!(
+            cost > batch.len(),
+            "its bytes alone would admit it for less"
+        );
+        let slots = cost / FRAME_BYTES_PER_RECORD;
+        let entry = entry(0, Some(batch));
+        assert!(
+            plan_with(&partition_budget(FRAME, slots), Zstd::Allowed, &entry).is_ok(),
+            "the decode takes no more than the request was admitted for"
+        );
+        assert_eq!(
+            plan_with(&partition_budget(FRAME, slots - 1), Zstd::Allowed, &entry).unwrap_err(),
+            ERROR_MESSAGE_TOO_LARGE
         );
     }
 
@@ -869,11 +981,11 @@ mod tests {
         assert_eq!(cost_of(vec![entry(0, Some(batch))], 4096), 4096);
     }
 
-    /// Admits four large requests, which takes every large slot.
-    async fn large_slots_taken(state: &GatewayState) -> Vec<Admission<'_>> {
+    /// Admits four requests of `cost`, which takes every large slot.
+    async fn large_slots_taken(state: &GatewayState, cost: usize) -> Vec<Admission> {
         let mut admitted = Vec::new();
         for _ in 0..4 {
-            admitted.push(admit(state, CODEC_OFF_WORKER_BYTES).await.unwrap());
+            admitted.push(admit(state, cost).await.unwrap());
         }
         admitted
     }
@@ -881,21 +993,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn given_the_large_slots_taken_when_a_small_request_comes_should_admit_it() {
         let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
-        let _large = large_slots_taken(&state).await;
+        let _large = large_slots_taken(&state, FRAME).await;
 
-        let fifth = tokio::time::timeout(WAIT, admit(&state, CODEC_OFF_WORKER_BYTES)).await;
-        assert!(fifth.is_err(), "a fifth large request waits its turn");
-        let small = tokio::time::timeout(WAIT, admit(&state, CODEC_OFF_WORKER_BYTES - 1)).await;
+        let fifth = admit(&state, CODEC_OFF_WORKER_BYTES);
         assert!(
-            small.is_ok(),
-            "a small one does not queue behind large ones"
+            tokio::time::timeout(WAIT, fifth).await.is_err(),
+            "a fifth large request waits its turn"
+        );
+        let small = admit(&state, CODEC_OFF_WORKER_BYTES - 1);
+        assert!(
+            tokio::time::timeout(WAIT, small).await.is_ok(),
+            "four requests of a whole cap each leave a small one its memory"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn given_the_large_slots_taken_when_a_large_request_waits_should_hold_no_memory() {
         let state = GatewayState::stub(BrokerAdvertise::default(), FRAME);
-        let _large = large_slots_taken(&state).await;
+        let _large = large_slots_taken(&state, CODEC_OFF_WORKER_BYTES).await;
         let free = state.produce_memory.available_permits();
 
         let waiting = admit(&state, FRAME);
@@ -905,6 +1020,79 @@ mod tests {
             state.produce_memory.available_permits(),
             free,
             "small requests can still take that memory"
+        );
+    }
+
+    /// A gateway whose bridge never dialed. A request that stops before its first send needs no
+    /// server.
+    fn offline_state() -> GatewayState {
+        GatewayState::new(
+            BrokerAdvertise::default(),
+            Some(Arc::new(IggyBridge::offline())),
+            FRAME,
+            false,
+            0,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        )
+    }
+
+    /// One large Produce v9 request of `connection` for partition 0, through the whole handler.
+    async fn handled(
+        state: &GatewayState,
+        connection: &ConnectionState,
+        acks: i16,
+    ) -> HandleOutcome {
+        let value = vec![7; CODEC_OFF_WORKER_BYTES];
+        let batch = compressed_batch(&[record(0, &value)], Compression::None);
+        let request = request_of(vec![entry(0, Some(batch))])
+            .with_acks(acks)
+            .with_timeout_ms(50);
+        let mut body = BytesMut::new();
+        request.encode(&mut body, 9).expect("encode the request");
+        handle(state, connection, None, 9, body.freeze()).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_the_producers_earlier_send_still_running_when_handled_should_answer_timed_out() {
+        let state = offline_state();
+        let bridge = state.bridge.as_deref().expect("a bridge");
+        let connection = ConnectionState::default();
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+        let _earlier_send = bridge
+            .produce_turn(Producer::Connection(connection.id()), far)
+            .await
+            .expect("a free turn");
+        let free = |state: &GatewayState| {
+            (
+                state.produce_large.available_permits(),
+                state.produce_memory.available_permits(),
+            )
+        };
+        let before = free(&state);
+
+        let waiting = handled(&state, &connection, ACKS_ALL);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut waiting)
+                .await
+                .is_err(),
+            "it waits for the turn until its own deadline"
+        );
+        assert_eq!(
+            free(&state),
+            before,
+            "and holds no large slot and no memory while it waits"
+        );
+        let mut answer = waiting.await.expect_response("acks=-1 is answered");
+        let response = ProduceResponse::decode(&mut answer, 9).expect("decode the response");
+        let code = response.responses[0].partition_responses[0].error_code;
+        assert_eq!(
+            code, ERROR_REQUEST_TIMED_OUT,
+            "it must not overtake that send"
+        );
+        assert!(
+            handled(&state, &connection, ACKS_NONE).await.is_close(),
+            "acks=0 has no response to carry the 7"
         );
     }
 
