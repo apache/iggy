@@ -237,11 +237,17 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            const jobs = await github.rest.actions.listJobsForWorkflowRun({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId
-            });
+            let jobs;
+            try {
+              jobs = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: context.runId
+              });
+            } catch (error) {
+              core.warning(`Job timings unavailable: ${error.message}`);
+              jobs = { data: { jobs: [] } };
+            }
 
             const jobTimes = {};
             const jobStatuses = {};
