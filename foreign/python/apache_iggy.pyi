@@ -27,6 +27,8 @@ import typing
 
 __all__ = [
     "Durability",
+    "ClusterNodeRole",
+    "ClusterNodeStatus",
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
@@ -37,8 +39,6 @@ __all__ = [
     "CacheMetricsKey",
     "ClusterMetadata",
     "ClusterNode",
-    "ClusterNodeRole",
-    "ClusterNodeStatus",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
@@ -3734,52 +3734,6 @@ class WebSocketReconnectionConfig:
     def __repr__(self) -> builtins.str: ...
 
 @typing.final
-class ClusterNodeRole(enum.Enum):
-    r"""
-    The role of a node within the cluster.
-    """
-
-    Leader = ...
-    r"""
-    Primary/Leader node - handles all writes.
-    """
-    Follower = ...
-    r"""
-    Follower/Secondary node - read replica.
-    """
-
-@typing.final
-class ClusterNodeStatus(enum.Enum):
-    r"""
-    The current status of a node.
-    """
-
-    Healthy = ...
-    r"""
-    Node is healthy and responsive.
-    """
-    Starting = ...
-    r"""
-    Node is starting up.
-    """
-    Stopping = ...
-    r"""
-    Node is shutting down.
-    """
-    Unreachable = ...
-    r"""
-    Node is unreachable.
-    """
-    Maintenance = ...
-    r"""
-    Node is in maintenance mode.
-    """
-    Unknown = ...
-    r"""
-    Node is unknown.
-    """
-
-@typing.final
 class ProducerSharding(enum.Enum):
     r"""
     How a background producer distributes sends among its workers.
@@ -3806,3 +3760,19 @@ class UserStatus(enum.Enum):
 class Durability(str, enum.Enum):  # noqa: UP042
     REPLICATED = "replicated"
     PERSISTED = "persisted"
+
+class ClusterNodeRole(str, enum.Enum):  # noqa: UP042
+    """The role of a node within the cluster."""
+
+    LEADER = "leader"
+    FOLLOWER = "follower"
+
+class ClusterNodeStatus(str, enum.Enum):  # noqa: UP042
+    """The current status of a node."""
+
+    HEALTHY = "healthy"
+    STARTING = "starting"
+    STOPPING = "stopping"
+    UNREACHABLE = "unreachable"
+    MAINTENANCE = "maintenance"
+    UNKNOWN = "unknown"

@@ -16,6 +16,7 @@
 # under the License.
 
 import contextlib
+import enum
 import json
 import threading
 from collections.abc import Iterator
@@ -36,22 +37,22 @@ from .utils import (
 # they must become. A server without clustering only reports a healthy leader,
 # so the TCP tests below never see the other values.
 REPORTED_NODES = [
-    ("leader", "healthy", ClusterNodeRole.Leader, ClusterNodeStatus.Healthy),
-    ("follower", "starting", ClusterNodeRole.Follower, ClusterNodeStatus.Starting),
-    ("follower", "stopping", ClusterNodeRole.Follower, ClusterNodeStatus.Stopping),
+    ("leader", "healthy", ClusterNodeRole.LEADER, ClusterNodeStatus.HEALTHY),
+    ("follower", "starting", ClusterNodeRole.FOLLOWER, ClusterNodeStatus.STARTING),
+    ("follower", "stopping", ClusterNodeRole.FOLLOWER, ClusterNodeStatus.STOPPING),
     (
         "follower",
         "unreachable",
-        ClusterNodeRole.Follower,
-        ClusterNodeStatus.Unreachable,
+        ClusterNodeRole.FOLLOWER,
+        ClusterNodeStatus.UNREACHABLE,
     ),
     (
         "follower",
         "maintenance",
-        ClusterNodeRole.Follower,
-        ClusterNodeStatus.Maintenance,
+        ClusterNodeRole.FOLLOWER,
+        ClusterNodeStatus.MAINTENANCE,
     ),
-    ("follower", "unknown", ClusterNodeRole.Follower, ClusterNodeStatus.Unknown),
+    ("follower", "unknown", ClusterNodeRole.FOLLOWER, ClusterNodeStatus.UNKNOWN),
 ]
 
 
@@ -126,8 +127,8 @@ class TestClusterMetadata:
         node = nodes[0]
         assert node.name
         assert node.ip
-        assert node.role == ClusterNodeRole.Leader
-        assert node.status == ClusterNodeStatus.Healthy
+        assert node.role == ClusterNodeRole.LEADER
+        assert node.status == ClusterNodeStatus.HEALTHY
 
         endpoints = node.endpoints
         # The connection under test is TCP, so the node must advertise it. The
@@ -138,35 +139,36 @@ class TestClusterMetadata:
         assert f"name='{metadata.name}'" in repr(metadata)
         assert "nodes_count=1" in repr(metadata)
         assert f"name='{node.name}'" in repr(node)
-        assert "role=ClusterNodeRole.Leader" in repr(node)
-        assert "status=ClusterNodeStatus.Healthy" in repr(node)
+        assert "role=ClusterNodeRole.LEADER" in repr(node)
+        assert "status=ClusterNodeStatus.HEALTHY" in repr(node)
         assert f"tcp={endpoints.tcp}" in repr(endpoints)
 
     @pytest.mark.unit
-    def test_role_and_status_are_comparable_and_hashable(self):
-        """Roles and statuses compare by value and can key a dict."""
-        assert ClusterNodeRole.Leader != ClusterNodeRole.Follower
-        assert len({ClusterNodeRole.Leader, ClusterNodeRole.Follower}) == 2
+    def test_role_and_status_are_python_enums(self):
+        """Roles and statuses are str-backed Enums: they iterate, expose `.name`
+        and `.value`, look up by the server's spelling, and can key a dict."""
+        assert issubclass(ClusterNodeRole, enum.Enum)
+        assert issubclass(ClusterNodeStatus, enum.Enum)
+
+        assert [role.name for role in ClusterNodeRole] == ["LEADER", "FOLLOWER"]
+        assert [role.value for role in ClusterNodeRole] == ["leader", "follower"]
+        assert [status.value for status in ClusterNodeStatus] == [
+            "healthy",
+            "starting",
+            "stopping",
+            "unreachable",
+            "maintenance",
+            "unknown",
+        ]
+        assert ClusterNodeRole("follower") is ClusterNodeRole.FOLLOWER
+        assert ClusterNodeStatus("maintenance") is ClusterNodeStatus.MAINTENANCE
+        assert ClusterNodeRole.LEADER == "leader"
 
         status_by_role = {
-            ClusterNodeRole.Leader: ClusterNodeStatus.Healthy,
-            ClusterNodeRole.Follower: ClusterNodeStatus.Starting,
+            ClusterNodeRole.LEADER: ClusterNodeStatus.HEALTHY,
+            ClusterNodeRole.FOLLOWER: ClusterNodeStatus.STARTING,
         }
-        assert status_by_role[ClusterNodeRole.Follower] == ClusterNodeStatus.Starting
-
-        statuses = (
-            ClusterNodeStatus.Healthy,
-            ClusterNodeStatus.Starting,
-            ClusterNodeStatus.Stopping,
-            ClusterNodeStatus.Unreachable,
-            ClusterNodeStatus.Maintenance,
-            ClusterNodeStatus.Unknown,
-        )
-        assert len(set(statuses)) == len(statuses)
-
-        role_by_status = {ClusterNodeStatus.Healthy: ClusterNodeRole.Leader}
-        assert role_by_status[ClusterNodeStatus.Healthy] == ClusterNodeRole.Leader
-        assert ClusterNodeStatus.Unknown not in role_by_status
+        assert status_by_role[ClusterNodeRole.FOLLOWER] is ClusterNodeStatus.STARTING
 
     @pytest.mark.asyncio
     async def test_get_cluster_metadata_requires_connection_and_auth(self):
@@ -235,6 +237,10 @@ class TestClusterMetadata:
         ]
         assert [node.role for node in nodes] == [row[2] for row in REPORTED_NODES]
         assert [node.status for node in nodes] == [row[3] for row in REPORTED_NODES]
+        assert [node.role.value for node in nodes] == [row[0] for row in REPORTED_NODES]
+        assert [node.status.value for node in nodes] == [
+            row[1] for row in REPORTED_NODES
+        ]
         for index, node in enumerate(nodes, start=1):
             assert node.ip == f"10.0.0.{index}"
             assert node.endpoints.tcp == 8090 + index

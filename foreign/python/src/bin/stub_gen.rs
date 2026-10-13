@@ -22,6 +22,7 @@ use std::{
     path::Path,
 };
 
+use apache_iggy::cluster::{ROLE_ENUM, ROLE_MEMBERS, STATUS_ENUM, STATUS_MEMBERS};
 use pyo3_stub_gen::Result;
 
 const LICENSE: &str = "# Licensed to the Apache Software Foundation (ASF) under one
@@ -53,9 +54,34 @@ fn main() -> Result<()> {
     let mut f = File::open(&path)?;
     let mut content = LICENSE.to_owned();
     f.read_to_string(&mut content)?;
-    content = content.replacen("__all__ = [", "__all__ = [\n    \"Durability\",", 1);
+    content = content.replacen(
+        "__all__ = [",
+        &format!("__all__ = [\n    \"Durability\",\n    \"{ROLE_ENUM}\",\n    \"{STATUS_ENUM}\","),
+        1,
+    );
     // The runtime creates a str-backed Enum, whose str() differs from StrEnum.
     content.push_str("\nclass Durability(str, enum.Enum):  # noqa: UP042\n    REPLICATED = 'replicated'\n    PERSISTED = 'persisted'\n");
+    // The cluster node enums are str-backed Enums built at runtime as well, so
+    // they are written from the member lists `cluster::register_enums` uses.
+    for (name, doc, members) in [
+        (
+            ROLE_ENUM,
+            "The role of a node within the cluster.",
+            ROLE_MEMBERS.as_slice(),
+        ),
+        (
+            STATUS_ENUM,
+            "The current status of a node.",
+            STATUS_MEMBERS.as_slice(),
+        ),
+    ] {
+        content.push_str(&format!(
+            "\nclass {name}(str, enum.Enum):  # noqa: UP042\n    \"\"\"{doc}\"\"\"\n\n"
+        ));
+        for (member, value) in members {
+            content.push_str(&format!("    {member} = '{value}'\n"));
+        }
+    }
 
     let mut f = File::create(path)?;
     f.write_all(content.as_bytes())?;

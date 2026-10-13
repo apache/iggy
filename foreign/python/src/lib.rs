@@ -16,7 +16,7 @@
 // under the License.
 
 pub mod client;
-mod cluster;
+pub mod cluster;
 mod config;
 mod consumer;
 mod durability;
@@ -35,9 +35,7 @@ mod user;
 mod user_headers;
 
 use client::IggyClient;
-use cluster::{
-    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
-};
+use cluster::{ClusterMetadata, ClusterNode, TransportEndpoints};
 use config::{
     AutoLogin, HttpConfig, QuicConfig, QuicReconnectionConfig, TcpConfig, TcpReconnectionConfig,
     WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
@@ -120,8 +118,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GlobalPermissions>()?;
     m.add_class::<StreamPermissions>()?;
     m.add_class::<TopicPermissions>()?;
-    m.add_class::<ClusterNodeRole>()?;
-    m.add_class::<ClusterNodeStatus>()?;
+    cluster::register_enums(py, m)?;
     m.add_class::<TransportEndpoints>()?;
     m.add_class::<ClusterNode>()?;
     m.add_class::<ClusterMetadata>()?;

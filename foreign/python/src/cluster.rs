@@ -17,62 +17,53 @@
 
 use iggy::prelude::{
     ClusterMetadata as RustClusterMetadata, ClusterNode as RustClusterNode,
-    ClusterNodeRole as RustClusterNodeRole, ClusterNodeStatus as RustClusterNodeStatus,
     TransportEndpoints as RustTransportEndpoints,
 };
-use pyo3::prelude::*;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3::{
+    prelude::*,
+    types::{PyDict, PyString},
+};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
-/// The role of a node within the cluster.
-#[gen_stub_pyclass_enum]
-#[pyclass(eq, frozen, hash, skip_from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClusterNodeRole {
-    /// Primary/Leader node - handles all writes.
-    Leader,
-    /// Follower/Secondary node - read replica.
-    Follower,
-}
+/// Python name and members of the node role enum. Each value is the lowercase
+/// name the server uses, so a role converts by its `as_ref()` string.
+pub const ROLE_ENUM: &str = "ClusterNodeRole";
+pub const ROLE_MEMBERS: [(&str, &str); 2] = [("LEADER", "leader"), ("FOLLOWER", "follower")];
 
-impl From<RustClusterNodeRole> for ClusterNodeRole {
-    fn from(role: RustClusterNodeRole) -> Self {
-        match role {
-            RustClusterNodeRole::Leader => ClusterNodeRole::Leader,
-            RustClusterNodeRole::Follower => ClusterNodeRole::Follower,
-        }
+/// Python name and members of the node status enum, keyed like the role enum.
+pub const STATUS_ENUM: &str = "ClusterNodeStatus";
+pub const STATUS_MEMBERS: [(&str, &str); 6] = [
+    ("HEALTHY", "healthy"),
+    ("STARTING", "starting"),
+    ("STOPPING", "stopping"),
+    ("UNREACHABLE", "unreachable"),
+    ("MAINTENANCE", "maintenance"),
+    ("UNKNOWN", "unknown"),
+];
+
+/// Adds `ClusterNodeRole` and `ClusterNodeStatus` to the module as str-backed
+/// `enum.Enum` types, the way `Durability` is exported, so `.name`, `.value`,
+/// and iteration work as the stub declares.
+pub fn register_enums(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+    for (name, members) in [
+        (ROLE_ENUM, ROLE_MEMBERS.as_slice()),
+        (STATUS_ENUM, STATUS_MEMBERS.as_slice()),
+    ] {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("type", py.get_type::<PyString>())?;
+        kwargs.set_item("module", "apache_iggy")?;
+        let enumeration = py
+            .import("enum")?
+            .getattr("Enum")?
+            .call((name, members.to_vec()), Some(&kwargs))?;
+        module.add(name, enumeration)?;
     }
+    Ok(())
 }
 
-/// The current status of a node.
-#[gen_stub_pyclass_enum]
-#[pyclass(eq, frozen, hash, skip_from_py_object)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClusterNodeStatus {
-    /// Node is healthy and responsive.
-    Healthy,
-    /// Node is starting up.
-    Starting,
-    /// Node is shutting down.
-    Stopping,
-    /// Node is unreachable.
-    Unreachable,
-    /// Node is in maintenance mode.
-    Maintenance,
-    /// Node is unknown.
-    Unknown,
-}
-
-impl From<RustClusterNodeStatus> for ClusterNodeStatus {
-    fn from(status: RustClusterNodeStatus) -> Self {
-        match status {
-            RustClusterNodeStatus::Healthy => ClusterNodeStatus::Healthy,
-            RustClusterNodeStatus::Starting => ClusterNodeStatus::Starting,
-            RustClusterNodeStatus::Stopping => ClusterNodeStatus::Stopping,
-            RustClusterNodeStatus::Unreachable => ClusterNodeStatus::Unreachable,
-            RustClusterNodeStatus::Maintenance => ClusterNodeStatus::Maintenance,
-            RustClusterNodeStatus::Unknown => ClusterNodeStatus::Unknown,
-        }
-    }
+/// Returns the member of the exported enum `name` whose value is `value`.
+fn enum_member<'py>(py: Python<'py>, name: &str, value: &str) -> PyResult<Bound<'py, PyAny>> {
+    py.import("apache_iggy")?.getattr(name)?.call1((value,))
 }
 
 /// Transport endpoints exposed by a cluster node.
@@ -135,8 +126,8 @@ impl From<RustClusterNode> for ClusterNode {
 impl ClusterNode {
     /// The name of the node.
     #[getter]
-    pub fn name(&self) -> String {
-        self.inner.name.clone()
+    pub fn name(&self) -> &str {
+        &self.inner.name
     }
 
     /// The address clients should use to reach the node.
@@ -145,8 +136,8 @@ impl ClusterNode {
     /// brackets, so an IPv6 address needs brackets before a port is appended,
     /// for example `[::1]:8090`.
     #[getter]
-    pub fn ip(&self) -> String {
-        self.inner.ip.clone()
+    pub fn ip(&self) -> &str {
+        &self.inner.ip
     }
 
     /// The transport endpoints of the node.
@@ -157,24 +148,26 @@ impl ClusterNode {
 
     /// The role of the node in the cluster.
     #[getter]
-    pub fn role(&self) -> ClusterNodeRole {
-        ClusterNodeRole::from(self.inner.role)
+    #[gen_stub(override_return_type(type_repr = "ClusterNodeRole"))]
+    pub fn role<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        enum_member(py, ROLE_ENUM, self.inner.role.as_ref())
     }
 
     /// The current status of the node.
     #[getter]
-    pub fn status(&self) -> ClusterNodeStatus {
-        ClusterNodeStatus::from(self.inner.status)
+    #[gen_stub(override_return_type(type_repr = "ClusterNodeStatus"))]
+    pub fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        enum_member(py, STATUS_ENUM, self.inner.status.as_ref())
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "ClusterNode(name='{}', ip='{}', endpoints={}, role=ClusterNodeRole.{:?}, status=ClusterNodeStatus.{:?})",
+            "ClusterNode(name='{}', ip='{}', endpoints={}, role={ROLE_ENUM}.{}, status={STATUS_ENUM}.{})",
             self.inner.name,
             self.inner.ip,
             TransportEndpoints::from(&self.inner.endpoints).__repr__(),
-            ClusterNodeRole::from(self.inner.role),
-            ClusterNodeStatus::from(self.inner.status),
+            self.inner.role.as_ref().to_uppercase(),
+            self.inner.status.as_ref().to_uppercase(),
         )
     }
 }
@@ -199,8 +192,8 @@ impl From<RustClusterMetadata> for ClusterMetadata {
 impl ClusterMetadata {
     /// The name of the cluster.
     #[getter]
-    pub fn name(&self) -> String {
-        self.inner.name.clone()
+    pub fn name(&self) -> &str {
+        &self.inner.name
     }
 
     /// The list of all nodes in the cluster.
