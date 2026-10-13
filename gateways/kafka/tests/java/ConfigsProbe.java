@@ -53,26 +53,17 @@ public final class ConfigsProbe {
         try (AdminClient admin = AdminClient.create(props)) {
             Config before = describe(admin, resource);
             ConfigEntry retention = before.get("retention.ms");
-            ConfigEntry cleanup = before.get("cleanup.policy");
             require(retention != null && "-1".equals(retention.value()), "initial retention.ms");
             require(
                     retention.source() == ConfigEntry.ConfigSource.DEFAULT_CONFIG,
                     "initial retention source");
             require(!retention.isReadOnly(), "retention.ms is writable");
-            require(cleanup != null && "delete".equals(cleanup.value()), "cleanup.policy");
-            require(cleanup.isReadOnly(), "cleanup.policy is read only");
-            require(
-                    cleanup.source() == ConfigEntry.ConfigSource.DEFAULT_CONFIG,
-                    "cleanup source");
+            // Kafka Connect refuses an internal topic that reports any cleanup.policy other
+            // than compact, and starts when the entry is missing.
+            require(before.get("cleanup.policy") == null, "cleanup.policy is not reported");
             System.out.println(
                     "retention.ms=" + retention.value() + " source=" + retention.source());
-            System.out.println(
-                    "cleanup.policy="
-                            + cleanup.value()
-                            + " read_only="
-                            + cleanup.isReadOnly()
-                            + " source="
-                            + cleanup.source());
+            System.out.println("cleanup.policy=absent");
 
             try {
                 admin.alterConfigs(Map.of(resource, config("no.such", "1"))).all().get();

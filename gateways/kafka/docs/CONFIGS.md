@@ -23,20 +23,26 @@ authorization check of its own.
 
 ## What a describe returns
 
-A null or empty `configuration_keys` list returns both keys below. A non-empty
+A null or empty `configuration_keys` list returns `retention.ms`. A non-empty
 list returns only the requested names this gateway knows, in request order,
 with a name repeated in the list collapsed to one entry. A name it does not
-know, including `retention.minutes` and `retention.hours`, is omitted. The
-resource's error code stays `NONE` (0), and the known keys in that request are
-still returned.
+know, including `cleanup.policy`, `retention.minutes` and `retention.hours`, is
+omitted. The resource's error code stays `NONE` (0), and the known keys in that
+request are still returned.
 
 | Key | Value | Read only | Source |
 | --- | ----- | --------- | ------ |
 | `retention.ms` | Sealed-segment lifetime from Iggy `message_expiry`, or `-1` when those segments never expire | no | `DEFAULT_CONFIG` (5) for the unset never-expire default; `DYNAMIC_TOPIC_CONFIG` (1) when a client set it or a stored duration cannot be shown as milliseconds |
-| `cleanup.policy` | `delete` | yes | `DEFAULT_CONFIG` (5) |
 
-`is_sensitive` is false for both. From v3, `include_documentation` is honored:
-true attaches one sentence per known key, false sends no documentation.
+The gateway does not report `cleanup.policy` until it stores a policy per
+topic. Iggy deletes expired messages and does not compact, so the true value is
+`delete`. Kafka Connect refuses an internal topic that reports any policy other
+than `compact`. When the entry is missing, Connect starts
+(`TopicAdmin.verifyTopicCleanupPolicyOnlyCompact`). A reported `delete`
+therefore stops Connect, even on topics that an operator created for it.
+
+`is_sensitive` is false. From v3, `include_documentation` is honored: true
+attaches one sentence per known key, false sends no documentation.
 `include_synonyms` has no effect: this gateway models no config-inheritance
 chain beyond `retention.ms` itself, so the synonym list on every entry is
 always empty.
@@ -86,11 +92,14 @@ call `update_topic`.
 
 ## Limitations
 
-- `IncrementalAlterConfigs` (API 44) is not implemented here. It is planned
-  after this work merges. It is not advertised, so a client falls back to
-  `AlterConfigs` (33); see "Authorization" above for what an unadvertised key
-  does to the client.
+- `IncrementalAlterConfigs` (API 44) is not implemented and is not
+  advertised. No client falls back to `AlterConfigs` (33) on its own. The Java
+  client and librdkafka fail locally, as the top of this page says. Kafka 4.0
+  removed `Admin.alterConfigs`, and `kafka-configs --alter` sends only API 44.
+  A Java 4.x client or tool therefore cannot change `retention.ms` through this
+  gateway.
 - `retention.ms` remains the only value Iggy stores.
+- `cleanup.policy` is not reported. See "What a describe returns".
 
 ## Other resource errors
 
