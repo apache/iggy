@@ -24,7 +24,6 @@ use fluss::metadata::{DataField, RowType, TablePath};
 use fluss::record::ScanRecords;
 use fluss::row::InternalRow;
 use fluss::rpc::message::OffsetSpec;
-use iggy_connector_sdk::retry::{RetryPolicy, retry_async};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     source::SourceBatchResult, source_connector,
@@ -51,14 +50,9 @@ const METADATA_OFFSET: &str = "_fluss_offset";
 const METADATA_TIMESTAMP: &str = "_fluss_timestamp";
 const METADATA_PREFIX: &str = "_fluss_";
 const NANOS_PER_MILLI: u64 = 1_000_000;
-/// A rewind is local scanner bookkeeping unless the client has to refresh the table's
-/// metadata first. An error from `on_batch_result` stops the source, so that refresh gets a
-/// few attempts before the failure is reported.
-const REWIND_RETRY: RetryPolicy = RetryPolicy {
-    max_attempts: 3,
-    base_delay: Duration::from_millis(200),
-    max_delay: Duration::from_secs(1),
-};
+/// Set on every message id. Sending replaces a zero id with a random one, which bucket 0,
+/// offset 0 would otherwise get on every delivery.
+const MESSAGE_ID_TAG: u128 = 1 << 127;
 
 /// Deliberately not `Serialize`. The runtime hands plugin configuration over as raw JSON and
 /// never serializes this struct, so leaving it out keeps `sasl_password` unserializable.
@@ -102,6 +96,13 @@ struct State {
     rows_skipped: u64,
 }
 
+/// A batch handed to the runtime and not acknowledged yet, kept with the records it was built
+/// from so that a rejected batch can be built again from the same rows.
+struct StagedBatch {
+    state: State,
+    records: ScanRecords,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum StartingOffset {
     Earliest,
@@ -135,19 +136,32 @@ pub struct FlussSource {
     poll_timeout: Duration,
     include_metadata: bool,
     verbose_logging: bool,
-    connection: Option<FlussConnection>,
+    /// Set when a saved state was handed over but could not be decoded. `open()` refuses to
+    /// resolve start offsets without it, since starting over from `latest` would skip whatever
+    /// arrived after the last acknowledged batch.
+    unreadable_state: bool,
     scanner: Option<LogScanner>,
     fields: Vec<DataField>,
     state: Mutex<State>,
-    pending_state: Mutex<Option<State>>,
+    staged: Mutex<Option<StagedBatch>>,
+    /// Records of a batch the runtime rejected, or of one whose state could not be staged. The
+    /// next poll builds its batch from them instead of reading the scanner. Rewinding the scanner
+    /// instead is not safe here: a fetch response is credited to the bucket's position when it
+    /// lands, so one requested before the rewind would pass for the rewound fetch and skip the
+    /// rejected rows.
+    replay: Mutex<Option<ScanRecords>>,
+    /// Set when the scanner fails a poll. It can fail after moving past the records it had
+    /// collected, dropping them, so the next poll points it back at the committed offsets
+    /// before reading again.
+    rewind_required: AtomicBool,
     /// Set when `open()` resolved start offsets that are not on disk yet. The next poll carries
     /// them through the ACK handshake even without rows, so a restart before the first row does
     /// not resolve `latest` again and skip what was written in between.
     start_offsets_unsaved: AtomicBool,
 }
 
-/// `FlussConnection` and `LogScanner` do not implement `Debug`, so the derive is replaced by
-/// a hand-written one that reports connection presence instead of client internals.
+/// `LogScanner` and `ScanRecords` do not implement `Debug`, so the derive is replaced by a
+/// hand-written one that reports whether the source is open instead of client internals.
 impl std::fmt::Debug for FlussSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -181,6 +195,7 @@ impl FlussSource {
         let verbose_logging = config.verbose_logging.unwrap_or(false);
         let table_path = TablePath::new(config.database.clone(), config.table.clone());
 
+        let state_handed_over = state.is_some();
         let restored_state = state
             .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, id))
             .inspect(|state| {
@@ -191,6 +206,7 @@ impl FlussSource {
                     state.messages_produced
                 );
             });
+        let unreadable_state = state_handed_over && restored_state.is_none();
 
         FlussSource {
             id,
@@ -200,11 +216,13 @@ impl FlussSource {
             poll_timeout,
             include_metadata,
             verbose_logging,
-            connection: None,
+            unreadable_state,
             scanner: None,
             fields: Vec::new(),
             state: Mutex::new(restored_state.unwrap_or_default()),
-            pending_state: Mutex::new(None),
+            staged: Mutex::new(None),
+            replay: Mutex::new(None),
+            rewind_required: AtomicBool::new(false),
             start_offsets_unsaved: AtomicBool::new(false),
         }
     }
@@ -367,7 +385,7 @@ impl FlussSource {
     /// instead, and the offsets still move past it.
     async fn build_batch(
         &self,
-        records: &ScanRecords,
+        records: ScanRecords,
     ) -> Result<(Vec<ProducedMessage>, Option<ConnectorState>), Error> {
         let buckets = records.records_by_buckets();
         let mut messages = Vec::with_capacity(records.count());
@@ -399,10 +417,22 @@ impl FlussSource {
             }
         }
 
-        let state = self
+        match self
             .stage_batch_state(polled_offsets, messages.len(), skipped)
-            .await?;
-        Ok((messages, state))
+            .await
+        {
+            Ok(Some((state, persisted))) => {
+                *self.staged.lock().await = Some(StagedBatch { state, records });
+                Ok((messages, Some(persisted)))
+            }
+            Ok(None) => Ok((messages, None)),
+            Err(error) => {
+                // The scanner is already past these records, so they are built again on the
+                // next poll rather than skipped along with the error.
+                *self.replay.lock().await = Some(records);
+                Err(error)
+            }
+        }
     }
 
     fn build_message(
@@ -436,16 +466,16 @@ impl FlussSource {
         })
     }
 
-    /// Stages the state a polled batch would leave behind until the runtime reports its
-    /// result. A poll that read no rows changes no offset, so it carries no state unless the
-    /// start offsets from `open()` still have to reach disk. A poll whose rows were all skipped
-    /// still moves the offsets past them.
+    /// Builds the state a polled batch would leave behind, to be committed once the runtime
+    /// acknowledges the batch. A poll that read no rows changes no offset, so it carries no state
+    /// unless the start offsets from `open()` still have to reach disk. A poll whose rows were
+    /// all skipped still moves the offsets past them.
     async fn stage_batch_state(
         &self,
         polled_offsets: HashMap<i32, i64>,
         produced: usize,
         skipped: usize,
-    ) -> Result<Option<ConnectorState>, Error> {
+    ) -> Result<Option<(State, ConnectorState)>, Error> {
         if polled_offsets.is_empty() && !self.start_offsets_unsaved.load(Ordering::Acquire) {
             return Ok(None);
         }
@@ -460,29 +490,36 @@ impl FlussSource {
                 self.id
             ))
         })?;
-        *self.pending_state.lock().await = Some(candidate);
-        Ok(Some(persisted))
+        Ok(Some((candidate, persisted)))
     }
 
-    /// The scanner moves past records as soon as it returns them, so a batch that is not
-    /// acknowledged is only read again once the scanner points back at the committed offsets.
-    /// A fetch still buffered from the old position is dropped by the scanner's own
-    /// expected-offset check.
-    async fn rewind(&self, scanner: &LogScanner) -> Result<(), Error> {
-        let committed = { self.state.lock().await.bucket_offsets.clone() };
-        let context = format!("{CONNECTOR_NAME} connector with ID: {} rewind", self.id);
-        retry_async(
-            REWIND_RETRY,
-            &context,
-            fluss::error::Error::is_retriable,
-            || scanner.subscribe_buckets(&committed),
-        )
-        .await
-        .map_err(|failure| {
-            Error::Connection(format!(
-                "failed to rewind the Apache Fluss scanner to the last acknowledged offsets: \
-                 {failure}"
-            ))
+    /// Reads the next records, first pointing the scanner back at the committed offsets if its
+    /// last poll failed. The rewind is safe in that case: the scanner fails a poll after
+    /// collecting records only when sending the next fetches fails, before any of them is sent,
+    /// so no fetch is in flight for the buckets whose records were dropped.
+    async fn read(&self, scanner: &LogScanner) -> Result<ScanRecords, Error> {
+        if self.rewind_required.load(Ordering::Acquire) {
+            let committed = { self.state.lock().await.bucket_offsets.clone() };
+            scanner
+                .subscribe_buckets(&committed)
+                .await
+                .map_err(|error| {
+                    Error::Connection(format!(
+                        "failed to rewind the Apache Fluss scanner to the last acknowledged \
+                         offsets: {error}"
+                    ))
+                })?;
+            self.rewind_required.store(false, Ordering::Release);
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} rewound its scanner to the last \
+                 acknowledged offsets after a failed poll",
+                self.id
+            );
+        }
+
+        scanner.poll(self.poll_timeout).await.map_err(|error| {
+            self.rewind_required.store(true, Ordering::Release);
+            Error::Connection(format!("failed to poll Apache Fluss: {error}"))
         })
     }
 }
@@ -491,6 +528,14 @@ impl FlussSource {
 impl Source for FlussSource {
     async fn open(&mut self) -> Result<(), Error> {
         let start = self.validate_config()?;
+        if self.unreadable_state {
+            return Err(Error::InitError(format!(
+                "the saved state of {CONNECTOR_NAME} connector with ID: {} cannot be decoded. \
+                 Starting over could skip rows that were never delivered, so remove the state \
+                 file to start again from starting_offset",
+                self.id
+            )));
+        }
 
         let connection = FlussConnection::new(self.client_config())
             .await
@@ -596,8 +641,8 @@ impl Source for FlussSource {
             state.bucket_offsets = offsets;
         }
 
+        // The scanner holds its own handles to the client, so the connection is not kept.
         self.fields = fields;
-        self.connection = Some(connection);
         self.scanner = Some(scanner);
 
         info!(
@@ -614,32 +659,20 @@ impl Source for FlussSource {
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         sleep(self.poll_interval).await;
 
-        let Some(scanner) = self.scanner.as_ref() else {
-            return Err(Error::InitError(format!(
-                "{CONNECTOR_NAME} connector with ID: {} polled before it was opened",
-                self.id
-            )));
-        };
-
-        let records = scanner
-            .poll(self.poll_timeout)
-            .await
-            .map_err(|error| Error::Connection(format!("failed to poll Apache Fluss: {error}")))?;
-
-        let (messages, state) = match self.build_batch(&records).await {
-            Ok(batch) => batch,
-            Err(error) => {
-                // The scanner is already past these records, so they are read again on the next
-                // poll rather than skipped along with the error.
-                warn!(
-                    "Rewinding {CONNECTOR_NAME} connector with ID: {} after a batch it could not \
-                     build: {error}",
-                    self.id
-                );
-                self.rewind(scanner).await?;
-                return Err(error);
+        let replayed = self.replay.lock().await.take();
+        let records = match replayed {
+            Some(records) => records,
+            None => {
+                let Some(scanner) = self.scanner.as_ref() else {
+                    return Err(Error::InitError(format!(
+                        "{CONNECTOR_NAME} connector with ID: {} polled before it was opened",
+                        self.id
+                    )));
+                };
+                self.read(scanner).await?
             }
         };
+        let (messages, state) = self.build_batch(records).await?;
 
         let produced = messages.len();
         if produced > 0 {
@@ -664,34 +697,35 @@ impl Source for FlussSource {
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
-        let Some(candidate_state) = self.pending_state.lock().await.take() else {
+        let Some(staged) = self.staged.lock().await.take() else {
             return Ok(());
         };
         match result {
             SourceBatchResult::Ack => {
-                *self.state.lock().await = candidate_state;
+                *self.state.lock().await = staged.state;
                 self.start_offsets_unsaved.store(false, Ordering::Release);
-                Ok(())
             }
             SourceBatchResult::Nack => {
-                let Some(scanner) = self.scanner.as_ref() else {
-                    return Ok(());
-                };
-                warn!(
-                    "Rewinding {CONNECTOR_NAME} connector with ID: {} to the last acknowledged \
-                     offsets after a rejected batch",
-                    self.id
-                );
-                self.rewind(scanner).await
+                // A batch of start offsets alone has no rows to send again. The offsets still
+                // ride the next poll while they are unsaved.
+                if !staged.records.is_empty() {
+                    warn!(
+                        "{CONNECTOR_NAME} connector with ID: {} will send a rejected batch of {} \
+                         rows again",
+                        self.id,
+                        staged.records.count()
+                    );
+                    *self.replay.lock().await = Some(staged.records);
+                }
             }
         }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
         // `FlussConnection::close` only drains the writer client, which a source never creates,
-        // so dropping the scanner and the connection is what releases them.
+        // so dropping the scanner is what releases the client.
         self.scanner = None;
-        self.connection = None;
         let state = self.state.lock().await;
         info!(
             "Closed {CONNECTOR_NAME} connector with ID: {}, total messages produced: {}, rows \
@@ -704,9 +738,10 @@ impl Source for FlussSource {
 
 /// Buckets are per-table and offsets are per-bucket, so the pair is unique within a table and
 /// stable across restarts. A consumer can use it to spot a record replayed after an
-/// at-least-once redelivery. The Apache Iggy server does not dedupe on it.
+/// at-least-once redelivery. The Apache Iggy server does not dedupe on it. The offset fills the
+/// low 64 bits, the bucket the next 32, and [`MESSAGE_ID_TAG`] keeps the id from being zero.
 fn message_id(bucket: i32, offset: i64) -> u128 {
-    ((bucket as u32 as u128) << 64) | (offset as u64 as u128)
+    MESSAGE_ID_TAG | ((bucket as u32 as u128) << 64) | (offset as u64 as u128)
 }
 
 fn origin_timestamp_nanos(timestamp_millis: i64) -> Option<u64> {
@@ -775,9 +810,11 @@ fn ensure_no_metadata_collision(fields: &[DataField]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluss::metadata::DataTypes;
+    use fluss::metadata::{DataTypes, TableBucket};
+    use fluss::record::{ArrowReader, ChangeType, RowAppendRecordBatchBuilder, ScanRecord};
     use fluss::row::GenericRow;
     use serde_json::Value;
+    use std::sync::Arc;
 
     fn test_config() -> FlussSourceConfig {
         FlussSourceConfig {
@@ -804,6 +841,41 @@ mod tests {
             messages_produced: produced,
             ..State::default()
         }
+    }
+
+    fn staged_without_rows(state: State) -> StagedBatch {
+        StagedBatch {
+            state,
+            records: ScanRecords::empty(),
+        }
+    }
+
+    /// Records for a table with a single `id` column, decoded from Arrow the way the scanner
+    /// hands them over.
+    fn scan_records(bucket: i32, first_offset: i64, ids: &[i32]) -> ScanRecords {
+        let row_type = RowType::new(vec![field("id")]);
+        let mut builder =
+            RowAppendRecordBatchBuilder::new(&row_type).expect("Failed to create batch builder");
+        for id in ids {
+            let mut row = GenericRow::new(1);
+            row.set_field(0, *id);
+            builder.append(&row).expect("Failed to append row");
+        }
+        let batch = builder
+            .build_arrow_record_batch()
+            .expect("Failed to build record batch");
+        let reader = ArrowReader::new(batch, Arc::new(row_type)).expect("Failed to read batch");
+        let records = (0..ids.len())
+            .map(|row_id| {
+                ScanRecord::new(
+                    reader.read(row_id),
+                    first_offset + row_id as i64,
+                    1_700_000_000_000,
+                    ChangeType::AppendOnly,
+                )
+            })
+            .collect();
+        ScanRecords::new(HashMap::from([(TableBucket::new(1, bucket), records)]))
     }
 
     #[test]
@@ -834,21 +906,25 @@ mod tests {
         });
     }
 
-    /// The state is only a per-bucket cursor. An unreadable one falls back to
-    /// `starting_offset`, which with the default `earliest` re-reads the table: duplicates that
-    /// at-least-once delivery already allows, not lost rows.
+    /// The state is a per-bucket cursor, but starting over without it is not always a repeat.
+    /// With `latest` it resumes at the tail and skips whatever arrived after the last
+    /// acknowledged batch, so an unreadable state stops the source before it resolves offsets.
     #[test]
-    fn given_invalid_state_should_start_fresh() {
+    fn given_invalid_state_should_refuse_to_open() {
         let invalid = ConnectorState(b"not valid msgpack".to_vec());
+        let mut config = test_config();
+        config.starting_offset = Some("latest".to_owned());
 
-        let source = FlussSource::new(1, test_config(), Some(invalid));
+        let mut source = FlussSource::new(1, config, Some(invalid));
 
         let runtime = tokio::runtime::Runtime::new().expect("Failed to build runtime");
-        runtime.block_on(async {
-            let state = source.state.lock().await;
-            assert_eq!(state.messages_produced, 0);
-            assert!(state.bucket_offsets.is_empty());
-        });
+        let error = runtime
+            .block_on(source.open())
+            .expect_err("An unreadable state should keep the source from opening");
+        assert!(
+            matches!(&error, Error::InitError(message) if message.contains("cannot be decoded")),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1030,6 +1106,12 @@ mod tests {
         assert_ne!(message_id(0, 1), message_id(1, 0));
         assert_ne!(message_id(0, 1), message_id(0, 2));
         assert_eq!(message_id(2, 5), message_id(2, 5));
+        assert_eq!(message_id(2, 5), (1 << 127) | (2 << 64) | 5);
+    }
+
+    #[test]
+    fn given_first_row_of_first_bucket_should_get_a_nonzero_message_id() {
+        assert_ne!(message_id(0, 0), 0);
     }
 
     #[test]
@@ -1063,7 +1145,7 @@ mod tests {
         let source = FlussSource::new(1, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
         runtime.block_on(async {
-            *source.pending_state.lock().await = Some(state_with(&[(0, 42)], 42));
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 42)));
 
             source
                 .on_batch_result(SourceBatchResult::Ack)
@@ -1073,7 +1155,7 @@ mod tests {
             let state = source.state.lock().await;
             assert_eq!(state.messages_produced, 42);
             assert_eq!(state.bucket_offsets.get(&0), Some(&42));
-            assert!(source.pending_state.lock().await.is_none());
+            assert!(source.staged.lock().await.is_none());
         });
     }
 
@@ -1082,7 +1164,7 @@ mod tests {
         let source = FlussSource::new(1, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
         runtime.block_on(async {
-            *source.pending_state.lock().await = Some(state_with(&[(0, 42)], 42));
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 42)));
 
             source
                 .on_batch_result(SourceBatchResult::Nack)
@@ -1092,7 +1174,11 @@ mod tests {
             let state = source.state.lock().await;
             assert_eq!(state.messages_produced, 0);
             assert!(state.bucket_offsets.is_empty());
-            assert!(source.pending_state.lock().await.is_none());
+            assert!(source.staged.lock().await.is_none());
+            assert!(
+                source.replay.lock().await.is_none(),
+                "A batch without rows has nothing to send again"
+            );
         });
     }
 
@@ -1109,7 +1195,6 @@ mod tests {
                 .expect("An empty batch should stage");
 
             assert!(state.is_none());
-            assert!(source.pending_state.lock().await.is_none());
         });
     }
 
@@ -1127,10 +1212,9 @@ mod tests {
                 .expect("An empty batch should stage");
 
             let persisted = state
-                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .and_then(|(_, state)| state.deserialize::<State>(CONNECTOR_NAME, 1))
                 .expect("Unsaved start offsets should ride the empty batch");
             assert_eq!(persisted.bucket_offsets.get(&0), Some(&42));
-            assert!(source.pending_state.lock().await.is_some());
         });
     }
 
@@ -1147,7 +1231,7 @@ mod tests {
                 .expect("A polled batch should stage");
 
             let persisted = state
-                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .and_then(|(_, state)| state.deserialize::<State>(CONNECTOR_NAME, 1))
                 .expect("A batch with rows should carry state");
             assert_eq!(persisted.bucket_offsets.get(&0), Some(&45));
             assert_eq!(persisted.bucket_offsets.get(&1), Some(&7));
@@ -1166,14 +1250,14 @@ mod tests {
         runtime.block_on(async {
             source.start_offsets_unsaved.store(true, Ordering::Release);
 
-            *source.pending_state.lock().await = Some(state_with(&[(0, 42)], 0));
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 0)));
             source
                 .on_batch_result(SourceBatchResult::Nack)
                 .await
                 .expect("NACK should be applied");
             assert!(source.start_offsets_unsaved.load(Ordering::Acquire));
 
-            *source.pending_state.lock().await = Some(state_with(&[(0, 42)], 0));
+            *source.staged.lock().await = Some(staged_without_rows(state_with(&[(0, 42)], 0)));
             source
                 .on_batch_result(SourceBatchResult::Ack)
                 .await
@@ -1183,29 +1267,75 @@ mod tests {
     }
 
     #[test]
-    fn given_skipped_rows_read_again_after_a_nack_should_count_them_once() {
+    fn given_skipped_rows_sent_again_after_a_nack_should_count_them_once() {
         let source = FlussSource::new(1, test_config(), None);
         let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
         runtime.block_on(async {
-            source
+            let (state, _) = source
                 .stage_batch_state(HashMap::from([(0, 3)]), 1, 2)
                 .await
-                .expect("A batch with skipped rows should stage");
+                .expect("A batch with skipped rows should stage")
+                .expect("A batch with rows should carry state");
+            *source.staged.lock().await = Some(staged_without_rows(state));
             source
                 .on_batch_result(SourceBatchResult::Nack)
                 .await
                 .expect("NACK should be applied");
             assert_eq!(source.state.lock().await.rows_skipped, 0);
 
-            source
+            let (state, _) = source
                 .stage_batch_state(HashMap::from([(0, 3)]), 1, 2)
                 .await
-                .expect("The rewound batch should stage again");
+                .expect("The rejected batch should stage again")
+                .expect("A batch with rows should carry state");
+            *source.staged.lock().await = Some(staged_without_rows(state));
             source
                 .on_batch_result(SourceBatchResult::Ack)
                 .await
                 .expect("ACK should be applied");
             assert_eq!(source.state.lock().await.rows_skipped, 2);
+        });
+    }
+
+    /// Rewinding the scanner after a NACK could let a fetch requested before the rewind skip
+    /// the rejected rows, so the source keeps them and builds the same batch again.
+    #[test]
+    fn given_nack_when_batch_has_rows_should_send_the_same_rows_again() {
+        let (source, _) = source_with_id_column(true);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = state_with(&[(0, 10)], 10);
+
+            let (rejected, _) = source
+                .build_batch(scan_records(0, 10, &[1, 2, 3]))
+                .await
+                .expect("The batch should build");
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+            assert_eq!(source.state.lock().await.bucket_offsets.get(&0), Some(&10));
+
+            let replayed = source
+                .poll()
+                .await
+                .expect("The rejected rows should be polled again");
+            let summary = |messages: &[ProducedMessage]| {
+                messages
+                    .iter()
+                    .map(|message| (message.id, message.payload.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(summary(&replayed.messages), summary(&rejected));
+            assert!(replayed.state.is_some());
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+            let committed = source.state.lock().await;
+            assert_eq!(committed.bucket_offsets.get(&0), Some(&13));
+            assert_eq!(committed.messages_produced, 13);
         });
     }
 
@@ -1397,23 +1527,18 @@ mod tests {
         runtime.block_on(async {
             *source.state.lock().await = state_with(&[(0, 42)], 42);
 
-            let state = source
+            let (candidate, persisted) = source
                 .stage_batch_state(HashMap::from([(0, 45)]), 0, 3)
                 .await
-                .expect("A batch of skipped rows should stage");
-
-            let persisted = state
-                .and_then(|state| state.deserialize::<State>(CONNECTOR_NAME, 1))
+                .expect("A batch of skipped rows should stage")
                 .expect("Offsets past skipped rows should be staged");
+
+            let persisted = persisted
+                .deserialize::<State>(CONNECTOR_NAME, 1)
+                .expect("The staged state should decode");
             assert_eq!(persisted.bucket_offsets.get(&0), Some(&45));
             assert_eq!(persisted.messages_produced, 42);
-            let pending_skipped = source
-                .pending_state
-                .lock()
-                .await
-                .as_ref()
-                .map(|pending| pending.rows_skipped);
-            assert_eq!(pending_skipped, Some(3));
+            assert_eq!(candidate.rows_skipped, 3);
         });
     }
 }

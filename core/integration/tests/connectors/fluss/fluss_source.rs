@@ -53,6 +53,15 @@ struct FlussRecord {
     offset: i64,
     #[serde(rename = "_fluss_timestamp")]
     timestamp: i64,
+    /// The Apache Iggy message id, read from the message header rather than the payload.
+    #[serde(skip)]
+    message_id: u128,
+}
+
+/// An Apache Iggy message reduced to what the tests check.
+struct PolledMessage {
+    id: u128,
+    payload: Value,
 }
 
 #[iggy_harness(
@@ -92,6 +101,7 @@ async fn log_table_rows_are_produced_to_iggy(harness: &TestHarness, fixture: Flu
             "Fluss timestamp should be populated at {index}"
         );
     }
+    assert_message_ids(&received);
 }
 
 #[iggy_harness(
@@ -143,7 +153,7 @@ async fn given_rejected_batch_when_iggy_restarts_should_replay_rows_from_fluss(
         .expect("Failed to restart the Iggy server");
 
     // The scanner handed these rows over before the batch was rejected, so they only arrive if
-    // the source rewound it instead of moving on.
+    // the source sends the rejected batch again instead of moving on.
     let client = harness.root_client().await.unwrap();
     let received = poll_records(&client, payloads.len(), REDELIVERY_ATTEMPTS).await;
     assert_rows_delivered(&received, &payloads, 0);
@@ -364,6 +374,26 @@ fn assert_rows_delivered(received: &[FlussRecord], payloads: &[String], first_of
             received.len()
         );
     }
+    assert_message_ids(received);
+}
+
+/// Every delivery of a row, a repeat included, carries the id derived from its bucket and
+/// offset, so a consumer can match a replayed row with the first one.
+fn assert_message_ids(received: &[FlussRecord]) {
+    for record in received {
+        assert_eq!(
+            record.message_id,
+            expected_message_id(record.bucket, record.offset),
+            "Message id of the row at Fluss offset {} should come from its bucket and offset",
+            record.offset
+        );
+    }
+}
+
+/// The offset fills the low 64 bits, the bucket the next 32, and the top bit is set so that
+/// no id is zero.
+fn expected_message_id(bucket: i32, offset: i64) -> u128 {
+    (1 << 127) | ((bucket as u128) << 64) | offset as u128
 }
 
 async fn poll_records(
@@ -371,24 +401,39 @@ async fn poll_records(
     expected_rows: usize,
     attempts: usize,
 ) -> Vec<FlussRecord> {
-    poll_payloads(client, expected_rows, attempts)
+    poll_until_rows(client, expected_rows, attempts)
         .await
-        .iter()
-        .map(|payload| {
-            FlussRecord::deserialize(payload)
-                .unwrap_or_else(|error| panic!("Unexpected Fluss row {payload}: {error}"))
+        .into_iter()
+        .map(|message| {
+            let mut record = FlussRecord::deserialize(&message.payload).unwrap_or_else(|error| {
+                panic!("Unexpected Fluss row {}: {error}", message.payload)
+            });
+            record.message_id = message.id;
+            record
         })
+        .collect()
+}
+
+async fn poll_payloads(client: &IggyClient, expected_rows: usize, attempts: usize) -> Vec<Value> {
+    poll_until_rows(client, expected_rows, attempts)
+        .await
+        .into_iter()
+        .map(|message| message.payload)
         .collect()
 }
 
 /// Polls until messages for `expected_rows` distinct Fluss offsets have arrived, keeping
 /// any repeats an at-least-once redelivery produced.
-async fn poll_payloads(client: &IggyClient, expected_rows: usize, attempts: usize) -> Vec<Value> {
+async fn poll_until_rows(
+    client: &IggyClient,
+    expected_rows: usize,
+    attempts: usize,
+) -> Vec<PolledMessage> {
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "fluss_test_consumer".try_into().unwrap();
 
-    let mut received: Vec<Value> = Vec::new();
+    let mut received: Vec<PolledMessage> = Vec::new();
     for _ in 0..attempts {
         if let Ok(polled) = client
             .poll_messages(
@@ -409,11 +454,14 @@ async fn poll_payloads(client: &IggyClient, expected_rows: usize, attempts: usiz
                         String::from_utf8_lossy(&message.payload)
                     )
                 });
-                received.push(payload);
+                received.push(PolledMessage {
+                    id: message.header.id,
+                    payload,
+                });
             }
             let distinct_rows: HashSet<i64> = received
                 .iter()
-                .filter_map(|payload| payload["_fluss_offset"].as_i64())
+                .filter_map(|message| message.payload["_fluss_offset"].as_i64())
                 .collect();
             if distinct_rows.len() >= expected_rows {
                 break;

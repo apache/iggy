@@ -2,7 +2,8 @@
 
 Reads rows from an [Apache Fluss](https://fluss.apache.org/) log table and publishes them to an Apache Iggy stream as JSON.
 
-Each Fluss row becomes one Apache Iggy message. Offsets are tracked per bucket and persisted through the runtime state API, so a restart resumes where the previous run stopped. Offsets only advance once the runtime acknowledges a delivered batch; a rejected batch rewinds the scanner to the last acknowledged offsets and is read again. The start position is persisted with the first poll even when it returns no rows, so a restart does not resolve `latest` again past rows written in between.
+Each Fluss row becomes one Apache Iggy message. Offsets are tracked per bucket and persisted through the runtime state API, so a restart resumes where the previous run stopped.
+Offsets only advance once the runtime acknowledges a delivered batch. A rejected batch is kept and sent again on the next poll, and a poll that fails partway points the scanner back at the last acknowledged offsets before it reads on. The start position is persisted with the first poll even when it returns no rows, so a restart does not resolve `latest` again past rows written in between.
 
 ## Configuration
 
@@ -69,7 +70,7 @@ Temporal values keep every fractional digit the column holds, so the default `TI
 
 Rows are decoded with the table schema read when the connector starts. A row written before a column was added carries `null` for it, and a column added after startup stays out of the output until the connector restarts.
 
-Every message carries an `id` derived from its bucket and offset, so a consumer can spot a record replayed after an at-least-once redelivery (the Apache Iggy server does not deduplicate on it).
+Every message carries an `id` derived from its bucket and offset, so a consumer can spot a record replayed after an at-least-once redelivery (the Apache Iggy server does not deduplicate on it). The offset fills the low 64 bits, the bucket the next 32, and the top bit is always set, since a zero id would be replaced with a random one when the message is sent.
 
 The connector also hands the runtime the Fluss record timestamp as `origin_timestamp`, but the runtime does not pass it on, so Apache Iggy stamps each message with its own time. Turn on `include_metadata` to keep the record timestamp in the payload as `_fluss_timestamp`.
 
@@ -82,6 +83,7 @@ These are limits of this connector, not of the `fluss-rs` client.
 - **Partitioned tables are not supported.** They are detected and rejected at startup.
 - **Rows that cannot be converted are skipped.** A value the JSON mapping cannot hold, such as a date beyond what `chrono` represents, fails the same way on every read. Such a row is dropped and logged at error level with its bucket and offset, the offsets move past it, and the number of skipped rows is logged when the connector closes.
 - **A crash right after starting from `latest` can miss rows.** The resolved start offsets stay in memory until the first batch is acknowledged, which normally takes one poll. If the connector crashes in that window, the next start resolves `latest` again and misses the rows written in between.
+- **An unreadable saved state stops the connector at startup.** Starting over from `starting_offset` could skip rows that were never delivered, `latest` above all, so the connector refuses to open until the saved state is removed (the `source_<key>.state` file under the runtime's state path with the default file storage).
 - **An offset outside a bucket's range is not reset.** If a configured offset, or one restored from state after retention removed it, falls outside what the bucket still holds, polls keep failing until the offset is changed. The connector does not move to the earliest or latest offset on its own.
 
 ## Build and test
