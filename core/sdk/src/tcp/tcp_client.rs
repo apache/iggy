@@ -664,19 +664,13 @@ impl TcpClient {
                     sleep(remaining.get_duration()).await;
                 }
 
-                if self.caller_disconnected() {
+                if let Some(error) = self.sweep_interrupted().await {
                     self.fail_connect().await;
-                    return Err(IggyError::NotConnected);
+                    return Err(error);
                 }
 
                 info!("{NAME} client is connecting to server: {server_address}...");
                 match self.establish_bounded(&server_address, &candidates).await {
-                    // Dropped before it is installed: the caller disconnected
-                    // while it was being dialed.
-                    Ok(_) if self.caller_disconnected() => {
-                        self.fail_connect().await;
-                        return Err(IggyError::NotConnected);
-                    }
                     Ok(connection) => {
                         let dialed = server_address.clone();
                         // The endpoint that answered is where this client now
@@ -694,6 +688,15 @@ impl TcpClient {
                             connection.remote_address,
                         );
                         self.link.lock().await.replace(connection.link);
+                        // Checked once the link is installed, not before:
+                        // `shutdown()` sets `Shutdown` before it takes the
+                        // link, so a shutdown during the dial either takes
+                        // this link or is seen here.
+                        if let Some(error) = self.sweep_interrupted().await {
+                            self.link.lock().await.take();
+                            self.fail_connect().await;
+                            return Err(error);
+                        }
                         self.set_state(ClientState::Connected).await;
                         self.connected_at.lock().await.replace(now);
                         self.publish_event(DiagnosticEvent::Connected).await;
@@ -742,9 +745,9 @@ impl TcpClient {
                 }
                 candidate = 0;
 
-                if self.caller_disconnected() {
+                if let Some(error) = self.sweep_interrupted().await {
                     self.fail_connect().await;
-                    return Err(IggyError::NotConnected);
+                    return Err(error);
                 }
 
                 // An unreadable CA file, a domain that will not parse: no
@@ -1211,6 +1214,11 @@ impl TcpClient {
     /// left at `Connecting`, the next `connect()` returns ok at the top
     /// without ever dialing.
     async fn fail_connect(&self) {
+        // The state stays `Shutdown`, and a `Disconnected` event would
+        // contradict the `Shutdown` one.
+        if self.get_state().await == ClientState::Shutdown {
+            return;
+        }
         self.set_state(ClientState::Disconnected).await;
         self.publish_event(DiagnosticEvent::Disconnected).await;
     }
@@ -1220,6 +1228,17 @@ impl TcpClient {
     /// disconnects, nothing in the sweep may bring the client back.
     fn caller_disconnected(&self) -> bool {
         self.disconnected_by_caller.load(Ordering::SeqCst)
+    }
+
+    /// A reconnect sweep checks this before each dial, after it installs a
+    /// link and before each retry pause: once the client is shut down or the
+    /// caller disconnects, nothing in the sweep may bring the client back.
+    async fn sweep_interrupted(&self) -> Option<IggyError> {
+        if self.get_state().await == ClientState::Shutdown {
+            return Some(IggyError::ClientShutdown);
+        }
+        self.caller_disconnected()
+            .then_some(IggyError::NotConnected)
     }
 
     /// [`Self::establish`], bounded while other endpoints are queued behind
@@ -1305,12 +1324,14 @@ impl TcpClient {
 
         let client_address = self.get_client_address_value().await;
         info!("Shutting down the {NAME} TCP client: {client_address}");
+        // Set before the link is taken: a reconnect sweep that installs a link
+        // after this point sees `Shutdown` and drops it.
+        self.set_state(ClientState::Shutdown).await;
         let link = self.link.lock().await.take();
         if let Some(link) = link {
             link.shutdown().await;
         }
         self.reset_vsr_session().await?;
-        self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} TCP client: {client_address} has been shutdown.");
         Ok(())
@@ -3910,6 +3931,58 @@ mod tests {
         assert!(
             tokio::time::timeout(TEST_BUDGET, publish).await.is_ok(),
             "a publish waited for room that an unread receiver never frees"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_a_reconnect_sweep_ends_the_sweep() {
+        let address = dead_endpoint().await;
+        let client = Arc::new(
+            TcpClient::create(Arc::new(TcpClientConfig {
+                server_address: address.clone(),
+                reconnection: TcpClientReconnectionConfig {
+                    enabled: true,
+                    max_retries: None,
+                    interval: NonZeroIggyDuration::from_str("500ms").expect("duration"),
+                    reestablish_after: IggyDuration::new(Duration::ZERO),
+                },
+                ..TcpClientConfig::default()
+            }))
+            .expect("create the client"),
+        );
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { TcpClient::connect(&client).await }
+        });
+        while client.get_state().await != ClientState::Connecting {
+            sleep(Duration::from_millis(10)).await;
+        }
+        // The first dial is refused at once, so the sweep now waits out its
+        // retry interval.
+        sleep(Duration::from_millis(100)).await;
+
+        Client::shutdown(&*client).await.unwrap();
+        // The server comes back before the next dial.
+        let listener = TcpListener::bind(&address).await.expect("bind again");
+        let result = tokio::time::timeout(Duration::from_secs(2), sweep)
+            .await
+            .expect("the sweep must end after the shutdown")
+            .expect("the sweep task must not panic");
+
+        assert!(
+            matches!(result, Err(IggyError::ClientShutdown)),
+            "got {result:?}"
+        );
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
+        assert!(
+            client.link.lock().await.is_none(),
+            "no link may be installed after the shutdown"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "the sweep must not dial after the shutdown"
         );
     }
 }
