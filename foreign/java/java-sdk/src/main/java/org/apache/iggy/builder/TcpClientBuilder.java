@@ -44,6 +44,11 @@ import org.apache.iggy.client.blocking.tcp.IggyTcpClientBuilder;
  *     .credentials("iggy", "iggy")
  *     .buildAndLogin();
  *
+ * // Blocking TCP client - from a connection string, with auto-login
+ * var client = Iggy.tcpClientBuilder()
+ *     .fromConnectionString("iggy://iggy:iggy@localhost:8090")
+ *     .buildAndLogin();
+ *
  * // Async TCP client - manual connect and login
  * var asyncClient = Iggy.tcpClientBuilder().async()
  *     .host("localhost")
@@ -73,6 +78,34 @@ public final class TcpClientBuilder {
      */
     public IggyTcpClientBuilder blocking() {
         return IggyTcpClient.builder();
+    }
+
+    /**
+     * Returns a blocking TCP client builder configured from an Iggy connection string.
+     *
+     * <p>Accepts {@code iggy://} and {@code iggy+tcp://} with
+     * {@code <username>:<password>@<host>:<port>}, where the host may be an IPv6
+     * address in brackets. The only supported option is {@code tls=true|false}:
+     * <pre>{@code
+     * var client = Iggy.tcpClientBuilder()
+     *     .fromConnectionString("iggy://iggy:iggy@localhost:8090")
+     *     .buildAndLogin();
+     * }</pre>
+     *
+     * <p>Other transports such as {@code iggy+quic://}, personal access tokens and
+     * other options are rejected.
+     *
+     * @param connectionString the connection string
+     * @return a new IggyTcpClientBuilder with host, port, credentials and TLS set
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the connection string is invalid
+     */
+    public IggyTcpClientBuilder fromConnectionString(String connectionString) {
+        TcpConnectionString parsed = TcpConnectionString.parse(connectionString);
+        return blocking()
+                .host(parsed.host())
+                .port(parsed.port())
+                .credentials(parsed.username(), parsed.password())
+                .tls(parsed.tls());
     }
 
     /**
