@@ -87,7 +87,39 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 use tracing::{debug, warn};
 
-type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHeader>>>>>;
+type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<QueuedClientRequest>>>>;
+
+struct QueuedClientRequest {
+    message: Message<GenericHeader>,
+    // A queued metadata barrier can change the namespace resolved by this frame.
+    progress: Option<(u64, Option<ConsumerProgress>)>,
+}
+
+impl From<Message<GenericHeader>> for QueuedClientRequest {
+    fn from(message: Message<GenericHeader>) -> Self {
+        Self {
+            message,
+            progress: None,
+        }
+    }
+}
+
+impl QueuedClientRequest {
+    fn progress_key(
+        &mut self,
+        metadata_frontier: u64,
+        resolve: impl FnOnce(&Message<GenericHeader>) -> Option<ConsumerProgress>,
+    ) -> Option<ConsumerProgress> {
+        if let Some((frontier, key)) = self.progress
+            && frontier == metadata_frontier
+        {
+            return key;
+        }
+        let key = resolve(&self.message);
+        self.progress = Some((metadata_frontier, key));
+        key
+    }
+}
 
 /// Requests one client may have queued behind a request this shard has not
 /// answered yet.
@@ -140,7 +172,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             deny_overflowing_client_request(shard_handle, client_id, message);
             return;
         }
-        queue.push_back(message);
+        queue.push_back(message.into());
     }
     let running = active.borrow().get(&client_id).cloned();
     if let Some(drain) = running {
@@ -259,10 +291,14 @@ impl Drop for ActiveDrainSlot {
 /// prologue of each. Login, logout, `BIND_SESSION` and partition admission
 /// finish on the drain. Metadata commits run in tasks, but later non-PING
 /// frames wait in the queue until the metadata lane releases, before they
-/// capture session state or resolve a namespace. PING can pass that queue.
-/// Polls and explicit offset writes share a lane per resolved namespace and
-/// consumer until their reply. Independent requests can pass a queued conflict,
-/// but cannot pass a queued session or metadata barrier. A PING still waits
+/// capture session state or resolve a namespace. This orders dispatch, not local
+/// metadata catch-up: partition writes still resolve from this shard's STM
+/// without waiting for the connection watermark. PING can pass that queue.
+/// Stored-offset reads, Next/auto-commit polls and explicit offset writes share
+/// a lane per resolved namespace and consumer until their reply or wait expiry.
+/// Expiry releases only this connection's guard, not an admitted mutation, which
+/// may still commit after later progress. Independent requests can pass a queued
+/// conflict, but cannot pass a queued session or metadata barrier. A PING still waits
 /// behind a frame already suspended in admission or binding.
 ///
 /// `capacity` caps those tasks at `message_bus.client_queue_capacity`, the
@@ -404,19 +440,26 @@ async fn drain_client_requests<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     loop {
-        let next = pop_next_client_request(&queues, client_id, |message| {
-            if is_ping(message) {
+        let metadata_frontier = shard.plane.metadata().applied_frontier().get();
+        let next = pop_next_client_request(&queues, client_id, |queued| {
+            if is_ping(&queued.message) {
                 return true;
             }
             if drain.metadata_write.get() {
                 return false;
             }
-            progress_key(&shard, message).is_none_or(|key| {
-                drain.in_flight.get() < drain.capacity && !drain.progress.borrow().contains(&key)
-            })
+            queued
+                .progress_key(metadata_frontier, |message| progress_key(&shard, message))
+                .is_none_or(|key| {
+                    drain.in_flight.get() < drain.capacity
+                        && !drain.progress.borrow().contains(&key)
+                })
         });
-        if let Some(message) = next {
-            let progress = progress_key(&shard, &message).map(|key| drain.admit_progress(key));
+        if let Some(queued) = next {
+            let progress = queued
+                .progress
+                .and_then(|(_, key)| key)
+                .map(|key| drain.admit_progress(key));
             handle_client_request(
                 &shard,
                 &sessions,
@@ -424,7 +467,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
                 max_tokens_per_user,
                 drain,
                 client_id,
-                message,
+                queued.message,
                 progress,
             )
             .await;
@@ -439,8 +482,8 @@ async fn drain_client_requests<B, MJ, S, SB>(
 fn pop_next_client_request(
     queues: &ClientRequestQueues,
     client_id: u128,
-    ready: impl Fn(&Message<GenericHeader>) -> bool,
-) -> Option<Message<GenericHeader>> {
+    mut ready: impl FnMut(&mut QueuedClientRequest) -> bool,
+) -> Option<QueuedClientRequest> {
     // Freed as soon as it drains empty. Keeping it would cost the connection
     // one `VecDeque` (at its peak depth, since `pop_front` never gives
     // capacity back), and the connection-lost hook cannot be the sole owner:
@@ -451,28 +494,30 @@ fn pop_next_client_request(
     let queue = queues.get_mut(&client_id)?;
     let mut waiting = false;
     let mut barrier = false;
-    let index = queue.iter().position(|message| {
-        if is_ping(message) {
+    let index = queue.iter_mut().position(|queued| {
+        if is_ping(&queued.message) {
             return true;
         }
         if barrier {
             return false;
         }
-        let orders_followers = message
-            .try_as_typed::<RequestHeader>()
-            .map_or(true, |request| {
-                let header = request.header();
-                if header.operation == Operation::NonReplicated {
-                    header.reserved[..4] == BIND_SESSION_CODE.to_le_bytes()
-                } else {
-                    !header.operation.is_partition()
-                }
-            });
+        let orders_followers =
+            queued
+                .message
+                .try_as_typed::<RequestHeader>()
+                .map_or(true, |request| {
+                    let header = request.header();
+                    if header.operation == Operation::NonReplicated {
+                        header.reserved[..4] == BIND_SESSION_CODE.to_le_bytes()
+                    } else {
+                        !header.operation.is_partition()
+                    }
+                });
         if waiting && orders_followers {
             barrier = true;
             return false;
         }
-        if ready(message) {
+        if ready(queued) {
             return true;
         }
         waiting = true;
@@ -1111,16 +1156,19 @@ mod tests {
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, prepare_message,
-        register_reply, request_message, test_shard,
+        FIRST_BOOT, SpyBus, TestMux, TestShard, UNDECLARED_OPERATION, create_one_partition,
+        prepare_message, register_reply, request_message, test_shard,
     };
     use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, POLL_MESSAGES_CODE,
+        POLL_MESSAGES_ON_PRIMARY_CODE,
     };
+    use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::requests::messages::PollMessagesRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::system::BindSessionRequest;
     use iggy_binary_protocol::requests::users::{
@@ -1139,13 +1187,13 @@ mod tests {
     use metadata::stm::StateMachine;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
-    use server_common::sharding::ShardId;
+    use server_common::sharding::{PartitionLocation, ShardId};
     use shard::metrics::ShardMetrics;
-    use shard::shards_table::PapayaShardsTable;
+    use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
         ConnectedClientInfo, LifecycleFrame, ListClientsReply, MetadataSubmit, NoopHost,
-        PartitionConsensusConfig, ReplicaTopology, ShardFrame, ShardHost, ShardIdentity,
-        shard_channel,
+        PartitionConsensusConfig, PartitionRead, PartitionReadReply, ReplicaTopology, ShardFrame,
+        ShardHost, ShardIdentity, shard_channel,
     };
     use std::mem::size_of;
     use std::sync::atomic::AtomicBool;
@@ -2353,6 +2401,151 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_held_partition_poll_when_ping_follows_should_answer_ping_before_owner_reply() {
+        const POLL_REQUEST: u64 = 1;
+        const PING_REQUEST: u64 = 2;
+        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE] {
+            let bus = SpyBus::default();
+            let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+            let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+            shard.attach_senders(vec![sender]);
+            let shard = Rc::new(shard);
+            let namespace = create_one_partition(&shard);
+            shard
+                .shards_table()
+                .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+            commit_root_session(&shard);
+            let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+            let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
+            bind_root_session(&shard, host.sessions()).await;
+            let body = PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+                strategy: WirePollingStrategy::offset(0),
+                count: 1,
+                auto_commit: false,
+            }
+            .to_bytes();
+            let mut poll = wire_request(
+                Operation::NonReplicated,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                POLL_REQUEST,
+                &body,
+            );
+            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
+            );
+            header.reserved[..4].copy_from_slice(&code.to_le_bytes());
+            header.partition_incarnation = shard
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .created_revision_for_namespace(namespace)
+                .unwrap();
+            host.on_client_request(ROOT_TRANSPORT, poll.into_generic());
+            settle().await;
+            let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                read: PartitionRead::PollOnPrimary { .. },
+                reply,
+                ..
+            }) = owner_inbox
+                .try_recv()
+                .expect("the poll must reach its partition owner")
+            else {
+                panic!("the owner must receive a primary-gated poll");
+            };
+            assert!(bus.client_replies.borrow().is_empty());
+
+            host.on_client_request(
+                ROOT_TRANSPORT,
+                root_read(PING_CODE, PING_REQUEST).into_generic(),
+            );
+            await_replies(&bus, 1).await;
+            {
+                let replies = bus.client_replies.borrow();
+                assert_eq!(
+                    replies.len(),
+                    1,
+                    "PING must not wait for partition I/O on code {code}"
+                );
+                assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
+            }
+            reply
+                .try_send(PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted,
+                ))
+                .unwrap();
+            await_replies(&bus, 2).await;
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
+        }
+    }
+
+    #[compio::test]
+    async fn given_queued_progress_when_metadata_changes_should_resolve_once_per_frontier() {
+        const CREATED_FRONTIER: u64 = ROOT_SESSION + 1;
+        let (_, shard, _) = root_host(ServerConfig::default());
+        let body = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::named("stream").unwrap(),
+            topic_id: WireIdentifier::named("topic").unwrap(),
+            partition_id: Some(0),
+            offset: 1,
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let mut queued = QueuedClientRequest::from(
+            wire_request(
+                Operation::StoreConsumerOffset,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                1,
+                &body,
+            )
+            .into_generic(),
+        );
+        assert!(
+            queued.progress.is_none(),
+            "enqueue must not resolve ahead of a metadata barrier"
+        );
+        let resolutions = Cell::new(0);
+        let resolve = |message: &Message<GenericHeader>| {
+            resolutions.set(resolutions.get() + 1);
+            progress_key(&shard, message)
+        };
+        for _ in 0..3 {
+            assert_eq!(queued.progress_key(ROOT_SESSION, resolve), None);
+        }
+        assert_eq!(
+            resolutions.get(),
+            1,
+            "wakes must reuse a resolved missing key too"
+        );
+        let namespace = create_one_partition(&shard);
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(CREATED_FRONTIER);
+        for _ in 0..3 {
+            assert_eq!(
+                queued.progress_key(shard.plane.metadata().applied_frontier().get(), resolve),
+                Some((namespace.inner(), iggy_binary_protocol::KIND_CONSUMER, 1))
+            );
+        }
+        assert_eq!(
+            resolutions.get(),
+            2,
+            "new metadata must invalidate the cached namespace"
+        );
+    }
+
+    #[compio::test]
     async fn given_pending_metadata_when_read_and_ping_queue_should_answer_ping_then_wake_read() {
         const READ_REQUEST: u64 = 1;
         const PING_REQUEST: u64 = 2;
@@ -2363,10 +2556,13 @@ mod tests {
         let metadata = drain.admit(Admission::MetadataLane).await;
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
             ROOT_TRANSPORT,
-            VecDeque::from([
-                held_get_me(READ_REQUEST, 0),
-                root_read(PING_CODE, PING_REQUEST).into_generic(),
-            ]),
+            VecDeque::from(
+                [
+                    held_get_me(READ_REQUEST, 0),
+                    root_read(PING_CODE, PING_REQUEST).into_generic(),
+                ]
+                .map(QueuedClientRequest::from),
+            ),
         )])));
         let draining = drain_client_requests(
             shard,
@@ -2413,22 +2609,26 @@ mod tests {
             };
             let queues = Rc::new(RefCell::new(AHashMap::from_iter([(
                 ROOT_TRANSPORT,
-                VecDeque::from([
-                    wire_request(
-                        Operation::StoreConsumerOffset,
-                        ROOT_CLIENT,
-                        ROOT_SESSION,
-                        BLOCKED,
-                        &[],
-                    )
-                    .into_generic(),
-                    barrier,
-                    held_get_me(READ, 0),
-                    root_read(PING_CODE, PING).into_generic(),
-                ]),
+                VecDeque::from(
+                    [
+                        wire_request(
+                            Operation::StoreConsumerOffset,
+                            ROOT_CLIENT,
+                            ROOT_SESSION,
+                            BLOCKED,
+                            &[],
+                        )
+                        .into_generic(),
+                        barrier,
+                        held_get_me(READ, 0),
+                        root_read(PING_CODE, PING).into_generic(),
+                    ]
+                    .map(QueuedClientRequest::from),
+                ),
             )])));
-            let ready = |message: &Message<GenericHeader>| {
-                message
+            let ready = |queued: &mut QueuedClientRequest| {
+                queued
+                    .message
                     .try_as_typed::<RequestHeader>()
                     .unwrap()
                     .header()
@@ -2436,12 +2636,13 @@ mod tests {
                     != BLOCKED
             };
             let ping = pop_next_client_request(&queues, ROOT_TRANSPORT, ready).unwrap();
-            assert!(is_ping(&ping));
+            assert!(is_ping(&ping.message));
             assert!(pop_next_client_request(&queues, ROOT_TRANSPORT, ready).is_none());
             for expected in [BLOCKED, BARRIER, READ] {
                 let message = pop_next_client_request(&queues, ROOT_TRANSPORT, |_| true).unwrap();
                 assert_eq!(
                     message
+                        .message
                         .try_as_typed::<RequestHeader>()
                         .unwrap()
                         .header()
@@ -2887,7 +3088,7 @@ mod tests {
             .borrow_mut()
             .entry(CLIENT)
             .or_default()
-            .push_back(non_replicated_request(CLIENT, PING_CODE));
+            .push_back(non_replicated_request(CLIENT, PING_CODE).into());
 
         assert!(pop_next_client_request(&queues, CLIENT, |_| true).is_some());
         assert!(

@@ -350,7 +350,9 @@ async fn relay_partition_reply<B, MJ, S, SB>(
         let Some(reply) = shard.await_partition_submit(ticket).await else {
             // Abandoned or expired. Deliberately silent: the outcome is
             // unknown, and a synthesized failure could contradict a write that
-            // commits moments later. The client's read-timeout is the recovery.
+            // commits moments later. Releasing the progress guard does not
+            // cancel that write or fence it against later progress.
+            // The client's read-timeout is the recovery.
             return;
         };
         if let Some(kind) = consumer_kind
@@ -379,7 +381,7 @@ async fn relay_partition_reply<B, MJ, S, SB>(
     });
 }
 
-/// The offset key shared by polls and explicit progress writes on a connection.
+/// The offset key shared by stored-offset reads and progress writes on a connection.
 /// Failed resolution is left to the normal handler's authorization and error path.
 pub(super) fn progress_key<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -405,6 +407,9 @@ where
                     == POLL_MESSAGES_ON_PRIMARY_CODE.to_le_bytes() =>
         {
             let poll = PollMessagesRequest::decode_from(request.body()).ok()?;
+            if !poll.auto_commit && poll.strategy.kind != WirePollingStrategy::next().kind {
+                return None;
+            }
             GetConsumerOffsetRequest {
                 consumer: poll.consumer,
                 stream_id: poll.stream_id,
@@ -1829,6 +1834,114 @@ mod tests {
             "routing waits cannot promote an old binding past Logout"
         );
         assert_eq!(metadata.applied_frontier().get(), LATER_FRONTIER);
+    }
+
+    #[compio::test]
+    async fn given_poll_strategies_when_resolving_progress_should_only_order_stored_offset_dependencies()
+     {
+        const CONSUMER: u32 = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = create_one_partition(&shard);
+        let expected = Some((namespace.inner(), KIND_CONSUMER, CONSUMER as usize));
+        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE] {
+            for (strategy, reads_stored) in [
+                (WirePollingStrategy::offset(0), false),
+                (WirePollingStrategy::timestamp(1), false),
+                (WirePollingStrategy::first(), false),
+                (WirePollingStrategy::last(), false),
+                (WirePollingStrategy::next(), true),
+            ] {
+                for auto_commit in [false, true] {
+                    let body = PollMessagesRequest {
+                        consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                        partition_id: Some(0),
+                        strategy: strategy.clone(),
+                        count: 1,
+                        auto_commit,
+                    }
+                    .to_bytes();
+                    let mut request = request_message(Operation::NonReplicated, 1, 1, 1, &body);
+                    bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                        &mut request.as_mut_slice()[..size_of::<RequestHeader>()],
+                    )
+                    .reserved[..4]
+                        .copy_from_slice(&code.to_le_bytes());
+                    assert_eq!(
+                        progress_key(&shard, &request.into_generic()),
+                        if reads_stored || auto_commit {
+                            expected
+                        } else {
+                            None
+                        },
+                        "code {code}, strategy {strategy:?}, auto_commit {auto_commit}",
+                    );
+                }
+            }
+        }
+        let requests = [
+            request_message(
+                Operation::StoreConsumerOffset,
+                1,
+                1,
+                1,
+                &StoreConsumerOffsetRequest {
+                    consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: Some(0),
+                    offset: 1,
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes(),
+            ),
+            request_message(
+                Operation::DeleteConsumerOffset,
+                1,
+                1,
+                2,
+                &DeleteConsumerOffsetRequest {
+                    consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: Some(0),
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes(),
+            ),
+        ];
+        for request in requests {
+            assert_eq!(
+                progress_key(&shard, &request.into_generic()),
+                expected,
+                "explicit writes must retain the same progress lane"
+            );
+        }
+        let mut read = request_message(
+            Operation::NonReplicated,
+            1,
+            1,
+            3,
+            &GetConsumerOffsetRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+            }
+            .to_bytes(),
+        );
+        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+        )
+        .reserved[..4]
+            .copy_from_slice(&GET_CONSUMER_OFFSET_CODE.to_le_bytes());
+        assert_eq!(
+            progress_key(&shard, &read.into_generic()),
+            expected,
+            "stored-offset reads must still wait for explicit progress"
+        );
     }
 
     #[compio::test]

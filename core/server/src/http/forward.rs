@@ -48,9 +48,8 @@
 //!   primary's pipeline: a connect-phase failure, and for a metadata relay a
 //!   503 whose body carries the `TransientNotAccepted` or `NotPrimary` code or
 //!   a 307 from a stale target, for a partition relay a 503 carrying
-//!   `NotPrimary`. Every other outcome - including a 503 carrying
-//!   `TransientNotCommitted`, whose op
-//!   may still commit - is relayed as-is, because re-issuing it under a fresh
+//!   `NotPrimary`. Every other outcome, including `TransientNotCommitted`, is
+//!   relayed as-is: its op may still commit, and re-issuing it under a fresh
 //!   session would defeat the consensus dedup and double-apply the op.
 //! - A partition read changes no state, so a transport failure after its send
 //!   is retried too: the resend cannot apply anything twice.
