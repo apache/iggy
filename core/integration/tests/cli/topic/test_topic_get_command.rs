@@ -24,18 +24,10 @@ use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::Durability;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::TopicCreateOptions;
+use iggy::prelude::{IggyMessage, Partitioning, TopicCreateOptions};
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-
-struct ExpectedPartitionRow {
-    id: u32,
-    created_at: String,
-    segments_count: u32,
-    current_offset: u64,
-    size: String,
-    messages_count: u64,
-}
 
 struct TestTopicGetCmd {
     stream_id: u32,
@@ -46,34 +38,47 @@ struct TestTopicGetCmd {
     using_topic_id: TestTopicId,
     partitions_count: u32,
     durability: Durability,
-    expected_partitions: Vec<ExpectedPartitionRow>,
+    consumer_offset_durability: Durability,
+    expected_partitions: Vec<Vec<String>>,
+    expected_options: Vec<Vec<String>>,
+    expected_size: String,
+    expected_messages_count: u64,
+    populate_partitions: bool,
 }
 
 impl TestTopicGetCmd {
     fn new(
-        stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         using_stream_id: TestStreamId,
         using_topic_id: TestTopicId,
     ) -> Self {
         Self {
-            stream_id,
+            stream_id: 0,
             stream_name,
-            topic_id,
+            topic_id: 0,
             topic_name,
             using_stream_id,
             using_topic_id,
             partitions_count: 1,
             durability: Durability::Replicated,
+            consumer_offset_durability: Durability::Replicated,
             expected_partitions: Vec::new(),
+            expected_options: Vec::new(),
+            expected_size: String::new(),
+            expected_messages_count: 0,
+            populate_partitions: false,
         }
     }
 
     fn with_topic_options(mut self, partitions_count: u32, durability: Durability) -> Self {
         self.partitions_count = partitions_count;
         self.durability = durability;
+        self.consumer_offset_durability = match durability {
+            Durability::Persisted => Durability::Replicated,
+            Durability::Replicated => Durability::Persisted,
+        };
+        self.populate_partitions = true;
         self
     }
 
@@ -95,8 +100,11 @@ impl TestTopicGetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestTopicGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name).await;
-        assert!(stream.is_ok());
+        let stream = client
+            .create_stream(&self.stream_name)
+            .await
+            .expect("stream should be created");
+        self.stream_id = stream.id;
 
         let topic = client
             .create_topic(
@@ -106,11 +114,31 @@ impl IggyCmdTestCase for TestTopicGetCmd {
                     partitions_count: Some(self.partitions_count),
                     message_expiry: Some(IggyExpiry::NeverExpire),
                     durability: self.durability,
+                    consumer_offset_durability: self.consumer_offset_durability,
+                    preallocate_segments: Some(false),
                     ..TopicCreateOptions::default()
                 },
             )
-            .await;
-        assert!(topic.is_ok());
+            .await
+            .expect("topic should be created");
+        self.topic_id = topic.id;
+
+        if self.populate_partitions {
+            for (index, partition) in topic.partitions.iter().enumerate() {
+                let mut messages = (0..=index)
+                    .map(|_| "topic get test payload".parse::<IggyMessage>().unwrap())
+                    .collect::<Vec<_>>();
+                client
+                    .send_messages(
+                        &self.stream_id.try_into().unwrap(),
+                        &self.topic_id.try_into().unwrap(),
+                        &Partitioning::partition_id(partition.id),
+                        &mut messages,
+                    )
+                    .await
+                    .expect("messages should be sent");
+            }
+        }
 
         let details = client
             .get_topic(
@@ -123,16 +151,33 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         self.expected_partitions = details
             .partitions
             .iter()
-            .map(|partition| ExpectedPartitionRow {
-                id: partition.id,
-                created_at: partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
-                segments_count: partition.segments_count,
-                current_offset: partition.current_offset,
-                size: partition.size.to_string(),
-                messages_count: partition.messages_count,
+            .map(|partition| {
+                vec![
+                    partition.id.to_string(),
+                    partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
+                    partition.segments_count.to_string(),
+                    partition.current_offset.to_string(),
+                    partition.size.to_string(),
+                    partition.messages_count.to_string(),
+                ]
             })
             .collect();
-        assert_eq!(self.expected_partitions.len(), self.partitions_count as usize);
+        self.expected_options = details
+            .options
+            .iter()
+            .map(|(key, option)| {
+                vec![
+                    String::from_utf8_lossy(key.as_bytes()).into_owned(),
+                    option.value.to_string_value(),
+                ]
+            })
+            .collect();
+        self.expected_size = details.size.to_string();
+        self.expected_messages_count = details.messages_count;
+        assert_eq!(
+            self.expected_partitions.len(),
+            self.partitions_count as usize
+        );
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -157,49 +202,59 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         let start_message =
             format!("Executing get topic with ID: {topic_id} from stream with ID: {stream_id}");
 
-        let mut assertion = command_state
+        let assertion = command_state
             .success()
             .stdout(starts_with(start_message))
-            .stdout(contains("Topic id            | 0"))
+            .stdout(contains(format!("Topic id            | {}", self.topic_id)))
             .stdout(contains(format!(
                 "Topic name          | {}",
                 self.topic_name
             )))
-            .stdout(contains("Topic size          | 0"))
+            .stdout(contains(format!(
+                "Topic size          | {}",
+                self.expected_size
+            )))
             .stdout(contains("Message expiry      | unlimited"))
             .stdout(contains("Max topic size      | unlimited"))
-            .stdout(contains("Topic message count | 0"))
+            .stdout(contains(format!(
+                "Topic message count | {}",
+                self.expected_messages_count
+            )))
             .stdout(contains(format!(
                 "Partitions count    | {}",
                 self.partitions_count
-            )))
-            .stdout(contains("Partition id"))
-            .stdout(contains("Created"))
-            .stdout(contains("Segments count"))
-            .stdout(contains("Current offset"))
-            .stdout(contains("Size"))
-            .stdout(contains("Messages count"))
-            .stdout(contains("durability"))
-            .stdout(
-                predicates::str::is_match(format!(r"durability\s+{}", self.durability))
-                    .expect("valid durability regex"),
-            );
+            )));
 
-        for partition in &self.expected_partitions {
-            // Check every field in every row against the topic details returned by the server.
-            let row = format!(
-                r"\b{}\s+{}\s+{}\s+{}\s+{}\s+{}\b",
-                partition.id,
-                partition.created_at,
-                partition.segments_count,
-                partition.current_offset,
-                partition.size,
-                partition.messages_count,
-            );
-            assertion = assertion
-                .stdout(predicates::str::is_match(row).expect("valid partition row regex"));
-        }
-        assertion.stdout(contains("Options"));
+        let stdout = std::str::from_utf8(&assertion.get_output().stdout)
+            .expect("CLI output should be UTF-8");
+        let mut partition_rows = nested_table_rows(stdout, "Partitions");
+        assert_eq!(
+            partition_rows.remove(0),
+            [
+                "Partition id",
+                "Created",
+                "Segments count",
+                "Current offset",
+                "Size",
+                "Messages count"
+            ]
+        );
+        let mut expected_partitions = self.expected_partitions.clone();
+        partition_rows.sort();
+        expected_partitions.sort();
+        assert_eq!(partition_rows, expected_partitions);
+
+        let mut option_rows = nested_table_rows(stdout, "Options");
+        assert_eq!(option_rows.remove(0), ["Option", "Value"]);
+        let mut expected_options = self.expected_options.clone();
+        option_rows.sort();
+        expected_options.sort();
+        assert_eq!(option_rows, expected_options);
+        assert!(option_rows.contains(&vec!["durability".to_owned(), self.durability.to_string()]));
+        assert!(option_rows.contains(&vec![
+            "consumer_offset_durability".to_owned(),
+            self.consumer_offset_durability.to_string(),
+        ]));
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
@@ -226,9 +281,7 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            0,
             String::from("main"),
-            0,
             String::from("sync"),
             TestStreamId::Named,
             TestTopicId::Named,
@@ -236,9 +289,7 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            1,
             String::from("customer"),
-            3,
             String::from("probe"),
             TestStreamId::Named,
             TestTopicId::Named,
@@ -246,9 +297,7 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            1,
             String::from("development"),
-            2,
             String::from("testing"),
             TestStreamId::Named,
             TestTopicId::Named,
@@ -256,9 +305,7 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicGetCmd::new(
-            6,
             String::from("other"),
-            1,
             String::from("topic"),
             TestStreamId::Named,
             TestTopicId::Named,
@@ -274,9 +321,7 @@ pub async fn should_show_multiple_partitions_and_persisted_durability() {
     iggy_cmd_test
         .execute_test(
             TestTopicGetCmd::new(
-                7,
                 String::from("durable-stream"),
-                4,
                 String::from("multi-partition-topic"),
                 TestStreamId::Named,
                 TestTopicId::Named,
@@ -284,6 +329,68 @@ pub async fn should_show_multiple_partitions_and_persisted_durability() {
             .with_topic_options(3, Durability::Persisted),
         )
         .await;
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_show_multiple_partitions_using_numeric_identifiers() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(
+            TestTopicGetCmd::new(
+                String::from("numeric-stream"),
+                String::from("numeric-topic"),
+                TestStreamId::Numeric,
+                TestTopicId::Numeric,
+            )
+            .with_topic_options(3, Durability::Replicated),
+        )
+        .await;
+}
+
+struct TestMissingTopicGetCmd;
+
+#[async_trait]
+impl IggyCmdTestCase for TestMissingTopicGetCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        client.create_stream("missing-topic-stream").await.unwrap();
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .args(vec![
+                "topic",
+                "get",
+                "missing-topic-stream",
+                "missing-topic",
+            ])
+            .with_env_credentials()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        command_state
+            .success()
+            .stdout(contains(
+                "Topic with ID: missing-topic in stream missing-topic-stream was not found",
+            ))
+            .stdout(predicates::str::contains("Partitions").not());
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        client
+            .delete_stream(&"missing-topic-stream".try_into().unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn should_report_missing_topic() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test.execute_test(TestMissingTopicGetCmd).await;
 }
 
 #[tokio::test]
@@ -351,4 +458,49 @@ Options:
             ),
         ))
         .await;
+}
+
+fn nested_table_rows(stdout: &str, property: &str) -> Vec<Vec<String>> {
+    let rows = stdout.lines().filter_map(|line| {
+        let (key, value) = line.strip_prefix('|')?.split_once('|')?;
+        Some((key.trim(), value.strip_suffix('|')?.trim()))
+    });
+    rows.skip_while(|(key, _)| *key != property)
+        .enumerate()
+        .take_while(|(index, (key, _))| *index == 0 || key.is_empty())
+        .map(|(_, (_, value))| value)
+        .filter(|value| {
+            !value.is_empty() && !value.chars().all(|c| matches!(c, '-' | '=' | '+' | ' '))
+        })
+        .map(|value| {
+            value
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn nested_rows_preserve_line_boundaries_and_exact_option_keys() {
+    let stdout = "| Partitions | Partition id | Created | Segments count | Current offset | Size | Messages count |\n\
+                  |            | ============ |\n\
+                  |            | 1 | 2026-10-13 12:00:00 | 2 |\n\
+                  |            | 30 | 1.23 KB | 4 |\n\
+                  | Options    | Option | Value |\n\
+                  |            | ============ |\n\
+                  |            | consumer_offset_durability | persisted |\n";
+    let partitions = nested_table_rows(stdout, "Partitions");
+    assert_eq!(partitions.len(), 3);
+    assert_eq!(partitions[1], ["1", "2026-10-13 12:00:00", "2"]);
+    assert_eq!(partitions[2], ["30", "1.23 KB", "4"]);
+    let options = nested_table_rows(stdout, "Options");
+    assert_eq!(
+        options,
+        [
+            vec!["Option", "Value"],
+            vec!["consumer_offset_durability", "persisted"]
+        ]
+    );
+    assert!(!options.contains(&vec!["durability".to_owned(), "persisted".to_owned()]));
 }
