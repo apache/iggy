@@ -203,7 +203,6 @@ struct VSRHeaderVectorTests {
         var session = ConsensusSession(clientID: clientID)
         let unbound = try VSRFrame.encodeRequest(session: &session, code: CommandCode.ping.rawValue, payload: [])
         #expect(header(unbound) == golden.bytes("vsr.request.ping"))
-        _ = session.beginRegister()
         try session.bind(99)
         _ = try session.nextRequestID()
         _ = try session.nextRequestID()
@@ -213,7 +212,6 @@ struct VSRHeaderVectorTests {
 
     @Test func metadataHeaderStampsTheChecksum() throws {
         var session = ConsensusSession(clientID: clientID)
-        _ = session.beginRegister()
         try session.bind(99)
         let payload = golden.bytes("payload.create_stream")
         #expect(payload == (try Requests.createStream(name: "stream")))
@@ -225,7 +223,6 @@ struct VSRHeaderVectorTests {
 
     @Test func partitionHeaderLeavesTheChecksumZero() throws {
         var session = ConsensusSession(clientID: clientID)
-        _ = session.beginRegister()
         try session.bind(99)
         _ = try session.nextRequestID()
         let request = try VSRFrame.encodeRequest(session: &session, code: CommandCode.sendMessages.rawValue, payload: [9, 9, 9, 9])
@@ -233,9 +230,23 @@ struct VSRHeaderVectorTests {
         #expect(request.requestID == 2)
     }
 
+    /// The server fences a send on the context captured with the partition,
+    /// which rides the header rather than the payload.
+    @Test func partitionHeaderCarriesTheCapturedContext() throws {
+        var session = ConsensusSession(clientID: clientID)
+        try session.bind(99)
+        _ = try session.nextRequestID()
+        var reader = ByteReader(golden.bytes("partition.context"))
+        let context = try PartitionContext.decode(from: &reader)
+        let request = try VSRFrame.encodeRequest(
+            session: &session, code: CommandCode.sendMessages.rawValue, payload: [9, 9, 9, 9], partitionContext: context)
+        #expect(header(request) == golden.bytes("vsr.request.send_messages.fenced"))
+        #expect(Array(request.bytes[VSRFrame.headerSize...]) == [9, 9, 9, 9])
+        #expect(request.bytes.count == VSRFrame.headerSize + 4)
+    }
+
     @Test func logoutAndUnknownCodes() throws {
         var session = ConsensusSession(clientID: clientID)
-        _ = session.beginRegister()
         try session.bind(99)
         for _ in 0..<3 {
             _ = try session.nextRequestID()

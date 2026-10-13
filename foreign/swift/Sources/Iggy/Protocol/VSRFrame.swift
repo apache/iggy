@@ -38,6 +38,9 @@ enum VSRFrame {
         static let operation = 176
         static let session = 184
         static let reserved = 196
+        static let partitionIncarnation = 200
+        static let ownerGeneration = 208
+        static let minimumMetadataOp = 216
     }
 
     /// Reply header field offsets the client reads.
@@ -97,7 +100,13 @@ enum VSRFrame {
     /// table deduplicates, like the Rust SDK does; partition and
     /// non-replicated operations leave it zero, which the server reads as
     /// unstamped.
-    static func encodeRequest(session: inout ConsensusSession, code: UInt32, payload: [UInt8]) throws -> EncodedRequest {
+    ///
+    /// `partitionContext` is the context captured with the partition the
+    /// request targets. The server fences a send or an offset change on it, so
+    /// a request for a partition past its first incarnation must carry it.
+    static func encodeRequest(
+        session: inout ConsensusSession, code: UInt32, payload: [UInt8], partitionContext: PartitionContext = .empty
+    ) throws -> EncodedRequest {
         let totalSize = headerSize + payload.count
         guard totalSize <= UInt32.max else {
             throw IggyError(.invalidConfiguration, context: "request of \(totalSize) bytes exceeds the frame size limit")
@@ -107,7 +116,7 @@ enum VSRFrame {
         let sessionID: UInt64
         switch operation {
         case .register:
-            requestID = session.beginRegister()
+            requestID = ConsensusSession.registerRequestID
             sessionID = 0
         case .nonReplicated:
             requestID = session.currentRequestID
@@ -122,7 +131,9 @@ enum VSRFrame {
         let requestChecksum: UInt64 =
             (operation.isPartition || operation == .nonReplicated) ? 0 : XXH3.hash64(payload)
 
-        var frame = [UInt8](repeating: 0, count: totalSize)
+        var frame = [UInt8]()
+        frame.reserveCapacity(totalSize)
+        frame.append(contentsOf: repeatElement(0, count: headerSize))
         frame.withUnsafeMutableBytes { buffer in
             buffer.storeBytes(of: UInt32(totalSize).littleEndian, toByteOffset: RequestOffset.size, as: UInt32.self)
             buffer[RequestOffset.command] = Command.request.rawValue
@@ -135,10 +146,11 @@ enum VSRFrame {
             if operation == .nonReplicated {
                 buffer.storeBytes(of: code.littleEndian, toByteOffset: RequestOffset.reserved, as: UInt32.self)
             }
+            buffer.storeBytes(of: partitionContext.incarnation.littleEndian, toByteOffset: RequestOffset.partitionIncarnation, as: UInt64.self)
+            buffer.storeBytes(of: partitionContext.ownerGeneration.littleEndian, toByteOffset: RequestOffset.ownerGeneration, as: UInt64.self)
+            buffer.storeBytes(of: partitionContext.metadataOp.littleEndian, toByteOffset: RequestOffset.minimumMetadataOp, as: UInt64.self)
         }
-        if !payload.isEmpty {
-            frame.replaceSubrange(headerSize..., with: payload)
-        }
+        frame.append(contentsOf: payload)
         return EncodedRequest(bytes: frame, requestID: requestID, operation: operation)
     }
 

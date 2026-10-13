@@ -212,11 +212,11 @@ enum Batch {
                 // Each length is checked against what is left before it is
                 // added, so a hostile frame cannot overflow a 32-bit `Int`.
                 guard frame.payloadLength <= UInt32(clamping: batchEnd - payloadStart) else {
-                    throw WireError.truncated(offset: payloadStart - bytes.startIndex, need: Int(frame.payloadLength), have: batchEnd - payloadStart)
+                    throw WireError.truncated(offset: payloadStart - bytes.startIndex, need: Int(clamping: frame.payloadLength), have: batchEnd - payloadStart)
                 }
                 let payloadEnd = payloadStart + Int(frame.payloadLength)
                 guard frame.userHeadersLength <= UInt32(clamping: batchEnd - payloadEnd) else {
-                    throw WireError.truncated(offset: payloadEnd - bytes.startIndex, need: Int(frame.userHeadersLength), have: batchEnd - payloadEnd)
+                    throw WireError.truncated(offset: payloadEnd - bytes.startIndex, need: Int(clamping: frame.userHeadersLength), have: batchEnd - payloadEnd)
                 }
                 let headersEnd = payloadEnd + Int(frame.userHeadersLength)
                 if verifyChecksums {
@@ -253,6 +253,11 @@ enum Batch {
                 }
             }
             position = batchEnd
+        }
+        // The reply prefix states how many messages follow, so a body that
+        // holds fewer or more batches than it declares is malformed.
+        guard UInt64(messages.count) == UInt64(expectedCount) else {
+            throw WireError.validation("reply declares \(expectedCount) messages but its batches hold \(messages.count)")
         }
         return messages
     }

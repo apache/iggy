@@ -31,7 +31,7 @@ struct ConsensusSessionTests {
 
     @Test func requestIDsAreMonotonicAfterBinding() throws {
         var session = ConsensusSession(clientID: 1)
-        #expect(session.beginRegister() == 0)
+        #expect(ConsensusSession.registerRequestID == 0)
         try session.bind(10)
         #expect(try session.nextRequestID() == 1)
         #expect(try session.nextRequestID() == 2)
@@ -43,50 +43,67 @@ struct ConsensusSessionTests {
         #expect(throws: IggyError(.unauthenticated, context: "request id taken before the session is bound")) {
             try session.nextRequestID()
         }
+        #expect(session.currentRequestID == 1)
     }
 
-    @Test func doubleBindAndZeroSessionFail() throws {
+    @Test func conflictingRegistrationCannotReplaceALiveSession() throws {
         var session = ConsensusSession(clientID: 1)
+        #expect(throws: IggyError.self) { try session.bind(0) }
+        #expect(!session.isBound)
         try session.bind(10)
-        #expect(throws: IggyError(.alreadyAuthenticated)) {
+        #expect(throws: IggyError(.sessionMismatch, context: "session is bound to 10, the server returned 20")) {
             try session.bind(20)
         }
-        var other = ConsensusSession(clientID: 1)
-        #expect(throws: IggyError.self) {
-            try other.bind(0)
-        }
+        #expect(session.session == 10)
     }
 
-    @Test func reRegisterMintsAFreshIdentity() throws {
-        var session = ConsensusSession(clientID: 7)
-        _ = session.beginRegister()
-        #expect(session.clientID == 7)
-        try session.bind(42)
-        #expect(session.beginRegister() == 0)
-        #expect(!session.isBound)
-        #expect(session.clientID != 7)
-    }
-
-    @Test func bindSecretIsRandomPerSession() throws {
+    /// A login whose reply was lost is sent again. The retry must reach the
+    /// server under the identity and secret the first attempt registered.
+    @Test func registrationRetryPreservesIdentityAndSecret() throws {
         var session = ConsensusSession(clientID: 7)
         let secret = session.bindSecret
-        #expect(secret.count == Requests.bindSecretSize)
-        #expect(secret != ConsensusSession(clientID: 7).bindSecret)
-        #expect(secret != [UInt8](repeating: 0, count: Requests.bindSecretSize))
-        _ = session.beginRegister()
-        try session.bind(42)
+        let payload = try Requests.loginRegister(username: "iggy", password: "iggy", bindSecret: secret)
+        let first = try VSRFrame.encodeRequest(session: &session, code: CommandCode.loginRegister.rawValue, payload: payload)
+        let retry = try VSRFrame.encodeRequest(session: &session, code: CommandCode.loginRegister.rawValue, payload: payload)
+        #expect(retry.bytes == first.bytes)
+        #expect(session.clientID == 7)
         #expect(session.bindSecret == secret)
-        _ = session.beginRegister()
-        #expect(session.bindSecret != secret)
+        #expect(!session.isBound)
     }
 
-    @Test func resetDropsEverything() throws {
+    /// A reconnect replays the Register on a bound session and binds to the
+    /// fence the server returns again, without losing the request watermark.
+    @Test func reconnectPreservesBindingAndRequestCounter() throws {
         var session = ConsensusSession(clientID: 7)
-        _ = session.beginRegister()
+        let secret = session.bindSecret
         try session.bind(42)
+        #expect(try session.nextRequestID() == 1)
+        let replay = try VSRFrame.encodeRequest(session: &session, code: CommandCode.loginRegister.rawValue, payload: [])
+        #expect(replay.requestID == 0)
+        #expect(UInt64(littleEndianBytes: replay.bytes[VSRFrame.RequestOffset.session..<VSRFrame.RequestOffset.session + 8]) == 0)
+        try session.bind(42)
+        #expect(session.clientID == 7)
+        #expect(session.bindSecret == secret)
+        #expect(session.session == 42)
+        #expect(try session.nextRequestID() == 2)
+    }
+
+    @Test func bindSecretIsRandomPerSession() {
+        let session = ConsensusSession(clientID: 7)
+        #expect(session.bindSecret.count == Requests.bindSecretSize)
+        #expect(session.bindSecret != ConsensusSession(clientID: 7).bindSecret)
+        #expect(session.bindSecret != [UInt8](repeating: 0, count: Requests.bindSecretSize))
+    }
+
+    @Test func resetStartsANewLogicalSession() throws {
+        var session = ConsensusSession(clientID: 7)
+        let secret = session.bindSecret
+        try session.bind(42)
+        _ = try session.nextRequestID()
         session.reset()
         #expect(!session.isBound)
         #expect(session.clientID != 7)
+        #expect(session.bindSecret != secret)
         #expect(session.currentRequestID == 1)
     }
 }

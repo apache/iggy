@@ -894,6 +894,17 @@ fn main() {
             &[9, 9, 9, 9],
         ))),
     );
+    let mut fenced_send = request_header(SEND_MESSAGES_CODE, client_id, 2, 99, &[9, 9, 9, 9]);
+    PartitionContext {
+        incarnation: 17,
+        owner_generation: 9,
+        metadata_op: 52,
+    }
+    .stamp(&mut fenced_send);
+    vectors.insert(
+        "vsr.request.send_messages.fenced".to_owned(),
+        hex(bytemuck::bytes_of(&fenced_send)),
+    );
     vectors.insert(
         "vsr.request.logout".to_owned(),
         hex(bytemuck::bytes_of(&request_header(

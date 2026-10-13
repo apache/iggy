@@ -153,10 +153,4 @@ enum OptionsBlock {
         options.merge(try decode(explicit, explicit: true)) { _, explicitValue in explicitValue }
         return options
     }
-
-    /// Reads a `u32`-length-prefixed block; every caller decodes it next,
-    /// which validates it.
-    static func readPrefixed(from reader: inout ByteReader) throws -> ArraySlice<UInt8> {
-        try reader.readPrefixedBytes()
-    }
 }

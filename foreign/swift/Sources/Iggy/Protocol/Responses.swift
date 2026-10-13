@@ -43,7 +43,7 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let name = try reader.readName()
-        let options = try OptionsBlock.decode(try OptionsBlock.readPrefixed(from: &reader), explicit: true)
+        let options = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
         return StreamInfo(
             id: id, createdAt: IggyTimestamp(microseconds: createdAt), name: name, sizeBytes: sizeBytes, messagesCount: messagesCount, topicsCount: topicsCount,
             options: options)
@@ -84,8 +84,8 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let name = try reader.readName()
-        let explicit = try OptionsBlock.readPrefixed(from: &reader)
-        let derived = try OptionsBlock.readPrefixed(from: &reader)
+        let explicit = try reader.readPrefixedBytes()
+        let derived = try reader.readPrefixedBytes()
         guard let compressionAlgorithm = CompressionAlgorithm(rawValue: compression) else {
             throw IggyError(.invalidCommand, context: "unknown compression algorithm \(compression)")
         }
@@ -248,7 +248,7 @@ enum Responses {
         let createdAt = try reader.readUInt64()
         let statusCode = try reader.readUInt8()
         let username = try reader.readName()
-        let options = try OptionsBlock.decode(try OptionsBlock.readPrefixed(from: &reader), explicit: true)
+        let options = try OptionsBlock.decode(try reader.readPrefixedBytes(), explicit: true)
         guard let status = UserStatus(rawValue: statusCode) else {
             throw IggyError(.invalidUserStatus, context: "unknown user status \(statusCode)")
         }

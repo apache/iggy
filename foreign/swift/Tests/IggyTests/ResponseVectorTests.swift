@@ -285,6 +285,29 @@ struct ResponseVectorTests {
         // The frames must tile `message_count` on the layout-only path too.
         #expect(throws: IggyError.self) { try Responses.polledMessages(wrongCount[...]) }
         #expect(throws: IggyError.self) { try Responses.polledMessages(wrongCount[...], verifyChecksums: true) }
+
+        // `user_headers_length` is at +32 and `payload_length` at +36 inside
+        // the first frame. Neither may trap while the error is built.
+        let frameStart = batchStart + Batch.headerSize
+        for lengthOffset in [32, 36] {
+            var hostileFrame = golden.bytes("response.poll_messages")
+            hostileFrame.replaceSubrange(frameStart + lengthOffset..<frameStart + lengthOffset + 4, with: UInt32.max.littleEndianBytes)
+            #expect(throws: IggyError.self) { try Responses.polledMessages(hostileFrame[...]) }
+        }
+    }
+
+    /// The count in the reply prefix, at +12, must match what the batches hold.
+    @Test func polledMessagesRejectACountTheBatchesDoNotHold() throws {
+        var noBatches = golden.bytes("response.poll_messages.empty")
+        noBatches.replaceSubrange(12..<16, with: UInt32(1).littleEndianBytes)
+        #expect(throws: IggyError.self) { try Responses.polledMessages(noBatches[...]) }
+
+        for declared: UInt32 in [0, 2, 4, .max] {
+            var mismatched = golden.bytes("response.poll_messages")
+            mismatched.replaceSubrange(12..<16, with: declared.littleEndianBytes)
+            #expect(throws: IggyError.self) { try Responses.polledMessages(mismatched[...]) }
+            #expect(throws: IggyError.self) { try Responses.polledMessages(mismatched[...], verifyChecksums: true) }
+        }
     }
 
     @Test func sendBatchRoundTripsThroughThePollDecoder() throws {

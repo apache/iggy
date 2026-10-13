@@ -17,21 +17,28 @@
 
 /// Consensus-level session state, a port of `core/sdk/src/session.rs`.
 ///
-/// Each client generates an ephemeral random client identifier. After login
-/// the server registers the client through consensus and returns a session
-/// number, the fence every later request echoes. Replicated requests carry a
-/// monotonically increasing request id the server deduplicates on.
+/// Each logical login owns one session: an ephemeral random client
+/// identifier and a bind secret. After login the server registers the client
+/// through consensus and returns a session number, the fence every later
+/// request echoes. Replicated requests carry a monotonically increasing
+/// request id the server deduplicates on.
+///
+/// The identity, the secret, and the request counter outlive a transport
+/// reconnect, so a registration retry recovers the session the server already
+/// committed. Only an explicit logout starts a new one, through ``reset()``.
 ///
 /// Not thread-safe: the connection owns one and serializes access through
 /// the lockstep exchange.
 struct ConsensusSession: Sendable {
-    private(set) var clientID: UInt128Value
+    /// Register carries request id 0. Application requests start at 1.
+    static let registerRequestID: UInt64 = 0
+
+    let clientID: UInt128Value
     private(set) var session: UInt64?
     /// Bearer proof that binds connections to this logical session, sent with
     /// every login. Generated per session and never logged.
     let bindSecret: [UInt8]
     private var requestCounter: UInt64
-    private var registerConsumed: Bool
 
     init(clientID: UInt128Value = .random()) {
         var generator = SystemRandomNumberGenerator()
@@ -39,29 +46,19 @@ struct ConsensusSession: Sendable {
         self.bindSecret = (0..<Requests.bindSecretSize).map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) }
         self.session = nil
         self.requestCounter = 1
-        self.registerConsumed = false
     }
 
     var isBound: Bool { session != nil }
 
-    /// Arms the session for a Register and returns its request id, always 0.
-    /// A session that already registered or bound is replaced wholesale with a
-    /// fresh client identifier, so a re-login encodes a clean Register.
-    mutating func beginRegister() -> UInt64 {
-        if registerConsumed || isBound {
-            self = ConsensusSession()
-        }
-        registerConsumed = true
-        return 0
-    }
-
     /// Records the session fence the server assigned when Register committed.
+    /// A registration replayed after a reconnect returns the same fence and is
+    /// accepted; a different one cannot replace a live session.
     mutating func bind(_ session: UInt64) throws {
-        if isBound {
-            throw IggyError(.alreadyAuthenticated)
-        }
         if session == 0 {
             throw IggyError(.invalidSession, context: "session must be greater than zero")
+        }
+        if let bound = self.session, bound != session {
+            throw IggyError(.sessionMismatch, context: "session is bound to \(bound), the server returned \(session)")
         }
         self.session = session
     }
@@ -72,7 +69,7 @@ struct ConsensusSession: Sendable {
             throw IggyError(.unauthenticated, context: "request id taken before the session is bound")
         }
         if requestCounter == UInt64.max {
-            throw IggyError(.invalidConfiguration, context: "request counter exhausted")
+            throw IggyError(.requestIdExhausted)
         }
         let id = requestCounter
         requestCounter += 1
@@ -83,9 +80,9 @@ struct ConsensusSession: Sendable {
     /// because the server never consults the client table for them.
     var currentRequestID: UInt64 { requestCounter }
 
-    /// Drops the session and mints a fresh client identifier. A disconnect
-    /// invalidates the server-side fence, so the next Register must arrive
-    /// under a new identity.
+    /// Ends the logical session and starts a new one under a fresh client
+    /// identifier and bind secret. An explicit logout retires the server-side
+    /// session, so the next Register must not be mistaken for a retry of it.
     mutating func reset() {
         self = ConsensusSession()
     }
