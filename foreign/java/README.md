@@ -120,6 +120,25 @@ client.connect();
 client.users().login("iggy", "iggy");
 ```
 
+### Connection String
+
+`fromConnectionString` builds a blocking TCP client from an `iggy://` connection string:
+
+```java
+var client = Iggy.tcpClientBuilder()
+    .fromConnectionString("iggy://iggy:iggy@localhost:8090")
+    .buildAndLogin();
+
+// With TLS
+var secureClient = Iggy.tcpClientBuilder()
+    .fromConnectionString("iggy+tcp://admin:secret@iggy-server.example.com:8090?tls=true")
+    .buildAndLogin();
+```
+
+The Java SDK accepts `iggy://` and `iggy+tcp://` with `<username>:<password>` credentials and the `tls` option.
+Unlike the Rust, Node and C# SDKs, it does not yet accept a personal access token in place of the credentials,
+or options such as `tls_domain` and `reconnection_retries`. These are rejected with an `IggyInvalidArgumentException`.
+
 ### TCP Client (Async)
 
 ```java
