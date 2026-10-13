@@ -21,7 +21,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{HeaderKey, HeaderValue, IggyTimestamp, calculate_256};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
-    convert::owned_value_to_serde_json,
+    convert::owned_value_into_serde_json,
     retry::{is_transient_status, parse_duration, parse_retry_after, retry_backoff},
     sink_connector,
 };
@@ -515,7 +515,7 @@ impl OpenSearchSink {
             std::mem::replace(&mut message.payload, Payload::Raw(Vec::new())).into_json_document();
 
         let mut document = match payload {
-            Payload::Json(value) => document_from_json(owned_value_to_serde_json(&value)),
+            Payload::Json(value) => document_from_json(owned_value_into_serde_json(value)),
             Payload::Raw(bytes) => document_from_raw(bytes),
             Payload::Text(text) | Payload::Proto(text) => Map::from_iter([
                 ("text".to_string(), Value::String(text)),
