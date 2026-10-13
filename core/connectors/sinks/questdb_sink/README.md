@@ -222,15 +222,19 @@ Use one source per table.
 
 ## Delivery semantics
 
-Rows in a flush that QuestDB accepted are delivered at least once. A reconnect,
-a failover or a store-and-forward replay can send them again, with or without
-`sf_dir`. Rows the sink does not write, such as a rejected record or a failed
+Rows in a flush that QuestDB accepted are delivered at least once. The exception
+is `ack_level = "ok"` on a cluster: a primary that fails before it ships its
+write-ahead log can lose rows it accepted. See
+[Choosing an ack level](#choosing-an-ack-level). A reconnect,
+a failover or a replay of queued frames can send them again. The client queues
+unacknowledged frames in memory, or on disk when `sf_dir` is set. Rows the sink does not write, such as a rejected record or a failed
 chunk, are lost, as the rest of this section describes. Declare
 [`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
 
 Without `sf_dir`, the queue of unacknowledged frames is kept only in memory. A
-crash, or a shutdown that outlasts `close_flush_timeout`, loses it even though
+crash, or a shutdown that outlasts the connect string's `close_flush_timeout`,
+loses it even though
 `consume()` already reported success.
 
 A batch fails when:
