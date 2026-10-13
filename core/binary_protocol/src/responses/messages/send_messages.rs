@@ -28,7 +28,7 @@ use std::borrow::Cow;
 /// against the old stride would take its second entry from the middle of the
 /// first and return the garbage as a successful decode. Extra data needs a new
 /// response type or a protocol-version gate. The entry count may grow freely.
-const CONFIRMATION_SIZE: usize = 20;
+pub const CONFIRMATION_SIZE: usize = 20;
 
 /// Commit confirmation for one partition written by a `SendMessages` request.
 ///
@@ -37,10 +37,9 @@ const CONFIRMATION_SIZE: usize = 20;
 /// [stream_id:4][topic_id:4][partition_id:4][base_offset:8]
 /// ```
 ///
-/// `base_offset` is the offset assigned to the first message of the batch in
-/// that partition. It does not imply uniqueness: retries outside the server's
-/// deduplication coverage may append the batch again. Crash durability depends
-/// on the topic's durability policy, not on the presence of offset information.
+/// `base_offset` identifies the first message in this partition. Retrying the
+/// unresolved request under the same live session returns the original receipt.
+/// Replicated topics accept these writes; Persisted adds crash-safe receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessagesConfirmationResponse {
     pub stream_id: u32,
@@ -87,9 +86,8 @@ impl WireDecode for SendMessagesConfirmationResponse {
 /// [confirmations_count:4][SendMessagesConfirmationResponse]*
 /// ```
 ///
-/// `confirmations_count == 0` supplies no offset information. Callers must also
-/// handle an empty successful reply body, which the server uses for a request
-/// classified as a duplicate. Neither response identifies an append position.
+/// `confirmations_count == 0` supplies no offset information. An explicit
+/// session's successful send retains the original confirmation on retries.
 ///
 /// The server currently reports a single partition per request; the list
 /// decodes any count, so a later multi-partition send needs no wire change.

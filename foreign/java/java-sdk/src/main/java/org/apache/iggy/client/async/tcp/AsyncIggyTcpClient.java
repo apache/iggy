@@ -177,6 +177,7 @@ public class AsyncIggyTcpClient {
     };
     private final AtomicReference<AsyncTcpConnection> connection = new AtomicReference<>();
     private final PollRouter pollRouter = new PollRouter(connection::get, this::openPollConnection);
+    private final PartitionContexts sendContexts = PartitionContexts.forSends(connection::get);
     private final AtomicReference<CompletableFuture<Void>> loginChain =
             new AtomicReference<>(CompletableFuture.completedFuture(null));
     private volatile ConnectionInfo connectionInfo;
@@ -209,6 +210,7 @@ public class AsyncIggyTcpClient {
     private SystemClient systemClient;
     private PersonalAccessTokensClient personalAccessTokensClient;
     private PartitionsClient partitionsClient;
+    private RawPartitionRequests rawRequests;
 
     /**
      * Creates a new async TCP client with default settings.
@@ -303,16 +305,21 @@ public class AsyncIggyTcpClient {
         Supplier<AsyncTcpConnection> currentConnection = connection::get;
         return newConnection.connect().thenRun(() -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
-            messagesClient =
-                    new MessagesTcpClient(currentConnection, routingState, pollRouter, this::isClusteredForPoll);
+            var messages = new MessagesTcpClient(
+                    currentConnection, routingState, pollRouter, this::isClusteredForPoll, sendContexts);
+            var offsets = new ConsumerOffsetsTcpClient(currentConnection, pollRouter, this::isClusteredForPoll);
+            messagesClient = messages;
             consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
-            consumerOffsetsClient = new ConsumerOffsetsTcpClient(currentConnection);
-            streamsClient = new StreamsTcpClient(currentConnection);
-            topicsClient = new TopicsTcpClient(currentConnection);
+            consumerOffsetsClient = offsets;
+            rawRequests = new RawPartitionRequests(currentConnection, sendContexts, messages, offsets);
+            // One partition can be cached under its name and under its id, so
+            // this client's own topology changes drop every send context.
+            streamsClient = new StreamsTcpClient(currentConnection, sendContexts::clear);
+            topicsClient = new TopicsTcpClient(currentConnection, sendContexts::clear);
             usersClient = new UsersTcpClient(currentConnection, loginRoutingHook);
             systemClient = new SystemTcpClient(currentConnection);
             personalAccessTokensClient = new PersonalAccessTokensTcpClient(currentConnection, loginRoutingHook);
-            partitionsClient = new PartitionsTcpClient(currentConnection);
+            partitionsClient = new PartitionsTcpClient(currentConnection, sendContexts::clear);
         });
     }
 
@@ -344,6 +351,22 @@ public class AsyncIggyTcpClient {
      *
      * <p>Session-control codes complete the returned future with an invalid-command error.
      *
+     * <p>SendMessages, PollMessages, StoreConsumerOffset and DeleteConsumerOffset
+     * carry the partition context the server fences them by, which the client
+     * captures before it sends them. A SendMessages payload must name an explicit
+     * partition id: balanced and messages-key partitioning complete the future
+     * with a feature-unavailable error, because only the typed
+     * {@link MessagesClient#sendMessages} resolves them to a partition. A payload
+     * of these commands that does not follow their binary layout completes the
+     * future with an {@link org.apache.iggy.exception.IggyInvalidArgumentException}.
+     * Neither failure sends anything.
+     *
+     * <p>PollMessages takes the routed path of a typed poll, and StoreConsumerOffset
+     * and DeleteConsumerOffset that of a typed offset write. Each uses the context
+     * its route reports, so after another client deleted and recreated the
+     * partition, one call can fail with code 87 (5009 for a consumer group). The
+     * failed route is dropped and the next call routes again.
+     *
      * @param code the command code
      * @param payload the command payload
      * @return a future containing the raw response payload
@@ -355,12 +378,12 @@ public class AsyncIggyTcpClient {
             return CompletableFuture.failedFuture(
                     IggyServerException.fromTcpResponse(INVALID_COMMAND_ERROR_CODE, new byte[0]));
         }
-        AsyncTcpConnection currentConnection = connection.get();
-        if (currentConnection == null) {
+        RawPartitionRequests raw = rawRequests;
+        if (connection.get() == null || raw == null) {
             throw new IggyNotConnectedException();
         }
 
-        return currentConnection.send(code, Unpooled.copiedBuffer(payload)).thenApply(response -> {
+        return raw.send(code, payload).thenApply(response -> {
             try {
                 if (response.readableBytes() <= 1) {
                     return new byte[0];

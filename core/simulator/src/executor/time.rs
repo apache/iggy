@@ -254,7 +254,7 @@ mod tests {
         // Partial advance: nothing is due yet, and the first poll landing
         // after time already moved must not re-anchor the deadline to poll
         // time (a poll-anchored deadline would sit at 16ms).
-        assert!(handle.advance(Duration::from_millis(6)).is_empty());
+        assert_eq!(handle.advance(Duration::from_millis(6)), [] as [u64; 0]);
         assert_eq!(poll_once(&mut sleep), Poll::Pending);
 
         // Crossing the creation-anchored 10ms deadline fires exactly once.
@@ -277,6 +277,6 @@ mod tests {
         let handle = TimerHandle::new();
         let sleep = handle.sleep(Duration::from_millis(5));
         drop(sleep);
-        assert!(handle.advance(Duration::from_millis(10)).is_empty());
+        assert_eq!(handle.advance(Duration::from_millis(10)), [] as [u64; 0]);
     }
 }

@@ -51,6 +51,13 @@ describe('e2e -> system', async () => {
     );
   });
 
+  it('e2e -> system::snapshot', async () => {
+    const data = await c.system.snapshot();
+    assert.ok(data.length > 0);
+    assert.equal(data[0], 0x50);
+    assert.equal(data[1], 0x4B);
+  });
+
   it('e2e -> system::logout', async () => {
     assert.ok(await c.session.logout());
   });

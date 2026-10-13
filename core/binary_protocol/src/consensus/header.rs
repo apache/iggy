@@ -289,28 +289,26 @@ pub struct RequestHeader {
     pub reserved_frame: [u8; 66],
 
     pub client: u128,
-    /// Integrity stamp over the request payload, used by the client table to
-    /// catch a `request` number reused for a different operation: a retry that
-    /// disagrees with the stamp of the cached reply is refused rather than
-    /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison. The Rust SDK stamps metadata/session ops and `DeleteSegments`;
-    /// partition and non-replicated ops leave it zero. The server
-    /// verifies any nonzero stamp before routing.
+    /// Optional XXH3 integrity stamp over the client's request payload. Zero
+    /// means unstamped; the server verifies a nonzero stamp before routing or
+    /// rewriting the body. The Rust SDK stamps metadata/session operations
+    /// and `DeleteSegments`; partition and non-replicated operations leave it
+    /// zero. Retry identity uses the client, session, request, group and
+    /// operation, so matching retries replay the first receipt without
+    /// comparing stamps.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
     pub operation: Operation,
     pub operation_padding: [u8; 7],
-    /// Session fence epoch: the commit op of the latest committed `Register`
-    /// for this `client`. Handed to the client by that register's reply and
-    /// echoed on every subsequent request.
+    /// Session fence epoch: the commit op of the `Register` that created this
+    /// client's logical session, returned by its reply and echoed on subsequent
+    /// requests.
     ///
-    /// Every bind commits a `Register`, so each rebind of the same `client`
-    /// carries a strictly higher value, and a request stamped with an older one
-    /// is a zombie from before that rebind and gets fenced. Being a log
-    /// position rather than a counter is what makes it non-regressing: it
-    /// cannot restart low after the server drops an entry and the client
-    /// registers again.
+    /// `BindSession` and matching registration retries preserve this epoch.
+    /// A new registration after retirement establishes a new epoch, fencing
+    /// requests from the old session. Using the log position keeps the epoch
+    /// monotonic when a registry slot is reused.
     ///
     /// Header validation requires zero on `Register` itself. `NonReplicated`
     /// operations also permit zero before a client has registered.
@@ -320,7 +318,14 @@ pub struct RequestHeader {
     /// On `Register` it carries the freshly authenticated user.
     /// The submitter's wire value is never trusted.
     pub user_id: u32,
-    pub reserved: [u8; 60],
+    /// Little-endian command code in `reserved[0..4]` for `NonReplicated`.
+    pub reserved: [u8; 4],
+    /// Captured with the request and retained across retries and route refreshes.
+    pub partition_incarnation: u64,
+    pub owner_generation: u64,
+    /// Minimum committed metadata operation needed to interpret this request.
+    pub minimum_metadata_op: u64,
+    pub reserved_tail: [u8; 32],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -331,7 +336,10 @@ const _: () = {
     assert!(
         offset_of!(RequestHeader, user_id) == offset_of!(RequestHeader, session) + size_of::<u64>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 60]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestHeader, partition_incarnation) == 200);
+    assert!(offset_of!(RequestHeader, owner_generation) == 208);
+    assert!(offset_of!(RequestHeader, minimum_metadata_op) == 216);
+    assert!(offset_of!(RequestHeader, reserved_tail) + size_of::<[u8; 32]>() == HEADER_SIZE);
 };
 
 /// A [`RequestHeader`] AFTER the receiving node resolved its target.
@@ -343,9 +351,8 @@ const _: () = {
 /// (it is derived: plane from `operation`, partition group from the body),
 /// so this is where the derivation result lives for the internal hop.
 ///
-/// Layout: identical to [`RequestHeader`] with `group` claiming the LAST
-/// eight reserved bytes (the tail, bytes 248..256); the leading 52 reserved
-/// bytes keep their client-wire meaning, so promotion is a same-size copy.
+/// Layout: identical to [`RequestHeader`] with server routing fields claiming
+/// bytes 240..256; captured incarnation and ownership retain their client-wire offsets.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RoutedRequestHeader {
@@ -367,10 +374,16 @@ pub struct RoutedRequestHeader {
     pub operation_padding: [u8; 7],
     pub session: u64,
     pub user_id: u32,
-    /// Same offset and meaning as the leading 52 bytes of
-    /// `RequestHeader::reserved` -- this region CARRIES DATA (the
-    /// non-replicated op code range), so `group` must not displace it.
-    pub reserved: [u8; 52],
+    /// Little-endian command code in `reserved[0..4]` for `NonReplicated`.
+    pub reserved: [u8; 4],
+    /// Captured with the request and retained across retries and route refreshes.
+    pub partition_incarnation: u64,
+    pub owner_generation: u64,
+    /// Minimum committed metadata operation needed to interpret this request.
+    pub minimum_metadata_op: u64,
+    pub reserved_tail: [u8; 16],
+    /// Server-observed metadata frontier at partition admission.
+    pub metadata_watermark: u64,
     /// The resolved consensus group id (see `binary_protocol::namespace`),
     /// claiming the TAIL of the client header's reserved area.
     pub group: u64,
@@ -384,6 +397,18 @@ const _: () = {
     assert!(offset_of!(RoutedRequestHeader, session) == offset_of!(RequestHeader, session));
     assert!(offset_of!(RoutedRequestHeader, user_id) == offset_of!(RequestHeader, user_id));
     assert!(offset_of!(RoutedRequestHeader, reserved) == offset_of!(RequestHeader, reserved));
+    assert!(
+        offset_of!(RoutedRequestHeader, partition_incarnation)
+            == offset_of!(RequestHeader, partition_incarnation)
+    );
+    assert!(
+        offset_of!(RoutedRequestHeader, owner_generation)
+            == offset_of!(RequestHeader, owner_generation)
+    );
+    assert!(
+        offset_of!(RoutedRequestHeader, minimum_metadata_op)
+            == offset_of!(RequestHeader, minimum_metadata_op)
+    );
     assert!(offset_of!(RoutedRequestHeader, group) + size_of::<u64>() == HEADER_SIZE);
 };
 
@@ -407,7 +432,12 @@ impl Default for RoutedRequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 52],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            owner_generation: 0,
+            minimum_metadata_op: 0,
+            reserved_tail: [0; 16],
+            metadata_watermark: 0,
             group: 0,
         }
     }
@@ -433,7 +463,11 @@ impl Default for RequestHeader {
             operation_padding: [0; 7],
             session: 0,
             user_id: 0,
-            reserved: [0; 60],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            owner_generation: 0,
+            minimum_metadata_op: 0,
+            reserved_tail: [0; 32],
         }
     }
 }
@@ -582,8 +616,9 @@ pub struct ReplyHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    /// Echoed from the request this reply answers; the client table stores it
-    /// alongside the cached reply. See `RequestHeader::request_checksum`.
+    /// The original request's integrity stamp, preserved with its receipt.
+    /// A replay retains this value even if a retry supplies a different stamp.
+    /// See [`RequestHeader::request_checksum`].
     pub request_checksum: u128,
     pub context: u128,
     pub client: u128,
@@ -604,7 +639,9 @@ pub struct ReplyHeader {
     /// Carved from `reserved` like `user_id` in `RequestHeader` / `PrepareHeader`;
     /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
-    pub reserved: [u8; 36],
+    pub reserved: [u8; 4],
+    pub partition_incarnation: u64,
+    pub reserved_tail: [u8; 24],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -612,7 +649,13 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>() == HEADER_SIZE);
+    assert!(
+        offset_of!(ReplyHeader, reserved) + size_of::<[u8; 4]>()
+            == offset_of!(ReplyHeader, partition_incarnation)
+    );
+    assert!(offset_of!(ReplyHeader, partition_incarnation) == 224);
+    assert!(offset_of!(ReplyHeader, reserved_tail) == 232);
+    assert!(offset_of!(ReplyHeader, reserved_tail) + size_of::<[u8; 24]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -637,7 +680,9 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             status: 0,
-            reserved: [0; 36],
+            reserved: [0; 4],
+            partition_incarnation: 0,
+            reserved_tail: [0; 24],
         }
     }
 }
@@ -667,14 +712,16 @@ impl ReplyHeader {
             timestamp: prepare_header.timestamp,
             request: prepare_header.request,
             operation: prepare_header.operation,
+            partition_incarnation: prepare_header.partition_incarnation,
             ..Self::default()
         }
     }
 
     /// The base of a reply that answers `request_header` without a prepare
     /// (rejections, denials, non-replicated reads): `cluster`, `view`,
-    /// `release`, `replica`, `request_checksum`, `timestamp`, `request` and
-    /// `operation` echo the request, `command` is `Reply`, `size` is the
+    /// `release`, `replica`, `request_checksum`, `timestamp`, `request`,
+    /// `operation` and `partition_incarnation` echo the
+    /// request, `command` is `Reply`, `size` is the
     /// caller's frame length, and every other field is zero.
     ///
     /// `client`, `op`, `commit` and `status` stay zero. Callers stamp two
@@ -695,6 +742,7 @@ impl ReplyHeader {
             timestamp: request_header.timestamp,
             request: request_header.request,
             operation: request_header.operation,
+            partition_incarnation: request_header.partition_incarnation,
             ..Self::default()
         }
     }
@@ -1009,7 +1057,13 @@ pub struct PrepareHeader {
     /// Acting user id, copied verbatim from the admitted `RequestHeader`; see
     /// that field for the stamping contract.
     pub user_id: u32,
-    pub reserved: [u8; 28],
+    /// Immutable capacity nominated by the first committed prepare in this group.
+    pub retry_capacity: u32,
+    pub partition_incarnation: u64,
+    pub reserved: [u8; 8],
+    /// Metadata Register commit identifying the authenticated session.
+    /// Zero is reserved for registration and server-originated operations.
+    pub session: u64,
 }
 const _: () = {
     assert!(size_of::<PrepareHeader>() == HEADER_SIZE);
@@ -1020,7 +1074,11 @@ const _: () = {
     assert!(
         offset_of!(PrepareHeader, user_id) == offset_of!(PrepareHeader, group) + size_of::<u64>()
     );
-    assert!(offset_of!(PrepareHeader, reserved) + size_of::<[u8; 28]>() == HEADER_SIZE);
+    assert!(offset_of!(PrepareHeader, retry_capacity) == 228);
+    assert!(offset_of!(PrepareHeader, partition_incarnation) == 232);
+    assert!(offset_of!(PrepareHeader, reserved) == 240);
+    assert!(offset_of!(PrepareHeader, session) == 248);
+    assert!(offset_of!(PrepareHeader, session) + size_of::<u64>() == HEADER_SIZE);
 };
 
 impl Default for PrepareHeader {
@@ -1046,7 +1104,10 @@ impl Default for PrepareHeader {
             operation_padding: [0; 7],
             group: 0,
             user_id: 0,
-            reserved: [0; 28],
+            retry_capacity: 0,
+            partition_incarnation: 0,
+            reserved: [0; 8],
+            session: 0,
         }
     }
 }
@@ -1102,8 +1163,8 @@ impl ConsensusHeader for PrepareHeader {
 
 /// `checksum` of a prepare no producer sealed.
 ///
-/// Written by a build predating the identity seal. Verification skips such
-/// entries so an older build's WAL still replays.
+/// Used by in-process producers that do not seal frames. A zero checksum does
+/// not grant storage-format compatibility; boot validates that separately.
 pub const CHECKSUM_UNSEALED: u128 = 0;
 
 /// The frame's body, bounded by `size`. What `checksum_body` covers.
@@ -2076,12 +2137,9 @@ pub struct StateTransferTargetHeader {
     /// Set on an `available == 0` refusal that means "not right now" rather than
     /// "this node is broken".
     ///
-    /// PARTITION arm only: it is the only side with a consecutive-failure count
-    /// to charge. The requester then re-arms on a flat interval instead of
-    /// charging that count, whose exponential backoff climbs to 1024x the retry
-    /// interval and is reset only by a completed install. A serving primary
-    /// momentarily behind its own frontier is the common case under produce
-    /// load.
+    /// Partition receivers re-arm without charging exponential failure backoff.
+    /// Metadata receivers awaiting a descriptor retain their session and retry
+    /// on the normal interval while the peer's checkpoint writer is busy.
     ///
     /// This and `commit_max` below claim the HEAD of what used to be the
     /// reserved tail, so every pre-existing field keeps its published offset.
@@ -2095,8 +2153,8 @@ pub struct StateTransferTargetHeader {
     pub reserved_alignment: [u8; 6],
     /// Serving replica's `commit_max` when the descriptor was built.
     ///
-    /// Read by the PARTITION receiver only; the metadata arm branches on
-    /// `available` and falls back to journal repair without a refusal.
+    /// Read by the partition receiver only. Metadata receivers use `available`
+    /// and `unavailable_transient` to select transfer retry or journal repair.
     ///
     /// A partition receiver refuses an offer from a replica that knows LESS
     /// than it does:
@@ -2432,7 +2490,19 @@ impl ConsensusHeader for ForwardRegisterHeader {
                 found: self.command,
             });
         }
-        validate_forward_register_frame(self.size, self.client, self.nonce, &self.reserved)
+        let expected = HEADER_SIZE + crate::requests::users::login_register::BIND_SECRET_BYTES;
+        if self.size as usize != expected {
+            return Err(ConsensusError::InvalidSize {
+                expected: u32::try_from(expected).expect("fixed register frame fits u32"),
+                found: self.size,
+            });
+        }
+        validate_forward_register_frame(
+            u32::try_from(HEADER_SIZE).expect("fixed header fits u32"),
+            self.client,
+            self.nonce,
+            &self.reserved,
+        )
     }
 }
 
@@ -2700,6 +2770,8 @@ pub enum ForwardLogoutOutcome {
     PipelineFull = 2,
     InProgress = 3,
     Canceled = 4,
+    RequestTooOld = 5,
+    OperationMismatch = 6,
 }
 
 impl ConsensusHeader for ForwardLogoutResultHeader {
@@ -3115,10 +3187,8 @@ mod tests {
         );
     }
 
-    // `group` claims the TAIL of the client header's reserved area; the
-    // leading 52 reserved bytes carry data (the non-replicated op code lives
-    // in `reserved[0..4]`), so a reshuffle of the carve must trip here rather
-    // than silently move the code range.
+    // Routing must preserve the client prefix, including the command code
+    // in `reserved[0..4]` and the captured partition context.
     #[test]
     fn routed_request_group_claims_reserved_tail() {
         use std::mem::offset_of;
@@ -3219,7 +3289,10 @@ mod tests {
             operation_padding: [16; 7],
             group: 17,
             user_id: 18,
-            reserved: [19; 28],
+            retry_capacity: 31,
+            partition_incarnation: 19,
+            reserved: [23; 8],
+            session: 37,
         };
         let reply = ReplyHeader::from_prepare(&prepare, 20);
         assert_eq!(reply.cluster, 3);
@@ -3241,7 +3314,9 @@ mod tests {
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
         assert_eq!(reply.status, 0);
-        assert_eq!(reply.reserved, [0; 36]);
+        assert_eq!(reply.reserved, [0; 4]);
+        assert_eq!(reply.reserved_tail, [0; 24]);
+        assert_eq!(reply.partition_incarnation, 19);
     }
 
     #[test]
@@ -3264,7 +3339,12 @@ mod tests {
             operation_padding: [13; 7],
             session: 14,
             user_id: 15,
-            reserved: [16; 52],
+            reserved: [16; 4],
+            partition_incarnation: 19,
+            owner_generation: 29,
+            minimum_metadata_op: 31,
+            reserved_tail: [0; 16],
+            metadata_watermark: 17,
             group: 17,
         };
         let reply = ReplyHeader::echoing(&request, 18);
@@ -3288,7 +3368,9 @@ mod tests {
         assert_eq!(reply.reserved_frame, [0; 66]);
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
-        assert_eq!(reply.reserved, [0; 36]);
+        assert_eq!(reply.reserved, [0; 4]);
+        assert_eq!(reply.reserved_tail, [0; 24]);
+        assert_eq!(reply.partition_incarnation, 19);
     }
 
     // Wire-discriminant pin: any change breaks SDK decoders.
@@ -3379,7 +3461,7 @@ mod tests {
             checksum: 0,
             checksum_body: 0,
             cluster: 7,
-            size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
+            size: u32::try_from(HEADER_SIZE + 32).expect("HEADER_SIZE fits u32"),
             view: 3,
             release: 0,
             command: Command::ForwardRegister,
@@ -3435,7 +3517,15 @@ mod tests {
             let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf)
                 .expect("a forward-register frame is a valid generic header");
             assert_eq!(generic.command, command);
-            assert_eq!(generic.size as usize, HEADER_SIZE);
+            assert_eq!(
+                generic.size as usize,
+                HEADER_SIZE
+                    + if command == Command::ForwardRegister {
+                        32
+                    } else {
+                        0
+                    }
+            );
         }
 
         let buf = {
@@ -3674,7 +3764,7 @@ mod tests {
         bytes.copy_from_slice(bytemuck::bytes_of(&forward_logout_result(
             ForwardLogoutOutcome::Ok,
         )));
-        bytes[OUTCOME_OFFSET] = 5;
+        bytes[OUTCOME_OFFSET] = u8::MAX;
         assert!(bytemuck::checked::try_from_bytes::<ForwardLogoutResultHeader>(&bytes).is_err());
     }
 
@@ -3685,5 +3775,7 @@ mod tests {
         assert_eq!(ForwardLogoutOutcome::PipelineFull as u8, 2);
         assert_eq!(ForwardLogoutOutcome::InProgress as u8, 3);
         assert_eq!(ForwardLogoutOutcome::Canceled as u8, 4);
+        assert_eq!(ForwardLogoutOutcome::RequestTooOld as u8, 5);
+        assert_eq!(ForwardLogoutOutcome::OperationMismatch as u8, 6);
     }
 }

@@ -81,6 +81,7 @@ async fn create_stream_and_topic(harness: &TestHarness) {
         message_expiry: Some(IggyExpiry::NeverExpire),
         messages_required_to_save: Some(1),
         durability: iggy_common::Durability::Persisted,
+        consumer_offset_durability: iggy_common::Durability::Persisted,
         ..TopicCreateOptions::default()
     };
     setup_client
@@ -424,6 +425,7 @@ async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_fo
         topic_id: Identifier::default(),
         partitioning: Partitioning::partition_id(PARTITION_ID),
         batch: IggyMessagesBatch::from(&messages),
+        context: None,
     };
     let response = http
         .client
@@ -455,6 +457,7 @@ async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_fo
     let offsets_path = format!("/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/consumer-offsets");
     let consumer_id = Identifier::numeric(1).expect("valid consumer id");
     let store = StoreConsumerOffset {
+        context: None,
         consumer: Consumer::new(consumer_id),
         partition_id: Some(PARTITION_ID),
         offset: 0,

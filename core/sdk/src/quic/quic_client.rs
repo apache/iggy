@@ -23,7 +23,8 @@ use crate::leader_aware::{
 use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::prelude::AutoLogin;
 use crate::session::ConsensusSession;
-use crate::vsr::replay_after_session_reset_is_safe;
+use crate::vsr::{RetainedRequest, retain_replay_header};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
@@ -35,7 +36,7 @@ use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+    BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
 };
 use iggy_common::{
     ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
@@ -100,6 +101,11 @@ pub struct QuicClient {
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -119,11 +125,15 @@ impl Default for QuicClient {
 #[async_trait]
 impl Client for QuicClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         QuicClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        QuicClient::disconnect(self).await
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
+        self.forget_session_credentials().await;
+        QuicClient::disconnect_transport(self).await?;
+        self.reset_vsr_session().await
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
@@ -141,15 +151,19 @@ impl BinaryTransport for QuicClient {
         &self,
         code: u32,
         payload: Bytes,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.write_offset(self, code, payload).await
+        self.poll_router
+            .write_offset(self, code, payload, context)
+            .await
     }
 
     async fn send_poll_with_response(
         &self,
         request: &iggy_binary_protocol::requests::messages::PollMessagesRequest,
+        context: Option<PartitionContext>,
     ) -> Result<Bytes, IggyError> {
-        self.poll_router.poll(self, request).await
+        self.poll_router.poll(self, request, context).await
     }
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -170,12 +184,28 @@ impl BinaryTransport for QuicClient {
         }
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    async fn send_raw_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
+        if self.caller_disconnected() {
+            return Err(match self.get_state().await {
+                ClientState::Shutdown => IggyError::ClientShutdown,
+                _ => IggyError::NotConnected,
+            });
+        }
         if is_poll_routing_code(code) {
-            return self.send_poll_request(code, payload).await;
+            return self
+                .send_poll_request_with_context(code, payload, context)
+                .await;
         }
         let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-        let mut result = self.send_raw(code, payload.clone()).await;
+        let mut header = RetainedRequest::new(context);
+        let mut result = self
+            .send_raw_retaining_header(code, payload.clone(), &mut header)
+            .await;
 
         // A persistent not-admitted refusal is a verdict about who leads the
         // TARGET group, which the metadata leader check alone cannot repair:
@@ -185,9 +215,9 @@ impl BinaryTransport for QuicClient {
         // gate, and a login/register replay stays on its own connection.
         if matches!(result, Err(IggyError::TransientNotAccepted))
             && !is_login_register_code(code)
-            && code != GET_CLUSTER_METADATA_CODE
+            && !matches!(code, GET_CLUSTER_METADATA_CODE | BIND_SESSION_CODE)
             && self.config.reconnection.enabled
-            && !matches!(self.config.auto_login, AutoLogin::Disabled)
+            && self.sign_in_credentials().is_some()
         {
             let routing_guard =
                 match tokio::time::timeout_at(roster_deadline, self.routing_lock.lock()).await {
@@ -200,7 +230,7 @@ impl BinaryTransport for QuicClient {
             // while this request waited for the gate.
             result = match tokio::time::timeout_at(
                 overall_deadline,
-                self.send_raw(code, payload.clone()),
+                self.send_raw_retaining_header(code, payload.clone(), &mut header),
             )
             .await
             {
@@ -308,9 +338,15 @@ impl BinaryTransport for QuicClient {
                     target = next;
                     needs_settle = true;
                 }
+                retain_replay_header(
+                    &mut header,
+                    &self.consensus_session,
+                    code,
+                    &IggyError::TransientNotAccepted,
+                )?;
                 result = match tokio::time::timeout_at(
                     overall_deadline,
-                    self.send_raw(code, payload.clone()),
+                    self.send_raw_retaining_header(code, payload.clone(), &mut header),
                 )
                 .await
                 {
@@ -328,6 +364,7 @@ impl BinaryTransport for QuicClient {
         }
 
         let error = result.unwrap_err();
+        let mut retry_outcome = crate::vsr::RetryOutcome::for_reconnect(code, &error);
         if !matches!(
             error,
             IggyError::Disconnected
@@ -345,7 +382,7 @@ impl BinaryTransport for QuicClient {
             return Err(error);
         }
 
-        if code == GET_CLUSTER_METADATA_CODE {
+        if matches!(code, GET_CLUSTER_METADATA_CODE | BIND_SESSION_CODE) {
             return Err(error);
         }
 
@@ -353,7 +390,7 @@ impl BinaryTransport for QuicClient {
             return Err(IggyError::Disconnected);
         }
 
-        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
+        if !is_login_register_code(code) && self.sign_in_credentials().is_none() {
             // Without auto-login a reconnect cannot re-establish the session, so
             // non-login requests are not recovered here - their transient replay
             // happens on the live connection inside `send_raw`. Login/register
@@ -363,7 +400,6 @@ impl BinaryTransport for QuicClient {
             return Err(error);
         }
 
-        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
         let skip_auto_login = is_login_register_code(code);
         let owner_context = skip_auto_login
             .then(|| self.connect_coordinator.current_owner_context())
@@ -375,13 +411,19 @@ impl BinaryTransport for QuicClient {
             Some(self.routing_lock.lock().await)
         };
         if !nested_connect && self.connect_coordinator.is_active() {
-            self.connect().await?;
-            if !replay_after_reconnect {
-                return Err(error);
-            }
-            return self.send_raw(code, payload).await;
+            self.connect()
+                .await
+                .map_err(|error| retry_outcome.observe(error))?;
+            retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
+            drop(_routing_guard);
+            return self
+                .send_raw_retaining_header(code, payload, &mut header)
+                .await
+                .map_err(|error| retry_outcome.observe(error));
         }
-        self.disconnect().await?;
+        self.disconnect_transport()
+            .await
+            .map_err(|error| retry_outcome.observe(error))?;
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
         }
@@ -399,15 +441,12 @@ impl BinaryTransport for QuicClient {
         if skip_auto_login && reconnect.is_err() {
             *self.skip_auto_login_once.lock().await = false;
         }
-        reconnect?;
-        if !replay_after_reconnect {
-            warn!(
-                "Reconnected, but command: {code} may have committed before its reply was lost; \
-                 replaying it under the new session could apply it twice."
-            );
-            return Err(error);
-        }
-        self.send_raw(code, payload).await
+        reconnect.map_err(|error| retry_outcome.observe(error))?;
+        retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
+        drop(_routing_guard);
+        self.send_raw_retaining_header(code, payload, &mut header)
+            .await
+            .map_err(|error| retry_outcome.observe(error))
     }
 
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
@@ -423,27 +462,45 @@ impl iggy_common::VsrSessionSealed for QuicClient {}
 
 #[async_trait::async_trait]
 impl iggy_common::VsrSessionControl for QuicClient {
-    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
-        if session == 0 {
-            return Err(IggyError::InvalidSession(session));
-        }
+    async fn session_identity(
+        &self,
+    ) -> Result<iggy_binary_protocol::requests::system::SessionIdentity, IggyError> {
+        let session = self
+            .consensus_session
+            .lock()
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+        Ok(iggy_binary_protocol::requests::system::SessionIdentity {
+            client_id: session.client_id(),
+            session: session.session().ok_or(IggyError::Unauthenticated)?,
+            metadata_watermark: self
+                .poll_router
+                .metadata_watermark
+                .load(std::sync::atomic::Ordering::Acquire),
+        })
+    }
 
+    async fn session_bind_secret(
+        &self,
+    ) -> Result<iggy_binary_protocol::requests::users::login_register::BindSecret, IggyError> {
+        Ok(self
+            .consensus_session
+            .lock()
+            .map_err(|_| IggyError::InvalidConfiguration)?
+            .bind_secret())
+    }
+
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
         let mut consensus_session = self
             .consensus_session
             .lock()
-            .expect("consensus session mutex poisoned");
-        if consensus_session.is_bound() {
-            return Err(IggyError::AlreadyAuthenticated);
-        }
-
-        consensus_session.bind(session);
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+        let was_bound = consensus_session.is_bound();
+        consensus_session.bind(session)?;
         drop(consensus_session);
-        // Every fresh client identity passes through here, including one that
-        // replaces a session the transport never reset: a connection lost
-        // mid-request can leave the old session in place until this sign-in
-        // re-mints it.
-        self.consumer_group_state.clear_session_scoped();
-        self.poll_router.clear_session();
+        if !was_bound {
+            self.consumer_group_state.clear_session_scoped();
+            self.poll_router.clear_session();
+        }
         Ok(())
     }
 
@@ -451,7 +508,7 @@ impl iggy_common::VsrSessionControl for QuicClient {
         *self
             .consensus_session
             .lock()
-            .expect("consensus session mutex poisoned") = ConsensusSession::new();
+            .map_err(|_| IggyError::InvalidConfiguration)? = ConsensusSession::new();
         self.consumer_group_state.clear_session_scoped();
         self.poll_router.clear_session();
         Ok(())
@@ -505,11 +562,7 @@ impl PollTransport for QuicClient {
     async fn connect_poll_client(&self, endpoint: &str) -> Result<Self, IggyError> {
         let mut config = (*self.config).clone();
         config.server_address = endpoint.to_owned();
-        config.auto_login = AutoLogin::Enabled(
-            self.poll_router
-                .credentials()
-                .ok_or(IggyError::Unauthenticated)?,
-        );
+        config.auto_login = AutoLogin::Disabled;
         config.reconnection.enabled = false;
         let mut client_address = config
             .client_address
@@ -517,20 +570,36 @@ impl PollTransport for QuicClient {
             .map_err(|_| IggyError::InvalidClientAddress)?;
         client_address.set_port(0);
         config.client_address = client_address.to_string();
-        let client = Self::create(Arc::new(config))?;
+        let mut client = Self::create(Arc::new(config))?;
+        client.consensus_session = Arc::clone(&self.consensus_session);
+        client.poll_router.metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         client.connect_off_leader().await?;
         Ok(client)
     }
 
-    async fn send_poll_request(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        self.send_raw_request(code, payload, false).await
+    async fn send_poll_request_with_context(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: PartitionContext,
+    ) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, false, &mut RetainedRequest::new(context))
+            .await
     }
 }
 
 impl QuicClient {
-    /// Whether an `AutoLogin` is configured on this client, which makes the
-    /// session after any connect the configured user's rather than whoever
-    /// signed in by hand.
+    fn sign_in_credentials(&self) -> Option<Credentials> {
+        self.poll_router
+            .remembered_credentials()
+            .or_else(|| match &self.config.auto_login {
+                AutoLogin::Enabled(credentials) => Some(credentials.clone()),
+                AutoLogin::Disabled => None,
+            })
+    }
+
+    /// Whether fallback `AutoLogin` credentials are configured. A remembered
+    /// successful sign-in takes precedence after reconnecting.
     pub(crate) fn auto_login_configured(&self) -> bool {
         matches!(self.config.auto_login, AutoLogin::Enabled(_))
     }
@@ -600,6 +669,7 @@ impl QuicClient {
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -646,7 +716,7 @@ impl QuicClient {
         crate::vsr::decode_response(Bytes::from(buffer))
     }
 
-    async fn connect(&self) -> Result<(), IggyError> {
+    pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         self.connect_with_settlement(false).await
     }
 
@@ -674,10 +744,18 @@ impl QuicClient {
             .await
     }
 
+    /// A reconnect sweep checks this before each dial and before it installs
+    /// the connection: once the caller disconnects, nothing in the sweep may
+    /// bring the client back.
+    fn caller_disconnected(&self) -> bool {
+        self.disconnected_by_caller.load(Ordering::SeqCst)
+    }
+
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         let single_attempt = context.single_attempt();
-        loop {
+        let mut resume_walk = None;
+        'connect: loop {
             match self.get_state().await {
                 ClientState::Shutdown => {
                     trace!("Cannot connect. Client is shutdown.");
@@ -692,6 +770,10 @@ impl QuicClient {
                 ClientState::Connecting => {
                     trace!("Client is already connecting.");
                     return Ok(());
+                }
+                _ if self.caller_disconnected() => {
+                    trace!("Cannot connect. The caller disconnected the client.");
+                    return Err(IggyError::NotConnected);
                 }
                 _ => {}
             }
@@ -716,6 +798,11 @@ impl QuicClient {
             let connection;
             let remote_address;
             loop {
+                if self.caller_disconnected() {
+                    self.set_state(ClientState::Disconnected).await;
+                    self.publish_event(DiagnosticEvent::Disconnected).await;
+                    return Err(IggyError::NotConnected);
+                }
                 let server_address_str = self.current_server_address.lock().await.clone();
                 let server_address = tokio::net::lookup_host(&server_address_str)
                     .await
@@ -793,6 +880,13 @@ impl QuicClient {
                 break;
             }
 
+            if self.caller_disconnected() {
+                connection.close(0u32.into(), b"");
+                self.set_state(ClientState::Disconnected).await;
+                self.publish_event(DiagnosticEvent::Disconnected).await;
+                return Err(IggyError::NotConnected);
+            }
+
             let now = IggyTimestamp::now();
             info!("{NAME} client has connected to server: {remote_address} at {now}",);
             self.set_state(ClientState::Connected).await;
@@ -805,66 +899,74 @@ impl QuicClient {
                 std::mem::take(&mut *guard)
             };
 
-            // Handle auto-login
-            let should_redirect = match &self.config.auto_login {
-                AutoLogin::Disabled => {
-                    info!("Automatic sign-in is disabled.");
-                    // Only `IggyClient` redirects after a manual sign-in, so
-                    // a raw transport can stay on a backup, and nothing on
-                    // the send path redirects either: its replicated writes
-                    // replay on the live connection, then surface the
-                    // transient failure to the caller.
-                    false
-                }
-                AutoLogin::Enabled(credentials) => {
-                    if skip_auto_login {
-                        info!("Skipping automatic sign-in for a retried login/register request.");
+            if skip_auto_login {
+                return Ok(());
+            }
+            let Some(credentials) = self.sign_in_credentials() else {
+                return Ok(());
+            };
+            let bound = self
+                .consensus_session
+                .lock()
+                .map_err(|_| IggyError::InvalidConfiguration)?
+                .is_bound();
+            let resumed = if bound {
+                match self.resume_vsr_session().await {
+                    Ok(()) => true,
+                    Err(IggyError::Unauthenticated | IggyError::TransientNotCommitted) => {
+                        self.reset_vsr_session().await?;
                         false
-                    } else {
-                        info!(
-                            "{NAME} client: {} is signing in...",
-                            self.config.client_address
-                        );
-                        self.set_state(ClientState::Authenticating).await;
-                        match credentials {
-                            Credentials::UsernamePassword(username, password) => {
-                                self.login_user(username, password.expose_secret()).await?;
-                                self.publish_event(DiagnosticEvent::SignedIn).await;
-                                info!(
-                                    "{NAME} client: {} has signed in with the user credentials, username: {username}",
-                                    self.config.client_address
-                                );
-                            }
-                            Credentials::PersonalAccessToken(token) => {
-                                self.login_with_personal_access_token(token.expose_secret())
-                                    .await?;
-                                self.publish_event(DiagnosticEvent::SignedIn).await;
-                                info!(
-                                    "{NAME} client: {} has signed in with a personal access token.",
-                                    self.config.client_address
-                                );
+                    }
+                    Err(error) => {
+                        self.disconnect_transport().await?;
+                        if !single_attempt && crate::vsr::resume_error_is_retryable(&error) {
+                            let current = self.current_server_address.lock().await.clone();
+                            let roster = self.roster_endpoints.lock().await.clone();
+                            let walk = resume_walk
+                                .get_or_insert_with(|| RosterWalk::new(&current, &roster));
+                            if let Some(next) = walk.next() {
+                                *self.current_server_address.lock().await = next;
+                                continue 'connect;
                             }
                         }
-
-                        // A roster walk stays on the endpoint it dialed: the
-                        // leader settlement below would put the connection
-                        // straight back on the node whose partition replica
-                        // keeps refusing the request. One connect only.
-                        if settle_off_leader {
-                            info!(
-                                "{NAME} client stays on the dialed node for a partition failover."
-                            );
-                            false
-                        } else {
-                            // The sole leader settlement, and it runs
-                            // authenticated. Any node completes a login now --
-                            // a backup forwards the register to the primary --
-                            // so this decides where later ops land, not
-                            // whether sign-in works.
-                            self.handle_leader_redirection().await?
-                        }
+                        return Err(error);
                     }
                 }
+            } else {
+                false
+            };
+            if !resumed {
+                self.set_state(ClientState::Authenticating).await;
+                let result = match credentials {
+                    Credentials::UsernamePassword(username, password) => self
+                        .login_user(&username, password.expose_secret())
+                        .await
+                        .map(|_| ()),
+                    Credentials::PersonalAccessToken(token) => self
+                        .login_with_personal_access_token(token.expose_secret())
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(error) = result {
+                    // An explicit disconnect landed during the sign-in. The
+                    // non-retryable arm below would keep the connection up.
+                    if self.caller_disconnected() {
+                        self.disconnect_transport().await?;
+                        return Err(IggyError::NotConnected);
+                    }
+                    if crate::vsr::resume_error_is_retryable(&error) {
+                        self.disconnect_transport().await?;
+                    } else {
+                        self.set_state(ClientState::Connected).await;
+                    }
+                    return Err(error);
+                }
+                self.publish_event(DiagnosticEvent::SignedIn).await;
+            }
+            let should_redirect = if settle_off_leader {
+                false
+            } else {
+                self.handle_leader_redirection().await?
             };
 
             if should_redirect {
@@ -880,7 +982,6 @@ impl QuicClient {
             connection.close(0u32.into(), b"");
         }
         self.endpoint.wait_idle().await;
-        self.reset_vsr_session().await?;
         self.set_state(ClientState::Disconnected).await;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         Ok(())
@@ -924,7 +1025,7 @@ impl QuicClient {
 
             // Clear connected_at to avoid reestablish_after delay during redirection
             self.connected_at.lock().await.take();
-            self.disconnect().await?;
+            self.disconnect_transport().await?;
             *self.current_server_address.lock().await = new_leader_address;
 
             Ok(true)
@@ -947,7 +1048,7 @@ impl QuicClient {
              metadata leader; trying the next cluster node at {next}."
         );
         self.connected_at.lock().await.take();
-        self.disconnect().await?;
+        self.disconnect_transport().await?;
         *self.current_server_address.lock().await = next;
         Ok(())
     }
@@ -971,8 +1072,11 @@ impl QuicClient {
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Disconnected {
+    async fn disconnect_transport(&self) -> Result<(), IggyError> {
+        // Taken before the state is read: a teardown aborted after it set
+        // `Disconnected` can leave the connection installed.
+        let connection = self.connection.lock().await.take();
+        if connection.is_none() && self.get_state().await == ClientState::Disconnected {
             return Ok(());
         }
 
@@ -981,9 +1085,8 @@ impl QuicClient {
             self.config.client_address
         );
         self.set_state(ClientState::Disconnected).await;
-        self.connection.lock().await.take();
+        drop(connection);
         self.endpoint.wait_idle().await;
-        self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!(
@@ -993,8 +1096,13 @@ impl QuicClient {
         Ok(())
     }
 
-    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        self.send_raw_request(code, payload, true).await
+    async fn send_raw_retaining_header(
+        &self,
+        code: u32,
+        payload: Bytes,
+        header: &mut RetainedRequest,
+    ) -> Result<Bytes, IggyError> {
+        self.send_raw_request(code, payload, true, header).await
     }
 
     async fn send_raw_request(
@@ -1002,6 +1110,66 @@ impl QuicClient {
         code: u32,
         payload: Bytes,
         retry_transient: bool,
+        header: &mut RetainedRequest,
+    ) -> Result<Bytes, IggyError> {
+        // One deadline bounds the whole request including transient replays
+        // and lifecycle retries.
+        let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+        // `TransientNotAccepted` gets a short same-connection window
+        // only: past it the refusal is a verdict about who leads, not
+        // load, and the caller runs a leader recheck or roster walk.
+        // Login/register keeps the full budget on this connection: the
+        // connect flow owns its leader settlement.
+        let not_accepted_deadline = if is_login_register_code(code) {
+            deadline
+        } else {
+            deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
+        };
+        let mut retry_outcome = crate::vsr::RetryOutcome::default();
+        let mut lifecycle_retry_interval = NOT_READY_RETRY_INTERVAL;
+        loop {
+            match self
+                .send_raw_exchange(
+                    code,
+                    payload.clone(),
+                    retry_transient,
+                    header,
+                    deadline,
+                    not_accepted_deadline,
+                    &mut retry_outcome,
+                )
+                .await
+            {
+                // The refusal committed under this request id, so the retry is a
+                // new request. The pause holds no connection lock, and the next
+                // exchange takes its id only once it holds the connection, above
+                // any id another request sent during the pause.
+                Err(IggyError::LifecycleBusy)
+                    if retry_transient
+                        && tokio::time::Instant::now() + lifecycle_retry_interval < deadline =>
+                {
+                    header.header = None;
+                    tokio::time::sleep(lifecycle_retry_interval).await;
+                    lifecycle_retry_interval = (lifecycle_retry_interval * 2)
+                        .min(crate::vsr::LIFECYCLE_RETRY_MAX_INTERVAL);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// The part of [`Self::send_raw_request`] that holds the connection lock.
+    /// `retry_outcome` carries over between the exchanges of one request.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_raw_exchange(
+        &self,
+        code: u32,
+        payload: Bytes,
+        retry_transient: bool,
+        header: &mut RetainedRequest,
+        deadline: tokio::time::Instant,
+        not_accepted_deadline: tokio::time::Instant,
+        retry_outcome: &mut crate::vsr::RetryOutcome,
     ) -> Result<Bytes, IggyError> {
         match self.get_state().await {
             ClientState::Shutdown => {
@@ -1030,46 +1198,29 @@ impl QuicClient {
         let consensus_session = self.consensus_session.clone();
         let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
-        tokio::spawn(async move {
-            let connection = connection.lock().await;
-            let Some(connection) = connection.as_ref() else {
-                error!("Cannot send data. Client is not connected.");
-                return Err(IggyError::NotConnected);
-            };
+        let preencoded = *header;
+        let mut outcome_so_far = std::mem::take(retry_outcome);
+        let (used_header, result, outcome_so_far) = tokio::spawn(async move {
+            let mut used_header = preencoded;
+            let result = async {
+                let connection = connection.lock().await;
+                let Some(connection) = connection.as_ref() else {
+                    error!("Cannot send data. Client is not connected.");
+                    return Err(IggyError::NotConnected);
+                };
 
-            let (request_header, request_size) = {
-                    let mut consensus_session = consensus_session
-                        .lock()
-                        .expect("consensus session mutex poisoned");
-                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
+                let request_header = {
+                    let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                    used_header.encode(&mut session, code, &payload)?
                 };
-                trace!("Sending a QUIC VSR request of size {request_size} with code: {code}");
-                // Same-connection transient resend, gated on the EXPLICIT
-                // `TransientNotCommitted` frame only. The server answers every
-                // transient submit with that frame (it is pre-commit by
-                // construction, so replaying the SAME request header on a fresh
-                // bidi cannot double-commit), and it no longer abandons a bidi
-                // whose op is still committing. Silence therefore is NOT a
-                // retry signal: the partition plane has no dedup or reply
-                // cache, so resending a silently-unanswered request whose
-                // first attempt was buffered and later commits would commit it
-                // twice (duplicate `SendMessages`, or a succeeded delete coming
-                // back as terminal `ConsumerOffsetNotFound`). A silent deadline
-                // expiry surfaces `Disconnected` and takes the
-                // reconnect path in `send_raw_with_response`, same as TCP.
-                let header_bytes = bytemuck::bytes_of(&request_header);
-                let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-                // `TransientNotAccepted` gets a short same-connection window
-                // only: past it the refusal is a verdict about who leads, not
-                // load, and the caller runs a leader recheck or roster walk.
-                // Login/register keeps the full budget on this connection: the
-                // connect flow owns its leader settlement.
-                let not_accepted_deadline = if is_login_register_code(code) {
-                    deadline
-                } else {
-                    deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
-                };
+                trace!(
+                    "Sending a QUIC VSR request of size {} with code: {code}",
+                    request_header.size
+                );
+                // Replays retain the exact identity so committed receipts resolve
+                // uncertain attempts. Silence alone does not authorize a replay.
                 loop {
+                    let header_bytes = bytemuck::bytes_of(&request_header);
                     let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                         error!("Failed to open a bidirectional stream: {error}");
                         IggyError::QuicError
@@ -1100,6 +1251,7 @@ impl QuicClient {
                         &metadata_watermark,
                     )
                     .await
+                    .map_err(|error| outcome_so_far.observe(error))
                     {
                         Ok(reply) => return Ok(reply),
                         Err(error) if !retry_transient => return Err(error),
@@ -1135,12 +1287,18 @@ impl QuicClient {
                         Err(error) => return Err(error),
                     }
                 }
+            }
+            .await;
+            (used_header, result, outcome_so_far)
         })
         .await
         .map_err(|e| {
             error!("Task execution failed during QUIC request: {}", e);
             IggyError::QuicError
-        })?
+        })?;
+        *header = used_header;
+        *retry_outcome = outcome_so_far;
+        result
     }
 }
 
@@ -1215,12 +1373,417 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
     Ok(client_config)
 }
 
-/// Unit tests for QuicClient.
-/// Currently only tests for "from_connection_string()" are implemented.
-/// TODO: Add complete unit tests for QuicClient.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use iggy_binary_protocol::codes::{JOIN_CONSUMER_GROUP_CODE, SEND_MESSAGES_CODE};
+    use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
+    use iggy_binary_protocol::requests::system::BindSessionRequest;
+    use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+    use iggy_binary_protocol::{
+        Command, HEADER_SIZE, IGGY_PROTOCOL_VERSION, Operation, ReplyHeader, RequestHeader,
+        WireDecode, WireEncode, WireName,
+    };
+    use iggy_common::QuicClientReconnectionConfig;
+
+    async fn read_test_request(
+        connection: &quinn::Connection,
+    ) -> (quinn::SendStream, RequestHeader, Vec<u8>) {
+        let (send, mut recv) = connection.accept_bi().await.unwrap();
+        let mut bytes = [0; HEADER_SIZE];
+        recv.read_exact(&mut bytes).await.unwrap();
+        let header: RequestHeader = bytemuck::checked::try_pod_read_unaligned(&bytes).unwrap();
+        let mut body = vec![0; header.size as usize - HEADER_SIZE];
+        recv.read_exact(&mut body).await.unwrap();
+        (send, header, body)
+    }
+
+    async fn answer_test_request(
+        send: &mut quinn::SendStream,
+        request: &RequestHeader,
+        status: u32,
+        body: &[u8],
+    ) {
+        let header = ReplyHeader {
+            command: Command::Reply,
+            operation: request.operation,
+            client: request.client,
+            request: request.request,
+            size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
+            status,
+            ..Default::default()
+        };
+        send.write_all(bytemuck::bytes_of(&header)).await.unwrap();
+        send.write_all(body).await.unwrap();
+        send.finish().unwrap();
+        send.stopped().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_poisoned_session_when_sending_or_resetting_should_return_configuration_error() {
+        const NO_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let consensus_session = Arc::clone(&client.consensus_session);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _session = consensus_session.lock().unwrap();
+                panic!("poison the session for the regression test");
+            })
+            .is_err()
+        );
+
+        let mut request = crate::vsr::RetainedRequest::default();
+        assert_eq!(
+            client
+                .send_raw_request(
+                    SEND_MESSAGES_CODE,
+                    Bytes::from_static(b"send"),
+                    false,
+                    &mut request,
+                )
+                .await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        assert!(request.header.is_none());
+        assert_eq!(
+            client.reset_vsr_session().await,
+            Err(IggyError::InvalidConfiguration)
+        );
+        {
+            let session = consensus_session.lock().unwrap_err().into_inner();
+            assert_eq!(session.session(), Some(1));
+            assert_eq!(session.current_request_id(), 1);
+        }
+        assert!(
+            tokio::time::timeout(NO_REQUEST_TIMEOUT, peer.accept_bi())
+                .await
+                .is_err()
+        );
+        client.disconnect_transport().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retained_write_waiting_for_the_connection_must_recheck_its_session() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let payload = Bytes::from_static(b"uncertain-send");
+        let retained = crate::vsr::encode_request_header(
+            &mut client.consensus_session.lock().unwrap(),
+            SEND_MESSAGES_CODE,
+            &payload,
+        )
+        .unwrap()
+        .0;
+        let connection_guard = client.connection.lock().await;
+        let mut retained = RetainedRequest {
+            header: Some(retained),
+            ..Default::default()
+        };
+        let attempt = client.send_raw_request(SEND_MESSAGES_CODE, payload, false, &mut retained);
+        tokio::pin!(attempt);
+        tokio::select! {
+            biased;
+            _ = &mut attempt => panic!("the exchange must wait for the connection lock"),
+            () = tokio::task::yield_now() => {}
+        }
+        client.reset_vsr_session().await.unwrap();
+        client.bind_vsr_session(2).await.unwrap();
+        drop(connection_guard);
+        assert_eq!(
+            tokio::time::timeout(TEST_BUDGET, &mut attempt)
+                .await
+                .unwrap(),
+            Err(IggyError::TransientNotCommitted)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), peer.accept_bi())
+                .await
+                .is_err()
+        );
+        Client::shutdown(&client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_lifecycle_refusal_when_retried_should_not_block_other_requests() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = Arc::new(
+            QuicClient::create(Arc::new(QuicClientConfig {
+                server_address: endpoint.local_addr().unwrap().to_string(),
+                ..Default::default()
+            }))
+            .unwrap(),
+        );
+        let (connection, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&*client)
+        );
+        connected.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        let (refused, first_refusal) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut rejection = [0; REJECTION_SECTION_LEN];
+            write_rejection_section(&mut rejection, IggyError::LifecycleBusy.as_code());
+            let mut refused = Some(refused);
+            let mut other = None;
+            loop {
+                let (mut reply, request, _) = read_test_request(&connection).await;
+                if request.operation == Operation::SendMessages {
+                    answer_test_request(&mut reply, &request, 0, b"sent").await;
+                    other = Some(request);
+                } else if let Some(other) = other {
+                    // The server accepts only request ids above its watermark.
+                    assert!(
+                        request.request > other.request,
+                        "a retry must take its request id after the requests sent during its pause"
+                    );
+                    let mut success = 0u32.to_le_bytes().to_vec();
+                    success.extend_from_slice(b"joined");
+                    answer_test_request(&mut reply, &request, 0, &success).await;
+                    return;
+                } else {
+                    answer_test_request(&mut reply, &request, 0, &rejection).await;
+                    if let Some(refused) = refused.take() {
+                        refused.send(()).unwrap();
+                    }
+                }
+            }
+        });
+        let join = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_raw_request(
+                        JOIN_CONSUMER_GROUP_CODE,
+                        Bytes::new(),
+                        true,
+                        &mut RetainedRequest::default(),
+                    )
+                    .await
+            })
+        };
+        first_refusal.await.unwrap();
+        // Start inside the first pause, so a retry that took its request id
+        // before the pause would reach the peer below this request's id.
+        tokio::time::sleep(NOT_READY_RETRY_INTERVAL / 2).await;
+
+        let sent = tokio::time::timeout(
+            TEST_BUDGET,
+            client.send_raw_request(
+                SEND_MESSAGES_CODE,
+                Bytes::from_static(b"send-body"),
+                true,
+                &mut RetainedRequest::default(),
+            ),
+        )
+        .await
+        .expect("a request must not wait out the lifecycle retries of another request");
+        assert_eq!(sent.unwrap(), Bytes::from_static(b"sent"));
+        tokio::time::timeout(TEST_BUDGET, peer)
+            .await
+            .unwrap()
+            .unwrap();
+        let joined = tokio::time::timeout(TEST_BUDGET, join)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.unwrap(), Bytes::from_static(b"joined"));
+        Client::shutdown(&*client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_resumes_and_replays_only_the_original_session() {
+        const TEST_USER_ID: u32 = 7;
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        for fresh_login in [false, true] {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let certified =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let config = quinn::ServerConfig::with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+            let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let client = QuicClient::create(Arc::new(QuicClientConfig {
+                server_address: endpoint.local_addr().unwrap().to_string(),
+                reconnection: QuicClientReconnectionConfig {
+                    reestablish_after: IggyDuration::from_str("0s").unwrap(),
+                    max_retries: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .unwrap();
+            client.bind_vsr_session(1).await.unwrap();
+            let (first, connected) = tokio::join!(
+                async { endpoint.accept().await.unwrap().await.unwrap() },
+                Client::connect(&client)
+            );
+            connected.unwrap();
+            client.set_state(ClientState::Authenticated).await;
+            client.roster_learned.store(true, Ordering::SeqCst);
+            client
+                .remember_session_credentials(
+                    Credentials::UsernamePassword("iggy".into(), "secret".into()),
+                    TEST_USER_ID,
+                )
+                .await;
+            let original = client.session_identity().await.unwrap();
+            let secret = client.session_bind_secret().await.unwrap();
+            let peer = tokio::spawn(async move {
+                let first = first;
+                let (lost_reply, lost_header, lost_body) = read_test_request(&first).await;
+                assert_eq!(lost_header.operation, Operation::SendMessages);
+                drop(lost_reply);
+                first.close(quinn::VarInt::from_u32(0), b"reply lost");
+                let resumed = endpoint.accept().await.unwrap().await.unwrap();
+                let (mut bind_reply, bind_header, bind_body) = read_test_request(&resumed).await;
+                assert_eq!(
+                    u32::from_le_bytes(bind_header.reserved[..4].try_into().unwrap()),
+                    BIND_SESSION_CODE
+                );
+                let binding = BindSessionRequest::decode_from(&bind_body).unwrap();
+                assert_eq!(binding.identity, original);
+                assert_eq!(binding.bind_secret.expose_secret(), secret.expose_secret());
+                let login = LoginRegisterResponse {
+                    user_id: TEST_USER_ID,
+                    session: if fresh_login { 2 } else { 1 },
+                    server_protocol_version: IGGY_PROTOCOL_VERSION,
+                    server_version: WireName::new("test").unwrap(),
+                }
+                .to_bytes();
+                answer_test_request(
+                    &mut bind_reply,
+                    &bind_header,
+                    if fresh_login {
+                        IggyError::Unauthenticated.as_code()
+                    } else {
+                        0
+                    },
+                    if fresh_login { &[] } else { &login },
+                )
+                .await;
+                if fresh_login {
+                    let (mut register_reply, register, _) = read_test_request(&resumed).await;
+                    assert_eq!(register.operation, Operation::Register);
+                    assert_ne!(register.client, original.client_id);
+                    let mut result = vec![0; size_of::<u32>()];
+                    result.extend_from_slice(&login);
+                    answer_test_request(&mut register_reply, &register, 0, &result).await;
+                }
+                loop {
+                    let (mut reply, header, body) = read_test_request(&resumed).await;
+                    if header.operation == Operation::NonReplicated {
+                        answer_test_request(
+                            &mut reply,
+                            &header,
+                            IggyError::FeatureUnavailable.as_code(),
+                            &[],
+                        )
+                        .await;
+                        continue;
+                    }
+                    if fresh_login {
+                        assert_ne!(header.client, lost_header.client);
+                        assert_eq!(body, b"explicit-new-send");
+                    } else {
+                        assert_eq!(
+                            bytemuck::bytes_of(&header),
+                            bytemuck::bytes_of(&lost_header)
+                        );
+                        assert_eq!(body, lost_body);
+                    }
+                    answer_test_request(&mut reply, &header, 0, b"receipt").await;
+                    return;
+                }
+            });
+            let result = tokio::time::timeout(
+                TEST_BUDGET,
+                client.send_raw_with_context(
+                    SEND_MESSAGES_CODE,
+                    Bytes::from_static(b"lost-send"),
+                    PartitionContext::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            if fresh_login {
+                assert_eq!(result.unwrap_err(), IggyError::TransientNotCommitted);
+                assert_ne!(
+                    client.session_identity().await.unwrap().client_id,
+                    original.client_id
+                );
+                assert_eq!(
+                    client
+                        .send_raw_with_context(
+                            SEND_MESSAGES_CODE,
+                            Bytes::from_static(b"explicit-new-send"),
+                            PartitionContext::default()
+                        )
+                        .await
+                        .unwrap(),
+                    Bytes::from_static(b"receipt")
+                );
+            } else {
+                assert_eq!(result.unwrap(), Bytes::from_static(b"receipt"));
+                assert_eq!(client.session_identity().await.unwrap(), original);
+            }
+            tokio::time::timeout(TEST_BUDGET, peer)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = Client::shutdown(&client).await;
+        }
+    }
 
     #[tokio::test]
     async fn a_roster_hop_does_not_enter_the_reconnect_ladder() {
@@ -1596,5 +2159,54 @@ mod tests {
 
         let client = QuicClient::create(config);
         assert!(client.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = QuicClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_teardown_cut_short_after_the_state_change_is_finished_by_the_next_one() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        // What an abort leaves between the state change and the cleanup.
+        client.set_state(ClientState::Disconnected).await;
+
+        client.disconnect_transport().await.unwrap();
+
+        assert!(client.connection.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), peer.closed())
+            .await
+            .expect("the live connection must be closed");
     }
 }

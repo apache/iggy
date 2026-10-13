@@ -18,23 +18,20 @@
 use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
 use crate::prelude::{
     ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration,
-    PollingStrategy,
+    PollingStrategy, Validatable,
 };
 use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::error;
 
 const DEFAULT_PARTITION_ID: u32 = 0;
 
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
 pub struct IggyConsumerConfig {
-    /// Identifier of the stream. Must be unique.
-    stream_id: Identifier,
     /// Name of the stream. Must be unique.
     stream_name: String,
-    /// Identifier of the topic. Must be unique.
-    topic_id: Identifier,
     /// Name of the topic. Must be unique.
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
@@ -48,7 +45,8 @@ pub struct IggyConsumerConfig {
     create_topic_if_not_exists: bool,
     /// Members of the same consumer group use the same name.
     consumer_name: String,
-    /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
+    /// The type of consumer: `Consumer` or `ConsumerGroup`, the default. `ExternalGroup` only holds
+    /// offsets, so a consumer built with it fails with `FeatureUnavailable`, as a poll with it does.
     consumer_kind: ConsumerKind,
     /// Partition count when creating a topic.
     partitions_count: u32,
@@ -72,13 +70,8 @@ pub struct IggyConsumerConfig {
 
 impl Default for IggyConsumerConfig {
     fn default() -> Self {
-        let stream_id = Identifier::from_str_value("test_stream").unwrap();
-        let topic_id = Identifier::from_str_value("test_topic").unwrap();
-
         Self {
-            stream_id,
             stream_name: "test_stream".to_string(),
-            topic_id,
             topic_name: "test_topic".to_string(),
             auto_commit: AutoCommit::When(AutoCommitWhen::PollingMessages),
             batch_length: 100,
@@ -103,9 +96,7 @@ impl IggyConsumerConfig {
     ///
     /// # Args
     ///
-    /// * `stream_id` - The stream id.
     /// * `stream_name` - The stream name.
-    /// * `topic_id` - The topic id.
     /// * `topic_name` - The topic name.
     /// * `auto_commit` - The auto commit config.
     /// * `batch_length` - The max number of messages to poll in a batch.
@@ -129,9 +120,7 @@ impl IggyConsumerConfig {
     ///
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        stream_id: Identifier,
         stream_name: String,
-        topic_id: Identifier,
         topic_name: String,
         auto_commit: AutoCommit,
         batch_length: u32,
@@ -148,9 +137,7 @@ impl IggyConsumerConfig {
         init_interval: NonZeroIggyDuration,
     ) -> Self {
         Self {
-            stream_id,
             stream_name,
-            topic_id,
             topic_name,
             auto_commit,
             batch_length,
@@ -187,13 +174,12 @@ impl IggyConsumerConfig {
         batch_length: u32,
         polling_interval: IggyDuration,
     ) -> Result<Self, IggyError> {
-        let stream_id = Identifier::from_str_value(stream)?;
-        let topic_id = Identifier::from_str_value(topic)?;
+        // Validate stream and topic names. Returns IggyError if names are not allowed.
+        Identifier::named(stream)?;
+        Identifier::named(topic)?;
 
         Ok(Self {
-            stream_id,
             stream_name: stream.to_string(),
-            topic_id,
             topic_name: topic.to_string(),
             auto_commit: AutoCommit::When(AutoCommitWhen::PollingMessages),
             batch_length,
@@ -220,16 +206,8 @@ impl IggyConsumerConfig {
         self
     }
 
-    pub fn stream_id(&self) -> &Identifier {
-        &self.stream_id
-    }
-
     pub fn stream_name(&self) -> &str {
         &self.stream_name
-    }
-
-    pub fn topic_id(&self) -> &Identifier {
-        &self.topic_id
     }
 
     pub fn topic_name(&self) -> &str {
@@ -292,20 +270,50 @@ impl IggyConsumerConfig {
     }
 }
 
+impl Validatable<IggyError> for IggyConsumerConfig {
+    /// Refuses a configuration that no consumer can poll with, before any call reaches the server.
+    fn validate(&self) -> Result<(), IggyError> {
+        if self.consumer_kind == ConsumerKind::ExternalGroup {
+            error!(
+                consumer_kind = %self.consumer_kind,
+                "consumer_kind must be consumer or consumer_group: an external group only holds \
+                 offsets and cannot poll"
+            );
+            return Err(IggyError::FeatureUnavailable);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl IggyConsumerConfig {
+    /// The default configuration with the one kind that no consumer can poll with.
+    pub(crate) fn with_external_group_kind() -> Self {
+        Self {
+            consumer_kind: ConsumerKind::ExternalGroup,
+            ..Self::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn should_be_equal() {
-        let stream_id = Identifier::from_str_value("test_stream").unwrap();
-        let topic_id = Identifier::from_str_value("test_topic").unwrap();
+    fn given_external_group_kind_when_validated_should_refuse_it() {
+        assert!(matches!(
+            IggyConsumerConfig::with_external_group_kind().validate(),
+            Err(IggyError::FeatureUnavailable)
+        ));
+        assert!(IggyConsumerConfig::default().validate().is_ok());
+    }
 
+    #[test]
+    fn should_be_equal() {
         // Builder is generated by the bon macro
         let config = IggyConsumerConfig::builder()
-            .stream_id(stream_id)
             .stream_name("test_stream".to_string())
-            .topic_id(topic_id)
             .topic_name("test_topic".to_string())
             .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
             .batch_length(100)
@@ -321,15 +329,7 @@ mod tests {
             .init_interval(NonZeroIggyDuration::from_str("3s").unwrap())
             .build();
 
-        assert_eq!(
-            config.stream_id(),
-            &Identifier::from_str_value("test_stream").unwrap()
-        );
         assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(
-            config.topic_id(),
-            &Identifier::from_str_value("test_topic").unwrap()
-        );
         assert_eq!(config.topic_name(), "test_topic");
         assert_eq!(
             config.auto_commit(),
@@ -361,13 +361,8 @@ mod tests {
 
     #[test]
     fn should_be_default() {
-        let stream_id = Identifier::from_str_value("test_stream").unwrap();
-        let topic_id = Identifier::from_str_value("test_topic").unwrap();
-
         let config = IggyConsumerConfig::default();
-        assert_eq!(config.stream_id(), &stream_id);
         assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(config.topic_id(), &topic_id);
         assert_eq!(config.topic_name(), "test_topic");
         assert_eq!(
             config.auto_commit(),
@@ -399,9 +394,7 @@ mod tests {
     #[test]
     fn should_be_new() {
         let config = IggyConsumerConfig::new(
-            Identifier::from_str_value("test_stream").unwrap(),
             "test_stream".to_string(),
-            Identifier::from_str_value("test_topic").unwrap(),
             "test_topic".to_string(),
             AutoCommit::When(AutoCommitWhen::PollingMessages),
             100,
@@ -417,15 +410,7 @@ mod tests {
             Some(3),
             NonZeroIggyDuration::from_str("3s").unwrap(),
         );
-        assert_eq!(
-            config.stream_id(),
-            &Identifier::from_str_value("test_stream").unwrap(),
-        );
         assert_eq!(config.stream_name(), "test_stream");
-        assert_eq!(
-            config.topic_id(),
-            &Identifier::from_str_value("test_topic").unwrap()
-        );
         assert_eq!(config.topic_name(), "test_topic");
         assert_eq!(
             config.auto_commit(),

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Reflection;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Vsr;
 
@@ -57,7 +58,7 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(7);
         session.Resolve(VsrOperation.Register);
-        session.Bind(42);
+        session.Bind(42, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         var frame = session.Resolve(VsrOperation.Register);
 
@@ -70,7 +71,7 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(7);
         session.Resolve(VsrOperation.Register);
-        session.Bind(42);
+        session.Bind(42, new byte[LoginRegister.BIND_SECRET_BYTES]);
         session.Resolve(VsrOperation.CreateStream);
 
         Assert.Equal(0UL, session.Resolve(VsrOperation.Register).RequestId);
@@ -101,7 +102,7 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
-        session.Bind(10);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.CreateStream).RequestId);
         Assert.Equal(2UL, session.Resolve(VsrOperation.CreateStream).RequestId);
@@ -118,12 +119,53 @@ public sealed class ConsensusSessionTests
         Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
     }
 
+    [Theory]
+    [InlineData((byte)VsrOperation.CreateStream)]
+    [InlineData((byte)VsrOperation.SendMessages)]
+    public void NextRequestId_ExhaustionPreservesIdentityAndRejectsLocally(byte operation)
+    {
+        var bindSecret = Enumerable.Range(0, LoginRegister.BIND_SECRET_BYTES)
+            .Select(value => (byte)value).ToArray();
+        var session = new ConsensusSession(1, 10, bindSecret);
+        var clientId = session.ClientId;
+        var generation = session.Generation;
+        var counter = typeof(ConsensusSession).GetField("_requestCounter",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(counter);
+        counter.SetValue(session, ulong.MaxValue - 1);
+
+        var lastFrame = session.Resolve((VsrOperation)operation);
+        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue - 1, 10), lastFrame);
+        Assert.Equal(ulong.MaxValue, session.RequestCounter);
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            SessionFrame? issued = null;
+            var error = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            {
+                issued = session.Resolve((VsrOperation)operation);
+            });
+
+            Assert.Null(issued);
+            Assert.Equal(VsrError.REQUEST_ID_EXHAUSTED, error.StatusCode);
+            Assert.False(error.FromServer);
+            Assert.Equal(ulong.MaxValue, session.RequestCounter);
+            Assert.Equal(clientId, session.ClientId);
+            Assert.Equal(10UL, session.Session);
+            Assert.Equal(generation, session.Generation);
+            Assert.Equal(bindSecret, session.BindSecret);
+        }
+
+        Assert.Equal(new SessionFrame(clientId, ulong.MaxValue, 10), session.Resolve(VsrOperation.NonReplicated));
+        Assert.Equal(ulong.MaxValue, session.RequestCounter);
+    }
+
     [Fact]
     public void Resolve_DoesNotConsumeAnIdForNonReplicatedOps()
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
-        session.Bind(10);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.NonReplicated).RequestId);
         Assert.Equal(1UL, session.RequestCounter);
@@ -137,7 +179,7 @@ public sealed class ConsensusSessionTests
         // two planes interleave on one sequence.
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
-        session.Bind(10);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
         Assert.Equal(1UL, session.Resolve(VsrOperation.SendMessages).RequestId);
         Assert.Equal(2UL, session.Resolve(VsrOperation.SendMessages).RequestId);
@@ -150,9 +192,9 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
-        session.Bind(10);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
 
-        Assert.Throws<NotConnectedException>(() => session.Bind(20));
+        Assert.Throws<NotConnectedException>(() => session.Bind(20, new byte[LoginRegister.BIND_SECRET_BYTES]));
         Assert.Equal(10UL, session.Session);
     }
 
@@ -161,7 +203,7 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(1);
 
-        var exception = Assert.Throws<IggyInvalidStatusCodeException>(() => session.Bind(0));
+        var exception = Assert.Throws<IggyInvalidStatusCodeException>(() => session.Bind(0, new byte[LoginRegister.BIND_SECRET_BYTES]));
         Assert.Equal(VsrError.INVALID_FORMAT, exception.StatusCode);
     }
 
@@ -170,7 +212,7 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(1);
 
-        Assert.Throws<NotConnectedException>(() => session.Bind(10));
+        Assert.Throws<NotConnectedException>(() => session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]));
     }
 
     /// <summary>
@@ -186,7 +228,7 @@ public sealed class ConsensusSessionTests
 
         session.Reset();
 
-        Assert.Throws<NotConnectedException>(() => session.Bind(10));
+        Assert.Throws<NotConnectedException>(() => session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]));
         Assert.False(session.IsBound);
     }
 
@@ -221,7 +263,7 @@ public sealed class ConsensusSessionTests
     {
         var session = new ConsensusSession(1);
         session.Resolve(VsrOperation.Register);
-        session.Bind(10);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
         session.Resolve(VsrOperation.CreateStream);
 
         session.Reset();
@@ -238,7 +280,7 @@ public sealed class ConsensusSessionTests
         var initialGeneration = session.Generation;
 
         session.Resolve(VsrOperation.Register);
-        session.Bind(10);
+        session.Bind(10, new byte[LoginRegister.BIND_SECRET_BYTES]);
         Assert.Equal(initialGeneration, session.Generation);
 
         session.Reset();
@@ -246,7 +288,7 @@ public sealed class ConsensusSessionTests
 
         // A register on a previously bound session re-arms the identity, which is a new generation too.
         session.Resolve(VsrOperation.Register);
-        session.Bind(11);
+        session.Bind(11, new byte[LoginRegister.BIND_SECRET_BYTES]);
         session.Resolve(VsrOperation.Register);
         Assert.Equal(initialGeneration + 2, session.Generation);
     }

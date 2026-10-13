@@ -309,29 +309,35 @@ mod logging_tests {
     use iggy_common::{IggyByteSize, IggyDuration};
     use std::time::Duration;
 
+    #[test]
+    fn given_print_interval_samples_when_validating_should_accept_zero_or_at_least_one_second() {
+        let one_second = Duration::from_secs(1);
+        let samples = [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_millis(1),
+            Duration::from_millis(500),
+            Duration::from_nanos(999_999_999),
+            one_second,
+            Duration::from_nanos(1_000_000_001),
+            Duration::from_secs(10),
+        ];
+        for interval in samples {
+            let accepted = with_sysinfo_print_interval(interval).validate().is_ok();
+            assert_eq!(
+                accepted,
+                interval.is_zero() || interval >= one_second,
+                "sysinfo_print_interval {interval:?}"
+            );
+        }
+    }
+
     fn with_sysinfo_print_interval(interval: Duration) -> LoggingConfig {
         LoggingConfig {
             sysinfo_print_interval: IggyDuration::new(interval),
             ..LoggingConfig::default()
         }
-    }
-
-    #[test]
-    fn sub_second_sysinfo_print_interval_is_rejected() {
-        let config = with_sysinfo_print_interval(Duration::from_millis(999));
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn one_second_sysinfo_print_interval_is_accepted() {
-        let config = with_sysinfo_print_interval(Duration::from_secs(1));
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn disabled_sysinfo_print_interval_is_accepted() {
-        let config = with_sysinfo_print_interval(Duration::ZERO);
-        assert!(config.validate().is_ok());
     }
 
     #[test]

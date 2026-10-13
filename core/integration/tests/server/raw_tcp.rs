@@ -31,6 +31,7 @@ use iggy_binary_protocol::consensus::{
     result_section_len,
 };
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, EvictionHeader, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName,
@@ -40,6 +41,8 @@ use secrecy::SecretString;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
+
+pub(crate) const TEST_BIND_SECRET: [u8; 32] = [0x5a; 32];
 
 /// Per-frame reply wait. A server that drops the frame answers nothing at
 /// all, so an unanswered read is a verdict, not a reason to wait longer.
@@ -61,6 +64,24 @@ pub(crate) async fn connect(harness: &TestHarness) -> TcpStream {
 
 pub(crate) async fn connect_to(addr: SocketAddr) -> TcpStream {
     TcpStream::connect(addr).await.unwrap()
+}
+
+pub(crate) async fn partition_context(
+    client: &IggyClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: u32,
+) -> PartitionContext {
+    client
+        .get_topic(stream_id, topic_id)
+        .await
+        .expect("discover partition context")
+        .expect("topic exists")
+        .partitions
+        .into_iter()
+        .find(|partition| partition.id == partition_id)
+        .expect("partition exists")
+        .context
 }
 
 pub(crate) fn request_header(
@@ -95,7 +116,11 @@ pub(crate) fn non_replicated_header(
 }
 
 pub(crate) async fn write_frame(stream: &mut TcpStream, header: &RequestHeader, body: &[u8]) {
-    stream.write_all(bytemuck::bytes_of(header)).await.unwrap();
+    write_raw_frame(stream, bytemuck::bytes_of(header), body).await;
+}
+
+async fn write_raw_frame(stream: &mut TcpStream, header: &[u8], body: &[u8]) {
+    stream.write_all(header).await.unwrap();
     if !body.is_empty() {
         stream.write_all(body).await.unwrap();
     }
@@ -118,7 +143,17 @@ pub(crate) async fn exchange(
     header: &RequestHeader,
     body: &[u8],
 ) -> ([u8; HEADER_SIZE], Vec<u8>) {
-    write_frame(stream, header, body).await;
+    exchange_raw(stream, bytemuck::bytes_of(header), body).await
+}
+
+/// [`exchange`] for a header that [`RequestHeader`] cannot hold, such as one
+/// whose operation byte this build does not declare.
+pub(crate) async fn exchange_raw(
+    stream: &mut TcpStream,
+    header: &[u8],
+    body: &[u8],
+) -> ([u8; HEADER_SIZE], Vec<u8>) {
+    write_raw_frame(stream, header, body).await;
     let reply_header = read_frame_header(stream).await;
     let command = frame_command(&reply_header);
     assert_eq!(
@@ -175,6 +210,7 @@ pub(crate) async fn register_root(stream: &mut TcpStream, client: u128) -> u64 {
         username: WireName::new(DEFAULT_ROOT_USERNAME).unwrap(),
         password: SecretString::from(DEFAULT_ROOT_PASSWORD),
         client_context: None,
+        bind_secret: BindSecret::new(Box::new(TEST_BIND_SECRET)),
     }
     .to_bytes();
     let header = request_header(Operation::Register, client, 0, 0, body.len());

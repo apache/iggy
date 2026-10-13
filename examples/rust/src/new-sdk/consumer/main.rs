@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         ConsumerKind::ConsumerGroup => {
             client.consumer_group(name, &args.stream_id, &args.topic_id)?
         }
+        ConsumerKind::ExternalGroup => return Err("an external group cannot poll".into()),
     }
     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
     .create_consumer_group_if_not_exists()

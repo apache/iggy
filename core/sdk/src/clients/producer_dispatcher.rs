@@ -62,6 +62,7 @@ use tokio::task::JoinHandle;
 ///
 /// let producer = client
 ///     .producer("my-stream", "my-topic")?
+///     .topic_durability(iggy::prelude::Durability::Persisted)
 ///     .background(BackgroundConfig::builder().num_shards(4).build())
 ///     .build();
 /// producer.init().await?;

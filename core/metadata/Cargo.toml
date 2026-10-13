@@ -41,7 +41,9 @@ simulator = []
 ahash = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+compio = { workspace = true }
 consensus = { workspace = true }
+futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
@@ -56,8 +58,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
-compio = { workspace = true }
-futures = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

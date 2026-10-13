@@ -26,17 +26,29 @@
 //! every function some *other* binary uses as unused here.
 #![allow(dead_code)]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use kafka_protocol::protocol::{Decodable, Encodable};
 
 use super::codec::Encoder;
 
+/// Encodes any `kafka_protocol` request or response type at `version`.
+pub fn encode<M: Encodable>(message: &M, version: i16) -> Bytes {
+    let mut buf = BytesMut::new();
+    message.encode(&mut buf, version).expect("encode request");
+    buf.freeze()
+}
+
+/// Decodes any `kafka_protocol` request or response type at `version`.
+pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
+    let mut buf = body;
+    M::decode(&mut buf, version).expect("decode response")
+}
+
 /// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
 pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
-    (8, "OffsetCommit"),
-    (9, "OffsetFetch"),
-    (15, "DescribeGroups"),
-    (16, "ListGroups"),
-    (20, "DeleteTopics"),
+    (21, "DeleteRecords"),
+    (42, "DeleteGroups"),
+    (44, "IncrementalAlterConfigs"),
 ];
 
 /// Append Metadata request fields that follow the topics array for `version`.
@@ -178,6 +190,47 @@ pub fn build_create_topics_empty_request(version: i16) -> Bytes {
     enc.freeze()
 }
 
+/// Empty `DeleteTopics` request (no topic names) for supported versions (v1-v5).
+pub fn build_delete_topics_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+
+    if flexible {
+        enc.write_varint(1); // empty topic_names compact array (N+1 = 1)
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_i32(5_000); // timeout_ms
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
+/// `DeleteTopics` request naming one topic, for supported versions (v1-v5).
+///
+/// Unlike [`build_delete_topics_empty_request`], this actually produces a per-topic result -
+/// an empty request's response has zero entries, so no error code in it is ever observed.
+pub fn build_delete_topics_request_with_name(version: i16, name: &str) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(32);
+
+    if flexible {
+        enc.write_varint(2); // one topic_names entry (N+1 = 2)
+        enc.write_compact_nullable_string(Some(name));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(name)).expect("name fits");
+    }
+    enc.write_i32(5_000); // timeout_ms
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
 /// Produce v2–v8 legacy request with optional transactional id and topic.
 pub fn build_produce_legacy_request(
     version: i16,
@@ -212,6 +265,41 @@ pub fn build_produce_flexible_empty_request(acks: i16) -> Bytes {
     enc.write_i32(1_000); // timeout_ms
     enc.write_varint(1); // empty topics compact array (N+1)
     enc.write_empty_tagged_fields();
+    enc.freeze()
+}
+
+/// `DescribeConfigs` with no resources. Flexible from v4. `include_documentation` exists from v3.
+pub fn build_describe_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 4;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // include_synonyms
+    if version >= 3 {
+        enc.write_bool(false); // include_documentation
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `AlterConfigs` with no resources. Flexible from v2.
+pub fn build_alter_configs_empty_request(version: i16) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(16);
+    if flexible {
+        enc.write_varint(1);
+    } else {
+        enc.write_i32(0);
+    }
+    enc.write_bool(false); // validate_only
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
     enc.freeze()
 }
 
@@ -463,7 +551,49 @@ pub fn build_create_topics_request_with_sections(version: i16, topic: &str) -> B
     enc.freeze()
 }
 
-// ── Consumer group coordination (keys 10, 11, 12, 14) ───────────────────────
+// ── Consumer group coordination (keys 10-16) ────────────────────────────────
+
+/// `DescribeGroups` request naming `groups`. `include_authorized_operations` is written from v3.
+pub fn build_describe_groups_request(
+    version: i16,
+    groups: &[&str],
+    include_authorized_operations: bool,
+) -> Bytes {
+    let flexible = version >= 5;
+    let mut enc = Encoder::with_capacity(64);
+    write_array_count(&mut enc, flexible, groups.len());
+    for group in groups {
+        write_string(&mut enc, flexible, Some(group));
+    }
+    if version >= 3 {
+        enc.write_bool(include_authorized_operations);
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `ListGroups` request. `states` is written from v4 and `group_types` from v5.
+pub fn build_list_groups_request(version: i16, states: &[&str], group_types: &[&str]) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    if version >= 4 {
+        enc.write_varint((states.len() + 1) as u64);
+        for state in states {
+            enc.write_compact_nullable_string(Some(state));
+        }
+    }
+    if version >= 5 {
+        enc.write_varint((group_types.len() + 1) as u64);
+        for group_type in group_types {
+            enc.write_compact_nullable_string(Some(group_type));
+        }
+    }
+    if version >= 3 {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
 
 /// Write a Kafka string, compact or legacy by `flexible`.
 fn write_string(enc: &mut Encoder, flexible: bool, value: Option<&str>) {
@@ -596,6 +726,107 @@ pub fn build_heartbeat_request(
     if flexible {
         enc.write_empty_tagged_fields();
     }
+    enc.freeze()
+}
+
+/// `OffsetCommit` request for partition 0 of `topic`, made outside the group protocol.
+pub fn build_offset_commit_request(
+    version: i16,
+    group_id: &str,
+    topic: &str,
+    offset: i64,
+) -> Bytes {
+    let flexible = version >= 8;
+    let mut enc = Encoder::with_capacity(64);
+
+    write_string(&mut enc, flexible, Some(group_id));
+    enc.write_i32(-1); // generation_id_or_member_epoch
+    write_string(&mut enc, flexible, Some("")); // member_id
+    if version >= 7 {
+        write_string(&mut enc, flexible, None); // group_instance_id
+    }
+    if version <= 4 {
+        enc.write_i64(-1); // retention_time_ms
+    }
+    write_array_count(&mut enc, flexible, 1);
+    write_string(&mut enc, flexible, Some(topic));
+    write_array_count(&mut enc, flexible, 1);
+    enc.write_i32(0); // partition_index
+    enc.write_i64(offset);
+    if version >= 6 {
+        enc.write_i32(-1); // committed_leader_epoch
+    }
+    write_string(&mut enc, flexible, None); // committed_metadata
+    if flexible {
+        enc.write_empty_tagged_fields(); // partition
+        enc.write_empty_tagged_fields(); // topic
+        enc.write_empty_tagged_fields(); // request
+    }
+    enc.freeze()
+}
+
+/// `OffsetFetch` request for one group: top level below v8, the `groups` array from v8.
+/// `Some(topic)` asks for partition 0 of `topic`. `None` sends a null topic list, which asks for
+/// every offset of the group, from version 2.
+pub fn build_offset_fetch_request(version: i16, group_id: &str, topic: Option<&str>) -> Bytes {
+    let flexible = version >= 6;
+    let mut enc = Encoder::with_capacity(64);
+
+    if version >= 8 {
+        write_array_count(&mut enc, true, 1); // groups
+    }
+    write_string(&mut enc, flexible, Some(group_id));
+    if version >= 9 {
+        write_string(&mut enc, true, None); // member_id
+        enc.write_i32(-1); // member_epoch
+    }
+    match topic {
+        Some(topic) => {
+            write_array_count(&mut enc, flexible, 1); // topics
+            write_string(&mut enc, flexible, Some(topic));
+            write_array_count(&mut enc, flexible, 1); // partition_indexes
+            enc.write_i32(0);
+            if flexible {
+                enc.write_empty_tagged_fields(); // topic
+            }
+        }
+        None if flexible => enc.write_varint(0), // topics: null
+        None => enc.write_i32(-1),               // topics: null
+    }
+    if version >= 8 {
+        enc.write_empty_tagged_fields(); // group
+    }
+    if version >= 7 {
+        enc.write_bool(false); // require_stable
+    }
+    if flexible {
+        enc.write_empty_tagged_fields(); // request
+    }
+    enc.freeze()
+}
+
+/// `OffsetFetch` request, v8 or later, for every group of `groups`. Each asks for partition 0 of
+/// `topic`.
+pub fn build_offset_fetch_groups_request(version: i16, groups: &[&str], topic: &str) -> Bytes {
+    assert!(version >= 8, "only v8 and later name several groups");
+    let mut enc = Encoder::with_capacity(64);
+
+    write_array_count(&mut enc, true, groups.len());
+    for group_id in groups {
+        write_string(&mut enc, true, Some(group_id));
+        if version >= 9 {
+            write_string(&mut enc, true, None); // member_id
+            enc.write_i32(-1); // member_epoch
+        }
+        write_array_count(&mut enc, true, 1); // topics
+        write_string(&mut enc, true, Some(topic));
+        write_array_count(&mut enc, true, 1); // partition_indexes
+        enc.write_i32(0);
+        enc.write_empty_tagged_fields(); // topic
+        enc.write_empty_tagged_fields(); // group
+    }
+    enc.write_bool(false); // require_stable
+    enc.write_empty_tagged_fields(); // request
     enc.freeze()
 }
 

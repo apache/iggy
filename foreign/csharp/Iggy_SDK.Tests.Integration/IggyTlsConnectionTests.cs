@@ -101,4 +101,20 @@ public class IggyTlsConnectionTests
 
         loginResult.ShouldNotBeNull();
     }
+
+    [Test]
+    public async Task Connect_WithTlsConnectionString_Should_SignIn()
+    {
+        var address = await Fixture.GetIggyAddressAsync(Protocol.Tcp);
+
+        // The heartbeat stays below the fixture's server heartbeat, or an idle client is evicted mid-test.
+        using var client = IggyClientFactory.CreateClient(
+            $"iggy://iggy:iggy@{address}?tls=true&tls_domain=localhost&tls_ca_file=Certs/iggy_ca_cert.pem"
+            + "&reconnection_retries=0&heartbeat_interval=1s");
+        await client.ConnectAsync();
+
+        var me = await client.GetMeAsync();
+        me.ShouldNotBeNull();
+        me.UserId.ShouldBe(0u);
+    }
 }

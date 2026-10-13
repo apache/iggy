@@ -28,17 +28,24 @@ use super::register_forwarding::connect_without_login;
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
-    ATTACH_CONSUMER_SESSION_CODE, GET_POLL_ROUTING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-    STORE_CONSUMER_OFFSET_CODE,
+    BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_POLL_ROUTING_CODE,
+    POLL_MESSAGES_ON_PRIMARY_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
+use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::system::BindSessionRequest;
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::messages::PollRoutingResponse;
-use iggy_binary_protocol::{WireDecode, WireEncode};
+use iggy_binary_protocol::{
+    ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireName,
+};
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::wire_conversions::{
     consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
 };
-use iggy_common::{BinaryTransport, RESYNC_REQUIRED_PARTITION_SENTINEL};
+use iggy_common::{BinaryTransport, RESYNC_REQUIRED_PARTITION_SENTINEL, VsrSessionControl};
 use integration::harness::TestHarness;
 use integration::harness::disk::{
     leader_node_index_via, read_metadata_superblock_state, read_partition_superblock_state,
@@ -136,6 +143,7 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
             TOPIC_NAME,
             &TopicCreateOptions {
                 partitions_count: Some(1),
+                durability: Durability::Persisted,
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 ..TopicCreateOptions::default()
             },
@@ -181,21 +189,30 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
     );
 }
 
-#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    consumer_group.rebalancing_timeout = "1s",
+))]
 async fn given_different_metadata_and_partition_primaries_when_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
     assert_group_auto_commit_routing(harness, TransportProtocol::Tcp).await;
 }
 
-#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    consumer_group.rebalancing_timeout = "1s",
+))]
 async fn given_different_metadata_and_partition_primaries_when_quic_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
     assert_group_auto_commit_routing(harness, TransportProtocol::Quic).await;
 }
 
-#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    consumer_group.rebalancing_timeout = "1s",
+))]
 async fn given_different_metadata_and_partition_primaries_when_websocket_group_auto_commits_should_return_messages(
     harness: &mut TestHarness,
 ) {
@@ -317,6 +334,15 @@ async fn assert_group_offset_routing(
         .join_consumer_group(&stream, &topic, &group)
         .await
         .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        member,
+        &stream,
+        &topic,
+        &group,
+        1,
+        PRECONDITION_BUDGET,
+    )
+    .await;
     let before = member.get_me().await.unwrap();
     for offset in 0..GROUP_PAYLOADS.len() as u64 {
         timeout(
@@ -448,6 +474,7 @@ async fn seed_split_primaries(harness: &mut TestHarness) -> (usize, usize, u32) 
                 message_expiry: Some(IggyExpiry::NeverExpire),
                 messages_required_to_save: Some(1),
                 durability: Durability::Persisted,
+                consumer_offset_durability: Durability::Persisted,
                 ..TopicCreateOptions::default()
             },
         )
@@ -557,6 +584,15 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
         .join_consumer_group(&stream, &topic, &group)
         .await
         .unwrap();
+    integration::harness::wait_for_consumer_group_assignment(
+        &member,
+        &stream,
+        &topic,
+        &group,
+        1,
+        PRECONDITION_BUDGET,
+    )
+    .await;
     let membership = member
         .get_consumer_group(&stream, &topic, &group)
         .await
@@ -783,62 +819,83 @@ async fn assert_data_session_fences(
     let route = PollRoutingResponse::decode_from(&response).unwrap();
     let address = harness.node(partition_primary).tcp_addr().unwrap();
     let data = connect_without_login(address).await;
-    data.login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await
-        .unwrap();
+    let mut binding = {
+        let client = member.client();
+        let client = client.read().await;
+        let bind_secret = match &*client {
+            ClientWrapper::Tcp(client) => client.session_bind_secret().await,
+            ClientWrapper::Quic(client) => client.session_bind_secret().await,
+            ClientWrapper::WebSocket(client) => client.session_bind_secret().await,
+            ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => {
+                panic!("fixture requires a binary transport");
+            }
+        };
+        BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("routing-test").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            identity: route.consumer_session,
+            bind_secret: bind_secret.unwrap(),
+        }
+    };
     member
         .create_user(OTHER_USER, OTHER_PASSWORD, UserStatus::Active, None)
         .await
         .unwrap();
     let other_user = Identifier::named(OTHER_USER).unwrap();
+    let observer = harness
+        .root_client_for_node(partition_primary)
+        .await
+        .unwrap();
     timeout(PRECONDITION_BUDGET, async {
-        while data.get_user(&other_user).await.unwrap().is_none() {
+        while observer.get_user(&other_user).await.unwrap().is_none() {
             sleep(PRECONDITION_POLL).await;
         }
     })
     .await
-    .expect("the data node must observe the new user before login");
+    .expect("the metadata observer must see the new user before login");
     let other = connect_without_login(address).await;
     other.login_user(OTHER_USER, OTHER_PASSWORD).await.unwrap();
     assert!(
         matches!(
             other
-                .send_raw_with_response(
-                    ATTACH_CONSUMER_SESSION_CODE,
-                    route.consumer_session.to_bytes()
-                )
+                .send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
                 .await,
-            Err(IggyError::StaleClient)
+            Err(IggyError::AlreadyAuthenticated)
         ),
         "authentication as another user must not authorize attachment"
     );
     let anonymous = connect_without_login(address).await;
+    let mut wrong_secret = binding.clone();
+    const WRONG_BIND_SECRET: [u8; 32] = [0; 32];
+    wrong_secret.bind_secret = BindSecret::new(Box::new(WRONG_BIND_SECRET));
     assert!(matches!(
         anonymous
-            .send_raw_with_response(
-                ATTACH_CONSUMER_SESSION_CODE,
-                route.consumer_session.to_bytes()
-            )
+            .send_raw_with_response(BIND_SESSION_CODE, wrong_secret.to_bytes())
             .await,
         Err(IggyError::Unauthenticated)
     ));
-    let mut wrong_epoch = route.consumer_session;
-    wrong_epoch.session += 1;
+    let mut wrong_epoch = binding.clone();
+    wrong_epoch.identity.session += 1;
     assert!(
         matches!(
-            data.send_raw_with_response(ATTACH_CONSUMER_SESSION_CODE, wrong_epoch.to_bytes())
+            data.send_raw_with_response(BIND_SESSION_CODE, wrong_epoch.to_bytes())
                 .await,
-            Err(IggyError::StaleClient)
+            Err(IggyError::InvalidSession(_))
         ),
         "attachment must require the exact parent epoch"
     );
-    data.send_raw_with_response(
-        ATTACH_CONSUMER_SESSION_CODE,
-        route.consumer_session.to_bytes(),
-    )
-    .await
-    .unwrap();
-    data.send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+    data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
+        .await
+        .unwrap();
+    // Raw Bind authenticates the server connection, but the SDK encoder still
+    // needs its epoch before it can issue the explicit offset request below.
+    data.bind_vsr_session(binding.identity.session)
+        .await
+        .unwrap();
+    data.send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
         .await
         .unwrap();
 
@@ -846,22 +903,29 @@ async fn assert_data_session_fences(
         .leave_consumer_group(stream, topic, &consumer.id)
         .await
         .unwrap();
+    let membership_query = GetConsumerGroupRequest {
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        group_id: identifier_to_wire(&consumer.id).unwrap(),
+    }
+    .to_bytes();
     timeout(PRECONDITION_BUDGET, async {
-        while data
-            .get_consumer_group(stream, topic, &consumer.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .members_count
-            != 0
-        {
+        loop {
+            let response = data
+                .send_raw_with_response(GET_CONSUMER_GROUP_CODE, membership_query.clone())
+                .await
+                .unwrap();
+            let membership = ConsumerGroupDetailsResponse::decode_from(&response).unwrap();
+            if membership.group.members_count == 0 {
+                break;
+            }
             sleep(PRECONDITION_POLL).await;
         }
     })
     .await
     .expect("the data node must observe the member leaving");
     let response = data
-        .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
         .await
         .unwrap();
     let polled = PolledMessages::from_bytes(response).unwrap();
@@ -881,8 +945,12 @@ async fn assert_data_session_fences(
     .to_bytes();
     assert!(
         matches!(
-            data.send_raw_with_response(STORE_CONSUMER_OFFSET_CODE, offset_write.clone())
-                .await,
+            data.send_raw_with_context(
+                STORE_CONSUMER_OFFSET_CODE,
+                offset_write.clone(),
+                route.context
+            )
+            .await,
             Err(IggyError::ConsumerGroupPartitionNotOwned(..))
         ),
         "a departed member must not commit through its attachment"
@@ -892,36 +960,46 @@ async fn assert_data_session_fences(
         .join_consumer_group(stream, topic, &consumer.id)
         .await
         .unwrap();
-    member
-        .poll_messages(
-            stream,
-            topic,
-            None,
-            consumer,
-            &PollingStrategy::next(),
-            1,
-            true,
-        )
-        .await
-        .unwrap();
-    let response = member
-        .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
-        .await
-        .unwrap();
-    let route = PollRoutingResponse::decode_from(&response).unwrap();
-    data.send_raw_with_response(
-        ATTACH_CONSUMER_SESSION_CODE,
-        route.consumer_session.to_bytes(),
+    integration::harness::wait_for_consumer_group_assignment(
+        member,
+        stream,
+        topic,
+        &consumer.id,
+        1,
+        PRECONDITION_BUDGET,
     )
+    .await;
+    // The rejoining session can still appear as the draining old owner.
+    let replacement_route = timeout(PRECONDITION_BUDGET, async {
+        loop {
+            match member
+                .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+                .await
+            {
+                Ok(response) => break PollRoutingResponse::decode_from(&response).unwrap(),
+                Err(
+                    IggyError::ConsumerGroupPartitionNotOwned(..) | IggyError::TransientNotAccepted,
+                ) => {}
+                Err(error) => panic!("route discovery failed after rejoining: {error:?}"),
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
     .await
-    .unwrap();
+    .expect("rejoining must install a pollable owner within the routing budget");
+    assert!(replacement_route.context.owner_generation > route.context.owner_generation);
+    let route = replacement_route;
+    binding.identity = route.consumer_session;
+    data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
+        .await
+        .unwrap();
     member.logout_user().await.unwrap();
     timeout(PRECONDITION_BUDGET, async {
         loop {
             let result = data
-                .send_raw_with_response(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone())
+                .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
                 .await;
-            if matches!(result, Err(IggyError::StaleClient)) {
+            if matches!(result, Err(IggyError::Unauthenticated)) {
                 break;
             }
             assert!(

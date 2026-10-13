@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp.vsr;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import org.apache.iggy.partition.PartitionContext;
 
 /**
  * Encodes a (code, payload) command into a VSR request frame:
@@ -43,11 +44,32 @@ public final class VsrRequestEncoder {
         this.session = session;
     }
 
+    public static ByteBuf bindSession(
+            ByteBufAllocator alloc, long clientLow, long clientHigh, long session, long watermark, byte[] bindSecret) {
+        return VsrLoginCodec.bindSession(alloc, clientLow, clientHigh, session, watermark, bindSecret);
+    }
+
+    public ByteBuf bindSession(ByteBufAllocator alloc) {
+        synchronized (session) {
+            return bindSession(
+                    alloc,
+                    session.clientIdLow(),
+                    session.clientIdHigh(),
+                    session.boundSession(),
+                    session.metadataWatermark(),
+                    session.bindSecret());
+        }
+    }
+
     /**
      * Builds the full request frame. The caller keeps ownership of
      * {@code payload}; its reader index is not advanced.
      */
     public ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload) {
+        return encode(alloc, commandCode, payload, PartitionContext.EMPTY);
+    }
+
+    public ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload, PartitionContext context) {
         int operation;
         long requestId;
         long sessionId;
@@ -55,17 +77,17 @@ public final class VsrRequestEncoder {
         boolean releaseBody = false;
 
         if (commandCode == LOGIN_USER_CODE || commandCode == LOGIN_REGISTER_CODE) {
-            body = VsrLoginCodec.rewriteUserLogin(alloc, payload);
+            requestId = session.beginRegister();
+            body = VsrLoginCodec.rewriteUserLogin(alloc, payload, session.bindSecret());
             releaseBody = true;
             operation = VsrOperation.REGISTER;
-            requestId = session.beginRegister();
             sessionId = 0;
         } else if (commandCode == LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
                 || commandCode == LOGIN_REGISTER_WITH_PAT_CODE) {
-            body = VsrLoginCodec.rewritePatLogin(alloc, payload);
+            requestId = session.beginRegister();
+            body = VsrLoginCodec.rewritePatLogin(alloc, payload, session.bindSecret());
             releaseBody = true;
             operation = VsrOperation.REGISTER;
-            requestId = session.beginRegister();
             sessionId = 0;
         } else {
             body = payload;
@@ -96,6 +118,13 @@ public final class VsrRequestEncoder {
             frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
             frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
             frame.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
+            frame.setLongLE(
+                    VsrHeaders.REQUEST_INCARNATION_OFFSET, context.incarnation().longValue());
+            frame.setLongLE(
+                    VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET,
+                    context.ownerGeneration().longValue());
+            frame.setLongLE(
+                    VsrHeaders.REQUEST_METADATA_OP_OFFSET, context.metadataOp().longValue());
             if (operation == VsrOperation.NON_REPLICATED) {
                 frame.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, commandCode);
             }

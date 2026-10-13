@@ -181,6 +181,7 @@ pub(in crate::http) async fn resolve_credential(
     if let Ok(claims) = state.jwt.decode(bearer).await
         && let Ok(user_id) = claims.sub.parse::<u32>()
     {
+        state.ensure_active_user(user_id)?;
         return Ok((
             format!("{JWT_KEY_PREFIX}{}", claims.jti),
             user_id,

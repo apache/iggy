@@ -52,7 +52,9 @@ use std::path::{Path, PathBuf};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use server_common::fatal::NoteDescriptorExhaustion;
 
-use crate::prepare_journal::TmpFileGuard;
+use crate::prepare_journal::{TmpFileGuard, sweep_tmp_files};
+use futures::lock::Mutex;
+use std::sync::Arc;
 use twox_hash::XxHash3_64;
 
 /// Identifies a superblock file and rejects a foreign or zeroed one. "SBLK".
@@ -168,6 +170,7 @@ impl Slot {
 /// Two-file ping-pong superblock. See the module docs for the durability
 /// argument.
 pub struct PingPongSuperblock {
+    temporary_file_gate: Arc<Mutex<()>>,
     dir: PathBuf,
     /// Sequence to stamp on the next `write`. Monotonic; selects the latest
     /// record on read.
@@ -212,6 +215,7 @@ impl PingPongSuperblock {
         dir: impl Into<PathBuf>,
     ) -> io::Result<(Self, SuperblockContents)> {
         let dir = dir.into();
+        sweep_tmp_files(&[FILE_A, FILE_B].map(|name| dir.join(format!("{name}.tmp")))).await;
         let slot_a = read_slot(&dir.join(FILE_A)).await?;
         let slot_b = read_slot(&dir.join(FILE_B)).await?;
         let seq_a = sequence_of(&slot_a);
@@ -233,6 +237,7 @@ impl PingPongSuperblock {
         let next_slot = if a_is_newest { Slot::B } else { Slot::A };
 
         let store = Self {
+            temporary_file_gate: Arc::new(Mutex::new(())),
             dir,
             next_sequence: Cell::new(latest + 1),
             next_slot: Cell::new(next_slot),
@@ -272,7 +277,13 @@ impl SuperblockStore for PingPongSuperblock {
         // contract nobody violated, sending whoever debugs it to audit the lock.
         #[cfg(debug_assertions)]
         let _writing = WritingGuard::acquire(&self.writing);
-        atomic_replace(&self.dir, slot.file_name(), record).await?;
+        atomic_replace(
+            &self.dir,
+            slot.file_name(),
+            record,
+            &self.temporary_file_gate,
+        )
+        .await?;
         self.next_sequence.set(sequence + 1);
         self.next_slot.set(slot.other());
         Ok(())
@@ -525,23 +536,27 @@ async fn read_slot(path: &Path) -> io::Result<SlotClass> {
 
 /// Replace `dir/file_name` atomically: write a temp, fsync it, rename over the
 /// target, then fsync the directory so the rename itself is durable.
-async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Result<()> {
-    let tmp_path = dir.join(format!("{file_name}.tmp"));
+async fn atomic_replace(
+    dir: &Path,
+    file_name: &str,
+    bytes: Vec<u8>,
+    gate: &Arc<Mutex<()>>,
+) -> io::Result<()> {
+    let (mut tmp, guard) =
+        TmpFileGuard::create(&dir.join(format!("{file_name}.tmp")), gate).await?;
     let final_path = dir.join(file_name);
 
-    // Unlink the temp on any failure before the rename. Not a correctness matter,
-    // since `File::create` truncates and `next_sequence` / `next_slot` stay
-    // un-advanced so a retry re-targets the same slot; it keeps a failing disk from
-    // littering `superblock.{a,b}.tmp` next to the slots an operator is inspecting.
-    let guard = TmpFileGuard::new(tmp_path.clone());
-    let mut tmp = compio::fs::File::create(&tmp_path)
-        .await
-        .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))?;
-    let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
-    result?;
-    tmp.sync_all().await?;
-
-    compio::fs::rename(&tmp_path, &final_path).await?;
+    let prepared = async {
+        let (result, _buf) = tmp.write_all_at(bytes, 0).await.into();
+        result?;
+        tmp.sync_all().await?;
+        compio::fs::rename(guard.path(), &final_path).await
+    }
+    .await;
+    if let Err(error) = prepared {
+        guard.cleanup().await;
+        return Err(error);
+    }
     guard.defuse();
 
     let dir_file = compio::fs::File::open(dir)

@@ -78,14 +78,15 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
                 Optional.ofNullable(connectionTimeout),
                 Optional.ofNullable(requestTimeout),
                 Optional.ofNullable(tlsCertificate));
+        var sendContexts = new SendContexts();
         systemClient = new SystemHttpClient(internalHttpClient);
-        streamsClient = new StreamsHttpClient(internalHttpClient);
+        streamsClient = new StreamsHttpClient(internalHttpClient, sendContexts);
         usersClient = new UsersHttpClient(internalHttpClient);
-        topicsClient = new TopicsHttpClient(internalHttpClient);
-        partitionsClient = new PartitionsHttpClient(internalHttpClient);
+        topicsClient = new TopicsHttpClient(internalHttpClient, sendContexts);
+        partitionsClient = new PartitionsHttpClient(internalHttpClient, sendContexts);
         consumerGroupsClient = new ConsumerGroupsHttpClient(internalHttpClient);
         consumerOffsetsClient = new ConsumerOffsetsHttpClient(internalHttpClient);
-        messagesClient = new MessagesHttpClient(internalHttpClient);
+        messagesClient = new MessagesHttpClient(internalHttpClient, topicsClient, sendContexts);
         personalAccessTokensHttpClient = new PersonalAccessTokensHttpClient(internalHttpClient);
         log.debug("Initialized HTTP client for {} | {}", url, IggyVersion.getInstance());
     }

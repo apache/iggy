@@ -196,8 +196,9 @@ class ClientRoutingStateTest {
             var group = group("s", "t", "g");
             state.setAssignment(group, 1, List.of(0L), 42L);
 
-            assertThat(state.assignment(group)).hasValueSatisfying(assignment -> assertThat(assignment.syncedAtNanos())
-                    .isEqualTo(42L));
+            assertThat(state.assignment(group))
+                    .hasValueSatisfying(
+                            assignment -> assertThat(assignment.syncedAtNanos()).isEqualTo(42L));
         }
     }
 

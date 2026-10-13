@@ -23,22 +23,24 @@
 //! 3. The owner checks the reply connection, history, and recovery state, admits
 //!    any automatic commit, and updates progress before releasing the reply.
 //!
-//! A disk read can yield while purge or state transfer replaces the history,
-//! even on the same shard thread. The detached task therefore cannot advance
-//! progress or authorize a successful reply. Completion validation and progress
-//! updates run synchronously on the owner, before any replication wait.
+//! A disk read can yield while a delete and re-create or a state transfer
+//! replaces the history, even on the same shard thread. The detached task
+//! therefore cannot advance progress or authorize a successful reply.
+//! Completion validation and progress updates run synchronously on the owner,
+//! before any replication wait.
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, PartitionRead, PartitionReadReply, Sender};
 use consensus::client_table::SessionAttachment;
-use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
+use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::PollMetadata;
-use partitions::{PollCompletion, PollPlan, PollReadResult};
+use partitions::{PollCompletion, PollPlan, PollReadResult, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
@@ -48,7 +50,7 @@ mod completion_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
-mod timeout_tests;
+pub mod timeout_tests;
 
 /// Parent session and metadata identity checked by the partition owner before
 /// accepting consumer progress, including after detached poll I/O.
@@ -56,6 +58,18 @@ mod timeout_tests;
 pub struct ConsumerAttachment {
     pub session: SessionAttachment,
     pub metadata: PollMetadata,
+}
+
+impl ConsumerAttachment {
+    pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
+        if !is_partition_receipt_operation(operation) {
+            return Err(IggyError::InvalidCommand);
+        }
+        if !self.session.is_valid() {
+            return Err(IggyError::StaleClient);
+        }
+        Ok(())
+    }
 }
 
 /// A read result awaiting acceptance by its partition owner.
@@ -86,20 +100,12 @@ where
     M: StreamsFrontend,
     SB: SuperblockStore,
 {
-    pub(crate) fn validate_offset_attachment(
+    pub(crate) fn validate_partition_attachment(
         &self,
         request: &Message<RoutedRequestHeader>,
         attachment: &ConsumerAttachment,
     ) -> Result<(), IggyError> {
-        if !matches!(
-            request.header().operation,
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-        ) {
-            return Err(IggyError::InvalidCommand);
-        }
-        if !attachment.session.is_valid() {
-            return Err(IggyError::StaleClient);
-        }
+        attachment.validate_write(request.header().operation)?;
         let namespace = IggyNamespace::from_raw(request.header().group);
         if !attachment
             .metadata
@@ -116,10 +122,9 @@ where
                     && consensus.is_primary()
                     && consensus.is_normal()
                     && !consensus.is_transferring()
-                    && attachment.metadata.matches_partition(
-                        self.shards_table.epoch_for(namespace),
-                        partition.applied_purge_generation(),
-                    )
+                    && attachment
+                        .metadata
+                        .matches_partition(self.shards_table.epoch_for(namespace))
             })
             .unwrap_or(false);
         if !admissible {
@@ -139,28 +144,76 @@ where
         reply: Sender<PartitionReadReply>,
     ) {
         let partitions = self.plane.partitions();
-        let rejected = partitions
+        if matches!(read, PartitionRead::SessionRetired { .. }) {
+            let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
+                partitions
+                    .with_partition(&namespace, |partition| {
+                        partition.fatal().map(|_| partition.created_revision())
+                    })
+                    .flatten()
+            });
+            if let Some(created_revision) = failed_revision {
+                let _ = reply
+                    .try_send(PartitionReadReply::SessionRetirementFailed { created_revision });
+                return;
+            }
+        }
+        let rejection = partitions
             .with_partition(&namespace, |partition| {
-                if partition.requires_state_transfer() {
-                    return true;
+                if partition.requires_state_transfer() || partition.read_history_is_changing() {
+                    return Some(IggyError::TransientNotAccepted);
                 }
-                if let PartitionRead::PollOnPrimary { attachment, .. } = &read {
+                if let PartitionRead::PollOnPrimary {
+                    consumer,
+                    attachment,
+                    ..
+                } = &read
+                {
                     let consensus = partition.consensus();
-                    return !consensus.is_primary()
+                    if !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
-                        || !attachment.metadata.matches_partition(
-                            self.shards_table.epoch_for(namespace),
-                            partition.applied_purge_generation(),
-                        );
+                        || !attachment
+                            .metadata
+                            .matches_partition(self.shards_table.epoch_for(namespace))
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                    // This node's metadata can lag a delete fence the partition
+                    // already applied, so it still authorizes the old incarnation.
+                    if partition.history_deleted() {
+                        return Some(IggyError::HistoryUnavailable);
+                    }
+                    // The plan captures this owner in the same turn, and
+                    // completion refuses an owner that changed since.
+                    return match *consumer {
+                        PollingConsumer::ConsumerGroup(group_id, _) => group_owner_rejection(
+                            namespace,
+                            group_id as u64,
+                            partition.consumer_group_owner(group_id as u64),
+                            &attachment.metadata,
+                        ),
+                        PollingConsumer::Consumer(..) => None,
+                    };
                 }
-                false
+                if let PartitionRead::Poll {
+                    metadata: Some(metadata),
+                    ..
+                } = &read
+                    && (!metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace)))
+                {
+                    return Some(IggyError::TransientNotAccepted);
+                }
+                (matches!(read, PartitionRead::Poll { .. }) && partition.history_deleted())
+                    .then_some(IggyError::HistoryUnavailable)
             })
-            .unwrap_or(matches!(read, PartitionRead::PollOnPrimary { .. }));
-        if rejected {
-            let _ = reply.try_send(PartitionReadReply::Rejected(
-                IggyError::TransientNotAccepted,
-            ));
+            .unwrap_or_else(|| {
+                matches!(read, PartitionRead::PollOnPrimary { .. })
+                    .then_some(IggyError::TransientNotAccepted)
+            });
+        if let Some(error) = rejection {
+            let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
         }
         let (read, attachment) = match read {
@@ -168,10 +221,22 @@ where
                 consumer,
                 args,
                 attachment,
-            } => (PartitionRead::Poll { consumer, args }, Some(attachment)),
+            } => (
+                PartitionRead::Poll {
+                    consumer,
+                    args,
+                    metadata: None,
+                },
+                Some(attachment),
+            ),
             read => (read, None),
         };
         let result = match read {
+            PartitionRead::SessionRetired { identity } => partitions
+                .with_partition(&namespace, |partition| {
+                    PartitionReadReply::SessionRetired(partition.session_retired(identity))
+                })
+                .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Primary => partitions
                 .with_partition(&namespace, |partition| {
                     let consensus = partition.consensus();
@@ -186,7 +251,7 @@ where
                     }
                 })
                 .unwrap_or(PartitionReadReply::NotFound),
-            PartitionRead::Poll { consumer, args }
+            PartitionRead::Poll { consumer, args, .. }
             | PartitionRead::PollOnPrimary { consumer, args, .. } => {
                 match partitions.build_poll_snapshot(&namespace, consumer, &args) {
                     None => PartitionReadReply::NotFound,
@@ -250,6 +315,14 @@ where
                         current_offset,
                     }
                 }),
+            PartitionRead::ExternalGroupOffset { group_id } => partitions
+                .external_group_offset_read(&namespace, group_id)
+                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                    PartitionReadReply::ConsumerOffset {
+                        stored,
+                        current_offset,
+                    }
+                }),
             PartitionRead::GroupOffsetState { group_id } => partitions
                 .group_offset_state(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {
@@ -258,17 +331,18 @@ where
                         committed,
                     }
                 }),
-            PartitionRead::ClearGroupLastPolled { group_id } => partitions
-                .clear_group_last_polled(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |()| PartitionReadReply::Ack),
             PartitionRead::ResolveSegmentDeleteOffset { count } => partitions
                 .segment_delete_resolution(&namespace, count)
-                .map_or(PartitionReadReply::NotFound, |(up_to_offset, lagging)| {
-                    PartitionReadReply::SegmentDeleteOffset {
-                        up_to_offset,
-                        lagging,
-                    }
-                }),
+                .map_or(
+                    PartitionReadReply::NotFound,
+                    |(up_to_offset, lagging, created_revision)| {
+                        PartitionReadReply::SegmentDeleteOffset {
+                            up_to_offset,
+                            lagging,
+                            created_revision,
+                        }
+                    },
+                ),
         };
         let _ = reply.try_send(result);
     }
@@ -317,6 +391,7 @@ where
         let consumer_kind = result.consumer_kind();
         match partitions.complete_poll(&namespace, result) {
             Ok(PollCompletion {
+                context,
                 fragments,
                 current_offset,
                 replication,
@@ -325,6 +400,7 @@ where
                 // queued. Release the reply before waiting for replication.
                 // A poll reply does not acknowledge a durable offset commit.
                 let _ = reply.try_send(PartitionReadReply::Poll {
+                    context,
                     fragments,
                     current_offset,
                 });
@@ -342,6 +418,31 @@ where
             }
         }
     }
+}
+
+/// Serve a group read only to the partition's installed owner. The serving
+/// node's metadata can lag an install the partition already applied, for
+/// example on a new primary after a view change, and the partition commits a
+/// read's progress under the installed owner.
+fn group_owner_rejection(
+    namespace: IggyNamespace,
+    group_id: u64,
+    installed: Option<ConsumerGroupOwner>,
+    metadata: &PollMetadata,
+) -> Option<IggyError> {
+    if installed.is_some_and(|owner| metadata.is_installed_owner(group_id, owner)) {
+        return None;
+    }
+    // Metadata activates an owner only after its install committed, so an
+    // older or missing install means this replica has not applied it yet.
+    let attached_generation = metadata.context(0).owner_generation;
+    if installed.is_none_or(|owner| owner.generation < attached_generation) {
+        return Some(IggyError::TransientNotAccepted);
+    }
+    Some(IggyError::ConsumerGroupPartitionNotOwned(
+        u32::try_from(group_id).unwrap_or(u32::MAX),
+        u32::try_from(namespace.partition_id()).unwrap_or(u32::MAX),
+    ))
 }
 
 /// Read an owned snapshot without borrowing the partition or changing progress.

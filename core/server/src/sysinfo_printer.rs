@@ -20,9 +20,10 @@
 //! Spawned on shard 0 only: the numbers describe the whole process, so one
 //! line per node is enough, and the client count is already a cross-shard
 //! gather.
+//! CPU usage is the latest sampler delta (1 s), not the interval between logs.
 
 use crate::shell::ServerShard;
-use crate::sysinfo_probe::{SystemStats, stats_disk_space};
+use crate::sysinfo_probe::{SystemStats, probe_system_stats};
 use consensus::MetadataHandle;
 use iggy_common::IggyByteSize;
 use metadata::impls::metadata::StreamsFrontend;
@@ -30,29 +31,23 @@ use shard::Receiver;
 use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
-use sysinfo::System as SysinfoSystem;
 use tracing::level_filters::LevelFilter;
 use tracing::{info, trace};
 
 /// Run the printer until `stop` fires, logging one line every `interval`.
 pub async fn run_sysinfo_printer(shard: Rc<ServerShard>, stop: Receiver<()>, interval: Duration) {
     info!("System info logger is enabled, OS info will be printed every: {interval:?}");
-    // Not the shared `GetStats` sampler: a tick would reset its CPU window, and
-    // a `GetStats` on shard 0 right after a tick would show CPU near zero.
-    // Sampled once now, so the first line covers a full interval.
-    let mut system = SysinfoSystem::new();
-    SystemStats::capture(&mut system);
     loop {
         // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> print.
         match compio::time::timeout(interval, stop.recv()).await {
             Ok(_) => break,
-            Err(_) => print_sysinfo(&shard, &mut system).await,
+            Err(_) => print_sysinfo(&shard).await,
         }
     }
     trace!(shard = shard.id, "sysinfo printer exited");
 }
 
-async fn print_sysinfo(shard: &Rc<ServerShard>, system: &mut SysinfoSystem) {
+async fn print_sysinfo(shard: &Rc<ServerShard>) {
     // The global max level, not `tracing::enabled!`: the logger's idle
     // OpenTelemetry layers veto every `enabled` query, so that is always false.
     if LevelFilter::current() < LevelFilter::INFO {
@@ -60,14 +55,12 @@ async fn print_sysinfo(shard: &Rc<ServerShard>, system: &mut SysinfoSystem) {
     }
     let clients_count = shard.count_all_clients().await;
     let (messages_size_bytes, messages_count) = messages_totals(shard);
-    let (free_disk_space, total_disk_space) = stats_disk_space();
+    let system = probe_system_stats();
     let line = SysinfoLine {
-        system: SystemStats::capture(system),
+        system,
         messages_size_bytes,
         messages_count,
         clients_count,
-        free_disk_space,
-        total_disk_space,
     };
     info!("{line}");
 }
@@ -94,8 +87,6 @@ struct SysinfoLine {
     messages_size_bytes: u64,
     messages_count: u64,
     clients_count: usize,
-    free_disk_space: u64,
-    total_disk_space: u64,
 }
 
 impl SysinfoLine {
@@ -121,8 +112,8 @@ impl fmt::Display for SysinfoLine {
             IggyByteSize::from(system.memory_usage),
             IggyByteSize::from(system.total_memory.saturating_sub(system.available_memory)),
             IggyByteSize::from(system.total_memory),
-            IggyByteSize::from(self.free_disk_space),
-            IggyByteSize::from(self.total_disk_space),
+            IggyByteSize::from(system.free_disk_space),
+            IggyByteSize::from(system.total_disk_space),
             IggyByteSize::from(self.messages_size_bytes),
             self.clients_count,
             self.messages_count,
@@ -165,12 +156,12 @@ mod tests {
                 os_name: String::new(),
                 os_version: String::new(),
                 kernel_version: String::new(),
+                free_disk_space: 0,
+                total_disk_space: 0,
             },
             messages_size_bytes: 0,
             messages_count: 42,
             clients_count: 3,
-            free_disk_space: 0,
-            total_disk_space: 0,
         }
     }
 

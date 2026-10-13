@@ -16,6 +16,7 @@
 // under the License.
 
 using System.Buffers;
+using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.ExceptionServices;
 using Apache.Iggy.Contracts;
@@ -53,6 +54,15 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     replaying alone never recovers.
     /// </summary>
     private const int VsrTransientFailoverCheckMs = 2_000;
+
+    /// <summary>
+    ///     First pause before a <see cref="VsrError.LIFECYCLE_BUSY" /> request goes out again. Every retry is a
+    ///     new request that commits another refusal, so the pause doubles up to
+    ///     <see cref="LifecycleRetryMaxIntervalMs" />.
+    /// </summary>
+    private const int LifecycleRetryIntervalMs = 50;
+
+    private const int LifecycleRetryMaxIntervalMs = 1_000;
 
     /// <summary>
     ///     How long a transiently leaderless roster is polled before the connection proceeds on the current
@@ -152,7 +162,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     await SendWithResponseAsync(code, message, autoLoginOnReconnect: false, token: token);
 
                 response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
-                _consensusSession.Bind(response.Session);
+                _consensusSession.Bind(response.Session, LoginRegister.ReadBindSecret(message));
             }
             catch
             {
@@ -184,6 +194,10 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             else if (await RedirectAsync(token))
             {
                 await ConnectAsync(false, token);
+                if (await ResumeSessionAsync(token))
+                {
+                    return authResponse;
+                }
                 continue;
             }
 
@@ -195,6 +209,54 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return authResponse;
+        }
+    }
+
+    private async Task<bool> ResumeSessionAsync(CancellationToken token)
+    {
+        await _sendingSemaphore.WaitAsync(token);
+        try
+        {
+            if (_consensusSession.Session is not { } session || _connection is not { } connection)
+            {
+                return false;
+            }
+            var identity = new byte[ConsumerSessionSize];
+            BinaryPrimitives.WriteUInt128LittleEndian(identity, _consensusSession.ClientId);
+            BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionEpochOffset), session);
+            lock (_pollRoutingGate)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(identity.AsSpan(ConsumerSessionWatermarkOffset), _metadataWatermark);
+            }
+            var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+            var attempt = await connection.SendAttemptAsync(CommandCodes.BIND_SESSION_CODE,
+                LoginRegister.SerializeBindSession(identity, _consensusSession.BindSecret), deadline, deadline,
+                false, token, retryTransient: false);
+            if (attempt.Error is IggyInvalidStatusCodeException
+                {
+                    FromServer: true,
+                    StatusCode: VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT
+                })
+            {
+                ResetConsensusSession();
+                return false;
+            }
+            if (attempt.Error is { } error)
+            {
+                ExceptionDispatchInfo.Throw(error);
+            }
+            using var response = attempt.Response!;
+            var bound = LoginRegister.Deserialize(response.Memory.Span);
+            if (bound.Session != session)
+            {
+                throw VsrError.Exception(VsrError.SESSION_MISMATCH, "Bind reply changed the logical session.");
+            }
+            SetConnectionState(ConnectionState.Authenticated);
+            return true;
+        }
+        finally
+        {
+            _sendingSemaphore.Release();
         }
     }
 
@@ -263,11 +325,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Polls one of the group member's assigned partitions, round-robin. A fence rejection - either the typed
-    ///     error or the sentinel partition id an empty poll carries - re-syncs the assignment and retries once.
+    ///     Polls one of the group member's assigned partitions, round-robin, with the strategy
+    ///     <paramref name="pollingStrategyFor" /> gives for it. A fence rejection - either the typed error or the
+    ///     sentinel partition id an empty poll carries - re-syncs the assignment and retries once.
     /// </summary>
     private async Task<PolledMessagesRental> PollGroupMessagesRentedAsync(Identifier streamId, Identifier topicId,
-        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token)
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        CancellationToken token)
     {
         var key = new GroupKey(streamId, topicId, consumer.ConsumerId);
         if (!_groupState.HasAssignment(key))
@@ -288,6 +352,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 return NoAssignedPartitionPolledMessages;
             }
 
+            // Asked per attempt: a fence retry can land on another partition.
+            var pollingStrategy = pollingStrategyFor(partitionId);
             PolledMessagesRental? rental = null;
             try
             {
@@ -301,7 +367,14 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             })
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
-                // re-sync below.
+                // re-sync below. A caller context names the owner the poll was meant for, so the caller gets the
+                // fence instead of a poll of another partition.
+                if (pollingStrategy.Context is not null)
+                {
+                    _groupState.InvalidateAssignment(key);
+                    await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
+                    throw;
+                }
             }
 
             if (rental is not null)
@@ -529,7 +602,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     redirection for the handshake, and reconnecting from underneath it would recurse.
     /// </remarks>
     private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
-        CancellationToken token, bool allowRedirect = true)
+        CancellationToken token, bool allowRedirect = true, PartitionContext context = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -557,7 +630,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
                 var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
-                    clearSensitiveReply, token);
+                    clearSensitiveReply, token, context);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
 
@@ -730,7 +803,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
+        PartitionContext context = default)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -742,7 +816,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                clearSensitiveReply, token);
+                clearSensitiveReply, token, context: context);
         }
         finally
         {
@@ -805,13 +879,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Drops the connection along with the session. A late or half-read reply would desync the framing of the
+    ///     Drops the connection while retaining the session. A late or half-read reply would desync the framing of the
     ///     next request, so the socket cannot be reused. The caller must hold <see cref="_sendingSemaphore" />,
     ///     which owns every write to <see cref="_connection" />.
     /// </summary>
     /// <param name="connection">
-    ///     The connection the caller was using. A reconnect that completed in the meantime already closed it and
-    ///     re-armed the session, so dropping anything but the live one would tear down a healthy replacement.
+    ///     The connection the caller was using. A reconnect that completed in the meantime already closed it,
+    ///     so dropping anything but the live one would tear down a healthy replacement.
     /// </param>
     private void DropVsrConnectionLocked(VsrConnection? connection)
     {
@@ -820,7 +894,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             return;
         }
 
-        ResetConsensusSession();
+        _groupState.ClearSessionScoped();
+        ClearPollSession();
         _connection = null;
         SetConnectionState(ConnectionState.Disconnected);
         connection.Dispose();
