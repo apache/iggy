@@ -178,39 +178,26 @@ struct PartitionSizeBudget {
 /// one maximum bus frame past `segment_size`. An operator who raises that knob
 /// grows real sealed segments with it.
 ///
-/// `ServerDefault` is resolved against the node default HERE, at enforcement
-/// time. Create admission rewrites the sentinel before replication, but an
-/// UPDATE to `ServerDefault` leaves it in committed state, and reading that as
-/// "no cap" made an updated topic behave differently from an identically
-/// configured created one. A node default of unlimited (the shipped config)
-/// still yields `None`.
-///
-/// `ServerDefault` must never reach a sized branch: its `as_bytes_u64()` is 0,
-/// which would trim every sealed segment.
+/// `ServerDefault` is resolved against `DEFAULT_MAX_TOPIC_SIZE` HERE, at
+/// enforcement time. Create admission rewrites the sentinel before
+/// replication, but an UPDATE to `ServerDefault` leaves it in committed state,
+/// and reading that as "no cap" made an updated topic behave differently from
+/// an identically configured created one. `DEFAULT_MAX_TOPIC_SIZE` is a
+/// compile-time const set to unlimited, so this still yields `None` today.
 fn per_partition_size_budget(
     max_topic_size: MaxTopicSize,
     default_max_topic_size: u64,
     partition_count: usize,
     sealed_segment_ceiling: u64,
 ) -> Option<PartitionSizeBudget> {
-    let resolved = match max_topic_size {
-        MaxTopicSize::ServerDefault => MaxTopicSize::from(default_max_topic_size),
-        sized => sized,
-    };
-    match resolved {
-        MaxTopicSize::Custom(size) => {
-            let divisor = u64::try_from(partition_count).unwrap_or(1).max(1);
-            let configured_share = size.as_bytes_u64() / divisor;
-            Some(PartitionSizeBudget {
-                max_bytes: configured_share.max(sealed_segment_ceiling),
-                configured_share,
-                resolved_cap: size.as_bytes_u64(),
-            })
-        }
-        // `From<u64>` maps 0 back to `ServerDefault`, so a node default of 0
-        // lands here as "no cap" rather than as a trim-everything budget.
-        MaxTopicSize::Unlimited | MaxTopicSize::ServerDefault => None,
-    }
+    let resolved_cap = max_topic_size.resolve(default_max_topic_size)?;
+    let divisor = u64::try_from(partition_count).unwrap_or(1).max(1);
+    let configured_share = resolved_cap / divisor;
+    Some(PartitionSizeBudget {
+        max_bytes: configured_share.max(sealed_segment_ceiling),
+        configured_share,
+        resolved_cap,
+    })
 }
 
 #[cfg(test)]

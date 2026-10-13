@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::diagnostic_events::diagnostic_event_channel;
 use crate::leader_aware::read_transport_endpoints;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
@@ -32,7 +33,7 @@ use crate::prelude::{
     IggyDuration, IggyError, IggyTimestamp, NonZeroIggyDuration, QuicClientConfig,
 };
 use crate::quic::skip_server_verification::SkipServerVerification;
-use async_broadcast::{Receiver, Sender, broadcast};
+use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
@@ -179,7 +180,7 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
+        if let Err(error) = self.events.0.try_broadcast(event) {
             error!("Failed to send a QUIC diagnostic event: {error}");
         }
     }
@@ -661,7 +662,7 @@ impl QuicClient {
             endpoint,
             connection: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
-            events: broadcast(1000),
+            events: diagnostic_event_channel(),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),

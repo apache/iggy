@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::diagnostic_events::diagnostic_event_channel;
 use crate::leader_aware::read_transport_endpoints;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
@@ -31,7 +32,7 @@ use iggy_common::TransportProtocol;
 use rustls::{ClientConfig, pki_types::pem::PemObject};
 
 use crate::prelude::Client;
-use async_broadcast::{Receiver, Sender, broadcast};
+use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
@@ -173,7 +174,7 @@ impl BinaryTransport for WebSocketClient {
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
+        if let Err(error) = self.events.0.try_broadcast(event) {
             error!("Failed to send a {} diagnostic event: {error}", NAME);
         }
     }
@@ -602,7 +603,6 @@ impl WebSocketClient {
             return Err(IggyError::InvalidConfiguration);
         }
 
-        let (sender, receiver) = broadcast(1000);
         let server_address = config.server_address.clone();
         Ok(WebSocketClient {
             poll_router: PollRouter::default(),
@@ -610,7 +610,7 @@ impl WebSocketClient {
             config,
             state: Mutex::new(ClientState::Disconnected),
             client_address: Mutex::new(None),
-            events: (sender, receiver),
+            events: diagnostic_event_channel(),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),

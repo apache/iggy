@@ -67,5 +67,16 @@ pub trait Client:
     async fn shutdown(&self) -> Result<(), IggyError>;
 
     /// Subscribe to diagnostic events.
+    ///
+    /// The event channel is bounded. When it is full, the client drops the
+    /// oldest event, so publishing never waits for a subscriber. A subscriber
+    /// that falls behind loses old events, not the newest ones.
+    ///
+    /// After a loss, the next `recv()` returns `RecvError::Overflowed` with the
+    /// number of lost events, and the calls after it return the events that are
+    /// left. Thus, after `Overflowed`, call `recv()` again, or read the receiver
+    /// with `StreamExt::next()`, which skips that error.
+    ///
+    /// HTTP keeps no connection, so it publishes no events.
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent>;
 }
