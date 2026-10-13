@@ -335,6 +335,7 @@ mod ffi {
     }
 
     struct ClusterNode {
+        replica_id: u8,
         name: String,
         ip: String,
         endpoints: TransportEndpoints,

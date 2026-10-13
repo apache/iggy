@@ -744,6 +744,27 @@ public sealed class BinaryMapper
     }
 
     [Fact]
+    public void MapPartitionRoute_PreservesEveryFieldWithoutUsingThePositionContextLayout()
+    {
+        byte[] payload = [.. BitConverter.GetBytes(17ul), .. BitConverter.GetBytes(52ul),
+            .. BitConverter.GetBytes(7u), .. BitConverter.GetBytes(3u), 99];
+
+        var route = Mappers.BinaryMapper.MapPartitionRoute(payload);
+
+        Assert.Equal(new PartitionRoute(17, 52, 7, 3, 99), route);
+        Assert.Equal(new PartitionContext(17, 0, 52), route.Context);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(24)]
+    [InlineData(26)]
+    public void MapPartitionRoute_RejectsTruncatedAndTrailingBytes(int length)
+    {
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapPartitionRoute(new byte[length]));
+    }
+
+    [Fact]
     public void MapClusterMetadata_OversizedNodesCount_Throws()
     {
         var payload = new byte[8];
@@ -764,6 +785,8 @@ public sealed class BinaryMapper
 
         Assert.Equal("cluster", metadata.Name);
         Assert.Equal(2, metadata.Nodes.Length);
+        Assert.Equal((byte)0, metadata.Nodes[0].ReplicaId);
+        Assert.Equal((byte)1, metadata.Nodes[1].ReplicaId);
         Assert.Equal("nödé-1", metadata.Nodes[0].Name);
         Assert.Equal("10.0.0.1", metadata.Nodes[0].Ip);
         Assert.Equal(8090, metadata.Nodes[0].Endpoints.Tcp);
@@ -786,7 +809,7 @@ public sealed class BinaryMapper
     {
         var payload = CreateClusterMetadataPayload("cluster", ("node-1", "10.0.0.1", 8090, 1, 1));
         // cut inside the u32 length prefix of the node ip, right after the node name
-        var cut = 4 + "cluster".Length + 4 + 4 + "node-1".Length + 2;
+        var cut = 4 + "cluster".Length + 4 + 1 + 4 + "node-1".Length + 2;
         var truncated = payload.AsSpan(0, cut).ToArray();
 
         Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
@@ -935,8 +958,10 @@ public sealed class BinaryMapper
         var buffer = new List<byte>();
         WriteString(buffer, clusterName);
         buffer.AddRange(BitConverter.GetBytes((uint)nodes.Length));
+        byte replicaId = 0;
         foreach (var (name, ip, tcp, role, status) in nodes)
         {
+            buffer.Add(replicaId++);
             WriteString(buffer, name);
             WriteString(buffer, ip);
             buffer.AddRange(BitConverter.GetBytes(tcp));

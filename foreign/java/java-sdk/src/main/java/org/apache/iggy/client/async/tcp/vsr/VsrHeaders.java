@@ -115,7 +115,7 @@ public final class VsrHeaders {
         return frame.getUnsignedByte(frame.readerIndex() + REQUEST_OPERATION_OFFSET);
     }
 
-    static long readRequestId(ByteBuf frame) {
+    public static long readRequestId(ByteBuf frame) {
         return frame.getLongLE(frame.readerIndex() + REQUEST_ID_OFFSET);
     }
 

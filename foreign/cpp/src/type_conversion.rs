@@ -296,6 +296,7 @@ impl From<RustTransportEndpoints> for ffi::TransportEndpoints {
 impl From<RustClusterNode> for ffi::ClusterNode {
     fn from(node: RustClusterNode) -> Self {
         ffi::ClusterNode {
+            replica_id: node.replica_id,
             name: node.name,
             ip: node.ip,
             endpoints: ffi::TransportEndpoints::from(node.endpoints),

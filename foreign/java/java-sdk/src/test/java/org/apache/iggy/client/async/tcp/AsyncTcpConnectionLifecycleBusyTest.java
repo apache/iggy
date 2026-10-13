@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_POLL_ROUTING_CODE;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
@@ -63,7 +63,7 @@ class AsyncTcpConnectionLifecycleBusyTest {
     private static final int UNAUTHORIZED = IggyErrorCode.UNAUTHORIZED.getCode();
     private static final int PING_CODE = 1;
     private static final int LOGIN_CODE = 38;
-    private static final int POLL_ON_PRIMARY_CODE = 104;
+    private static final int POLL_CODE = 104;
     private static final int JOIN_GROUP_CODE = 604;
     private static final int OPERATION_JOIN_GROUP = 148;
     private static final int TEST_TIMEOUT_SECONDS = 5;
@@ -260,11 +260,11 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     routings.incrementAndGet();
                     return Response.error(OPERATION_NON_REPLICATED, LIFECYCLE_BUSY);
                 }
-                if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     primaryPolls.incrementAndGet();
                     return Response.error(OPERATION_NON_REPLICATED, LIFECYCLE_BUSY);
                 }
@@ -276,14 +276,14 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 // Context discovery may replay transient denials, never a lifecycle refusal.
                 assertServerError(
                         connection.send(
-                                GET_POLL_ROUTING_CODE,
+                                GET_PARTITION_ROUTE_CODE,
                                 Unpooled.EMPTY_BUFFER,
                                 0,
-                                new TransientFailoverState(PartitionContext.EMPTY, true)),
+                                new TransientFailoverState(PartitionContext.EMPTY)),
                         LIFECYCLE_BUSY);
                 assertServerError(
-                        connection.send(
-                                POLL_ON_PRIMARY_CODE, Unpooled.EMPTY_BUFFER, 0, new TransientFailoverState(CONTEXT)),
+                        connection.sendRouted(
+                                POLL_CODE, Unpooled.EMPTY_BUFFER, 0, 0, new TransientFailoverState(CONTEXT)),
                         LIFECYCLE_BUSY);
             } finally {
                 connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -295,7 +295,7 @@ class AsyncTcpConnectionLifecycleBusyTest {
     }
 
     @Test
-    void shouldReplayNotCommittedUnderItsIdAndKeepTheUncertainOutcomeAcrossALifecycleRetry() throws Exception {
+    void shouldReplayNotCommittedUnderItsIdAcrossEveryLaterRefusal() throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             List<Long> requestIds = new CopyOnWriteArrayList<>();
             CompletableFuture<Void> server = serve(socket, request -> {
@@ -322,9 +322,7 @@ class AsyncTcpConnectionLifecycleBusyTest {
                 connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             }
             server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            assertThat(requestIds).hasSize(3);
-            assertThat(requestIds.get(1)).isEqualTo(requestIds.get(0));
-            assertThat(requestIds.get(2)).isNotEqualTo(requestIds.get(0));
+            assertThat(requestIds).hasSizeGreaterThanOrEqualTo(3).containsOnly(requestIds.get(0));
         }
     }
 
@@ -385,6 +383,36 @@ class AsyncTcpConnectionLifecycleBusyTest {
             assertServerError(join, LIFECYCLE_BUSY);
             server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             assertThat(attempts).hasValue(LONG_PAUSE_ATTEMPT);
+        }
+    }
+
+    @Test
+    void shouldCompleteATransientRetryWhenItsEventLoopStops() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> refused = new CompletableFuture<>();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.operation() == OPERATION_JOIN_GROUP) {
+                    refused.complete(null);
+                    return Response.error(OPERATION_JOIN_GROUP, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncTcpConnection connection = connection(socket, REQUEST_TIMEOUT);
+            CompletableFuture<ByteBuf> pending;
+            try {
+                login(connection);
+                pending = connection.send(JOIN_GROUP_CODE, Unpooled.wrappedBuffer(JOIN_BODY));
+                refused.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                // Let the refusal schedule its delayed replay before shutdown cancels it.
+                Thread.sleep(10);
+            } finally {
+                connection.close().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+            assertServerError(pending, AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
+            server.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
     }
 

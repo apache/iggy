@@ -23,7 +23,6 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.MessagesClient;
-import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyResourceNotFoundException;
@@ -39,8 +38,6 @@ import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.CommandCode;
-import org.apache.iggy.topic.TopicDetails;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,20 +72,15 @@ public class MessagesTcpClient implements MessagesClient {
     private static final int PARTITION_NOT_OWNED_ERROR_CODE = 5009;
 
     /**
-     * Staleness budget for the client-side routing caches: group assignments
-     * and topic partition counts. Both re-fetch lazily on the next use once
+     * Staleness budget for group assignments. They re-fetch on the next use once
      * this old, so a partition-count change or rebalance is picked up without
      * a background refresher thread.
      */
     private static final Duration ROUTING_CACHE_REFRESH = Duration.ofSeconds(5);
 
     private final ClientRoutingState routingState;
-    private final TopicsClient topicsClient;
     private final ConsumerGroupsClient consumerGroupsClient;
     private final PollRouter pollRouter;
-    private final Supplier<CompletableFuture<Boolean>> clustered;
-    private final PartitionContexts sendContexts;
-    private final PartitionContexts pollContexts;
 
     /**
      * Creates a low-level client on the supplied connection without primary routing.
@@ -100,39 +92,14 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     MessagesTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, ClientRoutingState routingState) {
-        this(connectionSupplier, routingState, null, () -> CompletableFuture.completedFuture(false));
+        this(connectionSupplier, routingState, null);
     }
 
     MessagesTcpClient(
-            Supplier<AsyncTcpConnection> connectionSupplier,
-            ClientRoutingState routingState,
-            PollRouter pollRouter,
-            Supplier<CompletableFuture<Boolean>> clustered) {
-        this(connectionSupplier, routingState, pollRouter, clustered, PartitionContexts.forSends(connectionSupplier));
-    }
-
-    /**
-     * @param sendContexts the owning client's send-context cache, shared with its
-     *     raw requests and dropped when it deletes a stream or a topic, or creates
-     *     or deletes partitions
-     */
-    MessagesTcpClient(
-            Supplier<AsyncTcpConnection> connectionSupplier,
-            ClientRoutingState routingState,
-            PollRouter pollRouter,
-            Supplier<CompletableFuture<Boolean>> clustered,
-            PartitionContexts sendContexts) {
+            Supplier<AsyncTcpConnection> connectionSupplier, ClientRoutingState routingState, PollRouter pollRouter) {
         this.routingState = routingState;
-        this.topicsClient = new TopicsTcpClient(connectionSupplier);
         this.consumerGroupsClient = new ConsumerGroupsTcpClient(connectionSupplier);
-        this.pollRouter = pollRouter;
-        this.clustered = clustered;
-        this.sendContexts = sendContexts;
-        this.pollContexts = new PartitionContexts(
-                connectionSupplier,
-                CommandCode.Messages.GET_POLL_ROUTING.getValue(),
-                PollRouter.ATTACHMENT_BYTES,
-                false);
+        this.pollRouter = pollRouter == null ? new PollRouter(connectionSupplier, null) : pollRouter;
     }
 
     @Override
@@ -208,39 +175,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     CompletableFuture<ByteBuf> sendPoll(ByteBuf payload, Optional<PartitionContext> context) {
-        if (pollRouter == null) {
-            return sendPlainPoll(payload, context);
-        }
-        PollCancellation cancellation = new PollCancellation();
-        CompletableFuture<ByteBuf> result = clustered
-                .get()
-                .handle((isClustered, error) -> {
-                    if (error != null || cancellation.isCancelled()) {
-                        payload.release();
-                        return CompletableFuture.<ByteBuf>failedFuture(
-                                error != null ? error : new CancellationException());
-                    }
-                    CompletableFuture<ByteBuf> sent =
-                            isClustered ? pollRouter.poll(payload, context) : sendPlainPoll(payload, context);
-                    cancellation.track(sent);
-                    return sent;
-                })
-                .thenCompose(sent -> sent);
-        result.whenComplete((response, error) -> {
-            if (result.isCancelled()) {
-                cancellation.cancel();
-            }
-        });
-        return result;
-    }
-
-    private CompletableFuture<ByteBuf> sendPlainPoll(ByteBuf payload, Optional<PartitionContext> context) {
-        return pollContexts.send(
-                CommandCode.Messages.POLL.getValue(),
-                payload,
-                payload.retainedDuplicate(),
-                payload.readableBytes() - PollRouter.POLL_PARAMETERS_BYTES,
-                context);
+        return pollRouter.poll(payload, context);
     }
 
     @Override
@@ -260,7 +195,7 @@ public class MessagesTcpClient implements MessagesClient {
                     // recreated); drop it so the next send re-fetches now
                     // instead of waiting out the staleness budget.
                     if (unwrapCompletion(error) instanceof IggyResourceNotFoundException) {
-                        routingState.invalidatePartitionCount(ClientRoutingState.topicKey(streamId, topicId));
+                        pollRouter.clear();
                     }
                     return CompletableFuture.failedFuture(error);
                 });
@@ -286,8 +221,7 @@ public class MessagesTcpClient implements MessagesClient {
             writeAndRelease(contextPayload, toBytes(streamId));
             writeAndRelease(contextPayload, toBytes(topicId));
             contextPayload.writeBytes(partitioning.value());
-            sent = sendContexts.send(
-                    CommandCode.Messages.SEND.getValue(), payload, contextPayload, contextPayload.readableBytes());
+            sent = pollRouter.sendMessages(payload, contextPayload);
         } catch (RuntimeException | Error error) {
             payload.release();
             throw error;
@@ -318,12 +252,10 @@ public class MessagesTcpClient implements MessagesClient {
     /**
      * One group-poll attempt: sync the assignment when missing or stale, pick
      * the next assigned partition round-robin, poll it explicitly, and on a
-     * generation fence (the re-sync sentinel or a partition-not-owned error)
-     * drop the cached assignment and retry. The attempt budget allows one
+     * generation fence (the re-sync sentinel), drop the cached assignment and retry. The attempt budget allows one
      * re-sync after the coordinator rejects a stale assignment, then one
      * retry; an exhausted budget is an empty poll, not an error. A
-     * partition-not-owned error under a caller context is returned instead,
-     * as the Rust SDK does.
+     * partition-not-owned error is returned without retry.
      */
     @SuppressWarnings("checkstyle:ParameterNumber")
     private CompletableFuture<PolledMessages> pollGroupMessages(
@@ -380,18 +312,10 @@ public class MessagesTcpClient implements MessagesClient {
                         return CompletableFuture.completedFuture(polled);
                     })
                     .exceptionallyCompose(error -> {
-                        if (!retriesAfterFence(error, groupKey, strategy)) {
-                            return CompletableFuture.failedFuture(error);
+                        if (isPartitionNotOwned(error)) {
+                            routingState.invalidateAssignment(groupKey);
                         }
-                        return pollGroupMessages(
-                                streamId,
-                                topicId,
-                                consumer,
-                                strategy,
-                                count,
-                                autoCommit,
-                                attemptsLeft - 1,
-                                cancellation);
+                        return CompletableFuture.failedFuture(error);
                     });
         });
     }
@@ -422,19 +346,6 @@ public class MessagesTcpClient implements MessagesClient {
                 });
     }
 
-    /**
-     * Drops the cached assignment once a poll was refused as not owned, and says
-     * whether the poll retries on a fresh assignment. A poll with a caller context
-     * does not: the retry would carry the same context, which the server refuses again.
-     */
-    private boolean retriesAfterFence(Throwable error, ClientRoutingState.GroupKey groupKey, PollingStrategy strategy) {
-        if (!isPartitionNotOwned(error)) {
-            return false;
-        }
-        routingState.invalidateAssignment(groupKey);
-        return strategy.context().isEmpty();
-    }
-
     private static boolean isPartitionNotOwned(Throwable error) {
         return unwrapCompletion(error) instanceof IggyServerException serverError
                 && serverError.getRawErrorCode() == PARTITION_NOT_OWNED_ERROR_CODE;
@@ -460,38 +371,7 @@ public class MessagesTcpClient implements MessagesClient {
     }
 
     private CompletableFuture<Long> partitionCount(StreamId streamId, TopicId topicId) {
-        var topicKey = ClientRoutingState.topicKey(streamId, topicId);
-        var cached = routingState.partitionCount(topicKey);
-        if (cached.isPresent() && System.nanoTime() - cached.get().fetchedAtNanos() < ROUTING_CACHE_REFRESH.toNanos()) {
-            return CompletableFuture.completedFuture(cached.get().count());
-        }
-        return topicsClient
-                .getTopic(streamId, topicId)
-                .thenApply(topicDetails -> {
-                    var partitionsCount =
-                            topicDetails.map(TopicDetails::partitionsCount).orElse(0L);
-                    if (partitionsCount == 0) {
-                        throw new IggyResourceNotFoundException(
-                                IggyErrorCode.TOPIC_ID_NOT_FOUND,
-                                IggyErrorCode.TOPIC_ID_NOT_FOUND.getCode(),
-                                "Cannot resolve partitioning: topic " + topicId + " in stream " + streamId
-                                        + " was not found or has no partitions",
-                                Optional.empty(),
-                                Optional.empty());
-                    }
-                    routingState.setPartitionCount(topicKey, partitionsCount, System.nanoTime());
-                    return partitionsCount;
-                })
-                .exceptionallyCompose(error -> {
-                    // A failed refresh should not stop routing while a stale
-                    // count is still on hand, except when the topic itself is
-                    // gone; serving the stale value keeps sends flowing
-                    // through transient metadata-fetch failures.
-                    if (cached.isPresent() && !(unwrapCompletion(error) instanceof IggyResourceNotFoundException)) {
-                        return CompletableFuture.completedFuture(cached.get().count());
-                    }
-                    return CompletableFuture.failedFuture(error);
-                });
+        return pollRouter.partitionCount(streamId, topicId);
     }
 
     private static final class PollCancellation {

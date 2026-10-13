@@ -297,7 +297,7 @@ public sealed class OffsetContinuationTests
 
         internal static PartitionContext Route(PartitionContext live)
         {
-            return live with { MetadataOp = RouteMetadataOp };
+            return live with { OwnerGeneration = 0, MetadataOp = RouteMetadataOp };
         }
 
         /// <summary>
@@ -314,8 +314,9 @@ public sealed class OffsetContinuationTests
             return request.Code switch
             {
                 GET_CLUSTER_METADATA_CODE => StandaloneRoster(_node.Port),
-                CommandCodes.GET_POLL_ROUTING_CODE => RouteReply(request, Route(_live[Partition(request)]),
-                    _node.Port, true),
+                CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request,
+                    Route(_live[BinaryPrimitives.ReadUInt32LittleEndian(request.Body.AsSpan(request.Body.Length - sizeof(uint)))]),
+                    0, (uint)_live.Count),
                 CommandCodes.SYNC_CONSUMER_GROUP_CODE => Reply(OPERATION_NON_REPLICATED,
                     AssignmentBody(1, [.. _live.Keys.Order()])),
                 CommandCodes.POLL_MESSAGES_CODE => Serve(request),
@@ -337,7 +338,7 @@ public sealed class OffsetContinuationTests
                 return Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE);
             }
 
-            if (poll.Context.OwnerGeneration != live.OwnerGeneration)
+            if (poll.Context.OwnerGeneration != 0 && poll.Context.OwnerGeneration != live.OwnerGeneration)
             {
                 return Reply(request.Operation, [], VsrError.CONSUMER_GROUP_PARTITION_NOT_OWNED);
             }

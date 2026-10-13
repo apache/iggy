@@ -22,6 +22,7 @@ package org.apache.iggy.cluster;
 /**
  * A single node in the cluster roster.
  *
+ * @param replicaId the configured replica id, independent of roster order
  * @param name      the node name
  * @param ip        the node IP address or hostname
  * @param endpoints the per-transport ports of the node
@@ -29,4 +30,9 @@ package org.apache.iggy.cluster;
  * @param status    the node status
  */
 public record ClusterNode(
-        String name, String ip, TransportEndpoints endpoints, ClusterNodeRole role, ClusterNodeStatus status) {}
+        int replicaId,
+        String name,
+        String ip,
+        TransportEndpoints endpoints,
+        ClusterNodeRole role,
+        ClusterNodeStatus status) {}
