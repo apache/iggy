@@ -88,7 +88,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
 
         // Warmup runs under the same limiter as the measured phase, so the phase boundary is
         // a step rather than a burst far above the rate being measured.
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+        let mut rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
             self.log_warmup_info();
@@ -96,7 +96,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
 
             while Instant::now() < warmup_end {
                 if let Some(batch) = self.client.produce_batch(&mut batch_generator).await?
-                    && let Some(rate_limiter) = &rate_limiter
+                    && let Some(rate_limiter) = &mut rate_limiter
                 {
                     rate_limiter
                         .wait_until_necessary(batch.user_data_bytes)
@@ -138,7 +138,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
                 total_bytes: total_bytes_processed,
             });
 
-            if let Some(rate_limiter) = &rate_limiter {
+            if let Some(rate_limiter) = &mut rate_limiter {
                 rate_limiter
                     .wait_until_necessary(batch.user_data_bytes)
                     .await;

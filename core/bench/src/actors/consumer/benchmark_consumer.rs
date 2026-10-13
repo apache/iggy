@@ -84,12 +84,12 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         };
 
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
-            let rate_limiter = make_rate_limiter();
+            let mut rate_limiter = make_rate_limiter();
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
             while Instant::now() < warmup_end {
                 if let Some(batch) = self.client.consume_batch().await?
-                    && let Some(rate_limiter) = &rate_limiter
+                    && let Some(rate_limiter) = &mut rate_limiter
                 {
                     rate_limiter
                         .wait_until_necessary(batch.user_data_bytes)
@@ -103,7 +103,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
             }
         }
 
-        let rate_limiter = make_rate_limiter();
+        let mut rate_limiter = make_rate_limiter();
         self.log_setup_info();
 
         let max_capacity = self.finish_condition.max_capacity();
@@ -136,7 +136,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
                 total_bytes: bytes_processed,
             });
 
-            if let Some(rate_limiter) = &rate_limiter {
+            if let Some(rate_limiter) = &mut rate_limiter {
                 rate_limiter
                     .wait_until_necessary(batch.user_data_bytes)
                     .await;

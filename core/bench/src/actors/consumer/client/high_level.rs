@@ -19,7 +19,7 @@ use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
     consumer::client::{
         BenchmarkConsumerClient,
-        interface::{BenchmarkConsumerConfig, ConsumerClient, clear_group_offsets},
+        interface::{BenchmarkConsumerConfig, ConsumerClient},
     },
 };
 
@@ -55,11 +55,16 @@ impl HighLevelConsumerClient {
         }
     }
 
-    fn build_consumer(&self, client: &IggyClient) -> Result<IggyConsumer, IggyError> {
+    fn build_consumer(
+        &self,
+        client: &IggyClient,
+        group_polling_strategy: PollingStrategy,
+    ) -> Result<IggyConsumer, IggyError> {
         let stream_id_str = &self.config.stream_id;
         let builder = if let Some(cg_id) = self.config.consumer_group_id {
             client
                 .consumer_group(&format!("cg_{cg_id}"), stream_id_str, TOPIC_ID)?
+                .polling_strategy(group_polling_strategy)
                 .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
                 .create_consumer_group_if_not_exists()
                 .auto_join_consumer_group()
@@ -139,24 +144,12 @@ impl ConsumerClient for HighLevelConsumerClient {
     async fn reset_offsets(&mut self) -> Result<(), IggyError> {
         let client = self.client.as_deref().expect("Client not initialized");
 
-        let mut replacement = self.build_consumer(client)?;
+        let mut replacement = self.build_consumer(client, PollingStrategy::offset(0))?;
 
         // Dropping the old consumer stops its polling. A bare drop does not leave the
         // group, so the re-join below is the same member and keeps its partitions.
         self.consumer = None;
         replacement.init().await?;
-
-        // After the re-join, so a member that lost its membership still clears its partitions.
-        // The new consumer sends its first poll only on its first `next()`.
-        if self.config.consumer_group_id.is_some() {
-            clear_group_offsets(
-                client,
-                &Consumer::group(replacement.name().try_into()?),
-                replacement.stream(),
-                replacement.topic(),
-            )
-            .await?;
-        }
 
         self.consumer = Some(replacement);
         Ok(())
@@ -166,7 +159,7 @@ impl ConsumerClient for HighLevelConsumerClient {
 impl BenchmarkInit for HighLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let client = self.client_factory.create_authenticated_client().await?;
-        let mut consumer = self.build_consumer(&client)?;
+        let mut consumer = self.build_consumer(&client, PollingStrategy::next())?;
         consumer.init().await?;
         self.consumer = Some(consumer);
         self.client = Some(Box::new(client));

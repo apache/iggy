@@ -16,15 +16,14 @@
 // under the License.
 
 use crate::actors::consumer::client::BenchmarkConsumerClient;
-use crate::actors::consumer::client::interface::{
-    BenchmarkConsumerConfig, ConsumerClient, clear_group_offsets,
-};
+use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, ConsumerClient};
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use crate::benchmarks::common::create_consumer;
 use crate::utils::ClientFactory;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
 use iggy::prelude::*;
 use std::collections::HashMap;
+use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -129,16 +128,10 @@ impl ConsumerClient for LowLevelConsumerClient {
         }))
     }
 
-    async fn reset_offsets(&mut self) -> Result<(), IggyError> {
-        let client = self.client.as_ref().expect("client not initialized");
-        let consumer = self.consumer.as_ref().expect("consumer not initialized");
-
+    fn reset_offsets(&mut self) -> impl Future<Output = Result<(), IggyError>> {
         self.next_offsets.clear();
-        if self.polling_strategy.kind == PollingKind::Offset {
-            return Ok(());
-        }
-
-        clear_group_offsets(client, consumer, &self.stream_id, &self.topic_id).await
+        self.polling_strategy = PollingStrategy::offset(0);
+        ready(Ok(()))
     }
 }
 
@@ -189,3 +182,56 @@ impl ApiLabel for LowLevelConsumerClient {
 }
 
 impl BenchmarkConsumerClient for LowLevelConsumerClient {}
+
+#[cfg(test)]
+mod tests {
+    use super::{BenchmarkConsumerConfig, ConsumerClient, LowLevelConsumerClient};
+    use crate::utils::client_factory::TcpClientFactory;
+    use bench_report::numeric_parameter::BenchmarkNumericParameter;
+    use iggy::prelude::{
+        ClientWrapper, Consumer, Identifier, IggyClient, IggyDuration, PollingStrategy, TcpClient,
+        TcpClientConfig,
+    };
+    use std::{collections::HashMap, sync::Arc};
+
+    const GROUP_ID: u32 = 1;
+    const WARMUP_OFFSETS: [(u32, u64); 2] = [(0, 12), (1, 34)];
+
+    #[tokio::test]
+    async fn given_disconnected_group_member_when_resetting_should_rewind_without_offset_requests()
+    {
+        for (polling_strategy, auto_commit) in [
+            (PollingStrategy::next(), true),
+            (PollingStrategy::offset(0), false),
+        ] {
+            let mut consumer = LowLevelConsumerClient::new(
+                Arc::new(TcpClientFactory::default()),
+                BenchmarkConsumerConfig {
+                    consumer_id: 1,
+                    consumer_group_id: Some(GROUP_ID),
+                    stream_id: "bench-stream-1".to_owned(),
+                    messages_per_batch: BenchmarkNumericParameter::Value(1),
+                    warmup_time: IggyDuration::default(),
+                    polling_kind: polling_strategy.kind,
+                    origin_timestamp_latency_calculation: false,
+                    pretty: false,
+                },
+            );
+            consumer.client = Some(IggyClient::new(ClientWrapper::Tcp(
+                TcpClient::create(Arc::new(TcpClientConfig::default())).unwrap(),
+            )));
+            consumer.consumer = Some(Consumer::group(Identifier::numeric(GROUP_ID).unwrap()));
+            consumer.polling_strategy = polling_strategy;
+            consumer.auto_commit = auto_commit;
+            if !auto_commit {
+                consumer.next_offsets = HashMap::from(WARMUP_OFFSETS);
+            }
+
+            consumer.reset_offsets().await.unwrap();
+
+            assert_eq!(consumer.polling_strategy, PollingStrategy::offset(0));
+            assert!(consumer.next_offsets.is_empty());
+            assert_eq!(consumer.auto_commit, auto_commit);
+        }
+    }
+}
