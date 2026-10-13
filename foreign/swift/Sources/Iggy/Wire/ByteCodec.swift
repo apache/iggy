@@ -23,6 +23,26 @@ enum WireError: Error, Equatable {
     case truncated(offset: Int, need: Int, have: Int)
     case invalidUTF8(offset: Int)
     case validation(String)
+    case invalidBatchChecksum(stored: UInt64, computed: UInt64)
+    case invalidMessageChecksum(stored: UInt64, computed: UInt64, offset: UInt64)
+
+    /// The error a reply decoder surfaces. An unreadable body maps onto
+    /// `invalidCommand`, the code the Rust client raises for the same class,
+    /// so callers matching on the code see one value across SDKs.
+    var iggyError: IggyError {
+        switch self {
+        case .truncated(let offset, let need, let have):
+            IggyError(.invalidCommand, context: "unexpected end of buffer at offset \(offset): need \(need) bytes, have \(have)")
+        case .invalidUTF8(let offset):
+            IggyError(.invalidUtf8, context: "invalid utf-8 at offset \(offset)")
+        case .validation(let message):
+            IggyError(.invalidCommand, context: message)
+        case .invalidBatchChecksum(let stored, let computed):
+            IggyError(.invalidBatchChecksum, context: "stored \(stored), computed \(computed)")
+        case .invalidMessageChecksum(let stored, let computed, let offset):
+            IggyError(.invalidMessageChecksum, context: "stored \(stored), computed \(computed), offset \(offset)")
+        }
+    }
 }
 
 /// Little-endian append-only encoder over a byte array.
@@ -36,6 +56,8 @@ struct ByteWriter {
         bytes = []
         bytes.reserveCapacity(capacity)
     }
+
+    var count: Int { bytes.count }
 
     mutating func write(_ value: UInt8) {
         bytes.append(value)
@@ -76,6 +98,24 @@ struct ByteWriter {
 
     mutating func write(_ value: String) {
         bytes.append(contentsOf: value.utf8)
+    }
+
+    mutating func writeZeros(_ count: Int) {
+        bytes.append(contentsOf: repeatElement(0, count: count))
+    }
+
+    /// Replaces the `value.count` bytes starting at `offset` with `value`,
+    /// which the batch encoder uses to patch the header it has already
+    /// written. The range must lie inside the bytes written so far; a range
+    /// past the end is a programming error and traps.
+    mutating func overwrite(at offset: Int, with value: [UInt8]) {
+        bytes.replaceSubrange(offset..<offset + value.count, with: value)
+    }
+
+    /// Patches one little-endian `UInt64` in place, without an intermediate
+    /// array; the batch encoder does this once per message frame.
+    mutating func overwrite(at offset: Int, with value: UInt64) {
+        bytes.withUnsafeMutableBytes { $0.storeBytes(of: value.littleEndian, toByteOffset: offset, as: UInt64.self) }
     }
 
     /// `[len: u8][utf8]`, the layout of every wire name, which must be 1 to
@@ -184,15 +224,32 @@ struct ByteReader {
         return try readString(length)
     }
 
-    /// `[len: u32][utf8]`.
-    mutating func readLongString() throws -> String {
+    mutating func skip(_ count: Int) throws {
+        try require(count)
+        offset += count
+    }
+
+    /// The bytes not yet consumed, without consuming them.
+    var rest: ArraySlice<UInt8> { bytes[offset...] }
+
+    /// `[len: u32][bytes]`, the layout of every length-prefixed block.
+    mutating func readPrefixedBytes() throws -> ArraySlice<UInt8> {
         let declared = try readUInt32()
         // A length that does not fit the platform's Int cannot be in the
         // buffer either; report it as truncation rather than trapping.
         guard let length = Int(exactly: declared) else {
             throw WireError.truncated(offset: position, need: Int.max, have: remaining)
         }
-        return try readString(length)
+        return try readBytes(length)
+    }
+
+    /// `[len: u32][utf8]`.
+    mutating func readLongString() throws -> String {
+        let start = position + 4
+        guard let value = String(bytes: try readPrefixedBytes(), encoding: .utf8) else {
+            throw WireError.invalidUTF8(offset: start)
+        }
+        return value
     }
 }
 

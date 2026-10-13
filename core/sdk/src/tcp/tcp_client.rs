@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::diagnostic_events::diagnostic_event_channel;
 use crate::leader_aware::{
     ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
     check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
@@ -30,7 +31,7 @@ use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use crate::vsr::{RetainedRequest, retain_replay_header};
-use async_broadcast::{Receiver, Sender, broadcast};
+use async_broadcast::{Receiver, Sender};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{
@@ -232,7 +233,7 @@ impl BinaryTransport for TcpClient {
     }
 
     async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
+        if let Err(error) = self.events.0.try_broadcast(event) {
             error!("Failed to send a TCP diagnostic event: {error}");
         }
     }
@@ -626,7 +627,7 @@ impl TcpClient {
             client_address: Mutex::new(None),
             stream: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
-            events: broadcast(1000),
+            events: diagnostic_event_channel(),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
@@ -1861,6 +1862,7 @@ fn tls_server_name(server_address: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic_events::DIAGNOSTIC_EVENT_CAPACITY;
     use crate::vsr::replay_after_session_reset_is_safe;
     use iggy_binary_protocol::codes::{
         GET_ME_CODE, JOIN_CONSUMER_GROUP_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
@@ -2875,6 +2877,33 @@ mod tests {
             ),
             "a second connect has to dial again rather than report success"
         );
+    }
+
+    // Each failed connect publishes `Disconnected`, and nothing reads the
+    // receiver the client keeps. A server that stays down must not fill the
+    // event channel and wedge the next connect, nor every call queued behind it.
+    #[tokio::test]
+    async fn failed_connects_past_the_event_capacity_do_not_wedge_the_client() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: dead_endpoint().await,
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        for attempt in 1..=DIAGNOSTIC_EVENT_CAPACITY + 1 {
+            let connect = tokio::time::timeout(Duration::from_secs(5), TcpClient::connect(&client))
+                .await
+                .unwrap_or_else(|_| panic!("connect {attempt} hung"));
+
+            assert!(
+                matches!(connect, Err(IggyError::CannotEstablishConnection)),
+                "connect {attempt}: {connect:?}"
+            );
+        }
     }
 
     // An endpoint that accepts TCP but fails the TLS handshake is not where
