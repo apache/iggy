@@ -39,8 +39,14 @@ record TcpConnectionString(String host, int port, String username, String passwo
     private static final int MAX_PORT = 65535;
 
     // Matches both "[ipv6]:port" and "host:port", where an unbracketed host may not
-    // contain a colon. Multi-colon authorities such as "2001:db8::1:8090" are rejected.
-    private static final Pattern ADDRESS = Pattern.compile("^(?:\\[([^\\]]+)\\]|([^:\\[\\]]+)):(\\d{1,5})$");
+    // contain a colon. Multi-colon authorities such as "2001:db8::1:8090" are rejected,
+    // and so are hosts with whitespace or control characters.
+    private static final Pattern ADDRESS =
+            Pattern.compile("^(?:\\[([^\\]\\s\\p{Cc}]+)\\]|([^:\\[\\]\\s\\p{Cc}]+)):(\\d{1,5})$");
+
+    // A transport name is echoed in errors only when it is plain letters, because a
+    // malformed scheme can contain the credentials.
+    private static final Pattern TRANSPORT_NAME = Pattern.compile("^[A-Za-z]+$");
 
     static TcpConnectionString parse(String connectionString) {
         if (connectionString == null || connectionString.isEmpty()) {
@@ -63,12 +69,10 @@ record TcpConnectionString(String host, int port, String username, String passwo
         if (addressAndOptions.length > 2) {
             throw invalid("expected at most one '?' before the options");
         }
-        Matcher address = parseAddress(addressAndOptions[0]);
-        String host = address.group(1) != null ? address.group(1) : address.group(2);
-        int port = Integer.parseInt(address.group(3));
+        Address address = parseAddress(addressAndOptions[0]);
 
         boolean tls = addressAndOptions.length == 2 && parseTlsOption(addressAndOptions[1]);
-        return new TcpConnectionString(host, port, credentials[0], credentials[1], tls);
+        return new TcpConnectionString(address.host(), address.port(), credentials[0], credentials[1], tls);
     }
 
     private static String[] parseCredentials(String credentials) {
@@ -82,15 +86,17 @@ record TcpConnectionString(String host, int port, String username, String passwo
         return usernameAndPassword;
     }
 
-    private static Matcher parseAddress(String serverAddress) {
+    private static Address parseAddress(String serverAddress) {
         Matcher address = ADDRESS.matcher(serverAddress);
         if (!address.matches()) {
             throw invalid("server address must be <host>:<port> or [<ipv6>]:<port>");
         }
-        if (Integer.parseInt(address.group(3)) > MAX_PORT) {
+        int port = Integer.parseInt(address.group(3));
+        if (port > MAX_PORT) {
             throw invalid("port must be at most " + MAX_PORT);
         }
-        return address;
+        String host = address.group(1) != null ? address.group(1) : address.group(2);
+        return new Address(host, port);
     }
 
     private static void parseScheme(String scheme) {
@@ -101,10 +107,14 @@ record TcpConnectionString(String host, int port, String username, String passwo
             throw invalid("scheme must be iggy:// or iggy+tcp://");
         }
         String transport = scheme.substring(SCHEME_PREFIX.length());
-        if (!TCP_TRANSPORT.equals(transport)) {
-            throw new IggyInvalidArgumentException(
-                    "Unsupported transport '" + transport + "' in connection string, only tcp is supported");
+        if (TCP_TRANSPORT.equals(transport)) {
+            return;
         }
+        if (!TRANSPORT_NAME.matcher(transport).matches()) {
+            throw invalid("scheme must be iggy:// or iggy+tcp://");
+        }
+        throw new IggyInvalidArgumentException(
+                "Unsupported transport '" + transport + "' in connection string, only tcp is supported");
     }
 
     private static boolean parseTlsOption(String options) {
@@ -140,4 +150,6 @@ record TcpConnectionString(String host, int port, String username, String passwo
     private static IggyInvalidArgumentException invalid(String reason) {
         return new IggyInvalidArgumentException("Invalid connection string: " + reason);
     }
+
+    private record Address(String host, int port) {}
 }
