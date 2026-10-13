@@ -7143,6 +7143,15 @@ mod tests {
     /// denied.
     #[test]
     fn shell_workload_drains_and_converges() {
+        shell_workload_with_ack_quorum_ratio(0.5);
+    }
+
+    #[test]
+    fn given_serial_quorum_offsets_when_shell_workload_quiesces_should_compare_the_shadow() {
+        shell_workload_with_ack_quorum_ratio(1.0);
+    }
+
+    fn shell_workload_with_ack_quorum_ratio(ack_quorum_ratio: f32) {
         use crate::workload::{
             self, Workload,
             options::{ActionWeights, WorkloadOptions},
@@ -7182,6 +7191,7 @@ mod tests {
 
         let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
         options.weights = ActionWeights::uniform();
+        options.ack_quorum_ratio = ack_quorum_ratio;
         let mut wl = Workload::new(options);
 
         let clients = [client];
@@ -7213,7 +7223,27 @@ mod tests {
             "{}",
             oracle::quiesce_failure_report(&sim, &wl),
         );
-        oracle::assert_converged(&sim, &mut wl);
+        let convergence = oracle::assert_converged(&sim, &mut wl);
+        if ack_quorum_ratio >= 1.0 {
+            assert!(
+                wl.auditor
+                    .stats()
+                    .commits(crate::workload::actions::Action::StoreConsumerOffset)
+                    > 0,
+                "the strict CI cell must acknowledge an offset store"
+            );
+            assert!(
+                convergence.offsets_compared_with_shadow > 0,
+                "the strict CI cell must compare its acknowledged offset shadow"
+            );
+            println!(
+                "strict offset proof: stores={}, offsets_compared_with_shadow={}",
+                wl.auditor
+                    .stats()
+                    .commits(crate::workload::actions::Action::StoreConsumerOffset),
+                convergence.offsets_compared_with_shadow,
+            );
+        }
     }
 
     /// A result-framed transport rejection is not a committed result.

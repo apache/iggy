@@ -26,11 +26,12 @@
 //! `IndexSet` for state we sample randomly (O(1) `get_index`).
 //! `HashMap` for pure-lookup state.
 
+use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 use indexmap::IndexSet;
 use metadata::stm::stream::Streams;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use server_common::sharding::IggyNamespace;
 
@@ -44,6 +45,18 @@ pub const FIXTURE_GROUP_NAME: &str = "sim-fixture-group";
 /// Id of the fixture group: the first group of its topic, and every topic
 /// incarnation numbers its groups from 0.
 pub const FIXTURE_GROUP_ID: u32 = 0;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CapturedOwner {
+    pub namespace: IggyNamespace,
+    pub owner: ConsumerGroupOwner,
+    pub context: PartitionContext,
+}
+
+struct ObservedOwner {
+    captured: CapturedOwner,
+    current: ConsumerGroupOwner,
+}
 
 /// The half of a fixture replacement one request performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +256,9 @@ pub struct Shadow {
     /// Namespaces of the fixture topics whose delete was reached since the last
     /// [`Self::take_deleted_namespaces`].
     deleted_namespaces: Vec<IggyNamespace>,
+    /// One original token per fixture/client; only input selection reads these
+    /// observations. The independent committed-log oracle validates effects.
+    captured_owners: BTreeMap<(IggyNamespace, u128), ObservedOwner>,
 }
 
 impl Shadow {
@@ -302,7 +318,52 @@ impl Shadow {
             fixtures,
             fixture_deletes_open: true,
             deleted_namespaces: Vec::new(),
+            captured_owners: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn observe_owner(
+        &mut self,
+        namespace: IggyNamespace,
+        owner: ConsumerGroupOwner,
+        context: PartitionContext,
+    ) {
+        self.captured_owners.retain(|&(ns, _), observed| {
+            ns != namespace || observed.captured.context.incarnation == context.incarnation
+        });
+        for (&(ns, _), observed) in &mut self.captured_owners {
+            if ns == namespace {
+                observed.current = owner;
+            }
+        }
+        if !owner.is_unassigned() {
+            self.captured_owners
+                .entry((namespace, owner.client_id))
+                .or_insert(ObservedOwner {
+                    captured: CapturedOwner {
+                        namespace,
+                        owner,
+                        context,
+                    },
+                    current: owner,
+                });
+        }
+    }
+
+    pub(crate) fn pick_stale_owner(&self, prng: &mut Xoshiro256PlusPlus) -> Option<CapturedOwner> {
+        let stale = || {
+            self.captured_owners.values().filter(|observed| {
+                observed.current.generation > observed.captured.owner.generation
+                    && self.namespaces_live.contains(&observed.captured.namespace)
+            })
+        };
+        let count = stale().count();
+        if count == 0 {
+            return None;
+        }
+        stale()
+            .nth(prng.random_range(0..count))
+            .map(|observed| observed.captured)
     }
 
     /// Start a toggle of a fixture topic picked uniformly among those that can
@@ -384,6 +445,8 @@ impl Shadow {
                     .retain(|namespace, _| !namespaces.contains(namespace));
                 self.consumer_offsets
                     .retain(|(namespace, _, _), _| !namespaces.contains(namespace));
+                self.captured_owners
+                    .retain(|(namespace, _), _| !namespaces.contains(namespace));
                 self.deleted_namespaces.extend(namespaces);
                 if let Some(group) = &mut self.fixtures[index].group {
                     group.exists = false;

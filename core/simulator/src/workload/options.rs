@@ -45,6 +45,7 @@ const UNIFORM_EXCLUDED: &[Action] = &[
     Action::ReplaceFixtureTopic,
     Action::JoinFixtureGroup,
     Action::LeaveFixtureGroup,
+    Action::StoreStaleOwnerOffset,
 ];
 
 /// Per-action sampling weights as percentages. Unlisted variants default
@@ -94,11 +95,12 @@ impl ActionWeights {
     pub fn lifecycle() -> Self {
         Self::new(&[
             (Action::SendMessages, 42),
-            (Action::StoreConsumerOffset, 25),
+            (Action::StoreConsumerOffset, 20),
             (Action::DeleteConsumerOffset, 8),
             (Action::ReplaceFixtureTopic, 5),
             (Action::JoinFixtureGroup, 12),
             (Action::LeaveFixtureGroup, 8),
+            (Action::StoreStaleOwnerOffset, 5),
         ])
     }
 

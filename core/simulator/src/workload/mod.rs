@@ -43,7 +43,9 @@ use crate::workload::ops::{
 };
 use actions::Action;
 use auditor::{OnReply, ServerAuditor};
+use consensus::MetadataHandle;
 use effect::{Effect, SimCommand};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::{
     KIND_CONSUMER_GROUP, Operation, ReplyHeader, RoutedRequestHeader, result_code,
 };
@@ -161,6 +163,8 @@ pub struct Workload {
     /// Partition ops of deleted fixture incarnations witnessed by more than one
     /// replica, for the run summary.
     deleted_partition_ops_compared: usize,
+    stale_owner_stores: u64,
+    owner_fence_refusals: u64,
     /// Clients whose recovery or redirect handshake is in flight, with the replica
     /// and the tick it last went out on. Such a client submits nothing: its session
     /// is gone or moving, so anything it sent would be refused.
@@ -207,6 +211,8 @@ impl Workload {
             evictions: 0,
             redirects: 0,
             deleted_partition_ops_compared: 0,
+            stale_owner_stores: 0,
+            owner_fence_refusals: 0,
             pending_handshakes: BTreeMap::new(),
             homes: BTreeMap::new(),
             samples_none: 0,
@@ -555,6 +561,13 @@ impl Workload {
             self.samples_none += 1;
             return None;
         };
+        if let InFlightInput::StoreStaleOwnerOffset(input) = &input {
+            if input.captured.owner.client_id != client.client_id() {
+                self.samples_none += 1;
+                return None;
+            }
+            self.stale_owner_stores += 1;
+        }
         let message = ops::build_message(client, &input);
 
         let header = message.header();
@@ -584,6 +597,43 @@ impl Workload {
         );
 
         Some((target, message))
+    }
+
+    #[must_use]
+    pub const fn stale_owner_stores(&self) -> u64 {
+        self.stale_owner_stores
+    }
+
+    #[must_use]
+    pub const fn owner_fence_refusals(&self) -> u64 {
+        self.owner_fence_refusals
+    }
+
+    fn observe_fixture_owners(&mut self, sim: &Simulator) {
+        if self.options.weights.weight(Action::StoreStaleOwnerOffset) == 0 {
+            return;
+        }
+        for &namespace in &self.options.namespaces {
+            let Some(primary) = sim.primary_index(namespace).map(usize::from) else {
+                continue;
+            };
+            let Some(incarnation) = sim.partition_incarnation(primary, namespace) else {
+                continue;
+            };
+            let owner = sim
+                .installed_group_owner(primary, namespace, u64::from(shadow::FIXTURE_GROUP_ID))
+                .unwrap_or_default();
+            let context = PartitionContext {
+                incarnation,
+                owner_generation: owner.generation,
+                metadata_op: sim.replicas[primary].shards[0]
+                    .plane
+                    .metadata()
+                    .applied_frontier()
+                    .get(),
+            };
+            self.shadow.observe_owner(namespace, owner, context);
+        }
     }
 
     /// Validate and apply a reply. Returns [`SimCommand`]s the driver
@@ -616,6 +666,18 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
         let namespace = IggyNamespace::from_raw(entry.request_namespace);
+        if entry.action == Action::StoreStaleOwnerOffset {
+            assert_ne!(
+                header.status, 0,
+                "a captured stale owner committed an offset: input={:?}, request={}, seed={:#x}",
+                entry.input, header.request, self.options.seed,
+            );
+            if header.status
+                == IggyError::ConsumerGroupPartitionNotOwned(shadow::FIXTURE_GROUP_ID, 0).as_code()
+            {
+                self.owner_fence_refusals += 1;
+            }
+        }
         let attempts = self.outstanding.get(&key).map_or(1, |entry| entry.attempts);
         // A refusal proves only that its own attempt did not commit.
         let refusal = if attempts > 1 {
@@ -1095,6 +1157,7 @@ fn drive_tick(
     // slot, so `build_request` would decline it anyway.
     resubmit_due(sim, workload);
     resubmit_due_handshakes(sim, workload, clients);
+    workload.observe_fixture_owners(sim);
     for client in clients {
         // A client whose session is gone submits nothing: the request would be
         // refused and evict it again, and the eviction would look like a fresh
@@ -1429,6 +1492,7 @@ mod tests {
     use crate::partition_repair_driver_tests::is_commit_for;
     use consensus::{MetadataHandle, StateTransferStage, Status};
     use iggy_binary_protocol::namespace::METADATA_GROUP;
+    use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::{Command, WireDecode};
     use metadata::impls::metadata::StreamsFrontend;
@@ -3132,6 +3196,137 @@ mod tests {
         assert!(
             convergence.owners_compared > 0,
             "no settled owner was compared"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_a_recaptured_assignment_when_storing_with_its_old_owner_should_refuse_in_the_workload()
+    {
+        const SEED: u64 = 0x57A1_E001;
+        const REPLICAS: u8 = 3;
+        const TRAFFIC_TICKS: u64 = 200;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(REPLICAS),
+            1,
+            [1].into_iter(),
+            PacketSimulatorOptions {
+                node_count: REPLICAS,
+                client_count: 1,
+                seed: SEED,
+                ..Default::default()
+            },
+        );
+        sim.init_partition(namespace);
+        sim.seed_stream_topic_partition(namespace);
+        let clients = [SimClient::new(1)];
+        sim.shell_login(&clients[0]);
+        let mut options = WorkloadOptions::new(SEED, REPLICAS, vec![namespace]);
+        options.ack_quorum_ratio = 1.0;
+        options.weights = ActionWeights::lifecycle();
+        let mut workload = Workload::new(options);
+        let mut invariants = Invariants::new();
+        create_fixture_groups(&mut sim, &mut workload, &clients[0]);
+        workload.options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
+        run(
+            &mut sim,
+            &mut workload,
+            &clients,
+            TRAFFIC_TICKS,
+            u64::MAX,
+            &mut invariants,
+        );
+        assert!(oracle::drive_to_quiesce(
+            &mut sim,
+            &mut workload,
+            &clients,
+            u64::from(crate::SETUP_TOTAL_STEPS),
+            &mut invariants,
+        ));
+        assert!(workload.shadow.sends_committed(namespace) > 0);
+        workload.options.weights = ActionWeights::new(&[(Action::StoreStaleOwnerOffset, 100)]);
+        let (stream, topic) = workload.shadow.fixture_names(0);
+        let mut original = None;
+        for join in [true, false, true] {
+            let request = if join {
+                clients[0].join_consumer_group(&stream, &topic, shadow::FIXTURE_GROUP_NAME)
+            } else {
+                clients[0].leave_consumer_group(&stream, &topic, shadow::FIXTURE_GROUP_NAME)
+            };
+            let operation = request.header().operation;
+            let reply = sim.await_setup_reply(
+                &clients[0],
+                0,
+                &request.into_generic(),
+                operation,
+                "owner handoff",
+            );
+            assert_eq!(result_code(reply.body()), Some(0));
+            assert!(
+                (0..crate::SETUP_TOTAL_STEPS).any(|_| {
+                    sim.step();
+                    sim.installed_group_owner(0, namespace, u64::from(shadow::FIXTURE_GROUP_ID))
+                        .is_some_and(|owner| {
+                            owner.is_unassigned() != join
+                                && original.is_none_or(|old: ConsumerGroupOwner| {
+                                    owner.generation > old.generation
+                                })
+                        })
+                }),
+                "the requested owner handoff must install"
+            );
+            if original.is_none() {
+                original =
+                    sim.installed_group_owner(0, namespace, u64::from(shadow::FIXTURE_GROUP_ID));
+            }
+            workload.observe_fixture_owners(&sim);
+        }
+        let current = sim
+            .installed_group_owner(0, namespace, u64::from(shadow::FIXTURE_GROUP_ID))
+            .unwrap();
+        let original = original.unwrap();
+        assert_eq!(current.client_id, original.client_id);
+        assert_eq!(current.session, original.session);
+        assert!(current.generation > original.generation);
+
+        run(
+            &mut sim,
+            &mut workload,
+            &clients,
+            TRAFFIC_TICKS,
+            u64::MAX,
+            &mut invariants,
+        );
+        assert!(oracle::drive_to_quiesce(
+            &mut sim,
+            &mut workload,
+            &clients,
+            u64::from(crate::SETUP_TOTAL_STEPS),
+            &mut invariants,
+        ));
+        assert!(
+            workload.stale_owner_stores() > 0,
+            "no captured stale owner was submitted"
+        );
+        assert!(
+            workload.owner_fence_refusals() > 0,
+            "no captured stale owner reached its fence"
+        );
+        let convergence = oracle::assert_converged(&sim, &mut workload);
+        assert!(convergence.owners_compared > 0);
+        assert!(convergence.offsets_compared_with_shadow > 0);
+        println!(
+            "stale owner proof: submitted={}, fence_refusals={}, owners_compared={}, offsets_compared_with_shadow={}",
+            workload.stale_owner_stores(),
+            workload.owner_fence_refusals(),
+            convergence.owners_compared,
+            convergence.offsets_compared_with_shadow,
         );
     }
 }

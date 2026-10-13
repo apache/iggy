@@ -563,7 +563,7 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
     let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
 
     let owners_compared = assert_settled_owners_installed(sim, workload, leader, seed);
-    assert_partition_offsets_agree(sim, workload, &live, seed);
+    let offsets_compared_with_shadow = assert_partition_offsets_agree(sim, workload, &live, seed);
     assert_no_stale_revocations(sim, leader, seed);
 
     let report = ConvergenceReport {
@@ -572,6 +572,7 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> Convergence
         replicas_compared,
         namespaces_checked,
         owners_compared,
+        offsets_compared_with_shadow,
     };
 
     // Entity oracle: on a serial run the shadow must equal the committed
@@ -635,6 +636,8 @@ pub struct ConvergenceReport {
     /// Consumer group owners settled in leader metadata that were compared with
     /// the owner their partition primary installed.
     pub owners_compared: usize,
+    /// Partition offset tables compared with the serial acknowledged shadow.
+    pub offsets_compared_with_shadow: usize,
 }
 
 /// Require a host and exactly one primary for every workload namespace committed
@@ -848,7 +851,13 @@ fn assert_settled_owners_installed(
     compared
 }
 
-fn assert_partition_offsets_agree(sim: &Simulator, workload: &Workload, live: &[usize], seed: u64) {
+fn assert_partition_offsets_agree(
+    sim: &Simulator,
+    workload: &Workload,
+    live: &[usize],
+    seed: u64,
+) -> usize {
+    let mut compared_with_shadow = 0;
     for &namespace in &workload.options.namespaces {
         let mut committed = BTreeMap::new();
         for &replica in live {
@@ -892,10 +901,12 @@ fn assert_partition_offsets_agree(sim: &Simulator, workload: &Workload, live: &[
                     offsets, expected,
                     "consumer offsets differ from the serial acknowledged shadow (ns={namespace:?}, seed={seed:#x})"
                 );
+                compared_with_shadow += 1;
             }
             committed.insert(prefix, (replica, offsets));
         }
     }
+    compared_with_shadow
 }
 
 /// Fail if a revocation pending in the metadata of replica `leader` aged past

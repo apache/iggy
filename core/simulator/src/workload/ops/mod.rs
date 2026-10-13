@@ -49,6 +49,7 @@ pub mod leave_fixture_group;
 pub mod replace_fixture_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
+pub mod store_stale_owner_offset;
 pub mod update_permissions;
 pub mod update_stream;
 pub mod update_topic;
@@ -213,4 +214,5 @@ op_dispatch! {
     ReplaceFixtureTopic       => replace_fixture_topic,
     JoinFixtureGroup          => join_fixture_group,
     LeaveFixtureGroup         => leave_fixture_group,
+    StoreStaleOwnerOffset      => store_stale_owner_offset,
 }

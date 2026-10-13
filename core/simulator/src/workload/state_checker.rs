@@ -42,7 +42,9 @@ use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_offsets::{
     GetConsumerOffsetRequest, split_prepared_offset,
 };
-use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+use iggy_binary_protocol::requests::partitions::{
+    InstallConsumerGroupOwnerRequest, RetireConsumerGroupOwnersRequest,
+};
 use iggy_binary_protocol::{HEADER_SIZE, Operation, PrepareHeader, WireDecode};
 use journal::Journal;
 use message_bus::is_auto_commit_client;
@@ -76,7 +78,13 @@ struct PartitionProgress {
     incarnation: u64,
     replica_incarnation: u128,
     committed: u64,
-    owners: BTreeMap<u64, ConsumerGroupOwner>,
+    owners: PartitionOwners,
+}
+
+#[derive(Debug, Default)]
+struct PartitionOwners {
+    installed: BTreeMap<u64, ConsumerGroupOwner>,
+    retirement: Option<RetireConsumerGroupOwnersRequest>,
 }
 
 /// Canonical committed metadata and partition chains, accumulated across ticks.
@@ -203,7 +211,7 @@ impl StateChecker {
             incarnation,
             replica_incarnation,
             committed: state.commit_min,
-            owners: previous.map_or_else(BTreeMap::new, |previous| previous.owners),
+            owners: previous.map_or_else(PartitionOwners::default, |previous| previous.owners),
         };
         let Some(headers) =
             sim.partition_journaled_headers(idx, namespace, first..=state.commit_min)
@@ -230,6 +238,7 @@ impl StateChecker {
             if matches!(
                 header.operation,
                 Operation::InstallConsumerGroupOwner
+                    | Operation::RetireConsumerGroupOwners
                     | Operation::StoreConsumerOffset
                     | Operation::DeleteConsumerOffset
             ) {
@@ -384,7 +393,7 @@ impl StateChecker {
 /// Membership is metadata state; the partition's ordered install barrier is
 /// what fences a departed member's later offset writes.
 fn check_partition_owner(
-    owners: &mut BTreeMap<u64, ConsumerGroupOwner>,
+    owners: &mut PartitionOwners,
     header: &PrepareHeader,
     body: &[u8],
     seed: u64,
@@ -392,10 +401,28 @@ fn check_partition_owner(
     if header.operation == Operation::InstallConsumerGroupOwner {
         let install = InstallConsumerGroupOwnerRequest::decode_from(body)
             .expect("a committed owner installation decodes");
-        owners.insert(install.group_id, install.owner);
+        if !owners
+            .retirement
+            .as_ref()
+            .is_some_and(|catalog| catalog.retires(install.group_id))
+        {
+            owners.installed.insert(install.group_id, install.owner);
+        }
         return;
     }
-    if is_auto_commit_client(header.client) {
+    if header.operation == Operation::RetireConsumerGroupOwners {
+        let mut catalog = RetireConsumerGroupOwnersRequest::decode_from(body)
+            .expect("a committed owner retirement decodes");
+        if let Some(previous) = &owners.retirement {
+            if catalog.metadata_op < previous.metadata_op {
+                return;
+            }
+            catalog
+                .live_group_ids
+                .retain(|group| !previous.retires(*group));
+        }
+        owners.installed.retain(|group, _| !catalog.retires(*group));
+        owners.retirement = Some(catalog);
         return;
     }
     let (request, generation) =
@@ -412,12 +439,26 @@ fn check_partition_owner(
             .as_u32()
             .expect("a prepared group id is numeric"),
     );
-    // The repair ring may have evicted the install before this checker started.
-    if let Some(owner) = owners.get(&group_id) {
+    let auto_commit = is_auto_commit_client(header.client);
+    let cleanup = auto_commit && header.operation == Operation::DeleteConsumerOffset;
+    if owners
+        .retirement
+        .as_ref()
+        .is_some_and(|catalog| catalog.retires(group_id))
+    {
         assert!(
-            !owner.is_unassigned()
-                && owner.client_id == header.client
-                && owner.session == header.session
+            cleanup,
+            "group offset committed past its retirement fence: group={group_id}, op={}, seed={seed:#x}",
+            header.op,
+        );
+        return;
+    }
+    // The repair ring may have evicted the install before this checker started.
+    if let Some(owner) = owners.installed.get(&group_id) {
+        assert!(
+            (!owner.is_unassigned() || cleanup)
+                && (auto_commit
+                    || (owner.client_id, owner.session) == (header.client, header.session))
                 && owner.generation == generation,
             "group offset committed past its owner fence: group={group_id}, owner={owner:?}, \
              client={}, session={}, generation={generation}, op={}, seed={seed:#x}",
@@ -592,15 +633,18 @@ mod tests {
     use crate::workload::Workload;
     use crate::workload::invariants::Invariants;
     use crate::workload::options::WorkloadOptions;
-    use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::requests::consumer_offsets::{
+        DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
+    };
     use iggy_binary_protocol::{AckLevel, WireConsumer, WireEncode, WireIdentifier};
+    use message_bus::AUTO_COMMIT_CLIENT_ID;
 
     const SEED: u64 = 0x5C11;
 
     #[test]
     #[should_panic(expected = "group offset committed past its owner fence")]
     fn given_a_successor_install_when_the_departed_owner_commits_should_fail_the_oracle() {
-        let mut owners = BTreeMap::new();
+        let mut owners = PartitionOwners::default();
         let original = ConsumerGroupOwner {
             client_id: 1,
             session: 2,
@@ -651,6 +695,146 @@ mod tests {
                 SEED,
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "group offset committed past its owner fence")]
+    fn given_an_auto_commit_with_a_stale_generation_when_committed_should_fail_the_oracle() {
+        let mut owners = installed_owner();
+        check_offset(
+            &mut owners,
+            AUTO_COMMIT_CLIENT_ID,
+            0,
+            6,
+            Operation::StoreConsumerOffset,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "group offset committed past its owner fence")]
+    fn given_an_offset_with_a_stale_session_when_committed_should_fail_the_oracle() {
+        let mut owners = installed_owner();
+        check_offset(&mut owners, 1, 3, 7, Operation::StoreConsumerOffset);
+    }
+
+    #[test]
+    #[should_panic(expected = "group offset committed past its retirement fence")]
+    fn given_a_retired_group_when_an_auto_commit_store_commits_should_fail_the_oracle() {
+        let mut owners = retired_owner();
+        check_offset(
+            &mut owners,
+            AUTO_COMMIT_CLIENT_ID,
+            0,
+            7,
+            Operation::StoreConsumerOffset,
+        );
+    }
+
+    #[test]
+    fn given_an_auto_commit_when_current_or_cleaning_retired_offsets_should_pass_the_oracle() {
+        let mut owners = installed_owner();
+        check_offset(
+            &mut owners,
+            AUTO_COMMIT_CLIENT_ID,
+            0,
+            7,
+            Operation::StoreConsumerOffset,
+        );
+        let mut owners = retired_owner();
+        check_offset(
+            &mut owners,
+            AUTO_COMMIT_CLIENT_ID,
+            0,
+            6,
+            Operation::DeleteConsumerOffset,
+        );
+    }
+
+    fn installed_owner() -> PartitionOwners {
+        PartitionOwners {
+            installed: BTreeMap::from([(
+                0,
+                ConsumerGroupOwner {
+                    client_id: 1,
+                    session: 2,
+                    generation: 7,
+                },
+            )]),
+            retirement: None,
+        }
+    }
+
+    fn retired_owner() -> PartitionOwners {
+        let mut owners = installed_owner();
+        owners.installed.insert(
+            0,
+            ConsumerGroupOwner {
+                generation: 7,
+                ..Default::default()
+            },
+        );
+        for (metadata_op, live_group_ids) in [(8, vec![]), (9, vec![0])] {
+            let catalog = RetireConsumerGroupOwnersRequest {
+                incarnation: 1,
+                metadata_op,
+                next_group_id: 1,
+                live_group_ids,
+            };
+            check_partition_owner(
+                &mut owners,
+                &PrepareHeader {
+                    operation: Operation::RetireConsumerGroupOwners,
+                    ..Default::default()
+                },
+                &catalog.to_bytes(),
+                SEED,
+            );
+        }
+        assert!(owners.installed.is_empty());
+        owners
+    }
+
+    fn check_offset(
+        owners: &mut PartitionOwners,
+        client: u128,
+        session: u64,
+        generation: u64,
+        operation: Operation,
+    ) {
+        let request = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer_group(WireIdentifier::numeric(0)),
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(1),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        };
+        let mut body = if operation == Operation::DeleteConsumerOffset {
+            DeleteConsumerOffsetRequest {
+                consumer: request.consumer,
+                stream_id: request.stream_id,
+                topic_id: request.topic_id,
+                partition_id: request.partition_id,
+                ack: request.ack,
+            }
+            .to_bytes()
+            .to_vec()
+        } else {
+            request.to_bytes().to_vec()
+        };
+        body.extend_from_slice(&generation.to_le_bytes());
+        check_partition_owner(
+            owners,
+            &PrepareHeader {
+                operation,
+                client,
+                session,
+                op: 10,
+                ..Default::default()
+            },
+            &body,
+            SEED,
+        );
     }
 
     /// A three-replica cluster with six committed metadata ops behind it.
