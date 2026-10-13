@@ -21,6 +21,7 @@ package org.apache.iggy.client.blocking.http;
 
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.system.Stats;
 import org.assertj.core.data.Offset;
@@ -218,6 +219,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 10,
                           "count": 1,
+                          "context": {
+                            "incarnation": 17,
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -254,6 +260,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 10,
                           "count": 1,
+                          "context": {
+                            "incarnation": 17,
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -347,6 +358,11 @@ class ObjectMapperTest {
                           "partition_id": 1,
                           "current_offset": 0,
                           "count": 1,
+                          "context": {
+                            "incarnation": 17,
+                            "owner_generation": 9,
+                            "metadata_op": 52
+                          },
                           "messages": [
                             {
                               "header": {
@@ -371,6 +387,20 @@ class ObjectMapperTest {
 
     @Nested
     class Serialization {
+
+        @Test
+        void shouldSerializeAPolledContextInTheShapeTheServerStores() {
+            // given
+            var context = new PartitionContext(BigInteger.valueOf(17), BigInteger.valueOf(9), BigInteger.valueOf(52));
+
+            // when
+            String json = objectMapper.writeValueAsString(context);
+
+            // then
+            assertThat(objectMapper.readTree(json)).isEqualTo(objectMapper.readTree("""
+                    {"incarnation": 17, "owner_generation": 9, "metadata_op": 52}
+                    """));
+        }
 
         @Nested
         @DisplayName("Payload")

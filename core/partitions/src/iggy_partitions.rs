@@ -113,6 +113,7 @@ where
     /// Reconciler fences must not borrow a partition held by the pump across await.
     teardown: RefCell<AHashMap<IggyNamespace, crate::PartitionTeardown>>,
     consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
+    fence_published: Rc<Cell<bool>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
     loopback_ready: Rc<LoopbackReady>,
@@ -156,6 +157,7 @@ where
             tombstoned: RefCell::new(AHashMap::new()),
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             loopback_ready: Rc::default(),
@@ -175,6 +177,7 @@ where
             tombstoned: RefCell::new(AHashMap::new()),
             teardown: RefCell::new(AHashMap::new()),
             consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
+            fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             loopback_ready: Rc::default(),
@@ -356,6 +359,7 @@ where
         partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
             &self.consumer_group_offsets_reconcile_epoch,
         ));
+        partition.set_fence_published_flag(Rc::clone(&self.fence_published));
         self.teardown
             .borrow_mut()
             .insert(namespace, partition.teardown_handle());
@@ -377,6 +381,11 @@ where
                 .get()
                 .wrapping_add(1),
         );
+    }
+
+    /// Whether a partition here published a fence since the last call.
+    pub fn take_fence_published(&self) -> bool {
+        self.fence_published.replace(false)
     }
 
     /// Check if a namespace exists.
@@ -712,14 +721,6 @@ where
         })
     }
 
-    /// Drop a group's ephemeral `last_polled` mark on the partition for
-    /// `namespace`. `None` for a missing/tombstoned namespace.
-    pub fn clear_group_last_polled(&self, namespace: &IggyNamespace, group_id: u64) -> Option<()> {
-        self.with_partition(namespace, |partition| {
-            partition.clear_group_last_polled(group_id);
-        })
-    }
-
     /// Resolve a `DeleteSegments` count to the `end_offset` of the `count`-th
     /// oldest sealed segment on the partition for `namespace`. The outer `None`
     /// is a missing/tombstoned namespace; the inner `None` is a partition with
@@ -734,9 +735,9 @@ where
         })
     }
 
-    /// Read `(end_offset, lagging, created_revision, applied_purge_generation)`
-    /// in one partition access. The caller compares this local history with
-    /// committed metadata before submitting the resolved watermark.
+    /// Read `(end_offset, lagging, created_revision)` in one partition access.
+    /// The caller compares this local history with committed metadata before
+    /// submitting the resolved watermark.
     /// No sealed segment permits a no-op on a converged history; a lagging
     /// replica must retry because it may be missing whole sealed segments.
     /// `None` means no local partition. The caller can record that no-op with
@@ -745,7 +746,7 @@ where
         &self,
         namespace: &IggyNamespace,
         count: u32,
-    ) -> Option<(Option<u64>, bool, u64, u64)> {
+    ) -> Option<(Option<u64>, bool, u64)> {
         self.with_partition(namespace, |partition| {
             let consensus = partition.consensus();
             let lagging = consensus.is_follower()
@@ -756,7 +757,6 @@ where
                 partition.nth_oldest_sealed_end_offset(count),
                 lagging,
                 partition.created_revision(),
-                partition.applied_purge_generation(),
             )
         })
     }

@@ -748,6 +748,11 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
         .await
         .expect("send_messages: send_messages should work");
 
+    assert_unauthorized(
+        client.get_topic(&stream_id, &topic_id).await,
+        "send_messages: get_topic",
+    );
+
     // Cannot poll messages
     assert_unauthorized(
         client
@@ -2889,7 +2894,7 @@ fn assert_error_code<T: std::fmt::Debug>(
 
 /// The `id` field of an HTTP `ErrorResponse` body is the wire `IggyError` code,
 /// so a status-collapsed `HttpResponseError` can still be matched exactly.
-fn http_error_id(body: &str) -> Option<u32> {
+pub(crate) fn http_error_id(body: &str) -> Option<u32> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     value.get("id")?.as_u64().map(|id| id as u32)
 }

@@ -148,8 +148,6 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     dirty_segments: RefCell<BTreeSet<u64>>,
     dirty_offsets: [RefCell<BTreeSet<u32>>; ConsumerKind::COUNT],
     dirty_offset_directories: [Cell<bool>; ConsumerKind::COUNT],
-    purge_generation: Cell<u64>,
-    purge_floor: Cell<u64>,
     capacity: u64,
     disk_bytes: Cell<u64>,
     retained_bytes: Cell<u64>,
@@ -419,11 +417,6 @@ enum Mutation<S: DurableStorage> {
         op: u64,
         checksum: u128,
     },
-    Purge {
-        epoch: u64,
-        generation: u64,
-        floor: u64,
-    },
     Append {
         epoch: u64,
         prepare: Frozen<4096>,
@@ -574,8 +567,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             dirty_offsets: std::array::from_fn(|_| RefCell::new(BTreeSet::new())),
             // Recovery may have completed a rename or unlink without its final barrier.
             dirty_offset_directories: std::array::from_fn(|_| Cell::new(true)),
-            purge_generation: Cell::new(journal.purge_marker().0),
-            purge_floor: Cell::new(journal.purge_marker().1),
             capacity,
             disk_bytes: Cell::new(journal.size_bytes()),
             retained_bytes: Cell::new(journal.retained_bytes()),
@@ -1029,18 +1020,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         });
     }
 
-    pub fn mark_purge(&self, generation: u64, floor: u64) {
-        self.queue.borrow_mut().push_back(Mutation::Purge {
-            epoch: self.epoch.get(),
-            generation,
-            floor,
-        });
-    }
-
-    pub const fn purge_marker(&self) -> (u64, u64) {
-        (self.purge_generation.get(), self.purge_floor.get())
-    }
-
     pub fn needs_checkpoint(&self) -> bool {
         !self.checkpoint_pending()
             && (self.checkpoint_needed.get()
@@ -1268,7 +1247,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 | Mutation::Sync { epoch }
                 | Mutation::EnableSegments { epoch, .. }
                 | Mutation::ReanchorSegments { epoch, .. }
-                | Mutation::Purge { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
                 | Mutation::Reset { epoch, .. } => (*epoch, 0),
@@ -1280,7 +1258,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 mutation,
                 Mutation::EnableSegments { .. }
                     | Mutation::ReanchorSegments { .. }
-                    | Mutation::Purge { .. }
                     | Mutation::Truncate { .. }
                     | Mutation::Checkpoint { .. }
                     | Mutation::Reset { .. }
@@ -1352,8 +1329,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
         self.checkpoint.set(journal.checkpoint_op());
         self.checkpoint_checksum.set(journal.checkpoint_checksum());
-        self.purge_generation.set(journal.purge_marker().0);
-        self.purge_floor.set(journal.purge_marker().1);
         if advanced {
             self.notify();
         }
@@ -1376,9 +1351,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             Mutation::CertifyView {
                 view, op, checksum, ..
             } => journal.certify_log_view(view, op, checksum).await,
-            Mutation::Purge {
-                generation, floor, ..
-            } => journal.mark_purge(generation, floor).await,
             Mutation::Append {
                 prepare, durable, ..
             } => {

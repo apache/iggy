@@ -22,14 +22,18 @@ import pytest
 
 from apache_iggy import (
     Consumer,
+    ConsumerPosition,
     HeaderKey,
     HeaderValue,
     IggyClient,
+    PartitionContext,
     Partitioning,
     PollingStrategy,
     UserHeaders,
 )
 from apache_iggy import SendMessage as Message
+
+from .utils import wait_for_consumer_group_assignment
 
 
 class TestPartitioning:
@@ -71,6 +75,49 @@ class TestPartitioning:
         with pytest.raises(TypeError):
             # pyrefly: ignore  # bad-argument-type
             Partitioning.messages_key(1)
+
+
+class TestPartitionContext:
+    """Test the context and position values that fence polls and commits."""
+
+    @pytest.mark.unit
+    def test_context_and_position_are_comparable_values(self):
+        context = PartitionContext(incarnation=7, owner_generation=11, metadata_op=13)
+        position = ConsumerPosition(partition_id=3, offset=42, context=context)
+
+        assert context.incarnation == 7
+        assert context.owner_generation == 11
+        assert context.metadata_op == 13
+        assert position.partition_id == 3
+        assert position.offset == 42
+        assert position.context == context
+        assert repr(position) == (
+            "ConsumerPosition(partition_id=3, offset=42, context="
+            "PartitionContext(incarnation=7, owner_generation=11, metadata_op=13))"
+        )
+
+        equal_position = ConsumerPosition(3, 42, PartitionContext(7, 11, 13))
+        assert position == equal_position
+        assert hash(position) == hash(equal_position)
+        assert position != ConsumerPosition(3, 42, PartitionContext(8, 11, 13))
+
+    @pytest.mark.unit
+    async def test_poll_messages_accepts_a_caller_context(self):
+        client = IggyClient()
+        poll = client.poll_messages(
+            "stream",
+            "topic",
+            consumer=Consumer.Single(1),
+            polling_strategy=PollingStrategy.Offset(value=42),
+            count=1,
+            auto_commit=False,
+            partition_id=3,
+            context=PartitionContext(7, 11, 13),
+        )
+
+        # The context was accepted; the poll fails only because nothing is connected.
+        with pytest.raises(RuntimeError, match="Disconnected"):
+            await poll
 
 
 class TestMessageOperations:
@@ -1596,6 +1643,9 @@ class TestMessageOperations:
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
         for partition_id in range(partitions_count):
             await iggy_client.send_messages(
                 stream=stream_name,
@@ -1672,6 +1722,9 @@ class TestMessageOperations:
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
         for partition_id in range(partitions_count):
             await iggy_client.send_messages(
                 stream=stream_name,
@@ -1713,6 +1766,9 @@ class TestMessageOperations:
         )
         await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
         await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await wait_for_consumer_group_assignment(
+            iggy_client, stream_name, topic_name, group_name, members_count=1
+        )
         await iggy_client.send_messages(
             stream=stream_name,
             topic=topic_name,

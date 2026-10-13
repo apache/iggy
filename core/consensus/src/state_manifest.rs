@@ -49,9 +49,8 @@ pub mod artifact_kind {
     /// (prepare-stripped `SendMessages` records); `frontier` = the
     /// segment's base offset.
     pub const SEGMENT_LOG: u8 = 2;
-    /// Partition plane: the encoded consumer + consumer-group offset table
-    /// (plus the applied purge generation); `frontier` = the offer's
-    /// `commit_op`.
+    /// Partition plane: the encoded consumer + consumer-group offset table;
+    /// `frontier` = the offer's `commit_op`.
     pub const CONSUMER_OFFSETS: u8 = 3;
 }
 

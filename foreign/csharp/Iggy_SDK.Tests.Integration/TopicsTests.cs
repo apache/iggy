@@ -21,7 +21,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -202,37 +201,6 @@ public class TopicsTests
         result.MessageExpiry.ShouldBe(TimeSpan.FromMinutes(10));
         result.CompressionAlgorithm.ShouldBe(CompressionAlgorithm.Gzip);
         result.MaxTopicSize.ShouldBe(3_000_000_000u);
-    }
-
-    [Test]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully(Protocol protocol)
-    {
-        var client = await Fixture.CreateAuthenticatedClient(protocol);
-
-        var streamName = $"topic-purge-{Guid.NewGuid():N}";
-        await client.CreateStreamAsync(streamName);
-        await client.CreateTopicAsync(Identifier.String(streamName), "Purge Topic", 1);
-
-        await client.SendMessagesAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic"), Partitioning.None(), GetMessages(5));
-
-        var beforePurge = await client.GetTopicByIdAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic"));
-        beforePurge.ShouldNotBeNull();
-        beforePurge.MessagesCount.ShouldBe(5u);
-        beforePurge.Size.ShouldBeGreaterThan(0u);
-
-        await Should.NotThrowAsync(client.PurgeTopicAsync(Identifier.String(streamName),
-            Identifier.String("Purge Topic")));
-
-        // The server commits the purge by advancing a generation its reconciler acts on a tick later.
-        var afterPurge = await Eventually.ReadAsync(
-            () => client.GetTopicByIdAsync(Identifier.String(streamName), Identifier.String("Purge Topic")),
-            topic => topic?.MessagesCount == 0, TimeSpan.FromSeconds(10));
-        afterPurge.ShouldNotBeNull();
-        afterPurge!.MessagesCount.ShouldBe(0u);
-        afterPurge.Size.ShouldBe(0u);
     }
 
     [Test]

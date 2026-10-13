@@ -18,10 +18,46 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition, Identifier, IggyError};
 
 #[async_trait]
 impl ConsumerOffsetClient for ClientWrapper {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        match self {
+            ClientWrapper::Iggy(client) => {
+                client
+                    .store_consumer_position(consumer, stream_id, topic_id, position)
+                    .await
+            }
+            ClientWrapper::Http(client) => {
+                client
+                    .store_consumer_position(consumer, stream_id, topic_id, position)
+                    .await
+            }
+            ClientWrapper::Tcp(client) => {
+                client
+                    .store_consumer_position(consumer, stream_id, topic_id, position)
+                    .await
+            }
+            ClientWrapper::Quic(client) => {
+                client
+                    .store_consumer_position(consumer, stream_id, topic_id, position)
+                    .await
+            }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .store_consumer_position(consumer, stream_id, topic_id, position)
+                    .await
+            }
+        }
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,

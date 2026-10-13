@@ -20,11 +20,11 @@ under the License.
 <script lang="ts">
   import { SvelteSet } from 'svelte/reactivity';
   import ModalBase from './ModalBase.svelte';
-  import type { CloseModalFn } from '$lib/types/utilTypes';
-  import { type Message, type HeaderEntry, type HeaderField } from '$lib/domain/Message';
-  import MessageDecoder from '$lib/components/MessageDecoder/MessageDecoder.svelte';
+  import type { CloseModalFn } from '#lib/types/utilTypes.js';
+  import { type Message, type HeaderEntry, type HeaderField } from '#lib/domain/Message.js';
+  import MessageDecoder from '#lib/components/MessageDecoder/MessageDecoder.svelte';
 
-  import { formatMessageId } from '$lib/utils/formatters/uuidFormatter';
+  import { formatMessageId } from '#lib/utils/formatters/uuidFormatter.js';
 
   interface Props {
     closeModal: CloseModalFn;

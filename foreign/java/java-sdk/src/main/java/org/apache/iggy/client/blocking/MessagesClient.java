@@ -51,6 +51,23 @@ public interface MessagesClient {
                 autoCommit);
     }
 
+    /**
+     * Polls messages from a topic partition.
+     *
+     * <p>Over TCP, a poll without a caller context takes the partition context from the
+     * client's route to the partition, and the client caches that route. After another
+     * client deletes and recreates the partition, such a poll can fail once with error 87
+     * (history unavailable), or 5009 (partition not owned) for a group consumer. The
+     * client returns that error and does not retry it. It drops the failed route, so the
+     * next call routes again. A group poll without a partition ID is the exception for
+     * 5009: it syncs the assignment again and retries once, unless its strategy has a
+     * context.
+     *
+     * <p>To continue at an offset from an earlier poll, pass the
+     * {@link PolledMessages#context()} of that poll with {@link PollingStrategy#withContext}.
+     * Then a poll of a recreated partition is refused instead of reading it at an offset
+     * from the old incarnation.
+     */
     PolledMessages pollMessages(
             StreamId streamId,
             TopicId topicId,

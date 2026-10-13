@@ -28,35 +28,83 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTopicCache_DropStreamForgetsEveryTopicUnderTheStream(t *testing.T) {
+func TestTopicCache_DropStreamRestartsItsCursorsAndForgetsEveryCountAndContext(t *testing.T) {
 	cache := topicCache{}
 	doomed := topicKey{stream: "doomed", topic: "orders"}
 	doomedSibling := topicKey{stream: "doomed", topic: "billing"}
 	survivor := topicKey{stream: "kept", topic: "orders"}
+	keys := []topicKey{doomed, doomedSibling, survivor}
 
-	for _, key := range []topicKey{doomed, doomedSibling, survivor} {
+	for _, key := range keys {
 		cache.setPartitionsCount(key, 4)
 		cache.nextBalanced(key, 4)
+		cache.setPartitionContext(key, 1, iggcon.PartitionContext{OwnerGeneration: 7})
 	}
 
 	cache.dropStream("doomed")
 
-	_, ok := cache.partitionsCount(doomed)
-	assert.False(t, ok)
-	_, ok = cache.partitionsCount(doomedSibling)
-	assert.False(t, ok)
-	count, ok := cache.partitionsCount(survivor)
-	assert.True(t, ok, "topics of other streams stay cached")
-	assert.Equal(t, uint32(4), count)
+	for _, key := range keys {
+		_, ok := cache.partitionsCount(key)
+		assert.False(t, ok, "the key of another stream may alias the deleted one: %+v", key)
+		_, ok = cache.partitionContext(key, 1)
+		assert.False(t, ok, "the key of another stream may alias the deleted one: %+v", key)
+	}
 	assert.Equal(t, uint32(1), cache.nextBalanced(survivor, 4),
 		"the surviving cursor keeps its position")
 	assert.Equal(t, uint32(0), cache.nextBalanced(doomed, 4),
 		"the dropped cursor restarts")
 }
 
+func TestTopologyChanges_DropTheCachedDiscoveryOfEveryAlias(t *testing.T) {
+	ctx := context.Background()
+	streamId := numericIdentifier(t, 1)
+	topicId := numericIdentifier(t, 2)
+	streamName, err := iggcon.NewIdentifier("orders")
+	require.NoError(t, err)
+	topicName, err := iggcon.NewIdentifier("eu")
+	require.NoError(t, err)
+	// One topic, cached once under its numeric ids and once under its names.
+	aliases := []topicKey{newTopicKey(streamId, topicId), newTopicKey(streamName, topicName)}
+	changes := []struct {
+		name      string
+		operation vsr.Operation
+		apply     func(client *IggyTcpClient) error
+	}{
+		{name: "stream delete", operation: vsr.OperationDeleteStream,
+			apply: func(client *IggyTcpClient) error { return client.DeleteStream(ctx, streamId) }},
+		{name: "topic delete", operation: vsr.OperationDeleteTopic,
+			apply: func(client *IggyTcpClient) error { return client.DeleteTopic(ctx, streamId, topicId) }},
+		{name: "partition create", operation: vsr.OperationCreatePartitions,
+			apply: func(client *IggyTcpClient) error { return client.CreatePartitions(ctx, streamId, topicId, 1) }},
+		{name: "partition delete", operation: vsr.OperationDeletePartitions,
+			apply: func(client *IggyTcpClient) error { return client.DeletePartitions(ctx, streamId, topicId, 1) }},
+	}
+	for _, change := range changes {
+		t.Run(change.name, func(t *testing.T) {
+			client, serverConn := newPipeClient(t)
+			serve(serverConn, func(_ int, _ request) []byte {
+				return replyFrame(change.operation, resultSection())
+			})
+			for _, key := range aliases {
+				client.topics.setPartitionsCount(key, 3)
+				client.topics.setPartitionContext(key, 1, iggcon.PartitionContext{Incarnation: 17})
+			}
+
+			require.NoError(t, change.apply(client))
+
+			for _, key := range aliases {
+				_, cached := client.topics.partitionsCount(key)
+				assert.False(t, cached, "the count cached under %+v", key)
+				_, cached = client.topics.partitionContext(key, 1)
+				assert.False(t, cached, "the context cached under %+v", key)
+			}
+		})
+	}
+}
+
 func TestDeleteStream_DropsTheCachedTopicsOfTheStream(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(_ int, read request) []byte {
+	server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
 		switch {
 		case read.operation() == vsr.OperationSendMessages:
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())

@@ -472,6 +472,7 @@ impl Workload {
     /// If a metadata reply carries a committed result code outside the op's
     /// declared result enum (a server bug).
     #[must_use = "returned SimCommands must be applied; call apply_sim_commands or use Workload::run"]
+    #[allow(clippy::too_many_lines)]
     pub fn on_reply(&mut self, reply: &Message<ReplyHeader>) -> Vec<SimCommand> {
         let header = reply.header();
         let key = (header.client, header.request);
@@ -485,19 +486,20 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
 
-        // A pre-commit denial short-circuits everything below. The two channels are
-        // mutually exclusive: a reply either commits (status 0, result section
-        // present) or is denied before commit (status set, EMPTY body). Reading a
-        // result section off a denial finds no bytes, which the metadata branch
-        // below would report as a corrupt reply.
-        //
-        // The op never entered the log, so the shadow must not move and there is
-        // nothing to classify. Only the dispatch shell produces these, since
-        // authorization runs there, which is why this went unmodelled until the
-        // workload ran through the shell.
+        // Uncertain replies can arrive in either the status or result section.
+        // A pending lifecycle already committed its intent, so only its retained
+        // request can resolve the outcome without losing the shadow's effect.
         if header.status != 0 {
-            self.auditor.note_denial(entry.action, header.status);
-            self.release_outstanding(key);
+            if TransientRejection::from_code(header.status)
+                == Some(TransientRejection::NotCommitted)
+            {
+                self.auditor
+                    .note_transient_rejection(entry.action, header.status);
+                self.auditor.record_in_flight(key, entry);
+            } else {
+                self.auditor.note_denial(entry.action, header.status);
+                self.release_outstanding(key);
+            }
             return Vec::new();
         }
 
@@ -550,6 +552,14 @@ impl Workload {
                         self.auditor.record_in_flight(key, entry);
                     }
                 }
+                return Vec::new();
+            }
+
+            // A pending lifecycle refused the op in apply: a committed no-op that
+            // no op's result enum declares, so the shadow must not move.
+            if code == IggyError::LifecycleBusy.as_code() {
+                self.auditor.note_committed_rejection();
+                self.release_outstanding(key);
                 return Vec::new();
             }
 
@@ -769,6 +779,7 @@ pub fn run_with_faults(
             if workload.is_recovering(client.client_id()) {
                 continue;
             }
+            sim.discover_partition_contexts(client);
             if let Some((target, msg)) = workload.build_request(client) {
                 sim.submit_request(client.client_id(), target, msg.into_generic());
             }
@@ -1050,6 +1061,9 @@ pub fn apply_sim_commands(sim: &mut Simulator, cmds: &[SimCommand]) {
 mod tests {
     use super::*;
     use crate::packet::PacketSimulatorOptions;
+    use iggy_binary_protocol::Command;
+    use metadata::stm::result::ApplyReply;
+    use options::ActionWeights;
     use server_common::sharding::IggyNamespace;
 
     /// A raw-path eviction is recovered by re-registering, not by a shell login.
@@ -1139,5 +1153,36 @@ mod tests {
             sim.take_evictions().is_empty(),
             "the recovered client was evicted again, so the re-registration did not bind"
         );
+    }
+
+    /// A pending lifecycle refuses a conflicting metadata op in apply. The refusal
+    /// commits `LifecycleBusy`, which no op's result enum declares.
+    #[test]
+    fn given_lifecycle_busy_reply_when_received_should_release_the_request_without_effect() {
+        const SAMPLE_ATTEMPTS: usize = 16;
+        const SESSION: u64 = 1;
+        let client = SimClient::new(1);
+        client.bind_session(SESSION);
+        let mut options = WorkloadOptions::new(0x4C43_4259, 1, Vec::new());
+        options.weights = ActionWeights::new(&[(Action::CreateStream, 100)]);
+        let mut workload = Workload::new(options);
+        let (_, request) = (0..SAMPLE_ATTEMPTS)
+            .find_map(|_| workload.build_request(&client))
+            .expect("an empty shadow samples a stream create");
+        let busy = ApplyReply::err(IggyError::LifecycleBusy.as_code());
+        let size = size_of::<ReplyHeader>() + busy.reply_body_len();
+        let mut reply =
+            Message::<ReplyHeader>::new(size).transmute_header(|_, header: &mut ReplyHeader| {
+                header.command = Command::Reply;
+                header.size = u32::try_from(size).unwrap();
+                header.client = request.header().client;
+                header.request = request.header().request;
+                header.operation = request.header().operation;
+            });
+        busy.write_reply_body(&mut reply.as_mut_slice()[size_of::<ReplyHeader>()..]);
+
+        assert!(workload.on_reply(&reply).is_empty());
+        assert_eq!(workload.auditor.stats().committed_rejections, 1);
+        assert!(workload.client_idle(client.client_id()));
     }
 }

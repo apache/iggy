@@ -339,6 +339,14 @@
   code: 85
   format: "request is below the deduplication window; outcome unknown, resending may duplicate the write"
   fields: []
+- name: HistoryUnavailable
+  code: 87
+  format: "request history is no longer available; retry cannot execute it again"
+  fields: []
+- name: LifecycleBusy
+  code: 88
+  format: "a committed lifecycle operation prevents this mutation; retry as a new request"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
@@ -658,6 +666,10 @@
 - name: PartitionsLimitReached
   code: 2022
   format: "partitions limit reached, raise [metadata] partitions_max"
+  fields: []
+- name: PartitionResizeDisabled
+  code: 2023
+  format: "partition resizing is disabled for this fixed topic"
   fields: []
 - name: CannotCreatePartition
   code: 3000
@@ -1151,6 +1163,10 @@
       type: uint32
     - name: PartitionId
       type: uint32
+- name: TooManyConsumerGroups
+  code: 5010
+  format: "too many consumer groups"
+  fields: []
 - name: MissingBaseOffsetRetainedMessageBatch
   code: 6000
   format: "base offset is missing"
