@@ -17,14 +17,17 @@
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    TestTopicId, USAGE_PREFIX,
+    TestTopicId, USAGE_PREFIX, clear_session_entry,
 };
+use assert_cmd::Command;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
 use iggy::prelude::Durability;
 use iggy::prelude::IggyExpiry;
-use iggy::prelude::{IggyMessage, Partitioning, TopicCreateOptions};
+use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+use iggy::prelude::{IggyMessage, Partitioning, StreamClient, TopicClient, TopicCreateOptions};
+use integration::harness::{TestHarnessBuilder, TestServerConfig};
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -227,7 +230,8 @@ impl IggyCmdTestCase for TestTopicGetCmd {
 
         let stdout = std::str::from_utf8(&assertion.get_output().stdout)
             .expect("CLI output should be UTF-8");
-        let mut partition_rows = nested_table_rows(stdout, "Partitions");
+        let mut partition_rows =
+            nested_table_rows(stdout, "Partitions", 6).expect("complete partition rows");
         assert_eq!(
             partition_rows.remove(0),
             [
@@ -244,7 +248,8 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         expected_partitions.sort();
         assert_eq!(partition_rows, expected_partitions);
 
-        let mut option_rows = nested_table_rows(stdout, "Options");
+        let mut option_rows =
+            nested_table_rows(stdout, "Options", 2).expect("complete option rows");
         assert_eq!(option_rows.remove(0), ["Option", "Value"]);
         let mut expected_options = self.expected_options.clone();
         option_rows.sort();
@@ -460,7 +465,11 @@ Options:
         .await;
 }
 
-fn nested_table_rows(stdout: &str, property: &str) -> Vec<Vec<String>> {
+fn nested_table_rows(
+    stdout: &str,
+    property: &str,
+    columns: usize,
+) -> Result<Vec<Vec<String>>, &'static str> {
     let rows = stdout.lines().filter_map(|line| {
         let (key, value) = line.strip_prefix('|')?.split_once('|')?;
         Some((key.trim(), value.strip_suffix('|')?.trim()))
@@ -473,28 +482,30 @@ fn nested_table_rows(stdout: &str, property: &str) -> Vec<Vec<String>> {
             !value.is_empty() && !value.chars().all(|c| matches!(c, '-' | '=' | '+' | ' '))
         })
         .map(|value| {
-            value
-                .split('|')
-                .map(|cell| cell.trim().to_owned())
-                .collect()
+            let cells = value.split('|').map(str::trim).collect::<Vec<_>>();
+            if cells.len() != columns || cells.iter().any(|cell| cell.is_empty()) {
+                return Err("nested table row has missing, empty, or extra cells");
+            }
+            Ok(cells.into_iter().map(str::to_owned).collect())
         })
         .collect()
 }
 
 #[test]
-fn nested_rows_preserve_line_boundaries_and_exact_option_keys() {
+fn nested_rows_preserve_complete_records_and_exact_option_keys() {
     let stdout = "| Partitions | Partition id | Created | Segments count | Current offset | Size | Messages count |\n\
                   |            | ============ |\n\
-                  |            | 1 | 2026-10-13 12:00:00 | 2 |\n\
-                  |            | 30 | 1.23 KB | 4 |\n\
+                  |            | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |\n\
                   | Options    | Option | Value |\n\
                   |            | ============ |\n\
                   |            | consumer_offset_durability | persisted |\n";
-    let partitions = nested_table_rows(stdout, "Partitions");
-    assert_eq!(partitions.len(), 3);
-    assert_eq!(partitions[1], ["1", "2026-10-13 12:00:00", "2"]);
-    assert_eq!(partitions[2], ["30", "1.23 KB", "4"]);
-    let options = nested_table_rows(stdout, "Options");
+    let partitions = nested_table_rows(stdout, "Partitions", 6).unwrap();
+    assert_eq!(partitions.len(), 2);
+    assert_eq!(
+        partitions[1],
+        ["1", "2026-10-13 12:00:00", "2", "30", "1.23 KB", "4"]
+    );
+    let options = nested_table_rows(stdout, "Options", 2).unwrap();
     assert_eq!(
         options,
         [
@@ -503,4 +514,129 @@ fn nested_rows_preserve_line_boundaries_and_exact_option_keys() {
         ]
     );
     assert!(!options.contains(&vec!["durability".to_owned(), "persisted".to_owned()]));
+}
+
+#[test]
+fn nested_rows_reject_malformed_partition_records() {
+    for malformed in [
+        "| | 1 | 2026-10-13 12:00:00 | 2 |\n| | 30 | 1.23 KB | 4 |",
+        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB |",
+        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 | extra |",
+        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | | 4 |",
+    ] {
+        let stdout = format!(
+            "| Partitions | Partition id | Created | Segments count | Current offset | Size | Messages count |\n\
+             | | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5 |\n{malformed}\n"
+        );
+        assert!(
+            nested_table_rows(&stdout, "Partitions", 6).is_err(),
+            "malformed record must invalidate the table: {malformed}"
+        );
+    }
+}
+
+#[tokio::test]
+#[parallel]
+#[ignore = "opt-in end-to-end test of the CLI persisted durability flag"]
+pub async fn should_show_persisted_durability_created_through_cli() {
+    let mut harness = TestHarnessBuilder::default()
+        .server(TestServerConfig::default())
+        .build()
+        .unwrap();
+    harness.start().await.expect("test server should start");
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream = client.create_stream("cli-persisted-stream").await.unwrap();
+    let address = harness.server().raw_tcp_addr().unwrap();
+    let socket_address = harness.server().tcp_addr().unwrap();
+    clear_session_entry(socket_address);
+    let cli = || {
+        #[allow(deprecated)]
+        let mut command = Command::cargo_bin("iggy").unwrap();
+        command.env("IGGY_TOKEN", "").env("COLUMNS", "200").args([
+            "--tcp-server-address",
+            &address,
+            "--username",
+            DEFAULT_ROOT_USERNAME,
+            "--password",
+            DEFAULT_ROOT_PASSWORD,
+        ]);
+        command
+    };
+    cli()
+        .args([
+            "topic",
+            "create",
+            "cli-persisted-stream",
+            "cli-persisted-topic",
+            "3",
+            "none",
+            "--durability",
+            "persisted",
+            "--set",
+            "preallocate_segments=false",
+        ])
+        .assert()
+        .success();
+
+    let details = client
+        .get_topic(
+            &stream.id.try_into().unwrap(),
+            &"cli-persisted-topic".try_into().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(details.partitions_count, 3);
+    assert_eq!(details.partitions.len(), 3);
+    let option = details
+        .options
+        .iter()
+        .find(|(key, _)| key.as_bytes() == b"durability")
+        .unwrap();
+    assert_eq!(option.1.value.to_string_value(), "persisted");
+
+    let assertion = cli()
+        .args([
+            "topic",
+            "get",
+            "cli-persisted-stream",
+            "cli-persisted-topic",
+        ])
+        .assert()
+        .success();
+    let stdout = std::str::from_utf8(&assertion.get_output().stdout).unwrap();
+    let partitions = nested_table_rows(stdout, "Partitions", 6).unwrap();
+    assert_eq!(partitions.len(), 4);
+    let mut actual_ids = partitions[1..]
+        .iter()
+        .map(|row| row[0].parse::<u32>().unwrap())
+        .collect::<Vec<_>>();
+    let mut expected_ids = details
+        .partitions
+        .iter()
+        .map(|partition| partition.id)
+        .collect::<Vec<_>>();
+    actual_ids.sort();
+    expected_ids.sort();
+    assert_eq!(actual_ids, expected_ids);
+    let options = nested_table_rows(stdout, "Options", 2).unwrap();
+    assert!(options.contains(&vec!["durability".to_owned(), "persisted".to_owned()]));
+    assert!(options.contains(&vec![
+        "consumer_offset_durability".to_owned(),
+        "replicated".to_owned()
+    ]));
+
+    client
+        .delete_topic(
+            &stream.id.try_into().unwrap(),
+            &details.id.try_into().unwrap(),
+        )
+        .await
+        .unwrap();
+    client
+        .delete_stream(&stream.id.try_into().unwrap())
+        .await
+        .unwrap();
+    clear_session_entry(socket_address);
+    harness.stop().await.unwrap();
 }
