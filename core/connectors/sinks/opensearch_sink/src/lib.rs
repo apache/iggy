@@ -78,13 +78,39 @@ const MAX_DOCUMENT_ID_BYTES: usize = 512;
 // keeps this config's wire format under this connector's own control instead
 // of an internal detail of the opensearch crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RefreshPolicyRepr")]
 pub enum RefreshPolicy {
-    #[serde(rename = "true")]
     True,
-    #[serde(rename = "false")]
     False,
-    #[serde(rename = "wait_for")]
     WaitFor,
+}
+
+// The runtime parses environment overrides into typed JSON, so
+// `..._REFRESH=true` arrives as a boolean while TOML writes the string "true".
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RefreshPolicyRepr {
+    Flag(bool),
+    Name(String),
+}
+
+impl TryFrom<RefreshPolicyRepr> for RefreshPolicy {
+    type Error = String;
+
+    fn try_from(repr: RefreshPolicyRepr) -> Result<Self, Self::Error> {
+        match repr {
+            RefreshPolicyRepr::Flag(true) => Ok(RefreshPolicy::True),
+            RefreshPolicyRepr::Flag(false) => Ok(RefreshPolicy::False),
+            RefreshPolicyRepr::Name(name) => match name.as_str() {
+                "true" => Ok(RefreshPolicy::True),
+                "false" => Ok(RefreshPolicy::False),
+                "wait_for" => Ok(RefreshPolicy::WaitFor),
+                other => Err(format!(
+                    "unknown refresh policy '{other}', expected true, false or wait_for"
+                )),
+            },
+        }
+    }
 }
 
 impl From<RefreshPolicy> for Refresh {
@@ -3708,6 +3734,25 @@ mod tests {
     #[test]
     fn given_schemeless_url_should_be_reported_as_implicit() {
         assert_eq!(explicit_http_scheme_hint("host:9200"), "implicit http://");
+    }
+
+    #[test]
+    fn given_refresh_booleans_from_env_overrides_should_deserialize() {
+        assert_eq!(
+            serde_json::from_value::<RefreshPolicy>(json!(true)).unwrap(),
+            RefreshPolicy::True
+        );
+        assert_eq!(
+            serde_json::from_value::<RefreshPolicy>(json!(false)).unwrap(),
+            RefreshPolicy::False
+        );
+    }
+
+    #[test]
+    fn given_unknown_refresh_value_should_be_rejected() {
+        for value in [json!("sometimes"), json!(1), json!(null)] {
+            assert!(serde_json::from_value::<RefreshPolicy>(value).is_err());
+        }
     }
 
     #[test]

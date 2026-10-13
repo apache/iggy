@@ -62,7 +62,8 @@ verbose_logging = false
   Defaults to `30s`. Applies to every request the connector makes, including
   reading the response body.
 - `refresh`: OpenSearch bulk `refresh` parameter: `"false"` (default),
-  `"true"`, or `"wait_for"`. `"wait_for"` blocks the bulk response until the
+  `"true"`, or `"wait_for"`. Booleans are accepted for `true` and `false`, so
+  an environment override such as `..._REFRESH=true` works. `"wait_for"` blocks the bulk response until the
   write is visible to search, but only at the *next* scheduled OpenSearch
   refresh cycle (default interval ~1s), not immediately. Do not assume a
   fixed short delay is enough to observe a write via `_search` afterward.
