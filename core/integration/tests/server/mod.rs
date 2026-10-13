@@ -92,6 +92,6 @@ mod message_retrieval;
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
 mod delete_segments;
-mod scenarios;
+pub(crate) mod scenarios;
 mod specific;
 mod telemetry;
