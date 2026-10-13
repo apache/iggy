@@ -323,3 +323,69 @@ async fn wait_for_updated_name(
         POLL_ATTEMPTS
     );
 }
+
+// Dynamic date detection would map the first date-like header value as `date`
+// and reject every later ordinary string under the same key. The sink's index
+// template pins `iggy_headers.*.data` to keyword so both are indexed.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/opensearch/sink.toml")),
+    seed = seeds::connector_multi_topic_stream
+)]
+async fn given_date_like_header_value_when_later_value_is_text_should_index_both(
+    harness: &TestHarness,
+    fixture: OpenSearchSinkFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let header_key = HeaderKey::try_from("x-observed-at").expect("header key");
+
+    for (message_id, order_id, header_value) in
+        [(1u128, "H-1", "2024-01-01"), (2, "H-2", "not a date")]
+    {
+        let mut messages = vec![
+            IggyMessage::builder()
+                .id(message_id)
+                .payload(Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({ "order_id": order_id }))
+                        .expect("serialize"),
+                ))
+                .user_headers(BTreeMap::from([(
+                    header_key.clone(),
+                    HeaderValue::try_from(header_value).expect("header value"),
+                )]))
+                .build()
+                .expect("build message"),
+        ];
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .expect("send message with header");
+
+        // Sent one at a time so the first value has already pinned the mapping
+        // by the time the second arrives.
+        fixture
+            .wait_for_document_count(message_id as u64)
+            .await
+            .expect("both header values should be indexed");
+    }
+
+    let documents = fixture
+        .search_all(fixture.index())
+        .await
+        .expect("search index");
+    let observed: Vec<&str> = documents["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .filter_map(|hit| hit["_source"]["iggy_headers"]["x-observed-at"]["data"].as_str())
+        .collect();
+    assert_eq!(observed.len(), 2);
+    assert!(observed.contains(&"2024-01-01"));
+    assert!(observed.contains(&"not a date"));
+}

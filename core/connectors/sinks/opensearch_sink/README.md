@@ -149,6 +149,20 @@ pins `iggy_headers.<key>` to whatever type the first indexed document uses, so
 a per-kind shape would make every later message using the other kind fail with
 a `mapper_parsing_exception` and be dropped.
 
+The sink also adds a dynamic template to the index it creates, mapping
+`iggy_headers.*.data` as `keyword`. Without it, OpenSearch's date detection
+would map the first date-like header value (such as `2024-01-01`) as `date`
+and reject every later ordinary string under the same key. The template is
+placed ahead of any `dynamic_templates` in `index_mapping`, and is skipped when
+`include_metadata = false`. An index that already exists keeps its mapping, so
+add the same template to it by hand:
+
+```json
+{ "iggy_headers_data_as_keyword": {
+    "path_match": "iggy_headers.*.data",
+    "mapping": { "type": "keyword" } } }
+```
+
 Two hazards remain, both inherent to using header keys as field names:
 
 - A header key containing a `.` is read as a path. A key `a.b` alongside a key

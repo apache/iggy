@@ -39,7 +39,7 @@ use opensearch::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
     future::Future,
@@ -53,6 +53,8 @@ use url::Url;
 
 sink_connector!(OpenSearchSink);
 
+const HEADER_DATA_TEMPLATE_NAME: &str = "iggy_headers_data_as_keyword";
+const HEADER_DATA_PATH_MATCH: &str = "iggy_headers.*.data";
 const DEFAULT_CREATE_INDEX_IF_NOT_EXISTS: bool = true;
 const DEFAULT_INCLUDE_METADATA: bool = true;
 const DEFAULT_BATCH_SIZE: usize = 1000;
@@ -263,6 +265,8 @@ impl OpenSearchSink {
             ));
         }
 
+        self.index_creation_body()?;
+
         match (&self.config.username, &self.config.password) {
             (Some(_), None) => Err(Error::InvalidConfigValue(
                 "OpenSearch username is set without a password".to_string(),
@@ -421,6 +425,23 @@ impl OpenSearchSink {
         Err(map_status_error("index existence check", status, &body))
     }
 
+    /// The user's `index_mapping` with the sink's own header template in front.
+    /// Dynamic date detection would otherwise map the first date-like header
+    /// value as `date`, after which any ordinary string under that key is
+    /// rejected. The template comes first because OpenSearch applies the first
+    /// matching one.
+    fn index_creation_body(&self) -> Result<Option<Value>, Error> {
+        let mut body = match &self.config.index_mapping {
+            Some(mapping) => mapping.clone(),
+            None if self.config.include_metadata => Value::Object(Map::new()),
+            None => return Ok(None),
+        };
+        if self.config.include_metadata {
+            prepend_header_data_template(&mut body)?;
+        }
+        Ok(Some(body))
+    }
+
     async fn create_index(&self, client: &OpenSearch) -> Result<(), Error> {
         info!(
             "OpenSearch sink connector ID: {}: creating index '{}'",
@@ -429,8 +450,8 @@ impl OpenSearchSink {
 
         let indices = client.indices();
         let request = indices.create(IndicesCreateParts::Index(&self.config.index));
-        let response = if let Some(mapping) = &self.config.index_mapping {
-            request.body(mapping.clone()).send().await
+        let response = if let Some(body) = self.index_creation_body()? {
+            request.body(body).send().await
         } else {
             request.send().await
         }
@@ -1320,6 +1341,32 @@ fn headers_to_json(headers: &BTreeMap<HeaderKey, HeaderValue>) -> Value {
     Value::Object(map)
 }
 
+fn prepend_header_data_template(body: &mut Value) -> Result<(), Error> {
+    let invalid =
+        |detail: &str| Error::InvalidConfigValue(format!("OpenSearch index_mapping {detail}"));
+    let templates = body
+        .as_object_mut()
+        .ok_or_else(|| invalid("must be an object"))?
+        .entry("mappings")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| invalid("'mappings' must be an object"))?
+        .entry("dynamic_templates")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| invalid("'mappings.dynamic_templates' must be an array"))?;
+    templates.insert(
+        0,
+        json!({
+            HEADER_DATA_TEMPLATE_NAME: {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "mapping": { "type": "keyword" }
+            }
+        }),
+    );
+    Ok(())
+}
+
 fn upsert_metadata_field(id: u32, document: &mut Map<String, Value>, field: &str, value: Value) {
     if document.insert(field.to_string(), value).is_some() {
         debug!(
@@ -1531,7 +1578,7 @@ mod tests {
     use iggy_connector_sdk::Schema;
     use serde_json::json;
     use std::sync::atomic::AtomicU32;
-    use wiremock::matchers::{body_bytes, method, path, query_param};
+    use wiremock::matchers::{body_bytes, body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn topic_metadata() -> TopicMetadata {
@@ -3397,6 +3444,121 @@ mod tests {
         );
         assert_eq!(error.indexed, 0);
         assert_eq!(error.failed, 4);
+    }
+
+    fn header_template() -> Value {
+        json!({
+            HEADER_DATA_TEMPLATE_NAME: {
+                "path_match": HEADER_DATA_PATH_MATCH,
+                "mapping": { "type": "keyword" }
+            }
+        })
+    }
+
+    #[test]
+    fn given_no_index_mapping_should_create_index_with_header_template() {
+        let body = sink_with_config(base_config())
+            .index_creation_body()
+            .expect("valid body");
+
+        assert_eq!(
+            body,
+            Some(json!({ "mappings": { "dynamic_templates": [header_template()] } }))
+        );
+    }
+
+    #[test]
+    fn given_user_mapping_should_keep_it_and_put_header_template_first() {
+        let existing_template =
+            json!({ "strings": { "match_mapping_type": "string", "mapping": { "type": "text" } } });
+        let mut config = base_config();
+        config.index_mapping = Some(json!({
+            "settings": { "number_of_shards": 1 },
+            "mappings": {
+                "properties": { "count": { "type": "integer" } },
+                "dynamic_templates": [existing_template.clone()]
+            }
+        }));
+
+        let body = sink_with_config(config)
+            .index_creation_body()
+            .expect("valid body");
+
+        assert_eq!(
+            body,
+            Some(json!({
+                "settings": { "number_of_shards": 1 },
+                "mappings": {
+                    "properties": { "count": { "type": "integer" } },
+                    "dynamic_templates": [header_template(), existing_template]
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn given_metadata_disabled_without_mapping_should_send_no_index_body() {
+        let mut config = base_config();
+        config.include_metadata = Some(false);
+
+        let body = sink_with_config(config)
+            .index_creation_body()
+            .expect("valid body");
+
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn given_metadata_disabled_with_mapping_should_send_it_unchanged() {
+        let mapping = json!({ "mappings": { "properties": { "count": { "type": "integer" } } } });
+        let mut config = base_config();
+        config.include_metadata = Some(false);
+        config.index_mapping = Some(mapping.clone());
+
+        let body = sink_with_config(config)
+            .index_creation_body()
+            .expect("valid body");
+
+        assert_eq!(body, Some(mapping));
+    }
+
+    #[test]
+    fn given_malformed_dynamic_templates_should_fail_validation() {
+        for mapping in [
+            json!([]),
+            json!({ "mappings": [] }),
+            json!({ "mappings": { "dynamic_templates": {} } }),
+        ] {
+            let mut config = base_config();
+            config.index_mapping = Some(mapping);
+
+            let error = sink_with_config(config)
+                .validate_config()
+                .expect_err("malformed index_mapping should be rejected");
+
+            assert!(matches!(error, Error::InvalidConfigValue(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn given_index_creation_should_send_header_template_body() {
+        let server = MockServer::start().await;
+        let sink = mock_health_sink(&server, "").await;
+        let client = mock_client(&sink);
+
+        Mock::given(method("PUT"))
+            .and(path(format!("/{}", sink.config.index)))
+            .and(body_json(
+                json!({ "mappings": { "dynamic_templates": [header_template()] } }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "acknowledged": true })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        sink.create_index(&client)
+            .await
+            .expect("index creation should send the header template");
     }
 
     #[tokio::test]
