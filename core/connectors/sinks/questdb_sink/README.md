@@ -86,9 +86,10 @@ A QWP frame has a size cap, about 4 MiB by default, and the client refuses a
 frame over the cap with all of its rows. `max_flush_bytes` flushes before a
 batch of wide rows reaches it. The 1 MB default leaves room, because the buffer
 size is an estimate and a frame can also carry the symbol dictionary. The cap
-is the smaller of `max_buf_size` and `sf_max_segment_bytes` in the connect
-string, so to raise it, raise both. The server's own maximum batch size still
-applies.
+is the smaller of `max_buf_size` (100 MiB by default) and the segment size
+`sf_max_segment_bytes` (4 MiB by default) in the connect string, so with the
+defaults you raise the cap through `sf_max_segment_bytes`. The server's own
+maximum batch size still applies.
 
 The check runs before each row is added. A message larger than the frame cap
 minus `max_flush_bytes` can therefore push one frame over the cap. That flush
@@ -231,16 +232,17 @@ a failover or a replay of queued frames can send the same rows again. Declare
 [`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
 
-There are two exceptions. With `ack_level = "ok"` on a cluster, a primary that
-fails before it ships its write-ahead log can lose rows it accepted. See
-[Choosing an ack level](#choosing-an-ack-level). Rows the sink does not write,
-such as a rejected record or a failed chunk, are lost, as the rest of this
-section describes.
-
 The client queues unacknowledged frames in memory, or on disk when `sf_dir` is
-set. Without `sf_dir`, a crash, or a shutdown that outlasts
-`close_flush_timeout_millis` in the connect string, loses the queue even though
-`consume()` already reported success.
+set. Rows can still be lost in three cases:
+
+- With `ack_level = "ok"` on a cluster, a primary that fails before it ships
+  its write-ahead log can lose rows it accepted. See
+  [Choosing an ack level](#choosing-an-ack-level).
+- Without `sf_dir`, a crash, or a shutdown that outlasts
+  `close_flush_timeout_millis` in the connect string, loses the queue even
+  though `consume()` already reported success.
+- Rows the sink does not write, such as a rejected record or a failed chunk,
+  are lost, as the rest of this section describes.
 
 A batch fails when:
 
@@ -254,6 +256,9 @@ A batch fails when:
 - 10 batches in a row on one topic each leave a flush unacknowledged within
   `flush_timeout`. A single late ack is only a warning, because the frames stay
   queued and are delivered later.
+- The client's inbox of rejection reports overflows and drops events. A terminal
+  rejection may then be unreported, so the next batch fails although its own
+  rows were written.
 
 The runtime counts a failed batch in `iggy_connector_errors_total`. It does not
 retry it ([#2927](https://github.com/apache/iggy/issues/2927)).

@@ -260,11 +260,11 @@ pub struct Mapping {
     pub table: String,
     pub symbol_columns: ColumnNames,
     pub uuid_columns: ColumnNames,
-    /// Columns that stay `LONG` while [`Mapping::numbers_as_double`] is on.
+    /// Columns stored as `LONG`, whatever [`Mapping::numbers_as_double`] says.
     ///
-    /// The list also pins the type when `numbers_as_double` is off: a
-    /// fractional value in a listed column is rejected either way, because
-    /// storing it as a `DOUBLE` would break the type the declaration pinned.
+    /// A fractional value in a listed column is rejected in both modes,
+    /// because storing it as a `DOUBLE` would break the type the declaration
+    /// pinned.
     pub integer_columns: ColumnNames,
     pub timestamp_source: TimestampSource,
     pub timestamp_field: Option<String>,
