@@ -19,19 +19,9 @@ package client
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"math/big"
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	"github.com/apache/iggy/foreign/go/internal/command"
@@ -75,12 +65,18 @@ func TestParseConnectionString_ParsesBracketedIPv6Host(t *testing.T) {
 // TestParseConnectionString_NoDelayOptionLandsOnTheClient pins the nodelay
 // rule: the spelling validates and, unlike a dropped validation, the
 // parsed value reaches the client, so ?nodelay=false really turns Nagle
-// back on and the default stays with Nagle off.
+// back on, while a query that leaves nodelay out keeps the client
+// default and stays with Nagle off.
 func TestParseConnectionString_NoDelayOptionLandsOnTheClient(t *testing.T) {
 	withoutOption, err := ParseConnectionString("iggy://iggy:secret@localhost:8090")
 	require.NoError(t, err)
 	assert.True(t, applyOptions(t, withoutOption).GetNoDelay(),
 		"the default must keep Nagle disabled")
+
+	unspecified, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?tls=true")
+	require.NoError(t, err)
+	assert.True(t, applyOptions(t, unspecified).GetNoDelay(),
+		"a query without nodelay must keep Nagle disabled")
 
 	enabled, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?nodelay=true")
 	require.NoError(t, err)
@@ -94,12 +90,13 @@ func TestParseConnectionString_NoDelayOptionLandsOnTheClient(t *testing.T) {
 
 // TestParseConnectionString_NonZeroDurationOptionsRejectZeroSpellings
 // pins the typing the Rust SDK gives each option:
-// reconnection_interval and heartbeat_interval are non-zero durations, so
-// the zero spellings and any zero-valued duration are refused, while
-// reestablish_after is a plain duration where they parse.
+// reconnection_interval and heartbeat_interval are non-zero durations
+// whose wire format carries whole microseconds, so the zero spellings,
+// zero-valued durations and anything below one microsecond are refused,
+// while reestablish_after is a plain duration where they parse.
 func TestParseConnectionString_NonZeroDurationOptionsRejectZeroSpellings(t *testing.T) {
 	for _, option := range []string{"reconnection_interval", "heartbeat_interval"} {
-		for _, value := range []string{"0", "none", "disabled", "unlimited", "0s", "0ms"} {
+		for _, value := range []string{"0", "none", "disabled", "unlimited", "0s", "0ms", "1ns", "999ns"} {
 			invalid := "iggy://iggy:secret@localhost:8090?" + option + "=" + value
 			t.Run(invalid, func(t *testing.T) {
 				opts, err := ParseConnectionString(invalid)
@@ -117,6 +114,17 @@ func TestParseConnectionString_NonZeroDurationOptionsRejectZeroSpellings(t *test
 				"reestablish_after is a plain duration in the Rust SDK")
 			assert.NotEmpty(t, opts)
 		})
+	}
+	for _, option := range []string{"reconnection_interval", "heartbeat_interval"} {
+		for _, value := range []string{"1000ns", "1µs", "1us"} {
+			valid := "iggy://iggy:secret@localhost:8090?" + option + "=" + value
+			t.Run(valid, func(t *testing.T) {
+				opts, err := ParseConnectionString(valid)
+				require.NoError(t, err,
+					"%s must parse at the one-microsecond floor", option)
+				assert.NotEmpty(t, opts)
+			})
+		}
 	}
 }
 
@@ -209,7 +217,7 @@ func TestParseConnectionString_ConnectsAndLogsInAgainstAServer(t *testing.T) {
 // option would send its register frame in plaintext and the TLS handshake
 // would fail, so a successful connect-and-login proves the option landed.
 func TestParseConnectionString_TLSEnabledByQueryString(t *testing.T) {
-	certificate, caPath := selfSignedCert(t)
+	certificate, caPath := SelfSignedCert(t)
 
 	server := Listen(t, func(conn net.Conn) net.Conn {
 		return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
@@ -232,40 +240,6 @@ func TestParseConnectionString_TLSEnabledByQueryString(t *testing.T) {
 	require.Len(t, recorded, 2)
 	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation())
 	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].Code())
-}
-
-// selfSignedCert mints a throwaway server certificate for the loopback
-// listener, so the test carries no expiry or checkout-layout dependency.
-func selfSignedCert(t *testing.T) (tls.Certificate, string) {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "localhost"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	require.NoError(t, err)
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	require.NoError(t, err)
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
-	require.NoError(t, err)
-
-	caPath := filepath.Join(t.TempDir(), "ca.pem")
-	require.NoError(t, os.WriteFile(caPath, certPEM, 0o600))
-	return certificate, caPath
 }
 
 // TestParseConnectionString_RejectsMalformedConnectionStrings pins every
@@ -319,8 +293,9 @@ func TestParseConnectionString_AcceptsPortZero(t *testing.T) {
 }
 
 // TestParseConnectionString_AcceptsFractionalAndMultiUnitDurations pins
-// the duration grammar the other SDKs share: fractional seconds and
-// sequences of units, all accepted in connection-string options.
+// the duration grammar the other SDKs share: fractional seconds,
+// sequences of units, a space between an amount and its unit, and the
+// µs spelling, all accepted in connection-string options.
 func TestParseConnectionString_AcceptsFractionalAndMultiUnitDurations(t *testing.T) {
 	for _, options := range []string{
 		"reconnection_interval=500ms",
@@ -329,6 +304,9 @@ func TestParseConnectionString_AcceptsFractionalAndMultiUnitDurations(t *testing
 		"reconnection_interval=2m",
 		"reconnection_interval=1h 1m 1s",
 		"reconnection_interval=1h30m",
+		"reconnection_interval=1µs",
+		"reestablish_after=1 s",
+		"reestablish_after=1µs",
 		"reconnection_interval=5sec",
 		"reconnection_interval=5msec",
 		"heartbeat_interval=10s",

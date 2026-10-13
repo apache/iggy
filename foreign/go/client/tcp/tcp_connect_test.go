@@ -19,13 +19,7 @@ package tcp
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
@@ -34,49 +28,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"log/slog"
-	"math/big"
 	"net"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// selfSignedCert mints a throwaway server certificate for the loopback
-// listener, so the test carries no expiry or checkout-layout dependency.
-func selfSignedCert(t *testing.T) (tls.Certificate, string) {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	template := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "localhost"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	require.NoError(t, err)
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	require.NoError(t, err)
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
-	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
-	require.NoError(t, err)
-
-	caPath := filepath.Join(t.TempDir(), "ca.pem")
-	require.NoError(t, os.WriteFile(caPath, certPEM, 0o600))
-	return certificate, caPath
-}
 
 // testListener is a VSR server on a loopback port. The handler is called with
 // the zero-based index of the accepted connection and of the frame within it.
@@ -628,7 +585,7 @@ func TestConnect_UnwindsWhenEveryReadFailsInsideTheConnectFlow(t *testing.T) {
 }
 
 func TestConnect_ExchangesOverTLS(t *testing.T) {
-	certificate, caPath := selfSignedCert(t)
+	certificate, caPath := SelfSignedCert(t)
 
 	var server *testListener
 	server = listenVSR(t,

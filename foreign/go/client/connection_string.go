@@ -66,17 +66,20 @@ const (
 //	nodelay=true|false
 //
 // Durations take the units the other SDKs share, from nanos to years,
-// including the hr, hrs, wk, wks and month spellings, with optional
-// fractions and parts run together or spaced, as in 1h30m or 1h 30m.
+// including the hr, hrs, wk, wks, month and µs spellings, with optional
+// fractions and parts run together or spaced, as in 1h30m, 1h 30m or 1 s.
 // The reconnection_interval and heartbeat_interval spellings must be
-// non-zero, because the Rust SDK types them as non-zero durations;
-// reestablish_after takes the zero spellings, which Rust accepts there.
+// non-zero and no shorter than one microsecond, because the Rust SDK
+// types them as non-zero durations whose wire format carries whole
+// microseconds; reestablish_after takes the zero spellings, which Rust
+// accepts there.
 // The Go client keeps its own reconnect and heartbeat pacing, so those
 // three spellings are validated for compatibility and then ignored, and
 // a value the other SDKs would reject is still rejected here, so one
 // connection string is either valid everywhere or nowhere. The nodelay
 // spelling is applied, because the Go client carries a matching
-// TCP_NODELAY option.
+// TCP_NODELAY option; it defaults to true, the Go client default, so
+// only nodelay=false ever turns Nagle back on.
 func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 	protocolParts := strings.Split(connectionString, "://")
 	if len(protocolParts) != 2 {
@@ -113,6 +116,9 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 		return nil, ierror.InvalidConnectionString{}
 	}
 
+	// The no-delay default lives here for the no-options path and in
+	// parseConnectionOptions for queries, so a query that leaves the
+	// spelling out keeps Nagle off.
 	var tlsConfig parsedTLS
 	tlsConfig.noDelay = true
 	if len(serverAndOptions) == 2 {
@@ -192,7 +198,7 @@ type parsedTLS struct {
 // keeping the tls options and ignoring the reconnect spellings the Go
 // client does not take from a connection string.
 func parseConnectionOptions(optionsString string) (parsedTLS, error) {
-	parsed := parsedTLS{}
+	parsed := parsedTLS{noDelay: true}
 	if optionsString == "" {
 		return parsed, ierror.InvalidConnectionString{}
 	}
@@ -218,9 +224,10 @@ func parseConnectionOptions(optionsString string) (parsedTLS, error) {
 				}
 			}
 		case "reconnection_interval", "heartbeat_interval":
-			// Rust types both as non-zero durations, so the zero spellings
-			// and any zero-valued duration are rejected.
-			if nanos, err := parseIggyDuration(value); err != nil || nanos == 0 {
+			// Rust types both as NonZeroIggyDuration, which refuses the
+			// zero spellings and anything shorter than the whole
+			// microseconds the wire format carries.
+			if nanos, err := parseIggyDuration(value); err != nil || nanos < 1_000 {
 				return parsed, ierror.InvalidConnectionString{}
 			}
 		case "reestablish_after":
@@ -261,8 +268,10 @@ func isASCIILetters(s string) bool {
 // lowercased, the zero spellings become a zero duration, and everything
 // else goes through a humantime-style grammar of amounts and units, with
 // optional fractions and parts run together as in 1h30m or spaced as in
-// 1h 30m. Fractions must land on a whole nanosecond, as in the Rust and
-// Node parsers, so 1.5us parses while 0.5ns does not.
+// 1h 30m. A space is allowed between an amount and its unit as in 1 s,
+// and the µs spelling parses like us. Fractions must land on a whole
+// nanosecond, as in the Rust and Node parsers, so 1.5us parses while
+// 0.5ns does not.
 func parseIggyDuration(value string) (uint64, error) {
 	lower := strings.ToLower(value)
 	switch lower {
@@ -280,7 +289,9 @@ func parseIggyDuration(value string) (uint64, error) {
 		if !ok {
 			return 0, errInvalidDuration(value)
 		}
-		remainder = rest
+		// humantime skips whitespace between an amount and its unit, as
+		// in 1 s, the way spaces between parts are skipped below.
+		remainder = strings.TrimLeft(rest, " 	")
 
 		index, rest, ok := cutDurationUnit(remainder)
 		if !ok {
@@ -326,14 +337,7 @@ func parseIggyDuration(value string) (uint64, error) {
 		}
 	}
 
-	// A carry out of the nanoseconds, as the Rust implementation does
-	// past a full second.
-	billion := big.NewInt(1_000_000_000)
-	if nanos.Cmp(billion) >= 0 {
-		seconds.Add(&seconds, new(big.Int).Div(&nanos, billion))
-		nanos.Mod(&nanos, billion)
-	}
-	total := new(big.Int).Mul(&seconds, billion)
+	total := new(big.Int).Mul(&seconds, big.NewInt(1_000_000_000))
 	total.Add(total, &nanos)
 	if total.BitLen() > 64 {
 		return 0, errInvalidDuration(value)
@@ -405,7 +409,8 @@ type durationUnit struct {
 // a prefix match cannot cut a longer unit short, which is also why the
 // single-letter minute spelling m comes after month and millis. The table
 // matches the one the Node and C# SDKs parse: it carries the hr, hrs, wk,
-// wks and month spellings, and takes millis but not milliseconds.
+// wks and month spellings, the µs spelling beside us, and takes millis
+// but not milliseconds.
 var durationUnits = []durationUnit{
 	{"seconds", 1, 0},
 	{"minutes", 60, 0},
@@ -420,6 +425,7 @@ var durationUnits = []durationUnit{
 	{"years", 31_557_600, 0},
 	{"nsec", 0, 1},
 	{"usec", 0, 1_000},
+	{"µs", 0, 1_000},
 	{"msec", 0, 1_000_000},
 	{"secs", 1, 0},
 	{"mins", 60, 0},
