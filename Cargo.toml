@@ -391,6 +391,7 @@ web-sys = { version = "0.3", features = [
 webpki-roots = "1.0.9"
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
+x509-parser = "0.18.1"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }

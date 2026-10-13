@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::delete_topics;
 
@@ -104,10 +104,8 @@ async fn connected_state(server: &TestServer) -> GatewayState {
         .await
         .expect("bridge should connect to a ready server");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )

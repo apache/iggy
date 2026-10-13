@@ -23,6 +23,7 @@ use tracing::warn;
 
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::{TopicMapping, validate_identifier_name};
+use crate::env::parse_bool;
 
 /// Iggy address used when `IGGY_KAFKA_IGGY_ADDR` is unset.
 ///
@@ -37,6 +38,64 @@ const DEFAULT_IGGY_USERNAME: &str = "iggy";
 /// Iggy's default `message_bus.max_message_size`.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// How the gateway reaches Iggy: the bridge's own clients and the SASL credential check alike.
+///
+/// Separate from the gateway's own listener security. A deployment can terminate TLS on the Kafka
+/// side and still speak plain TCP to a co-located Iggy, or the reverse, and the two are configured
+/// independently because they protect different hops.
+#[derive(Debug, Clone, Default)]
+pub struct IggyTls {
+    pub enabled: bool,
+    /// Name checked against the server certificate. Empty means derive it from the address.
+    pub domain: String,
+    /// PEM roots to trust. Unset uses the SDK's bundled roots, not the system trust store.
+    pub ca_file: Option<String>,
+}
+
+impl IggyTls {
+    /// The `IGGY_KAFKA_*` vars [`Self::from_env`] reads.
+    pub const KNOWN_ENV_VARS: &'static [&'static str] = &[
+        "IGGY_KAFKA_IGGY_TLS_ENABLED",
+        "IGGY_KAFKA_IGGY_TLS_DOMAIN",
+        "IGGY_KAFKA_IGGY_TLS_CA_FILE",
+    ];
+
+    /// Reads the transport security of the Iggy hop from the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending variable when `IGGY_KAFKA_IGGY_TLS_ENABLED` is set
+    /// to anything but `true` or `false`, or when material is configured with the switch off.
+    /// Defaulting a mistyped security switch to off is how a deployment ends up sending
+    /// passwords in the clear while believing it does not.
+    pub fn from_env() -> Result<Self, String> {
+        // Unset reads as off; only a value that is set and unrecognised is an error, which is
+        // what `parse_bool` decides for every switch in this gateway.
+        let enabled = match std::env::var("IGGY_KAFKA_IGGY_TLS_ENABLED") {
+            Ok(raw) => parse_bool("IGGY_KAFKA_IGGY_TLS_ENABLED", &raw)?,
+            Err(_) => false,
+        };
+        let domain = std::env::var("IGGY_KAFKA_IGGY_TLS_DOMAIN").unwrap_or_default();
+        let ca_file = std::env::var("IGGY_KAFKA_IGGY_TLS_CA_FILE").ok();
+        // Configuring TLS material and leaving the switch off is the same "believes TLS is on"
+        // mistake the value check above exists to catch, reached through the unset path instead of
+        // a typo. Silently ignoring it would send credentials in the clear.
+        if !enabled && (!domain.is_empty() || ca_file.is_some()) {
+            return Err(
+                "IGGY_KAFKA_IGGY_TLS_DOMAIN or IGGY_KAFKA_IGGY_TLS_CA_FILE is set but \
+                 IGGY_KAFKA_IGGY_TLS_ENABLED is not true; the connection to Iggy would be in the \
+                 clear despite the TLS configuration"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            enabled,
+            domain,
+            ca_file,
+        })
+    }
+}
+
 /// Connection + topic-mapping config for [`IggyBridge`](crate::bridge::iggy_bridge::IggyBridge).
 ///
 /// `Debug` is safe to derive: `password` is `SecretString`, which redacts on `Debug` by design
@@ -50,6 +109,8 @@ pub struct IggyBridgeConfig {
     pub topic_mapping: TopicMapping,
     /// Iggy's `message_bus.max_message_size`, in bytes. Larger partitions answer 10.
     pub max_message_size: u64,
+    /// Transport security of every client the bridge opens.
+    pub tls: IggyTls,
 }
 
 impl IggyBridgeConfig {
@@ -68,6 +129,9 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_IGGY_STREAM",
         "IGGY_KAFKA_TOPIC_MAP_PATH",
         "IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE",
+        "IGGY_KAFKA_IGGY_TLS_ENABLED",
+        "IGGY_KAFKA_IGGY_TLS_DOMAIN",
+        "IGGY_KAFKA_IGGY_TLS_CA_FILE",
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
@@ -162,12 +226,15 @@ impl IggyBridgeConfig {
                 })?,
         };
 
+        let tls = IggyTls::from_env().map_err(BridgeError::InvalidConfig)?;
+
         Ok(Self {
             address,
             username,
             password: SecretString::from(password),
             topic_mapping,
             max_message_size,
+            tls,
         })
     }
 }
@@ -186,6 +253,7 @@ mod tests {
             topic_mapping: TopicMapping::new("kafka".to_string(), std::collections::HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            tls: IggyTls::default(),
         }
     }
 
@@ -220,6 +288,9 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
             std::env::remove_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE");
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_ENABLED");
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_DOMAIN");
+            std::env::remove_var("IGGY_KAFKA_IGGY_TLS_CA_FILE");
         }
         let result = IggyBridgeConfig::from_env();
         unsafe {
@@ -228,6 +299,10 @@ mod tests {
 
         let config = result.expect("valid config from documented defaults alone");
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+        assert!(
+            !config.tls.enabled,
+            "the Iggy hop is in the clear unless switched on"
+        );
         assert_eq!(config.address, "127.0.0.1:8090");
         assert_eq!(config.username, "iggy");
         assert_eq!(config.topic_mapping.default_stream(), "kafka");

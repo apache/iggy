@@ -26,7 +26,7 @@ pub mod error;
 pub mod iggy_bridge;
 pub mod topic_map;
 
-pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig};
+pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls};
 pub use error::BridgeError;
 pub use iggy_bridge::{
     IggyBridge, KafkaTopicMetadata, OFFSET_GROUP_PREFIX, OffsetCalls, StreamTopicCache,

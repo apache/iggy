@@ -19,6 +19,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
 };
@@ -26,6 +27,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 use tracing::info;
 
+use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
@@ -243,13 +245,30 @@ async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeE
 
     let credentials =
         Credentials::UsernamePassword(config.username.clone(), config.password.clone());
-    let client = IggyClientBuilder::new()
+    let mut builder = IggyClientBuilder::new()
         .with_tcp()
         .with_server_address(config.address.clone())
         .with_auto_sign_in(AutoLogin::Enabled(credentials))
-        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
-        .build()
-        .map_err(BridgeError::Iggy)?;
+        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES));
+    if config.tls.enabled {
+        builder = builder.with_tls_enabled(true);
+        if !config.tls.domain.is_empty() {
+            builder = builder.with_tls_domain(config.tls.domain.clone());
+        }
+        if let Some(ref ca_file) = config.tls.ca_file {
+            builder = builder.with_tls_ca_file(ca_file.clone());
+        }
+    }
+    let client = builder.build().map_err(BridgeError::Iggy)?;
     with_request_timeout(client.connect()).await?;
     Ok(client)
+}
+
+/// The bridge's own session answers for the users client certificates name. It runs as the
+/// bridge's Iggy user, so that account needs `read_users` for any certificate to be admitted.
+#[async_trait]
+impl PrincipalResolver for IggyBridge {
+    async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
+        resolve_principal(self.client.as_ref(), username).await
+    }
 }

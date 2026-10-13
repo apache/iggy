@@ -413,7 +413,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::iggy_bridge::FetchPool;
-    use crate::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
+    use crate::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, TopicMapping};
 
     fn target(topic: &str) -> TopicTarget {
         TopicTarget {
@@ -457,6 +457,7 @@ mod tests {
                 password: SecretString::from("iggy"),
                 topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new()).unwrap(),
                 max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+                tls: IggyTls::default(),
             },
             send_slot: Arc::new(Semaphore::new(1)),
             fetch_pool: Arc::new(FetchPool::new()),
