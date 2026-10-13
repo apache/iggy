@@ -279,8 +279,11 @@ impl MqttSource {
                 "username and password must be configured together".to_string(),
             ));
         }
-        // Certificate and hostname checks happen before rumqttc is constructed,
-        // so malformed TLS configuration cannot become a reconnect loop.
+        // Validate URL options before rumqttc parses them because its setters
+        // assert on some invalid values instead of returning an error.
+        validate_broker_url_options(&self.config)?;
+        // Validate TLS scheme and client-auth field pairing before opening the
+        // broker connection. Certificate parsing happens in the driver.
         validate_tls_config(&self.config)?;
 
         let qos = Qos::try_from(self.config.qos)?;
@@ -332,15 +335,11 @@ impl MqttSource {
             "batch_timeout",
         )?;
 
-        let minimum_keep_alive = match self.config.protocol {
-            MqttProtocol::Mqtt311 => Duration::from_secs(1),
-            MqttProtocol::Mqtt5 => Duration::from_secs(5),
-        };
-        if !keep_alive.is_zero() && keep_alive < minimum_keep_alive {
-            return Err(Error::InvalidConfigValue(format!(
-                "keep_alive must be at least {:?} for {:?}",
-                minimum_keep_alive, self.config.protocol
-            )));
+        validate_keep_alive(self.config.protocol, keep_alive, "keep_alive")?;
+        if !self.config.clean_start && !has_stable_configured_client_id(&self.config) {
+            return Err(Error::InvalidConfigValue(
+                "client_id must be configured and non-empty when clean_start is false".to_string(),
+            ));
         }
 
         Ok((
@@ -419,6 +418,7 @@ impl Source for MqttSource {
             keep_alive,
             poll_timeout,
             request_capacity,
+            batch_size,
         )
         .await
         {
@@ -650,6 +650,103 @@ fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Dur
     HumanDuration::from_str(value)
         .map(|duration| *duration)
         .map_err(|error| Error::InvalidConfigValue(format!("{field}: {error}")))
+}
+
+fn validate_broker_url_options(config: &MqttSourceConfig) -> Result<(), Error> {
+    let broker_url = Url::parse(&config.broker_url)
+        .map_err(|error| Error::InvalidConfigValue(format!("broker_url: {error}")))?;
+    if !broker_url.username().is_empty() || broker_url.password().is_some() {
+        return Err(Error::InvalidConfigValue(
+            "broker_url must not contain credentials; configure username and password separately"
+                .to_string(),
+        ));
+    }
+    let keep_alive_secs = broker_url
+        .query_pairs()
+        .filter(|(key, _)| key == "keep_alive_secs")
+        .map(|(_, value)| value.into_owned())
+        .last();
+    if let Some(keep_alive_secs) = keep_alive_secs {
+        let keep_alive_secs = keep_alive_secs.parse::<u64>().map_err(|_| {
+            Error::InvalidConfigValue(
+                "broker_url keep_alive_secs must be an unsigned integer".to_string(),
+            )
+        })?;
+        validate_keep_alive(
+            config.protocol,
+            Duration::from_secs(keep_alive_secs),
+            "broker_url keep_alive_secs",
+        )?;
+    }
+
+    if let Some(inflight_num) = broker_url
+        .query_pairs()
+        .filter(|(key, _)| key == "inflight_num")
+        .map(|(_, value)| value.into_owned())
+        .last()
+    {
+        let inflight_num = inflight_num.parse::<u16>().map_err(|_| {
+            Error::InvalidConfigValue(
+                "broker_url inflight_num must be an unsigned 16-bit integer".to_string(),
+            )
+        })?;
+        if inflight_num == 0 {
+            return Err(Error::InvalidConfigValue(
+                "broker_url inflight_num must be greater than zero".to_string(),
+            ));
+        }
+    }
+
+    if config.protocol == MqttProtocol::Mqtt311 && has_empty_configured_client_id(config) {
+        let clean_session = broker_url
+            .query_pairs()
+            .filter(|(key, _)| key == "clean_session")
+            .map(|(_, value)| value.into_owned())
+            .last();
+        if matches!(clean_session.as_deref(), Some("false")) {
+            return Err(Error::InvalidConfigValue(
+                "broker_url clean_session=false requires a non-empty client_id".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_keep_alive(
+    protocol: MqttProtocol,
+    keep_alive: Duration,
+    field: &str,
+) -> Result<(), Error> {
+    let minimum_keep_alive = match protocol {
+        MqttProtocol::Mqtt311 => Duration::from_secs(1),
+        MqttProtocol::Mqtt5 => Duration::from_secs(5),
+    };
+    let invalid = match protocol {
+        MqttProtocol::Mqtt311 => !keep_alive.is_zero() && keep_alive < minimum_keep_alive,
+        MqttProtocol::Mqtt5 => keep_alive < minimum_keep_alive,
+    };
+    if invalid {
+        return Err(Error::InvalidConfigValue(format!(
+            "{field} must be at least {:?} for {:?}",
+            minimum_keep_alive, protocol
+        )));
+    }
+    Ok(())
+}
+
+fn has_stable_configured_client_id(config: &MqttSourceConfig) -> bool {
+    config
+        .client_id
+        .as_deref()
+        .is_some_and(|client_id| !client_id.trim().is_empty())
+}
+
+fn has_empty_configured_client_id(config: &MqttSourceConfig) -> bool {
+    config
+        .client_id
+        .as_deref()
+        .is_some_and(|client_id| client_id.trim().is_empty())
 }
 
 fn validate_tls_config(config: &MqttSourceConfig) -> Result<(), Error> {
@@ -1223,5 +1320,115 @@ mod tests {
         let source = MqttSource::new(7, config, None);
 
         assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_mqtt5_zero_keep_alive_should_reject_configuration() {
+        let mut config = test_config();
+        config.keep_alive = Some("0s".to_string());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_mqtt5_url_zero_keep_alive_should_reject_configuration() {
+        let mut config = test_config();
+        config.broker_url = "mqtt://localhost:1883?keep_alive_secs=0".to_string();
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_mqtt5_url_keep_alive_below_minimum_should_reject_configuration() {
+        let mut config = test_config();
+        config.broker_url = "mqtt://localhost:1883?keep_alive_secs=4".to_string();
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_url_credentials_should_reject_configuration() {
+        let mut config = test_config();
+        config.broker_url = "mqtt://user:password@localhost:1883".to_string();
+        let source = MqttSource::new(7, config, None);
+
+        assert!(matches!(
+            source.validate_config(),
+            Err(Error::InvalidConfigValue(message))
+                if message == "broker_url must not contain credentials; configure username and password separately"
+        ));
+    }
+
+    #[test]
+    fn given_url_zero_inflight_should_reject_configuration() {
+        for protocol in [MqttProtocol::Mqtt311, MqttProtocol::Mqtt5] {
+            let mut config = test_config();
+            config.protocol = protocol;
+            config.broker_url = "mqtt://localhost:1883?inflight_num=0".to_string();
+            let source = MqttSource::new(7, config, None);
+
+            assert!(matches!(
+                source.validate_config(),
+                Err(Error::InvalidConfigValue(message))
+                    if message == "broker_url inflight_num must be greater than zero"
+            ));
+        }
+    }
+
+    #[test]
+    fn given_mqtt311_persistent_session_with_empty_client_id_should_reject_configuration() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.clean_start = false;
+        config.client_id = Some(String::new());
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_mqtt311_url_persistent_session_with_empty_client_id_should_reject_configuration() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.clean_start = true;
+        config.client_id = Some(String::new());
+        config.broker_url = "mqtt://localhost:1883?clean_session=false".to_string();
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_mqtt311_persistent_session_without_client_id_should_reject_configuration() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.clean_start = false;
+        config.client_id = None;
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_mqtt5_persistent_session_without_client_id_should_reject_configuration() {
+        let mut config = test_config();
+        config.clean_start = false;
+        config.client_id = None;
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_err());
+    }
+
+    #[test]
+    fn given_clean_session_without_client_id_should_use_generated_client_id() {
+        let mut config = test_config();
+        config.clean_start = true;
+        config.client_id = None;
+        let source = MqttSource::new(7, config, None);
+
+        assert!(source.validate_config().is_ok());
     }
 }

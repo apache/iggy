@@ -85,7 +85,7 @@ Configuration operates in **two distinct layers**:
 | `include_metadata` | Boolean | No | `false` | Enables the MQTT 5 metadata envelope. Requires `protocol = "mqtt5"` and a stream schema of `"json"`. |
 | `qos` | Integer | No | `1` | Default global subscription QoS (`0`, `1`, or `2`). |
 | `subscription_qos` | Table | No | `{}` | Map of topic-filter strings to explicit QoS overrides (`0`, `1`, or `2`). |
-| `client_id` | String | No | `iggy-mqtt-source-{id}` | MQTT client identifier. |
+| `client_id` | String | Conditional | `iggy-mqtt-source-{id}` when `clean_start = true` | MQTT client identifier. Required and non-empty when `clean_start = false` so a restart resumes the same broker session. |
 | `username` | String | No | None | Broker authentication username (must be supplied together with `password`). |
 | `password` | String | No | None | Broker authentication password (wrapped as a secret, never logged). |
 | `clean_start` | Boolean | No | `false` | MQTT clean start flag (or clean session for MQTT 3.1.1). |

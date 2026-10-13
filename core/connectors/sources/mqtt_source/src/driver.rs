@@ -139,12 +139,25 @@ enum MqttConnection {
     },
 }
 
+struct MqttSubscription {
+    topic: String,
+    qos: Qos,
+}
+
+enum PollResult {
+    Message(Box<ReceivedMessage>),
+    Buffered(VecDeque<ReceivedMessage>),
+    None,
+}
+
 /// Protocol-specific MQTT client and event loop behind one common driver API.
 pub(crate) struct MqttDriver {
     // Messages received while flushing acknowledgements are retained here rather
     // than dropped. The source batch size bounds this queue.
     connection: MqttConnection,
+    subscriptions: Vec<MqttSubscription>,
     buffered_messages: VecDeque<ReceivedMessage>,
+    max_buffered_messages: usize,
 }
 
 impl MqttDriver {
@@ -155,9 +168,11 @@ impl MqttDriver {
         keep_alive: Duration,
         poll_timeout: Duration,
         request_capacity: usize,
+        max_buffered_messages: usize,
     ) -> Result<Self, iggy_connector_sdk::Error> {
         install_rustls_provider();
         let broker_url = broker_url_with_client_id(config, id)?;
+        let subscriptions = configured_subscriptions(config, qos)?;
         match config.protocol {
             MqttProtocol::Mqtt311 => {
                 let mut options = Mqtt311Options::parse_url(&broker_url).map_err(|error| {
@@ -177,26 +192,23 @@ impl MqttDriver {
                 }
 
                 let (client, mut event_loop) = Mqtt311Client::new(options, request_capacity);
-                for topic in &config.subscriptions {
-                    // Each filter may select its own QoS override; the global
-                    // value is used only when no exact override is configured.
-                    let subscription_qos = qos_for_subscription(config, topic, qos)?;
-                    client
-                        .subscribe(topic, subscription_qos.into())
-                        .await
-                        .map_err(|error| {
-                            iggy_connector_sdk::Error::Connection(error.to_string())
-                        })?;
-                }
-                let buffered_messages =
-                    poll_mqtt311(&mut event_loop, config.subscriptions.len(), poll_timeout).await?;
+                subscribe_mqtt311(&client, &subscriptions).await?;
+                let buffered_messages = poll_mqtt311(
+                    &mut event_loop,
+                    subscriptions.len(),
+                    poll_timeout,
+                    max_buffered_messages,
+                )
+                .await?;
 
                 Ok(Self {
                     connection: MqttConnection::Mqtt311 {
                         client: Box::new(client),
                         event_loop: Box::new(event_loop),
                     },
+                    subscriptions,
                     buffered_messages,
+                    max_buffered_messages,
                 })
             }
             MqttProtocol::Mqtt5 => {
@@ -218,26 +230,23 @@ impl MqttDriver {
                 }
 
                 let (client, mut event_loop) = Mqtt5Client::new(options, request_capacity);
-                for topic in &config.subscriptions {
-                    // Keep subscription QoS resolution identical across protocol
-                    // versions so the configuration has one predictable meaning.
-                    let subscription_qos = qos_for_subscription(config, topic, qos)?;
-                    client
-                        .subscribe(topic, subscription_qos.into())
-                        .await
-                        .map_err(|error| {
-                            iggy_connector_sdk::Error::Connection(error.to_string())
-                        })?;
-                }
-                let buffered_messages =
-                    poll_mqtt5(&mut event_loop, config.subscriptions.len(), poll_timeout).await?;
+                subscribe_mqtt5(&client, &subscriptions).await?;
+                let buffered_messages = poll_mqtt5(
+                    &mut event_loop,
+                    subscriptions.len(),
+                    poll_timeout,
+                    max_buffered_messages,
+                )
+                .await?;
 
                 Ok(Self {
                     connection: MqttConnection::Mqtt5 {
                         client: Box::new(client),
                         event_loop: Box::new(event_loop),
                     },
+                    subscriptions,
                     buffered_messages,
+                    max_buffered_messages,
                 })
             }
         }
@@ -256,36 +265,45 @@ impl MqttDriver {
         // Bound each driver poll so the source can flush partial batches and
         // respond to runtime shutdown instead of waiting indefinitely.
         let deadline = tokio::time::Instant::now() + poll_timeout;
+        let max_buffered_messages = self.max_buffered_messages;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
             }
-            let event = match &mut self.connection {
-                MqttConnection::Mqtt311 { event_loop, .. } => {
+            let result = match (&mut self.connection, &self.subscriptions) {
+                (MqttConnection::Mqtt311 { client, event_loop }, subscriptions) => {
                     match timeout(remaining, event_loop.poll()).await {
-                        Ok(Ok(event)) => match event {
-                            Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
-                                Some(normalize_mqtt311(publish)?)
-                            }
-                            // Connection and subscription events advance the
-                            // event loop but are not source messages.
-                            Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => None,
-                        },
+                        Ok(Ok(event)) => {
+                            handle_mqtt311_event(
+                                client,
+                                event_loop,
+                                event,
+                                subscriptions,
+                                remaining,
+                                max_buffered_messages,
+                            )
+                            .await?
+                        }
                         Ok(Err(error)) => {
                             return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
                         }
                         Err(_) => return Ok(None),
                     }
                 }
-                MqttConnection::Mqtt5 { event_loop, .. } => {
+                (MqttConnection::Mqtt5 { client, event_loop }, subscriptions) => {
                     match timeout(remaining, event_loop.poll()).await {
-                        Ok(Ok(event)) => match event {
-                            Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
-                                Some(normalize_mqtt5(publish)?)
-                            }
-                            Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => None,
-                        },
+                        Ok(Ok(event)) => {
+                            handle_mqtt5_event(
+                                client,
+                                event_loop,
+                                event,
+                                subscriptions,
+                                remaining,
+                                max_buffered_messages,
+                            )
+                            .await?
+                        }
                         Ok(Err(error)) => {
                             return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
                         }
@@ -293,8 +311,15 @@ impl MqttDriver {
                     }
                 }
             };
-            if event.is_some() {
-                return Ok(event);
+            match result {
+                PollResult::Message(message) => return Ok(Some(*message)),
+                PollResult::Buffered(mut messages) => {
+                    self.buffered_messages.append(&mut messages);
+                    if let Some(message) = self.buffered_messages.pop_front() {
+                        return Ok(Some(message));
+                    }
+                }
+                PollResult::None => {}
             }
         }
     }
@@ -371,8 +396,8 @@ impl MqttDriver {
     ) -> Result<(), iggy_connector_sdk::Error> {
         // A publish can arrive while the event loop is being driven for an ACK.
         // Preserve it for the next source poll, subject to the batch bound.
-        let received = match &mut self.connection {
-            MqttConnection::Mqtt311 { event_loop, .. } => {
+        let result = match (&mut self.connection, &self.subscriptions) {
+            (MqttConnection::Mqtt311 { client, event_loop }, subscriptions) => {
                 let event = timeout(poll_timeout, event_loop.poll())
                     .await
                     .map_err(|_| {
@@ -381,14 +406,17 @@ impl MqttDriver {
                         )
                     })?
                     .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-                match event {
-                    Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
-                        Some(normalize_mqtt311(publish)?)
-                    }
-                    Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => None,
-                }
+                handle_mqtt311_event(
+                    client,
+                    event_loop,
+                    event,
+                    subscriptions,
+                    poll_timeout,
+                    max_buffered_messages,
+                )
+                .await?
             }
-            MqttConnection::Mqtt5 { event_loop, .. } => {
+            (MqttConnection::Mqtt5 { client, event_loop }, subscriptions) => {
                 let event = timeout(poll_timeout, event_loop.poll())
                     .await
                     .map_err(|_| {
@@ -397,21 +425,29 @@ impl MqttDriver {
                         )
                     })?
                     .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-                match event {
-                    Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
-                        Some(normalize_mqtt5(publish)?)
-                    }
-                    Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => None,
-                }
+                handle_mqtt5_event(
+                    client,
+                    event_loop,
+                    event,
+                    subscriptions,
+                    poll_timeout,
+                    max_buffered_messages,
+                )
+                .await?
             }
         };
 
-        if let Some(received) = received {
+        let mut received = match result {
+            PollResult::Message(message) => VecDeque::from([*message]),
+            PollResult::Buffered(messages) => messages,
+            PollResult::None => VecDeque::new(),
+        };
+        if !received.is_empty() {
             // The event loop has already handed ownership of this publish to
             // the driver. Buffer it before reporting a full queue so an error
             // does not turn the received message into silent data loss.
-            let buffer_full = self.buffered_messages.len() >= max_buffered_messages;
-            self.buffered_messages.push_back(received);
+            let buffer_full = self.buffered_messages.len() + received.len() > max_buffered_messages;
+            self.buffered_messages.append(&mut received);
             if buffer_full {
                 return Err(iggy_connector_sdk::Error::Connection(
                     "MQTT message buffer reached batch_size while flushing acknowledgements"
@@ -597,10 +633,111 @@ fn set_mqtt5_credentials(options: &mut Mqtt5Options, config: &MqttSourceConfig) 
     }
 }
 
+fn configured_subscriptions(
+    config: &MqttSourceConfig,
+    default_qos: Qos,
+) -> Result<Vec<MqttSubscription>, iggy_connector_sdk::Error> {
+    config
+        .subscriptions
+        .iter()
+        .map(|topic| {
+            Ok(MqttSubscription {
+                topic: topic.clone(),
+                qos: qos_for_subscription(config, topic, default_qos)?,
+            })
+        })
+        .collect()
+}
+
+async fn subscribe_mqtt311(
+    client: &Mqtt311Client,
+    subscriptions: &[MqttSubscription],
+) -> Result<(), iggy_connector_sdk::Error> {
+    for subscription in subscriptions {
+        client
+            .subscribe(&subscription.topic, subscription.qos.into())
+            .await
+            .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn subscribe_mqtt5(
+    client: &Mqtt5Client,
+    subscriptions: &[MqttSubscription],
+) -> Result<(), iggy_connector_sdk::Error> {
+    for subscription in subscriptions {
+        client
+            .subscribe(&subscription.topic, subscription.qos.into())
+            .await
+            .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn handle_mqtt311_event(
+    client: &Mqtt311Client,
+    event_loop: &mut Mqtt311EventLoop,
+    event: Mqtt311Event,
+    subscriptions: &[MqttSubscription],
+    poll_timeout: Duration,
+    max_buffered_messages: usize,
+) -> Result<PollResult, iggy_connector_sdk::Error> {
+    match event {
+        Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
+            Ok(PollResult::Message(Box::new(normalize_mqtt311(publish)?)))
+        }
+        Mqtt311Event::Incoming(Mqtt311Incoming::ConnAck(connack)) if !connack.session_present => {
+            subscribe_mqtt311(client, subscriptions).await?;
+            Ok(PollResult::Buffered(
+                poll_mqtt311(
+                    event_loop,
+                    subscriptions.len(),
+                    poll_timeout,
+                    max_buffered_messages,
+                )
+                .await?,
+            ))
+        }
+        // Connection and subscription events advance the event loop but are
+        // not source messages.
+        Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => Ok(PollResult::None),
+    }
+}
+
+async fn handle_mqtt5_event(
+    client: &Mqtt5Client,
+    event_loop: &mut Mqtt5EventLoop,
+    event: Mqtt5Event,
+    subscriptions: &[MqttSubscription],
+    poll_timeout: Duration,
+    max_buffered_messages: usize,
+) -> Result<PollResult, iggy_connector_sdk::Error> {
+    match event {
+        Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
+            Ok(PollResult::Message(Box::new(normalize_mqtt5(publish)?)))
+        }
+        Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(connack)) if !connack.session_present => {
+            subscribe_mqtt5(client, subscriptions).await?;
+            Ok(PollResult::Buffered(
+                poll_mqtt5(
+                    event_loop,
+                    subscriptions.len(),
+                    poll_timeout,
+                    max_buffered_messages,
+                )
+                .await?,
+            ))
+        }
+        Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => Ok(PollResult::None),
+    }
+}
+
 async fn poll_mqtt311(
     event_loop: &mut Mqtt311EventLoop,
     subscription_count: usize,
     poll_timeout: Duration,
+    max_buffered_messages: usize,
 ) -> Result<VecDeque<ReceivedMessage>, iggy_connector_sdk::Error> {
     let mut acknowledged_subscriptions = 0;
     let mut buffered_messages = VecDeque::new();
@@ -631,6 +768,12 @@ async fn poll_mqtt311(
                 acknowledged_subscriptions += 1;
             }
             Mqtt311Event::Incoming(Mqtt311Incoming::Publish(publish)) => {
+                if buffered_messages.len() >= max_buffered_messages {
+                    return Err(iggy_connector_sdk::Error::Connection(
+                        "MQTT resubscription buffer reached batch_size before subscription acknowledgements"
+                            .to_string(),
+                    ));
+                }
                 buffered_messages.push_back(normalize_mqtt311(publish)?);
             }
             Mqtt311Event::Outgoing(_) | Mqtt311Event::Incoming(_) => {}
@@ -644,6 +787,7 @@ async fn poll_mqtt5(
     event_loop: &mut Mqtt5EventLoop,
     subscription_count: usize,
     poll_timeout: Duration,
+    max_buffered_messages: usize,
 ) -> Result<VecDeque<ReceivedMessage>, iggy_connector_sdk::Error> {
     let mut acknowledged_subscriptions = 0;
     let mut buffered_messages = VecDeque::new();
@@ -674,6 +818,12 @@ async fn poll_mqtt5(
                 acknowledged_subscriptions += 1;
             }
             Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
+                if buffered_messages.len() >= max_buffered_messages {
+                    return Err(iggy_connector_sdk::Error::Connection(
+                        "MQTT resubscription buffer reached batch_size before subscription acknowledgements"
+                            .to_string(),
+                    ));
+                }
                 buffered_messages.push_back(normalize_mqtt5(publish)?);
             }
             Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => {}
@@ -1117,6 +1267,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(100),
             4,
+            3,
         ));
 
         assert!(matches!(
@@ -1162,6 +1313,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(100),
             4,
+            3,
         ));
 
         assert!(matches!(
