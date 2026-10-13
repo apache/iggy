@@ -57,10 +57,10 @@ verbose_logging = false
 | `table` | required | Target table. |
 | `timestamp_source` | `message` | `message`, `origin`, `payload`, or `server`. |
 | `timestamp_field` | none | Payload field holding the timestamp. Required when `timestamp_source = "payload"`. |
-| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`. |
+| `timestamp_unit` | `auto` | Unit of the payload timestamp: `auto`, `seconds`, `millis`, `micros`, `nanos`. `auto` infers the unit from the magnitude. Used only when `timestamp_source = "payload"`, but an invalid value is rejected with any source. |
 | `symbol_columns` | `[]` | Payload fields stored as `SYMBOL`. A record with an object or array in one of these fields is rejected. |
 | `uuid_columns` | `[]` | Payload fields holding RFC-4122 strings, stored as `UUID`. A record with a non-string value there is rejected. |
-| `integer_columns` | `[]` | Payload fields stored as `LONG` while `numbers_as_double` is on. A fractional value there is rejected. |
+| `integer_columns` | `[]` | Payload fields stored as `LONG`. A fractional or non-numeric value there is rejected. |
 | `include_stream_column` | `true` | Write the stream name as a `SYMBOL` column named `stream`. |
 | `include_topic_column` | `true` | Write the topic name as a `SYMBOL` column named `topic`. |
 | `include_partition_column` | `false` | Write `partition_id` as a `LONG`. |
@@ -82,11 +82,12 @@ in the connect string. See the
 
 ### Batch sizing
 
-A QWP frame has a size cap, about 4 MiB by default, and a frame over the cap is
-rejected with all of its rows. `max_flush_bytes` flushes before a batch of wide
-rows reaches it. The 1 MB default leaves room, because the buffer size is an
-estimate and a frame can also carry the symbol dictionary. If you raise it, also
-raise `sf_max_segment_bytes` in the connect string.
+A QWP frame has a size cap, about 4 MiB by default, and the client refuses a
+frame over the cap with all of its rows. `max_flush_bytes` flushes before a
+batch of wide rows reaches it. The 1 MB default leaves room, because the buffer
+size is an estimate and a frame can also carry the symbol dictionary. The cap
+is the smaller of `max_buf_size` and `sf_max_segment_bytes` in the connect
+string, so to raise it, raise both.
 
 The check runs before each row is added. A message larger than the frame cap
 minus `max_flush_bytes` can therefore push one frame over the cap. That flush
@@ -122,9 +123,9 @@ so rows lost in the sink cannot be read again from Iggy.
 
 The connector borrows a pooled connection for each chunk it writes, and the
 runtime writes each topic in its own task. `sender_pool_max` caps the pool and
-defaults to 4. When the pool is full, a borrow waits `acquire_timeout_ms` (5 s by
-default) and then fails, and that batch is lost. Set `sender_pool_max` to at
-least the number of topics the connector consumes:
+defaults to 4. When the pool is full, a borrow waits `acquire_timeout_ms`
+(5 s by default) and then fails, and the rest of that batch is lost. Set
+`sender_pool_max` to at least the number of topics the connector consumes:
 
 ```toml
 connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
@@ -135,13 +136,14 @@ connection_string = "ws::addr=localhost:9000;sender_pool_max=16;"
 - **Multi-host failover**: list several endpoints, for example
   `addr=node-a:9000,node-b:9000`. The client moves to another endpoint on
   reconnect and keeps buffering while a replica is promoted.
-- **TLS**: use `wss::`, with `tls_roots` and `tls_roots_password` for a private
-  CA. `tls_verify=unsafe_off` turns off certificate checks. A default build
-  refuses it. Build with the `insecure-skip-verify` feature to use it against a
-  test server.
+- **TLS**: use `wss::`. For a private CA, point `tls_roots` at its certificate
+  file, and add `tls_roots_password` if that file is a JKS or PKCS#12 keystore.
+  `tls_verify=unsafe_off` turns off certificate checks. A default build refuses
+  it. Build with the `insecure-skip-verify` feature to use it against a test
+  server.
 - **Durable ack**: set `request_durable_ack=on` in the connect string and
   `ack_level = "durable"`. The connector does not start with `durable` alone,
-  because QuestDB would refuse every wait. The server also needs replication
+  because the client would refuse every wait. The server also needs replication
   configured. Without it no flush is ever acknowledged.
 
 ### Choosing an ack level
@@ -222,19 +224,20 @@ Use one source per table.
 
 ## Delivery semantics
 
-Rows in a flush that QuestDB accepted are delivered at least once. The exception
-is `ack_level = "ok"` on a cluster: a primary that fails before it ships its
-write-ahead log can lose rows it accepted. See
-[Choosing an ack level](#choosing-an-ack-level). A reconnect,
-a failover or a replay of queued frames can send them again. The client queues
-unacknowledged frames in memory, or on disk when `sf_dir` is set. Rows the sink does not write, such as a rejected record or a failed
-chunk, are lost, as the rest of this section describes. Declare
+Rows in a flush that QuestDB accepted are delivered at least once. A reconnect,
+a failover or a replay of queued frames can send the same rows again. Declare
 [`DEDUP UPSERT KEYS(...)`](https://questdb.com/docs/concepts/deduplication/) on
 tables that must not have duplicates.
 
-Without `sf_dir`, the queue of unacknowledged frames is kept only in memory. A
-crash, or a shutdown that outlasts the connect string's `close_flush_timeout`,
-loses it even though
+There are two exceptions. With `ack_level = "ok"` on a cluster, a primary that
+fails before it ships its write-ahead log can lose rows it accepted. See
+[Choosing an ack level](#choosing-an-ack-level). Rows the sink does not write,
+such as a rejected record or a failed chunk, are lost, as the rest of this
+section describes.
+
+The client queues unacknowledged frames in memory, or on disk when `sf_dir` is
+set. Without `sf_dir`, a crash, or a shutdown that outlasts
+`close_flush_timeout_millis` in the connect string, loses the queue even though
 `consume()` already reported success.
 
 A batch fails when:
@@ -246,9 +249,9 @@ A batch fails when:
 - A chunk fails to write. If the cause is the connection, the connector skips
   the remaining chunks of the batch. It logs the offsets and message ids of the
   messages it did not write.
-- No flush is acknowledged for 10 batches in a row on a topic. A single late
-  ack is logged as a warning, because the frames stay queued and are delivered
-  later.
+- 10 batches in a row on one topic each leave a flush unacknowledged within
+  `flush_timeout`. A single late ack is only a warning, because the frames stay
+  queued and are delivered later.
 
 The runtime counts a failed batch in `iggy_connector_errors_total`. It does not
 retry it ([#2927](https://github.com/apache/iggy/issues/2927)).
@@ -272,9 +275,9 @@ Alert on the connector's logs instead.
 A record is rejected when:
 
 - **The connector rejects it before writing**: a binary payload that is not
-  UTF-8, a malformed UUID, a bad array, a value of the wrong type in a listed column, a missing or
-  out-of-range timestamp field, an invalid or duplicate column name, or a row
-  with no columns. The rest of the batch is written.
+  UTF-8, a malformed UUID, a bad array, a value of the wrong type in a listed
+  column, a missing or out-of-range timestamp field, an invalid or duplicate
+  column name, or a row with no columns. The rest of the batch is written.
 - **The client rejects it while writing**, usually because a column already has
   another type in this flush. The rest of the batch is written.
 - **The server rejects the frame.** QuestDB rejects whole frames, so the
@@ -285,8 +288,8 @@ This writes user data to the log.
 
 ### Reserved column names
 
-The connector writes these columns itself. A payload field with the same name,
-ignoring case, is rejected.
+The connector writes these columns itself. A record with a payload field of the
+same name, ignoring case, is rejected.
 
 | Column | Written when |
 | ------ | ------------ |
@@ -308,8 +311,9 @@ cargo test -p iggy_connector_questdb_sink
 ```
 
 The integration tests start a QuestDB container and need Docker. Build the
-plugin and the binaries first, because the runtime loads them from `target/`
-and `cargo test` does not build them:
+plugin and the binaries first. The tests run the server and the connectors
+runtime from `target/`, the runtime loads the plugin from there, and
+`cargo test` builds none of them:
 
 ```bash
 cargo build -p iggy_connector_questdb_sink
