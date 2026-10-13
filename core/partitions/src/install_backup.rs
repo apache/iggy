@@ -167,11 +167,22 @@ async fn link_tree<S: DurableStorage>(
                 storage.hard_link(&source_file, &destination).await?;
                 if !synced_files.contains(&source_file) {
                     files_to_sync.push(destination);
+                    if files_to_sync.len() == FILE_SYNC_CONCURRENCY {
+                        sync_files(&mut files_to_sync, storage).await?;
+                    }
                 }
             }
         }
     }
-    futures::stream::iter(files_to_sync.into_iter().map(Ok::<_, io::Error>))
+    sync_files(&mut files_to_sync, storage).await?;
+    for directory in directories.into_iter().rev() {
+        storage.sync_directory(&directory).await?;
+    }
+    Ok(())
+}
+
+async fn sync_files<S: DurableStorage>(files: &mut Vec<PathBuf>, storage: &S) -> io::Result<()> {
+    futures::stream::iter(std::mem::take(files).into_iter().map(Ok::<_, io::Error>))
         .try_for_each_concurrent(FILE_SYNC_CONCURRENCY, |destination| async move {
             storage
                 .open(&destination, OpenMode::Read)
@@ -179,11 +190,7 @@ async fn link_tree<S: DurableStorage>(
                 .sync()
                 .await
         })
-        .await?;
-    for directory in directories.into_iter().rev() {
-        storage.sync_directory(&directory).await?;
-    }
-    Ok(())
+        .await
 }
 
 async fn copy_file<S: DurableStorage>(
@@ -248,6 +255,30 @@ mod tests {
         }
         assert!(!root.join("99.log").exists());
         recover(root).await.unwrap();
+    }
+
+    #[compio::test]
+    async fn given_more_files_than_one_sync_batch_when_recovering_should_restore_them_all() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for index in 0..=FILE_SYNC_CONCURRENCY {
+            std::fs::write(root.join(format!("{index}.log")), b"old").unwrap();
+        }
+
+        begin(root, &BTreeSet::new()).await.unwrap();
+        for index in 0..=FILE_SYNC_CONCURRENCY {
+            let path = root.join(format!("{index}.log"));
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(path, b"new").unwrap();
+        }
+        recover(root).await.unwrap();
+
+        for index in 0..=FILE_SYNC_CONCURRENCY {
+            assert_eq!(
+                std::fs::read(root.join(format!("{index}.log"))).unwrap(),
+                b"old"
+            );
+        }
     }
 
     #[compio::test]

@@ -3349,12 +3349,6 @@ where
                             install.phase = InstallPhase::Backup;
                         }
                         Ok(false) => step = crate::PartitionIoStep::Pending,
-                        Err(source)
-                            if source.kind() == std::io::ErrorKind::TimedOut
-                                && persistence.failure().is_none() =>
-                        {
-                            step = crate::PartitionIoStep::Pending;
-                        }
                         Err(source) => self.fail_install(
                             &mut install,
                             PartitionInstallError::SwapIo {
@@ -4372,32 +4366,19 @@ where
                 },
                 crate::PartitionIoStep::Pending => {
                     if let Some(persistence) = &self.persistence {
-                        if let Err(source) = persistence.drain_with_timeout().await {
-                            if source.kind() == std::io::ErrorKind::TimedOut
-                                && persistence.failure().is_none()
-                            {
-                                return Err(PartitionInstallError::SwapIo {
-                                    path: self.partition_dir.clone().unwrap_or_default(),
-                                    source,
-                                });
-                            }
-                            if let Some(
-                                crate::iggy_partition::PendingPartitionTransition::Install(
-                                    mut install,
-                                ),
-                            ) = self.transition.take()
-                            {
-                                let error = PartitionInstallError::SwapIo {
-                                    path: install.partition_dir.clone(),
-                                    source,
-                                };
-                                self.fail_install(&mut install, error);
-                                self.transition = Some(
-                                    crate::iggy_partition::PendingPartitionTransition::Install(
-                                        install,
-                                    ),
-                                );
-                            }
+                        if let Err(source) = persistence.drain_with_timeout().await
+                            && let Some(crate::iggy_partition::PendingPartitionTransition::Install(
+                                mut install,
+                            )) = self.transition.take()
+                        {
+                            let error = PartitionInstallError::SwapIo {
+                                path: install.partition_dir.clone(),
+                                source,
+                            };
+                            self.fail_install(&mut install, error);
+                            self.transition = Some(
+                                crate::iggy_partition::PendingPartitionTransition::Install(install),
+                            );
                         }
                     } else {
                         return Err(PartitionInstallError::SwapIo {
