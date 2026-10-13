@@ -129,7 +129,7 @@ impl ActionWeights {
         ])
     }
 
-    /// Every action outside [`UNIFORM_EXCLUDED`] equally likely. Widest op
+    /// Every action outside `UNIFORM_EXCLUDED` equally likely. Widest op
     /// coverage per tick, at the cost of a shallow population per entity kind.
     ///
     /// The action count does not divide 100, so the first `100 % count` actions

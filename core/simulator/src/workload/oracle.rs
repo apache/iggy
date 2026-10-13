@@ -322,7 +322,7 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
 /// Returns `false` if the views never converge, which is a real liveness failure
 /// the caller should report rather than assert against an unsettled cluster.
 ///
-/// Also steps while an owner install is pending (see [`owner_install_pending`]):
+/// Also steps while an owner install is pending:
 /// the reconciler installs an owner on its own schedule, and the owner oracle
 /// compares only installed ones.
 ///
