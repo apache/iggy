@@ -46,6 +46,7 @@ services:
       # The published image listens on loopback only, so bind all interfaces.
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_LOGGING_LEVEL=debug
       - IGGY_NODE_ADVERTISED_ADDRESS=localhost
     healthcheck:
       test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping"]
@@ -72,8 +73,18 @@ services:
       - |
         set -eu
         iggy_cli() { iggy --tcp-server-address iggy-server:8090 -u iggy -p iggy "$$@"; }
-        iggy_cli stream get example_stream >/dev/null 2>&1 || iggy_cli stream create example_stream
-        iggy_cli topic get example_stream users >/dev/null 2>&1 || iggy_cli topic create example_stream users 1 none
+        # The CLI exits 0 from `get` for a missing resource, so `get || create`
+        # never creates. Create instead and tolerate only "already exists".
+        create_if_missing() {
+          if ! output="$$(iggy_cli "$$@" 2>&1)"; then
+            case "$$output" in
+              *"already exists"*) ;;
+              *) echo "$$output" >&2; return 1 ;;
+            esac
+          fi
+        }
+        create_if_missing stream create example_stream
+        create_if_missing topic create example_stream users 1 none
         echo "stream example_stream and topic users are ready"
     depends_on:
       iggy-server:
@@ -116,6 +127,7 @@ services:
     restart: unless-stopped
     environment:
       - IGGY_CONNECTORS_CONFIG_PATH=/config/config.toml
+      - IGGY_LOGGING_LEVEL=debug
     volumes:
       - ./config:/config:ro
     depends_on:
