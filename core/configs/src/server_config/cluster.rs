@@ -309,10 +309,13 @@ pub struct ClusterConfig {
     /// wedged the group is already fenced quorum-invisible and peers elect around
     /// it; this converts the log-only limp into a distinct exit status a
     /// supervisor can act on. It is also the deadline of each running
-    /// partition file job (`sharding.partition_io_capacity`). Zero (and the `0` /
-    /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
-    /// the fail-stop; nonzero values below
-    /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.
+    /// partition file job (`sharding.partition_io_capacity`), counted in pump
+    /// ticks. Expiry fences the partition that owns the job and stops the
+    /// node, and the timed-out job keeps its slot and allocation charge until
+    /// shutdown. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
+    /// all parse to zero) disables both the fail-stop and the file-job
+    /// deadline; nonzero values below `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are
+    /// rejected at boot.
     #[serde(default = "default_superblock_wedged_fatal_timeout")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]

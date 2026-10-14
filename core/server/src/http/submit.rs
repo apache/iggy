@@ -30,6 +30,7 @@ use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
 use metadata::impls::metadata::StreamsFrontend;
+use server_common::sharding::IggyNamespace;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
@@ -46,15 +47,6 @@ use crate::reply_frame::transient_code;
 use crate::rewrite::http_chain;
 use crate::shell::ServerShard;
 use crate::wire::request_body;
-
-/// Bound on a partition write's (produce / consumer-offset write) wait for its
-/// committed reply. Long enough to ride out a view change (plus the dispatch
-/// gates' own routable-wait budget), short enough not to pin HTTP connections
-/// behind a dead consensus group. On expiry the caller gets 504 and must treat
-/// the outcome as unknown: the partition plane is at-least-once and the prepare
-/// may still commit after the wait gave up, so the server never retries on the
-/// caller's behalf.
-const PARTITION_WRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Replay cadence for a control-plane write answered with the pre-consensus
 /// `TransientNotCommitted` frame (not-caught-up primary, pipeline pressure,
@@ -259,6 +251,16 @@ async fn submit_gated(
             None => IggyError::TransientNotCommitted,
         };
         saw_not_committed |= matches!(transient, IggyError::TransientNotCommitted);
+        // This node is a normal backup now, and replaying here cannot reach
+        // the primary. 58 tells the relay that sent it here, or the caller,
+        // that nothing was admitted, unless an earlier frame was 57.
+        if matches!(transient, IggyError::NotPrimary) {
+            return Err(WriteError::Rejected(if saw_not_committed {
+                IggyError::TransientNotCommitted
+            } else {
+                IggyError::TransientNotAccepted
+            }));
+        }
         // Pre-consensus transient frame: replay the SAME request id, mirroring
         // the binary SDKs' in-client loop. Safe to replay - the dominant
         // emissions never entered the pipeline, and the view-change cancel is
@@ -356,36 +358,29 @@ pub(in crate::http) async fn logout_session(state: &HttpInner, session: &Rc<Http
     state.forget_session(session);
 }
 
-pub(in crate::http) async fn partition_write_replicated(
+/// Choose the partition of a write once and fix its context: the given one,
+/// else the context current on this node. A relayed write reaches the primary
+/// with both, so a retry turn never places it again.
+pub(in crate::http) fn capture_partition_write(
     state: &HttpInner,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
     context: Option<PartitionContext>,
-) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
-    partition_write(state, session, operation, body, context, &mut None).await
-}
-
-async fn partition_write(
-    state: &HttpInner,
-    session: &HttpSession,
-    operation: Operation,
-    body: &[u8],
-    context: Option<PartitionContext>,
-    dispatched: &mut Option<oneshot::Sender<Result<(), PartitionWriteError>>>,
-) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
-    let deadline = Instant::now() + PARTITION_WRITE_REPLY_TIMEOUT;
-    let namespace = crate::namespace::resolve_partition_request_namespace(
-        &state.shard,
-        operation,
-        body,
-        session.client_id,
-    )
-    .map_err(PartitionWriteError::Rejected)?;
+) -> Result<(IggyNamespace, PartitionContext), PartitionWriteError> {
+    let namespace = IggyNamespace::from_raw(
+        crate::namespace::resolve_partition_request_namespace(
+            &state.shard,
+            operation,
+            body,
+            session.client_id,
+        )
+        .map_err(PartitionWriteError::Rejected)?,
+    );
     let attachment = session.attachment.borrow().clone();
     let captured = crate::dispatch::partition::capture_offset_attachment(
         state.shard.plane.metadata().mux_stm.streams(),
-        server_common::sharding::IggyNamespace::from_raw(namespace),
+        namespace,
         body,
         session.client_id,
         attachment,
@@ -397,6 +392,40 @@ async fn partition_write(
             .metadata
             .context(state.shard.plane.metadata().applied_frontier().get())
     });
+    Ok((namespace, context))
+}
+
+/// Dispatch a captured write on this node and wait for its committed reply
+/// until `deadline`. On expiry the caller gets 504 and must treat the outcome
+/// as unknown: the prepare may still commit after the wait gave up, so the
+/// server never retries on the caller's behalf.
+pub(in crate::http) async fn partition_write_replicated(
+    state: &HttpInner,
+    session: &HttpSession,
+    operation: Operation,
+    body: &[u8],
+    namespace: IggyNamespace,
+    context: PartitionContext,
+    deadline: Instant,
+) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
+    partition_write(
+        state, session, operation, body, namespace, context, deadline, &mut None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn partition_write(
+    state: &HttpInner,
+    session: &HttpSession,
+    operation: Operation,
+    body: &[u8],
+    namespace: IggyNamespace,
+    context: PartitionContext,
+    deadline: Instant,
+    dispatched: &mut Option<oneshot::Sender<Result<(), PartitionWriteError>>>,
+) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
+    let namespace = namespace.inner();
     let gate = session.partition_gate(namespace);
     // The group retains one receipt per session. Keep its lane occupied through
     // the reply wait, including when NoAck has already returned after dispatch.
@@ -454,6 +483,7 @@ async fn partition_write(
                 Some(session.user_id),
                 Some((session.client_id, attachment)),
                 Some(namespace),
+                None,
             )
             .await;
             if let Some(dispatched) = dispatched.take() {
@@ -478,7 +508,9 @@ pub(in crate::http) async fn produce_unacked(
     state: &Rc<HttpInner>,
     session: &Rc<HttpSession>,
     body: Bytes,
-    context: Option<PartitionContext>,
+    namespace: IggyNamespace,
+    context: PartitionContext,
+    deadline: Instant,
 ) -> Result<(), PartitionWriteError> {
     let state = Rc::clone(state);
     let session = Rc::clone(session);
@@ -490,7 +522,9 @@ pub(in crate::http) async fn produce_unacked(
             &session,
             Operation::SendMessages,
             &body,
+            namespace,
             context,
+            deadline,
             &mut sent,
         )
         .await;

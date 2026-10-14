@@ -25,36 +25,19 @@
 //!
 //! One bidirectional stream **per request** (matches the iggy SDK QUIC
 //! client, which opens a fresh `open_bi` per command and `send.finish()`-s
-//! after writing the request). The transport's [`QuicTransportConn::run`]
-//! runs an outer `accept_bi` loop on the connection and serves one bidi
-//! at a time:
+//! after writing the request). [`QuicTransportConn::run`] serves the
+//! streams of one connection at once, as many as the stream credit of
+//! `[quic] max_concurrent_bidi_streams` lets the client open. Each stream:
 //!
-//! 1. accept the next bidi (or break on shutdown / connection close);
-//! 2. read exactly one inbound frame from the `RecvStream`, note its
-//!    `request` id, and forward it to [`ActorContext::in_tx`];
-//! 3. wait on [`ActorContext::rx`] for the reply whose `request` id matches,
-//!    discarding any stale/duplicate reply left by an earlier attempt's bidi
-//!    (the SDK replays an explicit transient with the SAME request id); write
-//!    the matched reply, then `finish()` to deliver pending data + FIN;
-//! 4. drop the bidi pair and loop to the next `accept_bi`.
+//! 1. reads exactly one inbound frame, registers a waiter under its
+//!    `request` id, and forwards the frame to [`ActorContext::in_tx`];
+//! 2. gets the frame that answers it from a router that reads
+//!    [`ActorContext::rx`] (see `ReplyRouter`);
+//! 3. writes that frame, then `finish()`-es to deliver pending data + FIN.
 //!
-//! The `accept_bi` loop is serial (the iggy SDK serialises per connection via
-//! an internal `RwLock`, so one bidi at a time is a semantic match) and the
-//! reply wait is `request_id`-KEYED. The wait is NOT bounded by a short
-//! abandon-timeout: every transient submit is answered with an explicit
-//! `TransientNotCommitted` rejection frame these days, so an unanswered bidi
-//! means the dispatch truly dropped the request (both partition queues full)
-//! or the op is pathologically slow -- and abandoning the bidi while the op
-//! can still commit would strand its reply. All partition ops on a
-//! connection share ONE request id (only metadata ops advance the dedup
-//! counter), so a stranded reply would be consumed by the NEXT partition
-//! op's bidi and shift the connection's data-plane stream off by one,
-//! permanently. Instead, `REPLY_WAIT_BACKSTOP` (longer than the SDK's
-//! whole-request deadline, so the client always gives up first and
-//! reconnects) closes the CONNECTION, which drops the mailbox and every
-//! pending reply with it -- nothing can strand or cross request ids. A
-//! future pipelining upgrade would additionally run per-bidi handlers
-//! concurrently (and would then require a real per-op correlation id).
+//! A stream whose client stops it, or whose reply does not come within
+//! `REPLY_WAIT_BACKSTOP`, drops its waiter and resets. The other streams
+//! and the connection go on.
 //!
 //! The handshake itself is driven by [`accept_handshake`] (no bidi
 //! captured). To avoid a single slow / hostile peer wedging the entire
@@ -83,16 +66,25 @@ use super::{ActorContext, TransportConn, TransportListener};
 use crate::config::QuicTuning;
 use crate::framing;
 use crate::lifecycle::connection_registry::BusMessage;
+use async_channel::Sender;
 use compio::BufResult;
 use compio::io::AsyncWriteExt;
 use compio_quic::{
-    Connection, Endpoint, IdleTimeout, Incoming, VarInt, congestion,
+    Connection, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream, VarInt, congestion,
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
-use iggy_binary_protocol::{Command, HEADER_SIZE, ReplyHeader, RequestHeader};
+use futures::channel::oneshot;
+use futures::stream::{FuturesUnordered, StreamExt};
+use iggy_binary_protocol::{Command, GenericHeader, ReplyHeader, RequestHeader};
+use server_common::Message;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::mem::offset_of;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -286,38 +278,36 @@ async fn accept_handshake_inner(incoming: Incoming) -> Option<(QuicTransportConn
 /// using `MessageBusConfig::close_grace`.
 pub(crate) const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
-/// How long a bidi waits for its keyed reply before abandoning the stream.
-/// A replicated submit the server cannot yet commit is answered with silence
-/// (the server expects the SDK to replay), so without a bound the per-bidi
-/// wait - and, since `accept_bi` is serial, the whole connection - would wedge:
-/// Backstop for a bidi whose dispatch never produced a reply (a true drop:
-/// both partition queues full, or a pathologically slow commit). Longer than
-/// the SDK's whole-request deadline (30s), so the client always times out
-/// first, surfaces `Disconnected`, and reconnects. On firing the CONNECTION
-/// is closed rather than the bidi abandoned: partition ops all share one
-/// request id, so a reply stranded by an abandoned bidi would be consumed by
-/// the next data-plane op and shift every subsequent reply off by one.
-/// Closing the connection drops the mailbox and any late reply with it.
+/// How long a stream waits for its reply before it resets. A request whose
+/// dispatch never answers (both partition queues full, or a pathologically
+/// slow commit) would otherwise hold its stream credit for the life of the
+/// connection. Longer than the SDK's whole-request deadline (30s), so the
+/// client always gives up first. A reply that comes after the reset is an
+/// unclaimed frame (see `ReplyRouter::register`).
 const REPLY_WAIT_BACKSTOP: Duration = Duration::from_mins(1);
+
+/// Application error code that resets a stream ending without its reply.
+const QUIC_NO_REPLY: u32 = 0x1005;
 
 /// `Command` byte offset shared by every consensus header (after the
 /// fixed checksum/cluster/size/view/release prefix).
 const COMMAND_OFFSET: usize = 60;
 
-/// How an outbound frame routes to a waiting bidi.
+/// How an outbound frame routes to the waiting streams.
 enum ReplyRoute {
-    /// A request-keyed `Reply`: deliver only to the bidi whose request id
-    /// matches; a non-matching one is a stale/duplicate from an abandoned bidi.
+    /// A `Reply`, for the oldest stream that waits under this request id.
     Keyed(u64),
-    /// A terminal/control frame (`Eviction`, etc.) with no `request` field, or
-    /// an undecodable header: deliver to the in-flight bidi unconditionally.
-    /// Filtering these out would silently swallow session-terminal signals
-    /// (e.g. `NoSession` -> `Unauthenticated`), leaving the client to time out.
+    /// A terminal/control frame (`Eviction`, etc.) with no `request` field:
+    /// deliver to every waiting stream. Filtering these out would silently
+    /// swallow session-terminal signals (e.g. `NoSession` ->
+    /// `Unauthenticated`), leaving the client to time out.
     Unkeyed,
 }
 
 /// Decide how to route an outbound frame. Only `Command::Reply` carries a
-/// `request` id; everything else must pass through unfiltered.
+/// `request` id; everything else must pass through unfiltered. The id is
+/// read as raw bytes, because the deny of an operation this build does not
+/// declare echoes that byte, and a checked `ReplyHeader` cast refuses it.
 fn reply_route(frame: &BusMessage) -> ReplyRoute {
     let bytes = frame.first().as_slice();
     let is_reply = bytes
@@ -326,12 +316,205 @@ fn reply_route(frame: &BusMessage) -> ReplyRoute {
     if !is_reply {
         return ReplyRoute::Unkeyed;
     }
+    read_u64(bytes, offset_of!(ReplyHeader, request)).map_or(ReplyRoute::Unkeyed, ReplyRoute::Keyed)
+}
+
+/// The request id of a client frame, read as raw bytes like [`reply_route`],
+/// so a frame with an undeclared operation still has one.
+fn request_id(request: &Message<GenericHeader>) -> Option<u64> {
+    read_u64(request.as_slice(), offset_of!(RequestHeader, request))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     bytes
-        .get(..HEADER_SIZE)
-        .and_then(|header| bytemuck::checked::try_from_bytes::<ReplyHeader>(header).ok())
-        .map_or(ReplyRoute::Unkeyed, |header| {
-            ReplyRoute::Keyed(header.request)
-        })
+        .get(offset..offset + size_of::<u64>())
+        .and_then(|field| field.try_into().ok())
+        .map(u64::from_le_bytes)
+}
+
+/// Hands the outbound frames of one connection to the streams that wait
+/// for them.
+///
+/// A stream registers its waiter before it forwards its request, so a reply
+/// never comes before the stream it answers.
+struct ReplyRouter {
+    /// Waiting streams by request id, oldest first.
+    waiters: HashMap<u64, VecDeque<oneshot::Sender<BusMessage>>>,
+    /// Frames that came while no stream waited for them, oldest first.
+    unclaimed: VecDeque<BusMessage>,
+    /// When `unclaimed` holds this many frames, it drops its oldest one.
+    unclaimed_max: usize,
+}
+
+impl ReplyRouter {
+    fn new(unclaimed_max: usize) -> Self {
+        Self {
+            waiters: HashMap::new(),
+            unclaimed: VecDeque::new(),
+            unclaimed_max,
+        }
+    }
+
+    /// Register a stream that waits for the reply to `request_id`.
+    ///
+    /// The stream first takes the oldest unclaimed frame that has no request
+    /// id or has its own. The SDK replays an explicit transient with the same
+    /// request id on a new stream, so a late reply of the first attempt
+    /// answers the replay. The replies for other ids ahead of that frame are
+    /// dropped, because their streams already ended.
+    fn register(&mut self, request_id: u64) -> oneshot::Receiver<BusMessage> {
+        let (waiter, reply) = oneshot::channel();
+        while let Some(frame) = self.unclaimed.pop_front() {
+            if !matches!(reply_route(&frame), ReplyRoute::Keyed(id) if id != request_id) {
+                // `reply` is alive, so the send cannot fail.
+                let _ = waiter.send(frame);
+                return reply;
+            }
+        }
+        self.waiters
+            .entry(request_id)
+            .or_default()
+            .push_back(waiter);
+        reply
+    }
+
+    /// Hand a reply to the oldest waiter of its request id, and a frame
+    /// without one to every waiter, because an eviction ends every request
+    /// of the connection. A frame no stream takes stays unclaimed.
+    fn route(&mut self, frame: BusMessage) {
+        let unclaimed = match reply_route(&frame) {
+            ReplyRoute::Keyed(request_id) => self.deliver(request_id, frame),
+            ReplyRoute::Unkeyed => self.broadcast(frame),
+        };
+        if let Some(frame) = unclaimed {
+            if self.unclaimed.len() == self.unclaimed_max {
+                self.unclaimed.pop_front();
+            }
+            self.unclaimed.push_back(frame);
+        }
+    }
+
+    /// Drop the waiters of `request_id` whose streams ended without a reply.
+    fn release(&mut self, request_id: u64) {
+        if let Some(waiters) = self.waiters.get_mut(&request_id) {
+            waiters.retain(|waiter| !waiter.is_canceled());
+            if waiters.is_empty() {
+                self.waiters.remove(&request_id);
+            }
+        }
+    }
+
+    /// Returns the frame if no waiter took it.
+    fn deliver(&mut self, request_id: u64, mut frame: BusMessage) -> Option<BusMessage> {
+        let Some(waiters) = self.waiters.get_mut(&request_id) else {
+            return Some(frame);
+        };
+        let unclaimed = loop {
+            let Some(waiter) = waiters.pop_front() else {
+                break Some(frame);
+            };
+            match waiter.send(frame) {
+                Ok(()) => break None,
+                Err(returned) => frame = returned,
+            }
+        };
+        if waiters.is_empty() {
+            self.waiters.remove(&request_id);
+        }
+        unclaimed
+    }
+
+    /// Returns the frame if no waiter took it.
+    fn broadcast(&mut self, frame: BusMessage) -> Option<BusMessage> {
+        let mut delivered = false;
+        for waiter in self.waiters.drain().flat_map(|(_, waiters)| waiters) {
+            delivered |= waiter.send(frame.clone()).is_ok();
+        }
+        (!delivered).then_some(frame)
+    }
+}
+
+/// What the stream futures of [`QuicTransportConn::run`] borrow from it.
+struct StreamContext<'a> {
+    in_tx: &'a Sender<Message<GenericHeader>>,
+    router: &'a RefCell<ReplyRouter>,
+    max_message_size: usize,
+    reply_backstop: Duration,
+    label: &'static str,
+    peer: &'a str,
+}
+
+impl StreamContext<'_> {
+    /// Serve one request stream. Breaks when the inbound queue is gone,
+    /// because the connection then has no dispatch.
+    #[allow(clippy::future_not_send)]
+    async fn serve(&self, mut send: SendStream, mut recv: RecvStream) -> ControlFlow<()> {
+        let Self {
+            in_tx,
+            router,
+            max_message_size,
+            reply_backstop,
+            label,
+            peer,
+        } = *self;
+        // The SDK `finish()`-es after its request, so the stream carries one
+        // frame.
+        let request = match framing::read_message(&mut recv, max_message_size).await {
+            Ok(request) => request,
+            Err(e) => {
+                debug!(%label, %peer, error = ?e, "quic: bidi read error");
+                return ControlFlow::Continue(());
+            }
+        };
+        let Some(request_id) = request_id(&request) else {
+            debug!(%label, %peer, "quic: frame shorter than a request header");
+            return ControlFlow::Continue(());
+        };
+        let mut reply = router.borrow_mut().register(request_id);
+        if in_tx.send(request).await.is_err() {
+            debug!(%label, %peer, "quic: inbound queue dropped");
+            return ControlFlow::Break(());
+        }
+        let replied = {
+            let mut stopped = pin!(send.stopped().fuse());
+            let mut backstop = pin!(compio::time::sleep(reply_backstop).fuse());
+            futures::select_biased! {
+                frame = reply => frame.ok(),
+                _ = stopped => {
+                    debug!(%label, %peer, request_id, "quic: client stopped the stream before its reply");
+                    None
+                }
+                () = backstop => {
+                    warn!(%label, %peer, request_id, "quic: no reply within the backstop; resetting the stream");
+                    None
+                }
+            }
+        };
+        let Some(frame) = replied else {
+            drop(reply);
+            router.borrow_mut().release(request_id);
+            if let Err(e) = send.reset(VarInt::from_u32(QUIC_NO_REPLY)) {
+                debug!(%label, %peer, error = ?e, "quic: stream reset failed");
+            }
+            return ControlFlow::Continue(());
+        };
+        for fragment in frame.into_fragments() {
+            let BufResult(result, _frozen) = send.write_all(fragment).await;
+            if let Err(e) = result {
+                debug!(%label, %peer, error = ?e, "quic: write failed");
+                return ControlFlow::Continue(());
+            }
+        }
+        // `finish()` flushes pending data + a FIN, which tells the SDK the
+        // reply is complete.
+        if let Err(e) = send.finish() {
+            debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
+        }
+        // Keep the reply alive through graceful shutdown until the peer has
+        // acknowledged it. Closing the connection after FIN alone can discard it.
+        let _ = send.stopped().await;
+        ControlFlow::Continue(())
+    }
 }
 
 /// A single accepted QUIC connection.
@@ -343,6 +526,8 @@ fn reply_route(frame: &BusMessage) -> ReplyRoute {
 pub struct QuicTransportConn {
     connection: Connection,
     close_grace: Duration,
+    /// [`REPLY_WAIT_BACKSTOP`]. Tests shorten it.
+    reply_backstop: Duration,
 }
 
 impl QuicTransportConn {
@@ -352,6 +537,7 @@ impl QuicTransportConn {
         Self {
             connection,
             close_grace: DEFAULT_CLOSE_GRACE,
+            reply_backstop: REPLY_WAIT_BACKSTOP,
         }
     }
 
@@ -375,9 +561,13 @@ impl QuicTransportConn {
 }
 
 impl TransportConn for QuicTransportConn {
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
     async fn run(self, ctx: ActorContext) {
-        let connection = self.connection;
+        let Self {
+            connection,
+            reply_backstop,
+            close_grace,
+        } = self;
         let ActorContext {
             in_tx,
             rx,
@@ -389,139 +579,74 @@ impl TransportConn for QuicTransportConn {
             peer,
         } = ctx;
         let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
+        // Unclaimed frames never outnumber what the outbound queue holds.
+        let router = RefCell::new(ReplyRouter::new(rx.capacity().unwrap_or(usize::MAX)));
+        let context = StreamContext {
+            in_tx: &in_tx,
+            router: &router,
+            max_message_size,
+            reply_backstop,
+            label,
+            peer: &peer,
+        };
+        // The stream credit of the connection bounds this set.
+        let mut streams = FuturesUnordered::new();
 
-        // Outer accept loop: one bidirectional stream per request.
-        loop {
-            let (mut send, mut recv) = futures::select! {
+        let drain = loop {
+            futures::select! {
                 () = shutdown_fut.as_mut() => {
-                    debug!(%label, %peer, "quic: shutdown observed at accept_bi");
-                    break;
+                    debug!(%label, %peer, "quic: shutdown observed");
+                    break true;
                 }
-                res = connection.accept_bi().fuse() => match res {
-                    Ok(streams) => streams,
+                accepted = connection.accept_bi().fuse() => match accepted {
+                    Ok((send, recv)) => {
+                        // Defense-in-depth 0-RTT check (matches the previous
+                        // handshake-path guard now that bidi accept is deferred
+                        // to here).
+                        if recv.is_0rtt() {
+                            warn!(%label, %peer, "quic: bidi accepted in 0-RTT window; refusing");
+                            connection.close(
+                                VarInt::from_u32(QUIC_PROTOCOL_VIOLATION),
+                                b"0-RTT not permitted",
+                            );
+                            break false;
+                        }
+                        streams.push(context.serve(send, recv));
+                    }
                     Err(e) => {
                         debug!(%label, %peer, error = ?e, "quic: accept_bi failed (connection closed)");
-                        break;
+                        break false;
                     }
                 },
-            };
-
-            // Defense-in-depth 0-RTT check (matches the previous handshake-
-            // path guard now that bidi accept is deferred to here).
-            if recv.is_0rtt() {
-                warn!(%label, %peer, "quic: bidi accepted in 0-RTT window; refusing");
-                connection.close(
-                    VarInt::from_u32(QUIC_PROTOCOL_VIOLATION),
-                    b"0-RTT not permitted",
-                );
-                break;
+                frame = rx.recv().fuse() => if let Ok(frame) = frame {
+                    router.borrow_mut().route(frame);
+                } else {
+                    debug!(%label, %peer, "quic: mailbox closed");
+                    break false;
+                },
+                served = streams.select_next_some() => if served.is_break() {
+                    break false;
+                },
             }
+        };
 
-            // Read exactly one inbound frame from this bidi. The SDK
-            // `send.finish()`-s after writing the request, so further
-            // reads on this RecvStream would return ConnectionClosed.
-            let req = match framing::read_message(&mut recv, max_message_size).await {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!(%label, %peer, error = ?e, "quic: bidi read error");
-                    continue;
-                }
-            };
-            // Request id this bidi is waiting on. Used to match its reply and
-            // to discard stale/duplicate replies left by an abandoned bidi.
-            // `None` (unparsable) degrades to accepting the first reply.
-            let request_id = req
-                .as_slice()
-                .get(..HEADER_SIZE)
-                .and_then(|bytes| bytemuck::checked::try_from_bytes::<RequestHeader>(bytes).ok())
-                .map(|header| header.request);
-
-            if in_tx.send(req).await.is_err() {
-                debug!(%label, %peer, "quic: inbound queue dropped");
-                break;
-            }
-
-            // Wait for THIS bidi's reply, keyed by request id. The bus `rx` is
-            // a single unkeyed per-connection channel, so filter by id and
-            // discard replies belonging to an earlier attempt's bidi (an
-            // explicit-transient replay reuses the SAME request id, so a late
-            // reply matches and is consumed by the replay's bidi - never
-            // misrouted to a later request). There is no short abandon-timeout:
-            // transient submits are answered with explicit rejection frames, so
-            // silence here means the dispatch dropped the request or the op is
-            // pathologically slow. `REPLY_WAIT_BACKSTOP` (see its doc) closes
-            // the whole connection instead of abandoning the bidi, so a late
-            // reply can never strand and shift onto the next data-plane op.
-            let mut matched: Option<BusMessage> = None;
-            let mut connection_gone = false;
-            {
-                let mut reply_deadline =
-                    std::pin::pin!(compio::time::sleep(REPLY_WAIT_BACKSTOP).fuse());
-                loop {
+        if drain {
+            let pending = async {
+                while !streams.is_empty() {
                     futures::select! {
-                        () = shutdown_fut.as_mut() => {
-                            debug!(%label, %peer, "quic: shutdown during reply wait");
-                            connection_gone = true;
-                            break;
-                        }
-                        () = reply_deadline.as_mut() => {
-                            warn!(%label, %peer, ?request_id, "quic: no reply within backstop; closing connection so no reply can strand");
-                            connection_gone = true;
-                            break;
-                        }
-                        res = rx.recv().fuse() => if let Ok(m) = res {
-                            let deliver = match reply_route(&m) {
-                                // Eviction / control frame: always deliver.
-                                ReplyRoute::Unkeyed => true,
-                                // Keyed reply: only this bidi's; else it's a
-                                // stale/duplicate from an abandoned bidi -> drop.
-                                ReplyRoute::Keyed(id) => {
-                                    request_id.is_none() || Some(id) == request_id
-                                }
-                            };
-                            if deliver {
-                                matched = Some(m);
-                                break;
-                            }
-                        } else {
-                            debug!(%label, %peer, "quic: mailbox closed");
-                            connection_gone = true;
+                        frame = rx.recv().fuse() => match frame {
+                            Ok(frame) => router.borrow_mut().route(frame),
+                            Err(_) => break,
+                        },
+                        served = streams.select_next_some() => if served.is_break() {
                             break;
                         },
                     }
                 }
-            }
-            if connection_gone {
-                break;
-            }
-            let Some(first) = matched else {
-                // Unreachable in practice: every no-reply path above sets
-                // `connection_gone`. Close the send half defensively.
-                if let Err(e) = send.finish() {
-                    debug!(%label, %peer, error = ?e, "quic: send.finish() failed with no reply");
-                }
-                continue;
             };
-
-            // Write the reply fragment by fragment, then `finish()` so
-            // quinn-proto flushes pending data + a FIN, signalling the SDK
-            // that the reply is complete.
-            let mut write_failed = false;
-            for fragment in first.into_fragments() {
-                let BufResult(result, _frozen) = send.write_all(fragment).await;
-                if let Err(e) = result {
-                    debug!(%label, %peer, error = ?e, "quic: write failed");
-                    write_failed = true;
-                    break;
-                }
+            if compio::time::timeout(close_grace, pending).await.is_err() {
+                warn!(%label, %peer, "quic: close grace expired with streams in flight");
             }
-            if write_failed {
-                continue;
-            }
-            if let Err(e) = send.finish() {
-                debug!(%label, %peer, error = ?e, "quic: send.finish() failed");
-            }
-            // (send, recv) drop here -> stream fully closed.
         }
 
         connection.close(VarInt::from_u32(QUIC_SHUTDOWN), b"shutdown");
@@ -562,11 +687,29 @@ mod tests {
     use async_channel::bounded;
     use compio::io::AsyncWrite;
     use compio_quic::ClientBuilder;
-    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, Operation, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use server_common::iobuf::Frozen;
     use server_common::{MESSAGE_ALIGN, Message};
     use std::time::Duration;
+
+    const TEST_CLIENT: u128 = 1;
+    const ONE_STREAM: u32 = 1;
+    const TWO_STREAMS: u32 = 2;
+    const FIRST_REQUEST: u64 = 1;
+    const SECOND_REQUEST: u64 = 2;
+    /// The commit of a reply that no test tells apart from another.
+    const ANY_COMMIT: u64 = 0;
+    const FIRST_COMMIT: u64 = 1;
+    const SECOND_COMMIT: u64 = 2;
+    /// Bounds every wait of a test, so a frame that never comes fails it.
+    const TEST_WAIT: Duration = Duration::from_secs(5);
+    const SHORT_BACKSTOP: Duration = Duration::from_millis(200);
+    /// The server only sees that the client stopped, whatever the code.
+    const CLIENT_STOP: u32 = 0;
+    /// No `Operation` has this discriminant.
+    const UNDECLARED_OPERATION: u8 = u8::MAX;
+    const UNCLAIMED_MAX: usize = 16;
 
     fn install_crypto_provider() {
         // Idempotent. Tests in the same process race on
@@ -596,9 +739,9 @@ mod tests {
     async fn server_endpoint(
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
+        tuning: &QuicTuning,
     ) -> Endpoint {
-        let server_cfg = server_config_with_cert(vec![cert], key, &QuicTuning::default())
-            .expect("server config");
+        let server_cfg = server_config_with_cert(vec![cert], key, tuning).expect("server config");
         Endpoint::server("127.0.0.1:0", server_cfg)
             .await
             .expect("bind")
@@ -641,17 +784,126 @@ mod tests {
         (out_tx, in_rx, shutdown, handle)
     }
 
-    /// End-to-end frame delivery via the new accept_bi-per-bidi server
-    /// loop: client opens N bidis sequentially, writing one request per
-    /// bidi; server's loop reads each request, awaits a reply from
-    /// `rx`, writes it, and `finish()`-es the bidi. Verifies inbound
-    /// ordering matches what the client sent.
+    fn tuning(max_concurrent_bidi_streams: u32) -> QuicTuning {
+        QuicTuning {
+            max_concurrent_bidi_streams,
+            ..QuicTuning::default()
+        }
+    }
+
+    /// A served connection whose client can open `max_concurrent_bidi_streams`
+    /// streams at once, the client side of it, and the two endpoints, which
+    /// must outlive both.
+    #[allow(clippy::future_not_send)]
+    async fn connect(
+        max_concurrent_bidi_streams: u32,
+    ) -> (
+        QuicTransportConn,
+        Connection,
+        (QuicTransportListener, Endpoint),
+    ) {
+        install_crypto_provider();
+        let (cert, key) = self_signed();
+        let server = server_endpoint(cert.clone(), key, &tuning(max_concurrent_bidi_streams)).await;
+        let server_addr = server.local_addr().unwrap();
+        let listener = QuicTransportListener::new(server);
+        let client = client_endpoint(cert).await;
+        let connecting = client
+            .connect(server_addr, "localhost", None)
+            .expect("connect");
+        let (accepted, connection) = futures::join!(listener.accept(), connecting);
+        let (conn, _peer) = accepted.expect("accept");
+        (
+            conn,
+            connection.expect("client handshake"),
+            (listener, client),
+        )
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn request(request_id: u64) -> Frozen<MESSAGE_ALIGN> {
+        Message::<RequestHeader>::new(HEADER_SIZE)
+            .transmute_header(|_, h: &mut RequestHeader| {
+                h.command = Command::Request;
+                h.size = HEADER_SIZE as u32;
+                h.client = TEST_CLIENT;
+                // Sessionless, so the header needs no bound session.
+                h.operation = Operation::NonReplicated;
+                h.request = request_id;
+            })
+            .into_frozen()
+    }
+
+    /// A reply to `request_id`. `commit` tells two replies to one id apart.
+    #[allow(clippy::cast_possible_truncation)]
+    fn reply_message(request_id: u64, commit: u64) -> Message<GenericHeader> {
+        Message::<ReplyHeader>::new(HEADER_SIZE)
+            .transmute_header(|_, h: &mut ReplyHeader| {
+                h.command = Command::Reply;
+                h.size = HEADER_SIZE as u32;
+                h.request = request_id;
+                h.commit = commit;
+            })
+            .into_generic()
+    }
+
+    fn reply(request_id: u64, commit: u64) -> BusMessage {
+        reply_message(request_id, commit).into_frozen().into()
+    }
+
+    fn reply_header(frame: &[u8]) -> ReplyHeader {
+        *bytemuck::checked::from_bytes::<ReplyHeader>(&frame[..HEADER_SIZE])
+    }
+
+    /// Open a stream and send one request on it. The returned half reads the
+    /// answer.
+    #[allow(clippy::future_not_send)]
+    async fn send_request(client: &Connection, request_id: u64) -> RecvStream {
+        let (mut send, recv) = client.open_bi_wait().await.expect("open_bi");
+        let BufResult(result, _) = send.write_all(request(request_id)).await;
+        result.expect("write");
+        send.finish().expect("finish");
+        recv
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn read_answer(recv: &mut RecvStream) -> Message<GenericHeader> {
+        compio::time::timeout(
+            TEST_WAIT,
+            framing::read_message(recv, framing::MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect("answer within the test wait")
+        .expect("answer frame")
+    }
+
+    /// The request id of the next frame the server forwards.
+    #[allow(clippy::future_not_send)]
+    async fn forwarded(inbound: &async_channel::Receiver<Message<GenericHeader>>) -> u64 {
+        let frame = compio::time::timeout(TEST_WAIT, inbound.recv())
+            .await
+            .expect("frame forwarded within the test wait")
+            .expect("inbound queue open");
+        request_id(&frame).expect("whole request header")
+    }
+
+    /// The commit of the reply the router handed to `waiter`, if it got one.
+    fn routed_commit(waiter: &mut oneshot::Receiver<BusMessage>) -> Option<u64> {
+        let frame = waiter.try_recv().expect("waiter registered")?;
+        Some(reply_header(frame.first().as_slice()).commit)
+    }
+
+    /// End-to-end frame delivery with one stream at a time: the client
+    /// opens N bidis in turn, writing one request per bidi; the server
+    /// reads each request, takes its reply from `rx`, writes it, and
+    /// `finish()`-es the bidi. Verifies inbound ordering matches what the
+    /// client sent.
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn loopback_round_trip_three_frames() {
         install_crypto_provider();
         let (cert, key) = self_signed();
-        let server = server_endpoint(cert.clone(), key).await;
+        let server = server_endpoint(cert.clone(), key, &tuning(ONE_STREAM)).await;
         let server_addr = server.local_addr().unwrap();
 
         let listener = QuicTransportListener::new(server);
@@ -714,7 +966,7 @@ mod tests {
     async fn read_message_reports_oversize_via_run() {
         install_crypto_provider();
         let (cert, key) = self_signed();
-        let server = server_endpoint(cert.clone(), key).await;
+        let server = server_endpoint(cert.clone(), key, &QuicTuning::default()).await;
         let server_addr = server.local_addr().unwrap();
 
         let listener = QuicTransportListener::new(server);
@@ -760,6 +1012,178 @@ mod tests {
         );
     }
 
+    /// Streams of one connection run at once, and each reply reaches the
+    /// stream that sent its request id.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_two_streams_when_the_second_reply_is_ready_first_should_answer_it_first() {
+        let (conn, client, _endpoints) = connect(TWO_STREAMS).await;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        let mut first = send_request(&client, FIRST_REQUEST).await;
+        let mut second = send_request(&client, SECOND_REQUEST).await;
+        let mut requests = [forwarded(&inbound).await, forwarded(&inbound).await];
+        requests.sort_unstable();
+        assert_eq!(requests, [FIRST_REQUEST, SECOND_REQUEST]);
+
+        outbound
+            .send(reply(SECOND_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut second).await;
+        assert_eq!(reply_header(answer.as_slice()).request, SECOND_REQUEST);
+        outbound
+            .send(reply(FIRST_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut first).await;
+        assert_eq!(reply_header(answer.as_slice()).request, FIRST_REQUEST);
+
+        shutdown.trigger();
+        let _ = server.await;
+    }
+
+    /// An eviction ends every request of the connection, so it reaches
+    /// every waiting stream.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_two_pending_streams_when_an_eviction_arrives_should_deliver_it_to_both() {
+        let (conn, client, _endpoints) = connect(TWO_STREAMS).await;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        let mut first = send_request(&client, FIRST_REQUEST).await;
+        let mut second = send_request(&client, SECOND_REQUEST).await;
+        forwarded(&inbound).await;
+        forwarded(&inbound).await;
+
+        outbound
+            .send(header_only(Command::Eviction).into())
+            .await
+            .unwrap();
+        for stream in [&mut first, &mut second] {
+            assert_eq!(
+                read_answer(stream).await.header().command,
+                Command::Eviction
+            );
+        }
+
+        shutdown.trigger();
+        let _ = server.await;
+    }
+
+    /// A stream that its client stops gives back its stream credit, so the
+    /// next stream does not wait for a reply that never comes.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_a_stopped_stream_when_its_reply_never_comes_should_still_serve_the_next_stream()
+    {
+        let (conn, client, _endpoints) = connect(ONE_STREAM).await;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        let mut stopped = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        stopped
+            .stop(VarInt::from_u32(CLIENT_STOP))
+            .expect("stop the stream");
+
+        let mut next = compio::time::timeout(TEST_WAIT, send_request(&client, SECOND_REQUEST))
+            .await
+            .expect("the stopped stream gives back its credit");
+        assert_eq!(forwarded(&inbound).await, SECOND_REQUEST);
+        outbound
+            .send(reply(SECOND_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut next).await;
+        assert_eq!(reply_header(answer.as_slice()).request, SECOND_REQUEST);
+
+        shutdown.trigger();
+        let _ = server.await;
+    }
+
+    /// The backstop resets the one stream that has no reply, and the
+    /// connection serves the next stream.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_a_stream_without_a_reply_when_the_backstop_passes_should_reset_only_that_stream()
+    {
+        let (mut conn, client, _endpoints) = connect(ONE_STREAM).await;
+        conn.reply_backstop = SHORT_BACKSTOP;
+        let (outbound, inbound, shutdown, server) = drive(conn);
+        let mut unanswered = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        let reset = compio::time::timeout(TEST_WAIT, unanswered.received_reset())
+            .await
+            .expect("the backstop ends the stream")
+            .expect("reset by the server");
+        assert_eq!(reset, Some(VarInt::from_u32(QUIC_NO_REPLY)));
+
+        let mut next = compio::time::timeout(TEST_WAIT, send_request(&client, SECOND_REQUEST))
+            .await
+            .expect("the reset stream gives back its credit");
+        assert_eq!(forwarded(&inbound).await, SECOND_REQUEST);
+        outbound
+            .send(reply(SECOND_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut next).await;
+        assert_eq!(reply_header(answer.as_slice()).request, SECOND_REQUEST);
+
+        shutdown.trigger();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn given_two_streams_with_one_request_id_when_two_replies_arrive_should_answer_them_in_stream_order()
+     {
+        let mut router = ReplyRouter::new(UNCLAIMED_MAX);
+        let mut first = router.register(FIRST_REQUEST);
+        let mut second = router.register(FIRST_REQUEST);
+        router.route(reply(FIRST_REQUEST, FIRST_COMMIT));
+        router.route(reply(FIRST_REQUEST, SECOND_COMMIT));
+        assert_eq!(routed_commit(&mut first), Some(FIRST_COMMIT));
+        assert_eq!(routed_commit(&mut second), Some(SECOND_COMMIT));
+    }
+
+    /// A late reply waits for the stream that replays its request id. The
+    /// replies for other ids ahead of it are dropped, so a later stream with
+    /// such an id gets only its own reply.
+    #[test]
+    fn given_a_reply_without_a_waiting_stream_when_a_stream_with_its_id_registers_should_deliver_it()
+     {
+        let mut router = ReplyRouter::new(UNCLAIMED_MAX);
+        router.route(reply(SECOND_REQUEST, FIRST_COMMIT));
+        router.route(reply(FIRST_REQUEST, FIRST_COMMIT));
+        let mut replay = router.register(FIRST_REQUEST);
+        assert_eq!(routed_commit(&mut replay), Some(FIRST_COMMIT));
+
+        let mut later = router.register(SECOND_REQUEST);
+        assert_eq!(routed_commit(&mut later), None);
+        router.route(reply(SECOND_REQUEST, SECOND_COMMIT));
+        assert_eq!(routed_commit(&mut later), Some(SECOND_COMMIT));
+    }
+
+    #[test]
+    fn given_a_full_unclaimed_queue_when_another_frame_comes_should_drop_the_oldest() {
+        let mut router = ReplyRouter::new(1);
+        router.route(reply(FIRST_REQUEST, FIRST_COMMIT));
+        router.route(reply(FIRST_REQUEST, SECOND_COMMIT));
+        let mut kept = router.register(FIRST_REQUEST);
+        assert_eq!(routed_commit(&mut kept), Some(SECOND_COMMIT));
+        let mut next = router.register(FIRST_REQUEST);
+        assert_eq!(routed_commit(&mut next), None);
+    }
+
+    /// The deny of an operation this build does not declare goes to its own
+    /// stream only.
+    #[test]
+    fn given_a_reply_with_an_undeclared_operation_when_routed_should_key_it_by_request() {
+        let mut deny = reply_message(FIRST_REQUEST, ANY_COMMIT);
+        deny.as_mut_slice()[offset_of!(ReplyHeader, operation)] = UNDECLARED_OPERATION;
+        let deny: BusMessage = deny.into_frozen().into();
+        assert!(matches!(
+            reply_route(&deny),
+            ReplyRoute::Keyed(FIRST_REQUEST)
+        ));
+    }
+
     #[test]
     fn transport_config_from_default_builds() {
         // Lightweight smoke: confirm the helper builds without panicking
@@ -781,23 +1205,55 @@ mod tests {
         let _cfg = transport_config_from(&tuning);
     }
 
-    /// `with_close_grace` plumbs the override into the field that
-    /// `run`'s joint drain timeout consumes. The full timeout-bound
-    /// behaviour is exercised end-to-end by the existing
-    /// `request_reply_round_trip` (which goes through the default
-    /// `close_grace` path); deterministic wedge testing of the elapsed
-    /// arm requires a non-cancel-safe QUIC read state that cannot be
-    /// reliably constructed in-process.
-    #[test]
-    fn with_close_grace_overrides_default() {
-        // `QuicTransportConn` requires an actual `Connection`; constructing
-        // one outside an async context is not feasible here, so we exercise
-        // the builder via direct field replacement on a default-constructed
-        // tuning struct that mirrors the field type.
-        let custom = Duration::from_millis(123);
-        // Sanity: the default is non-zero (would otherwise immediately
-        // elapse every close drain) and our override differs from it.
-        assert_ne!(DEFAULT_CLOSE_GRACE, custom);
-        assert!(DEFAULT_CLOSE_GRACE > Duration::ZERO);
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_pending_reply_when_shutdown_starts_should_deliver_it_before_closing() {
+        let (conn, client, _endpoints) = connect(ONE_STREAM).await;
+        let (outbound, inbound, shutdown, mut server) = drive(conn.with_close_grace(TEST_WAIT));
+        let mut response = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        shutdown.trigger();
+        assert!(
+            compio::time::timeout(SHORT_BACKSTOP, &mut server)
+                .await
+                .is_err(),
+            "shutdown must keep an admitted request alive during the grace"
+        );
+        outbound
+            .send(reply(FIRST_REQUEST, ANY_COMMIT))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_answer(&mut response).await.header().command,
+            Command::Reply
+        );
+        compio::time::timeout(TEST_WAIT, server)
+            .await
+            .expect("the acknowledged reply releases the drain")
+            .expect("the server exits normally");
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_missing_reply_when_shutdown_grace_expires_should_close_within_the_bound() {
+        let (conn, client, _endpoints) = connect(ONE_STREAM).await;
+        let (_outbound, inbound, shutdown, server) = drive(conn.with_close_grace(SHORT_BACKSTOP));
+        let mut response = send_request(&client, FIRST_REQUEST).await;
+        assert_eq!(forwarded(&inbound).await, FIRST_REQUEST);
+        shutdown.trigger();
+        compio::time::timeout(TEST_WAIT, server)
+            .await
+            .expect("shutdown must not wait for the 60-second reply backstop")
+            .expect("the server exits normally");
+        let result = compio::time::timeout(
+            TEST_WAIT,
+            framing::read_message(&mut response, framing::MAX_MESSAGE_SIZE),
+        )
+        .await
+        .expect("the abandoned stream closes");
+        assert!(
+            result.is_err(),
+            "a request without a reply must not succeed"
+        );
     }
 }

@@ -18,6 +18,7 @@
 use crate::Identifier;
 use crate::utils::topic_size::MaxTopicSize;
 use crate::{IggyMessage, SendMessagesConfirmationResponse, utils::byte_size::IggyByteSize};
+use iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX;
 use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
@@ -178,10 +179,21 @@ pub enum IggyError {
         "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
     )]
     RequestTooOld = 85,
+    /// The request names a partition incarnation that is not the current one:
+    /// the partition was deleted, or recreated under the same id. Partition
+    /// admission and the poll gate answer this only once the node that
+    /// dispatched the request applied its `minimum_metadata_op`, and
+    /// [`Self::TransientNotAccepted`] before that. Clients must not replay
+    /// the request: they drop the captured context and any position read
+    /// under it, route again for the current context, and send new work. A
+    /// `DeleteSegments` that meets a recreated partition answers
+    /// [`Self::PartitionHistoryChanged`] instead.
     #[error("The partition history is no longer available; this request cannot execute again")]
     HistoryUnavailable = 87,
     #[error("A committed lifecycle operation prevents this mutation. Retry as a new request.")]
     LifecycleBusy = 88,
+    #[error("Request not accepted by a backup replica; retry on the primary of its group")]
+    NotPrimary = 89,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -338,6 +350,9 @@ pub enum IggyError {
     /// range frees again.
     #[error("Partition id space exhausted for this topic")]
     PartitionIdSpaceExhausted = 3013,
+    /// Committed metadata refused a `DeleteSegments` truncate: the partition
+    /// was recreated between the offset resolve on its owning shard and the
+    /// commit, so its creation revision no longer matches the resolved one.
     /// Clients must resolve the current partition state and submit a new request,
     /// rather than replay the rejected request against its previous history.
     #[error("Partition history changed after the request was resolved")]
@@ -503,7 +518,10 @@ pub enum IggyError {
         "Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress)."
     )]
     ConsumerGroupPartitionNotOwned(u32, u32) = 5009,
-    #[error("Too many consumer groups")]
+    #[error(
+        "Too many consumer groups in this topic (limit {max})",
+        max = CONSUMER_GROUP_OWNERS_MAX
+    )]
     TooManyConsumerGroups = 5010,
     #[error("Base offset is missing")]
     MissingBaseOffsetRetainedMessageBatch = 6000,
@@ -587,8 +605,14 @@ pub enum IggyError {
     IncompatibleProtocolVersion(u32, u32, u32) = 14003,
     #[error("VSR session mismatch: requested {0}, server bound {1}")]
     SessionMismatch(u64, u64) = 14004,
-    #[error("VSR request IDs exhausted; start a new logical session")]
+    #[error("VSR request IDs exhausted; create a new client")]
     RequestIdExhausted = 14005,
+    #[error("Operation {0} has an unknown outcome")]
+    OperationUncertain(u64) = 14006,
+    #[error("Lane blocked by operation {0} with an unknown outcome")]
+    LaneBlocked(u64) = 14007,
+    #[error("Operation {0} is not retained")]
+    OperationNotRetained(u64) = 14008,
 }
 
 impl IggyError {
@@ -624,6 +648,7 @@ mod tests {
     use super::*;
 
     const GROUP_NAME_ERROR_CODE: u32 = 5005;
+    const RETAINED_OPERATION: u64 = 7;
 
     #[test]
     fn derived_sdk_error_discriminant_keeps_codes() {
@@ -683,5 +708,57 @@ mod tests {
         assert_eq!(error.as_code(), 85);
         assert_eq!(IggyError::from_code(85), error);
         assert_eq!(IggyError::from_code_as_string(85), error.as_string());
+    }
+
+    #[test]
+    fn given_pending_operation_errors_when_round_tripped_by_code_should_keep_codes_and_names() {
+        let cases = [
+            (IggyError::NotPrimary, 89, "not_primary"),
+            (
+                IggyError::OperationUncertain(RETAINED_OPERATION),
+                14006,
+                "operation_uncertain",
+            ),
+            (
+                IggyError::LaneBlocked(RETAINED_OPERATION),
+                14007,
+                "lane_blocked",
+            ),
+            (
+                IggyError::OperationNotRetained(RETAINED_OPERATION),
+                14008,
+                "operation_not_retained",
+            ),
+        ];
+        for (error, code, name) in cases {
+            assert_eq!(error.as_code(), code);
+            assert_eq!(error.as_string(), name);
+            assert_eq!(IggyError::from_code_as_string(code), name);
+        }
+
+        // `PartialEq` compares codes only, so the payload needs a pattern.
+        assert!(matches!(IggyError::from_code(89), IggyError::NotPrimary));
+        assert!(matches!(
+            IggyError::from_code(14006),
+            IggyError::OperationUncertain(0)
+        ));
+        assert!(matches!(
+            IggyError::from_code(14007),
+            IggyError::LaneBlocked(0)
+        ));
+        assert!(matches!(
+            IggyError::from_code(14008),
+            IggyError::OperationNotRetained(0)
+        ));
+    }
+
+    #[test]
+    fn given_too_many_consumer_groups_when_displayed_should_name_the_per_topic_limit() {
+        let message = IggyError::TooManyConsumerGroups.to_string();
+        assert!(message.contains("topic"), "{message}");
+        assert!(
+            message.contains(&CONSUMER_GROUP_OWNERS_MAX.to_string()),
+            "{message}"
+        );
     }
 }

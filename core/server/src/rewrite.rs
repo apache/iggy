@@ -26,16 +26,15 @@
 //! against its own session table and passes the resolved `user_id`
 //! ([`rewrite_pat_request_for_user`]).
 //!
-//! Three more links complete the chains but live in their spines, because
-//! they fire partition-read mesh RPCs or are plane-specific. Two are async:
-//! the consumer-group Join/Leave enrichment ([`crate::consumer_group`], the
-//! TCP funnel calls it after [`tcp_chain`]) and the `DeleteSegments` ->
-//! `TruncatePartition` resolution
+//! Two more links complete the chains but live in their spines, because
+//! they fire partition-read mesh RPCs or are plane-specific: the async
+//! `DeleteSegments` -> `TruncatePartition` resolution
 //! (`dispatch::partition::resolve_delete_segments_truncate`, called by both
-//! spines). The third, the consumer-offset rewrite on the partition path
+//! spines), and the synchronous consumer-offset rewrite on the partition path
 //! (`consumer_group::maybe_rewrite_consumer_offset_request`, called by
-//! `dispatch::partition`), is synchronous.
+//! `dispatch::partition`).
 
+use crate::consumer_group::maybe_rewrite_consumer_group_request;
 use crate::pat::{maybe_rewrite_pat_request, rewrite_pat_request_for_user};
 use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
@@ -67,11 +66,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use tracing::warn;
 
-/// The pre-consensus rewrite stages, in chain order.
-///
-/// One owner for the set: the funnel's consumer-group rewrite runs outside
-/// [`tcp_chain`] but denies through the same path, so it names a variant
-/// here instead of passing a bare literal.
+/// The pre-consensus rewrite stages of [`tcp_chain`], in chain order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewriteStage {
     PersonalAccessToken,
@@ -103,11 +98,13 @@ pub struct RewriteDeny {
 
 /// The TCP funnel's pre-consensus rewrite chain, in order: the PAT rewrite
 /// (resolving the acting user from the transport `sessions` binding), the
-/// password rewrite, then the static bounds gate. Mirrors [`http_chain`]
-/// plus that bounds step, which the binary wire needs because it has no
-/// `command.validate()` layer. Returns the rewritten request and the raw
-/// PAT token the funnel substitutes into the committed reply; a rejection
-/// names the failing stage for the deny log line.
+/// password rewrite, the static bounds gate, then the consumer-group
+/// Join/Leave identity rewrite ([`crate::consumer_group`]). Mirrors
+/// [`http_chain`] plus the bounds step, which the binary wire needs because
+/// it has no `command.validate()` layer, and the group step, which only the
+/// binary wire serves. Returns the rewritten request and the raw PAT token
+/// the funnel substitutes into the committed reply; a rejection names the
+/// failing stage for the deny log line.
 pub fn tcp_chain<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -155,15 +152,20 @@ where
         stage: RewriteStage::StaticBounds,
         error,
     })?;
+    let request = maybe_rewrite_consumer_group_request(request).map_err(|error| RewriteDeny {
+        stage: RewriteStage::ConsumerGroup,
+        error,
+    })?;
     Ok((request, raw_pat_token))
 }
 
 /// The HTTP submit's pre-consensus rewrite chain: the PAT rewrite for the
 /// already-authenticated `user_id`, then the password rewrite. Mirrors
 /// [`tcp_chain`] minus the session lookup (the HTTP listener authenticates
-/// against its own session table and resolves the acting user itself) and
-/// minus the static bounds step: HTTP enforces the same bounds in its
-/// handlers via `command.validate()` plus the validators below. Returns the
+/// against its own session table and resolves the acting user itself),
+/// minus the static bounds step (HTTP enforces the same bounds in its
+/// handlers via `command.validate()` plus the validators below), and minus
+/// the group step, because HTTP serves no join or leave. Returns the
 /// rewritten request and the raw PAT token the caller substitutes into the
 /// committed reply.
 pub fn http_chain<B, MJ, S, SB>(

@@ -130,7 +130,7 @@ func TestExchange_ForwardsAVendorCodeInTheReservedField(t *testing.T) {
 	assert.Equal(t, []byte{7, 7}, recorded[0].payload)
 }
 
-func TestExchange_KeepsRepeatedVendorCodesFromGappingMetadataRequestIDs(t *testing.T) {
+func TestExchange_AllocatesUniqueIDsToNonReplicatedRequests(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	server := serve(serverConn, func(_ int, read request) []byte {
 		if read.operation() == vsr.OperationCreateStream {
@@ -149,11 +149,11 @@ func TestExchange_KeepsRepeatedVendorCodesFromGappingMetadataRequestIDs(t *testi
 	recorded := server.recorded()
 	require.Len(t, recorded, 4)
 	for index := range 3 {
-		assert.Equal(t, uint64(1), recorded[index].requestID(),
-			"a non-replicated request reads the watermark without consuming it")
+		assert.Equal(t, uint64(index+1), recorded[index].requestID(),
+			"every bound request consumes an id")
 	}
-	assert.Equal(t, uint64(1), recorded[3].requestID(),
-		"the metadata request still takes the first id")
+	assert.Equal(t, uint64(4), recorded[3].requestID(),
+		"metadata shares the request counter")
 }
 
 func TestSendBinaryRequest_RejectsSessionControlCodesWithoutWriting(t *testing.T) {
@@ -529,11 +529,11 @@ func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 2)
-	assert.Equal(t, uint32(command.GetSendContextCode), recorded[0].code())
+	assert.Equal(t, uint32(command.GetPartitionRouteCode), recorded[0].code())
 	assert.Equal(t, vsr.OperationSendMessages, recorded[1].operation())
 	assert.Equal(t, uint32(1), recorded[1].partitionID(t))
-	assert.Equal(t, uint64(1), recorded[1].requestID(),
-		"a partition request reads the watermark without consuming it")
+	assert.Equal(t, uint64(2), recorded[1].requestID(),
+		"the route query and send have distinct ids")
 }
 
 func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
@@ -598,7 +598,7 @@ func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T)
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
 		return replyFrame(vsr.OperationNonReplicated, topicDetailsBody(t, 4))
-	})
+	}, 4)
 
 	key, err := iggcon.EntityIdString("order-key-1")
 	require.NoError(t, err)
@@ -611,8 +611,8 @@ func TestSendMessages_ResolvesKeyPartitioningToAnExplicitPartition(t *testing.T)
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 3)
-	assert.Equal(t, uint32(command.GetTopicCode), recorded[0].code())
-	assert.Equal(t, uint32(command.GetSendContextCode), recorded[1].code())
+	assert.Equal(t, uint32(command.GetPartitionRouteCode), recorded[0].code())
+	assert.Equal(t, uint32(command.GetPartitionRouteCode), recorded[1].code())
 	// 0x0D3FE0E1 modulo four partitions.
 	assert.Equal(t, uint32(1), recorded[2].partitionID(t))
 }
@@ -624,7 +624,7 @@ func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 			return replyFrame(vsr.OperationSendMessages, zeroConfirmations())
 		}
 		return replyFrame(vsr.OperationNonReplicated, topicDetailsBody(t, 3))
-	})
+	}, 3)
 
 	message, err := iggcon.NewIggyMessage([]byte("payload"))
 	require.NoError(t, err)
@@ -645,11 +645,11 @@ func TestSendMessages_RoundRobinsBalancedPartitioning(t *testing.T) {
 
 	metadataRequests := 0
 	for _, recorded := range server.recorded() {
-		if recorded.code() == uint32(command.GetTopicCode) {
+		if recorded.code() == uint32(command.GetPartitionRouteCode) {
 			metadataRequests++
 		}
 	}
-	assert.Equal(t, 1, metadataRequests, "the partition count is cached after the first read")
+	assert.Equal(t, 3, metadataRequests, "each partition route is cached after its first read")
 }
 
 // The partition refuses a stale context before admission, so one resend of
@@ -660,9 +660,10 @@ func TestSendMessages_CachesTheContextAndRefreshesItOnceAfterARefusal(t *testing
 	var served, accepted atomic.Uint64
 	server := serve(serverConn, func(_ int, read request) []byte {
 		switch {
-		case read.code() == uint32(command.GetSendContextCode):
-			body := make([]byte, iggcon.PartitionContextSize)
+		case read.code() == uint32(command.GetPartitionRouteCode):
+			body := make([]byte, iggcon.PartitionRouteSize)
 			binary.LittleEndian.PutUint64(body, served.Load())
+			binary.LittleEndian.PutUint32(body[20:], 2)
 			return replyFrame(vsr.OperationNonReplicated, body)
 		case read.incarnation() != accepted.Load():
 			return statusReplyFrame(vsr.OperationSendMessages, uint32(ierror.HistoryUnavailableCode), nil)
@@ -688,7 +689,7 @@ func TestSendMessages_CachesTheContextAndRefreshesItOnceAfterARefusal(t *testing
 	require.ErrorIs(t, send(3, 4), ierror.ErrHistoryUnavailable, "a refreshed context is not refreshed again")
 
 	recorded := server.recorded()
-	assert.Equal(t, 3, requestCount(recorded, command.GetSendContextCode))
+	assert.Equal(t, 3, requestCount(recorded, command.GetPartitionRouteCode))
 	var sends []request
 	for _, read := range recorded {
 		if read.operation() == vsr.OperationSendMessages {

@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-OWNERSHIP-HISTORY-4\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-OWNERSHIP-HISTORY-5\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -1134,20 +1134,29 @@ fn make_metadata_commit_notifier(
 }
 
 /// Filter at the broadcast site, keeping unrelated ops off the SDK reply
-/// path. Any new partition-shape op must be added here.
+/// path. Any new partition-shape op must be added here, with its reason:
 ///
-/// The bare `CreateTopic` / `CreatePartitions` arms are unreachable: the
-/// leader's prepare-builder in `IggyMetadata` rewrites both into their
-/// `*WithAssignments` form, stamping each partition's `consensus_group_id`
-/// before journaling, so a committed prepare only ever carries the
-/// assignment-bearing variant. Kept as defense-in-depth against a future
-/// commit path that emits a bare op.
+/// - `CreateTopic`, `CreatePartitions`: unreachable, kept as defense in depth
+///   against a future commit path that emits a bare op. The leader's
+///   prepare-builder in `IggyMetadata` rewrites both into their
+///   `*WithAssignments` form, stamping each partition's `consensus_group_id`
+///   before journaling.
+/// - `CreateTopicWithAssignments`, `CreatePartitionsWithAssignments`: add
+///   partitions, which the reconciler materialises on the owning shard and
+///   routes on the others.
+/// - `DeleteStream`, `DeleteTopic`, `DeletePartitions`: begin a lifecycle
+///   whose history fences the reconciler sends to each affected partition.
+/// - `TruncatePartition`: leaves the partition set intact but advances the
+///   per-partition delete watermark, which only the reconciler enforces on
+///   disk. Omitting it defers the on-disk effect to the periodic safety tick,
+///   stretching a segment delete's client-visible tail to a full
+///   `reconcile_periodic_interval`.
+/// - `CompleteLifecycle`: records installed fences, so the reconciler reports
+///   its next batch. The last batch applies the deferred delete, whose
+///   partitions or group offsets the reconciler then removes.
+/// - `DeleteConsumerGroup`: begins a lifecycle whose owner fences the
+///   reconciler sends to each partition of the group's topic.
 ///
-/// "Partition-shape" is not only the partition SET: `TruncatePartition`
-/// leaves the set intact but advances the per-partition delete watermark,
-/// which only the reconciler enforces on disk. Omitting it defers the on-disk
-/// effect to the periodic safety tick, stretching a segment delete's
-/// client-visible tail to a full `reconcile_periodic_interval`.
 /// `DeleteSegments` is absent by design: the leader rewrites it into
 /// `TruncatePartition` before journaling, so no commit ever carries it.
 const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
@@ -1224,6 +1233,7 @@ mod tests {
             b"old format\n".as_slice(),
             b"IGGY-NO-PURGE-1\n",
             b"IGGY-OWNERSHIP-HISTORY-3\n",
+            b"IGGY-OWNERSHIP-HISTORY-4\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
@@ -1263,6 +1273,31 @@ mod tests {
             operation_triggers_partition_reconcile(Operation::TruncatePartition),
             "TruncatePartition is enforced by the reconciler and must wake it on commit"
         );
+        for (operation, reconciler_work) in [
+            (Operation::CreateTopic, "materialise a bare create"),
+            (
+                Operation::CreateTopicWithAssignments,
+                "materialise the new partitions",
+            ),
+            (Operation::CreatePartitions, "materialise a bare create"),
+            (
+                Operation::CreatePartitionsWithAssignments,
+                "materialise the new partitions",
+            ),
+            (Operation::DeleteStream, "send the history fences"),
+            (Operation::DeleteTopic, "send the history fences"),
+            (Operation::DeletePartitions, "send the history fences"),
+            (
+                Operation::CompleteLifecycle,
+                "report the next batch or remove a finished delete",
+            ),
+            (Operation::DeleteConsumerGroup, "send the owner fences"),
+        ] {
+            assert!(
+                operation_triggers_partition_reconcile(operation),
+                "{operation:?} must wake the reconciler to {reconciler_work}"
+            );
+        }
         assert!(
             !operation_triggers_partition_reconcile(Operation::CreateUser),
             "ops with no partition-shape effect must stay off the broadcast"
