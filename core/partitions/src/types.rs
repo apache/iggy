@@ -315,7 +315,7 @@ pub struct RepairSession {
     /// First op of the latest request. The next chunk is pulled once the held
     /// run reaches it, which works while a fenced commit point cannot move.
     ///
-    /// `None` after a proof dropped held entries, so the next sweep asks for
+    /// `None` after any removal of resident entries, so the next sweep asks for
     /// the cut window from the held run without waiting out
     /// [`REPAIR_RETRY_TICKS`].
     pub requested_from: Option<u64>,

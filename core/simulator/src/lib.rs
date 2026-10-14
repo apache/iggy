@@ -8968,7 +8968,7 @@ mod partition_repair_driver_tests {
     }
 
     /// `(status, view, commit_min, commit_max)` of one replica's partition group.
-    fn group_state(
+    pub fn group_state(
         sim: &Simulator,
         replica: u8,
         namespace: IggyNamespace,

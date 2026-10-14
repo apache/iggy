@@ -66,8 +66,7 @@ use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use iggy_binary_protocol::{
-    AckLevel, CHECKSUM_UNSEALED, Command, Operation, PrepareHeader, WireDecode, WireEncode,
-    WireIdentifier,
+    AckLevel, Command, Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier,
 };
 use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{
@@ -102,7 +101,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Which of a partition's offset counters are live.
 ///
@@ -5677,6 +5676,17 @@ where
         self.notify_io();
     }
 
+    /// Run a view adoption's `actions` once the pending truncation lands, so the
+    /// pipeline rebuild reads the journal after the cut.
+    pub fn defer_view_adoption(&mut self, adoption: Vec<consensus::VsrAction>, from: u8) {
+        if let Some(PendingPartitionTransition::Truncate { actions, peer, .. }) =
+            &mut self.transition
+        {
+            actions.extend(adoption);
+            *peer = Some(from);
+        }
+    }
+
     #[must_use]
     pub const fn view_truncation_pending(&self) -> bool {
         matches!(
@@ -5902,8 +5912,15 @@ where
             else {
                 unreachable!("truncate transition exists");
             };
-            let unproven_drop = self.unproven_drop_from.take() == Some(*ops.start());
             let from_op = *ops.start();
+            // Another cut that lands first leaves the marked entries resident, so the
+            // marker stays for the proof that finds them again.
+            let unproven_drop = self
+                .unproven_drop_from
+                .is_some_and(|marked| from_op <= marked);
+            if unproven_drop {
+                self.unproven_drop_from = None;
+            }
             let removed = self.remove_resident_range(ops).await?;
             if unproven_drop {
                 self.note_unproven_dropped(from_op, removed);
@@ -8444,7 +8461,9 @@ where
         }
         // After the in-flight commit: a proof that breaks truncates the journal.
         if self.view_fenced() {
-            self.prove_view_window().await;
+            if !self.view_proof_deferred() {
+                self.prove_view_window().await;
+            }
             if self.view_fenced() && self.recovered_commit <= self.consensus.commit_min() {
                 return;
             }
@@ -8859,16 +8878,11 @@ where
         let previous = self
             .view_fence
             .filter(|fence| fence.view == view && fence.through == through);
-        // An unsealed header names no identity, and a zero `parent` above op 1
-        // would link anything below it.
         let anchor = anchor
-            .filter(|anchor| {
-                anchor.checksum != CHECKSUM_UNSEALED
-                    && (anchor.parent != CHECKSUM_UNSEALED || anchor.op == 1)
-            })
+            .filter(PrepareHeader::anchors_chain)
             .or_else(|| previous.and_then(|fence| fence.anchor));
         if previous.is_none() {
-            info!(
+            debug!(
                 namespace_raw = self.namespace().inner(),
                 view,
                 commit_min = self.consensus.commit_min(),
@@ -8906,8 +8920,12 @@ where
         self.view_fence.as_ref().is_some_and(|fence| {
             fence.anchor.is_some()
                 && fence.through > self.consensus.commit_min()
-                && self.log.journal().inner.holds_op(fence.through)
-                && self.held_through() >= fence.through
+                && self
+                    .log
+                    .journal()
+                    .inner
+                    .held_through_until(self.consensus.commit_min(), fence.through)
+                    >= fence.through
         })
     }
 
@@ -8917,11 +8935,18 @@ where
         self.fatal.is_none()
             && !self.materialization_missing
             && !self.persistence_checkpoint_pending()
-            // A Break found while busy cuts nothing (`drop_unproven_from`), so
-            // walking the window then only rebuilds its header map to break
-            // again. A pending cut is history work too.
-            && !self.history_is_busy()
+            // The commit walk returns before the proof while the view's log is unproven.
+            && !self.consensus.view_log_unproven()
+            && !self.view_proof_deferred()
             && self.view_fence_held()
+    }
+
+    /// Whether a proof now would only find the same `Break` again: a Break found
+    /// while history work runs or a transition is queued cuts nothing
+    /// (`drop_unproven_from`), so walking the window rebuilds its header map for
+    /// nothing.
+    fn view_proof_deferred(&self) -> bool {
+        self.history_is_busy() || self.transition.is_some()
     }
 
     /// An installed snapshot replaces the history the recovered commit point named.
@@ -8986,8 +9011,7 @@ where
             && fence.anchor.is_none()
             && fence.view == header.view
             && header.op == fence.through + 1
-            && header.checksum != CHECKSUM_UNSEALED
-            && (header.parent != CHECKSUM_UNSEALED || header.op == 1)
+            && header.anchors_chain()
         {
             fence.anchor = Some(*header);
             fence.hole = None;
@@ -9108,9 +9132,9 @@ where
         }
         if self.has_io_dispatcher() {
             // The I/O lane owns a mounted partition's WAL. While other history work
-            // is in flight the fence keeps holding, and the next proof finds the
-            // same break.
-            if !self.history_is_busy() {
+            // is in flight or a transition is queued the fence keeps holding, and
+            // the next proof finds the same break.
+            if !self.view_proof_deferred() {
                 self.unproven_drop_from = Some(op);
                 self.defer_view_truncation(op..=u64::MAX, Vec::new(), None);
             }
@@ -9142,9 +9166,6 @@ where
         );
         if let Some(fence) = self.view_fence.as_mut() {
             fence.hole = None;
-        }
-        if let Some(session) = self.repair.as_mut() {
-            session.requested_from = None;
         }
         self.persist_repaired_prefix();
     }
@@ -9312,6 +9333,18 @@ where
             }
         }
         self.consensus.note_journal_mutation();
+        if *ops.start() <= self.recovered_commit {
+            let lowered = ops.start().saturating_sub(1);
+            error!(
+                namespace_raw = self.namespace().inner(),
+                from_op = *ops.start(),
+                recovered_commit = self.recovered_commit,
+                lowered,
+                "cut partition entries the WAL recovered as committed; lowering the recovered \
+                 commit point to {lowered} so repair refetches them"
+            );
+            self.recovered_commit = lowered;
+        }
         self.pending_consumer_offset_commits
             .retain(|op, _| !ops.contains(op));
         // Nothing is in flight for a cut range, so the next sweep re-requests it

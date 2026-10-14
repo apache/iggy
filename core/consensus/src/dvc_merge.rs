@@ -92,25 +92,21 @@ pub struct MergedLog {
 
 impl MergedLog {
     /// The log a `StartView` announces: its suffix slots verbatim, blanks included,
-    /// or `None` when it carries numbers only.
+    /// and no headers when it carries numbers only.
     ///
     /// # Errors
     /// Returns the decode error when the suffix body is malformed.
     pub fn from_start_view(
         header: &StartViewHeader,
         suffix_body: &[u8],
-    ) -> Result<Option<Self>, DvcSuffixError> {
+    ) -> Result<Self, DvcSuffixError> {
         let suffix = dvc_suffix_decode(suffix_body, header.op, 0, 0)?;
-        let headers = suffix.headers();
-        if headers.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(Self {
+        Ok(Self {
             op_head: header.op,
             commit_max: header.commit,
-            headers: headers.to_vec(),
+            headers: suffix.headers().to_vec(),
             committed_elsewhere: Vec::new(),
-        }))
+        })
     }
 }
 

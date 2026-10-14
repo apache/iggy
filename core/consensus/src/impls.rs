@@ -3538,18 +3538,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// correction).
     fn adopt_start_view_suffix(&self, header: &StartViewHeader, suffix_body: &[u8]) -> u64 {
         match MergedLog::from_start_view(header, suffix_body) {
-            Ok(Some(log)) => *self.pending_view_log.borrow_mut() = Some(log),
             // A numbers-only StartView still has to replace the pending log while
             // the held history is unproven, so the proof waits on this view's head.
-            Ok(None) if self.view_log_unproven() => {
-                *self.pending_view_log.borrow_mut() = Some(MergedLog {
-                    op_head: header.op,
-                    commit_max: header.commit,
-                    headers: Vec::new(),
-                    committed_elsewhere: Vec::new(),
-                });
+            Ok(log) if !log.headers.is_empty() || self.view_log_unproven() => {
+                *self.pending_view_log.borrow_mut() = Some(log);
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(
                     replica = self.replica,
