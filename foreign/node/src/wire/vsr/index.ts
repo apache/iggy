@@ -48,7 +48,7 @@ export class VsrSession {
   }
 
   reset(): void {
-    this.state = new ConsensusSession();
+    this.state.reset();
   }
 
   bind(session: bigint): void {
@@ -57,6 +57,10 @@ export class VsrSession {
 
   get hasActivity(): boolean {
     return this.state.hasActivity;
+  }
+
+  get sessionId(): bigint | null {
+    return this.state.session;
   }
 
   get clientId(): bigint {
@@ -97,7 +101,7 @@ export class VsrSession {
       request = this.state.beginRegister();
       session = 0n;
     } else if (operation === Operation.NonReplicated) {
-      request = this.state.isBound ? this.state.nextRequestId() : this.state.currentRequestId();
+      request = this.state.nextRequestId(false);
       session = this.state.session ?? 0n;
     } else {
       if (this.state.session === null)

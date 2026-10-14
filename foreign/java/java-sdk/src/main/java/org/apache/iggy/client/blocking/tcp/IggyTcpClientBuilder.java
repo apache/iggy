@@ -210,6 +210,12 @@ public final class IggyTcpClientBuilder {
         return this;
     }
 
+    /** Bounds active and retained mutations; admission waits within each call's deadline. */
+    public IggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        asyncBuilder.pendingOperations(count, bytes);
+        return this;
+    }
+
     /**
      * Builds and returns a configured IggyTcpClient instance.
      * Note: You still need to call {@link IggyTcpClient#connect()} on the returned client.

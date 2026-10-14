@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    num::NonZeroUsize,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
-use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl};
+use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl, types::Zval};
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
@@ -36,6 +41,44 @@ use crate::send_message::{SendMessage, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
 
+const DEFAULT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Client-wide limits for active and retained mutation frames, including queued writer bytes.
+#[php_class]
+#[php(name = "Iggy\\PendingOperationsConfig")]
+pub struct PendingOperationsConfig {
+    inner: iggy::prelude::PendingOperationsConfig,
+}
+
+#[php_impl]
+impl PendingOperationsConfig {
+    /// Defaults to 256 operations and 64 MiB of headers and bodies.
+    #[php(constructor)]
+    pub fn __construct(max_operations: Option<&Zval>, max_bytes: Option<&Zval>) -> PhpResult<Self> {
+        let defaults = iggy::prelude::PendingOperationsConfig::default();
+        Ok(Self {
+            inner: iggy::prelude::PendingOperationsConfig {
+                max_operations: pending_limit(
+                    max_operations,
+                    defaults.max_operations,
+                    "max_operations",
+                )?,
+                max_bytes: pending_limit(max_bytes, defaults.max_bytes, "max_bytes")?,
+            },
+        })
+    }
+
+    #[php(getter)]
+    pub fn max_operations(&self) -> usize {
+        self.inner.max_operations.get()
+    }
+
+    #[php(getter)]
+    pub fn max_bytes(&self) -> usize {
+        self.inner.max_bytes.get()
+    }
+}
+
 /// A PHP class representing the Iggy client.
 #[php_class]
 #[php(name = "Iggy\\Client")]
@@ -47,13 +90,19 @@ pub struct IggyClient {
 impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address.
     #[php(constructor)]
-    pub fn __construct(conn: Option<String>) -> PhpResult<Self> {
+    pub fn __construct(
+        conn: Option<String>,
+        pending_operations: Option<&PendingOperationsConfig>,
+    ) -> PhpResult<Self> {
         let server_address = conn
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "127.0.0.1:8090".to_string());
         let client = IggyClientBuilder::new()
             .with_tcp()
             .with_server_address(server_address)
+            .with_pending_operations(
+                pending_operations.map_or_else(Default::default, |limits| limits.inner),
+            )
             .build()
             .map_err(to_php_exception)?;
 
@@ -97,6 +146,40 @@ impl IggyClient {
     pub fn connect(&self) -> PhpResult {
         let inner = self.inner.clone();
         runtime().block_on(async move { inner.connect().await.map_err(to_php_exception) })
+    }
+
+    /// Replays an exact retained operation. A committed rejection raises its original error
+    /// and releases its lane; uncertainty keeps it retained. HTTP is unsupported.
+    /// Operation IDs use decimal strings to preserve the full unsigned 64-bit range.
+    pub fn resolve_operation(
+        &self,
+        operation_id: String,
+        timeout_micros: Option<&Zval>,
+    ) -> PhpResult {
+        let operation_id = operation_id_from_decimal(&operation_id)?;
+        let timeout = match optional_integer(timeout_micros, "timeout_micros")? {
+            Some(value) if value > 0 => Duration::from_micros(value as u64),
+            Some(_) => {
+                return Err(to_php_exception(
+                    "'timeout_micros' must be greater than zero",
+                ));
+            }
+            None => DEFAULT_RESOLVE_TIMEOUT,
+        };
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| to_php_exception("'timeout_micros' is too large"))?;
+        runtime()
+            .block_on(self.inner.resolve_operation(operation_id, deadline))
+            .map_err(to_php_exception)
+    }
+
+    /// Releases a retained operation without claiming whether it committed.
+    pub fn abandon_operation(&self, operation_id: String) -> PhpResult {
+        let operation_id = operation_id_from_decimal(&operation_id)?;
+        runtime()
+            .block_on(self.inner.abandon_operation(operation_id))
+            .map_err(to_php_exception)
     }
 
     /// Creates a new stream.
@@ -426,4 +509,46 @@ impl IggyClient {
 pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
     NonZeroIggyDuration::try_from(micros)
         .map_err(|_| to_php_exception(format!("'{field}' must be greater than 0 microseconds")))
+}
+
+fn pending_limit(
+    value: Option<&Zval>,
+    default: NonZeroUsize,
+    field: &str,
+) -> PhpResult<NonZeroUsize> {
+    let Some(value) = optional_integer(value, field)? else {
+        return Ok(default);
+    };
+    usize::try_from(value)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            to_php_exception(format!(
+                "'{field}' must be a positive platform-sized integer"
+            ))
+        })
+}
+
+// Option<i64> also maps a failed conversion to None in ext-php-rs. Validate the
+// supplied value before applying defaults so overflow cannot silently reset a limit.
+fn optional_integer(value: Option<&Zval>, field: &str) -> PhpResult<Option<i64>> {
+    value
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .long()
+                .ok_or_else(|| to_php_exception(format!("'{field}' must be an integer or null")))
+        })
+        .transpose()
+}
+
+fn operation_id_from_decimal(value: &str) -> PhpResult<u64> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(to_php_exception(
+            "'operation_id' must contain decimal digits only",
+        ));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| to_php_exception("'operation_id' exceeds the unsigned 64-bit range"))
 }

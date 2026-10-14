@@ -18,7 +18,10 @@
 
 declare(strict_types=1);
 
+use Iggy\Client;
 use Iggy\Exception\IggyException;
+use Iggy\Exception\PendingOperationException;
+use Iggy\PendingOperationsConfig;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
@@ -73,5 +76,91 @@ final class RawCommandTest extends TestCase
     public static function sessionControlCodes(): array
     {
         return [[38], [39], [40], [44], [45]];
+    }
+
+    #[DataProvider('recoveryOperations')]
+    public function testRecoveryPreservesExactUnsignedIdentity(string $method, string $operationId): void
+    {
+        $client = new Client('127.0.0.1:1');
+        $error = assert_throws(static fn () => $client->$method($operationId));
+        assert_instance_of(PendingOperationException::class, $error);
+        assert_same($operationId, $error->operation_id);
+        assert_same('not_retained', $error->kind);
+        assert_same(14008, $error->getCode());
+        assert_true(str_contains($error->getMessage(), $operationId));
+        assert_throws(static function () use ($error): void {
+            $error->operation_id = '0';
+        });
+    }
+
+    public static function recoveryOperations(): array
+    {
+        return [
+            ['resolveOperation', '9007199254741009'],
+            ['resolveOperation', '18446744073709551615'],
+            ['abandonOperation', '9007199254741009'],
+            ['abandonOperation', '18446744073709551615'],
+        ];
+    }
+
+    #[DataProvider('invalidOperationIds')]
+    public function testRecoveryRejectsInvalidUnsignedIdentity(string $operationId): void
+    {
+        $client = new Client('127.0.0.1:1');
+        foreach (['resolveOperation', 'abandonOperation'] as $method) {
+            $error = assert_throws(static fn () => $client->$method($operationId), 'operation_id');
+            assert_true(!($error instanceof PendingOperationException));
+        }
+    }
+
+    public static function invalidOperationIds(): array
+    {
+        return [[''], ['-1'], ['+1'], [' 1'], ['1 '], ['1.0'], ['1e2'], ['18446744073709551616']];
+    }
+
+    public function testRecoveryRejectsNonpositiveTimeout(): void
+    {
+        $client = new Client('127.0.0.1:1');
+        foreach ([0, -1] as $timeout) {
+            assert_throws(static fn () => $client->resolveOperation('1', $timeout), 'timeout_micros');
+        }
+        foreach (['18446744073709551616', 1.5, true] as $invalid) {
+            assert_throws(static fn () => $client->resolveOperation('1', $invalid), 'timeout_micros');
+        }
+    }
+
+    public function testPendingOperationLimitsValidateAndConstructClient(): void
+    {
+        $defaults = new PendingOperationsConfig();
+        assert_same(256, $defaults->max_operations);
+        assert_same(64 * 1024 * 1024, $defaults->max_bytes);
+        $limits = new PendingOperationsConfig(3, 4096);
+        assert_same(3, $limits->max_operations);
+        assert_same(4096, $limits->max_bytes);
+        assert_instance_of(Client::class, new Client('127.0.0.1:1', $limits));
+        assert_throws(static function () use ($limits): void {
+            $limits->max_operations = 4;
+        });
+        foreach ([0, -1] as $invalid) {
+            assert_throws(static fn () => new PendingOperationsConfig($invalid, 4096), 'max_operations');
+            assert_throws(static fn () => new PendingOperationsConfig(3, $invalid), 'max_bytes');
+        }
+        foreach (['18446744073709551616', 1.5, true] as $invalid) {
+            assert_throws(static fn () => new PendingOperationsConfig($invalid), 'max_operations');
+            assert_throws(static fn () => new PendingOperationsConfig(null, $invalid), 'max_bytes');
+        }
+    }
+
+    public function testConnectionStringBudgetsReachEveryBinaryTransport(): void
+    {
+        foreach (['tcp', 'quic', 'ws'] as $transport) {
+            $address = "iggy+{$transport}://iggy:iggy@127.0.0.1:1";
+            assert_instance_of(Client::class, Client::fromConnectionString(
+                $address . '?max_pending_operations=3&max_pending_operation_bytes=4096',
+            ));
+            foreach (['max_pending_operations', 'max_pending_operation_bytes'] as $field) {
+                assert_throws(static fn () => Client::fromConnectionString($address . "?{$field}=0"));
+            }
+        }
     }
 }

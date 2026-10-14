@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -103,6 +104,24 @@ class IggyException : public std::runtime_error {
   public:
     explicit IggyException(const char *message) : std::runtime_error(message) {}
     explicit IggyException(const std::string &message) : std::runtime_error(message) {}
+    IggyException(const std::string &message, const ffi::ErrorInfo &error)
+        : std::runtime_error(message), kind_(error.kind) {
+        if (!kind_.empty()) {
+            code_ = error.code;
+        }
+        if (error.has_operation_id) {
+            operation_id_ = error.operation_id;
+        }
+    }
+
+    [[nodiscard]] std::optional<std::uint32_t> Code() const noexcept { return code_; }
+    [[nodiscard]] const std::string &Kind() const noexcept { return kind_; }
+    [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+
+  private:
+    std::optional<std::uint32_t> code_;
+    std::string kind_;
+    std::optional<std::uint64_t> operation_id_;
 };
 
 /**
@@ -4127,15 +4146,33 @@ class IggyBlockingClient final {
      */
     Stats GetStats();
 
+    /**
+     * Resolves retained work on this client with its original identity. Success
+     * confirms completion without returning the original command payload.
+     * An unknown result stays retained. OperationNotRetained does not prove
+     * that the original command failed or make resending it safe.
+     */
+    void ResolveOperation(std::uint64_t operation_id, std::chrono::microseconds timeout = std::chrono::seconds(30));
+
+    /** Releases the local lane without undoing or determining the server result. */
+    void AbandonOperation(std::uint64_t operation_id);
+
   private:
     explicit IggyBlockingClient(ffi::Client *client);
 
     template <typename Operation>
     static decltype(auto) RethrowAsIggyException(Operation &&operation) {
+        ffi::ErrorInfo error_info{};
         try {
-            return std::forward<Operation>(operation)();
+            if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
+                return std::forward<Operation>(operation)(error_info);
+            } else {
+                return std::forward<Operation>(operation)();
+            }
+        } catch (const IggyException &) {
+            throw;
         } catch (const std::exception &error) {
-            throw IggyException(error.what());
+            throw IggyException(error.what(), error_info);
         }
     }
 
@@ -4314,6 +4351,9 @@ class IggyBlockingClient::Builder final {
      */
     Builder &WithNoDelay();
 
+    /** Bounds active and retained mutations. Defaults: 256 operations and 64 MiB. */
+    Builder &WithPendingOperations(std::uint64_t max_operations, std::uint64_t max_bytes);
+
     /**
      * @brief Builds an owning Iggy blocking client.
      *
@@ -4341,6 +4381,9 @@ class IggyBlockingClient::Builder final {
     std::string tls_ca_file_;
     std::optional<bool> tls_validate_certificate_;
     bool no_delay_{};
+    bool has_pending_operations_{};
+    std::uint64_t pending_max_operations_{};
+    std::uint64_t pending_max_bytes_{};
 };
 
 }  // namespace iggy

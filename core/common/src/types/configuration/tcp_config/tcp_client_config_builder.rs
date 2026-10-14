@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, TcpClientConfig,
-    validate_server_address,
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    TcpClientConfig, validate_server_address,
 };
 
 /// Builder for the TCP client configuration.
@@ -41,6 +41,12 @@ impl TcpClientConfigBuilder {
     /// Sets the server address for the TCP client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
         self.config.server_address = server_address;
+        self
+    }
+
+    /// Sets client-wide active and retained mutation limits.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config.pending_operations = pending_operations;
         self
     }
 

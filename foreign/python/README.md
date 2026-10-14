@@ -253,8 +253,6 @@ async def main():
         topic_partitions_count=3,
         topic_message_expiry=None,
         topic_max_size=None,
-        send_retries=3,
-        send_retry_interval=timedelta(seconds=1),
     )
 
     async with producer:
@@ -277,22 +275,33 @@ exchange. Persisted sends also provide crash-safe retry receipts; weaker topic
 policies can lose data and receipts on a crash. HTTP NoAck confirms dispatch
 only. An application resend creates a new request and can duplicate messages.
 
-Producer retries start a new attempt after an explicit `TransientNotAccepted`
-refusal or a connection failure before submission (`NotConnected` or
-`CannotEstablishConnection`). Missing destinations and other terminal errors
-stop immediately. `send_retries` counts retries after the initial attempt. The
-first permitted retry runs immediately, and `send_retry_interval` delays only
-later retries. Set `send_retries` to `None` or `0` to disable producer retries.
-Set `send_retry_interval` to `None` to run permitted retries without a delay.
-A zero interval raises `ValueError`.
+Mutation retries belong to the shared client driver. The producer no longer accepts
+`send_retries` or `send_retry_interval`; passing either raises `TypeError`. HTTP
+keeps its configured HTTP retry policy and does not support operation recovery.
 
-HTTP send errors stop producer retries immediately, so `send_retries` does not
-retry a failed HTTP send. Transport retries are separate from producer retries.
-For example, the default
-`HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
+`PendingOperationError` exposes the exact integer `operation_id`, the numeric
+`code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the
+same live client, `await client.resolve_operation(operation_id,
+timeout=timedelta(seconds=30))` replays the original operation. A committed
+business rejection raises its original error and releases the lane; uncertainty
+keeps the operation retained. The default timeout is 30 seconds; it must be a
+positive `timedelta`. `await client.abandon_operation(operation_id)` releases the
+lane without establishing whether the operation committed. A session reset
+forgets retained operations, so recovery must use the original session.
+
+`TcpConfig`, `QuicConfig`, and `WebSocketConfig` accept `pending_operations=
+PendingOperationsConfig(max_operations=256, max_bytes=64 * 1024 * 1024)`. These
+client-wide defaults bound active and retained mutations across every partition.
+Admission waits before allocating a request ID. Queued writer frames keep their
+bytes charged until their last reference is released, even after abandonment.
+TCP, QUIC and WebSocket connection strings accept `max_pending_operations` and
+`max_pending_operation_bytes` as positive integers, for example
+`iggy+tcp://iggy:iggy@localhost:8090?max_pending_operations=256&max_pending_operation_bytes=67108864`.
 
 A failed direct send raises `ProducerSendError`, which is a `RuntimeError`
-subclass. Its `cause` property contains the underlying error text. Its
+subclass. Its `cause` property contains the underlying error text, and its
+`__cause__` preserves a structured `PendingOperationError` when applicable. The
+optional `operation_id` identifies the retained send to resolve or abandon. Its
 `committed` property contains confirmations from completed chunks, and `failed`
 contains the remaining unconfirmed messages. If encryption is enabled, the
 failed messages contain encrypted payloads. Restore the original payloads

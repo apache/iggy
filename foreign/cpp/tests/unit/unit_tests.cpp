@@ -350,6 +350,54 @@ TEST(IggyExceptionTest, StoresMessage) {
     const std::string message = "boom2";
     const iggy::IggyException from_string(message);
     EXPECT_EQ(std::string(from_string.what()), message);
+    EXPECT_FALSE(from_string.Code().has_value());
+    EXPECT_TRUE(from_string.Kind().empty());
+    EXPECT_FALSE(from_string.OperationId().has_value());
+}
+
+TEST(IggyBlockingClientTest, RecoveryErrorsPreserveFullWidthOperationIds) {
+    auto client                      = iggy::IggyBlockingClient::Builder().Build();
+    const std::uint64_t operations[] = {(std::uint64_t{1} << 53) + 7, std::numeric_limits<std::uint64_t>::max()};
+    for (const auto operation : operations) {
+        for (const bool abandon : {false, true}) {
+            try {
+                if (abandon) {
+                    client.AbandonOperation(operation);
+                } else {
+                    client.ResolveOperation(operation);
+                }
+                FAIL() << "An unknown operation must not resolve or be abandoned";
+            } catch (const iggy::IggyException &error) {
+                EXPECT_EQ(error.Code(), 14008u);
+                EXPECT_EQ(error.Kind(), "operation_not_retained");
+                EXPECT_EQ(error.OperationId(), operation);
+            }
+        }
+    }
+    EXPECT_THROW(client.ResolveOperation(1, std::chrono::microseconds(-1)), iggy::IggyException);
+}
+
+TEST(IggyBlockingClientBuilderTest, PendingOperationLimitsMustBePositive) {
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(1, 4096).Build());
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(0, 4096), iggy::IggyException);
+    EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithPendingOperations(1, 0), iggy::IggyException);
+}
+
+TEST(IggyFfiRecoveryTest, PerCallDetailsSurviveExceptionsAndResetOnValidation) {
+    auto *client         = iggy::ffi::new_connection({});
+    const auto operation = std::numeric_limits<std::uint64_t>::max();
+    iggy::ffi::ErrorInfo error_info{};
+    EXPECT_THROW(client->resolve_operation(operation, 1000, error_info), std::exception);
+    EXPECT_EQ(error_info.code, 14008u);
+    EXPECT_EQ(std::string(error_info.kind), "operation_not_retained");
+    EXPECT_TRUE(error_info.has_operation_id);
+    EXPECT_EQ(error_info.operation_id, operation);
+
+    constexpr std::uint32_t login_command = 38;
+    EXPECT_THROW(client->send_binary_request(login_command, {}, error_info), std::exception);
+    EXPECT_FALSE(error_info.has_operation_id);
+    EXPECT_EQ(error_info.operation_id, 0u);
+    iggy::ffi::delete_client(client);
 }
 
 TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {

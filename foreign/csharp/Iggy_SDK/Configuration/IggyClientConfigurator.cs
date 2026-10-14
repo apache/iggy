@@ -48,6 +48,15 @@ public sealed class IggyClientConfigurator
     /// </summary>
     public int MaxResponseFrameSize { get; set; } = 64 * 1024 * 1024;
 
+    /// <summary>Maximum active and retained mutations across all partitions and metadata. Default is 256.</summary>
+    public int MaxPendingOperations { get; init; } = 256;
+
+    /// <summary>
+    ///     Maximum bytes of frozen mutation headers and bodies across active and retained operations.
+    ///     A replay shares its original reservation. Default is 64 MiB; minimum is one 256-byte header.
+    /// </summary>
+    public long MaxPendingOperationBytes { get; init; } = 64L * 1024 * 1024;
+
     /// <summary>
     ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
     ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size

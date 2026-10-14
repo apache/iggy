@@ -152,8 +152,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// .build()?;
 /// client.connect().await?;
 ///
-/// // A background producer batches in the background, retries failed sends,
-/// // and creates a topic.
+/// // A background producer batches messages and creates a topic.
 /// let producer = client
 ///     .producer("stream_name", "topic_name")?
 ///     .topic_durability(iggy::prelude::Durability::Persisted)
@@ -164,7 +163,6 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///             .build(),
 ///     )
 ///     .partitioning(Partitioning::balanced())
-///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
 ///     .create_topic_if_not_exists(
 ///         3,
 ///         IggyExpiry::ServerDefault,
@@ -760,7 +758,7 @@ impl IggyClient {
     /// # Examples
     ///
     /// Connect a client, build a producer that creates the topic if it is
-    /// missing and retries failed sends, then publish a message.
+    /// missing, then publish a message.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -776,7 +774,6 @@ impl IggyClient {
     ///     .producer("stream_name", "topic_name")?
     ///     .topic_durability(iggy::prelude::Durability::Persisted)
     ///     .partitioning(Partitioning::balanced())
-    ///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
     ///     .create_topic_if_not_exists(
     ///         3,
     ///         IggyExpiry::ServerDefault,
@@ -906,12 +903,12 @@ impl IggyClient {
         if SESSION_CONTROL_CODES.contains(&code) {
             return Err(IggyError::InvalidCommand);
         }
-        match &*self.client.read().await {
+        super::with_client!(self, client => match &*client {
             ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::WebSocket(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
-        }
+        })
     }
 
     /// Invokes a HTTP endpoint and returns the raw response body.
@@ -976,15 +973,6 @@ impl Drop for IggyClient {
 }
 
 impl IggyClient {
-    /// Connects again after a leader redirect without clearing the caller's
-    /// `disconnect()`: one that lands during the redirect holds, and the
-    /// transport refuses the reconnect.
-    pub(crate) async fn reconnect_after_redirect(&self) -> Result<(), IggyError> {
-        self.client.read().await.reconnect_keeping_intent().await?;
-        self.start_heartbeat().await;
-        Ok(())
-    }
-
     async fn start_heartbeat(&self) {
         let heartbeat_interval = self.client.read().await.heartbeat_interval().await;
         let mut heartbeat = self.heartbeat();
@@ -1002,7 +990,7 @@ impl IggyClient {
         heartbeat.handle = Some(spawn(async move {
             loop {
                 debug!("Sending the heartbeat...");
-                if let Err(error) = client.read().await.ping().await {
+                if let Err(error) = client.read().await.keepalive().await {
                     error!("There was an error when sending a heartbeat. {error}");
                     if error == IggyError::ClientShutdown {
                         warn!("The client has been shut down - stopping the heartbeat.");
@@ -1071,24 +1059,98 @@ impl Client for IggyClient {
     }
 
     async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
-        self.client
-            .read()
+        iggy_common::with_binary_deadline(deadline.into(), async {
+            let client = tokio::time::timeout_at(
+                iggy_common::binary_operation_deadline(),
+                self.client.read(),
+            )
             .await
-            .resolve_operation(op, deadline)
-            .await
+            .map_err(|_| IggyError::OperationUncertain(op))?;
+            client.resolve_operation(op, deadline).await
+        })
+        .await
     }
 
     async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
-        self.client.read().await.abandon_operation(op).await
+        super::with_client!(self, client => client.abandon_operation(op).await)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::OPERATION_TIMEOUT;
+    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint};
     use crate::links::test_support::LOCALHOST;
-    use iggy_common::TcpClientConfig;
+    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STATS_CODE};
+    use iggy_common::{StreamClient, TcpClientConfig};
+    use std::time::Duration;
     use tokio::net::TcpListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn given_nested_client_locks_when_reading_should_share_one_deadline() {
+        let cluster = FakeCluster::new(1);
+        let inner = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        let inner_lock = inner.client.clone();
+        let outer = IggyClient::new(ClientWrapper::Iggy(inner));
+        let outer_lock = outer.client.clone();
+        let inner_guard = inner_lock.write().await;
+        let outer_guard = outer_lock.write().await;
+        let lock_wait = Duration::from_secs(20);
+        let start = tokio::time::Instant::now();
+
+        let ((result, finished), ()) = tokio::join!(
+            async { (outer.get_stats().await, tokio::time::Instant::now()) },
+            async {
+                sleep(lock_wait).await;
+                drop(outer_guard);
+                sleep(lock_wait).await;
+                drop(inner_guard);
+            }
+        );
+
+        assert!(matches!(result, Err(IggyError::TransientNotAccepted)));
+        assert_eq!(finished - start, OPERATION_TIMEOUT);
+        assert_eq!(cluster.count(GET_STATS_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_wrapper_lock_wait_when_a_mutation_times_out_should_preserve_its_operation() {
+        let cluster = FakeCluster::new(1);
+        let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        cluster.script(&endpoint(0), CREATE_STREAM_CODE, [Answer::Silence]);
+        let client_lock = client.client.clone();
+        let guard = client_lock.write().await;
+        let start = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(client.create_stream("stream"), async {
+            sleep(Duration::from_secs(20)).await;
+            drop(guard);
+        });
+
+        let Err(IggyError::OperationUncertain(op)) = result else {
+            panic!("a sent mutation must return its retained operation identity");
+        };
+        assert_eq!(tokio::time::Instant::now() - start, OPERATION_TIMEOUT);
+        assert_eq!(cluster.count(CREATE_STREAM_CODE), 1);
+        assert!(client_lock.read().await.retains_operation(op).await);
+
+        let guard = client_lock.write().await;
+        let resolve_budget = Duration::from_secs(5);
+        let result = client
+            .resolve_operation(
+                op,
+                (tokio::time::Instant::now() + resolve_budget).into_std(),
+            )
+            .await;
+        assert_eq!(result, Err(IggyError::OperationUncertain(op)));
+        drop(guard);
+        assert!(client_lock.read().await.retains_operation(op).await);
+        client.abandon_operation(op).await.unwrap();
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {

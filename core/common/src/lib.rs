@@ -81,6 +81,10 @@ pub use iggy_binary_protocol::responses::messages::{
 };
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
+#[doc(hidden)]
+pub use traits::binary_transport::{
+    BINARY_OPERATION_TIMEOUT, binary_operation_deadline, with_binary_deadline,
+};
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
@@ -98,6 +102,8 @@ pub use traits::system_client::SystemClient;
 pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
+#[doc(hidden)]
+pub use traits::{BinarySendPartitioning, send_binary_messages};
 pub use traits::{rust_sdk_version_info, sign_in_request};
 pub use types::args::*;
 pub use types::client::client_info::*;
@@ -111,6 +117,7 @@ pub use types::configuration::auth_config::credentials::*;
 pub use types::configuration::http_config::http_client_config::*;
 pub use types::configuration::http_config::http_client_config_builder::*;
 pub use types::configuration::http_config::http_connection_string_options::*;
+pub use types::configuration::pending_operations_config::PendingOperationsConfig;
 pub use types::configuration::quic_config::quic_client_config::*;
 pub use types::configuration::quic_config::quic_client_config_builder::*;
 pub use types::configuration::quic_config::quic_client_reconnection_config::*;

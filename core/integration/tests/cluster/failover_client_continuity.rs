@@ -17,17 +17,9 @@
 
 //! Client continuity across a primary SIGKILL.
 //!
-//! A producing SDK client pinned to the primary must, after the primary dies,
-//! complete its next operation against the surviving quorum within a small
-//! budget and without an authentication error. Three separate pieces of
-//! client state make that possible, and the test fails if any one of them is
-//! lost: the endpoints the cluster roster named while the connection was
-//! healthy (the roster is unreachable exactly when it is needed), the
-//! credentials the sign-in succeeded with (this harness client signs in by
-//! hand rather than configuring `AutoLogin`, and a reconnect has to
-//! re-establish the session on whichever node answers), and a reconnect that
-//! dials those endpoints in turn instead of redialing the address the client
-//! was configured with.
+//! A producing SDK client must reach the surviving partition primary after
+//! SIGKILL without replacing its session. Partition and metadata primaries
+//! move independently, so verify each route through an operation on its plane.
 
 use std::time::Duration;
 
@@ -170,14 +162,18 @@ async fn given_a_client_producing_when_its_primary_is_killed_should_resume_witho
         resumed,
         "a client pinned to a killed primary must complete its next operation against \
          the surviving quorum within {RESUME_BUDGET:?}: the roster learned while the \
-         connection was healthy names the survivors, and the credentials the sign-in \
-         succeeded with re-establish the session on whichever one answers \
+         connection was healthy names the survivors, and the same session remains bound \
+         on the surviving links \
          ({attempt} attempts, last error: {last_error:?})"
     );
+    tokio::time::timeout_at(resume_deadline, producer.get_stream(&stream))
+        .await
+        .expect("metadata recovery must share the continuity budget")
+        .expect("the same session must reach the surviving metadata primary")
+        .expect("the stream must survive primary loss");
     assert_ne!(
         producer.get_connection_info().await.server_address,
         primary_endpoint,
-        "the send that resumed must have landed on a survivor, so the client has to \
-         have moved off the killed primary's endpoint"
+        "connection info must name the recovered metadata primary"
     );
 }

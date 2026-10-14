@@ -81,8 +81,17 @@ namespace Iggy {
          * Constructs a new IggyClient from a TCP server address.
          *
          * @param string|null $conn
+         * @param \Iggy\PendingOperationsConfig|null $pending_operations
          */
-        public function __construct(?string $conn = null) {}
+        public function __construct(?string $conn = null, ?\Iggy\PendingOperationsConfig $pending_operations = null) {}
+
+        /**
+         * Releases a retained operation without claiming whether it committed.
+         *
+         * @param string $operation_id
+         * @return void
+         */
+        public function abandonOperation(string $operation_id): void {}
 
         /**
          * Connects the IggyClient to its service.
@@ -222,6 +231,17 @@ namespace Iggy {
          * @return array
          */
         public function pollMessages(mixed $stream, mixed $topic, int $partition_id, \Iggy\PollingStrategy $polling_strategy, int $count, bool $auto_commit): array {}
+
+        /**
+         * Replays an exact retained operation. A committed rejection raises its original error
+         * and releases its lane; uncertainty keeps it retained. HTTP is unsupported.
+         * Operation IDs use decimal strings to preserve the full unsigned 64-bit range.
+         *
+         * @param string $operation_id
+         * @param mixed $timeout_micros
+         * @return void
+         */
+        public function resolveOperation(string $operation_id, mixed $timeout_micros = null): void {}
 
         /**
          * Sends a command code with a payload and returns the raw response bytes.
@@ -481,6 +501,23 @@ namespace Iggy {
          * @param int $metadata_op
          */
         public function __construct(int $incarnation, int $owner_generation, int $metadata_op) {}
+    }
+
+    /**
+     * Client-wide limits for active and retained mutation frames, including queued writer bytes.
+     */
+    class PendingOperationsConfig {
+        public readonly int $max_bytes;
+
+        public readonly int $max_operations;
+
+        /**
+         * Defaults to 256 operations and 64 MiB of headers and bodies.
+         *
+         * @param mixed $max_operations
+         * @param mixed $max_bytes
+         */
+        public function __construct(mixed $max_operations = null, mixed $max_bytes = null) {}
     }
 
     class PollingStrategy {
@@ -744,6 +781,23 @@ namespace Iggy\Exception {
     }
 
     class NotFoundException extends Iggy\Exception\IggyException {
+        public function __construct() {}
+    }
+
+    class PendingOperationException extends Iggy\Exception\IggyException {
+        protected int $code;
+
+        public readonly string $kind;
+
+        protected string $message;
+
+        /**
+         * Exact unsigned 64-bit operation ID, represented as a decimal string.
+         *
+         * @var string
+         */
+        public readonly string $operation_id;
+
         public function __construct() {}
     }
 

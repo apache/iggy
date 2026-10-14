@@ -33,6 +33,7 @@ export class ConsensusSession {
   private _session: bigint | null;
   private requestCounter: bigint;
   private registerConsumed: boolean;
+  private sessionRequestStart = 1n;
   readonly bindSecret: Buffer;
 
   constructor(clientId?: bigint) {
@@ -41,6 +42,14 @@ export class ConsensusSession {
     this.requestCounter = 1n;
     this.registerConsumed = false;
     this.bindSecret = randomBytes(BIND_SECRET_BYTES);
+  }
+
+  reset(): void {
+    this._clientId = generateClientId();
+    this._session = null;
+    this.registerConsumed = false;
+    this.sessionRequestStart = this.requestCounter;
+    randomBytes(BIND_SECRET_BYTES).copy(this.bindSecret);
   }
 
   get clientId(): bigint {
@@ -59,7 +68,7 @@ export class ConsensusSession {
   get hasActivity(): boolean {
     return this.registerConsumed ||
       this._session !== null ||
-      this.requestCounter > 1n;
+      this.requestCounter > this.sessionRequestStart;
   }
 
   /** Binds the session after Register commits through consensus. */
@@ -84,8 +93,8 @@ export class ConsensusSession {
    * Next application request id, advancing the counter: 1, 2, 3, ...
    * Request 0 is reserved for Register.
    */
-  nextRequestId(): bigint {
-    if (!this.isBound)
+  nextRequestId(requireBound = true): bigint {
+    if (requireBound && !this.isBound)
       throw new Error('nextRequestId called before bind');
     if (this.requestCounter === MAX_U64)
       throw new RangeError('VSR request counter exhausted');

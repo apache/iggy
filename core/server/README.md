@@ -44,10 +44,11 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-5` storage gate also
-rejects older data directories without modifying them. Existing data requires a
-separately validated offline migration or restore procedure before this release
-can use it.
+complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-6` storage gate
+requires fresh storage and rejects older data directories without modifying them.
+Cached replies now preserve a committed-result marker, which older receipts lack.
+No in-place upgrade or implicit migration is supported. A separately validated
+offline migration or restore procedure would be required to reuse existing data.
 
 Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
 `replicaId` component, changing constructor calls and record patterns. C# callers
@@ -199,7 +200,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-OWNERSHIP-HISTORY-5` requires this initialization contract;
+Storage format `IGGY-OWNERSHIP-HISTORY-6` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

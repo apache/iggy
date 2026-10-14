@@ -46,6 +46,11 @@ func (c *IggyTcpClient) SendMessages(
 	partitioning iggcon.Partitioning,
 	messages []iggcon.IggyMessage,
 ) (*iggcon.SendMessagesResponse, error) {
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
+	ctx, cancel := operationContext(ctx)
+	defer cancel()
 	if len(partitioning.Value) > 255 ||
 		(partitioning.Kind != iggcon.Balanced && len(partitioning.Value) == 0) {
 		return nil, ierror.ErrInvalidKeyValueLength
@@ -61,20 +66,32 @@ func (c *IggyTcpClient) SendMessages(
 		return nil, err
 	}
 
-	response, err := c.do(ctx, &command.SendMessages{
-		Compression:  c.MessageCompression,
-		StreamId:     streamId,
-		TopicId:      topicId,
-		Partitioning: resolved,
-		Messages:     messages,
-	})
-	if err != nil {
-		if errors.Is(err, ierror.ErrPartitionNotFound) {
-			// The cached count pointed this send at a partition the server
-			// does not have, so the topic was likely recreated smaller.
-			c.topics.forgetCount(newTopicKey(streamId, topicId))
+	var response []byte
+	for attempt := 0; ; attempt++ {
+		response, err = c.do(ctx, &command.SendMessages{
+			Compression: c.MessageCompression, StreamId: streamId, TopicId: topicId,
+			Partitioning: resolved, Messages: messages,
+		})
+		if err == nil {
+			break
 		}
-		return nil, err
+		if !errors.Is(err, ierror.ErrPartitionNotFound) {
+			return nil, err
+		}
+		key := newTopicKey(streamId, topicId)
+		c.topics.forgetCount(key)
+		if attempt != 0 || partitioning.Kind == iggcon.PartitionIdKind {
+			return nil, err
+		}
+		count, refreshErr := c.topicPartitionsCount(ctx, key)
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		partition := binary.LittleEndian.Uint32(resolved.Value) % count
+		if partitioning.Kind == iggcon.MessageKey {
+			partition = hash.XXHash32(partitioning.Value) % count
+		}
+		resolved = iggcon.PartitionId(partition)
 	}
 
 	confirmations, err := binaryserialization.DeserializeSendMessagesConfirmations(response)
@@ -126,10 +143,7 @@ func (c *IggyTcpClient) topicPartitionsCount(
 	}
 
 	query := binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), 0)
-	if err := c.ensureTopology(ctx); err != nil {
-		return 0, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, responseReadTimeout)
+	ctx, cancel := operationContext(ctx)
 	defer cancel()
 	c.polls.dropRoute(string(query))
 	for {
@@ -165,9 +179,11 @@ func (c *IggyTcpClient) PollMessages(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
-	if err := c.ensureTopology(ctx); err != nil {
-		return nil, err
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
 	}
+	ctx, cancel := operationContext(ctx)
+	defer cancel()
 	// A group poll that names no partition is orchestrated client-side: the
 	// member fetches its assignment and polls the partitions it owns in turn.
 	if consumer.Kind == iggcon.ConsumerKindGroup && partitionId == nil {

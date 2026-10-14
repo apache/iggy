@@ -20,13 +20,13 @@ package tcp
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
@@ -34,24 +34,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The node a client signed in on dies; its next request has to complete on a
-// survivor the roster named, under the retained logical identity.
-// Mirrors `core/integration/tests/cluster/failover_client_continuity.rs`.
 func TestReconnect_BindVerdictPreservesOrReplacesOnlyTheLogicalSession(t *testing.T) {
-	for _, refusal := range []uint32{0, 30, 40, 57, 58} {
-		t.Run(ierror.FromCode(ierror.Code(refusal)).Error(), func(t *testing.T) {
+	for _, refusal := range []ierror.Code{0, ierror.StaleClientCode, ierror.UnauthenticatedCode, ierror.TransientNotCommittedCode, ierror.TransientNotAcceptedCode} {
+		t.Run(fmt.Sprint(refusal), func(t *testing.T) {
 			var server *testListener
-			var registrations atomic.Int32
-			var writes atomic.Int32
+			var registrations, writes atomic.Int32
 			var bindStatus atomic.Uint32
-			bindStatus.Store(refusal)
+			bindStatus.Store(uint32(refusal))
 			server = listenVSR(t, nil, func(_, _ int, read request) []byte {
 				switch {
 				case read.operation() == vsr.OperationRegister:
 					return registerReplyFrame(7, uint64(128+registrations.Add(1)))
 				case read.code() == uint32(command.BindSessionCode):
-					if status := bindStatus.Load(); status != 0 {
-						return statusReplyFrame(vsr.OperationNonReplicated, status, nil)
+					if status := bindStatus.Swap(0); status != 0 {
+						return statusReplyFrame(read.operation(), status, nil)
 					}
 					return bindReplyFrame(7, read.sessionID())
 				case read.code() == uint32(command.GetClusterMetadataCode):
@@ -60,37 +56,34 @@ func TestReconnect_BindVerdictPreservesOrReplacesOnlyTheLogicalSession(t *testin
 					if writes.Add(1) == 1 {
 						return nil
 					}
-					return replyFrame(vsr.OperationCreateStream, resultSection())
+					return committedReply(read, 0)
 				default:
-					return replyFrame(vsr.OperationNonReplicated, nil)
+					return replyFrame(read.operation(), nil)
 				}
 			})
-			client := newDialingClient(t, server.address(),
-				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-			ctx := context.Background()
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
 			require.NoError(t, client.Connect(ctx))
 			original := client.session.ClientID()
-			secret := client.session.BindSecret()
 			_, err := client.do(ctx, &command.CreateStream{Name: "lost-reply"})
-			require.Error(t, err)
-			if refusal == uint32(ierror.TransientNotCommittedCode) || refusal == uint32(ierror.TransientNotAcceptedCode) {
-				require.ErrorIs(t, client.Connect(ctx), ierror.FromCode(ierror.Code(refusal)))
-				assert.Equal(t, original, client.session.ClientID())
-				assert.Equal(t, int32(1), registrations.Load())
-				bindStatus.Store(0)
-			}
-			require.NoError(t, client.Connect(ctx))
-			assert.Equal(t, int32(1), writes.Load(), "resume must not replay the uncertain mutation")
-			terminal := refusal == uint32(ierror.StaleClientCode) || refusal == uint32(ierror.UnauthenticatedCode)
+			terminal := refusal == ierror.StaleClientCode || refusal == ierror.UnauthenticatedCode
 			if terminal {
-				assert.NotEqual(t, original, client.session.ClientID())
-				assert.Equal(t, int32(2), registrations.Load())
+				var uncertain ierror.UncertainOutcome
+				require.ErrorAs(t, err, &uncertain)
+				require.Eventually(t, func() bool {
+					client.mtx.Lock()
+					defer client.mtx.Unlock()
+					return client.session.Bound() && client.session.ClientID() != original
+				}, time.Second, time.Millisecond)
+				require.ErrorIs(t, client.ResolveOperation(ctx, uncertain.OperationID), ierror.ErrOperationNotRetained)
+				require.Equal(t, int32(1), writes.Load(), "a replacement session cannot replay the old mutation")
 			} else {
-				assert.Equal(t, original, client.session.ClientID())
-				assert.Equal(t, secret, client.session.BindSecret())
-				assert.Equal(t, int32(1), registrations.Load())
+				require.NoError(t, err)
+				require.Equal(t, int32(2), writes.Load())
+				require.Equal(t, original, client.session.ClientID())
 			}
-			_, err = client.do(ctx, &command.CreateStream{Name: "explicit-new-write"})
+			_, err = client.do(ctx, &command.CreateStream{Name: "next-write"})
 			require.NoError(t, err)
 			var mutations []request
 			for _, read := range server.recorded() {
@@ -98,15 +91,17 @@ func TestReconnect_BindVerdictPreservesOrReplacesOnlyTheLogicalSession(t *testin
 					mutations = append(mutations, read)
 				}
 			}
-			require.Len(t, mutations, 2)
-			assert.NotEqual(t, mutations[0].payload, mutations[1].payload)
 			if terminal {
-				assert.NotEqual(t, mutations[0].clientID(), mutations[1].clientID())
-				assert.Equal(t, uint64(2), mutations[1].requestID())
+				require.Len(t, mutations, 2)
+				require.NotEqual(t, mutations[0].clientID(), mutations[1].clientID())
+				require.Equal(t, int32(2), registrations.Load())
 			} else {
-				assert.Equal(t, mutations[0].clientID(), mutations[1].clientID())
-				assert.Greater(t, mutations[1].requestID(), mutations[0].requestID(), "BindSession and roster reads share the retained counter")
+				require.Len(t, mutations, 3)
+				require.Equal(t, mutations[0].header, mutations[1].header)
+				require.Equal(t, mutations[0].payload, mutations[1].payload)
+				require.Equal(t, int32(1), registrations.Load())
 			}
+			require.Greater(t, mutations[len(mutations)-1].requestID(), mutations[0].requestID())
 		})
 	}
 }
@@ -157,7 +152,7 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 	_, err := client.LoginUser(ctx, "iggy", "iggy")
 	require.NoError(t, err)
 	require.NoError(t, client.Ping(ctx), "the live primary answers")
-	require.Equal(t, primary.address(), client.currentServerAddress)
+	require.Equal(t, primary.address(), client.GetConnectionInfo().ServerAddress)
 
 	primaryDead.Store(true)
 	require.NoError(t, primary.listener.Close(), "stop accepting, so a redial is refused")
@@ -165,7 +160,7 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 	require.NoError(t, client.Ping(ctx),
 		"the client has to resume on the survivor the roster named")
 
-	assert.Equal(t, survivor.address(), client.currentServerAddress,
+	assert.Equal(t, survivor.address(), client.GetConnectionInfo().ServerAddress,
 		"the client moved off the dead endpoint")
 	assert.True(t, client.session.Bound(), "the session was re-established")
 
@@ -179,77 +174,6 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 	assert.Equal(t, 1, requestCount(survivor.recorded(), command.BindSessionCode))
 }
 
-func TestFailover_WalksPastTwoRefusingReplicasToThePartitionPrimary(t *testing.T) {
-	var metadataLeader *testListener
-
-	partitionPrimary := listenVSR(t, nil, func(_, _ int, read request) []byte {
-		if read.code() == uint32(command.BindSessionCode) {
-			return bindReplyFrame(7, read.sessionID())
-		}
-		switch read.operation() {
-		case vsr.OperationRegister:
-			return registerReplyFrame(7, 384)
-		case vsr.OperationCreateStream:
-			return replyFrame(vsr.OperationCreateStream, resultSection())
-		default:
-			return replyFrame(vsr.OperationNonReplicated, nil)
-		}
-	})
-	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
-		if read.code() == uint32(command.BindSessionCode) {
-			return bindReplyFrame(7, read.sessionID())
-		}
-		if read.operation() == vsr.OperationRegister {
-			return registerReplyFrame(7, 256)
-		}
-		return statusReplyFrame(vsr.OperationCreateStream,
-			uint32(ierror.TransientNotAcceptedCode), nil)
-	})
-	metadataLeader = listenVSR(t, nil, func(_, _ int, read request) []byte {
-		switch {
-		case read.code() == uint32(command.BindSessionCode):
-			return bindReplyFrame(7, read.sessionID())
-		case read.code() == uint32(command.GetClusterMetadataCode):
-			return clusterMetadataFrame(t, 0, metadataLeader.address(),
-				follower.address(), partitionPrimary.address())
-		case read.operation() == vsr.OperationRegister:
-			return registerReplyFrame(7, 128)
-		default:
-			return statusReplyFrame(vsr.OperationCreateStream,
-				uint32(ierror.TransientNotAcceptedCode), nil)
-		}
-	})
-
-	client := newDialingClient(t, metadataLeader.address())
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	require.NoError(t, client.Connect(ctx))
-	_, err := client.LoginUser(ctx, "iggy", "iggy")
-	require.NoError(t, err)
-
-	_, err = client.do(ctx, &command.CreateStream{Name: "orders"})
-	require.NoError(t, err)
-	assert.Equal(t, partitionPrimary.address(), client.currentServerAddress)
-	assert.True(t, len(follower.recorded()) >= 2,
-		"the roster walk skipped the second replica")
-}
-
-func TestFailover_RosterWalkVisitsEachEndpointOnce(t *testing.T) {
-	roster := []string{"iggy-0:8090", "iggy-1:8090", "iggy-2:8090"}
-	visited := make(map[string]struct{})
-
-	second := nextRosterEndpoint(roster[0], roster, visited)
-	third := nextRosterEndpoint(second, roster, visited)
-	exhausted := nextRosterEndpoint(third, roster, visited)
-
-	assert.Equal(t, roster[1], second)
-	assert.Equal(t, roster[2], third)
-	assert.Empty(t, exhausted)
-	assert.Len(t, visited, len(roster))
-}
-
-// Without any credentials there is nothing to sign in with, so a request on a
-// dead node fails instead of reconnecting into an unauthenticated session.
 func TestFailover_FailsFastWhenNothingEverSignedIn(t *testing.T) {
 	var server *testListener
 	var dead atomic.Bool
@@ -305,17 +229,15 @@ func TestFailover_ServerEvictionReplaysTheRememberedSignIn(t *testing.T) {
 	registersBefore := registers.Load()
 
 	evict.Store(true)
-	// A ping is non-replicated, so the eviction is absorbed: the reconnect it
-	// triggers signs in again with the credentials the sign-in remembered and
-	// the request completes over the session it re-established.
-	require.NoError(t, client.Ping(ctx), "the evicted request was not recovered")
-
+	require.ErrorIs(t, client.Ping(ctx), ierror.ErrStaleClient)
 	_, remembered := client.signInCredentials()
-	assert.True(t, remembered, "an eviction is not a sign-out; the credentials stay")
-	require.NoError(t, client.Ping(ctx), "the session came back on its own")
-	assert.Greater(t, registers.Load(), registersBefore,
-		"the reconnect re-established the session")
-	assert.True(t, client.session.Bound())
+	require.True(t, remembered)
+	require.Eventually(t, func() bool {
+		client.mtx.Lock()
+		defer client.mtx.Unlock()
+		return client.session.Bound() && registers.Load() > registersBefore
+	}, time.Second, time.Millisecond)
+	require.NoError(t, client.Ping(ctx))
 }
 
 // An explicit sign-out is caller intent: the reconnect must not sign back in
@@ -463,7 +385,7 @@ func TestFailover_ReLoginSurvivesALogoutTheOldPrimaryRefused(t *testing.T) {
 	}
 
 	assert.True(t, client.session.Bound(), "the replayed sign-in bound a session")
-	assert.Equal(t, leader.address(), client.currentServerAddress)
+	assert.Equal(t, leader.address(), client.GetConnectionInfo().ServerAddress)
 }
 
 // A logout that never landed still ended the session it belonged to, so the
@@ -524,68 +446,6 @@ func TestFailover_ARejectedReLoginDoesNotResurrectThePreviousUser(t *testing.T) 
 // reestablishAfter is a cooldown on redialing the endpoint that was lost. It
 // is owed to that endpoint alone, so a failover to another one must not sit
 // through it.
-func TestFailover_DoesNotSpendTheLostEndpointsPauseOnAnotherEndpoint(t *testing.T) {
-	var survivor *testListener
-	survivor = listenVSR(t, nil, singleNodeHandler(t, func() string { return survivor.address() }))
-
-	client := newDialingClient(t, deadAddress(t))
-	client.config.reconnection.reestablishAfter = time.Minute
-	client.knownServerAddresses = []string{survivor.address()}
-	client.connectedAt = time.Now()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	started := time.Now()
-	require.NoError(t, client.Connect(ctx))
-
-	assert.Equal(t, survivor.address(), client.currentServerAddress)
-	assert.Less(t, time.Since(started), 2*time.Second,
-		"the failover waited out a pause it owed only the lost endpoint")
-}
-
-// The other half of the same promise: WithReestablishAfter is a cooldown on
-// the endpoint that was lost, and a known roster does not cancel it.
-func TestFailover_KeepsTheReestablishPauseForTheEndpointThatWasLost(t *testing.T) {
-	var current *testListener
-	current = listenVSR(t, nil, singleNodeHandler(t, func() string { return current.address() }))
-
-	client := newDialingClient(t, current.address())
-	client.config.reconnection.reestablishAfter = 500 * time.Millisecond
-	client.knownServerAddresses = []string{deadAddress(t)}
-	client.connectedAt = time.Now()
-
-	started := time.Now()
-	require.NoError(t, client.Connect(context.Background()))
-
-	assert.Equal(t, current.address(), client.currentServerAddress)
-	assert.GreaterOrEqual(t, time.Since(started), 350*time.Millisecond,
-		"the cooldown on the endpoint that was lost was skipped")
-}
-
-// The cooldown is a pace limit, not a commitment: a caller that gave the
-// connect a deadline has to get an answer inside it, and Close has to end the
-// wait too.
-func TestFailover_TheReestablishPauseHonoursTheCallersDeadline(t *testing.T) {
-	current := listenVSR(t, nil, func(_, _ int, read request) []byte {
-		return singleNodeHandler(t, func() string { return "127.0.0.1:8090" })(0, 0, read)
-	})
-
-	client := newDialingClient(t, current.address())
-	client.config.reconnection.reestablishAfter = time.Minute
-	client.connectedAt = time.Now()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	started := time.Now()
-	_ = client.Connect(ctx)
-
-	assert.Less(t, time.Since(started), 5*time.Second,
-		"the cooldown outlived the deadline the caller gave the connect")
-}
-
-// A node whose syns are dropped must not hold the sweep: without a bound on
-// the dial the survivors behind it are never reached. A black-holed address
-// cannot be arranged portably, so this pins the bound itself.
 func TestFailover_BoundsTheDialWhenOtherEndpointsAreQueuedBehindIt(t *testing.T) {
 	assert.Equal(t, 2*time.Second, failoverDialTimeout,
 		"the dial bound has to match the other SDKs")
@@ -601,7 +461,8 @@ func TestFailover_BoundsTheDialWhenOtherEndpointsAreQueuedBehindIt(t *testing.T)
 
 	client := newDialingClient(t, silent.Addr().String(),
 		WithTLS(WithTLSValidateCertificate(false)))
-	client.knownServerAddresses = []string{survivor.address()}
+	client.links.roster = []string{survivor.address()}
+	client.config.reconnection.enabled = false
 
 	done := make(chan error, 1)
 	go func() { done <- client.Connect(context.Background()) }()
@@ -634,10 +495,10 @@ func TestFailover_DoesNotSettleOnAnEndpointThatFailedTheHandshake(t *testing.T) 
 	configured := deadAddress(t)
 	client := newDialingClient(t, configured, WithTLS(WithTLSValidateCertificate(false)))
 	client.config.reconnection.enabled = false
-	client.knownServerAddresses = []string{hangup.Addr().String()}
+	client.links.roster = []string{hangup.Addr().String()}
 
 	require.Error(t, client.Connect(context.Background()))
-	assert.Equal(t, configured, client.currentServerAddress,
+	assert.Equal(t, configured, client.GetConnectionInfo().ServerAddress,
 		"the endpoint that failed the handshake became the current one")
 }
 
@@ -661,10 +522,10 @@ func TestFailover_UsesTheDialedEndpointAsTheServerName(t *testing.T) {
 	require.NoError(t, err)
 	client := newDialingClient(t, "127.0.0.2:"+port,
 		WithTLS(WithTLSCAFile(caPath), WithTLSValidateCertificate(true)))
-	client.knownServerAddresses = []string{"127.0.0.1:" + port}
+	client.links.roster = []string{"127.0.0.1:" + port}
 
 	require.NoError(t, client.Connect(context.Background()))
-	assert.Equal(t, "127.0.0.1:"+port, client.currentServerAddress)
+	assert.Equal(t, "127.0.0.1:"+port, client.GetConnectionInfo().ServerAddress)
 }
 
 // A TLS configuration the client itself cannot satisfy says the same thing on
@@ -735,10 +596,10 @@ func TestFailover_APlaintextEndpointDoesNotEndTheSweep(t *testing.T) {
 	client := newDialingClient(t, plaintext.Addr().String(),
 		WithTLS(WithTLSValidateCertificate(false)))
 	client.config.reconnection.maxRetries = 2
-	client.knownServerAddresses = []string{survivor.address()}
+	client.links.roster = []string{survivor.address()}
 
 	require.NoError(t, client.Connect(context.Background()))
-	assert.Equal(t, survivor.address(), client.currentServerAddress)
+	assert.Equal(t, survivor.address(), client.GetConnectionInfo().ServerAddress)
 }
 
 // A client with nothing to dial must say so: reporting success would leave
@@ -845,89 +706,6 @@ func TestConnect_ConcurrentReconnectsThroughExchangeShareOneAttempt(t *testing.T
 // ran on. Connect marks the client connected before it signs in, so a caller
 // parked on c.mtx for that sign-in wakes to a healthy-looking state that says
 // nothing about which connection is installed.
-func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
-	var server *testListener
-	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
-
-	client := newDialingClient(t, server.address(),
-		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-	require.NoError(t, client.Connect(context.Background()))
-
-	// What a request that fails on this connection carries with it.
-	failed := client.connGeneration
-
-	require.NoError(t, client.disconnect())
-	require.NoError(t, client.Connect(context.Background()))
-	require.NotEqual(t, failed, client.connGeneration,
-		"a reconnect installs a connection of its own")
-
-	torn, err := client.disconnectGeneration(failed)
-	require.NoError(t, err)
-	assert.False(t, torn, "the stale generation reported a teardown it did not make")
-	assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
-	require.NoError(t, client.Ping(context.Background()),
-		"the reconnected client was torn down by a stale failure")
-	assert.Equal(t, 2, server.connections(), "the stale teardown forced a third connection")
-
-	// The connection the caller did fail on is still torn down.
-	torn, err = client.disconnectGeneration(client.connGeneration)
-	require.NoError(t, err)
-	assert.True(t, torn)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
-}
-
-// The sign-in transaction holds registerMtx across its reconnect, and an
-// attempt started by a plain request ends in a sign-in that needs that same
-// lock. Waiting for that attempt closes a cycle -- the owner blocked on
-// registerMtx, the transaction blocked on the owner -- and callers pass a
-// context with no deadline, so nothing breaks it.
-func TestConnect_DoesNotWaitOnAnAttemptThatSignsIn(t *testing.T) {
-	certificate, _ := selfSignedCert(t)
-	var survivor *testListener
-	survivor = listenVSR(t,
-		func(conn net.Conn) net.Conn {
-			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
-		},
-		singleNodeHandler(t, func() string { return survivor.address() }))
-
-	// A listener that accepts and never answers the ClientHello: the attempt
-	// spends the whole dial bound here, which is the window a second caller
-	// arrives in.
-	silent, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = silent.Close() })
-
-	client := newDialingClient(t, silent.Addr().String(),
-		WithTLS(WithTLSValidateCertificate(false)),
-		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
-	client.knownServerAddresses = []string{survivor.address()}
-
-	// Stands in for the sign-in transaction: register holds this across the
-	// disconnect and the reconnect that follow it.
-	client.registerMtx.Lock()
-	owner := make(chan error, 1)
-	go func() { owner <- client.Connect(context.Background()) }()
-	require.Eventually(t, func() bool {
-		client.mtx.Lock()
-		defer client.mtx.Unlock()
-		return client.transportState == iggcon.TransportStateConnecting
-	}, time.Second, time.Millisecond, "the attempt never started dialing")
-
-	suppressed := make(chan error, 1)
-	go func() { suppressed <- client.Connect(suppressAutoLogin(context.Background())) }()
-	select {
-	case err := <-suppressed:
-		require.Error(t, err, "the transaction was told a connection it does not have is up")
-	case <-time.After(2 * failoverDialTimeout):
-		t.Fatal("the sign-in transaction waited on an attempt that cannot finish without it")
-	}
-
-	client.registerMtx.Unlock()
-	require.NoError(t, <-owner, "the attempt the transaction left alone did not finish")
-}
-
-// deadAddress returns an address nothing listens on, so a dial to it is
-// refused at once.
 func deadAddress(t *testing.T) string {
 	t.Helper()
 

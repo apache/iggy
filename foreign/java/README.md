@@ -93,7 +93,7 @@ session. Logout, lease expiry and user deactivation end session access.
 
 ## Quick Start
 
-`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It polls each partition through a separate connection to the primary of that partition.
+`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It maintains one shared-session connection per advertised replica and multiplexes partition requests on those connections.
 
 Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
@@ -207,8 +207,8 @@ var client = Iggy.tcpClientBuilder()
 
 ### Event Loop Threads
 
-Each TCP client drives a single connection, so by default it creates an event loop group
-with one thread. An application that opens many clients can instead register them all on
+Each TCP client shares one event loop group across its replica connections. By default
+the group has one thread. An application that opens many clients can instead register them all on
 one caller-owned group. The clients never shut that group down. Close the clients first,
 then shut the group down:
 
@@ -252,6 +252,32 @@ info.getUserAgent();   // User-Agent string for HTTP
 ## Exception Handling
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
+
+### Retained TCP operations
+
+Replicated mutations serialize within their metadata or partition lane. If a sent mutation's
+outcome cannot be established, `IggyOperationException` carries
+`IggyErrorCode.OPERATION_UNCERTAIN` and its exact operation ID. A later mutation in the
+same lane returns `LANE_BLOCKED` with that ID; unrelated partitions and pure reads continue.
+
+Both blocking and async TCP clients expose `resolveOperation(operationId, timeout)` and
+`abandonOperation(operationId)`. Resolve reuses the original request bytes and returns the
+response body, or the proved business error. Abandon releases local retention; it does not
+cancel or undo server work. `OPERATION_NOT_RETAINED` after abandonment or session reset
+provides no evidence that the original mutation was uncommitted. Do not resend it automatically.
+Java `long` preserves all 64 operation-ID bits, including negative values. Use
+`Long.toUnsignedString(operationId)` when displaying an ID.
+
+The TCP builders accept `.pendingOperations(count, bytes)`, defaulting to 256 mutations
+and 64 MiB across active and retained frames. Admission waits within the call's existing
+deadline; an oversized frame fails locally. Cancellation removes only the caller's waiter.
+A mutation already sent may remain retained. The byte limit counts admitted frozen frames and
+writer references; API input snapshots and queued serialization buffers are outside this limit.
+
+Auto-commit and `Next` polls use a temporary partition ordering barrier. Their success
+acknowledges local admission, not replicated offset durability. Code 57 or a lost reply ends
+the call with unknown progress and releases the barrier; these polls are never retained or
+replayed after uncertainty. Explicit non-admission (58 or 89) may retry within the same deadline.
 
 ## Examples
 

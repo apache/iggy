@@ -183,9 +183,6 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     // Options catalog discovery
     CommandMeta::non_replicated(DESCRIBE_OPTIONS_CODE, "options.describe"),
     CommandMeta::non_replicated(BIND_SESSION_CODE, "session.bind"),
-    CommandMeta::non_replicated(GET_POLL_ROUTING_CODE, "message.poll_routing"),
-    CommandMeta::non_replicated(POLL_MESSAGES_ON_PRIMARY_CODE, "message.poll_primary"),
-    CommandMeta::non_replicated(GET_CONSUMER_OFFSET_ROUTING_CODE, "consumer_offset.routing"),
     CommandMeta::non_replicated(GET_PARTITION_ROUTE_CODE, "partition.route"),
 ];
 
@@ -247,10 +244,7 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         LOGIN_REGISTER_WITH_PAT_CODE => 46,
         DESCRIBE_OPTIONS_CODE => 47,
         BIND_SESSION_CODE => 48,
-        GET_POLL_ROUTING_CODE => 49,
-        POLL_MESSAGES_ON_PRIMARY_CODE => 50,
-        GET_CONSUMER_OFFSET_ROUTING_CODE => 51,
-        GET_PARTITION_ROUTE_CODE => 52,
+        GET_PARTITION_ROUTE_CODE => 49,
         _ => return None,
     };
     Some(&COMMAND_TABLE[idx])

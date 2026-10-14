@@ -54,6 +54,8 @@ __all__ = [
     "Partition",
     "PartitionContext",
     "Partitioning",
+    "PendingOperationError",
+    "PendingOperationsConfig",
     "Permissions",
     "PollingStrategy",
     "ProducerSendError",
@@ -1385,6 +1387,21 @@ class IggyClient:
         Raises:
             RuntimeError: If the connection cannot be closed.
         """
+    def resolve_operation(
+        self, operation_id: builtins.int, *, timeout: datetime.timedelta | None = None
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Replays the exact retained operation until its final result or the deadline.
+        A committed rejection raises its original error and frees the lane.
+        Uncertainty keeps the operation retained. HTTP does not support this operation.
+        `timeout` must be a positive timedelta; omission or None uses 30 seconds.
+        """
+    def abandon_operation(
+        self, operation_id: builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Releases a retained operation without claiming whether it committed.
+        """
     def shutdown(self) -> collections.abc.Awaitable[None]:
         r"""
         Closes the connection. Shut down background producers with
@@ -1872,8 +1889,6 @@ class IggyClient:
         topic_partitions_count: builtins.int = 1,
         topic_message_expiry: IggyExpiry | None = None,
         topic_max_size: MaxTopicSize | None = None,
-        send_retries: builtins.int | None = 3,
-        send_retry_interval: datetime.timedelta | None = ...,
         topic_durability: Durability | None = None,
     ) -> collections.abc.Awaitable[IggyProducer]:
         r"""
@@ -2379,6 +2394,33 @@ class Partitioning:
         """
 
 @typing.final
+class PendingOperationError(builtins.RuntimeError):
+    r"""
+    An operation whose retained identity is needed to recover or release its lane.
+    """
+    @property
+    def operation_id(self) -> builtins.int: ...
+    @property
+    def code(self) -> builtins.int: ...
+    @property
+    def kind(self) -> builtins.str: ...
+
+@typing.final
+class PendingOperationsConfig:
+    r"""
+    Client-wide limits for active and retained mutations across every connection.
+    Queued writer frames keep their bytes charged until their last owner drops.
+    """
+    @property
+    def max_operations(self) -> builtins.int: ...
+    @property
+    def max_bytes(self) -> builtins.int: ...
+    def __new__(
+        cls, *, max_operations: builtins.int = 256, max_bytes: builtins.int = 67108864
+    ) -> PendingOperationsConfig: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Permissions:
     r"""
     The permissions of a user: global permissions applied to all streams,
@@ -2449,6 +2491,11 @@ class ProducerSendError(builtins.RuntimeError):
     A direct producer error that preserves partial-send recovery state.
     """
     @property
+    def operation_id(self) -> builtins.int | None:
+        r"""
+        The retained operation to resolve or abandon, when the send is uncertain or blocked.
+        """
+    @property
     def cause(self) -> builtins.str:
         r"""
         The underlying Iggy error message.
@@ -2480,6 +2527,8 @@ class QuicConfig:
     @property
     def server_name(self) -> builtins.str: ...
     @property
+    def pending_operations(self) -> PendingOperationsConfig: ...
+    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> QuicReconnectionConfig: ...
@@ -2510,6 +2559,7 @@ class QuicConfig:
         client_address: builtins.str | None = None,
         server_name: builtins.str | None = None,
         auto_login: AutoLogin | None = None,
+        pending_operations: PendingOperationsConfig | None = None,
         reconnection: QuicReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
         response_buffer_size: builtins.int | None = None,
@@ -2535,6 +2585,7 @@ class QuicConfig:
             server_name: Server name used for the QUIC/TLS handshake. Defaults to
                 `localhost`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
@@ -3099,6 +3150,8 @@ class TcpConfig:
     @property
     def server_address(self) -> builtins.str: ...
     @property
+    def pending_operations(self) -> PendingOperationsConfig: ...
+    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> TcpReconnectionConfig: ...
@@ -3119,6 +3172,7 @@ class TcpConfig:
         *,
         server_address: builtins.str | None = None,
         auto_login: AutoLogin | None = None,
+        pending_operations: PendingOperationsConfig | None = None,
         reconnection: TcpReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
         tls_enabled: builtins.bool | None = None,
@@ -3133,6 +3187,7 @@ class TcpConfig:
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             tls_enabled: Whether to connect over TLS. Defaults to disabled.
@@ -3491,6 +3546,8 @@ class WebSocketConfig:
     @property
     def server_address(self) -> builtins.str: ...
     @property
+    def pending_operations(self) -> PendingOperationsConfig: ...
+    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> WebSocketReconnectionConfig: ...
@@ -3511,6 +3568,7 @@ class WebSocketConfig:
         *,
         server_address: builtins.str | None = None,
         auto_login: AutoLogin | None = None,
+        pending_operations: PendingOperationsConfig | None = None,
         reconnection: WebSocketReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
         framing: WebSocketFramingConfig | None = None,
@@ -3525,6 +3583,7 @@ class WebSocketConfig:
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8092`.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
             reconnection: Reconnection policy. Defaults to `WebSocketReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
             framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.

@@ -19,10 +19,22 @@
 
 package org.apache.iggy.client.async.tcp.vsr;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.util.concurrent.EventExecutor;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.partition.PartitionContext;
 
+import java.math.BigInteger;
 import java.security.SecureRandom;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * VSR client identity and dedup state, mirroring
@@ -48,6 +60,13 @@ public final class ConsensusSession {
     private long metadataWatermark;
     private boolean shared;
     private ConsensusSession parent;
+    private final Map<LaneKey, Ticket> lanes = new HashMap<>();
+    private final Map<Long, Ticket> retained = new HashMap<>();
+    private CompletableFuture<Void> admissionChanged = new CompletableFuture<>();
+    private int maxPendingOperations = 256;
+    private long maxPendingBytes = 64L * 1024 * 1024;
+    private int pendingOperations;
+    private long pendingBytes;
 
     public ConsensusSession() {
         regenerateClientId();
@@ -66,6 +85,10 @@ public final class ConsensusSession {
 
     /** Binds the fence epoch returned by a committed Register reply. */
     synchronized void bind(long sessionEpoch) {
+        if (parent != null) {
+            parent.bind(sessionEpoch);
+            return;
+        }
         if (sessionEpoch == 0) {
             throw new IllegalStateException("Register reply carried a zero session epoch");
         }
@@ -78,9 +101,8 @@ public final class ConsensusSession {
 
     /**
      * Replicated ops (metadata and partition) consume the monotonic VSR dedup
-     * counter. The wire field is a u64 but Java has no unsigned long, so the
-     * counter is refused at {@link Long#MAX_VALUE} rather than wrapping
-     * negative and sending an id below the server's watermark.
+     * unsigned counter. Negative Java values preserve the upper half of the
+     * wire u64 range; zero marks exhaustion after the final valid id.
      *
      * <p>Exhaustion is terminal for this instance. {@link #beginRegister()}
      * deliberately carries the counter across a re-login to keep pending-reply
@@ -92,14 +114,13 @@ public final class ConsensusSession {
     long nextRequestId() {
         ConsensusSession numbering;
         synchronized (this) {
-            if (session == null) {
-                throw new IggyNotConnectedException("Not authenticated, call login first");
-            }
             numbering = parent;
             if (numbering == null) {
-                if (requestCounter == Long.MAX_VALUE) {
-                    throw new IllegalStateException(
-                            "VSR request counter exhausted, create a fresh client instance (reconnecting preserves the counter)");
+                if (session == null) {
+                    throw new IggyNotConnectedException("Not authenticated, call login first");
+                }
+                if (requestCounter == 0) {
+                    throw new IggyServerException(IggyErrorCode.REQUEST_ID_EXHAUSTED.getCode());
                 }
                 return requestCounter++;
             }
@@ -110,9 +131,12 @@ public final class ConsensusSession {
 
     long nextCorrelationId() {
         synchronized (this) {
+            if (parent != null) {
+                return parent.nextCorrelationId();
+            }
             if (session == null) {
-                if (requestCounter == Long.MAX_VALUE) {
-                    throw new IllegalStateException("VSR request counter exhausted");
+                if (requestCounter == 0) {
+                    throw new IggyServerException(IggyErrorCode.REQUEST_ID_EXHAUSTED.getCode());
                 }
                 return requestCounter++;
             }
@@ -121,6 +145,9 @@ public final class ConsensusSession {
     }
 
     public synchronized long[] identity() {
+        if (parent != null) {
+            return parent.identity();
+        }
         return new long[] {clientIdLow, clientIdHigh, boundSession()};
     }
 
@@ -129,10 +156,16 @@ public final class ConsensusSession {
     }
 
     synchronized long sessionOrZero() {
+        if (parent != null) {
+            return parent.sessionOrZero();
+        }
         return session == null ? 0 : session;
     }
 
     public synchronized long boundSession() {
+        if (parent != null) {
+            return parent.boundSession();
+        }
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
         }
@@ -140,22 +173,34 @@ public final class ConsensusSession {
     }
 
     public synchronized boolean isBound() {
-        return session != null;
+        return parent == null ? session != null : parent.isBound();
     }
 
     /** Ends the local identity after explicit logout or a refused session bind. */
-    public synchronized void reset() {
-        session = null;
-        metadataWatermark = 0;
-        regenerateClientId();
-        generation++;
+    public void reset() {
+        ConsensusSession owner = owner();
+        if (owner != this) {
+            owner.reset();
+            return;
+        }
+        List<Ticket> active;
+        synchronized (this) {
+            session = null;
+            regenerateClientId();
+            generation++;
+            active = List.copyOf(lanes.values());
+        }
+        active.forEach(Ticket::complete);
     }
 
     public synchronized byte[] bindSecret() {
-        return bindSecret.clone();
+        return parent == null ? bindSecret.clone() : parent.bindSecret();
     }
 
     public synchronized byte[] bindSecret(long clientLow, long clientHigh, long epoch) {
+        if (parent != null) {
+            return parent.bindSecret(clientLow, clientHigh, epoch);
+        }
         if (session == null || session != epoch || clientIdLow != clientLow || clientIdHigh != clientHigh) {
             throw new IggyNotConnectedException("Poll attachment no longer belongs to the parent session");
         }
@@ -163,11 +208,19 @@ public final class ConsensusSession {
     }
 
     /**
-     * Binds another connection to the identity of {@code parent}. Replicated requests
-     * take their ids from the parent's counter: the partition deduplicates by client
+     * Shares the logical identity with a physical connection. Replicated requests
+     * take their ids from the owner's counter: the partition deduplicates by client
      * and request id whichever connection carries them, so a counter of this
      * connection would reuse ids the server already answered.
      */
+    public synchronized void follow(ConsensusSession owner) {
+        if (owner == this) {
+            throw new IggyInvalidArgumentException("A physical connection needs a distinct session owner");
+        }
+        parent = owner.owner();
+        shared = true;
+    }
+
     public synchronized void bindShared(
             ConsensusSession parent, long clientLow, long clientHigh, long epoch, byte[] secret) {
         if (parent == null
@@ -183,7 +236,7 @@ public final class ConsensusSession {
         clientIdLow = clientLow;
         clientIdHigh = clientHigh;
         System.arraycopy(secret, 0, bindSecret, 0, BIND_SECRET_BYTES);
-        this.parent = parent;
+        this.parent = parent.owner();
         shared = true;
     }
 
@@ -198,21 +251,149 @@ public final class ConsensusSession {
     }
 
     public synchronized long metadataWatermark() {
-        return metadataWatermark;
+        return parent == null ? metadataWatermark : parent.metadataWatermark();
     }
 
     synchronized void observeMetadata(long commit) {
+        if (parent != null) {
+            parent.observeMetadata(commit);
+            return;
+        }
         if (Long.compareUnsigned(commit, metadataWatermark) > 0) {
             metadataWatermark = commit;
         }
     }
 
     synchronized long clientIdLow() {
-        return clientIdLow;
+        return parent == null ? clientIdLow : parent.clientIdLow();
     }
 
     synchronized long clientIdHigh() {
-        return clientIdHigh;
+        return parent == null ? clientIdHigh : parent.clientIdHigh();
+    }
+
+    public ConsensusSession owner() {
+        ConsensusSession numbering;
+        synchronized (this) {
+            numbering = parent;
+        }
+        return numbering == null ? this : numbering.owner();
+    }
+
+    public synchronized void configurePendingOperations(int count, long bytes) {
+        if (count <= 0 || bytes <= 0 || pendingOperations != 0 || pendingBytes != 0) {
+            throw new IggyInvalidArgumentException(
+                    "Pending operation limits must be positive and configured before use");
+        }
+        maxPendingOperations = count;
+        maxPendingBytes = bytes;
+    }
+
+    public CompletableFuture<Ticket> acquire(
+            LaneKey lane, boolean mutation, long frameBytes, long deadline, EventExecutor executor) {
+        ConsensusSession owner = owner();
+        if (owner != this) {
+            return owner.acquire(lane, mutation, frameBytes, deadline, executor);
+        }
+        CompletableFuture<Ticket> result = new CompletableFuture<>();
+        var timer = executor.schedule(
+                () -> result.completeExceptionally(
+                        new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode())),
+                Math.max(0, deadline - System.nanoTime()),
+                TimeUnit.NANOSECONDS);
+        result.whenComplete((ticket, error) -> timer.cancel(false));
+        acquireWhenAvailable(lane, mutation, frameBytes, deadline, result);
+        return result;
+    }
+
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private void acquireWhenAvailable(
+            LaneKey lane, boolean mutation, long frameBytes, long deadline, CompletableFuture<Ticket> result) {
+        CompletableFuture<Void> changed = null;
+        Ticket admitted = null;
+        RuntimeException failure = null;
+        synchronized (this) {
+            if (result.isDone()) {
+                return;
+            }
+            Ticket blocking = lanes.get(lane);
+            if (blocking != null && blocking.retained) {
+                failure = new IggyOperationException(IggyErrorCode.LANE_BLOCKED, blocking.operationId);
+            } else if (mutation && frameBytes > maxPendingBytes) {
+                failure = new IggyInvalidArgumentException("Request exceeds the pending operation byte limit");
+            } else if (deadline - System.nanoTime() <= 0) {
+                failure = new IggyServerException(IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+            } else if (blocking != null
+                    || (mutation
+                            && (pendingOperations >= maxPendingOperations
+                                    || frameBytes > maxPendingBytes - pendingBytes))) {
+                changed = admissionChanged;
+            } else {
+                admitted = new Ticket(this, lane, mutation, frameBytes, generation);
+                lanes.put(lane, admitted);
+                if (mutation) {
+                    pendingOperations++;
+                    pendingBytes += frameBytes;
+                }
+            }
+        }
+        if (failure != null) {
+            result.completeExceptionally(failure);
+        } else if (admitted != null) {
+            if (!result.complete(admitted)) {
+                admitted.complete();
+            }
+        } else {
+            changed.thenRun(() -> acquireWhenAvailable(lane, mutation, frameBytes, deadline, result));
+        }
+    }
+
+    public void checkRetained(LaneKey lane) {
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            Ticket ticket = owner.lanes.get(lane);
+            if (ticket != null && ticket.retained) {
+                throw new IggyOperationException(IggyErrorCode.LANE_BLOCKED, ticket.operationId);
+            }
+        }
+    }
+
+    public Ticket resume(long operationId) {
+        ConsensusSession owner = owner();
+        if (owner != this) {
+            return owner.resume(operationId);
+        }
+        synchronized (this) {
+            Ticket ticket = retained.get(operationId);
+            if (ticket == null || ticket.resolving) {
+                throw new IggyOperationException(
+                        ticket == null ? IggyErrorCode.OPERATION_NOT_RETAINED : IggyErrorCode.LANE_BLOCKED,
+                        operationId);
+            }
+            ticket.resolving = true;
+            return ticket;
+        }
+    }
+
+    public void abandon(long operationId) {
+        Ticket ticket;
+        ConsensusSession owner = owner();
+        synchronized (owner) {
+            ticket = owner.retained.get(operationId);
+            if (ticket == null) {
+                throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
+            }
+        }
+        ticket.complete();
+    }
+
+    private void changed() {
+        CompletableFuture<Void> signal;
+        synchronized (this) {
+            signal = admissionChanged;
+            admissionChanged = new CompletableFuture<>();
+        }
+        signal.complete(null);
     }
 
     private void regenerateClientId() {
@@ -221,5 +402,185 @@ public final class ConsensusSession {
             clientIdLow = RANDOM.nextLong();
             clientIdHigh = RANDOM.nextLong();
         } while (clientIdLow == 0 && clientIdHigh == 0);
+    }
+
+    public record LaneKey(long incarnation, long partition) {
+        public static final LaneKey METADATA = new LaneKey(0, 0);
+    }
+
+    /** One lane admission owns one immutable frame; writer aliases keep its bytes charged. */
+    public static final class Ticket {
+        private final ConsensusSession owner;
+        private final LaneKey lane;
+        private final boolean mutation;
+        private final long bytes;
+        private final long generation;
+        private ByteBuf frame;
+        private long operationId;
+        private int commandCode;
+        private byte[] routingBody;
+        private int writers;
+        private boolean completed;
+        private boolean retained;
+        private boolean resolving;
+        private boolean sent;
+        private boolean bytesReleased;
+
+        private Ticket(ConsensusSession owner, LaneKey lane, boolean mutation, long bytes, long generation) {
+            this.owner = owner;
+            this.lane = lane;
+            this.mutation = mutation;
+            this.bytes = bytes;
+            this.generation = generation;
+        }
+
+        public void freeze(ByteBuf request, int command, byte[] target) {
+            synchronized (owner) {
+                if (completed || generation != owner.generation || frame != null) {
+                    throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
+                }
+                operationId = VsrHeaders.readRequestId(request);
+                commandCode = command;
+                routingBody = target;
+                frame = request.retainedDuplicate();
+                writers++;
+            }
+        }
+
+        public boolean hasFrame() {
+            synchronized (owner) {
+                return frame != null;
+            }
+        }
+
+        public ByteBuf frame() {
+            synchronized (owner) {
+                if (completed || frame == null) {
+                    throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
+                }
+                writers++;
+                return frame.retainedDuplicate();
+            }
+        }
+
+        public boolean renewRequestId(ByteBuf attemptFrame) {
+            synchronized (owner) {
+                if (completed || retained || generation != owner.generation) {
+                    throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
+                }
+                if (writers != 1) {
+                    return false;
+                }
+                operationId = owner.nextRequestId();
+                attemptFrame.setLongLE(attemptFrame.readerIndex() + VsrHeaders.REQUEST_ID_OFFSET, operationId);
+                int floorOffset = attemptFrame.readerIndex() + VsrHeaders.REQUEST_METADATA_OP_OFFSET;
+                long capturedFloor = attemptFrame.getLongLE(floorOffset);
+                if (lane.equals(LaneKey.METADATA) && Long.compareUnsigned(owner.metadataWatermark, capturedFloor) > 0) {
+                    attemptFrame.setLongLE(floorOffset, owner.metadataWatermark);
+                }
+                return true;
+            }
+        }
+
+        public PartitionContext context() {
+            synchronized (owner) {
+                if (frame == null) {
+                    throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
+                }
+                int base = frame.readerIndex();
+                return new PartitionContext(
+                        new BigInteger(
+                                Long.toUnsignedString(frame.getLongLE(base + VsrHeaders.REQUEST_INCARNATION_OFFSET))),
+                        new BigInteger(Long.toUnsignedString(
+                                frame.getLongLE(base + VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET))),
+                        new BigInteger(
+                                Long.toUnsignedString(frame.getLongLE(base + VsrHeaders.REQUEST_METADATA_OP_OFFSET))));
+            }
+        }
+
+        public int commandCode() {
+            return commandCode;
+        }
+
+        public byte[] routingBody() {
+            return routingBody;
+        }
+
+        public long operationId() {
+            return operationId;
+        }
+
+        public boolean isMutation() {
+            return mutation;
+        }
+
+        public void startWrite() {
+            synchronized (owner) {
+                if (completed) {
+                    throw new IggyOperationException(IggyErrorCode.OPERATION_NOT_RETAINED, operationId);
+                }
+                sent = true;
+                writers++;
+            }
+        }
+
+        public void finishWrite() {
+            synchronized (owner) {
+                writers--;
+                releaseBytesIfUnused();
+            }
+            owner.changed();
+        }
+
+        public RuntimeException retain() {
+            boolean saved;
+            synchronized (owner) {
+                saved = !completed && mutation && sent && generation == owner.generation;
+                if (saved) {
+                    retained = true;
+                    resolving = false;
+                    owner.retained.put(operationId, this);
+                }
+            }
+            if (saved) {
+                owner.changed();
+                return new IggyOperationException(IggyErrorCode.OPERATION_UNCERTAIN, operationId);
+            }
+            complete();
+            if (mutation && sent) {
+                return new IggyOperationException(IggyErrorCode.OPERATION_UNCERTAIN, operationId);
+            }
+            return new IggyServerException(
+                    sent
+                            ? IggyErrorCode.TRANSIENT_NOT_COMMITTED.getCode()
+                            : IggyErrorCode.TRANSIENT_NOT_ACCEPTED.getCode());
+        }
+
+        public void complete() {
+            synchronized (owner) {
+                if (completed) {
+                    return;
+                }
+                completed = true;
+                owner.lanes.remove(lane, this);
+                owner.retained.remove(operationId, this);
+                if (mutation) {
+                    owner.pendingOperations--;
+                }
+                if (frame != null) {
+                    frame.release();
+                    frame = null;
+                }
+                releaseBytesIfUnused();
+            }
+            owner.changed();
+        }
+
+        private void releaseBytesIfUnused() {
+            if (mutation && completed && writers == 0 && !bytesReleased) {
+                bytesReleased = true;
+                owner.pendingBytes -= bytes;
+            }
+        }
     }
 }

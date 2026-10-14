@@ -18,6 +18,7 @@
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Credentials as RustCredentials,
     HttpClientConfig as RustHttpClientConfig, HttpClientConfigBuilder,
+    PendingOperationsConfig as RustPendingOperationsConfig,
     QuicClientConfig as RustQuicClientConfig, QuicClientConfigBuilder,
     QuicClientReconnectionConfig as RustQuicClientReconnectionConfig,
     TcpClientConfig as RustTcpClientConfig, TcpClientConfigBuilder,
@@ -34,12 +35,57 @@ use pyo3_stub_gen::impl_stub_type;
 use secrecy::SecretString;
 use std::fmt::Display;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::duration::{
     duration_repr, iggy_duration_to_py_delta, millis_repr, millis_to_py_delta,
     py_delta_to_iggy_duration, py_delta_to_millis, reject_zero,
 };
+
+/// Client-wide limits for active and retained mutations across every connection.
+/// Queued writer frames keep their bytes charged until their last owner drops.
+#[gen_stub_pyclass]
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PendingOperationsConfig {
+    inner: RustPendingOperationsConfig,
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PendingOperationsConfig {
+    #[new]
+    #[pyo3(signature = (*, max_operations=RustPendingOperationsConfig::DEFAULT_MAX_OPERATIONS.get(), max_bytes=RustPendingOperationsConfig::DEFAULT_MAX_BYTES.get()))]
+    fn new(max_operations: usize, max_bytes: usize) -> PyResult<Self> {
+        Ok(Self {
+            inner: RustPendingOperationsConfig {
+                max_operations: NonZeroUsize::new(max_operations)
+                    .ok_or_else(|| PyValueError::new_err("'max_operations' must not be zero"))?,
+                max_bytes: NonZeroUsize::new(max_bytes)
+                    .ok_or_else(|| PyValueError::new_err("'max_bytes' must not be zero"))?,
+            },
+        })
+    }
+
+    #[getter]
+    fn max_operations(&self) -> usize {
+        self.inner.max_operations.get()
+    }
+
+    #[getter]
+    fn max_bytes(&self) -> usize {
+        self.inner.max_bytes.get()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PendingOperationsConfig(max_operations={}, max_bytes={})",
+            self.max_operations(),
+            self.max_bytes()
+        )
+    }
+}
 
 /// The credentials replayed by the client every time it (re)connects.
 ///
@@ -249,6 +295,7 @@ impl TcpConfig {
     /// Args:
     ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+    ///     pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
     ///     reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
     ///     tls_enabled: Whether to connect over TLS. Defaults to disabled.
@@ -274,6 +321,7 @@ impl TcpConfig {
         *,
         server_address=None,
         auto_login=None,
+        pending_operations=None,
         reconnection=None,
         heartbeat_interval=None,
         tls_enabled=None,
@@ -288,6 +336,8 @@ impl TcpConfig {
             String,
         >,
         #[gen_stub(override_type(type_repr = "AutoLogin | None"))] auto_login: Option<AutoLogin>,
+        #[gen_stub(override_type(type_repr = "PendingOperationsConfig | None"))]
+        pending_operations: Option<PendingOperationsConfig>,
         #[gen_stub(override_type(type_repr = "TcpReconnectionConfig | None"))] reconnection: Option<
             TcpReconnectionConfig,
         >,
@@ -311,6 +361,9 @@ impl TcpConfig {
             .map_err(|e| invalid_address("server_address", e))?;
         if let Some(auto_login) = auto_login {
             inner.auto_login = auto_login.inner;
+        }
+        if let Some(pending_operations) = pending_operations {
+            inner.pending_operations = pending_operations.inner;
         }
         if let Some(reconnection) = reconnection {
             inner.reconnection = reconnection.inner;
@@ -345,6 +398,13 @@ impl TcpConfig {
     #[getter]
     fn server_address(&self) -> String {
         self.inner.server_address.clone()
+    }
+
+    #[getter]
+    fn pending_operations(&self) -> PendingOperationsConfig {
+        PendingOperationsConfig {
+            inner: self.inner.pending_operations,
+        }
     }
 
     #[getter]
@@ -399,9 +459,10 @@ impl TcpConfig {
             None => "None".to_owned(),
         };
         format!(
-            "TcpConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={}, nodelay={})",
+            "TcpConfig(server_address={:?}, auto_login={}, pending_operations={}, reconnection={}, heartbeat_interval={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={}, nodelay={})",
             self.inner.server_address,
             self.auto_login().__repr__(),
+            self.pending_operations().__repr__(),
             self.reconnection().__repr__(),
             duration_repr(self.inner.heartbeat_interval.get()),
             python_bool(self.inner.tls_enabled),
@@ -557,6 +618,7 @@ impl QuicConfig {
     ///     server_name: Server name used for the QUIC/TLS handshake. Defaults to
     ///         `localhost`.
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+    ///     pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
     ///     reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
     ///     response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
@@ -592,6 +654,7 @@ impl QuicConfig {
         client_address=None,
         server_name=None,
         auto_login=None,
+        pending_operations=None,
         reconnection=None,
         heartbeat_interval=None,
         response_buffer_size=None,
@@ -614,6 +677,8 @@ impl QuicConfig {
         >,
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_name: Option<String>,
         #[gen_stub(override_type(type_repr = "AutoLogin | None"))] auto_login: Option<AutoLogin>,
+        #[gen_stub(override_type(type_repr = "PendingOperationsConfig | None"))]
+        pending_operations: Option<PendingOperationsConfig>,
         #[gen_stub(override_type(type_repr = "QuicReconnectionConfig | None"))]
         reconnection: Option<QuicReconnectionConfig>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
@@ -662,6 +727,9 @@ impl QuicConfig {
         }
         if let Some(auto_login) = auto_login {
             inner.auto_login = auto_login.inner;
+        }
+        if let Some(pending_operations) = pending_operations {
+            inner.pending_operations = pending_operations.inner;
         }
         if let Some(reconnection) = reconnection {
             inner.reconnection = reconnection.inner;
@@ -729,6 +797,13 @@ impl QuicConfig {
     #[getter]
     fn server_name(&self) -> String {
         self.inner.server_name.clone()
+    }
+
+    #[getter]
+    fn pending_operations(&self) -> PendingOperationsConfig {
+        PendingOperationsConfig {
+            inner: self.inner.pending_operations,
+        }
     }
 
     #[getter]
@@ -806,11 +881,12 @@ impl QuicConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "QuicConfig(server_address={:?}, client_address={:?}, server_name={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, response_buffer_size={}, max_concurrent_bidi_streams={}, datagram_send_buffer_size={}, initial_mtu={}, send_window={}, receive_window={}, keep_alive_interval={}, max_idle_timeout={}, validate_certificate={})",
+            "QuicConfig(server_address={:?}, client_address={:?}, server_name={:?}, auto_login={}, pending_operations={}, reconnection={}, heartbeat_interval={}, response_buffer_size={}, max_concurrent_bidi_streams={}, datagram_send_buffer_size={}, initial_mtu={}, send_window={}, receive_window={}, keep_alive_interval={}, max_idle_timeout={}, validate_certificate={})",
             self.inner.server_address,
             self.inner.client_address,
             self.inner.server_name,
             self.auto_login().__repr__(),
+            self.pending_operations().__repr__(),
             self.reconnection().__repr__(),
             duration_repr(self.inner.heartbeat_interval.get()),
             self.inner.response_buffer_size,
@@ -1261,6 +1337,7 @@ impl WebSocketConfig {
     /// Args:
     ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8092`.
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+    ///     pending_operations: Client-wide mutation limits; defaults to 256 operations and 64 MiB.
     ///     reconnection: Reconnection policy. Defaults to `WebSocketReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
     ///     framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.
@@ -1286,6 +1363,7 @@ impl WebSocketConfig {
         *,
         server_address=None,
         auto_login=None,
+        pending_operations=None,
         reconnection=None,
         heartbeat_interval=None,
         framing=None,
@@ -1300,6 +1378,8 @@ impl WebSocketConfig {
             String,
         >,
         #[gen_stub(override_type(type_repr = "AutoLogin | None"))] auto_login: Option<AutoLogin>,
+        #[gen_stub(override_type(type_repr = "PendingOperationsConfig | None"))]
+        pending_operations: Option<PendingOperationsConfig>,
         #[gen_stub(override_type(type_repr = "WebSocketReconnectionConfig | None"))]
         reconnection: Option<WebSocketReconnectionConfig>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
@@ -1324,6 +1404,9 @@ impl WebSocketConfig {
             .map_err(|e| invalid_address("server_address", e))?;
         if let Some(auto_login) = auto_login {
             inner.auto_login = auto_login.inner;
+        }
+        if let Some(pending_operations) = pending_operations {
+            inner.pending_operations = pending_operations.inner;
         }
         if let Some(reconnection) = reconnection {
             inner.reconnection = reconnection.inner;
@@ -1358,6 +1441,13 @@ impl WebSocketConfig {
     #[getter]
     fn server_address(&self) -> String {
         self.inner.server_address.clone()
+    }
+
+    #[getter]
+    fn pending_operations(&self) -> PendingOperationsConfig {
+        PendingOperationsConfig {
+            inner: self.inner.pending_operations,
+        }
     }
 
     #[getter]
@@ -1414,9 +1504,10 @@ impl WebSocketConfig {
             None => "None".to_owned(),
         };
         format!(
-            "WebSocketConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, framing={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={})",
+            "WebSocketConfig(server_address={:?}, auto_login={}, pending_operations={}, reconnection={}, heartbeat_interval={}, framing={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={})",
             self.inner.server_address,
             self.auto_login().__repr__(),
+            self.pending_operations().__repr__(),
             self.reconnection().__repr__(),
             duration_repr(self.inner.heartbeat_interval.get()),
             self.framing().__repr__(),

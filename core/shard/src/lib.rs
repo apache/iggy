@@ -391,7 +391,9 @@ pub enum PartitionRead {
         consumer: PollingConsumer,
     },
     ConsumerOffsetOnPrimary {
-        consumer: PollingConsumer,
+        /// None means the named group no longer exists, so no offset can exist.
+        consumer: Option<PollingConsumer>,
+        metadata: metadata::stm::stream::PollMetadata,
     },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffset {
@@ -399,6 +401,7 @@ pub enum PartitionRead {
     },
     ExternalGroupOffsetOnPrimary {
         group_id: u32,
+        metadata: metadata::stm::stream::PollMetadata,
     },
     /// Cooperative-rebalance classification: the group's last-polled and
     /// committed offsets on this partition, so the join enrichment can tell an

@@ -23,6 +23,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -99,6 +100,7 @@ class AsyncIggyTcpClientSendContextCacheTest {
             assertThat(fake.discoveries).hasValue(3);
 
             fake.incarnations.put(1L, 2L);
+            assertServerError(send(client, 1, 0), HISTORY_UNAVAILABLE);
             send(client, 1, 0).get(5, TimeUnit.SECONDS);
             send(client, 1, 1).get(5, TimeUnit.SECONDS);
             send(client, 2, 0).get(5, TimeUnit.SECONDS);
@@ -177,6 +179,72 @@ class AsyncIggyTcpClientSendContextCacheTest {
                 assertThat(partitions)
                         .containsExactly(0L, 1L, 2L, org.apache.iggy.hash.XxHash32.hashUnsigned(keyed.value()) % 4);
                 assertThat(routes).hasValueGreaterThanOrEqualTo(4);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldRefreshSdkChosenPartitionOnlyOnceAfterDefinitePartitionNotFound() throws Exception {
+        assertPartitionNotFound(Partitioning.balanced(), false, 2);
+    }
+
+    @Test
+    void shouldPreserveExplicitPartitionOnPartitionNotFound() throws Exception {
+        assertPartitionNotFound(Partitioning.partitionId(0L), false, 1);
+    }
+
+    @Test
+    void shouldKeepTheUncertainIdentityInsteadOfReselectingAfterPartitionNotFound() throws Exception {
+        assertPartitionNotFound(Partitioning.balanced(), true, 1);
+    }
+
+    private static void assertPartitionNotFound(Partitioning partitioning, boolean uncertain, int identities)
+            throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            List<Request> sends = new CopyOnWriteArrayList<>();
+            AtomicInteger routes = new AtomicInteger();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    routes.incrementAndGet();
+                    return Response.success(OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), 1));
+                }
+                if (request.operation() == OPERATION_SEND_MESSAGES) {
+                    sends.add(request);
+                    int status = uncertain && sends.size() == 1
+                            ? AsyncTcpConnection.TRANSIENT_NOT_COMMITTED
+                            : IggyErrorCode.PARTITION_NOT_FOUND.getCode();
+                    return Response.error(OPERATION_SEND_MESSAGES, status);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertServerError(
+                        client.messages().sendMessages(STREAM, TopicId.of(1L), partitioning, List.of(Message.of("m"))),
+                        uncertain
+                                ? IggyErrorCode.OPERATION_UNCERTAIN.getCode()
+                                : IggyErrorCode.PARTITION_NOT_FOUND.getCode());
+                assertThat(sends.stream().map(Request::requestId).distinct()).hasSize(identities);
+                assertThat(routes).hasValue(identities);
+                if (uncertain) {
+                    assertServerError(
+                            client.messages()
+                                    .sendMessages(STREAM, TopicId.of(1L), partitioning, List.of(Message.of("next"))),
+                            IggyErrorCode.LANE_BLOCKED.getCode());
+                    assertThat(sends.stream().map(Request::requestId).distinct())
+                            .hasSize(1);
+                }
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }

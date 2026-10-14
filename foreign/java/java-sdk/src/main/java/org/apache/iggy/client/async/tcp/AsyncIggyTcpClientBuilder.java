@@ -88,6 +88,8 @@ public final class AsyncIggyTcpClientBuilder {
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
     private Duration heartbeatInterval = Duration.ofSeconds(5);
+    private int maxPendingOperations = 256;
+    private long maxPendingOperationBytes = 64L * 1024 * 1024;
     private long maxVsrFrameSize = VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE;
     private int ioThreads = AsyncTcpConnection.DEFAULT_IO_THREADS;
     private IoEventLoopGroup eventLoopGroup;
@@ -276,6 +278,16 @@ public final class AsyncIggyTcpClientBuilder {
         return this;
     }
 
+    /** Bounds active and retained mutations; defaults are 256 operations and 64 MiB. */
+    public AsyncIggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        if (count <= 0 || bytes <= 0) {
+            throw new IggyInvalidArgumentException("Pending operation limits must be positive");
+        }
+        maxPendingOperations = count;
+        maxPendingOperationBytes = bytes;
+        return this;
+    }
+
     /**
      * Builds and returns a configured AsyncIggyTcpClient instance.
      * Note: You still need to call {@link AsyncIggyTcpClient#connect()} on the returned client.
@@ -294,7 +306,7 @@ public final class AsyncIggyTcpClientBuilder {
         validateIoThreads();
         validateEventLoopGroup();
 
-        return new AsyncIggyTcpClient(
+        AsyncIggyTcpClient client = new AsyncIggyTcpClient(
                 host,
                 port,
                 username,
@@ -309,6 +321,8 @@ public final class AsyncIggyTcpClientBuilder {
                 Optional.ofNullable(tlsCertificate),
                 Optional.ofNullable(eventLoopGroup),
                 ioThreads);
+        client.configurePendingOperations(maxPendingOperations, maxPendingOperationBytes);
+        return client;
     }
 
     private void validateHost() {

@@ -1164,7 +1164,6 @@ mod tests {
     use iggy_binary_protocol::Command;
     use iggy_binary_protocol::codes::{
         GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, POLL_MESSAGES_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE,
     };
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
@@ -2406,86 +2405,80 @@ mod tests {
     async fn given_a_held_partition_poll_when_ping_follows_should_answer_ping_before_owner_reply() {
         const POLL_REQUEST: u64 = 1;
         const PING_REQUEST: u64 = 2;
-        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE] {
-            let bus = SpyBus::default();
-            let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
-            let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
-            shard.attach_senders(vec![sender]);
-            let shard = Rc::new(shard);
-            let namespace = create_one_partition(&shard);
-            shard
-                .shards_table()
-                .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
-            commit_root_session(&shard);
-            let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-            let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
-            bind_root_session(&shard, host.sessions()).await;
-            let body = PollMessagesRequest {
-                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-                stream_id: WireIdentifier::numeric(0),
-                topic_id: WireIdentifier::numeric(0),
-                partition_id: Some(0),
-                strategy: WirePollingStrategy::offset(0),
-                count: 1,
-                auto_commit: false,
-            }
-            .to_bytes();
-            let mut poll = wire_request(
-                Operation::NonReplicated,
-                ROOT_CLIENT,
-                ROOT_SESSION,
-                POLL_REQUEST,
-                &body,
-            );
-            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
-            );
-            header.reserved[..4].copy_from_slice(&code.to_le_bytes());
-            header.partition_incarnation = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .created_revision_for_namespace(namespace)
-                .unwrap();
-            host.on_client_request(ROOT_TRANSPORT, poll.into_generic());
-            settle().await;
-            let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                read: PartitionRead::PollOnPrimary { .. },
-                reply,
-                ..
-            }) = owner_inbox
-                .try_recv()
-                .expect("the poll must reach its partition owner")
-            else {
-                panic!("the owner must receive a primary-gated poll");
-            };
-            assert!(bus.client_replies.borrow().is_empty());
-
-            host.on_client_request(
-                ROOT_TRANSPORT,
-                root_read(PING_CODE, PING_REQUEST).into_generic(),
-            );
-            await_replies(&bus, 1).await;
-            {
-                let replies = bus.client_replies.borrow();
-                assert_eq!(
-                    replies.len(),
-                    1,
-                    "PING must not wait for partition I/O on code {code}"
-                );
-                assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
-            }
-            reply
-                .try_send(PartitionReadReply::Rejected(
-                    IggyError::TransientNotAccepted,
-                ))
-                .unwrap();
-            await_replies(&bus, 2).await;
-            let replies = bus.client_replies.borrow();
-            assert_eq!(replies.len(), 2);
-            assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
+        bind_root_session(&shard, host.sessions()).await;
+        let body = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::offset(0),
+            count: 1,
+            auto_commit: false,
         }
+        .to_bytes();
+        let mut poll = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            POLL_REQUEST,
+            &body,
+        );
+        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut poll.as_mut_slice()[..size_of::<RequestHeader>()],
+        );
+        header.reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+        header.partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        host.on_client_request(ROOT_TRANSPORT, poll.into_generic());
+        settle().await;
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            read: PartitionRead::PollOnPrimary { .. },
+            reply,
+            ..
+        }) = owner_inbox
+            .try_recv()
+            .expect("the poll must reach its partition owner")
+        else {
+            panic!("the owner must receive a primary-gated poll");
+        };
+        assert!(bus.client_replies.borrow().is_empty());
+
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            root_read(PING_CODE, PING_REQUEST).into_generic(),
+        );
+        await_replies(&bus, 1).await;
+        {
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "PING must not wait for partition I/O");
+            assert_eq!(reply_request(&replies[0].1), PING_REQUEST);
+        }
+        reply
+            .try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ))
+            .unwrap();
+        await_replies(&bus, 2).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
     }
 
     #[compio::test]

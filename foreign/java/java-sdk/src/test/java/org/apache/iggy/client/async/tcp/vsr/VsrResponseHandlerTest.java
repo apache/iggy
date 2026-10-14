@@ -116,6 +116,7 @@ class VsrResponseHandlerTest {
         ByteBuf truncateReply =
                 replyFrame(VsrOperation.TRUNCATE_PARTITION, 7, Unpooled.buffer().writeIntLE(0));
         truncateReply.setLongLE(VsrHeaders.REPLY_COMMIT_OFFSET, 11);
+        truncateReply.setLongLE(VsrHeaders.REPLY_OP_OFFSET, 11);
         channel.writeInbound(truncateReply);
         truncated.get().release();
         assertThat(session.metadataWatermark()).isEqualTo(11);
@@ -123,6 +124,7 @@ class VsrResponseHandlerTest {
         CompletableFuture<ByteBuf> sent = enqueue(VsrOperation.SEND_MESSAGES, 8);
         ByteBuf partitionReply = replyFrame(VsrOperation.SEND_MESSAGES, 8, Unpooled.EMPTY_BUFFER);
         partitionReply.setLongLE(VsrHeaders.REPLY_COMMIT_OFFSET, 99);
+        partitionReply.setLongLE(VsrHeaders.REPLY_OP_OFFSET, 99);
         channel.writeInbound(partitionReply);
         sent.get().release();
         assertThat(session.metadataWatermark()).isEqualTo(11);
@@ -243,16 +245,23 @@ class VsrResponseHandlerTest {
     }
 
     @Test
-    void shouldCloseChannelWhenResponseDeadlineExpires() {
+    void shouldExpireOnlyOneRequestAndIgnoreItsLateReply() {
         CompletableFuture<ByteBuf> pending = new CompletableFuture<>();
         ByteBuf request = requestFrame(VsrOperation.NON_REPLICATED, 7);
         handler.registerRequest(channel, request, pending, System.nanoTime(), 1);
         request.release();
 
+        CompletableFuture<ByteBuf> other = enqueue(VsrOperation.NON_REPLICATED, 8);
         channel.runScheduledPendingTasks();
+        channel.writeInbound(replyFrame(VsrOperation.NON_REPLICATED, 7, Unpooled.EMPTY_BUFFER));
+        channel.writeInbound(
+                replyFrame(VsrOperation.NON_REPLICATED, 8, Unpooled.buffer().writeByte(42)));
 
-        assertThat(channel.isActive()).isFalse();
+        assertThat(channel.isActive()).isTrue();
         assertThatThrownBy(pending::join).hasCauseInstanceOf(IggyTimeoutException.class);
+        ByteBuf response = other.join();
+        assertThat(response.readByte()).isEqualTo((byte) 42);
+        response.release();
     }
 
     @Test
@@ -287,6 +296,7 @@ class VsrResponseHandlerTest {
 
         CompletableFuture<ByteBuf> inFlight = new CompletableFuture<>();
         long beforeLoginId = registerEncodedSend(encoder, inFlight);
+        long[] beforeIdentity = session.identity();
 
         session.reset();
         ByteBuf loginPayload = loginUserPayload();
@@ -300,10 +310,16 @@ class VsrResponseHandlerTest {
         assertThat(afterLoginId).isNotEqualTo(beforeLoginId);
         assertThat(channel.isActive()).isTrue();
 
-        channel.writeInbound(
-                replyFrame(VsrOperation.SEND_MESSAGES, afterLoginId, Unpooled.wrappedBuffer(new byte[] {2})));
-        channel.writeInbound(
-                replyFrame(VsrOperation.SEND_MESSAGES, beforeLoginId, Unpooled.wrappedBuffer(new byte[] {1})));
+        ByteBuf afterReply =
+                replyFrame(VsrOperation.SEND_MESSAGES, afterLoginId, Unpooled.wrappedBuffer(new byte[] {2}));
+        afterReply.setLongLE(VsrHeaders.REPLY_CLIENT_OFFSET, session.identity()[0]);
+        afterReply.setLongLE(VsrHeaders.REPLY_CLIENT_OFFSET + Long.BYTES, session.identity()[1]);
+        ByteBuf beforeReply =
+                replyFrame(VsrOperation.SEND_MESSAGES, beforeLoginId, Unpooled.wrappedBuffer(new byte[] {1}));
+        beforeReply.setLongLE(VsrHeaders.REPLY_CLIENT_OFFSET, beforeIdentity[0]);
+        beforeReply.setLongLE(VsrHeaders.REPLY_CLIENT_OFFSET + Long.BYTES, beforeIdentity[1]);
+        channel.writeInbound(afterReply);
+        channel.writeInbound(beforeReply);
 
         ByteBuf inFlightResponse = inFlight.get();
         ByteBuf afterLoginResponse = afterLogin.get();
@@ -314,6 +330,27 @@ class VsrResponseHandlerTest {
             inFlightResponse.release();
             afterLoginResponse.release();
         }
+    }
+
+    @Test
+    void shouldPreserveMetadataFloorAndFenceOldSessionReplyEffectsAfterReset() throws Exception {
+        session.bind(42);
+        session.observeMetadata(11);
+        var metadata = enqueue(VsrOperation.CREATE_STREAM, 7);
+        var logout = enqueue(VsrOperation.LOGOUT, 8);
+        ByteBuf oldMetadata =
+                replyFrame(VsrOperation.CREATE_STREAM, 7, Unpooled.buffer().writeIntLE(0));
+        oldMetadata.setLongLE(VsrHeaders.REPLY_OP_OFFSET, 22);
+        oldMetadata.setLongLE(VsrHeaders.REPLY_COMMIT_OFFSET, 22);
+        ByteBuf oldLogout = replyFrame(VsrOperation.LOGOUT, 8, Unpooled.EMPTY_BUFFER);
+        session.reset();
+        session.bind(43);
+        channel.writeInbound(oldMetadata);
+        channel.writeInbound(oldLogout);
+        metadata.get().release();
+        logout.get().release();
+        assertThat(session.boundSession()).isEqualTo(43);
+        assertThat(session.metadataWatermark()).isEqualTo(11);
     }
 
     @Test
@@ -351,13 +388,60 @@ class VsrResponseHandlerTest {
         channel.writeInbound(
                 replyFrame(VsrOperation.DELETE_TOPIC, 7, Unpooled.buffer().writeIntLE(0)));
 
-        assertThat(channel.isActive()).isFalse();
+        assertThat(channel.isActive()).isTrue();
         assertThat(rawErrorCode(pending)).isEqualTo(VsrHeaders.ERROR_INVALID_COMMAND);
+    }
+
+    @Test
+    void shouldProveCommittedBusinessRejectionOnlyForTheExactRequest() {
+        int[] mismatchedOffsets = {
+            VsrHeaders.REPLY_CLIENT_OFFSET, VsrHeaders.REPLY_CHECKSUM_OFFSET,
+            VsrHeaders.REPLY_INCARNATION_OFFSET, VsrHeaders.REPLY_OP_OFFSET,
+            VsrHeaders.REPLY_COMMITTED_RESULT_OFFSET
+        };
+        for (int index = 0; index <= mismatchedOffsets.length; index++) {
+            long requestId = index + 1;
+            CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+            ByteBuf request = requestFrame(VsrOperation.DELETE_STREAM, requestId);
+            request.setLongLE(0, 99);
+            request.setLongLE(VsrHeaders.REQUEST_CHECKSUM_OFFSET, 13);
+            VsrResponseHandler.PendingRequest pending = handler.registerRequest(
+                    channel, request, result, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), 203);
+            request.release();
+            ByteBuf body = Unpooled.buffer().writeIntLE(1).writeIntLE(0).writeIntLE(1010);
+            ByteBuf reply = replyFrame(VsrOperation.DELETE_STREAM, requestId, body);
+            reply.setLongLE(VsrHeaders.REPLY_CHECKSUM_OFFSET, 13);
+            if (index < mismatchedOffsets.length) {
+                int offset = mismatchedOffsets[index];
+                reply.setByte(offset, reply.getByte(offset) + 1);
+            }
+            channel.writeInbound(reply);
+            assertThat(rawErrorCode(result))
+                    .isEqualTo(index < mismatchedOffsets.length - 1 ? VsrHeaders.ERROR_INVALID_COMMAND : 1010);
+            assertThat(pending.isCommitted())
+                    .as("proof mismatch case %s", index)
+                    .isEqualTo(index == mismatchedOffsets.length);
+        }
+    }
+
+    @Test
+    void shouldIgnoreCancelledMetadataReplyWithoutAdvancingTheFrontier() {
+        CompletableFuture<ByteBuf> cancelled = enqueue(VsrOperation.CREATE_STREAM, 7);
+        CompletableFuture<ByteBuf> other = enqueue(VsrOperation.NON_REPLICATED, 8);
+        cancelled.cancel(false);
+        channel.writeInbound(
+                replyFrame(VsrOperation.CREATE_STREAM, 7, Unpooled.buffer().writeIntLE(0)));
+        channel.writeInbound(replyFrame(VsrOperation.NON_REPLICATED, 8, Unpooled.EMPTY_BUFFER));
+        other.join().release();
+        assertThat(channel.isActive()).isTrue();
+        assertThat(session.metadataWatermark()).isZero();
     }
 
     private CompletableFuture<ByteBuf> enqueue(int operation, long requestId) {
         CompletableFuture<ByteBuf> future = new CompletableFuture<>();
-        handler.registerRequest(future, operation, requestId);
+        ByteBuf request = requestFrame(operation, requestId);
+        handler.registerRequest(channel, request, future, System.nanoTime() + TimeUnit.MINUTES.toNanos(1), 1);
+        request.release();
         return future;
     }
 
@@ -394,18 +478,25 @@ class VsrResponseHandlerTest {
         return frame;
     }
 
-    private static ByteBuf requestFrame(int operation, long requestId) {
+    private ByteBuf requestFrame(int operation, long requestId) {
         ByteBuf frame = emptyFrame();
+        frame.setLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET, session.clientIdLow());
+        frame.setLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET + Long.BYTES, session.clientIdHigh());
         frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
         frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
         return frame;
     }
 
-    private static ByteBuf replyFrame(int operation, long requestId, ByteBuf body) {
+    private ByteBuf replyFrame(int operation, long requestId, ByteBuf body) {
         ByteBuf frame = emptyFrame();
         frame.setByte(VsrHeaders.COMMAND_OFFSET, VsrHeaders.COMMAND_REPLY);
+        frame.setLongLE(VsrHeaders.REPLY_CLIENT_OFFSET, session.clientIdLow());
+        frame.setLongLE(VsrHeaders.REPLY_CLIENT_OFFSET + Long.BYTES, session.clientIdHigh());
         frame.setByte(VsrHeaders.REPLY_OPERATION_OFFSET, operation);
         frame.setLongLE(VsrHeaders.REPLY_REQUEST_OFFSET, requestId);
+        frame.setByte(VsrHeaders.REPLY_COMMITTED_RESULT_OFFSET, VsrHeaders.COMMITTED_RESULT);
+        frame.setLongLE(VsrHeaders.REPLY_OP_OFFSET, 1);
+        frame.setLongLE(VsrHeaders.REPLY_COMMIT_OFFSET, 1);
         frame.setIntLE(VsrHeaders.SIZE_OFFSET, VsrHeaders.HEADER_SIZE + body.readableBytes());
         frame.writeBytes(body);
         body.release();

@@ -659,6 +659,8 @@ pub struct ReplyHeader {
     /// Carved from `reserved` like `user_id` in `RequestHeader` / `PrepareHeader`;
     /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
+    /// Byte 220 is [`Self::COMMITTED_RESULT`] only for a final committed result.
+    /// Zero and unknown values carry no commitment proof.
     pub reserved: [u8; 4],
     /// Echoes the request, and the plain poll reply overwrites it with the
     /// served incarnation. Clients read the served context from the poll
@@ -668,6 +670,7 @@ pub struct ReplyHeader {
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved) == 220);
     assert!(
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
@@ -711,10 +714,13 @@ impl Default for ReplyHeader {
 }
 
 impl ReplyHeader {
+    /// Wire marker for a final committed result, stored in `reserved[0]`.
+    pub const COMMITTED_RESULT: u8 = 1;
+
     /// The reply to a committed prepare.
     ///
-    /// Every field comes from the prepare or is zero, never from the primary's
-    /// live state, so a cached reply replayed by any replica carries the same
+    /// Fields come from the prepare and fixed protocol values, never from the
+    /// primary's live state, so a cached reply replayed by any replica carries the same
     /// bytes for `(client, request)`: `view` is the commit-time view and
     /// `replica` the original primary's id. `commit` is the prepare's `op`, not
     /// `commit_max`, because it drives the `ClientTable` eviction order and
@@ -735,6 +741,7 @@ impl ReplyHeader {
             timestamp: prepare_header.timestamp,
             request: prepare_header.request,
             operation: prepare_header.operation,
+            reserved: [Self::COMMITTED_RESULT, 0, 0, 0],
             partition_incarnation: prepare_header.partition_incarnation,
             ..Self::default()
         }
@@ -768,6 +775,15 @@ impl ReplyHeader {
             partition_incarnation: request_header.partition_incarnation,
             ..Self::default()
         }
+    }
+
+    /// Header evidence of a final committed result. The caller must also validate
+    /// the result body and its correlation with the original request.
+    #[must_use]
+    pub fn has_committed_result(&self) -> bool {
+        self.command == Command::Reply
+            && self.status == 0
+            && self.reserved[0] == Self::COMMITTED_RESULT
     }
 }
 
@@ -3405,6 +3421,7 @@ mod tests {
         use std::mem::offset_of;
         assert_eq!(size_of::<ReplyHeader>(), HEADER_SIZE);
         assert_eq!(offset_of!(ReplyHeader, status), 216);
+        assert_eq!(offset_of!(ReplyHeader, reserved), 220);
         assert_eq!(
             offset_of!(ReplyHeader, reserved) + size_of::<[u8; 36]>(),
             HEADER_SIZE
@@ -3538,9 +3555,28 @@ mod tests {
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
         assert_eq!(reply.status, 0);
-        assert_eq!(reply.reserved, [0; 4]);
+        assert_eq!(reply.reserved, [ReplyHeader::COMMITTED_RESULT, 0, 0, 0]);
+        assert!(reply.has_committed_result());
         assert_eq!(reply.reserved_tail, [0; 24]);
         assert_eq!(reply.partition_incarnation, 19);
+    }
+
+    #[test]
+    fn given_unknown_marker_or_denial_when_reading_reply_should_not_prove_commit() {
+        let mut reply = ReplyHeader::from_prepare(
+            &PrepareHeader::default(),
+            u32::try_from(HEADER_SIZE).unwrap(),
+        );
+        for marker in [0, 2, u8::MAX] {
+            reply.reserved[0] = marker;
+            assert!(!reply.has_committed_result());
+        }
+        reply.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+        reply.status = 1;
+        assert!(!reply.has_committed_result());
+        reply.status = 0;
+        reply.command = Command::Eviction;
+        assert!(!reply.has_committed_result());
     }
 
     #[test]
@@ -3593,6 +3629,7 @@ mod tests {
         assert_eq!(reply.context, 0);
         assert_eq!(reply.operation_padding, [0; 7]);
         assert_eq!(reply.reserved, [0; 4]);
+        assert!(!reply.has_committed_result());
         assert_eq!(reply.reserved_tail, [0; 24]);
         assert_eq!(reply.partition_incarnation, 19);
     }

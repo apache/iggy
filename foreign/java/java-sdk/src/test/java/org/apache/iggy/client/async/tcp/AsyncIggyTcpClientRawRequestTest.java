@@ -53,6 +53,7 @@ import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailov
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.POLL_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.TRANSIENT_NOT_ACCEPTED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.bindBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.client;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.clusterMetadata;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.emptyPoll;
@@ -159,10 +160,22 @@ class AsyncIggyTcpClientRawRequestTest {
                 }
                 throw new IllegalStateException("Unexpected coordinator request: " + request);
             });
-            CompletableFuture<Void> primary = serve(primarySocket, 2, request -> {
+            CompletableFuture<Void> primary = serve(primarySocket, request -> {
                 if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                     controls.add(request);
-                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+                    return Response.success(OPERATION_NON_REPLICATED, bindBody(request));
+                }
+                if (code(request) == GET_PARTITION_ROUTE_CODE) {
+                    controls.add(request);
+                    routes.incrementAndGet();
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            Unpooled.buffer()
+                                    .writeLongLE(INCARNATION)
+                                    .writeLongLE(METADATA_OP)
+                                    .writeIntLE(routes.get())
+                                    .writeIntLE(1)
+                                    .writeByte(1));
                 }
                 if (code(request) == SEND_CODE) {
                     sends.add(request);

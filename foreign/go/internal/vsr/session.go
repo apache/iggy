@@ -134,6 +134,11 @@ func (s *Session) NextRequestID() (uint64, error) {
 	if !s.bound {
 		return 0, ErrNotBound
 	}
+	return s.NextReadRequestID()
+}
+
+// NextReadRequestID keeps reply correlation unique before authentication too.
+func (s *Session) NextReadRequestID() (uint64, error) {
 	for {
 		id := s.requestCounter.Load()
 		if id == math.MaxUint64 {
@@ -162,8 +167,6 @@ func (s *Session) reset() {
 	s.client = newClientID()
 	s.session = 0
 	s.bound = false
-	s.requestCounter = &atomic.Uint64{}
-	s.requestCounter.Store(1)
 	s.registerConsumed = false
 }
 

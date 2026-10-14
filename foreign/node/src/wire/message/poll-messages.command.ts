@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { OperationUncertainError } from '../../client/client.operation.js';
 import { idKey, type Id } from '../identifier.utils.js';
 import type {
   CommandResponse,
@@ -275,7 +276,7 @@ export const pollMessages = (getClient: ClientProvider) =>
             // Retry only when the command stream confirms that the VSR session
             // was reset. Other command, authorization, and decode errors remain
             // terminal for the caller.
-            if (state.sessionGeneration === sessionGeneration ||
+            if (error instanceof OperationUncertainError || state.sessionGeneration === sessionGeneration ||
                 (error instanceof ResponseError &&
                   error.errorCode === TRANSIENT_NOT_COMMITTED))
               throw error;

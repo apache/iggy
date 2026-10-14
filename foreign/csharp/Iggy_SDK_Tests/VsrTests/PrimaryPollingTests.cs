@@ -18,6 +18,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
@@ -64,7 +65,7 @@ public sealed class PrimaryPollingTests
         Assert.Equal(1, cluster.Coordinator.Registrations);
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
         Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(2, cluster.RouteRequests.Length);
         Assert.All(cluster.Primaries, primary =>
         {
             Assert.Equal(1, primary.Connections);
@@ -88,7 +89,7 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
-    public async Task given_cached_route_when_metadata_commits_should_reattach_at_the_acknowledged_floor()
+    public async Task given_cached_route_when_metadata_commits_should_refresh_at_the_acknowledged_floor()
     {
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
@@ -96,9 +97,8 @@ public sealed class PrimaryPollingTests
         await client.DeleteTopicAsync(Stream, Topic, TestContext.Current.CancellationToken);
         await PollAsync(client);
 
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-        Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
-            BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(24))));
+        Assert.Equal(2, cluster.RouteRequests.Length);
+        Assert.Equal(new ulong[] { 0, MetadataCommit }, cluster.RouteRequests.Select(request => request.Context.MetadataOp));
         Assert.Equal(1, cluster.Primaries[0].Connections);
     }
 
@@ -128,7 +128,7 @@ public sealed class PrimaryPollingTests
         }
 
         Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Empty(cluster.RouteRequests);
         Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
 
@@ -150,7 +150,7 @@ public sealed class PrimaryPollingTests
 
         Assert.Equal(metadataReads, cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE));
         Assert.Equal(standalone ? 2 : 0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Single(cluster.RouteRequests);
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
         if (!standalone)
         {
@@ -161,7 +161,7 @@ public sealed class PrimaryPollingTests
     [Theory]
     [InlineData((byte)VsrOperation.TruncatePartition)]
     [InlineData((byte)VsrOperation.DeleteSegments)]
-    public async Task given_delete_segments_commit_when_polling_should_raise_the_attachment_floor(byte replyOperation)
+    public async Task given_delete_segments_commit_when_polling_should_raise_the_route_discovery_floor(byte replyOperation)
     {
         using var cluster = new PollCluster();
         cluster.OnCoordinator = request =>
@@ -172,7 +172,7 @@ public sealed class PrimaryPollingTests
             }
 
             var reply = Reply(replyOperation,
-                replyOperation == (byte)VsrOperation.TruncatePartition ? new byte[4] : []);
+                new byte[4]);
             BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), MetadataCommit);
             return reply;
         };
@@ -181,8 +181,7 @@ public sealed class PrimaryPollingTests
         await client.DeleteSegmentsAsync(Stream, Topic, 0, 1, TestContext.Current.CancellationToken);
         await PollAsync(client);
 
-        Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
-            BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(24))));
+        Assert.Equal(new ulong[] { 0, MetadataCommit }, cluster.RouteRequests.Select(request => request.Context.MetadataOp));
         Assert.Equal(1, cluster.Primaries[0].Connections);
     }
 
@@ -190,16 +189,11 @@ public sealed class PrimaryPollingTests
     public async Task given_roster_without_nodes_when_polling_should_preserve_the_last_valid_topology()
     {
         using var cluster = new PollCluster();
-        var emptyRoster = true;
+        var emptyRoster = false;
         cluster.OnCoordinator = request => request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE && emptyRoster
             ? Reply(request.Operation, new byte[8])
             : null;
         using var client = await cluster.ConnectAsync();
-        await Assert.ThrowsAsync<MalformedResponseException>(() => PollAsync(client));
-        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
-
-        emptyRoster = false;
         await PollAsync(client);
         emptyRoster = true;
         await Assert.ThrowsAsync<MalformedResponseException>(() =>
@@ -213,23 +207,26 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
-    public async Task given_only_refusals_when_the_poll_budget_expires_should_report_not_accepted()
+    public async Task given_only_route_refusals_when_canceled_should_send_no_poll()
     {
         using var cluster = new PollCluster();
-        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
-            ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED)
-            : null;
+        byte[]? Refuse(MockRequest request) => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
+            ? Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED) : null;
+        cluster.OnCoordinator = Refuse;
+        cluster.OnPrimaryControl = Refuse;
         using var client = await cluster.ConnectAsync();
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
-        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
-
-        Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromMilliseconds(200));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.PollMessagesAsync(Stream, Topic, 0,
+            Consumer.New(3), PollingStrategy.Offset(0), 10, false, cancellation.Token));
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
-        Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Connections));
+        Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Requests(CommandCodes.POLL_MESSAGES_CODE)));
+        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
     }
 
     [Fact]
-    public async Task given_poll_waiting_for_connection_when_metadata_commits_should_revalidate_its_cached_route()
+    public async Task given_a_waiting_progress_poll_when_metadata_commits_should_keep_its_context_and_refresh_the_next_call()
     {
         using var cluster = new PollCluster();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -256,9 +253,12 @@ public sealed class PrimaryPollingTests
             release.SetResult();
             await Task.WhenAll(first, waiting);
 
-            Assert.Equal(new ulong[] { 1, MetadataCommit }, cluster.Attachments.Select(request =>
-                BinaryPrimitives.ReadUInt64LittleEndian(BindIdentity(request.Body).AsSpan(24))));
-            Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+            Assert.Equal(2, polls);
+            Assert.All(cluster.PrimaryRequests.Where(request => request.Code == CommandCodes.POLL_MESSAGES_CODE),
+                request => Assert.Equal(cluster.RouteContext, request.Context));
+            await PollAsync(client);
+            Assert.Equal(new ulong[] { 0, MetadataCommit }, cluster.RouteRequests.Select(request => request.Context.MetadataOp));
+            Assert.Equal(2, cluster.RouteRequests.Length);
             Assert.Equal(1, cluster.Primaries[0].Connections);
         }
         finally
@@ -268,60 +268,43 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
-    public async Task given_more_endpoints_than_pool_capacity_when_polling_should_retire_idle_connections_only()
+    public async Task given_a_large_roster_when_links_start_should_bound_dials_and_preserve_ready_progress()
     {
-        using var cluster = new PollCluster(TcpMessageStream.MAX_POLL_CONNECTIONS + 1);
-        var advertisedPartition = 0;
-        cluster.OnCoordinator = request =>
-        {
-            if (request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE)
-            {
-                var roster = new List<byte>();
-                WriteString(roster, "changing-endpoints");
-                roster.AddRange(BitConverter.GetBytes(2u));
-                WriteNode(roster, cluster.Coordinator.Port, true);
-                WriteNode(roster, cluster.Primaries[advertisedPartition].Port, false, 1);
-                return Reply(request.Operation, roster.ToArray());
-            }
-            return request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
-                ? RouteReply(request, cluster.RouteContext, 1, (uint)cluster.Primaries.Length)
-                : null;
-        };
-        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cluster = new PollCluster(7);
+        var fourBindings = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allBindings = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        cluster.OnPrimaryPoll = request =>
+        var bindings = 0;
+        cluster.OnPrimaryAttachment = request =>
         {
-            if (Partition(request) == 0)
+            var count = Interlocked.Increment(ref bindings);
+            if (count == 4)
             {
-                started.TrySetResult();
-                release.Task.GetAwaiter().GetResult();
+                fourBindings.TrySetResult();
             }
-
-            return Batch(request);
+            if (count == cluster.Primaries.Length)
+            {
+                allBindings.TrySetResult();
+            }
+            release.Task.GetAwaiter().GetResult();
+            return BindingReply(request);
         };
         using var client = await cluster.ConnectAsync();
-        var active = PollAsync(client);
         try
         {
-            await started.Task.WaitAsync(TestContext.Current.CancellationToken);
-            for (uint partition = 1; partition < cluster.Primaries.Length; partition++)
-            {
-                advertisedPartition = (int)partition;
-                await client.GetClusterMetadataAsync(TestContext.Current.CancellationToken);
-                var result = await client.PollMessagesAsync(Stream, Topic, partition, Consumer.Group(3),
-                    PollingStrategy.Next(), 10, true, TestContext.Current.CancellationToken);
-                Assert.Equal(partition, result.PartitionId);
-            }
-
-            release.SetResult();
-            await active;
-            advertisedPartition = 1;
-            await client.GetClusterMetadataAsync(TestContext.Current.CancellationToken);
-            await client.PollMessagesAsync(Stream, Topic, 1, Consumer.Group(3), PollingStrategy.Next(), 10, true,
+            await fourBindings.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            Assert.Equal(4, cluster.Primaries.Sum(node => node.Connections));
+            await client.PingAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(4, Volatile.Read(ref bindings));
+            release.TrySetResult();
+            await allBindings.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await client.PollMessagesAsync(Stream, Topic, 6, Consumer.New(3), PollingStrategy.Offset(0), 10, false,
                 TestContext.Current.CancellationToken);
-
-            Assert.Equal(1, cluster.Primaries[0].Connections);
-            Assert.Equal(2, cluster.Primaries[1].Connections);
+            Assert.All(cluster.Primaries, node =>
+            {
+                Assert.Equal(1, node.Connections);
+                Assert.Equal(0, node.Registrations);
+            });
             Assert.Equal(1, cluster.Coordinator.Connections);
         }
         finally
@@ -361,7 +344,7 @@ public sealed class PrimaryPollingTests
         await PollAsync(client);
 
         Assert.Equal(2, polls);
-        Assert.Equal(2, cluster.Primaries[0].Connections);
+        Assert.Equal(lostConnection ? 2 : 1, cluster.Primaries[0].Connections);
         Assert.Equal(1, cluster.Coordinator.Registrations);
         Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
     }
@@ -378,7 +361,7 @@ public sealed class PrimaryPollingTests
         await PollAsync(client);
 
         Assert.Equal(2, polls);
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(2, cluster.RouteRequests.Length);
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.BIND_SESSION_CODE));
         Assert.Equal(1, cluster.Primaries[0].Connections);
         Assert.Equal(1, cluster.Coordinator.Registrations);
@@ -409,17 +392,25 @@ public sealed class PrimaryPollingTests
         };
         using var client = await cluster.ConnectAsync();
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
-        await PollAsync(client);
-
-        Assert.Equal(2, routes);
-        Assert.Equal(1, cluster.Coordinator.Registrations);
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.BIND_SESSION_CODE));
-        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        if (status == 0)
+        {
+            await PollAsync(client);
+            Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+            Assert.Equal(1, cluster.Coordinator.Registrations);
+        }
+        else
+        {
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
+            Assert.Equal((int)status, error.StatusCode);
+            await cluster.UntilAsync(() => cluster.Coordinator.Registrations == 2);
+            await PollAsync(client);
+            Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        }
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
     }
 
     [Fact]
-    public async Task given_stale_attachment_when_polling_should_replace_only_the_auxiliary_session()
+    public async Task given_a_stale_binding_when_links_start_should_replace_the_logical_session_once()
     {
         using var cluster = new PollCluster();
         var attachments = 0;
@@ -427,14 +418,13 @@ public sealed class PrimaryPollingTests
             ? Reply(request.Operation, [], VsrError.STALE_CLIENT)
             : BindingReply(request);
         using var client = await cluster.ConnectAsync();
-        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        await cluster.UntilAsync(() => cluster.Coordinator.Registrations == 2);
         await PollAsync(client);
-
-        Assert.Equal(2, attachments);
-        Assert.Equal(2, cluster.Primaries[0].Connections);
+        Assert.True(attachments >= 3);
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(1, cluster.Coordinator.Registrations);
-        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        Assert.Equal(2, cluster.Coordinator.Registrations);
+        var registrations = cluster.CoordinatorRequests.Where(request => request.Operation == OPERATION_REGISTER).ToArray();
+        Assert.NotEqual(registrations[0].ClientId, registrations[1].ClientId);
     }
 
     [Fact]
@@ -446,41 +436,48 @@ public sealed class PrimaryPollingTests
 
         var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
 
-        Assert.Equal(VsrError.INVALID_FORMAT, error.StatusCode);
+        Assert.Equal(VsrError.SESSION_MISMATCH, error.StatusCode);
         Assert.All(cluster.Primaries, primary =>
             Assert.Equal(0, primary.Requests(CommandCodes.POLL_MESSAGES_CODE)));
         Assert.Equal(1, cluster.Coordinator.Registrations);
     }
 
     [Fact]
-    public async Task given_partial_primary_reply_when_canceled_should_dispose_it_before_the_next_poll()
+    public async Task given_a_canceled_progress_poll_when_its_reply_arrives_late_should_reuse_the_healthy_link()
     {
         using var cluster = new PollCluster();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var polls = 0;
         cluster.OnPrimaryPoll = request =>
         {
-            var batch = Batch(request);
             if (Interlocked.Increment(ref polls) == 1)
             {
-                started.SetResult();
-                return batch[..^8];
+                started.TrySetResult();
+                release.Task.GetAwaiter().GetResult();
             }
-
-            return batch;
+            return Batch(request);
         };
         using var client = await cluster.ConnectAsync();
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         var pending = client.PollMessagesAsync(Stream, Topic, 0, Consumer.Group(3), PollingStrategy.Next(), 10,
             true, cancellation.Token);
-        await started.Task.WaitAsync(TestContext.Current.CancellationToken);
-        await cancellation.CancelAsync();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
-        await PollAsync(client);
-
-        Assert.Equal(2, polls);
-        Assert.Equal(2, cluster.Primaries[0].Connections);
-        Assert.Equal(1, cluster.Coordinator.Connections);
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await cancellation.CancelAsync();
+            var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => pending);
+            Assert.Null(error.OperationId);
+            release.TrySetResult();
+            await PollAsync(client);
+            Assert.Equal(2, polls);
+            Assert.Equal(1, cluster.Primaries[0].Connections);
+            Assert.Equal(1, cluster.Coordinator.Connections);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
     }
 
     [Fact]
@@ -506,30 +503,119 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
-    public async Task given_unsent_poll_when_its_session_is_replaced_should_report_not_accepted()
+    public async Task given_route_refresh_when_its_session_is_replaced_should_not_retry_in_the_new_session()
     {
         using var cluster = new PollCluster();
-        var binding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var refreshing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        cluster.OnPrimaryAttachment = request =>
+        cluster.OnPrimaryControl = request =>
         {
-            binding.SetResult();
+            if (request.Code != CommandCodes.GET_PARTITION_ROUTE_CODE)
+            {
+                return null;
+            }
+            refreshing.TrySetResult();
             release.Task.GetAwaiter().GetResult();
-            return BindingReply(request);
+            return RouteReply(request, cluster.RouteContext, 1, 2, view: 1);
         };
         using var client = await cluster.ConnectAsync();
-        var pending = PollAsync(client);
+        await client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Offset(0), 10, false,
+            TestContext.Current.CancellationToken);
+        cluster.OnPrimaryPoll = request => Reply(request.Operation, [], VsrError.NOT_PRIMARY);
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
+            ? Reply(request.Operation, [], VsrError.FEATURE_UNAVAILABLE) : null;
+        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        var pending = client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Offset(0), 10,
+            false, TestContext.Current.CancellationToken);
         try
         {
-            await binding.Task.WaitAsync(TestContext.Current.CancellationToken);
+            await refreshing.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
             await client.LogoutUserAsync(TestContext.Current.CancellationToken);
             await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
+            Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+            release.TrySetResult();
             var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
             Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
-            Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Requests(CommandCodes.POLL_MESSAGES_CODE)));
+            Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+            Assert.Equal(2, cluster.Coordinator.Registrations);
+            Assert.Equal(2, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+            var registration = cluster.CoordinatorRequests.First(request => request.Operation == OPERATION_REGISTER);
+            Assert.All(cluster.PrimaryRequests.Where(request => request.Code == CommandCodes.POLL_MESSAGES_CODE),
+                request => Assert.Equal(registration.ClientId, request.ClientId));
         }
         finally
         {
+            release.TrySetResult();
+        }
+    }
+
+    [Theory]
+    [InlineData(VsrError.LIFECYCLE_BUSY)]
+    [InlineData(VsrError.HISTORY_UNAVAILABLE)]
+    public async Task given_a_refused_send_when_relogin_precedes_route_refresh_should_not_send_in_the_new_session(
+        int status)
+    {
+        using var cluster = new PollCluster();
+        var sends = new ConcurrentQueue<MockRequest>();
+        cluster.OnPrimarySend = request =>
+        {
+            sends.Enqueue(request);
+            return sends.Count == 1
+                ? Reply(request.Operation, [], (uint)status)
+                : Reply(request.Operation, new byte[4]);
+        };
+        using var client = await cluster.ConnectAsync();
+        var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var operation = new AsyncLocal<bool>();
+        var intercepted = 0;
+        void HoldRefusal(object? sender, FirstChanceExceptionEventArgs args)
+        {
+            if (operation.Value && args.Exception is IggyInvalidStatusCodeException
+                { FromServer: true, CommandCode: CommandCodes.SEND_MESSAGES_CODE } error
+                && error.StatusCode == status && Interlocked.Exchange(ref intercepted, 1) == 0)
+            {
+                observed.SetResult();
+                release.Task.GetAwaiter().GetResult();
+            }
+        }
+
+        // Relogin must follow decoding, otherwise closing the socket replaces the refusal with a transport failure.
+        AppDomain.CurrentDomain.FirstChanceException += HoldRefusal;
+        try
+        {
+            var pending = Task.Run(async () =>
+            {
+                operation.Value = true;
+                await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+                    new Message(Guid.NewGuid(), "payload"u8.ToArray()), TestContext.Current.CancellationToken);
+            }, TestContext.Current.CancellationToken);
+            await observed.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+            await client.LogoutUserAsync(TestContext.Current.CancellationToken);
+            await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
+            Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+            release.SetResult();
+
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => pending);
+            Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+            Assert.Single(sends);
+            Assert.Equal(2, cluster.RouteRequests.Length);
+            Assert.Equal(2, cluster.Coordinator.Registrations);
+
+            await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+                new Message(Guid.NewGuid(), "fresh"u8.ToArray()), TestContext.Current.CancellationToken);
+            var writes = sends.ToArray();
+            Assert.Equal(2, writes.Length);
+            Assert.NotEqual(writes[0].ClientId, writes[1].ClientId);
+            var registrations = cluster.CoordinatorRequests.Where(request => request.Operation == OPERATION_REGISTER)
+                .ToArray();
+            Assert.Equal(registrations[0].ClientId, writes[0].ClientId);
+            Assert.Equal(registrations[1].ClientId, writes[1].ClientId);
+        }
+        finally
+        {
+            AppDomain.CurrentDomain.FirstChanceException -= HoldRefusal;
             release.TrySetResult();
         }
     }
@@ -540,7 +626,7 @@ public sealed class PrimaryPollingTests
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
         await PollAsync(client);
-        var oldParent = BinaryPrimitives.ReadUInt128LittleEndian(BindIdentity(cluster.Attachments.Single().Body));
+        var oldParent = BinaryPrimitives.ReadUInt128LittleEndian(BindIdentity(cluster.Attachments.First().Body));
         await client.LogoutUserAsync(TestContext.Current.CancellationToken);
         await client.LoginUserAsync("other", "secret", TestContext.Current.CancellationToken);
         await PollAsync(client);
@@ -564,18 +650,18 @@ public sealed class PrimaryPollingTests
             TestContext.Current.CancellationToken);
 
         Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Single(cluster.RouteRequests);
         Assert.Equal(0, Assert.Single(polls).Body[^1]);
     }
 
     [Fact]
-    public async Task given_cluster_manual_commit_poll_when_the_primary_connection_drops_should_poll_again()
+    public async Task given_a_pure_poll_when_the_primary_connection_drops_should_retry_the_same_read()
     {
         using var cluster = new PollCluster();
         var polls = 0;
         cluster.OnPrimaryPoll = request => Interlocked.Increment(ref polls) == 1 ? [] : Batch(request);
         using var client = await cluster.ConnectAsync();
-        await client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Next(), 10, false,
+        await client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Offset(0), 10, false,
             TestContext.Current.CancellationToken);
 
         Assert.Equal(2, Volatile.Read(ref polls));
@@ -591,7 +677,7 @@ public sealed class PrimaryPollingTests
         await client.DeleteOffsetAsync(Consumer.New(3), Stream, Topic, 1, TestContext.Current.CancellationToken);
 
         Assert.DoesNotContain(cluster.CoordinatorRequests, IsOffsetWrite);
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Single(cluster.RouteRequests);
         Assert.Equal([(byte)VsrOperation.StoreConsumerOffset, (byte)VsrOperation.DeleteConsumerOffset],
             cluster.OffsetWrites.Select(write => write.Operation));
         Assert.All(cluster.OffsetWrites, write => Assert.Equal(cluster.RouteContext, write.Context));
@@ -602,7 +688,7 @@ public sealed class PrimaryPollingTests
     ///     data connection has to take its id from the counter of the session it is bound to.
     /// </summary>
     [Fact]
-    public async Task given_a_metadata_write_when_storing_an_offset_on_the_primary_should_take_the_next_request_id()
+    public async Task given_a_metadata_write_when_storing_an_offset_on_the_primary_should_take_a_later_shared_request_id()
     {
         using var cluster = new PollCluster();
         using var client = await cluster.ConnectAsync();
@@ -611,24 +697,32 @@ public sealed class PrimaryPollingTests
 
         var update = Assert.Single(cluster.CoordinatorRequests,
             request => request.Operation == (byte)VsrOperation.UpdateStream);
-        Assert.Equal(update.RequestId + 1, Assert.Single(cluster.OffsetWrites).RequestId);
+        Assert.True(Assert.Single(cluster.OffsetWrites).RequestId > update.RequestId);
     }
 
     [Fact]
-    public async Task given_a_dropped_primary_connection_when_storing_an_offset_again_should_not_repeat_the_request_id()
+    public async Task given_a_dropped_offset_reply_when_resolving_should_reuse_the_retained_request_id()
     {
         using var cluster = new PollCluster();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
         cluster.OnPrimaryOffsetWrite = request =>
-            cluster.OffsetWrites.Count == 1 ? [] : Reply(request.Operation, new byte[4]);
+        {
+            if (cluster.OffsetWrites.Count == 1)
+            {
+                cancellation.Cancel();
+                return [];
+            }
+            return Reply(request.Operation, new byte[4]);
+        };
         using var client = await cluster.ConnectAsync();
-
-        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.StoreOffsetAsync(Consumer.New(3),
-            Stream, Topic, 10, 1, TestContext.Current.CancellationToken));
-        await client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, 1, TestContext.Current.CancellationToken);
-
+        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.StoreOffsetAsync(
+            Consumer.New(3), Stream, Topic, 10, 1, cancellation.Token));
+        var operationId = Assert.IsType<ulong>(error.OperationId);
+        await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(Consumer.New(3), Stream,
+            Topic, 10, 1, TestContext.Current.CancellationToken));
+        await client.ResolveOperationAsync(operationId, TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
         Assert.Equal(2, cluster.Primaries[1].Connections);
-        var first = cluster.OffsetWrites.First().RequestId;
-        Assert.Equal([first, first + 1], cluster.OffsetWrites.Select(write => write.RequestId));
+        Assert.Equal([operationId, operationId], cluster.OffsetWrites.Select(write => write.RequestId));
     }
 
     [Fact]
@@ -665,7 +759,7 @@ public sealed class PrimaryPollingTests
         await client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Next(), 10, false,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(2, cluster.RouteRequests.Length);
         Assert.Equal([first, first], polls.Select(poll => poll.Context));
     }
 
@@ -694,7 +788,7 @@ public sealed class PrimaryPollingTests
         await client.PollMessagesAsync(Stream, Topic, 0, Consumer.New(3), PollingStrategy.Next(), 10, autoCommit,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(2, cluster.RouteRequests.Length);
         Assert.Equal(replaced, polls.Last().Context);
     }
 
@@ -719,7 +813,7 @@ public sealed class PrimaryPollingTests
 
         await client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, 1, TestContext.Current.CancellationToken);
 
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(2, cluster.RouteRequests.Length);
         Assert.Equal(replaced, cluster.OffsetWrites.Last().Context);
     }
 
@@ -755,15 +849,16 @@ public sealed class PrimaryPollingTests
         var requests = cluster.PrimaryRequests.Where(request => request.Code != CommandCodes.BIND_SESSION_CODE).ToArray();
         Assert.Equal(5, requests.Length);
         Assert.All(requests, request => Assert.Equal(cluster.RouteContext, request.Context));
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Single(cluster.RouteRequests);
         Assert.Equal(1, cluster.Coordinator.Connections);
-        Assert.Equal(0, cluster.Primaries[0].Connections);
-        Assert.Equal(1, cluster.Primaries[1].Connections);
-        Assert.Single(cluster.Attachments);
+        await cluster.UntilAsync(() => cluster.Attachments.Count == 2);
+        Assert.All(cluster.Primaries, primary => Assert.Equal(1, primary.Connections));
+        Assert.Equal(0, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(0, cluster.Primaries[0].Requests(CommandCodes.SEND_MESSAGES_CODE));
         var writes = requests.Where(request => request.Operation != OPERATION_NON_REPLICATED).ToArray();
         Assert.Equal(3, writes.Length);
-        Assert.Equal([writes[0].RequestId, writes[0].RequestId + 1, writes[0].RequestId + 2],
-            writes.Select(request => request.RequestId));
+        Assert.Equal(requests.Length, requests.Select(request => request.RequestId).Distinct().Count());
+        Assert.True(writes[0].RequestId < writes[1].RequestId && writes[1].RequestId < writes[2].RequestId);
         var register = Assert.Single(cluster.CoordinatorRequests, request => request.Operation == OPERATION_REGISTER);
         Assert.All(requests, request => Assert.Equal(register.ClientId, request.ClientId));
         Assert.All(cluster.Primaries, primary => Assert.Equal(0, primary.Registrations));
@@ -777,6 +872,7 @@ public sealed class PrimaryPollingTests
         cluster.OnCoordinator = request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
             ? RouteReply(request, cluster.RouteContext, primary, 2)
             : null;
+        cluster.OnPrimaryControl = cluster.OnCoordinator;
         cluster.OnPrimaryOffsetWrite = request =>
         {
             primary = 2;
@@ -795,7 +891,7 @@ public sealed class PrimaryPollingTests
         Assert.Equal(writes[0].ClientId, writes[1].ClientId);
         Assert.Equal(writes[0].Session, writes[1].Session);
         Assert.Equal(writes[0].Body, writes[1].Body);
-        Assert.Equal(2, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(2, cluster.RouteRequests.Length);
         Assert.Equal(1, cluster.Coordinator.Connections);
         Assert.All(cluster.Primaries, node => Assert.Equal(1, node.Connections));
     }
@@ -805,7 +901,7 @@ public sealed class PrimaryPollingTests
     [InlineData(VsrError.NOT_PRIMARY)]
     [InlineData(VsrError.LIFECYCLE_BUSY)]
     [InlineData(VsrError.FEATURE_UNAVAILABLE)]
-    public async Task given_an_uncertain_write_when_a_later_refusal_arrives_should_not_refresh_or_reroute(int refusal)
+    public async Task given_an_uncertain_write_when_a_later_refusal_arrives_should_keep_its_retained_identity(int refusal)
     {
         using var cluster = new PollCluster();
         cluster.OnPrimaryOffsetWrite = request => cluster.OffsetWrites.Count switch
@@ -816,13 +912,22 @@ public sealed class PrimaryPollingTests
         };
         using var client = await cluster.ConnectAsync();
 
-        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.StoreOffsetAsync(Consumer.New(3),
-            Stream, Topic, 10, 0, TestContext.Current.CancellationToken));
-
-        Assert.Equal(3, cluster.OffsetWrites.Count);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromMilliseconds(500));
+        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.StoreOffsetAsync(Consumer.New(3),
+            Stream, Topic, 10, 0, cancellation.Token));
+        Assert.IsType<ulong>(error.OperationId);
+        Assert.True(cluster.OffsetWrites.Count >= 2);
         Assert.Single(cluster.OffsetWrites.Select(request => request.RequestId).Distinct());
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-        Assert.Equal(0, cluster.Primaries[1].Connections);
+        var original = cluster.OffsetWrites.First();
+        Assert.All(cluster.OffsetWrites, request =>
+        {
+            Assert.Equal(original.Context, request.Context);
+            Assert.Equal(original.Body, request.Body);
+        });
+        await Assert.ThrowsAsync<VsrLaneBlockedException>(() => client.StoreOffsetAsync(Consumer.New(3),
+            Stream, Topic, 10, 0, TestContext.Current.CancellationToken));
+        Assert.Equal(0, cluster.Primaries[1].Requests(CommandCodes.STORE_CONSUMER_OFFSET_CODE));
     }
 
     [Theory]
@@ -845,8 +950,8 @@ public sealed class PrimaryPollingTests
             Consumer.New(3), Stream, Topic, 10, 0, cancellation.Token));
 
         Assert.Equal(VsrError.LIFECYCLE_BUSY, error.StatusCode);
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-        Assert.Equal(controlCode == CommandCodes.BIND_SESSION_CODE ? 1 : 0, cluster.Attachments.Count);
+        Assert.Single(cluster.RouteRequests);
+        Assert.All(cluster.Primaries, primary => Assert.InRange(primary.Requests(CommandCodes.BIND_SESSION_CODE), 0, 1));
         Assert.Empty(cluster.OffsetWrites);
     }
 
@@ -881,18 +986,17 @@ public sealed class PrimaryPollingTests
 
         var writes = requests.ToArray();
         Assert.Equal(3, writes.Length);
-        Assert.Equal([writes[0].RequestId, writes[0].RequestId + 1, writes[0].RequestId + 2],
-            writes.Select(request => request.RequestId));
+        Assert.True(writes[0].RequestId < writes[1].RequestId && writes[1].RequestId < writes[2].RequestId);
         Assert.All(writes, request => Assert.Equal(writes[0].Context, request.Context));
         var sentAt = timestamps.ToArray();
         Assert.True(sentAt[1] - sentAt[0] >= 45);
         Assert.True(sentAt[2] - sentAt[1] >= 90);
-        Assert.Single(cluster.Attachments);
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.All(cluster.Primaries, primary => Assert.InRange(primary.Requests(CommandCodes.BIND_SESSION_CODE), 0, 1));
+        Assert.Single(cluster.RouteRequests);
     }
 
     [Fact]
-    public async Task given_a_lost_coordinator_when_discovering_a_route_should_not_fail_over_to_the_roster()
+    public async Task given_a_lost_coordinator_when_discovering_a_route_should_use_an_already_ready_replica()
     {
         using var cluster = new PollCluster();
         cluster.OnCoordinator = request =>
@@ -906,9 +1010,9 @@ public sealed class PrimaryPollingTests
         };
         using var client = await cluster.ConnectAsync();
 
-        await Assert.ThrowsAsync<SocketException>(() => PollAsync(client));
-
-        Assert.All(cluster.Primaries, node => Assert.Equal(0, node.Connections));
+        await PollAsync(client);
+        Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.All(cluster.Primaries, node => Assert.Equal(0, node.Registrations));
     }
 
     [Fact]
@@ -922,7 +1026,7 @@ public sealed class PrimaryPollingTests
             Stream, Topic, 10, 0, TestContext.Current.CancellationToken));
 
         Assert.Single(cluster.OffsetWrites);
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Single(cluster.RouteRequests);
     }
 
     [Fact]
@@ -941,7 +1045,7 @@ public sealed class PrimaryPollingTests
         Assert.Equal(2, attempts);
         Assert.Equal(reads + 1, cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE));
         Assert.Equal(1, cluster.Coordinator.Connections);
-        Assert.All(cluster.Primaries, node => Assert.Equal(0, node.Connections));
+        Assert.All(cluster.Primaries, node => Assert.Equal(0, node.Requests((int)command)));
     }
 
     [Fact]
@@ -972,9 +1076,9 @@ public sealed class PrimaryPollingTests
         await PollAsync(client);
 
         Assert.Equal(reads + 1, cluster.Coordinator.Requests(CommandCodes.GET_CLUSTER_METADATA_CODE));
-        Assert.Equal(1, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-        Assert.Equal(0, cluster.Primaries[0].Connections);
-        Assert.Equal(1, cluster.Primaries[1].Connections);
+        Assert.Single(cluster.RouteRequests);
+        Assert.Equal(0, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(1, cluster.Primaries[1].Requests(CommandCodes.POLL_MESSAGES_CODE));
     }
 
     [Fact]
@@ -1015,7 +1119,7 @@ public sealed class PrimaryPollingTests
 
         Assert.All(cluster.Primaries, node => Assert.Equal(1, node.Connections));
         Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.GET_TOPIC_CODE));
-        Assert.Equal(5, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(5, cluster.RouteRequests.Length);
     }
 
     [Fact]
@@ -1037,14 +1141,89 @@ public sealed class PrimaryPollingTests
             Assert.Equal(VsrError.INVALID_COMMAND, error.StatusCode);
             Assert.False(error.FromServer);
         });
-        Assert.Equal(0, cluster.Coordinator.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
-        Assert.Empty(cluster.PrimaryRequests);
+        Assert.Empty(cluster.RouteRequests);
+        Assert.DoesNotContain(cluster.PrimaryRequests, request => request.Code == CommandCodes.POLL_MESSAGES_CODE || IsOffsetWrite(request));
     }
 
     private static async Task PollAsync(TcpMessageStream client)
     {
         await client.PollMessagesAsync(Stream, Topic, 0, Consumer.Group(3), PollingStrategy.Next(), 10, true,
             TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task given_a_full_route_cache_when_one_entry_is_added_should_preserve_other_entries()
+    {
+        const int Capacity = 4096;
+        using var cluster = new PollCluster(primaryCount: 1);
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
+            ? RouteReply(request, cluster.RouteContext, 1, Capacity + 1) : null;
+        cluster.OnPrimaryControl = cluster.OnCoordinator;
+        using var client = await cluster.ConnectAsync();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(15));
+        Task Read(uint partition) => client.PollMessagesAsync(Stream, Topic, partition, Consumer.New(3),
+            PollingStrategy.Offset(0), 1, false, cancellation.Token);
+        for (uint partition = 0; partition <= Capacity; partition++)
+        {
+            await Read(partition);
+        }
+        Assert.Equal(Capacity + 1, cluster.RouteRequests.Length);
+        await Read(1);
+        await Read(Capacity);
+        Assert.Equal(Capacity + 1, cluster.RouteRequests.Length);
+        await Read(0);
+        Assert.Equal(Capacity + 2, cluster.RouteRequests.Length);
+        Assert.All(cluster.Primaries, node => Assert.Equal(1, node.Connections));
+    }
+
+    [Fact]
+    public async Task given_route_aliases_when_not_primary_raises_the_view_floor_should_reject_stale_alias_routes()
+    {
+        using var cluster = new PollCluster();
+        uint view = 0;
+        byte primary = 1;
+        var refused = false;
+        var staleReplies = 0;
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
+            ? RouteReply(request, cluster.RouteContext, primary, 2, view: view) : null;
+        cluster.OnPrimaryControl = request =>
+        {
+            if (request.Code != CommandCodes.GET_PARTITION_ROUTE_CODE)
+            {
+                return null;
+            }
+            if (view == 2 && request.Body[0] == IdKind.String.GetByte())
+            {
+                Interlocked.Increment(ref staleReplies);
+                return RouteReply(request, cluster.RouteContext, 1, 2, view: 1);
+            }
+            return RouteReply(request, cluster.RouteContext, primary, 2, view: view);
+        };
+        cluster.OnPrimaryPoll = request =>
+        {
+            if (refused)
+            {
+                refused = false;
+                primary = 2;
+                view = 2;
+                return Reply(request.Operation, [], VsrError.NOT_PRIMARY);
+            }
+            return Batch(request);
+        };
+        using var client = await cluster.ConnectAsync();
+        await cluster.UntilAsync(() => cluster.Attachments.Count == 2);
+        Task Read(Identifier stream) => client.PollMessagesAsync(stream, Topic, 0, Consumer.New(3),
+            PollingStrategy.Offset(0), 1, false, TestContext.Current.CancellationToken);
+        await Read(Stream);
+        await Read(Identifier.String("stream-alias"));
+        refused = true;
+        await Read(Stream);
+        var previous = cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE);
+        await Read(Identifier.String("stream-alias"));
+        Assert.True(staleReplies >= 1);
+        Assert.Equal(previous, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        Assert.Equal(2, cluster.Primaries[1].Requests(CommandCodes.POLL_MESSAGES_CODE));
     }
 
     private static byte[] Batch(MockRequest request)
@@ -1088,6 +1267,7 @@ public sealed class PrimaryPollingTests
         internal Func<MockRequest, byte[]> OnPrimaryOffsetWrite = request => Reply(request.Operation, new byte[4]);
         internal Func<MockRequest, byte[]> OnPrimarySend = request => Reply(request.Operation, new byte[4]);
         internal Func<MockRequest, byte[]> OnPrimaryAttachment = BindingReply;
+        internal Func<MockRequest, byte[]?>? OnPrimaryControl;
         internal Func<MockRequest, byte[]?>? OnCoordinator;
 
         internal PollCluster(int primaryCount = 2)
@@ -1101,25 +1281,9 @@ public sealed class PrimaryPollingTests
                     return overridden;
                 }
 
-                if (request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE)
+                if (DefaultControl(request) is { } control)
                 {
-                    var roster = new List<byte>();
-                    WriteString(roster, "cluster");
-                    roster.AddRange(BitConverter.GetBytes((uint)Primaries.Length + 1));
-                    WriteNode(roster, Coordinator.Port, true);
-                    for (var index = 0; index < Primaries.Length; index++)
-                    {
-                        WriteNode(roster, Primaries[index].Port, false, checked((byte)(index + 1)));
-                    }
-
-                    return Reply(request.Operation, roster.ToArray());
-                }
-
-                if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
-                {
-                    return RouteReply(request, RouteContext,
-                        Primaries.Length == 0 ? (byte)0 : checked((byte)(RoutedPartition(request) + 1)),
-                        (uint)Math.Max(1, Primaries.Length));
+                    return control;
                 }
 
                 if (request.Code == CommandCodes.SYNC_CONSUMER_GROUP_CODE)
@@ -1171,8 +1335,48 @@ public sealed class PrimaryPollingTests
                     }
                     return request.Code == CommandCodes.POLL_MESSAGES_CODE
                         ? OnPrimaryPoll(request)
-                        : Answer(request);
+                        : OnPrimaryControl?.Invoke(request) ?? DefaultControl(request) ?? Answer(request);
                 });
+            }
+        }
+
+        internal MockRequest[] RouteRequests => CoordinatorRequests.Concat(PrimaryRequests)
+            .Where(request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
+            .OrderBy(request => request.RequestId).ToArray();
+
+        private byte[]? DefaultControl(MockRequest request)
+        {
+            if (request.Code == CommandCodes.GET_CLUSTER_METADATA_CODE)
+            {
+                var roster = new List<byte>();
+                WriteString(roster, "cluster");
+                roster.AddRange(BitConverter.GetBytes((uint)Primaries.Length + 1));
+                WriteNode(roster, Coordinator.Port, true);
+                for (var index = 0; index < Primaries.Length; index++)
+                {
+                    WriteNode(roster, Primaries[index].Port, false, checked((byte)(index + 1)));
+                }
+
+                return Reply(request.Operation, roster.ToArray());
+            }
+
+            if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
+            {
+                return RouteReply(request, RouteContext,
+                    Primaries.Length == 0 ? (byte)0 : checked((byte)(RoutedPartition(request) + 1)),
+                    (uint)Math.Max(1, Primaries.Length));
+            }
+
+            return null;
+        }
+
+        internal async Task UntilAsync(Func<bool> predicate)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            while (!predicate())
+            {
+                await Task.Delay(5, timeout.Token);
             }
         }
 

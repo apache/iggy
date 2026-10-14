@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, QuicClientConfig,
-    validate_server_address,
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, PendingOperationsConfig,
+    QuicClientConfig, validate_server_address,
 };
 
 /// Builder for the QUIC client configuration.
@@ -57,6 +57,12 @@ impl QuicClientConfigBuilder {
     /// Sets the server address. Defaults to "127.0.0.1:8080".
     pub fn with_server_address(mut self, server_address: String) -> Self {
         self.config.server_address = server_address;
+        self
+    }
+
+    /// Sets client-wide active and retained mutation limits.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config.pending_operations = pending_operations;
         self
     }
 

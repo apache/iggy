@@ -27,6 +27,7 @@ import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.util.concurrent.ScheduledFuture;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.exception.IggyConnectionException;
@@ -50,6 +51,7 @@ import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailov
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.emptyPoll;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.pollRoute;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PollRouterTest {
     private static final long CLIENT_LOW = 1;
@@ -59,11 +61,8 @@ class PollRouterTest {
     private static final long INCARNATION = 7;
     private static final int PRIMARY_PORT = 8090;
     private static final int BIND_SECRET_BYTES = 32;
-    private static final int PARTITION_KEY_BYTES = 16;
     private static final PartitionContext ROUTE_CONTEXT =
             new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.valueOf(ROUTE_WATERMARK));
-    // Fire after route freshness checks, at the final attachment check before send.
-    private static final int SEND_CHECK_WATERMARK_READ = 6;
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
     private static final Duration NEVER = Duration.ofDays(1);
 
@@ -81,22 +80,27 @@ class PollRouterTest {
                     .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
                     .release();
 
-            CompletableFuture<Void> fire = new CompletableFuture<>();
-            Thread timeout = start("poll-timeout", () -> {
-                fire.join();
-                timers.last().run();
-            });
-            coordinator.onWatermarkRead(SEND_CHECK_WATERMARK_READ, () -> {
-                fire.complete(null);
-                awaitBlocked(timeout);
-            });
+            CompletableFuture<Void> enteredSend = new CompletableFuture<>();
+            CompletableFuture<Void> releaseSend = new CompletableFuture<>();
+            int timerIndex = timers.scheduled.size();
+            primary.beforeSend = () -> {
+                enteredSend.complete(null);
+                releaseSend.join();
+            };
             CompletableFuture<CompletableFuture<ByteBuf>> polled = new CompletableFuture<>();
             Thread caller = start("poll-caller", () -> polled.complete(router.poll(pollPayload(), Optional.empty())));
-
-            assertThat(polled)
-                    .as(() -> "caller " + caller.getState() + ", timeout " + timeout.getState())
-                    .succeedsWithin(TIMEOUT);
-            // The poll reached the primary before the timeout ended it, so its outcome is unknown.
+            enteredSend.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            CompletableFuture<Void> expired = new CompletableFuture<>();
+            Thread timeout = start("poll-timeout", () -> {
+                timers.scheduled.get(timerIndex).run();
+                expired.complete(null);
+            });
+            try {
+                assertThat(expired).succeedsWithin(TIMEOUT);
+            } finally {
+                releaseSend.complete(null);
+            }
+            assertThat(polled).succeedsWithin(TIMEOUT);
             assertServerError(polled.get(), AsyncTcpConnection.TRANSIENT_NOT_COMMITTED);
             caller.join(TIMEOUT.toMillis());
             timeout.join(TIMEOUT.toMillis());
@@ -136,6 +140,55 @@ class PollRouterTest {
         }
     }
 
+    @Test
+    void shouldRefuseAnExtraReplicaWithoutClosingHealthyLinks() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        List<Primary> links = new CopyOnWriteArrayList<>();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> {
+                Primary primary = new Primary(group);
+                links.add(primary);
+                return primary;
+            });
+            int replicaCapacity = 1 << Byte.SIZE;
+            for (int replica = 0; replica < replicaCapacity; replica++) {
+                router.connectionFor(
+                                new ConnectionInfo("localhost", PRIMARY_PORT + replica),
+                                System.nanoTime() + TIMEOUT.toNanos())
+                        .get(5, TimeUnit.SECONDS);
+            }
+            Primary first = links.get(0);
+            first.sendRouted(
+                            CommandCode.System.PING.getValue(),
+                            Unpooled.EMPTY_BUFFER,
+                            0,
+                            0,
+                            new AsyncTcpConnection.TransientFailoverState())
+                    .join()
+                    .release();
+            var pending = first.sendRouted(
+                    CommandCode.System.PING.getValue(),
+                    Unpooled.EMPTY_BUFFER,
+                    0,
+                    0,
+                    new AsyncTcpConnection.TransientFailoverState());
+            assertThatThrownBy(() -> router.connectionFor(
+                            new ConnectionInfo("localhost", PRIMARY_PORT + replicaCapacity),
+                            System.nanoTime() + TIMEOUT.toNanos()))
+                    .isInstanceOf(org.apache.iggy.exception.IggyServerException.class);
+            assertThat(links).hasSize(replicaCapacity);
+            assertThat(pending).isNotDone();
+            assertThat(links).allSatisfy(link -> assertThat(link.closes).hasValue(0));
+            router.clearSession().get(5, TimeUnit.SECONDS);
+            assertThat(pending).failsWithin(TIMEOUT);
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     private static ByteBuf pollPayload() {
         // The router keys routes by the bytes before the poll parameters and reads nothing else.
         return Unpooled.buffer()
@@ -162,13 +215,6 @@ class PollRouterTest {
         return thread;
     }
 
-    private static void awaitBlocked(Thread thread) {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        while (thread.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
-            Thread.onSpinWait();
-        }
-    }
-
     /** Holds every timer back, so the test fires a poll timeout at the instant it needs. */
     private static final class ManualTimers extends DefaultEventLoop {
         private final List<Runnable> scheduled = new CopyOnWriteArrayList<>();
@@ -177,10 +223,6 @@ class PollRouterTest {
         public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
             scheduled.add(command);
             return super.schedule(command, NEVER.toNanos(), TimeUnit.NANOSECONDS);
-        }
-
-        Runnable last() {
-            return scheduled.get(scheduled.size() - 1);
         }
     }
 
@@ -210,18 +252,10 @@ class PollRouterTest {
         private long watermark;
         private PartitionContext context = ROUTE_CONTEXT;
         private int routes;
-        private final AtomicInteger watermarkReadsLeft = new AtomicInteger();
-        private volatile Runnable watermarkHook = () -> {};
 
         Coordinator(IoEventLoopGroup group, EventLoop timers) {
             super(group);
             this.timers = timers;
-        }
-
-        /** Runs {@code hook} once, on the thread that makes the {@code reads}-th watermark read from now. */
-        void onWatermarkRead(int reads, Runnable hook) {
-            watermarkHook = hook;
-            watermarkReadsLeft.set(reads);
         }
 
         @Override
@@ -236,9 +270,6 @@ class PollRouterTest {
 
         @Override
         long metadataWatermark() {
-            if (watermarkReadsLeft.decrementAndGet() == 0) {
-                watermarkHook.run();
-            }
             return watermark;
         }
 
@@ -286,7 +317,9 @@ class PollRouterTest {
     private static final class Primary extends OfflineConnection {
         private final List<PartitionContext> sentContexts = new CopyOnWriteArrayList<>();
         private final CompletableFuture<ByteBuf> unanswered = new CompletableFuture<>();
+        private final AtomicInteger closes = new AtomicInteger();
         private boolean holdAfterFirst = true;
+        private Runnable beforeSend = () -> {};
 
         Primary(IoEventLoopGroup group) {
             super(group);
@@ -305,6 +338,7 @@ class PollRouterTest {
                 return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
             }
             sentContexts.add(state.context());
+            beforeSend.run();
             return !holdAfterFirst || sentContexts.size() == 1
                     ? CompletableFuture.completedFuture(emptyPoll(0))
                     : unanswered;
@@ -312,6 +346,7 @@ class PollRouterTest {
 
         @Override
         public CompletableFuture<Void> close() {
+            closes.incrementAndGet();
             // A closed channel fails what it still awaits on its own event loop, as channelInactive does.
             eventLoop()
                     .execute(() -> unanswered.completeExceptionally(

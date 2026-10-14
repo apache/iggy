@@ -33,7 +33,6 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public sealed partial class TcpMessageStream
 {
     private const int MaxCachedPartitionRoutes = 4096;
-    internal const int MAX_POLL_CONNECTIONS = 256;
     private const int PollRoutingRetryIntervalMs = 50;
     private const int ConsumerSessionSize = 32;
     private const int ConsumerSessionEpochOffset = 16;
@@ -43,7 +42,6 @@ public sealed partial class TcpMessageStream
 
     private readonly object _pollRoutingGate = new();
     private readonly Dictionary<PartitionRouteKey, CachedRoute> _partitionRoutes = [];
-    private readonly Dictionary<string, PollConnectionSlot> _pollConnections = [];
     private readonly Dictionary<byte, string> _replicaEndpoints = [];
     private ulong _metadataWatermark;
     private int _clusterNodeCount;
@@ -51,17 +49,10 @@ public sealed partial class TcpMessageStream
     private AutoLoginSettings? _configuredLoginOverride;
 
     private readonly record struct PartitionRouteKey(Identifier StreamId, Identifier TopicId, uint PartitionId);
-    private sealed record CachedRoute(string Endpoint, byte[] Attachment, ulong Generation, ulong Watermark,
-        PartitionRoute Route);
+    private sealed record CachedRoute(ulong Generation, ulong Watermark, PartitionRoute Route, uint MinimumView,
+        bool Stale, long Sequence);
+    private long _routeSequence;
     private readonly record struct SendTarget(PartitionRouteKey Key, byte[] Query);
-
-    private sealed class PollConnectionSlot
-    {
-        internal readonly SemaphoreSlim Gate = new(1, 1);
-        internal VsrConnection? Connection;
-        internal byte[]? Attachment;
-        internal volatile bool Retired;
-    }
 
     private static SendTarget ParseSendTarget(ReadOnlySpan<byte> body)
     {
@@ -163,223 +154,350 @@ public sealed partial class TcpMessageStream
         return query;
     }
 
-    private async Task<IMemoryOwner<byte>> SendRoutedAsync(int code, SendTarget target,
-        ReadOnlyMemory<byte> payload, PartitionContext? context, CancellationToken token)
+    private Task<IMemoryOwner<byte>> SendRoutedAsync(int code, SendTarget target,
+        ReadOnlyMemory<byte> payload, PartitionContext? context, CancellationToken token) =>
+        RunClientOperationAsync(code, payload, context, target, token);
+
+    private async Task<IMemoryOwner<byte>> RunClientOperationAsync(int code, ReadOnlyMemory<byte> payload,
+        PartitionContext? context, SendTarget? target, CancellationToken token, ClientOperation? retained = null,
+        TimeSpan? timeout = null)
     {
-        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        cancellation.CancelAfter(VsrRequestTimeoutMs);
-        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-        // A new route can change the destination, but not the request's identity or captured position.
-        var captured = context;
-        SessionFrame? frame = null;
-        ulong? generation = null;
-        var refreshHistory = code == CommandCodes.SEND_MESSAGES_CODE && context is null;
-        var refusedPrimary = false;
-        var lifecycleInterval = LifecycleRetryIntervalMs;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _clientLifetime.Token);
+        var budget = timeout ?? TimeSpan.FromMilliseconds(VsrRequestTimeoutMs);
+        if (budget <= TimeSpan.Zero || budget.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+        cancellation.CancelAfter(budget);
+        var deadline = Environment.TickCount64 + (long)budget.TotalMilliseconds;
+        var captured = retained?.Context ?? context;
+        var operation = retained;
+        SessionFrame? frame = retained?.Identity;
+        var generation = retained?.Generation ?? _consensusSession.Generation;
+        var retainable = VsrOperations.ForCode(code) is not (VsrOperation.NonReplicated or VsrOperation.Register or VsrOperation.Logout);
+        var progress = IsProgressPoll(code, payload.Span);
+        var refreshHistory = code == CommandCodes.SEND_MESSAGES_CODE && context is null && retained is null;
+        var retryDelay = LifecycleRetryIntervalMs;
+        var terminal = false;
+        var frameAcquired = false;
+        CancellationTokenRegistration operationCancellation = default;
         try
         {
             while (true)
             {
                 try
                 {
-                    var route = await GetPartitionRouteAsync(target.Key, target.Query, deadline, cancellation.Token);
-                    captured ??= route.Route.Context;
-                    if (generation is not null && generation != route.Generation)
+                    CachedRoute? route = null;
+                    if (target is { } partition)
+                    {
+                        if (operation is null && (retainable || progress))
+                        {
+                            PartitionContext? known = captured;
+                            lock (_pollRoutingGate)
+                            {
+                                if (known is null && _partitionRoutes.TryGetValue(partition.Key, out var cachedRoute)
+                                    && cachedRoute.Generation == generation)
+                                {
+                                    known = cachedRoute.Route.Context;
+                                }
+                            }
+                            if (known is { } knownContext)
+                            {
+                                _mutations.ThrowIfRetained(new MutationLane(knownContext.Incarnation, partition.Key.PartitionId));
+                            }
+                        }
+                        route = await GetPartitionRouteAsync(partition.Key, partition.Query, deadline, cancellation.Token);
+                        captured ??= route.Route.Context;
+                    }
+                    else
+                    {
+                        captured ??= new PartitionContext(0, 0, _metadataWatermark);
+                    }
+                    EnsureOperationSession(generation);
+                    if (operation is null && (retainable || progress))
+                    {
+                        var lane = target is { } selected
+                            ? new MutationLane(captured.Value.Incarnation, selected.Key.PartitionId) : MutationLane.Metadata;
+                        operation = await _mutations.EnterAsync(lane, code, payload, captured.Value, retainable, cancellation.Token);
+                        _mutations.Acquire(operation);
+                        frameAcquired = true;
+                        operationCancellation = operation.Lifetime.Token.Register(cancellation.Cancel);
+                        frame = operation.Identity;
+                    }
+                    frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
+                    VsrConnection connection;
+                    if (route is not null)
+                    {
+                        if (await FindReadyReplicaAsync(route.Route.PrimaryReplica, cancellation.Token) is not { } primary)
+                        {
+                            if (target is { } waiting)
+                            {
+                                RemovePartitionRoute(waiting.Key);
+                            }
+                            await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
+                            continue;
+                        }
+                        connection = primary;
+                    }
+                    else if (_metadataReplica is { } metadataPrimary)
+                    {
+                        if (await FindReadyReplicaAsync(metadataPrimary, cancellation.Token) is not { } primary)
+                        {
+                            await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                            await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
+                            continue;
+                        }
+                        connection = primary;
+                    }
+                    else
+                    {
+                        connection = ReadyReplicaLinks().FirstOrDefault() ?? throw new NotConnectedException();
+                    }
+                    EnsureOperationSession(generation);
+                    if (operation is not null && !_mutations.Owns(operation))
                     {
                         throw PollNotAccepted();
                     }
-                    generation ??= route.Generation;
-                    frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
-                    if (Volatile.Read(ref _clusterNodeCount) <= 1)
+                    var attempt = operation is null
+                        ? await connection.SendAttemptAsync(code, payload, deadline, deadline, HasSensitiveReply(code),
+                            cancellation.Token, retryTransient: false, context: captured.Value, retainedFrame: frame)
+                        : await connection.SendFrameAsync(operation, deadline, cancellation.Token);
+                    if (attempt.Error is null)
                     {
-                        var attempt = await SendVsrAttemptAsync(code, payload, Environment.TickCount64, deadline,
-                            false, cancellation.Token, captured.Value, frame,
-                            retryTransient: VsrOperations.ForCode(code) != VsrOperation.NonReplicated);
-                        if (attempt.Error is not null)
+                        if (operation is { Uncertain: true } && !attempt.Committed)
                         {
-                            if (attempt.RequestStarted && !VsrOperations.IsReplaySafeRead(code, false, payload.Span)
-                                && !IsDefinitiveVerdict(attempt.Error))
-                            {
-                                throw new VsrRequestOutcomeUnknownException(attempt.Error);
-                            }
-                            ExceptionDispatchInfo.Throw(attempt.Error);
+                            attempt.Response?.Dispose();
+                            throw new VsrRequestOutcomeUnknownException(
+                                VsrError.Exception(VsrError.TRANSIENT_NOT_COMMITTED, "The reply does not prove commit."),
+                                operation.Identity.RequestId);
                         }
+                        terminal = true;
                         return attempt.Response!;
                     }
-                    return await SendPrimaryOnceAsync(target.Key, code, payload, route, captured.Value,
-                        frame.Value, deadline, cancellation.Token);
+                    if (IsSessionFailure(attempt.Error))
+                    {
+                        ScheduleSessionRecovery(generation);
+                    }
+                    if (attempt.Error is IggyInvalidStatusCodeException status)
+                    {
+                        status.CommandCode = code;
+                        if ((!status.FromServer || status.StatusCode == VsrError.REQUEST_TOO_OLD)
+                            && attempt.RequestStarted && operation is { Retainable: true })
+                        {
+                            operation.Uncertain = true;
+                        }
+                        if (operation is not null && status.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED)
+                        {
+                            if (!operation.Retainable)
+                            {
+                                throw new VsrRequestOutcomeUnknownException(status);
+                            }
+                            operation.Uncertain = true;
+                        }
+                        if (operation is { Uncertain: true } && !status.Committed
+                            && status.StatusCode is not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY))
+                        {
+                            throw new VsrRequestOutcomeUnknownException(status, operation.Identity.RequestId);
+                        }
+                        if (status.Committed && operation is { Uncertain: true })
+                        {
+                            terminal = true;
+                        }
+                        if (status.StatusCode == VsrError.HISTORY_UNAVAILABLE && target is { } staleHistory)
+                        {
+                            RemovePartitionRoute(staleHistory.Key);
+                        }
+                        if (operation is not { Uncertain: true } && status.FromServer
+                            && status.StatusCode is VsrError.HISTORY_UNAVAILABLE or VsrError.LIFECYCLE_BUSY)
+                        {
+                            operationCancellation.Dispose();
+                        }
+                        ExceptionDispatchInfo.Throw(status);
+                    }
+                    if (attempt.RequestStarted && (retainable || progress || !VsrOperations.IsReplaySafeRead(code, false, payload.Span)))
+                    {
+                        if (operation is { Retainable: true })
+                        {
+                            operation.Uncertain = true;
+                        }
+                        else
+                        {
+                            throw new VsrRequestOutcomeUnknownException(attempt.Error);
+                        }
+                    }
+                    if (attempt.Error is OperationCanceledException)
+                    {
+                        ExceptionDispatchInfo.Throw(attempt.Error);
+                    }
+                    if (!VsrConnection.IsConnectionException(attempt.Error))
+                    {
+                        throw operation is { Uncertain: true }
+                            ? new VsrRequestOutcomeUnknownException(attempt.Error, operation.Identity.RequestId) : attempt.Error;
+                    }
+                    if (target is { } failed)
+                    {
+                        RemovePartitionRoute(failed.Key);
+                    }
+                    await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
                 }
                 catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
-                    VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY)
+                    VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.TRANSIENT_NOT_COMMITTED)
                 {
-                    RemovePartitionRoute(target.Key);
-                    if ((generation is not null && generation != _consensusSession.Generation)
+                    if (generation != _consensusSession.Generation
                         || Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
                     {
                         throw;
                     }
-                    if (error.StatusCode != VsrError.NOT_PRIMARY || refusedPrimary)
+                    if (target is { } failed)
                     {
-                        await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
+                        RemovePartitionRoute(failed.Key, error.StatusCode == VsrError.NOT_PRIMARY);
                     }
-                    refusedPrimary |= error.StatusCode == VsrError.NOT_PRIMARY;
+                    else
+                    {
+                        await RefreshPartitionRosterAsync(deadline, cancellation.Token);
+                    }
+                    await Task.Delay(PollRoutingRetryIntervalMs, cancellation.Token);
                 }
-                catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.HISTORY_UNAVAILABLE)
+                catch (IggyInvalidStatusCodeException error) when (retained is null
+                    && operation is not { Uncertain: true } && error.StatusCode == VsrError.HISTORY_UNAVAILABLE && refreshHistory)
                 {
-                    RemovePartitionRoute(target.Key);
-                    if (!refreshHistory)
-                    {
-                        throw;
-                    }
                     refreshHistory = false;
+                    if (target is { } failed)
+                    {
+                        RemovePartitionRoute(failed.Key);
+                    }
+                    if (operation is not null)
+                    {
+                        operationCancellation.Dispose();
+                        _mutations.Complete(operation);
+                        if (frameAcquired)
+                        {
+                            operation.Frame.Release();
+                            frameAcquired = false;
+                        }
+                        operation = null;
+                    }
                     captured = null;
                     frame = null;
                 }
-                catch (IggyInvalidStatusCodeException error) when (error.FromServer
-                    && error.StatusCode == VsrError.LIFECYCLE_BUSY
-                    && error.CommandCode == code
-                    && Environment.TickCount64 + lifecycleInterval < deadline)
+                catch (IggyInvalidStatusCodeException error) when (retained is null
+                    && operation is not { Uncertain: true } && error.FromServer && error.CommandCode == code
+                    && error.StatusCode == VsrError.LIFECYCLE_BUSY)
                 {
-                    await Task.Delay(lifecycleInterval, cancellation.Token);
-                    lifecycleInterval = Math.Min(lifecycleInterval * 2, LifecycleRetryMaxIntervalMs);
-                    frame = null;
-                }
-            }
-        }
-        catch (OperationCanceledException error) when (!token.IsCancellationRequested)
-        {
-            RemovePartitionRoute(target.Key);
-            throw new VsrRequestOutcomeUnknownException(error);
-        }
-    }
-
-    private async Task<IMemoryOwner<byte>> SendPrimaryOnceAsync(PartitionRouteKey key, int code,
-        ReadOnlyMemory<byte> payload, CachedRoute route, PartitionContext captured, SessionFrame frame,
-        long deadline, CancellationToken token)
-    {
-        PollConnectionSlot slot;
-        lock (_pollRoutingGate)
-        {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (!_pollConnections.TryGetValue(route.Endpoint, out slot!))
-            {
-                if (_pollConnections.Count >= MAX_POLL_CONNECTIONS)
-                {
-                    RetireIdlePollConnection();
-                }
-                slot = new PollConnectionSlot();
-                _pollConnections.Add(route.Endpoint, slot);
-            }
-        }
-
-        await slot.Gate.WaitAsync(token);
-        var started = false;
-        try
-        {
-            ValidatePollRoute(route, slot);
-            if (slot.Connection is null)
-            {
-                var connection = await ConnectPollConnectionAsync(route, token);
-                lock (_pollRoutingGate)
-                {
-                    if (slot.Retired || _disposed)
+                    if (operation is not null)
                     {
-                        connection.Dispose();
-                        throw PollNotAccepted();
+                        operationCancellation.Dispose();
+                        _mutations.Complete(operation);
+                        if (frameAcquired)
+                        {
+                            operation.Frame.Release();
+                            frameAcquired = false;
+                        }
+                        operation = null;
                     }
-                    slot.Connection = connection;
+                    frame = null;
+                    await Task.Delay(retryDelay, cancellation.Token);
+                    retryDelay = Math.Min(retryDelay * 2, LifecycleRetryMaxIntervalMs);
                 }
             }
-            ValidatePollRoute(route, slot);
-            if (slot.Attachment is null || !slot.Attachment.AsSpan().SequenceEqual(route.Attachment))
-            {
-                using var attached = await SendPollExchangeAsync(slot.Connection, CommandCodes.BIND_SESSION_CODE,
-                    LoginRegister.SerializeBindSession(route.Attachment, _consensusSession.BindSecret), deadline, token);
-                var binding = LoginRegister.Deserialize(attached.Memory.Span);
-                if (binding.Session != frame.SessionId)
-                {
-                    throw VsrError.Exception(VsrError.INVALID_FORMAT, "BindSession reply carried a different session epoch.");
-                }
-                slot.Attachment = route.Attachment;
-            }
-            ValidatePollRoute(route, slot);
-            started = true;
-            return await SendPollExchangeAsync(slot.Connection, code, payload, deadline, token, captured, frame);
         }
-        catch (IggyInvalidStatusCodeException error) when (error.StatusCode is
-            VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.LIFECYCLE_BUSY)
+        catch (Exception error) when (operation is { Retainable: true, Uncertain: true }
+            && error is not IggyInvalidStatusCodeException { Committed: true })
         {
-            throw;
+            _mutations.Retain(operation);
+            throw error is VsrRequestOutcomeUnknownException ? error
+                : new VsrRequestOutcomeUnknownException(error, operation.Identity.RequestId);
         }
-        catch (Exception error)
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
-            slot.Connection?.Dispose();
-            slot.Connection = null;
-            slot.Attachment = null;
-            RemovePartitionRoute(key);
-            if (started && !VsrOperations.IsReplaySafeRead(code, false, payload.Span)
-                && !IsDefinitiveVerdict(error) && error is not OperationCanceledException)
-            {
-                throw new VsrRequestOutcomeUnknownException(error);
-            }
-            if (IsPollConnectionFailure(error)
-                || error is IggyInvalidStatusCodeException
-                { StatusCode: VsrError.TRANSIENT_NOT_COMMITTED or VsrError.REQUEST_TOO_OLD })
-            {
-                throw PollNotAccepted();
-            }
-            throw;
+            throw PollNotAccepted();
         }
         finally
         {
-            slot.Gate.Release();
-        }
-    }
-
-    private void ValidatePollRoute(CachedRoute route, PollConnectionSlot slot)
-    {
-        lock (_pollRoutingGate)
-        {
-            if (slot.Retired || route.Generation != _consensusSession.Generation
-                || route.Watermark < _metadataWatermark)
+            operationCancellation.Dispose();
+            if (operation is not null && (terminal || !operation.Retained))
             {
-                throw PollNotAccepted();
+                _mutations.Complete(operation);
+            }
+            if (operation is not null && frameAcquired)
+            {
+                operation.Frame.Release();
             }
         }
     }
 
-    private void RetireIdlePollConnection()
+    /// <inheritdoc />
+    public async Task ResolveOperationAsync(ulong operationId, TimeSpan timeout, CancellationToken token = default)
     {
-        foreach (var (endpoint, slot) in _pollConnections)
+        if (timeout <= TimeSpan.Zero || timeout.TotalMilliseconds > int.MaxValue)
         {
-            if (!slot.Gate.Wait(0))
-            {
-                continue;
-            }
-            try
-            {
-                slot.Retired = true;
-                slot.Connection?.Dispose();
-                _pollConnections.Remove(endpoint);
-                return;
-            }
-            finally
-            {
-                slot.Gate.Release();
-            }
+            throw new ArgumentOutOfRangeException(nameof(timeout));
         }
-        throw PollNotAccepted();
+        var operation = _mutations.AcquireRetained(operationId);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, operation.Lifetime.Token);
+        cancellation.CancelAfter(timeout);
+        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
+        var acquired = false;
+        try
+        {
+            await operation.Resolution.WaitAsync(cancellation.Token);
+            acquired = true;
+            if (!_mutations.Owns(operation))
+            {
+                throw new VsrOperationNotRetainedException(operationId);
+            }
+            var target = operation.Lane == MutationLane.Metadata ? (SendTarget?)null
+                : PartitionTarget(operation.Code, operation.Body.Span);
+            using var response = await RunClientOperationAsync(operation.Code, operation.Body, operation.Context,
+                target, cancellation.Token, operation, TimeSpan.FromMilliseconds(Math.Max(1, deadline - Environment.TickCount64)));
+        }
+        catch (OperationCanceledException error)
+        {
+            throw new VsrRequestOutcomeUnknownException(error, operationId);
+        }
+        finally
+        {
+            if (acquired)
+            {
+                operation.Resolution.Release();
+            }
+            operation.Frame.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public Task AbandonOperationAsync(ulong operationId)
+    {
+        _mutations.Complete(_mutations.Retained(operationId));
+        return Task.CompletedTask;
+    }
+
+    private void EnsureOperationSession(ulong generation)
+    {
+        if (generation != _consensusSession.Generation)
+        {
+            throw PollNotAccepted();
+        }
+    }
+
+    private static bool IsProgressPoll(int code, ReadOnlySpan<byte> body)
+    {
+        const int PollTailSize = 14;
+        const byte NextStrategy = 5;
+        return code == CommandCodes.POLL_MESSAGES_CODE && body.Length >= PollTailSize
+            && (body[^1] != 0 || body[^PollTailSize] == NextStrategy);
     }
 
     private async Task<CachedRoute> GetPartitionRouteAsync(PartitionRouteKey key, ReadOnlyMemory<byte> query,
         long deadline, CancellationToken token)
     {
+        CachedRoute? previous;
         lock (_pollRoutingGate)
         {
-            if (_partitionRoutes.TryGetValue(key, out var cached) && cached.Watermark >= _metadataWatermark
-                && cached.Generation == _consensusSession.Generation)
+            if (_partitionRoutes.TryGetValue(key, out previous) && !previous.Stale
+                && previous.Watermark >= _metadataWatermark && previous.Generation == _consensusSession.Generation)
             {
-                return cached;
+                return previous;
             }
         }
         if (Volatile.Read(ref _clusterNodeCount) == 0)
@@ -387,43 +505,89 @@ public sealed partial class TcpMessageStream
             await RefreshPartitionRosterAsync(deadline, token);
         }
         var generation = _consensusSession.Generation;
-        using var response = await SendPollControlAsync(CommandCodes.GET_PARTITION_ROUTE_CODE, query, deadline, token);
-        var route = BinaryMapper.MapPartitionRoute(response.Memory.Span);
-        _groupState.SetPartitionCount(new TopicKey(key.StreamId, key.TopicId), route.PartitionsCount);
-        bool known;
+        var links = ReadyReplicaLinks().ToList();
         lock (_pollRoutingGate)
         {
-            known = _replicaEndpoints.ContainsKey(route.PrimaryReplica);
+            var preferred = previous?.Route.PrimaryReplica ?? _metadataReplica;
+            if (preferred is { } replica && _replicaLinks.TryGetValue(replica, out var slot)
+                && slot.Connection is { IsReady: true } connection)
+            {
+                links.Remove(connection);
+                links.Insert(0, connection);
+            }
         }
-        if (!known)
+        foreach (var connection in links)
         {
-            await RefreshPartitionRosterAsync(deadline, token);
+            var attempt = await connection.SendAttemptAsync(CommandCodes.GET_PARTITION_ROUTE_CODE, query,
+                deadline, deadline, false, token, retryTransient: false,
+                context: new PartitionContext(0, 0, _metadataWatermark));
+            if (attempt.Error is not null)
+            {
+                if (IsSessionFailure(attempt.Error))
+                {
+                    ScheduleSessionRecovery(generation);
+                }
+                if (attempt.Error is IggyInvalidStatusCodeException
+                    { StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY }
+                    || VsrConnection.IsConnectionException(attempt.Error))
+                {
+                    continue;
+                }
+                ExceptionDispatchInfo.Throw(attempt.Error);
+            }
+            using var response = attempt.Response!;
+            var route = BinaryMapper.MapPartitionRoute(response.Memory.Span);
+            bool knownReplica;
+            lock (_pollRoutingGate)
+            {
+                knownReplica = _replicaEndpoints.ContainsKey(route.PrimaryReplica);
+            }
+            if (!knownReplica)
+            {
+                await RefreshPartitionRosterAsync(deadline, token);
+            }
+            lock (_pollRoutingGate)
+            {
+                if (generation != _consensusSession.Generation || !_replicaEndpoints.ContainsKey(route.PrimaryReplica))
+                {
+                    throw PollNotAccepted();
+                }
+                _partitionRoutes.TryGetValue(key, out previous);
+                if (previous is not null && (route.MetadataOp < previous.Route.MetadataOp
+                    || route.Incarnation == previous.Route.Incarnation && (route.View < previous.MinimumView
+                        || route.View == previous.Route.View && route.PrimaryReplica != previous.Route.PrimaryReplica)))
+                {
+                    continue;
+                }
+                var aliases = _partitionRoutes.Where(entry => entry.Key.PartitionId == key.PartitionId
+                    && entry.Value.Route.Incarnation == route.Incarnation).ToArray();
+                var groupFloor = aliases.Select(entry => entry.Value.MinimumView).DefaultIfEmpty(route.View).Max();
+                if (route.View < groupFloor || aliases.Any(entry => entry.Value.Route.View == route.View
+                    && entry.Value.Route.PrimaryReplica != route.PrimaryReplica))
+                {
+                    continue;
+                }
+                foreach (var (alias, cachedAlias) in aliases)
+                {
+                    _partitionRoutes[alias] = cachedAlias with
+                    {
+                        MinimumView = Math.Max(cachedAlias.MinimumView, route.View),
+                        Stale = cachedAlias.Stale || cachedAlias.Route.View < route.View
+                    };
+                }
+                _groupState.SetPartitionCount(new TopicKey(key.StreamId, key.TopicId), route.PartitionsCount);
+                var cached = new CachedRoute(generation, Math.Max(_metadataWatermark, route.MetadataOp), route,
+                    route.View, false, checked(++_routeSequence));
+                if (_partitionRoutes.Count >= MaxCachedPartitionRoutes && !_partitionRoutes.ContainsKey(key))
+                {
+                    var oldest = _partitionRoutes.MinBy(entry => entry.Value.Sequence).Key;
+                    _partitionRoutes.Remove(oldest);
+                }
+                _partitionRoutes[key] = cached;
+                return cached;
+            }
         }
-        lock (_pollRoutingGate)
-        {
-            if (generation != _consensusSession.Generation
-                || !_replicaEndpoints.TryGetValue(route.PrimaryReplica, out var endpoint))
-            {
-                throw PollNotAccepted();
-            }
-            var session = _consensusSession.Resolve(VsrOperation.NonReplicated);
-            if (session.SessionId == 0)
-            {
-                throw PollNotAccepted();
-            }
-            var watermark = Math.Max(_metadataWatermark, route.MetadataOp);
-            var attachment = new byte[ConsumerSessionSize];
-            BinaryPrimitives.WriteUInt128LittleEndian(attachment, session.ClientId);
-            BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(ConsumerSessionEpochOffset), session.SessionId);
-            BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(ConsumerSessionWatermarkOffset), watermark);
-            var cached = new CachedRoute(endpoint, attachment, generation, watermark, route);
-            if (_partitionRoutes.Count >= MaxCachedPartitionRoutes)
-            {
-                _partitionRoutes.Clear();
-            }
-            _partitionRoutes[key] = cached;
-            return cached;
-        }
+        throw PollNotAccepted();
     }
 
     private async Task RefreshPartitionRosterAsync(long deadline, CancellationToken token)
@@ -436,100 +600,44 @@ public sealed partial class TcpMessageStream
     private async Task<IMemoryOwner<byte>> SendPollControlAsync(int code, ReadOnlyMemory<byte> payload,
         long deadline, CancellationToken token)
     {
-        ulong watermark;
-        lock (_pollRoutingGate)
+        while (true)
         {
-            watermark = _metadataWatermark;
-        }
-        var context = new PartitionContext(0, 0, watermark);
-        var attempt = await SendVsrAttemptAsync(code, payload, Environment.TickCount64, deadline, false, token, context);
-        if (attempt.Error is not null && IsPollConnectionFailure(attempt.Error)
-            && _configuration.ReconnectionSettings.Enabled)
-        {
-            await DropVsrConnectionAsync(attempt.Connection);
-            using var reconnectCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-            reconnectCancellation.CancelAfter((int)Math.Clamp(deadline - Environment.TickCount64, 0, int.MaxValue));
-            await ConnectAsync(true, false, reconnectCancellation.Token, sameEndpointOnly: true);
-            attempt = await SendVsrAttemptAsync(code, payload, Environment.TickCount64, deadline, false, token, context);
-        }
-        if (attempt.Error is not null)
-        {
-            ExceptionDispatchInfo.Throw(attempt.Error);
-        }
-        return attempt.Response!;
-    }
-
-    private async Task<VsrConnection> ConnectPollConnectionAsync(CachedRoute route, CancellationToken token)
-    {
-        var endpoint = route.Endpoint;
-        if (!ServerAddress.TryParse(endpoint, out var host, out var port))
-        {
-            throw new InvalidBaseAddressException();
-        }
-
-        using var dialCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        dialCancellation.CancelAfter(FailoverDialTimeout);
-        Socket? socket = new(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
-        VsrConnection? connection = null;
-        try
-        {
-            socket.NoDelay = true;
-            if (_configuration.SendBufferSize is { } sendBufferSize)
+            foreach (var connection in ReadyReplicaLinks())
             {
-                socket.SendBufferSize = sendBufferSize;
+                var context = new PartitionContext(0, 0, _metadataWatermark);
+                var attempt = await connection.SendAttemptAsync(code, payload, deadline, deadline, false, token,
+                    retryTransient: false, context: context);
+                if (attempt.Error is null)
+                {
+                    return attempt.Response!;
+                }
+                if (IsSessionFailure(attempt.Error))
+                {
+                    ScheduleSessionRecovery(_consensusSession.Generation);
+                }
+                if (attempt.Error is not IggyInvalidStatusCodeException
+                    { StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY }
+                    && !VsrConnection.IsConnectionException(attempt.Error))
+                {
+                    ExceptionDispatchInfo.Throw(attempt.Error);
+                }
             }
-
-            if (_configuration.ReceiveBufferSize is { } receiveBufferSize)
+            if (Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
             {
-                socket.ReceiveBufferSize = receiveBufferSize;
+                throw PollNotAccepted();
             }
-
-            await socket.ConnectAsync(host, port, dialCancellation.Token);
-            var stream = _configuration.TlsSettings.Enabled
-                ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, dialCancellation.Token)
-                : new NetworkStream(socket, true);
-            socket = null;
-            // An offset write on this connection is a replicated request of the bound session, so its request id
-            // comes from the same counter as the membership connection's, or the two would reuse ids.
-            connection = new VsrConnection(stream, _consensusSession, _configuration.MaxResponseFrameSize,
-                VsrRequestTimeoutMs, dropped => dropped.Dispose(), _logger);
-            return connection;
-        }
-        catch (OperationCanceledException) when (!token.IsCancellationRequested)
-        {
-            connection?.Dispose();
-            throw new IOException($"Timed out connecting to partition primary {endpoint}.");
-        }
-        catch
-        {
-            connection?.Dispose();
-            throw;
-        }
-        finally
-        {
-            socket?.Dispose();
+            await Task.Delay(PollRoutingRetryIntervalMs, token);
         }
     }
 
-    private static async Task<IMemoryOwner<byte>> SendPollExchangeAsync(VsrConnection connection, int code,
-        ReadOnlyMemory<byte> payload, long deadline, CancellationToken token, PartitionContext context = default,
-        SessionFrame? frame = null)
-    {
-        var attempt = await connection.SendAttemptAsync(code, payload, Environment.TickCount64, deadline,
-            HasSensitiveReply(code), token, retryTransient: VsrOperations.ForCode(code) != VsrOperation.NonReplicated,
-            context: context, retainedFrame: frame);
-        if (attempt.Error is not null)
-        {
-            ExceptionDispatchInfo.Throw(attempt.Error);
-        }
-        return attempt.Response!;
-    }
-
-    private void ObserveMetadataCommit(ulong commit)
+    private void ObserveMetadataCommit(ulong commit, ulong generation)
     {
         lock (_pollRoutingGate)
         {
-            _metadataWatermark = Math.Max(_metadataWatermark, commit);
+            if (generation == _consensusSession.Generation)
+            {
+                _metadataWatermark = Math.Max(_metadataWatermark, commit);
+            }
         }
     }
 
@@ -538,20 +646,24 @@ public sealed partial class TcpMessageStream
         lock (_pollRoutingGate)
         {
             _partitionRoutes.Clear();
-            foreach (var slot in _pollConnections.Values)
-            {
-                slot.Retired = true;
-                slot.Connection?.Dispose();
-            }
-            _pollConnections.Clear();
         }
     }
 
-    private void RemovePartitionRoute(PartitionRouteKey key)
+    private void RemovePartitionRoute(PartitionRouteKey key, bool notPrimary = false)
     {
         lock (_pollRoutingGate)
         {
-            _partitionRoutes.Remove(key);
+            if (!_partitionRoutes.TryGetValue(key, out var refused))
+            {
+                return;
+            }
+            var minimumView = notPrimary && refused.Route.View < uint.MaxValue
+                ? refused.Route.View + 1 : refused.MinimumView;
+            foreach (var (alias, route) in _partitionRoutes.Where(entry => entry.Key.PartitionId == key.PartitionId
+                && entry.Value.Route.Incarnation == refused.Route.Incarnation).ToArray())
+            {
+                _partitionRoutes[alias] = route with { Stale = true, MinimumView = Math.Max(route.MinimumView, minimumView) };
+            }
         }
     }
 
@@ -576,12 +688,6 @@ public sealed partial class TcpMessageStream
                     password ?? configured.Password);
             }
         }
-    }
-
-    private static bool IsPollConnectionFailure(Exception error)
-    {
-        return IsLostConnection(error) || error is VsrSessionEvictedException
-            or IggyInvalidStatusCodeException { StatusCode: VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT };
     }
 
     private static IggyInvalidStatusCodeException PollNotAccepted()

@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Encryption;
+using Apache.Iggy.Exceptions;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -71,4 +72,14 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the raw response payload bytes.</returns>
     Task<byte[]> SendBinaryRequestAsync(uint code, byte[] payload, CancellationToken token = default);
+
+    /// <summary>
+    ///     Replays a retained operation within one timeout. Success proves commit; a proved business rejection
+    ///     returns its original error and frees the lane. An unknown outcome keeps the operation retained.
+    /// </summary>
+    Task ResolveOperationAsync(ulong operationId, TimeSpan timeout, CancellationToken token = default) =>
+        Task.FromException(new FeatureUnavailableException());
+
+    /// <summary>Releases a retained operation without determining whether it committed.</summary>
+    Task AbandonOperationAsync(ulong operationId) => Task.FromException(new FeatureUnavailableException());
 }

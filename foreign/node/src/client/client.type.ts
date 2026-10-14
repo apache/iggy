@@ -47,21 +47,17 @@ export type CommandResponse = {
 };
 
 export type SendCommandOptions = {
+  /** Cancels this call without closing its shared replica link. */
+  signal?: AbortSignal,
   /** Whether the response uses the standard command response decoder */
   handleResponse?: boolean,
-  /** Whether to append rather than prepend the command to the queue */
+  /** @deprecated Multiplexed calls ignore this queue-order hint. */
   last?: boolean,
-  /**
-   * Whether a not-admitted refusal re-checks the leader and re-issues the
-   * command. False for the roster read a re-check itself runs: answering a
-   * leader check with another leader check would recurse.
-   */
+  /** @deprecated The shared session owner manages replica routing. */
   followsLeaderMoves?: boolean,
   /**
    * When the whole request gives up, as an epoch timestamp in milliseconds.
-   * Set when a command already carries a budget -- one re-issued after a
-   * leader move keeps the budget it was first submitted with, rather than
-   * opening a second one on top of it. Defaults to a fresh response timeout.
+   * Includes admission, discovery, link waits and retries. Defaults to 30 seconds.
    */
   deadline?: number,
   /**
@@ -89,9 +85,13 @@ export type RawClient = {
   isAuthenticated: boolean
   /** Authenticates the client with the server */
   authenticate: (c: ClientCredentials) => Promise<boolean>
+  /** Resolves the original frozen operation; never sends it under a fresh identity. */
+  resolveOperation?: (operationId: bigint, options?: SendCommandOptions) => Promise<void>,
+  /** Releases a retained lane without asserting that the operation did not commit. */
+  abandonOperation?: (operationId: bigint) => void,
   /** Destroys the client connection */
   destroy: () => void,
-  /** Holds a pooled client across multiple command submissions */
+  /** Tracks one facade operation across multiple command submissions. */
   hold?: () => () => void,
   /** Registers an event listener */
   on: (ev: string, cb: (e?: unknown) => void) => void
@@ -103,7 +103,7 @@ export type RawClient = {
 
 /**
  * Function type that provides a RawClient instance.
- * Used for dependency injection and connection pooling.
+ * Used for dependency injection.
  */
 export type ClientProvider = () => Promise<RawClient>;
 
@@ -125,14 +125,13 @@ export type ReconnectOption = {
   /** Whether automatic reconnection is enabled */
   enabled: boolean,
   /**
-   * Milliseconds to wait between passes. The first pass runs at once when more
-   * than one endpoint is known.
+   * Initial reconnect delay in milliseconds. Each replica uses exponential
+   * backoff capped at 10 seconds with jitter.
    */
   interval: number,
   /**
-   * Maximum number of passes over the known endpoints. One pass dials the
-   * endpoint the client is on, the endpoint it was configured with, and every
-   * node the roster named, so this counts passes rather than dials.
+   * Maximum retries per replica after the first attempt. Bootstrap retries
+   * sweep the configured seed and remembered endpoints.
    */
   maxRetries: number
 }
@@ -167,12 +166,12 @@ export type PasswordCredentials = {
 export type ClientCredentials = TokenCredentials | PasswordCredentials;
 
 /**
- * Connection pool size configuration.
+ * Legacy logical-client count. Replica links are managed independently.
  */
 export type PoolSizeOption = {
-  /** Minimum number of connections in the pool */
+  /** Minimum logical clients; normalized to one */
   min?: number,
-  /** Maximum number of connections in the pool */
+  /** Maximum logical clients; only one is supported */
   max?: number
 }
 
@@ -192,12 +191,16 @@ export type ClientConfig = {
   options: TransportOption,
   /** Authentication credentials */
   credentials: ClientCredentials,
-  /** Connection pool size configuration */
+  /** Legacy logical-client count; does not limit replica links. */
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
   /** Interval for sending heartbeat pings, in milliseconds */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
-  maxResponseFrameSize?: number
+  maxResponseFrameSize?: number,
+  /** Maximum active plus retained mutations across this client. Default: 256. */
+  maxPendingOperations?: number,
+  /** Frozen mutation headers and bodies, including retained and writer-owned bytes. Default: 64 MiB. */
+  maxPendingOperationBytes?: number
 }
