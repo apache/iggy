@@ -974,6 +974,7 @@ mod tests {
                     commit: 0,
                     group,
                     suffix: DvcSuffix::empty(),
+                    untrusted_log: false,
                 },
                 VsrAction::SendRequestStartView { view, group },
                 VsrAction::SendStartView {

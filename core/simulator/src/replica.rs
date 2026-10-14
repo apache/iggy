@@ -20,7 +20,9 @@ use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerConfig;
-use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
+use consensus::{
+    ClientTable, ConsensusClock, JoinMode, LocalPipeline, Sequencer, VsrConsensus, VsrState,
+};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use journal::Journal;
@@ -155,7 +157,11 @@ pub fn new_shard(
     recovered_state: Option<VsrState>,
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
-    seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    seed_namespaces: &[(
+        server_common::sharding::IggyNamespace,
+        u32,
+        iggy_common::Durability,
+    )],
     applied_frontier: Arc<AppliedFrontier>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
@@ -271,10 +277,11 @@ pub fn new_shard(
         // backup.
         let restored_head = restored_op.unwrap_or(0);
         if !solo && (restored_head > 0 || recovered_state.is_some() || has_checkpoint) {
-            consensus.init_as_backup();
-            consensus.begin_view_probe();
+            consensus.join(JoinMode::ProbeAsBackup {
+                await_state_transfer: true,
+            });
         } else {
-            consensus.init();
+            consensus.join(JoinMode::Init);
         }
         if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
             let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
@@ -333,8 +340,13 @@ pub fn new_shard(
     // seeding again would bring back a fixture topic a committed delete removed.
     if shard_idx == 0 && !has_checkpoint {
         let streams = metadata.mux_stm.streams();
-        for &(namespace, created_view) in seed_namespaces {
-            streams.seed_namespace(namespace, namespace.inner(), created_view);
+        for &(namespace, created_view, durability) in seed_namespaces {
+            streams.seed_namespace_with_durability(
+                namespace,
+                namespace.inner(),
+                created_view,
+                durability,
+            );
         }
     }
 

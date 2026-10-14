@@ -230,6 +230,8 @@ pub struct ReplicaLogContext {
     pub commit: u64,
     pub status: Status,
     pub role: ReplicaRole,
+    /// See [`VsrConsensus::has_untrusted_log`].
+    pub untrusted_log: bool,
 }
 
 impl ReplicaLogContext {
@@ -255,6 +257,7 @@ impl ReplicaLogContext {
             commit: consensus.commit_max(),
             status: consensus.status(),
             role,
+            untrusted_log: consensus.has_untrusted_log(),
         }
     }
 }
@@ -315,6 +318,10 @@ pub struct ControlActionLogEvent {
     pub target_replica: Option<u8>,
     pub op: Option<u64>,
     pub commit: Option<u64>,
+    /// The flag a `DoViewChange` carries, which for an empty vote differs from
+    /// [`ReplicaLogContext::untrusted_log`]: a barred replica never elected, yet
+    /// its vote is untrusted.
+    pub untrusted_log: Option<bool>,
 }
 
 impl ControlActionLogEvent {
@@ -327,6 +334,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::SendStartViewChange { .. } => Self {
                 replica,
@@ -334,15 +342,21 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::SendDoViewChange {
-                target, op, commit, ..
+                target,
+                op,
+                commit,
+                untrusted_log,
+                ..
             } => Self {
                 replica,
                 action: ControlActionKind::SendDoViewChange,
                 target_replica: Some(target),
                 op: Some(op),
                 commit: Some(commit),
+                untrusted_log: Some(untrusted_log),
             },
             VsrAction::SendStartView { op, commit, .. } => Self {
                 replica,
@@ -350,6 +364,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: Some(op),
                 commit: Some(commit),
+                untrusted_log: None,
             },
             VsrAction::SendPrepareOk {
                 target, from_op, ..
@@ -359,6 +374,7 @@ impl ControlActionLogEvent {
                 target_replica: Some(target),
                 op: Some(from_op),
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::RetransmitPrepares { .. } => Self {
                 replica,
@@ -366,6 +382,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::RebuildPipeline { from_op, to_op, .. } => Self {
                 replica,
@@ -373,6 +390,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: Some(from_op),
                 commit: Some(to_op),
+                untrusted_log: None,
             },
             VsrAction::CommitJournal => Self {
                 replica,
@@ -380,6 +398,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+                untrusted_log: None,
             },
             VsrAction::SendCommit { commit, .. } => Self {
                 replica,
@@ -387,6 +406,7 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: Some(commit),
+                untrusted_log: None,
             },
         }
     }
@@ -519,6 +539,7 @@ fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -557,6 +578,7 @@ fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -595,6 +617,7 @@ fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -633,6 +656,7 @@ fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -671,6 +695,7 @@ fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         operation,
         client,
         request,
@@ -772,6 +797,7 @@ pub fn emit_replica_event(sim_event: SimEventKind, ctx: &ReplicaLogContext) {
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
     );
 }
 
@@ -797,6 +823,7 @@ pub fn emit_namespace_progress_event(
         commit = ctx.commit,
         status = status_as_str(ctx.status),
         role = ctx.role.as_str(),
+        untrusted_log = ctx.untrusted_log,
         op,
         pipeline_depth,
     );
@@ -821,6 +848,7 @@ impl StructuredSimEvent for RequestLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             client_id = self.client_id,
             request_id = self.request_id,
             operation = operation_as_str(self.operation),
@@ -847,6 +875,7 @@ impl StructuredSimEvent for PrepareLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             op = self.op,
             parent_checksum = self.parent_checksum,
             prepare_checksum = self.prepare_checksum,
@@ -877,6 +906,7 @@ impl StructuredSimEvent for AckLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             op = self.op,
             prepare_checksum = self.prepare_checksum,
             ack_from_replica = self.ack_from_replica,
@@ -906,6 +936,7 @@ impl StructuredSimEvent for CommitLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             op = self.op,
             client_id = self.client_id,
             request_id = self.request_id,
@@ -936,6 +967,7 @@ impl StructuredSimEvent for ViewChangeLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             old_view = self.old_view,
             new_view = self.new_view,
             reason = self.reason.as_str(),
@@ -962,10 +994,12 @@ impl StructuredSimEvent for ControlActionLogEvent {
             commit = ctx.commit,
             status = status_as_str(ctx.status),
             role = ctx.role.as_str(),
+            untrusted_log = ctx.untrusted_log,
             action = self.action.as_str(),
             target_replica = self.target_replica.unwrap_or_default(),
             op = self.op.unwrap_or_default(),
             action_commit = self.commit.unwrap_or_default(),
+            action_untrusted_log = self.untrusted_log.unwrap_or_default(),
         );
     }
 }
