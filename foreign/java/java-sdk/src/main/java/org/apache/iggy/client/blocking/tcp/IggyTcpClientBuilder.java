@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.channel.IoEventLoopGroup;
+import org.apache.iggy.builder.TcpConnectionString;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
@@ -207,6 +208,30 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder tlsCertificate(String tlsCertificatePath) {
         asyncBuilder.tlsCertificate(tlsCertificatePath);
+        return this;
+    }
+
+    /**
+     * Sets the host, port, credentials and TLS options from a connection string.
+     *
+     * <p>The format is {@code iggy://<username>:<password>@<host>:<port>?<options>}, with
+     * {@code tls=true|false} and {@code tls_ca_file=<path>} as the supported options.
+     * Settings that are not in the connection string keep their current values.
+     *
+     * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090?tls=true}
+     * @return this builder
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the connection string is invalid
+     * @see TcpConnectionString
+     */
+    public IggyTcpClientBuilder fromConnectionString(String connectionString) {
+        TcpConnectionString parsed = TcpConnectionString.parse(connectionString);
+        host(parsed.host());
+        port(parsed.port());
+        credentials(parsed.username(), parsed.password());
+        tls(parsed.tls());
+        if (parsed.tlsCaFile() != null) {
+            tlsCertificate(parsed.tlsCaFile());
+        }
         return this;
     }
 
