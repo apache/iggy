@@ -5532,13 +5532,11 @@ mod timestamp_clamp_tests {
             ..PrepareHeader::default()
         };
         canonical.checksum = canonical.identity_checksum();
-        let mut suffix = vec![0; size_of::<PrepareHeader>()];
-        crate::encode_prepare_headers(&[canonical], &mut suffix);
 
         let actions = consensus.handle_start_view(
             PlaneKind::Metadata,
             make_start_view(VIEW, HEAD, HEAD, primary, 0).header(),
-            &suffix,
+            bytemuck::bytes_of(&canonical),
         );
 
         assert!(!actions.is_empty());
