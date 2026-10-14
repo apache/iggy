@@ -46,7 +46,6 @@ use tracing::trace;
 /// | [`topic_partitions_count()`] | partitions of a topic this call creates |
 /// | [`batch_length()`], [`linger_time()`] | the [`DirectConfig`] of the producer |
 /// | [`partitioning()`] | which partition a batch lands in |
-/// | [`send_retries_count()`], [`send_retries_interval()`] | retrying a failed request |
 /// | [`encryptor()`] | encrypting payloads and user headers, and it replaces the client's own |
 ///
 /// The stream and the topic are always created when they are missing. A topic created here gets
@@ -99,8 +98,6 @@ use tracing::trace;
 ///     .batch_length(100)
 ///     .linger_time(IggyDuration::new_from_secs(1))
 ///     .partitioning(Partitioning::messages_key_str("my-key")?)
-///     .send_retries_count(3)
-///     .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
 ///     .build();
 ///
 /// let producer = IggyStreamProducer::build(&client, &config).await?;
@@ -129,8 +126,6 @@ use tracing::trace;
 /// [`linger_time()`]: crate::prelude::IggyProducerConfig::linger_time
 /// [`partitioning()`]: crate::prelude::IggyProducerConfig::partitioning
 /// [`send()`]: crate::prelude::IggyProducer::send
-/// [`send_retries_count()`]: crate::prelude::IggyProducerConfig::send_retries_count
-/// [`send_retries_interval()`]: crate::prelude::IggyProducerConfig::send_retries_interval
 /// [`stream_name()`]: crate::prelude::IggyProducerConfig::stream_name
 /// [`topic_name()`]: crate::prelude::IggyProducerConfig::topic_name
 /// [`topic_partitions_count()`]: crate::prelude::IggyProducerConfig::topic_partitions_count
