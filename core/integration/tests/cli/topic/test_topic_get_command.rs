@@ -470,79 +470,177 @@ fn nested_table_rows(
     property: &str,
     columns: usize,
 ) -> Result<Vec<Vec<String>>, &'static str> {
-    let mut rows = Vec::new();
-    let mut inside_section = false;
-    for line in stdout.lines() {
-        if !inside_section {
-            let Some((key, _)) = line.strip_prefix('|').and_then(|body| body.split_once('|'))
-            else {
-                continue;
-            };
-            if key.trim() != property {
-                continue;
-            }
-            inside_section = true;
-        }
+    let expected_header: &[&str] = match property {
+        "Partitions" => &[
+            "Partition id",
+            "Created",
+            "Segments count",
+            "Current offset",
+            "Size",
+            "Messages count",
+        ],
+        "Options" => &["Option", "Value"],
+        _ => return Err("unsupported nested table property"),
+    };
+    if columns != expected_header.len() {
+        return Err("incorrect nested table column count");
+    }
 
-        if line
-            .strip_prefix('+')
-            .and_then(|body| body.strip_suffix('+'))
-            .is_some_and(is_table_separator)
-        {
-            break;
+    let mut lines = stdout.lines();
+    let header_line = lines
+        .find(|line| {
+            line.strip_prefix('|')
+                .and_then(|body| body.split_once('|'))
+                .is_some_and(|(key, _)| key.trim() == property)
+        })
+        .ok_or("nested table section was not found")?;
+    let (key, value) = nested_table_body(header_line)?;
+    let header_cells = value.split('|').map(str::trim).collect::<Vec<_>>();
+    if header_cells != expected_header {
+        return Err("incorrect nested table header");
+    }
+
+    // Outer borders span both cells; an inner separator never closes the section.
+    let border_body = format!(
+        "{}+{}",
+        "-".repeat(key.chars().count()),
+        "-".repeat(value.chars().count())
+    );
+    let row_boundary = format!("|{border_body}|");
+    let table_boundary = format!("+{border_body}+");
+    let separator_line = lines
+        .next()
+        .ok_or("nested table header separator is missing")?;
+    let (separator_key, separator) = nested_table_body(separator_line)?;
+    let separator = separator.trim();
+    if !separator_key.trim().is_empty()
+        || separator.is_empty()
+        || !separator.bytes().all(|character| character == b'=')
+        || separator.len() > value.chars().count().saturating_sub(2)
+    {
+        return Err("invalid nested table header separator");
+    }
+
+    let header_widths = value
+        .strip_prefix(' ')
+        .ok_or("nested table header is missing its padding")?
+        .split('|')
+        .take(columns - 1)
+        .map(|cell| cell.chars().count())
+        .collect::<Vec<_>>();
+    let used_width = header_widths.iter().sum::<usize>() + columns - 1;
+    let last_width = separator
+        .len()
+        .checked_sub(used_width)
+        .filter(|width| *width >= expected_header[columns - 1].len() + 2)
+        .ok_or("invalid nested table separator width")?;
+    let inner_row_separator = header_widths
+        .into_iter()
+        .chain([last_width])
+        .map(|width| "-".repeat(width))
+        .collect::<Vec<_>>()
+        .join("+");
+
+    let mut rows = vec![header_cells.into_iter().map(str::to_owned).collect()];
+    let mut pending_record = false;
+    while let Some(line) = lines.next() {
+        if line == row_boundary || line == table_boundary {
+            if rows.len() == 1 || pending_record {
+                return Err("nested table is empty or ends after a row separator");
+            }
+            if line == row_boundary {
+                let next_line = lines.next().ok_or("next topic property is missing")?;
+                let (next_key, _) = nested_table_body(next_line)?;
+                if next_key.trim().is_empty() || next_key.trim() == property {
+                    return Err("nested table boundary does not start another property");
+                }
+            }
+            return Ok(rows);
         }
-        let body = line
-            .strip_prefix('|')
-            .and_then(|body| body.strip_suffix('|'))
-            .ok_or("nested table row is missing an outer delimiter")?;
-        if is_table_separator(body) {
-            break;
-        }
-        let (key, value) = body
-            .split_once('|')
-            .ok_or("nested table row is missing its property separator")?;
-        if !rows.is_empty() && !key.trim().is_empty() {
+        let (key, value) = nested_table_body(line)?;
+        if !key.trim().is_empty() {
             return Err("unexpected property within nested table");
         }
         let value = value.trim();
-        if is_table_separator(value) {
+        if value == inner_row_separator {
+            if rows.len() == 1 || pending_record {
+                return Err("unexpected nested table row separator");
+            }
+            pending_record = true;
             continue;
         }
         let cells = value.split('|').map(str::trim).collect::<Vec<_>>();
         if cells.len() != columns || cells.iter().any(|cell| cell.is_empty()) {
             return Err("nested table row has missing, empty, or extra cells");
         }
+        if property == "Partitions" {
+            let partition_id = cells[0]
+                .parse::<u32>()
+                .map_err(|_| "invalid partition id")?;
+            for index in [2, 3, 5] {
+                cells[index]
+                    .parse::<u64>()
+                    .map_err(|_| "invalid numeric partition field")?;
+            }
+            if rows[1..]
+                .iter()
+                .any(|row: &Vec<String>| row[0].parse::<u32>().ok() == Some(partition_id))
+            {
+                return Err("duplicate partition id");
+            }
+        }
         rows.push(cells.into_iter().map(str::to_owned).collect());
+        pending_record = false;
     }
-    if !inside_section {
-        return Err("nested table section was not found");
-    }
-    Ok(rows)
+    Err("nested table closing boundary is missing")
 }
 
-fn is_table_separator(value: &str) -> bool {
-    value.chars().any(|c| matches!(c, '-' | '='))
-        && value.chars().all(|c| matches!(c, '-' | '=' | '+' | ' '))
+fn nested_table_body(line: &str) -> Result<(&str, &str), &'static str> {
+    line.strip_prefix('|')
+        .and_then(|body| body.strip_suffix('|'))
+        .ok_or("nested table row is missing an outer delimiter")?
+        .split_once('|')
+        .ok_or("nested table row is missing its property separator")
+}
+
+const PARTITION_HEADER: &str = " Partition id | Created             | Segments count | Current offset | Size    | Messages count ";
+const VALID_PARTITION: &str = "1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4";
+
+fn nested_rows_fixture(records: &[&str]) -> String {
+    let header_width = PARTITION_HEADER.len();
+    let boundary = format!("|------------+{}|", "-".repeat(header_width + 2));
+    let options = " Option                    | Value     ";
+    format!(
+        "| Partitions | {PARTITION_HEADER} |\n|            | {} |\n{}\n{boundary}\n\
+         | Options    | {options:header_width$} |\n\
+         |            | {:header_width$} |\n\
+         |            | {:header_width$} |\n+------------+{}+\n",
+        "=".repeat(header_width),
+        records.join("\n"),
+        "=".repeat(options.len()),
+        " consumer_offset_durability | persisted ",
+        "-".repeat(header_width + 2),
+    )
 }
 
 #[test]
 fn nested_rows_preserve_complete_records_and_exact_option_keys() {
-    let stdout = "| Partitions | Partition id | Created | Segments count | Current offset | Size | Messages count |\n\
-                  |            | ============ |\n\
-                  |            | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |\n\
-                  |            | -------+-------+-------+-------+-------+------- |\n\
-                  |------------+--------------------|\n\
-                  | Options    | Option | Value |\n\
-                  |            | ============ |\n\
-                  |            | consumer_offset_durability | persisted |\n\
-                  +------------+--------------------+\n";
-    let partitions = nested_table_rows(stdout, "Partitions", 6).unwrap();
-    assert_eq!(partitions.len(), 2);
+    let stdout = nested_rows_fixture(&[
+        "|            | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |",
+        "|            | --------------+---------------------+----------------+----------------+---------+---------------- |",
+        "|            | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5 |",
+    ]);
+    let partitions = nested_table_rows(&stdout, "Partitions", 6).unwrap();
+    assert_eq!(partitions.len(), 3);
     assert_eq!(
         partitions[1],
         ["1", "2026-10-13 12:00:00", "2", "30", "1.23 KB", "4"]
     );
-    let options = nested_table_rows(stdout, "Options", 2).unwrap();
+    assert_eq!(
+        partitions[2],
+        ["2", "2026-10-13 12:00:01", "3", "31", "2.34 KB", "5"]
+    );
+    let options = nested_table_rows(&stdout, "Options", 2).unwrap();
     assert_eq!(
         options,
         [
@@ -554,7 +652,8 @@ fn nested_rows_preserve_complete_records_and_exact_option_keys() {
 }
 
 #[test]
-fn nested_rows_reject_malformed_partition_records() {
+fn nested_rows_reject_malformed_partition_records_before_and_after_valid_rows() {
+    let valid = format!("|            | {VALID_PARTITION} |");
     for malformed in [
         "| | 1 | 2026-10-13 12:00:00 | 2 |\n| | 30 | 1.23 KB | 4 |",
         "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB |",
@@ -563,27 +662,127 @@ fn nested_rows_reject_malformed_partition_records() {
         "  | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |",
         "unframed data row",
         "| | |",
+        "| | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5",
     ] {
-        let stdout = format!(
-            "| Partitions | Partition id | Created | Segments count | Current offset | Size | Messages count |\n\
-             | | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5 |\n{malformed}\n"
-        );
-        assert!(
-            nested_table_rows(&stdout, "Partitions", 6).is_err(),
-            "malformed record must invalidate the table: {malformed}"
+        for records in [[malformed, valid.as_str()], [valid.as_str(), malformed]] {
+            let stdout = nested_rows_fixture(&records);
+            assert!(
+                nested_table_rows(&stdout, "Partitions", 6).is_err(),
+                "malformed record must invalidate the table: {malformed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_rows_reject_malformed_separator_like_lines() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    let malformed = "| | 2 | truncated";
+    for separator in [
+        "|-----|",
+        "+-----+",
+        "|-----+-----|",
+        "+-----+-----+",
+        "|---=--+-----|",
+        "|            | ===== |",
+        "|            | -----+----- |",
+        "|            | ---=--+-----+-----+-----+-----+----- |",
+        "|            | ------+-----+-----+-----+-----+----- |",
+        "|            | |",
+    ] {
+        for records in [
+            vec![separator, malformed, valid.as_str()],
+            vec![valid.as_str(), separator, malformed],
+            vec![malformed, separator, valid.as_str()],
+            vec![valid.as_str(), separator],
+        ] {
+            let stdout = nested_rows_fixture(&records);
+            assert!(
+                nested_table_rows(&stdout, "Partitions", 6).is_err(),
+                "invalid separator must not hide records: {separator}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_rows_reject_multiple_malformed_rows() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    for records in [
+        vec!["| | truncated |", "| | |", valid.as_str()],
+        vec![valid.as_str(), "| | truncated |", valid.as_str(), "| | |"],
+    ] {
+        assert!(nested_table_rows(&nested_rows_fixture(&records), "Partitions", 6).is_err());
+    }
+}
+
+#[test]
+fn nested_rows_require_header_separator_records_and_closure() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    let stdout = nested_rows_fixture(&[&valid]);
+    let partition_output = stdout.split("| Options").next().unwrap();
+    let unclosed = partition_output
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        nested_table_rows(&unclosed, "Partitions", 6),
+        Err("nested table closing boundary is missing")
+    );
+    assert!(nested_table_rows(&nested_rows_fixture(&[]), "Partitions", 6).is_err());
+    assert!(
+        nested_table_rows(
+            &stdout.replace("Partition id", "Wrong header"),
+            "Partitions",
+            6
+        )
+        .is_err()
+    );
+    assert!(nested_table_rows(&stdout.replacen('=', "-", 1), "Partitions", 6).is_err());
+    assert!(nested_table_rows("", "Partitions", 6).is_err());
+    let row_boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
+    let table_boundary = row_boundary.replace('|', "+");
+    let closed = partition_output.replace(&row_boundary, &table_boundary);
+    assert_eq!(
+        nested_table_rows(&closed, "Partitions", 6).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn nested_rows_reject_missing_closing_delimiter() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    let truncated = "| | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5";
+    for records in [[truncated, valid.as_str()], [valid.as_str(), truncated]] {
+        assert_eq!(
+            nested_table_rows(&nested_rows_fixture(&records), "Partitions", 6),
+            Err("nested table row is missing an outer delimiter")
         );
     }
 }
 
 #[test]
-fn nested_rows_reject_missing_closing_delimiter() {
-    let stdout = "| Partitions | Partition id | Created | Segments count | Current offset | Size | Messages count |\n\
-                  | | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |\n\
-                  | | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5\n";
-    assert_eq!(
-        nested_table_rows(stdout, "Partitions", 6),
-        Err("nested table row is missing an outer delimiter")
-    );
+fn nested_rows_reject_boundaries_followed_by_partition_records() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    let boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
+    let stdout = nested_rows_fixture(&[&valid, &boundary, "| | truncated |"]);
+    assert!(nested_table_rows(&stdout, "Partitions", 6).is_err());
+}
+
+#[test]
+fn nested_rows_reject_invalid_numeric_fields_and_duplicate_partition_ids() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    assert!(nested_table_rows(&nested_rows_fixture(&[&valid, &valid]), "Partitions", 6).is_err());
+    for malformed in [
+        "| | bad | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |",
+        "| | 1 | 2026-10-13 12:00:00 | bad | 30 | 1.23 KB | 4 |",
+        "| | 1 | 2026-10-13 12:00:00 | 2 | bad | 1.23 KB | 4 |",
+        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | bad |",
+        "| | - | - | - | - | - | - |",
+    ] {
+        assert!(nested_table_rows(&nested_rows_fixture(&[malformed]), "Partitions", 6).is_err());
+    }
 }
 
 #[tokio::test]
