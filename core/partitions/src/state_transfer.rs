@@ -58,7 +58,7 @@ use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::mem::size_of;
@@ -2040,11 +2040,13 @@ pub enum PartitionInstallError {
         previous_end: u64,
         next_start: u64,
     },
-    /// Filesystem failure at/after the swap; disk holds a contiguous prefix
-    /// of the new state and a crash-restart recovers it (see the module
-    /// crash-window notes). The IN-MEMORY partition is converged to an
-    /// empty, honestly-lagging state before this returns, so the live
-    /// process stays serviceable and the normal triggers re-transfer.
+    /// A writer sync or backup preparation failure returns before the swap;
+    /// the old in-memory partition remains in place and may be fenced.
+    /// At/after the swap, disk holds a contiguous prefix of the new state
+    /// and a crash-restart recovers it (see the module crash-window notes).
+    /// On the storeless post-swap failure path, the IN-MEMORY partition is
+    /// converged to an empty, honestly-lagging state before this returns,
+    /// so the live process stays serviceable and the normal triggers re-transfer.
     SwapIo {
         path: String,
         source: std::io::Error,
@@ -2411,6 +2413,7 @@ pub(crate) struct PendingInstall {
     next_offset: u64,
     phase: InstallPhase,
     drain: Option<crate::PersistenceDrain>,
+    synced_files: BTreeSet<PathBuf>,
     directory_handle: Option<compio::fs::File>,
     offset_dirs_changed: [bool; ConsumerKind::COUNT],
     /// Published with the offsets, replacing the local receipt table.
@@ -3331,13 +3334,18 @@ where
             }
             InstallPhase::Drain => {
                 if let Some(persistence) = &self.persistence {
+                    if install.drain.is_none() {
+                        // Checkpoint syncs may be skipped when the frontier is unchanged.
+                        // The backup still needs proof from each original writer.
+                        install.synced_files = self.barrier_install_files_locked();
+                        install.disposition = InstallDisposition::Backup;
+                    }
                     self.start_persistence();
                     let drain = install
                         .drain
                         .get_or_insert_with(|| persistence.begin_drain());
                     match persistence.observe_drain(drain) {
                         Ok(true) => {
-                            install.disposition = InstallDisposition::Backup;
                             install.phase = InstallPhase::Backup;
                         }
                         Ok(false) => step = crate::PartitionIoStep::Pending,
@@ -3615,6 +3623,7 @@ where
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
                     begin: true,
+                    synced_files: install.synced_files.clone(),
                 }),
                 InstallFilePhase::Backup,
             ),
@@ -3762,6 +3771,7 @@ where
                 file_job(crate::io::TransferFileJob::Backup {
                     directory: install.partition_dir.clone(),
                     begin: false,
+                    synced_files: BTreeSet::new(),
                 }),
                 InstallFilePhase::FinishBackup,
             ),
@@ -4320,6 +4330,7 @@ where
             next_offset,
             phase: InstallPhase::StageOffsets(0),
             drain: None,
+            synced_files: BTreeSet::new(),
             directory_handle: None,
             offset_dirs_changed: [false; ConsumerKind::COUNT],
             retry_table: Some(retry_table),
