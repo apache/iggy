@@ -176,6 +176,7 @@ public sealed partial class TcpMessageStream
         var refreshHistory = code == CommandCodes.SEND_MESSAGES_CODE && context is null;
         var refusedPrimary = false;
         var lifecycleInterval = LifecycleRetryIntervalMs;
+        IggyInvalidStatusCodeException? refusal = null;
         try
         {
             while (true)
@@ -192,6 +193,7 @@ public sealed partial class TcpMessageStream
                     frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
                     if (Volatile.Read(ref _clusterNodeCount) <= 1)
                     {
+                        refusal = null;
                         var attempt = await SendVsrAttemptAsync(code, payload, Environment.TickCount64, deadline,
                             false, cancellation.Token, captured.Value, frame,
                             retryTransient: VsrOperations.ForCode(code) != VsrOperation.NonReplicated);
@@ -206,6 +208,7 @@ public sealed partial class TcpMessageStream
                         }
                         return attempt.Response!;
                     }
+                    refusal = null;
                     return await SendPrimaryOnceAsync(target.Key, code, payload, route, captured.Value,
                         frame.Value, deadline, cancellation.Token);
                 }
@@ -213,6 +216,7 @@ public sealed partial class TcpMessageStream
                     VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY)
                 {
                     RemovePartitionRoute(target.Key);
+                    refusal = error;
                     if ((generation is not null && generation != _consensusSession.Generation)
                         || Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
                     {
@@ -249,6 +253,14 @@ public sealed partial class TcpMessageStream
         catch (OperationCanceledException error) when (!token.IsCancellationRequested)
         {
             RemovePartitionRoute(target.Key);
+            // The budget can expire in the backoff or in a read-only control request that follows it, before the
+            // send call for the request starts again, so the last refusal still decides the outcome. An expiry
+            // inside that send call reports an unknown outcome even before the write, which is conservative.
+            if (refusal is not null)
+            {
+                ExceptionDispatchInfo.Throw(refusal);
+            }
+
             throw new VsrRequestOutcomeUnknownException(error);
         }
     }
