@@ -39,7 +39,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 
 const STREAM_NAME: &str = "cg-partition-test-stream";
 const TOPIC_NAME: &str = "cg-partition-test-topic";
@@ -50,6 +50,10 @@ const PARTITIONS_COUNT: u32 = 3;
 /// `consumer_group.rebalancing_timeout`, which outlasts this bound, so the
 /// deadline cannot complete the handoff for them.
 const MEMBERS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Covers two passes of the default 1 s `reconcile_periodic_interval` with
+/// margin, and stays far below the default `consumer_group.rebalancing_timeout`.
+const LEAVE_OBSERVATION_WINDOW: Duration = Duration::from_secs(3);
+const MEMBER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Slices the slab-reuse wait so the surviving consumer can prove liveness
 /// inside the server's staleness window. Product of the two is the 3s the
 /// spec waits for the freed slab to become reusable.
@@ -2376,6 +2380,9 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .await
         .unwrap();
     join_cg(&client2).await;
+    // The join moves a partition client1 was never served, so its handoff
+    // needs no commit. Before that install client2 owns nothing and polls empty.
+    await_members_count(&root_client, 2).await;
 
     // 4. Consumer2 polls - it must NOT get the same partition as consumer1's
     //    in-flight message. Due to cooperative rebalance, the partition with
@@ -2393,23 +2400,27 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .await
         .unwrap();
 
-    if !polled2.messages.is_empty() {
-        assert_ne!(
-            polled2.partition_id,
-            partition_polled_by_client1,
-            "Consumer2 got partition {} which consumer1 is still processing! \
-             Message ID from consumer1: offset={}, partition={}. \
-             Message ID from consumer2: offset={}, partition={}. \
-             This is the duplicate processing bug!",
-            polled2.partition_id,
-            message_from_client1.header.offset,
-            partition_polled_by_client1,
-            polled2.messages[0].header.offset,
-            polled2.partition_id,
-        );
-    }
+    assert_eq!(
+        polled2.messages.len(),
+        1,
+        "Consumer2 must get the message of the partition it was handed, got partition {}",
+        polled2.partition_id
+    );
+    assert_ne!(
+        polled2.partition_id,
+        partition_polled_by_client1,
+        "Consumer2 got partition {} which consumer1 is still processing! \
+         Message ID from consumer1: offset={}, partition={}. \
+         Message ID from consumer2: offset={}, partition={}. \
+         This is the duplicate processing bug!",
+        polled2.partition_id,
+        message_from_client1.header.offset,
+        partition_polled_by_client1,
+        polled2.messages[0].header.offset,
+        polled2.partition_id,
+    );
 
-    // 5. Now consumer1 commits the offset
+    // 5. Consumer1 commits its in-flight message on the partition it kept
     client1
         .store_consumer_offset(
             &consumer,
@@ -2421,10 +2432,7 @@ async fn should_not_return_same_message_to_two_consumers_during_rebalance(harnes
         .await
         .unwrap();
 
-    // 6. Give the server a moment to process the revocation completion
-    sleep(Duration::from_millis(100)).await;
-
-    // 7. After commit, the partition should have transferred. Verify final state.
+    // 6. The commit hands off nothing, so the assignments stay unique
     let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);
     assert_unique_partition_assignments(&cg);
@@ -3202,7 +3210,6 @@ async fn should_not_assign_partition_to_wrong_member_after_slab_reuse(harness: &
 }
 
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic], server(
-    consumer_group.rebalancing_timeout = "1s",
     heartbeat.enabled = true,
     heartbeat.interval = "60s",
     consumer_group.heartbeat_interval = "500ms",
@@ -3223,8 +3230,9 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
     join_cg(&client1).await;
 
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
+    let mut polled_offsets = Vec::with_capacity(PARTITIONS_COUNT as usize);
     for _ in 0..PARTITIONS_COUNT {
-        client1
+        let polled = client1
             .poll_messages(
                 &Identifier::named(STREAM_NAME).unwrap(),
                 &Identifier::named(TOPIC_NAME).unwrap(),
@@ -3236,6 +3244,8 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
             )
             .await
             .unwrap();
+        assert_eq!(polled.messages.len(), 1);
+        polled_offsets.push((polled.partition_id, polled.messages[0].header.offset));
     }
 
     // 2. Consumer2 joins — triggers pending revocation for 1 partition
@@ -3263,6 +3273,39 @@ async fn should_not_complete_other_members_revocations_on_leave(harness: &TestHa
 
     client3.shutdown().await.unwrap();
     drop(client3);
+
+    // Client1 committed nothing and the default deadline outlasts this window,
+    // so only the leave could complete client2's revocation here.
+    let deadline = Instant::now() + MEMBERS_CONVERGENCE_TIMEOUT;
+    while get_consumer_group(&root_client).await.members_count != 2 {
+        assert!(
+            Instant::now() < deadline,
+            "Client3 did not leave the group within {MEMBERS_CONVERGENCE_TIMEOUT:?}"
+        );
+        sleep(MEMBER_POLL_INTERVAL).await;
+    }
+    sleep(LEAVE_OBSERVATION_WINDOW).await;
+    let cg = get_consumer_group(&root_client).await;
+    assert!(
+        cg.members
+            .iter()
+            .any(|member| member.partitions_count == PARTITIONS_COUNT),
+        "The leave completed a revocation that client1 never drained. Members: {:?}",
+        cg.members
+    );
+
+    for (partition_id, offset) in &polled_offsets {
+        client1
+            .store_consumer_offset(
+                &consumer,
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(*partition_id),
+                *offset,
+            )
+            .await
+            .unwrap();
+    }
 
     let cg = await_members_count(&root_client, 2).await;
     assert_eq!(cg.members_count, 2);

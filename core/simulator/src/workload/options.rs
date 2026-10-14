@@ -37,6 +37,17 @@ pub const DEFAULT_CRASH_STABILITY_TICKS: u64 = 300;
 /// run is not entirely half-repaired replicas.
 pub const DEFAULT_RESTART_STABILITY_TICKS: u64 = 500;
 
+/// Actions [`ActionWeights::uniform`] leaves at weight 0. Replacing a fixture
+/// changes what every partition-plane op on it can observe, and a fixture group
+/// join hands its partitions to a new owner, so only a preset that asks for them
+/// draws one.
+const UNIFORM_EXCLUDED: &[Action] = &[
+    Action::ReplaceFixtureTopic,
+    Action::JoinFixtureGroup,
+    Action::LeaveFixtureGroup,
+    Action::StoreStaleOwnerOffset,
+];
+
 /// Per-action sampling weights as percentages. Unlisted variants default
 /// to 0 (never picked). Listed weights must sum to 100.
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +88,22 @@ impl ActionWeights {
         ])
     }
 
+    /// Partition-plane traffic over fixture topics that are deleted and recreated
+    /// under it, so requests meet a replaced history, while clients join and leave
+    /// the fixture groups, so group offsets meet owner handoffs.
+    #[must_use]
+    pub fn lifecycle() -> Self {
+        Self::new(&[
+            (Action::SendMessages, 42),
+            (Action::StoreConsumerOffset, 20),
+            (Action::DeleteConsumerOffset, 8),
+            (Action::ReplaceFixtureTopic, 5),
+            (Action::JoinFixtureGroup, 12),
+            (Action::LeaveFixtureGroup, 8),
+            (Action::StoreStaleOwnerOffset, 5),
+        ])
+    }
+
     /// Metadata plane only, weighted so creates outrun deletes and the shadow keeps
     /// a live population to sample duplicate- and missing-target outcomes against.
     /// `DeleteSegments` is excluded: it resolves against partition state the
@@ -104,19 +131,22 @@ impl ActionWeights {
         ])
     }
 
-    /// Every action equally likely. Widest op coverage per tick, at the cost of a
-    /// shallow population per entity kind.
+    /// Every action outside `UNIFORM_EXCLUDED` equally likely. Widest op
+    /// coverage per tick, at the cost of a shallow population per entity kind.
     ///
-    /// `Action::COUNT` does not divide 100, so the first `100 % COUNT` actions carry
-    /// one extra point. Spread rather than asserting even division, so appending an
-    /// `Action` never breaks this preset.
+    /// The action count does not divide 100, so the first `100 % count` actions
+    /// carry one extra point. Spread rather than asserting even division, so
+    /// appending an `Action` never breaks this preset.
     ///
     /// # Panics
     /// If the spread weights do not sum to 100, which means the remainder
     /// arithmetic is wrong rather than the caller.
     #[must_use]
     pub fn uniform() -> Self {
-        let count = u32::try_from(Action::COUNT).expect("Action::COUNT fits u32");
+        let actions: Vec<Action> = Action::iter()
+            .filter(|action| !UNIFORM_EXCLUDED.contains(action))
+            .collect();
+        let count = u32::try_from(actions.len()).expect("action count fits u32");
         // Above 100 actions the base weight floors to 0 and the remainder gives the
         // FIRST 100 a weight of 1, leaving the rest at 0: a spread that still sums
         // to 100 while contradicting "every action equally likely". The sum check
@@ -128,7 +158,8 @@ impl ActionWeights {
         );
         let base = 100 / count;
         let remainder = 100 % count;
-        let entries: Vec<(Action, u8)> = Action::iter()
+        let entries: Vec<(Action, u8)> = actions
+            .into_iter()
             .enumerate()
             .map(|(idx, action)| {
                 let extra = u32::try_from(idx).expect("action index fits u32") < remainder;
@@ -145,6 +176,14 @@ impl ActionWeights {
     #[must_use]
     pub const fn weight(&self, action: Action) -> u8 {
         self.weights[action as usize]
+    }
+
+    /// Whether the run joins fixture groups, which needs the groups that
+    /// [`crate::workload::create_fixture_groups`] creates. A leave alone samples
+    /// nothing without them.
+    #[must_use]
+    pub const fn draws_fixture_groups(&self) -> bool {
+        self.weight(Action::JoinFixtureGroup) > 0
     }
 }
 

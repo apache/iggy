@@ -1293,6 +1293,7 @@ fn main() {
             name: "prod-cluster".to_owned(),
             nodes: vec![
                 ClusterNodeResponse {
+                    replica_id: 0,
                     name: "node-1".to_owned(),
                     ip: "10.0.0.1".to_owned(),
                     tcp_port: 8090,
@@ -1303,6 +1304,7 @@ fn main() {
                     status: 0,
                 },
                 ClusterNodeResponse {
+                    replica_id: 1,
                     name: "node-2".to_owned(),
                     ip: "fd00::2".to_owned(),
                     tcp_port: 8091,

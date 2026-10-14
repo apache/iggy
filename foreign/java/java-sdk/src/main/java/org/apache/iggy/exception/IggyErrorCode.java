@@ -75,6 +75,7 @@ public enum IggyErrorCode {
     HISTORY_UNAVAILABLE(87),
     /** A committed lifecycle operation prevents this mutation. Retry as a new request. */
     LIFECYCLE_BUSY(88),
+    NOT_PRIMARY(89),
 
     // Client errors
     CLIENT_NOT_FOUND(100),

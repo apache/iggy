@@ -34,6 +34,8 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// </summary>
     public bool FromServer { get; }
 
+    internal int? CommandCode { get; set; }
+
     internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false) : base(message)
     {
         StatusCode = statusCode;

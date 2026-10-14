@@ -48,7 +48,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 102 was flush_unsaved_buffer; the server keeps the code reserved.
     case getPollRouting = 103
     case pollMessagesOnPrimary = 104
-    case getSendContext = 105
+    case getPartitionRoute = 105
     case getConsumerOffset = 120
     case storeConsumerOffset = 121
     case deleteConsumerOffset = 122
@@ -107,7 +107,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .sendMessages: "message.send"
         case .getPollRouting: "message.poll_routing"
         case .pollMessagesOnPrimary: "message.poll_primary"
-        case .getSendContext: "message.send_context"
+        case .getPartitionRoute: "partition.route"
         case .getConsumerOffset: "consumer_offset.get"
         case .storeConsumerOffset: "consumer_offset.store"
         case .deleteConsumerOffset: "consumer_offset.delete"

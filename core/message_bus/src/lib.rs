@@ -1504,6 +1504,21 @@ pub const fn client_id_owning_shard(client_id: u128) -> u16 {
 /// so it still satisfies the wire header's `client != 0` validation.
 pub const AUTO_COMMIT_CLIENT_ID: u128 = u128::MAX;
 
+/// Internal clients cannot collide with minted ids, whose shard is below `u16::MAX`.
+const SERVER_INTERNAL_CLIENT_HIGH: u128 = u128::MAX << u64::BITS;
+
+/// Keep completions for one key on the same internal client across retries.
+#[must_use]
+pub const fn server_internal_client_id(key: u64) -> u128 {
+    SERVER_INTERNAL_CLIENT_HIGH | key as u128
+}
+
+/// Recognize the reserved high half shared by completions and auto-commits.
+#[must_use]
+pub const fn is_server_internal_client(client_id: u128) -> bool {
+    client_id & SERVER_INTERNAL_CLIENT_HIGH == SERVER_INTERNAL_CLIENT_HIGH
+}
+
 /// Whether `client_id` is the reserved [`AUTO_COMMIT_CLIENT_ID`] sentinel.
 #[must_use]
 pub const fn is_auto_commit_client(client_id: u128) -> bool {
@@ -1543,6 +1558,18 @@ mod tests {
     use super::*;
     use iggy_binary_protocol::{Command, HEADER_SIZE};
     use std::cell::RefCell;
+
+    #[test]
+    fn given_internal_client_keys_when_encoded_should_remain_reserved() {
+        for key in [0, 1, u64::MAX / 2, u64::MAX] {
+            let client_id = server_internal_client_id(key);
+            assert!(is_server_internal_client(client_id));
+            assert_eq!(client_id & u128::from(u64::MAX), u128::from(key));
+        }
+        assert!(is_server_internal_client(AUTO_COMMIT_CLIENT_ID));
+        assert!(!is_server_internal_client(0));
+        assert!(!is_server_internal_client(SERVER_INTERNAL_CLIENT_HIGH - 1));
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     fn dummy_message() -> Message<GenericHeader> {

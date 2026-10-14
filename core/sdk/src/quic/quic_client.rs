@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::diagnostic_events::diagnostic_event_channel;
+use crate::driver::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
 use crate::leader_aware::read_transport_endpoints;
 use crate::leader_aware::{
-    ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
-    check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
+    LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
+    is_unauthenticated_metadata_probe,
 };
-use crate::poll_routing::{PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code};
+use crate::links::connect::{
+    ConnectCoordinator, ConnectOwnerContext, accepts_state, is_same_spelling,
+};
+use crate::links::quic::QuicLink;
+use crate::links::{Frame, event_channel};
 use crate::prelude::AutoLogin;
-use crate::session::ConsensusSession;
+use crate::session_owner::SessionOwner;
 use crate::vsr::{RetainedRequest, retain_replay_header};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::VsrSessionControl as _;
@@ -44,13 +48,12 @@ use iggy_common::{
     QuicConnectionStringOptions, TransportProtocol, validate_server_address,
 };
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, VarInt};
 use rustls::crypto::CryptoProvider;
 use secrecy::ExposeSecret;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -64,8 +67,8 @@ const NAME: &str = "Iggy";
 /// cannot commit transiently is answered with silence - the server expects the
 /// SDK read-timeout to drive a replay. `RecvStream::read_to_end` on an
 /// unanswered bidi stream otherwise blocks until the QUIC idle timeout (which
-/// can be minutes), parking that request and, because the connection is held
-/// under lock per send, every later request on the client.
+/// can be minutes), parking that request and, because the link is held under
+/// lock per send, every later request on the client.
 const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Backoff before replaying a request the server answered with an explicit
@@ -86,16 +89,16 @@ const TRANSIENT_FAILOVER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 pub struct QuicClient {
     poll_router: PollRouter<Self>,
     pub(crate) endpoint: Endpoint,
-    pub(crate) connection: Arc<Mutex<Option<Connection>>>,
+    pub(crate) link: Arc<Mutex<Option<QuicLink>>>,
     pub(crate) config: Arc<QuicClientConfig>,
     pub(crate) state: Mutex<ClientState>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
-    // See `core/sdk/src/tcp/tcp_client.rs` for the `tokio::sync::Mutex` ->
-    // `std::sync::Mutex` rationale (pure-CPU critical section).
-    consensus_session: Arc<StdMutex<ConsensusSession>>,
+    /// The session and the sign-in, shared with the poll router and the
+    /// poll clients it dials.
+    session_owner: Arc<SessionOwner>,
     skip_auto_login_once: Mutex<bool>,
     /// Every endpoint the cluster roster named on the last leader check, kept
     /// as walk candidates for a request the current node keeps refusing to
@@ -126,6 +129,13 @@ impl Default for QuicClient {
 #[async_trait]
 impl Client for QuicClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        // A sweep that started before the last disconnect ends at its next
+        // read of the flag. Joined, it would go on with the session that the
+        // disconnect reset, and hand its failure to this connect. Once
+        // another connect cleared the flag, its sweep is the one to join.
+        self.connect_coordinator
+            .wait_until_inactive(|| self.caller_disconnected())
+            .await;
         self.disconnected_by_caller.store(false, Ordering::SeqCst);
         QuicClient::connect(self).await
     }
@@ -172,9 +182,7 @@ impl BinaryTransport for QuicClient {
 
     async fn set_state(&self, state: ClientState) {
         let mut current = self.state.lock().await;
-        // Shutdown is final: a later write, such as a disconnect or a lost
-        // connection, must not make the client usable again.
-        if *current != ClientState::Shutdown {
+        if accepts_state(*current, state, self.caller_disconnected()) {
             *current = state;
         }
     }
@@ -218,7 +226,7 @@ impl BinaryTransport for QuicClient {
             && !is_login_register_code(code)
             && !matches!(code, GET_CLUSTER_METADATA_CODE | BIND_SESSION_CODE)
             && self.config.reconnection.enabled
-            && self.sign_in_credentials().is_some()
+            && self.session_owner.sign_in_credentials().is_some()
         {
             let routing_guard =
                 match tokio::time::timeout_at(roster_deadline, self.routing_lock.lock()).await {
@@ -321,9 +329,7 @@ impl BinaryTransport for QuicClient {
                                 let first_visit = roster_walk
                                     .as_mut()
                                     .is_some_and(|walk| walk.record_attempt(&connected));
-                                if crate::leader_aware::is_same_spelling(&connected, &target)
-                                    || first_visit
-                                {
+                                if is_same_spelling(&connected, &target) || first_visit {
                                     break;
                                 }
                             }
@@ -341,7 +347,7 @@ impl BinaryTransport for QuicClient {
                 }
                 retain_replay_header(
                     &mut header,
-                    &self.consensus_session,
+                    &self.session_owner,
                     code,
                     &IggyError::TransientNotAccepted,
                 )?;
@@ -391,7 +397,7 @@ impl BinaryTransport for QuicClient {
             return Err(IggyError::Disconnected);
         }
 
-        if !is_login_register_code(code) && self.sign_in_credentials().is_none() {
+        if !is_login_register_code(code) && self.session_owner.sign_in_credentials().is_none() {
             // Without auto-login a reconnect cannot re-establish the session, so
             // non-login requests are not recovered here - their transient replay
             // happens on the live connection inside `send_raw`. Login/register
@@ -415,7 +421,7 @@ impl BinaryTransport for QuicClient {
             self.connect()
                 .await
                 .map_err(|error| retry_outcome.observe(error))?;
-            retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
+            retain_replay_header(&mut header, &self.session_owner, code, &error)?;
             drop(_routing_guard);
             return self
                 .send_raw_retaining_header(code, payload, &mut header)
@@ -443,7 +449,7 @@ impl BinaryTransport for QuicClient {
             *self.skip_auto_login_once.lock().await = false;
         }
         reconnect.map_err(|error| retry_outcome.observe(error))?;
-        retain_replay_header(&mut header, &self.consensus_session, code, &error)?;
+        retain_replay_header(&mut header, &self.session_owner, code, &error)?;
         drop(_routing_guard);
         self.send_raw_retaining_header(code, payload, &mut header)
             .await
@@ -466,39 +472,38 @@ impl iggy_common::VsrSessionControl for QuicClient {
     async fn session_identity(
         &self,
     ) -> Result<iggy_binary_protocol::requests::system::SessionIdentity, IggyError> {
-        let session = self
-            .consensus_session
-            .lock()
-            .map_err(|_| IggyError::InvalidConfiguration)?;
-        Ok(iggy_binary_protocol::requests::system::SessionIdentity {
-            client_id: session.client_id(),
-            session: session.session().ok_or(IggyError::Unauthenticated)?,
-            metadata_watermark: self
-                .poll_router
-                .metadata_watermark
-                .load(std::sync::atomic::Ordering::Acquire),
-        })
+        self.session_owner.identity()
     }
 
     async fn session_bind_secret(
         &self,
     ) -> Result<iggy_binary_protocol::requests::users::login_register::BindSecret, IggyError> {
-        Ok(self
-            .consensus_session
-            .lock()
-            .map_err(|_| IggyError::InvalidConfiguration)?
-            .bind_secret())
+        self.session_owner.bind_secret()
     }
 
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
-        let mut consensus_session = self
-            .consensus_session
-            .lock()
-            .map_err(|_| IggyError::InvalidConfiguration)?;
-        let was_bound = consensus_session.is_bound();
-        consensus_session.bind(session)?;
-        drop(consensus_session);
-        if !was_bound {
+        self.bind_vsr_session_at(self.session_fence(), session)
+            .await
+    }
+
+    fn session_fence(&self) -> u64 {
+        self.session_owner.fence()
+    }
+
+    async fn bind_vsr_session_at(&self, fence: u64, session: u64) -> Result<(), IggyError> {
+        let first_bind = self
+            .session_owner
+            .bind_at(fence, session)
+            .map_err(|error| {
+                // The reset of an explicit disconnect moved the fence, and the
+                // caller needs that reason, not the session the reply named.
+                if self.caller_disconnected() {
+                    IggyError::NotConnected
+                } else {
+                    error
+                }
+            })?;
+        if first_bind {
             self.consumer_group_state.clear_session_scoped();
             self.poll_router.clear_session();
         }
@@ -506,18 +511,19 @@ impl iggy_common::VsrSessionControl for QuicClient {
     }
 
     async fn reset_vsr_session(&self) -> Result<(), IggyError> {
-        *self
-            .consensus_session
-            .lock()
-            .map_err(|_| IggyError::InvalidConfiguration)? = ConsensusSession::new();
+        self.session_owner.reset()?;
         self.consumer_group_state.clear_session_scoped();
         self.poll_router.clear_session();
         Ok(())
     }
 
     async fn remember_session_credentials(&self, credentials: Credentials, user_id: u32) {
-        self.poll_router.remember_credentials(credentials, user_id);
-        if self.auto_login_configured()
+        // `disconnect()` raises the flag before it forgets the sign-in, so a
+        // sign-in answered after that cannot bring the credentials back.
+        if !self
+            .session_owner
+            .remember_unless(|| self.caller_disconnected(), credentials, user_id)
+            || self.auto_login_configured()
             || self.get_state().await != ClientState::Authenticated
             || self.roster_learned.swap(true, Ordering::SeqCst)
         {
@@ -538,15 +544,15 @@ impl iggy_common::VsrSessionControl for QuicClient {
     }
 
     async fn forget_session_credentials(&self) {
-        self.poll_router.forget_credentials();
+        self.session_owner.forget();
     }
 
     async fn refresh_session_password(&self, user: &iggy_common::Identifier, new_password: &str) {
-        self.poll_router.refresh_password(user, new_password);
+        self.session_owner.refresh_password(user, new_password);
     }
 
     async fn refresh_session_username(&self, user: &iggy_common::Identifier, new_username: &str) {
-        self.poll_router.refresh_username(user, new_username);
+        self.session_owner.refresh_username(user, new_username);
     }
 
     fn sdk_version(&self) -> &'static str {
@@ -571,9 +577,11 @@ impl PollTransport for QuicClient {
             .map_err(|_| IggyError::InvalidClientAddress)?;
         client_address.set_port(0);
         config.client_address = client_address.to_string();
-        let mut client = Self::create(Arc::new(config))?;
-        client.consensus_session = Arc::clone(&self.consensus_session);
-        client.poll_router.metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
+        let mut client =
+            Self::with_session_owner(Arc::new(config), Arc::clone(&self.session_owner))?;
+        // The shared owner holds the sign-in of this client, and a poll client
+        // must never sign in on the shared session.
+        *client.skip_auto_login_once.get_mut() = true;
         client.connect_off_leader().await?;
         Ok(client)
     }
@@ -590,15 +598,6 @@ impl PollTransport for QuicClient {
 }
 
 impl QuicClient {
-    fn sign_in_credentials(&self) -> Option<Credentials> {
-        self.poll_router
-            .remembered_credentials()
-            .or_else(|| match &self.config.auto_login {
-                AutoLogin::Enabled(credentials) => Some(credentials.clone()),
-                AutoLogin::Disabled => None,
-            })
-    }
-
     /// Whether fallback `AutoLogin` credentials are configured. A remembered
     /// successful sign-in takes precedence after reconnecting.
     pub(crate) fn auto_login_configured(&self) -> bool {
@@ -624,6 +623,15 @@ impl QuicClient {
 
     /// Create a new QUIC client for the provided configuration.
     pub fn create(config: Arc<QuicClientConfig>) -> Result<Self, IggyError> {
+        let session_owner = Arc::new(SessionOwner::new(config.auto_login.clone()));
+        Self::with_session_owner(config, session_owner)
+    }
+
+    /// A poll client passes the owner of the client that dials it.
+    fn with_session_owner(
+        config: Arc<QuicClientConfig>,
+        session_owner: Arc<SessionOwner>,
+    ) -> Result<Self, IggyError> {
         validate_server_address(&config.server_address)?;
 
         let resolved_addr = config
@@ -657,16 +665,16 @@ impl QuicClient {
 
         let server_address = config.server_address.clone();
         Ok(Self {
-            poll_router: PollRouter::default(),
+            poll_router: PollRouter::new(Arc::clone(&session_owner)),
             config,
             endpoint,
-            connection: Arc::new(Mutex::new(None)),
+            link: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
-            events: diagnostic_event_channel(),
+            events: event_channel(),
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
-            consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
+            session_owner,
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
@@ -686,35 +694,6 @@ impl QuicClient {
         Self::create(Arc::new(
             ConnectionString::<QuicConnectionStringOptions>::from_str(connection_string)?.into(),
         ))
-    }
-
-    async fn handle_response(
-        recv: &mut RecvStream,
-        response_buffer_size: usize,
-        read_timeout: Duration,
-        metadata_watermark: &std::sync::atomic::AtomicU64,
-    ) -> Result<Bytes, IggyError> {
-        let buffer = tokio::time::timeout(read_timeout, recv.read_to_end(response_buffer_size))
-            .await
-            .map_err(|_| {
-                error!("Timed out after {read_timeout:?} waiting for QUIC response");
-                IggyError::Disconnected
-            })?
-            .map_err(|error| {
-                error!("Failed to read response data: {error}");
-                IggyError::QuicError
-            })?;
-        if buffer.is_empty() {
-            return Err(IggyError::EmptyResponse);
-        }
-
-        if let Some(header) = buffer
-            .get(..iggy_binary_protocol::HEADER_SIZE)
-            .and_then(|header| header.try_into().ok())
-        {
-            crate::vsr::observe_metadata_reply(metadata_watermark, header);
-        }
-        crate::vsr::decode_response(Bytes::from(buffer))
     }
 
     pub(crate) async fn connect(&self) -> Result<(), IggyError> {
@@ -738,16 +717,24 @@ impl QuicClient {
                         if abandoned {
                             self.clear_abandoned_connect().await?;
                         }
-                        self.connect_inner(context).await
+                        self.connect_inner(context).await?;
+                        // A disconnect after the last check of the sweep, such
+                        // as one during its sign-in, ends the sweep here, so
+                        // nothing that the sweep set up outlives it.
+                        if self.caller_disconnected() {
+                            self.disconnect_transport().await?;
+                            return Err(IggyError::NotConnected);
+                        }
+                        Ok(())
                     })
                     .await
             })
             .await
     }
 
-    /// A reconnect sweep checks this before each dial and before it installs
-    /// the connection: once the caller disconnects, nothing in the sweep may
-    /// bring the client back.
+    /// A reconnect sweep checks this before each dial, before it installs the
+    /// connection and when it ends: once the caller disconnects, nothing in
+    /// the sweep may bring the client back.
     fn caller_disconnected(&self) -> bool {
         self.disconnected_by_caller.load(Ordering::SeqCst)
     }
@@ -891,7 +878,8 @@ impl QuicClient {
             let now = IggyTimestamp::now();
             info!("{NAME} client has connected to server: {remote_address} at {now}",);
             self.set_state(ClientState::Connected).await;
-            self.connection.lock().await.replace(connection);
+            let link = QuicLink::new(connection, self.config.response_buffer_size as usize);
+            self.link.lock().await.replace(link);
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
 
@@ -903,14 +891,10 @@ impl QuicClient {
             if skip_auto_login {
                 return Ok(());
             }
-            let Some(credentials) = self.sign_in_credentials() else {
+            let Some(credentials) = self.session_owner.sign_in_credentials() else {
                 return Ok(());
             };
-            let bound = self
-                .consensus_session
-                .lock()
-                .map_err(|_| IggyError::InvalidConfiguration)?
-                .is_bound();
+            let bound = self.session_owner.session()?.is_bound();
             let resumed = if bound {
                 match self.resume_vsr_session().await {
                     Ok(()) => true,
@@ -925,7 +909,11 @@ impl QuicClient {
                             let roster = self.roster_endpoints.lock().await.clone();
                             let walk = resume_walk
                                 .get_or_insert_with(|| RosterWalk::new(&current, &roster));
-                            if let Some(next) = walk.next() {
+                            // After an explicit disconnect, the next connect
+                            // starts from the endpoint the client was on.
+                            if !self.caller_disconnected()
+                                && let Some(next) = walk.next()
+                            {
                                 *self.current_server_address.lock().await = next;
                                 continue 'connect;
                             }
@@ -979,8 +967,8 @@ impl QuicClient {
     }
 
     async fn clear_abandoned_connect(&self) -> Result<(), IggyError> {
-        if let Some(connection) = self.connection.lock().await.take() {
-            connection.close(0u32.into(), b"");
+        if let Some(link) = self.link.lock().await.take() {
+            link.close();
         }
         self.endpoint.wait_idle().await;
         self.set_state(ClientState::Disconnected).await;
@@ -1060,9 +1048,9 @@ impl QuicClient {
         }
 
         info!("Shutting down the {NAME} QUIC client.");
-        let connection = self.connection.lock().await.take();
-        if let Some(connection) = connection {
-            connection.close(0u32.into(), b"");
+        let link = self.link.lock().await.take();
+        if let Some(link) = link {
+            link.close();
         }
 
         self.endpoint.wait_idle().await;
@@ -1075,9 +1063,9 @@ impl QuicClient {
 
     async fn disconnect_transport(&self) -> Result<(), IggyError> {
         // Taken before the state is read: a teardown aborted after it set
-        // `Disconnected` can leave the connection installed.
-        let connection = self.connection.lock().await.take();
-        if connection.is_none() && self.get_state().await == ClientState::Disconnected {
+        // `Disconnected` can leave the link installed.
+        let link = self.link.lock().await.take();
+        if link.is_none() && self.get_state().await == ClientState::Disconnected {
             return Ok(());
         }
 
@@ -1086,7 +1074,7 @@ impl QuicClient {
             self.config.client_address
         );
         self.set_state(ClientState::Disconnected).await;
-        drop(connection);
+        drop(link);
         self.endpoint.wait_idle().await;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -1142,9 +1130,9 @@ impl QuicClient {
                 .await
             {
                 // The refusal committed under this request id, so the retry is a
-                // new request. The pause holds no connection lock, and the next
-                // exchange takes its id only once it holds the connection, above
-                // any id another request sent during the pause.
+                // new request. The pause holds no link lock, and the next
+                // exchange takes its id only once it holds the link, above any
+                // id another request sent during the pause.
                 Err(IggyError::LifecycleBusy)
                     if retry_transient
                         && tokio::time::Instant::now() + lifecycle_retry_interval < deadline =>
@@ -1159,7 +1147,7 @@ impl QuicClient {
         }
     }
 
-    /// The part of [`Self::send_raw_request`] that holds the connection lock.
+    /// The part of [`Self::send_raw_request`] that holds the link lock.
     /// `retry_outcome` carries over between the exchanges of one request.
     #[allow(clippy::too_many_arguments)]
     async fn send_raw_exchange(
@@ -1194,24 +1182,23 @@ impl QuicClient {
             _ => {}
         }
 
-        let connection = self.connection.clone();
-        let response_buffer_size = self.config.response_buffer_size;
-        let consensus_session = self.consensus_session.clone();
-        let metadata_watermark = Arc::clone(&self.poll_router.metadata_watermark);
-        // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
+        let link = self.link.clone();
+        let session_owner = Arc::clone(&self.session_owner);
+        // A task finishes the exchange when its caller goes away, so the next
+        // request waits for the link until this one ends.
         let preencoded = *header;
         let mut outcome_so_far = std::mem::take(retry_outcome);
         let (used_header, result, outcome_so_far) = tokio::spawn(async move {
             let mut used_header = preencoded;
             let result = async {
-                let connection = connection.lock().await;
-                let Some(connection) = connection.as_ref() else {
+                let link = link.lock().await;
+                let Some(link) = link.as_ref() else {
                     error!("Cannot send data. Client is not connected.");
                     return Err(IggyError::NotConnected);
                 };
 
                 let request_header = {
-                    let mut session = consensus_session.lock().map_err(|_| IggyError::InvalidConfiguration)?;
+                    let mut session = session_owner.session()?;
                     used_header.encode(&mut session, code, &payload)?
                 };
                 trace!(
@@ -1220,39 +1207,20 @@ impl QuicClient {
                 );
                 // Replays retain the exact identity so committed receipts resolve
                 // uncertain attempts. Silence alone does not authorize a replay.
+                let mut replay = false;
                 loop {
-                    let header_bytes = bytemuck::bytes_of(&request_header);
-                    let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
-                        error!("Failed to open a bidirectional stream: {error}");
-                        IggyError::QuicError
-                    })?;
-                    send.write_all(header_bytes).await.map_err(|error| {
-                        error!("Failed to write VSR request header: {error}");
-                        IggyError::QuicError
-                    })?;
-                    if !payload.is_empty() {
-                        send.write_all(&payload).await.map_err(|error| {
-                            error!("Failed to write VSR request payload: {error}");
-                            IggyError::QuicError
-                        })?;
-                    }
-                    send.finish().map_err(|error| {
-                        error!("Failed to finish VSR request stream: {error}");
-                        IggyError::QuicError
-                    })?;
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(IggyError::Disconnected);
-                    }
-                    match QuicClient::handle_response(
-                        &mut recv,
-                        response_buffer_size as usize,
-                        remaining,
-                        &metadata_watermark,
-                    )
-                    .await
-                    .map_err(|error| outcome_so_far.observe(error))
+                    let frame = Frame {
+                        header: request_header,
+                        body: payload.clone(),
+                    };
+                    let reply = link
+                        .send(frame, deadline, &mut false)
+                        .await
+                        .map_err(|error| outcome_so_far.observe_link_error(error, replay))?;
+                    replay = true;
+                    session_owner.observe_metadata_reply(&reply.header);
+                    match crate::vsr::decode_response_split(&reply.header, reply.body)
+                        .map_err(|error| outcome_so_far.observe(error))
                     {
                         Ok(reply) => return Ok(reply),
                         Err(error) if !retry_transient => return Err(error),
@@ -1377,16 +1345,23 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::EVENT_CHANNEL_CAPACITY;
+    use crate::links::test_support::{
+        SIGNED_IN_USER_ID, quic_server, sign_in_reply, sign_in_steps_after_a_disconnect,
+        spawn_disconnect_behind_the_link, spawn_restart_behind_the_link,
+    };
 
     use iggy_binary_protocol::codes::{JOIN_CONSUMER_GROUP_CODE, SEND_MESSAGES_CODE};
-    use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
+    use iggy_binary_protocol::consensus::{
+        EvictionHeader, EvictionReason, REJECTION_SECTION_LEN, write_rejection_section,
+    };
     use iggy_binary_protocol::requests::system::BindSessionRequest;
     use iggy_binary_protocol::responses::users::LoginRegisterResponse;
     use iggy_binary_protocol::{
         Command, HEADER_SIZE, IGGY_PROTOCOL_VERSION, Operation, ReplyHeader, RequestHeader,
         WireDecode, WireEncode, WireName,
     };
-    use iggy_common::QuicClientReconnectionConfig;
+    use iggy_common::{Identifier, QuicClientReconnectionConfig};
 
     async fn read_test_request(
         connection: &quinn::Connection,
@@ -1424,15 +1399,7 @@ mod tests {
     #[tokio::test]
     async fn given_poisoned_session_when_sending_or_resetting_should_return_configuration_error() {
         const NO_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let config = quinn::ServerConfig::with_single_cert(
-            vec![certified.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
-                .into(),
-        )
-        .unwrap();
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (endpoint, _) = quic_server();
         let client = QuicClient::create(Arc::new(QuicClientConfig {
             server_address: endpoint.local_addr().unwrap().to_string(),
             ..Default::default()
@@ -1444,12 +1411,12 @@ mod tests {
         );
         connected.unwrap();
         client.bind_vsr_session(1).await.unwrap();
-        let consensus_session = Arc::clone(&client.consensus_session);
+        let session_owner = Arc::clone(&client.session_owner);
         assert!(
-            std::panic::catch_unwind(|| {
-                let _session = consensus_session.lock().unwrap();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _session = session_owner.session().unwrap();
                 panic!("poison the session for the regression test");
-            })
+            }))
             .is_err()
         );
 
@@ -1471,7 +1438,7 @@ mod tests {
             Err(IggyError::InvalidConfiguration)
         );
         {
-            let session = consensus_session.lock().unwrap_err().into_inner();
+            let session = session_owner.session_ignoring_poison();
             assert_eq!(session.session(), Some(1));
             assert_eq!(session.current_request_id(), 1);
         }
@@ -1484,17 +1451,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retained_write_waiting_for_the_connection_must_recheck_its_session() {
+    async fn a_retained_write_waiting_for_the_link_must_recheck_its_session() {
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let config = quinn::ServerConfig::with_single_cert(
-            vec![certified.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
-                .into(),
-        )
-        .unwrap();
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (endpoint, _) = quic_server();
         let client = QuicClient::create(Arc::new(QuicClientConfig {
             server_address: endpoint.local_addr().unwrap().to_string(),
             ..Default::default()
@@ -1508,13 +1467,13 @@ mod tests {
         client.bind_vsr_session(1).await.unwrap();
         let payload = Bytes::from_static(b"uncertain-send");
         let retained = crate::vsr::encode_request_header(
-            &mut client.consensus_session.lock().unwrap(),
+            &mut client.session_owner.session().unwrap(),
             SEND_MESSAGES_CODE,
             &payload,
         )
         .unwrap()
         .0;
-        let connection_guard = client.connection.lock().await;
+        let link_guard = client.link.lock().await;
         let mut retained = RetainedRequest {
             header: Some(retained),
             ..Default::default()
@@ -1523,12 +1482,12 @@ mod tests {
         tokio::pin!(attempt);
         tokio::select! {
             biased;
-            _ = &mut attempt => panic!("the exchange must wait for the connection lock"),
+            _ = &mut attempt => panic!("the exchange must wait for the link lock"),
             () = tokio::task::yield_now() => {}
         }
         client.reset_vsr_session().await.unwrap();
         client.bind_vsr_session(2).await.unwrap();
-        drop(connection_guard);
+        drop(link_guard);
         assert_eq!(
             tokio::time::timeout(TEST_BUDGET, &mut attempt)
                 .await
@@ -1544,17 +1503,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_an_uncertain_write_when_the_replay_loses_the_link_should_stay_uncertain() {
+        for (evict_on_replay, expected) in [
+            (true, IggyError::TransientNotCommitted),
+            (false, IggyError::Disconnected),
+        ] {
+            let (endpoint, _) = quic_server();
+            let client = QuicClient::create(Arc::new(QuicClientConfig {
+                server_address: endpoint.local_addr().unwrap().to_string(),
+                ..Default::default()
+            }))
+            .unwrap();
+            let (peer, connected) = tokio::join!(
+                async { endpoint.accept().await.unwrap().await.unwrap() },
+                Client::connect(&client)
+            );
+            connected.unwrap();
+            client.bind_vsr_session(1).await.unwrap();
+            let answer = async {
+                let (mut stream, request, _) = read_test_request(&peer).await;
+                let uncertain = IggyError::TransientNotCommitted.as_code();
+                answer_test_request(&mut stream, &request, uncertain, &[]).await;
+                // Without an eviction the connection closes before the replay.
+                if evict_on_replay {
+                    let (mut stream, request, _) = read_test_request(&peer).await;
+                    let eviction =
+                        EvictionHeader::new(0, 0, 0, request.client, EvictionReason::SessionError);
+                    stream
+                        .write_all(bytemuck::bytes_of(&eviction))
+                        .await
+                        .unwrap();
+                    stream.finish().unwrap();
+                } else {
+                    peer.close(0u32.into(), b"");
+                }
+            };
+            let mut header = RetainedRequest::default();
+
+            let (result, ()) = tokio::join!(
+                client.send_raw_request(SEND_MESSAGES_CODE, Bytes::new(), true, &mut header),
+                answer
+            );
+
+            assert_eq!(result.unwrap_err(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn given_lifecycle_refusal_when_retried_should_not_block_other_requests() {
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let config = quinn::ServerConfig::with_single_cert(
-            vec![certified.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
-                .into(),
-        )
-        .unwrap();
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (endpoint, _) = quic_server();
         let client = Arc::new(
             QuicClient::create(Arc::new(QuicClientConfig {
                 server_address: endpoint.local_addr().unwrap().to_string(),
@@ -1644,16 +1642,7 @@ mod tests {
         const TEST_USER_ID: u32 = 7;
         const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         for fresh_login in [false, true] {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let certified =
-                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-            let config = quinn::ServerConfig::with_single_cert(
-                vec![certified.cert.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
-                    .into(),
-            )
-            .unwrap();
-            let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+            let (endpoint, _) = quic_server();
             let client = QuicClient::create(Arc::new(QuicClientConfig {
                 server_address: endpoint.local_addr().unwrap().to_string(),
                 reconnection: QuicClientReconnectionConfig {
@@ -2181,15 +2170,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_teardown_cut_short_after_the_state_change_is_finished_by_the_next_one() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let config = quinn::ServerConfig::with_single_cert(
-            vec![certified.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
-                .into(),
-        )
-        .unwrap();
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (endpoint, _) = quic_server();
         let client = QuicClient::create(Arc::new(QuicClientConfig {
             server_address: endpoint.local_addr().unwrap().to_string(),
             ..Default::default()
@@ -2205,9 +2186,214 @@ mod tests {
 
         client.disconnect_transport().await.unwrap();
 
-        assert!(client.connection.lock().await.is_none());
+        assert!(client.link.lock().await.is_none());
         tokio::time::timeout(Duration::from_secs(1), peer.closed())
             .await
             .expect("the live connection must be closed");
+    }
+
+    #[tokio::test]
+    async fn given_a_configured_auto_login_when_the_password_changes_and_the_client_disconnects_should_sign_in_with_the_new_password()
+     {
+        const SESSION_USER_ID: u32 = 7;
+        let credentials = Credentials::UsernamePassword("iggy".to_owned(), "old".into());
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            auto_login: AutoLogin::Enabled(credentials.clone()),
+            ..Default::default()
+        }))
+        .unwrap();
+        client
+            .remember_session_credentials(credentials, SESSION_USER_ID)
+            .await;
+        client
+            .refresh_session_password(&Identifier::numeric(SESSION_USER_ID).unwrap(), "new")
+            .await;
+
+        Client::disconnect(&client).await.unwrap();
+
+        match client.session_owner.sign_in_credentials() {
+            Some(Credentials::UsernamePassword(username, password)) => {
+                assert_eq!(username, "iggy");
+                assert_eq!(password.expose_secret(), "new");
+            }
+            other => panic!("expected the configured user with the new password, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_late_steps_of_a_sign_in_leave_a_disconnected_client_signed_out() {
+        let client = QuicClient::default();
+
+        let state = sign_in_steps_after_a_disconnect(&client).await;
+
+        assert_eq!(state, ClientState::Disconnected);
+        assert!(client.session_owner.sign_in_credentials().is_none());
+    }
+
+    /// A client whose connection dropped after a sign-in: the next sweep
+    /// resumes its session, and dials the endpoint it left at once.
+    async fn client_to_resume(endpoint: &quinn::Endpoint) -> Arc<QuicClient> {
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            reconnection: QuicClientReconnectionConfig {
+                reestablish_after: IggyDuration::new(Duration::ZERO),
+                ..QuicClientReconnectionConfig::default()
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        client.session_owner.remember(
+            Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
+            SIGNED_IN_USER_ID,
+        );
+        Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn a_resume_answered_after_a_disconnect_lets_the_next_connect_dial() {
+        const TEST_BUDGET: Duration = Duration::from_secs(5);
+        let (endpoint, _) = quic_server();
+        let client = client_to_resume(&endpoint).await;
+        // The reconnect that a request runs after its connection dropped.
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.connect().await }
+        });
+        let peer = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, bind, _) = read_test_request(&peer).await;
+        assert_eq!(
+            u32::from_le_bytes(bind.reserved[..4].try_into().unwrap()),
+            BIND_SESSION_CODE
+        );
+
+        let disconnect =
+            spawn_disconnect_behind_the_link(&client, QuicClient::caller_disconnected).await;
+        answer_test_request(&mut send, &bind, 0, &sign_in_reply(1)).await;
+        tokio::time::timeout(TEST_BUDGET, disconnect)
+            .await
+            .expect("the disconnect must return")
+            .unwrap()
+            .unwrap();
+        let sweep = sweep.await.unwrap();
+        let state = client.get_state().await;
+        let bound = client.session_owner.epoch().bound;
+
+        // The dial completes only when the server accepts it.
+        let reconnect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::connect(&*client).await }
+        });
+        let redial = tokio::time::timeout(TEST_BUDGET, endpoint.accept()).await;
+        reconnect.abort();
+        assert!(
+            redial.is_ok() && matches!(sweep, Err(IggyError::NotConnected)) && !bound,
+            "sweep {sweep:?}, state after the disconnect {state:?}, \
+             session after the disconnect bound {bound}, \
+             connect() after the disconnect dialed {}",
+            redial.is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_right_after_a_disconnect_survives_a_resume_in_flight() {
+        const TEST_BUDGET: Duration = Duration::from_secs(5);
+        let (endpoint, _) = quic_server();
+        let endpoint = Arc::new(endpoint);
+        let client = client_to_resume(&endpoint).await;
+        // The reconnect that a request of another task runs.
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.connect().await }
+        });
+        let peer = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, bind, _) = read_test_request(&peer).await;
+
+        let restart = spawn_restart_behind_the_link(&client, QuicClient::caller_disconnected).await;
+        // The connect dials again, and the dial completes only when the
+        // server accepts it.
+        let redial = tokio::spawn({
+            let endpoint = Arc::clone(&endpoint);
+            async move { endpoint.accept().await.unwrap().await.unwrap() }
+        });
+        answer_test_request(&mut send, &bind, 0, &sign_in_reply(1)).await;
+        let connect = tokio::time::timeout(TEST_BUDGET, restart)
+            .await
+            .expect("the restart must return")
+            .unwrap();
+        let sweep = sweep.await.unwrap();
+        redial.abort();
+
+        let state = client.get_state().await;
+        let link = client.link.lock().await.is_some();
+        assert!(
+            connect.is_ok() && link,
+            "connect() right after disconnect() {connect:?}, the sweep {sweep:?}, \
+             state {state:?}, link installed {link}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_lost_during_a_disconnect_keeps_the_endpoint_the_client_was_on() {
+        const TEST_BUDGET: Duration = Duration::from_secs(5);
+        const OTHER_NODE: &str = "127.0.0.1:9";
+        let (endpoint, _) = quic_server();
+        let address = endpoint.local_addr().unwrap().to_string();
+        let client = client_to_resume(&endpoint).await;
+        *client.roster_endpoints.lock().await = vec![address.clone(), OTHER_NODE.to_string()];
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.connect().await }
+        });
+        let peer = endpoint.accept().await.unwrap().await.unwrap();
+        let (_send, _bind, _) = read_test_request(&peer).await;
+
+        let disconnect =
+            spawn_disconnect_behind_the_link(&client, QuicClient::caller_disconnected).await;
+        peer.close(0u32.into(), b"");
+        tokio::time::timeout(TEST_BUDGET, disconnect)
+            .await
+            .expect("the disconnect must return")
+            .unwrap()
+            .unwrap();
+        let sweep = sweep.await.unwrap();
+
+        let current = client.current_server_address.lock().await.clone();
+        assert!(
+            current == address,
+            "sweep {sweep:?}, the next connect starts from {current}, not {address}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bind_at_a_fence_from_before_a_reset_is_refused() {
+        let client = QuicClient::default();
+        let fence = client.session_fence();
+        client.reset_vsr_session().await.unwrap();
+
+        let bind = client.bind_vsr_session_at(fence, 1).await;
+
+        let bound = client.session_owner.epoch().bound;
+        assert!(
+            matches!(bind, Err(IggyError::InvalidSession(_))) && !bound,
+            "bind {bind:?}, session bound {bound}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_full_event_channel_when_publishing_should_not_block() {
+        const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+        let client = QuicClient::create(Arc::new(QuicClientConfig::default())).unwrap();
+
+        let publish = async {
+            for _ in 0..=EVENT_CHANNEL_CAPACITY {
+                client.publish_event(DiagnosticEvent::Disconnected).await;
+            }
+        };
+
+        assert!(
+            tokio::time::timeout(TEST_BUDGET, publish).await.is_ok(),
+            "a publish waited for room that an unread receiver never frees"
+        );
     }
 }

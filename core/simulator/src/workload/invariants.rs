@@ -66,6 +66,10 @@ const COMMIT_PREFIX_APPLIED_HEAD_TICKS: u32 = 2_000;
 pub struct Invariants {
     commit_offset: HashMap<(u8, IggyNamespace), u64>,
     view: HashMap<(u8, IggyNamespace), u64>,
+    /// Partition incarnation the marks of each `(replica, namespace)` belong to. A
+    /// recreated topic keeps its namespaces and starts their offsets and views
+    /// afresh, so a new incarnation resets them.
+    incarnation: HashMap<(u8, IggyNamespace), u64>,
     /// Consecutive ticks a replica has been a `Normal` metadata primary still
     /// gated by its recovery barrier. Reset as soon as any of that stops holding.
     barrier_gated_ticks: HashMap<u8, u32>,
@@ -95,12 +99,15 @@ impl Invariants {
     /// - no shard has shed a frame for an `unroutable` or `misrouted` reason,
     /// - live replicas agree on every committed metadata op they share, and the
     ///   committed chain stays hash-linked (see [`StateChecker`]).
+    /// - partition commits agree within each fixture incarnation, including
+    ///   history witnessed before a peer replaced that incarnation.
     ///
     /// Crashed replicas are skipped and their last-seen marks retained, which
     /// holds across a restart for both quantities: the superblock carries `view`,
     /// and `Simulator::retain_partition_logs` carries each partition's log so a
     /// rebuilt partition recovers its offsets instead of reporting zero. Without
-    /// that the check trips on a discarded log and calls it a regression.
+    /// that the check trips on a discarded log and calls it a regression. A
+    /// replica hosting a new incarnation of a namespace starts its marks again.
     ///
     /// # Panics
     /// On any regression or in-flight overflow. The workload seed is in the
@@ -123,6 +130,9 @@ impl Invariants {
                 sim.metadata_commit_prefix_hole(usize::from(replica_idx)),
             );
             for &ns in &workload.options.namespaces {
+                self.reset_on_new_incarnation(sim, replica_idx, ns);
+                self.state_checker
+                    .check_partition(sim, replica_idx, ns, seed);
                 self.check_commit_prefix_contiguity(
                     seed,
                     replica_idx,
@@ -156,6 +166,24 @@ impl Invariants {
         assert_no_bug_frame_drops(sim, seed);
 
         self.state_checker.check(sim, seed);
+    }
+
+    /// Drop the marks of `(replica_idx, ns)` when it hosts another incarnation than
+    /// the one they were taken on.
+    fn reset_on_new_incarnation(&mut self, sim: &Simulator, replica_idx: u8, ns: IggyNamespace) {
+        let Some(incarnation) = sim.partition_incarnation(usize::from(replica_idx), ns) else {
+            return;
+        };
+        let key = (replica_idx, ns);
+        if self
+            .incarnation
+            .insert(key, incarnation)
+            .is_some_and(|previous| previous != incarnation)
+        {
+            self.commit_offset.remove(&key);
+            self.view.remove(&key);
+            self.commit_hole_ticks.remove(&(replica_idx, Some(ns)));
+        }
     }
 
     /// Catch a metadata primary permanently shut behind its own recovery barrier.

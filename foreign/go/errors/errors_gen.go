@@ -755,6 +755,15 @@ func (e LifecycleBusy) Is(target error) bool {
 	return ok
 }
 
+type NotPrimary struct{}
+
+func (e NotPrimary) Error() string { return "the replica is not the primary of the target group" }
+func (e NotPrimary) Code() Code    { return 89 }
+func (e NotPrimary) Is(target error) bool {
+	_, ok := target.(NotPrimary)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2824,6 +2833,7 @@ var (
 	ErrRequestTooOld                              = RequestTooOld{}
 	ErrHistoryUnavailable                         = HistoryUnavailable{}
 	ErrLifecycleBusy                              = LifecycleBusy{}
+	ErrNotPrimary                                 = NotPrimary{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -3077,6 +3087,7 @@ const (
 	RequestTooOldCode                              Code = 85
 	HistoryUnavailableCode                         Code = 87
 	LifecycleBusyCode                              Code = 88
+	NotPrimaryCode                                 Code = 89
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3400,6 +3411,8 @@ func (c Code) String() string {
 		return "HistoryUnavailable"
 	case LifecycleBusyCode:
 		return "LifecycleBusy"
+	case NotPrimaryCode:
+		return "NotPrimary"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3903,6 +3916,8 @@ func FromCode(code Code) IggyError {
 		return ErrHistoryUnavailable
 	case LifecycleBusyCode:
 		return ErrLifecycleBusy
+	case NotPrimaryCode:
+		return ErrNotPrimary
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:

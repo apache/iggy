@@ -44,7 +44,6 @@ public final class ConsensusSession {
     private long clientIdHigh;
     private Long session;
     private long requestCounter = 1;
-    private long correlationCounter = 1;
     private long generation;
     private long metadataWatermark;
     private boolean shared;
@@ -109,12 +108,20 @@ public final class ConsensusSession {
         return numbering.nextRequestId();
     }
 
-    /**
-     * Non-replicated ops use an independent sequence for reply correlation,
-     * so they do not create gaps in the dedup sequence.
-     */
-    synchronized long nextCorrelationId() {
-        return correlationCounter++;
+    long nextCorrelationId() {
+        synchronized (this) {
+            if (session == null) {
+                if (requestCounter == Long.MAX_VALUE) {
+                    throw new IllegalStateException("VSR request counter exhausted");
+                }
+                return requestCounter++;
+            }
+        }
+        return nextRequestId();
+    }
+
+    public synchronized long[] identity() {
+        return new long[] {clientIdLow, clientIdHigh, boundSession()};
     }
 
     synchronized long currentRequestId() {

@@ -347,6 +347,10 @@
   code: 88
   format: "a committed lifecycle operation prevents this mutation; retry as a new request"
   fields: []
+- name: NotPrimary
+  code: 89
+  format: "the replica is not the primary of the target group"
+  fields: []
 - name: ClientNotFound
   code: 100
   format: "client with id: %d was not found."
