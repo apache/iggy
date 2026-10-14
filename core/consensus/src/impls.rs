@@ -1320,6 +1320,10 @@ where
     /// The installed view must prove the local suffix before it can be applied.
     /// Survives election resets until the plane successfully reconciles its journal.
     view_log_unproven: Cell<bool>,
+    /// The prefix below a repair gap is unknown; entries above it can be proven.
+    view_log_unproven_through: Cell<u64>,
+    /// Set only after adoption has removed the superseded tail.
+    view_log_missing_op: Cell<Option<u64>>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -1681,6 +1685,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             journal_mutations: Cell::new(0),
             pending_view_log: RefCell::new(None),
             view_log_unproven: Cell::new(false),
+            view_log_unproven_through: Cell::new(u64::MAX),
+            view_log_missing_op: Cell::new(None),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
@@ -3545,10 +3551,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             }
         };
         let headers = suffix.headers();
-        if headers.is_empty() {
+        if headers.is_empty() && !self.view_log_unproven() {
             return header.op;
         }
-
         *self.pending_view_log.borrow_mut() = Some(MergedLog {
             op_head: header.op,
             commit_max: header.commit,
@@ -3644,7 +3649,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // drop the answer to its own probe, and its election would push the
         // discarded suffix back.
         let head = self.sequencer.current_sequence();
-        if self.status.get() == Status::Normal && msg_view == self.log_view.get() && msg_op <= head
+        if self.status.get() == Status::Normal
+            && !self.view_log_unproven()
+            && msg_view == self.log_view.get()
+            && msg_op <= head
         {
             if msg_commit > self.commit_max() {
                 self.advance_commit_max(msg_commit);
@@ -3708,6 +3716,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Stale pipeline entries from the old view must be discarded
         self.view_log_unproven.set(needs_reconciliation);
+        self.view_log_unproven_through.set(u64::MAX);
+        self.view_log_missing_op.set(None);
         self.pipeline.borrow_mut().clear();
 
         // Cross-check the announced head against the headers published with it: a
@@ -3929,6 +3939,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.advance_commit_max(max_commit);
         *self.pending_view_log.borrow_mut() = Some(merged);
         self.view_log_unproven.set(true);
+        self.view_log_unproven_through.set(u64::MAX);
+        self.view_log_missing_op.set(None);
 
         // Stale pipeline entries are invalid in new view; reconciliation
         // replays from journal.
@@ -3997,6 +4009,49 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn settle_view_log_proof(&self) {
         self.view_log_unproven.set(false);
+        self.invalidate_local_dvc_suffix();
+    }
+
+    pub fn fence_view_log(&self, op: u64, unproven_through: u64) {
+        self.view_log_unproven.set(true);
+        self.view_log_unproven_through.set(unproven_through);
+        self.view_log_missing_op.set(Some(op));
+        self.invalidate_local_dvc_suffix();
+    }
+
+    #[must_use]
+    pub const fn view_log_entry_proven(&self, op: u64) -> bool {
+        !self.view_log_unproven()
+            || op <= self.commit_min()
+            || op > self.view_log_unproven_through.get()
+    }
+
+    #[must_use]
+    pub const fn view_log_unproven_range(&self) -> std::ops::RangeInclusive<u64> {
+        self.commit_min().saturating_add(1)..=if self.view_log_unproven() {
+            self.view_log_unproven_through.get()
+        } else {
+            0
+        }
+    }
+
+    #[must_use]
+    pub const fn view_log_repair_op(&self) -> Option<u64> {
+        if self.view_log_unproven() {
+            self.view_log_missing_op.get()
+        } else {
+            None
+        }
+    }
+
+    pub fn note_repaired_view_header(&self, header: PrepareHeader) {
+        if let Some(pending) = self.pending_view_log.borrow_mut().as_mut()
+            && pending.headers.is_empty()
+            && pending.op_head == header.op
+        {
+            pending.headers.push(header);
+            self.invalidate_local_dvc_suffix();
+        }
     }
 
     /// Whether a merge is parked, without cloning it.

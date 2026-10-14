@@ -3683,15 +3683,16 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .commit_min();
-            assert!(registered > 0);
             for _ in 0..SETUP_TOTAL_STEPS {
-                let backup = sim.replicas[BACKUP].shards[0]
+                if sim.replicas[BACKUP].shards[0]
                     .plane
                     .metadata()
                     .consensus
                     .as_ref()
-                    .unwrap();
-                if backup.commit_min() == registered {
+                    .unwrap()
+                    .commit_min()
+                    == registered
+                {
                     break;
                 }
                 sim.step();
@@ -3704,15 +3705,15 @@ mod tests {
                 let consensus = metadata.consensus.as_ref().unwrap();
                 let journal = metadata.journal.as_ref().unwrap();
                 let applied = consensus.commit_min();
+                assert_eq!(applied, registered);
                 let source_metadata = primary.plane.metadata();
                 let source = source_metadata.consensus.as_ref().unwrap();
-                assert_eq!(source.sequencer().current_sequence(), applied);
                 let mut prepares = Vec::new();
                 for name in [
-                    "old-suffix-first",
-                    "old-suffix-replaced",
-                    "new-suffix-next",
-                    "new-suffix-head",
+                    "retained-first",
+                    "retained-second",
+                    "repair-gap",
+                    "repair-head",
                 ] {
                     let prepare = consensus::seal_prepare_capacity(
                         client.create_stream(name).project(source),
@@ -3722,92 +3723,41 @@ mod tests {
                     source.set_last_prepare_checksum(prepare.header().checksum);
                     prepares.push(prepare);
                 }
+                for (index, prepare) in prepares.iter().take(LOCAL_ENTRIES).enumerate() {
+                    let entry = if fail_truncation && index == 0 {
+                        prepare
+                            .clone()
+                            .transmute_header(|mut header, next: &mut PrepareHeader| {
+                                header.client += 1;
+                                header.checksum = header.identity_checksum();
+                                *next = header;
+                            })
+                    } else {
+                        prepare.clone()
+                    };
+                    journal.handle().append(entry).await.unwrap();
+                }
                 let old_head = prepares[LOCAL_ENTRIES - 1].header().op;
                 let suffix_head = *prepares.last().unwrap().header();
-                let commit = Message::<iggy_binary_protocol::CommitHeader>::new(size_of::<
-                    iggy_binary_protocol::CommitHeader,
-                >(
-                ))
-                .transmute_header(
-                    |_, header: &mut iggy_binary_protocol::CommitHeader| {
-                        header.command = Command::Commit;
-                        header.cluster = consensus.cluster();
-                        header.group = METADATA_GROUP;
-                        header.replica = source.replica();
-                        header.view = source.view();
-                        header.commit = old_head;
-                        header.timestamp_monotonic = old_head;
-                        header.size = u32::try_from(std::mem::size_of_val(header)).unwrap();
-                        header.seal();
-                    },
-                );
-                shard.on_message(MessageBag::Commit(commit)).await;
-                assert_eq!(
-                    shard.metadata_repair_window(),
-                    Some((old_head, source.replica()))
-                );
-                let repair_request = outbox
-                    .drain()
-                    .into_iter()
-                    .find_map(|envelope| match envelope.payload {
-                        bus::EnvelopePayload::Replica(message)
-                            if message.header().command == Command::RequestPrepares =>
-                        {
-                            Some(*bytemuck::checked::from_bytes::<
-                                iggy_binary_protocol::RequestPreparesHeader,
-                            >(
-                                &message.as_slice()
-                                    [..size_of::<iggy_binary_protocol::RequestPreparesHeader>()],
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .expect("the commit gap arms a real repair session");
-                for prepare in prepares.into_iter().take(LOCAL_ENTRIES) {
-                    let repaired = prepare.transmute_header(
-                        |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
-                            repaired.0 = header;
-                            repaired.0.command = Command::RepairPrepare;
-                        },
-                    );
-                    shard.on_message(MessageBag::RepairPrepare(repaired)).await;
-                }
-                assert_eq!(consensus.commit_min(), applied);
-                assert_eq!(consensus.sequencer().current_sequence(), old_head);
-                let first_unapplied = usize::try_from(applied + 1).unwrap();
-                assert!(journal.handle().header(first_unapplied).is_some());
-                let peer_request =
-                    Message::<iggy_binary_protocol::RequestPreparesHeader>::new(size_of::<
-                        iggy_binary_protocol::RequestPreparesHeader,
-                    >(
-                    ))
-                    .transmute_header(
-                        |_, header: &mut iggy_binary_protocol::RequestPreparesHeader| {
-                            *header = repair_request;
-                            header.replica = source.replica();
-                            header.seal();
-                        },
-                    );
-                shard
-                    .on_message(MessageBag::RequestPrepares(peer_request.clone()))
-                    .await;
-                assert!(
-                    outbox.drain().into_iter().any(|envelope| {
-                        matches!(envelope.payload, bus::EnvelopePayload::Replica(message)
-                        if message.header().command == Command::RepairPrepare)
-                    }),
-                    "the resident entries must be servable before adoption"
-                );
+                consensus.sequencer().set_sequence(old_head);
+                let canonical: Vec<_> = if fail_truncation {
+                    prepares
+                        .iter()
+                        .rev()
+                        .map(|prepare| *prepare.header())
+                        .collect()
+                } else {
+                    vec![suffix_head]
+                };
                 if fail_truncation {
                     journal.fail_next_truncate();
                 }
-
                 let header_size = size_of::<iggy_binary_protocol::StartViewHeader>();
                 let mut message = Message::<iggy_binary_protocol::StartViewHeader>::new(
-                    header_size + size_of::<PrepareHeader>(),
+                    header_size + std::mem::size_of_val(canonical.as_slice()),
                 );
                 consensus::encode_prepare_headers(
-                    &[suffix_head],
+                    &canonical,
                     &mut message.as_mut_slice()[header_size..],
                 );
                 let checksum_body = u128::from(iggy_common::calculate_checksum(
@@ -3828,58 +3778,90 @@ mod tests {
                         header.seal();
                     },
                 );
-                shard.on_message(MessageBag::StartView(message)).await;
-                assert_eq!(
-                    consensus.commit_min(),
-                    applied,
-                    "unproven entries cannot be applied"
-                );
-                assert_eq!(
-                    journal.handle().header(first_unapplied).is_some(),
-                    fail_truncation,
-                );
-                assert_eq!(consensus.view_log_unproven(), fail_truncation);
-                if !fail_truncation {
-                    return;
-                }
-                outbox.drain();
                 shard
-                    .on_message(MessageBag::RequestPrepares(peer_request))
+                    .on_message(MessageBag::StartView(message.clone()))
                     .await;
+                assert_eq!(consensus.commit_min(), applied);
                 assert!(
-                    outbox.drain().is_empty(),
-                    "unproven entries cannot serve peer repair"
+                    journal
+                        .handle()
+                        .header(usize::try_from(applied + 1).unwrap())
+                        .is_some()
                 );
-
-                for _ in 0..consensus::TimeoutManager::NORMAL_HEARTBEAT_TICKS {
-                    consensus.tick(consensus::PlaneKind::Metadata);
-                }
-                assert_eq!(consensus.status(), Status::ViewChange);
-                assert_eq!(consensus.view(), NEW_VIEW + 1);
-                let done = Message::<iggy_binary_protocol::RepairRangeReplyHeader>::new(size_of::<
-                    iggy_binary_protocol::RepairRangeReplyHeader,
-                >(
-                ))
-                .transmute_header(
-                    |_, header: &mut iggy_binary_protocol::RepairRangeReplyHeader| {
-                        header.command = Command::RepairDone;
-                        header.cluster = consensus.cluster();
-                        header.group = METADATA_GROUP;
-                        header.replica = source.replica();
-                        header.view = repair_request.view;
-                        header.nonce = repair_request.nonce;
-                        header.op = old_head;
-                        header.size = u32::try_from(std::mem::size_of_val(header)).unwrap();
-                        header.seal();
-                    },
-                );
-                shard.on_message(MessageBag::RepairRangeReply(done)).await;
-                assert_eq!(
-                    consensus.commit_min(),
-                    applied,
-                    "an old RepairDone cannot apply the suffix left by failed truncation",
+                assert!(
+                    journal
+                        .handle()
+                        .header(usize::try_from(old_head).unwrap())
+                        .is_some()
                 );
                 assert!(consensus.view_log_unproven());
+                assert!(!consensus.view_log_entry_proven(applied + 1));
+
+                outbox.drain();
+                let request =
+                    Message::<iggy_binary_protocol::RequestPreparesHeader>::new(size_of::<
+                        iggy_binary_protocol::RequestPreparesHeader,
+                    >(
+                    ))
+                    .transmute_header(
+                        |_, header: &mut iggy_binary_protocol::RequestPreparesHeader| {
+                            header.command = Command::RequestPrepares;
+                            header.cluster = consensus.cluster();
+                            header.group = METADATA_GROUP;
+                            header.replica = 0;
+                            header.view = NEW_VIEW;
+                            header.from_op = applied + 1;
+                            header.to_op = old_head;
+                            header.size = u32::try_from(std::mem::size_of_val(header)).unwrap();
+                            header.seal();
+                        },
+                    );
+                shard.on_message(MessageBag::RequestPrepares(request)).await;
+                assert!(
+                    outbox.drain().is_empty(),
+                    "unproved entries cannot serve peer repair"
+                );
+
+                if fail_truncation {
+                    shard.on_message(MessageBag::StartView(message)).await;
+                    assert_eq!(consensus.view(), NEW_VIEW);
+                    assert!(
+                        journal
+                            .handle()
+                            .header(usize::try_from(applied + 1).unwrap())
+                            .is_none(),
+                        "the same-view retry must remove the proven mismatch"
+                    );
+                    assert!(
+                        journal
+                            .handle()
+                            .header(usize::try_from(old_head).unwrap())
+                            .is_some(),
+                        "removing a mismatch must preserve the canonical tail"
+                    );
+                }
+                for prepare in prepares.iter().rev() {
+                    let repaired = prepare.clone().transmute_header(
+                        |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                            repaired.0 = header;
+                            repaired.0.command = Command::RepairPrepare;
+                        },
+                    );
+                    shard.on_message(MessageBag::RepairPrepare(repaired)).await;
+                }
+                assert!(!consensus.view_log_unproven());
+                metadata.commit_journal().await;
+                assert_eq!(consensus.commit_min(), suffix_head.op);
+                for prepare in prepares {
+                    assert_eq!(
+                        journal
+                            .handle()
+                            .header(usize::try_from(prepare.header().op).unwrap())
+                            .unwrap()
+                            .checksum,
+                        prepare.header().checksum
+                    );
+                }
             });
         }
     }

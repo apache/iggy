@@ -1127,19 +1127,12 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         op_to_storage_offset.last_key_value().map(|(op, _)| *op)
     }
 
-    /// Drop every entry at or above `from_op`, rebuilding the indexes. Same
-    /// drain-and-re-append shape as `evict_prefix`, from the other end and retaining
-    /// nothing: `append` has no slot-collision check here, so a superseded entry left
-    /// in place sits beside the new view's prepare at the same op and
-    /// positional materialization flushes the stale one.
-    ///
-    /// Dropped entries do NOT enter the evicted repair ring: it answers repair for
-    /// committed ops, and these are ones the view just decided against.
-    async fn truncate_from(&self, from_op: u64) -> io::Result<usize> {
-        if from_op == 0 {
+    /// Removed entries must stay refillable and cannot enter the committed repair ring.
+    async fn remove_range(&self, ops: std::ops::RangeInclusive<u64>) -> io::Result<usize> {
+        if *ops.start() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+                "journal removal requires 1-based operations",
             ));
         }
         let all_entries = {
@@ -1148,15 +1141,15 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
         };
         // Positional against `headers` until the clear below (see the length-lock
         // invariant on `append_with_meta_sync`), so the ops are captured first.
-        let ops: Vec<u64> = {
+        let entry_ops: Vec<u64> = {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().map(|header| header.op).collect()
         };
         self.clear_resident_indexes();
 
         let mut removed = 0usize;
-        for (op, entry) in ops.into_iter().zip(all_entries) {
-            if op >= from_op {
+        for (op, entry) in entry_ops.into_iter().zip(all_entries) {
+            if ops.contains(&op) {
                 removed += 1;
                 continue;
             }

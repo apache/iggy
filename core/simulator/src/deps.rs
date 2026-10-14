@@ -215,15 +215,15 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     /// Drop the suffix, so a simulated backup whose entries disagree with a started
     /// view reconciles the way a real one does. Mirrors
     /// `PrepareJournal::truncate_from`, whose watermark stays put; here it never moves.
-    async fn truncate_from(&self, from_op: u64) -> std::io::Result<usize> {
+    async fn remove_range(&self, ops: std::ops::RangeInclusive<u64>) -> std::io::Result<usize> {
         #[cfg(test)]
         if self.fail_next_truncate.replace(false) {
             return Err(std::io::Error::other("injected journal truncation failure"));
         }
-        if from_op == 0 {
+        if *ops.start() == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+                "journal removal requires 1-based operations",
             ));
         }
         #[cfg(debug_assertions)]
@@ -233,7 +233,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
         let doomed: Vec<u64> = headers
             .keys()
             .copied()
-            .filter(|op| *op >= from_op)
+            .filter(|op| ops.contains(op))
             .collect();
         for op in &doomed {
             headers.remove(op);

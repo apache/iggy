@@ -528,7 +528,7 @@ pub enum PendingPartitionTransition {
         drain: Option<crate::PersistenceDrain>,
     },
     Truncate {
-        from_op: u64,
+        ops: std::ops::RangeInclusive<u64>,
         drain: Option<crate::PersistenceDrain>,
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
@@ -2344,7 +2344,10 @@ where
             return;
         };
         while let Some(op) = persistence.head().checked_add(1) {
-            if op > through || op > self.consensus.sequencer().current_sequence() {
+            if op > through
+                || op > self.consensus.sequencer().current_sequence()
+                || !self.consensus.view_log_entry_proven(op)
+            {
                 break;
             }
             let Some(prepare) = self.log.journal().inner.repair_entry(op) else {
@@ -5607,12 +5610,12 @@ where
 
     pub fn defer_view_truncation(
         &mut self,
-        from_op: u64,
+        ops: std::ops::RangeInclusive<u64>,
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
     ) {
         self.transition = Some(PendingPartitionTransition::Truncate {
-            from_op,
+            ops,
             drain: None,
             actions,
             peer,
@@ -5818,12 +5821,11 @@ where
             let message = self.deferred_views.swap_remove(next);
             return Ok(crate::PartitionIoStep::Transition(message));
         }
-        if let Some(PendingPartitionTransition::Truncate { from_op, drain, .. }) =
-            &mut self.transition
+        if let Some(PendingPartitionTransition::Truncate { ops, drain, .. }) = &mut self.transition
         {
             if let Some(persistence) = &self.persistence {
                 if drain.is_none() {
-                    persistence.truncate_from(*from_op);
+                    persistence.truncate_from(*ops.start());
                     if persistence.start() {
                         self.consensus
                             .message_bus()
@@ -5841,15 +5843,12 @@ where
                 persistence.finish_drain(drain);
             }
             let Some(PendingPartitionTransition::Truncate {
-                from_op,
-                actions,
-                peer,
-                ..
+                ops, actions, peer, ..
             }) = self.transition.take()
             else {
                 unreachable!("truncate transition exists");
             };
-            self.truncate_resident_from(from_op).await?;
+            self.remove_resident_range(ops).await?;
             return Ok(crate::PartitionIoStep::ViewApplied { actions, peer });
         }
         if matches!(
@@ -8765,11 +8764,45 @@ where
     }
 
     async fn truncate_resident_from(&mut self, from_op: u64) -> Result<usize, IggyError> {
+        self.remove_resident_range(from_op..=u64::MAX).await
+    }
+
+    /// Replace a proven mismatch while retaining the canonical tail across gaps.
+    ///
+    /// # Errors
+    /// Returns an error if the WAL or resident indexes cannot be rewritten.
+    pub async fn remove_divergent_prepare(&mut self, op: u64) -> Result<(), IggyError> {
+        if op
+            <= self
+                .consensus
+                .commit_min()
+                .max(self.log.journal().inner.evicted_through())
+        {
+            return Err(IggyError::InvalidCommand);
+        }
+        if let Some(persistence) = &self.persistence {
+            // The durable WAL is contiguous. A canonical tail beyond a divergent
+            // entry is repair-held and must be persisted again after the gap fills.
+            persistence.truncate_from(op);
+            self.start_persistence();
+            persistence
+                .drain_with_timeout()
+                .await
+                .map_err(|_| IggyError::CannotSyncFile)?;
+        }
+        self.remove_resident_range(op..=op).await?;
+        Ok(())
+    }
+
+    async fn remove_resident_range(
+        &mut self,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> Result<usize, IggyError> {
         let mut entries = self.log.journal().inner.resident_entries();
         entries.sort_unstable_by_key(peek_op);
         let mut retained_info = JournalInfo::default();
         let mut retained_next_offset = 0;
-        let mut rewind_next_offset = None;
+        let mut removed_messages = false;
         for entry in &entries {
             if peek_operation(entry) != Operation::SendMessages {
                 continue;
@@ -8779,12 +8812,8 @@ where
             if batch.message_count() == 0 {
                 continue;
             }
-            if peek_op(entry) >= from_op {
-                rewind_next_offset = Some(
-                    rewind_next_offset.map_or(batch.header.base_offset, |offset: u64| {
-                        offset.min(batch.header.base_offset)
-                    }),
-                );
+            if ops.contains(&peek_op(entry)) {
+                removed_messages = true;
                 continue;
             }
             accumulate_committed_info(
@@ -8823,14 +8852,14 @@ where
             .log
             .journal()
             .inner
-            .truncate_from(from_op)
+            .remove_range(ops.clone())
             .await
             .map_err(|_| IggyError::CannotAppendMessage)?;
 
         self.log.journal_mut().info = retained_info;
         self.log.active_segment_mut().current_position = restored_position;
-        if let Some(next_offset) = rewind_next_offset {
-            let next_offset = next_offset.max(minimum_next_offset);
+        if removed_messages {
+            let next_offset = minimum_next_offset;
             self.dirty_offset
                 .store(next_offset.saturating_sub(1), Ordering::Relaxed);
             // The APPEND bit follows the rewound counter. The committed bit does
@@ -8844,9 +8873,8 @@ where
             }
         }
         self.consensus.note_journal_mutation();
-        let commit_max = self.consensus.commit_max();
         self.pending_consumer_offset_commits
-            .retain(|op, _| *op < from_op || *op <= commit_max);
+            .retain(|op, _| !ops.contains(op));
         self.offset_reservations_need_resync.set(true);
         self.truncated_since_scan.set(true);
         Ok(removed)
@@ -11592,7 +11620,7 @@ where
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
         let header = *message.header();
-        if !self.prepare_history_available(&header) {
+        if self.view_truncation_pending() || !self.prepare_history_available(&header) {
             return;
         }
         let Some(session) = self.repair else {
@@ -11627,7 +11655,10 @@ where
         // A held frame is no progress: a peer that re-serves the same chunk
         // every round must still spend the budget, or it cannot be rotated
         // away from.
-        if self.log.journal().inner.holds_op(header.op) {
+        if let Some(held) = self.log.journal().inner.header_by_op(header.op) {
+            if held.checksum == header.checksum {
+                self.consensus.note_repaired_view_header(header);
+            }
             return;
         }
         // Any other in-window frame proves the stream is alive; only silence
@@ -11667,6 +11698,7 @@ where
         // its peer serves it again every round, and a refund per serve would
         // pin the session to that peer.
         self.restart_repair_budget();
+        self.consensus.note_repaired_view_header(header);
         self.persist_repaired_prefix();
         // Advance the sequencer only along the CONTIGUOUS journaled
         // frontier. DVC advertises `op = sequencer.current_sequence()` and
@@ -14315,6 +14347,37 @@ mod tests {
         settle_partition_io(&mut partition, &config).await;
         assert!(partition.fatal().is_none());
         assert_eq!(partition.log.journal().inner.resident_count(), 0);
+    }
+
+    #[compio::test]
+    async fn given_a_discarded_suffix_with_an_offset_gap_when_truncated_should_reuse_the_retained_frontier()
+     {
+        let mut partition = partition_at_view(0, 0);
+        let retained = checksummed_segment_prepare(1, 0, 0, b"retained");
+        let parent = retained.header().checksum;
+        partition
+            .append_repaired_send_messages(retained)
+            .await
+            .unwrap();
+        let discarded = checksummed_segment_prepare(3, parent, 2, b"discarded");
+        partition
+            .append_repaired_send_messages(discarded)
+            .await
+            .unwrap();
+        partition.consensus.sequencer().set_sequence(3);
+
+        partition.truncate_uncommitted_from(2).await.unwrap();
+
+        assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 0);
+        let replacement = checksummed_segment_prepare(2, parent, 1, b"replacement");
+        partition
+            .append_received_send_messages_to_journal(replacement)
+            .await
+            .unwrap();
+        assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 1);
+        assert!(partition.log.journal().inner.holds_op(1));
+        assert!(partition.log.journal().inner.holds_op(2));
+        assert!(!partition.log.journal().inner.holds_op(3));
     }
 
     #[compio::test]
@@ -21574,15 +21637,15 @@ mod tests {
             crate::PartitionIoStep::Transition(server_common::MessageBag::StartViewChange(message))
             if message.header().view == 2));
         partition.transition = Some(PendingPartitionTransition::Truncate {
-            from_op: 3,
+            ops: 3..=u64::MAX,
             actions: Vec::new(),
             peer: None,
             drain: None,
         });
         partition.defer_view_transition(start_view(3));
         assert!(matches!(
-            partition.transition,
-            Some(PendingPartitionTransition::Truncate { from_op: 3, .. })
+            partition.transition.as_ref(),
+            Some(PendingPartitionTransition::Truncate { ops, .. }) if *ops == (3..=u64::MAX)
         ));
         partition.defer_view_transition(start_view(4));
         partition.transition = None;
@@ -24172,6 +24235,48 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_queued_auto_commit_when_its_owner_is_replaced_should_refuse_it_at_promotion() {
+        const GROUP_ID: u32 = 7;
+        const CLIENT_ID: u128 = 42;
+        let mut partition = test_partition();
+        partition.stats.increment_messages_count(1);
+        install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID).await;
+        let store = partition
+            .build_poll_auto_commit_request(ConsumerKind::ConsumerGroup, GROUP_ID, 0)
+            .unwrap();
+        let generation = store.header().owner_generation;
+        install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID + 1).await;
+        assert!(
+            partition
+                .consumer_group_owner(u64::from(GROUP_ID))
+                .unwrap()
+                .generation
+                > generation
+        );
+        let head = partition.consensus.sequencer().current_sequence();
+        assert!(
+            partition
+                .consensus
+                .push_queued_request(consensus::RequestEntry::with_sender(store, None),)
+                .is_ok()
+        );
+
+        partition.drain_request_queue_into_prepares(1).await;
+
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "an internal auto-commit must retain the owner generation it captured"
+        );
+        assert!(partition.consensus.pop_queued_request().is_none());
+        assert_eq!(
+            partition.group_offset_state(u64::from(GROUP_ID)),
+            (None, None)
+        );
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+    }
+
+    #[compio::test]
     async fn given_queued_capacity_denial_when_promoting_should_use_the_slot_for_next_existing_key()
     {
         let (mut partition, _) = recording_partition_at(0, 3);
@@ -24271,7 +24376,7 @@ mod tests {
             partition.on_ack(stale_ack, &config).await;
             assert_eq!(partition.pending_owner_install.get(), Some(discarded));
 
-            partition.defer_view_truncation(discarded_op, Vec::new(), None);
+            partition.defer_view_truncation(discarded_op..=u64::MAX, Vec::new(), None);
             assert!(matches!(
                 partition.resume_io(&config).await,
                 crate::PartitionIoStep::ViewApplied { .. }

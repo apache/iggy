@@ -551,6 +551,14 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
     if let Err(rejection) = resolve_credential(&state, bearer).await {
         return rejection.into_response();
     }
+    let _guard = if matches!(hop, PartitionHop::Target(_)) {
+        let Some(guard) = ForwardGuard::admit(&state.forward.in_flight) else {
+            return forward_busy();
+        };
+        Some(guard)
+    } else {
+        None
+    };
     let (mut parts, request_body) = request.into_parts();
     let Ok(body) = to_bytes(request_body, state.forward.body_limit).await else {
         return error_response(

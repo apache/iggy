@@ -853,7 +853,7 @@ where
         return false;
     }
 
-    if consensus.is_transferring() {
+    if consensus.is_transferring() || consensus.view_log_unproven() {
         return false;
     }
 
@@ -903,37 +903,59 @@ where
         .await
 }
 
-/// Find a held entry below a view's suffix that the new history does not prove.
-///
-/// `canonical` is ordered by descending op. Entries above the local commit floor
-/// survive only if their parent chain reaches its lowest header, or a prepare's
-/// commit stamp proves them through the uninterrupted local chain. This runs once
-/// per installed log, before repair starts filling any resulting gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewLogProof {
+    Proven,
+    /// Fetch `op`; retained entries above `unproven_through` match the view.
+    Missing {
+        op: u64,
+        unproven_through: u64,
+    },
+    Divergent(u64),
+}
+
+/// Prove held entries against the view's hash chain. Canonical headers can
+/// bridge missing bodies; a gap with no header leaves its lower prefix unknown.
 #[must_use]
-pub fn first_unproven_op(
+pub fn view_log_proof(
     commit_floor: u64,
     canonical: &[PrepareHeader],
     op_head: u64,
-    last_op: Option<u64>,
     header_at: impl Fn(u64) -> Option<PrepareHeader>,
-) -> Option<u64> {
-    let last_op = last_op?;
+) -> ViewLogProof {
     let proven = locally_proven_commit(commit_floor, &header_at);
-    let (mut op, mut parent) = canonical.last().map_or((op_head, None), |lowest| {
-        (lowest.op.saturating_sub(1), Some(lowest.parent))
-    });
-    while op > proven {
-        match header_at(op) {
-            Some(local)
-                if local.checksum != CHECKSUM_UNSEALED && Some(local.checksum) == parent =>
-            {
-                parent = Some(local.parent);
-                op -= 1;
-            }
-            _ => break,
-        }
+    if op_head <= proven {
+        return ViewLogProof::Proven;
     }
-    (proven.checked_add(1)?..=op.min(last_op)).find(|&held| header_at(held).is_some())
+    let Some(head) = canonical.first().filter(|head| head.op == op_head) else {
+        return ViewLogProof::Missing {
+            op: op_head,
+            unproven_through: op_head,
+        };
+    };
+    let mut expected = head.checksum;
+    let mut missing = None;
+    for op in (proven + 1..=op_head).rev() {
+        let header = if let Some(local) = header_at(op) {
+            local
+        } else if let Some(header) = canonical.iter().find(|header| header.op == op) {
+            missing.get_or_insert(op);
+            *header
+        } else {
+            return ViewLogProof::Missing {
+                op,
+                unproven_through: op,
+            };
+        };
+        if header.checksum == CHECKSUM_UNSEALED || header.checksum != expected {
+            return ViewLogProof::Divergent(op);
+        }
+        expected = header.parent;
+    }
+    missing.map_or(ViewLogProof::Proven, |op| ViewLogProof::Missing {
+        op,
+        unproven_through: 0,
+    })
 }
 
 fn locally_proven_commit(
@@ -2195,25 +2217,19 @@ mod tests {
     }
 
     #[test]
-    fn given_start_view_without_suffix_when_adopted_should_trust_the_announced_op() {
-        // Probe answers and stale-view corrections carry numbers only: a backup must
-        // still adopt, and record nothing it could mistake for the view's decision.
+    fn given_start_view_without_suffix_when_adopted_should_keep_proof_pending() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
-
         let (header, body) = start_view_with_suffix(1, 1, 5, 3, false);
         assert!(body.is_empty());
         let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, &body);
 
-        assert!(
-            !actions.is_empty(),
-            "a numbers-only StartView must still adopt"
-        );
+        assert!(!actions.is_empty());
         assert_eq!(consensus.sequencer().current_sequence(), 5);
-        assert!(
-            consensus.pending_view_log().is_none(),
-            "no suffix means no canonical headers to verify against"
-        );
+        let pending = consensus.pending_view_log().unwrap();
+        assert_eq!(pending.op_head, 5);
+        assert_eq!(pending.headers, [] as [PrepareHeader; 0]);
+        assert!(consensus.view_log_unproven());
     }
 
     #[test]
@@ -2584,52 +2600,59 @@ mod tests {
     }
 
     #[test]
-    fn given_view_suffix_when_proving_local_history_should_keep_only_supported_entries() {
-        let chain = |ops: std::ops::RangeInclusive<u64>, mut parent, committed: u64| {
-            ops.map(|op| {
-                let header = PrepareHeader {
-                    op,
-                    parent,
-                    commit: committed.min(op - 1),
-                    checksum: u128::from(op),
-                    ..Default::default()
-                };
-                parent = header.checksum;
-                header
+    fn given_view_suffix_when_proving_local_history_should_distinguish_gaps_from_divergence() {
+        let local: Vec<_> = (3..=6)
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                commit: 2,
+                checksum: u128::from(op),
+                ..Default::default()
             })
-            .collect::<Vec<_>>()
-        };
-        let local = chain(3..=5, 2, 2);
-        let canonical = chain(6..=6, 5, 5);
+            .collect();
+        let canonical = [*local.last().unwrap()];
         let proof = |floor, entries: &[PrepareHeader], canonical: &[PrepareHeader]| {
             let held: BTreeMap<_, _> = entries.iter().map(|header| (header.op, *header)).collect();
-            first_unproven_op(floor, canonical, 6, held.keys().last().copied(), |op| {
-                held.get(&op).copied()
-            })
+            view_log_proof(floor, canonical, 6, |op| held.get(&op).copied())
         };
-        assert_eq!(proof(2, &local, &canonical), None, "matching parent chain");
+        assert_eq!(proof(2, &local, &canonical), ViewLogProof::Proven);
+        let mut gap = local.clone();
+        gap.remove(2);
         assert_eq!(
-            proof(2, &local[..2], &canonical),
-            Some(3),
-            "gap below suffix"
+            proof(2, &gap, &canonical),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            }
         );
-        let mut stamped = local.clone();
-        stamped[2].commit = 4;
-        assert_eq!(proof(2, &stamped, &[]), Some(5), "durable commit stamp");
-        let mut replaced = local.clone();
-        replaced[1].checksum += 1;
+        let bridged = [local[3], local[2]];
         assert_eq!(
-            proof(2, &replaced, &canonical),
-            Some(3),
-            "broken parent link"
+            proof(2, &gap, &bridged),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 0,
+            },
+            "a canonical header proves the prefix even while its body is missing"
         );
-        assert_eq!(proof(2, &local, &[]), Some(3), "empty canonical suffix");
-        assert_eq!(proof(5, &local, &[]), None, "no uncommitted entries");
-        stamped[1].checksum = CHECKSUM_UNSEALED;
+        gap[1].checksum += 10;
+        assert_eq!(proof(2, &gap, &bridged), ViewLogProof::Divergent(4));
         assert_eq!(
-            proof(2, &stamped, &[]),
-            Some(3),
-            "unsealed chain proves no stamp"
+            proof(2, &gap, &canonical),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            },
+            "a gap cannot prove the held prefix divergent"
         );
+        gap.insert(2, local[2]);
+        assert_eq!(proof(2, &gap, &canonical), ViewLogProof::Divergent(4));
+        assert_eq!(
+            proof(2, &local, &[]),
+            ViewLogProof::Missing {
+                op: 6,
+                unproven_through: 6
+            }
+        );
+        assert_eq!(proof(6, &local, &[]), ViewLogProof::Proven);
     }
 }

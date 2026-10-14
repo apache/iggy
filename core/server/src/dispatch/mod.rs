@@ -1167,7 +1167,9 @@ mod tests {
         POLL_MESSAGES_ON_PRIMARY_CODE,
     };
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
-    use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::requests::consumer_offsets::{
+        GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
+    };
     use iggy_binary_protocol::requests::messages::PollMessagesRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::system::BindSessionRequest;
@@ -2484,6 +2486,112 @@ mod tests {
             assert_eq!(replies.len(), 2);
             assert_eq!(reply_request(&replies[1].1), POLL_REQUEST);
         }
+    }
+
+    #[compio::test]
+    async fn given_a_held_store_when_next_and_offset_reads_queue_should_wait_for_its_guard() {
+        const CONSUMER_ID: u32 = 1;
+        const NEXT_REQUEST: u64 = 2;
+        const OFFSET_REQUEST: u64 = 3;
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        let namespace = create_one_partition(&shard);
+        bind_root_session(&shard, host.sessions()).await;
+        let config = Arc::new(ServerConfig::default());
+        let drain = Rc::new(ClientDrain::new(&config));
+        let store = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER_ID)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        }
+        .to_bytes();
+        let store = wire_request(
+            Operation::StoreConsumerOffset,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            1,
+            &store,
+        )
+        .into_generic();
+        let key = progress_key(&shard, &store).expect("store must take a consumer progress lane");
+        assert_eq!(key.0, namespace.inner());
+        let held = drain.admit_progress(key);
+        let poll = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER_ID)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::next(),
+            count: 1,
+            auto_commit: false,
+        }
+        .to_bytes();
+        let offset = GetConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER_ID)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+        }
+        .to_bytes();
+        let mut reads = VecDeque::new();
+        for (request, code, body) in [
+            (NEXT_REQUEST, POLL_MESSAGES_CODE, poll),
+            (OFFSET_REQUEST, GET_CONSUMER_OFFSET_CODE, offset),
+        ] {
+            let mut message = wire_request(
+                Operation::NonReplicated,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                request,
+                &body,
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&code.to_le_bytes());
+            reads.push_back(QueuedClientRequest::from(message.into_generic()));
+        }
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, reads)])));
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            1,
+            Rc::clone(&queues),
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        settle().await;
+        assert_eq!(
+            queues
+                .borrow()
+                .get(&ROOT_TRANSPORT)
+                .map_or(0, VecDeque::len),
+            2,
+            "Next without auto-commit and GetConsumerOffset must both stay queued"
+        );
+        assert!(bus.client_replies.borrow().is_empty());
+
+        drop(held);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        await_replies(&bus, 1).await;
+        while futures::poll!(running.as_mut()).is_pending() {
+            settle().await;
+        }
+        await_replies(&bus, 2).await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|(_, reply)| reply_request(reply))
+                .collect::<Vec<_>>(),
+            [NEXT_REQUEST, OFFSET_REQUEST]
+        );
     }
 
     #[compio::test]

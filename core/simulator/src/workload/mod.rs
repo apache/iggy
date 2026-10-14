@@ -2735,6 +2735,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_a_recreated_fixture_when_offsets_commit_while_settling_should_retain_their_effects() {
+        let fixture = IggyNamespace::new(1, 1, 0);
+        let toggler = bound_client(1);
+        let writer = bound_client(2);
+        let mut workload = Workload::new(WorkloadOptions::new(0x4C43_4259, 1, vec![fixture]));
+        let delete = sample_toggle(&mut workload, &toggler);
+        workload.options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
+        let (_, old_send) = workload.build_request(&writer).unwrap();
+        let committed = ApplyReply::default().to_reply_body();
+        assert!(
+            workload
+                .on_reply(&reply_to(&delete, 0, &committed))
+                .is_empty()
+        );
+        let create = sample_toggle(&mut workload, &toggler);
+        assert!(
+            workload
+                .on_reply(&reply_to(&create, 0, &committed))
+                .is_empty()
+        );
+        assert!(!workload.shadow.fixtures_restored());
+        assert!(workload.on_reply(&reply_to(&old_send, 0, &[])).is_empty());
+        assert_eq!(workload.shadow.sends_committed(fixture), 0);
+
+        workload.options.weights = ActionWeights::new(&[(Action::JoinFixtureGroup, 100)]);
+        workload.shadow.enable_fixture_groups();
+        for _ in 0..2 {
+            let (_, join) = workload.build_request(&writer).unwrap();
+            assert!(
+                workload
+                    .on_reply(&reply_to(&join, 0, &committed))
+                    .is_empty()
+            );
+        }
+        workload.options.weights = ActionWeights::new(&[(Action::StoreConsumerOffset, 100)]);
+        let (_, store) = workload.build_request(&writer).unwrap();
+        let (request, _) = StoreConsumerOffsetRequest::decode(store.body()).unwrap();
+        assert!(workload.on_reply(&reply_to(&store, 0, &[])).is_empty());
+        assert_eq!(
+            workload.shadow.consumer_offset(
+                fixture,
+                request.consumer.kind,
+                request.consumer.id.as_u32().unwrap()
+            ),
+            Some(request.offset),
+            "a store on the recreated history must survive before every replica settles",
+        );
+        workload.shadow.settle_fixtures(|_, _| true);
+        assert_eq!(
+            workload.shadow.consumer_offset(
+                fixture,
+                request.consumer.kind,
+                request.consumer.id.as_u32().unwrap()
+            ),
+            Some(request.offset),
+        );
+    }
+
     /// A send sampled while a fixture delete is in flight can commit on the
     /// deleted incarnation too, even though no replacement starts after it.
     #[test]

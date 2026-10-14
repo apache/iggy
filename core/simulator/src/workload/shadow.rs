@@ -96,6 +96,8 @@ pub enum ToggleFate {
 pub struct Replacements {
     /// Deletes sampled, less those refused before they reached the server.
     pub started: u64,
+    /// Recreated topics whose successful create has been observed.
+    pub created: u64,
     /// Replacements over: every live replica hosts the recreated incarnation.
     pub settled: u64,
 }
@@ -456,7 +458,10 @@ impl Shadow {
                     }
                 }
             }
-            FixtureState::Settling { .. } => self.namespaces_live.extend(namespaces),
+            FixtureState::Settling { .. } => {
+                self.namespaces_live.extend(namespaces);
+                self.fixtures[index].replacements.created += 1;
+            }
             _ => {}
         }
     }
@@ -509,19 +514,20 @@ impl Shadow {
 
     /// A pending delete can still refuse, so retain committed effects until its
     /// success clears them. After a successful delete, late replies belong to the
-    /// old history until the replacement settles.
+    /// old history once the replacement has been created, including while it settles.
     #[must_use]
     pub fn effect_is_current(&self, namespace: IggyNamespace, sampled: Replacements) -> bool {
         self.fixtures
             .iter()
             .find(|fixture| fixture.namespaces.contains(&namespace))
             .is_none_or(|fixture| {
-                sampled.settled == fixture.replacements.settled
+                sampled.created == fixture.replacements.created
                     && matches!(
                         fixture.state,
                         FixtureState::Live
                             | FixtureState::Deleting { .. }
                             | FixtureState::DeleteUnknown
+                            | FixtureState::Settling { .. }
                     )
             })
     }
@@ -533,6 +539,7 @@ impl Shadow {
             .iter()
             .fold(Replacements::default(), |total, fixture| Replacements {
                 started: total.started + fixture.replacements.started,
+                created: total.created + fixture.replacements.created,
                 settled: total.settled + fixture.replacements.settled,
             })
     }

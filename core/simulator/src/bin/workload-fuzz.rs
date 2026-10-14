@@ -663,6 +663,13 @@ fn run_quiesce_phase(
             args.min_owners_compared, convergence.owners_compared,
         ));
     }
+    if sim.is_shell() && args.plane == Plane::Lifecycle && workload.owner_fence_refusals() == 0 {
+        vacuous(format_args!(
+            "lifecycle --shell requires an owner-fence refusal, but observed none \
+             (stale_owner_stores={}, seed={seed:#x})",
+            workload.stale_owner_stores(),
+        ));
+    }
     // Again after the drain: the drain both answers outstanding requests and
     // issues its own resends, so the pre-drain numbers are not the final ones.
     print_coverage(workload);

@@ -856,8 +856,7 @@ func (c *IggyTcpClient) attempt(
 		}
 		if captured, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
 			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), captured)
-		}
-		if _, captured := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); !captured {
+		} else {
 			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), iggcon.PartitionContext{MetadataOp: c.metadataWatermark.Load()})
 		}
 		stamped = true

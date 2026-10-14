@@ -39,6 +39,22 @@ cargo run --bin iggy-server --release -- --replica-id 0
 
 Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
+## Upgrading
+
+Deploy matching server and SDK releases together. Rolling upgrades and mixed
+server versions are unsupported. Partition control frames from older servers
+carry incarnation zero and are rejected, so a mixed-version cluster cannot
+complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-5` storage gate also
+rejects older data directories without modifying them. Existing data requires a
+separately validated offline migration or restore procedure before this release
+can use it.
+
+Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
+`replicaId` component, changing constructor calls and record patterns. C# callers
+must initialize the required `ReplicaId` property. The CLI's cluster metadata list
+appends a replica ID column. Go, Java, Node.js and C# clients use command 105's new
+partition routes and refresh on `NotPrimary` (89); use their matching releases.
+
 ## Configuration
 
 Settings are read from [config.toml](config.toml), resolved relative to the working directory. Set `IGGY_CONFIG_PATH` to load a different file.

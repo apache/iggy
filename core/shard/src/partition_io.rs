@@ -705,10 +705,16 @@ where
                 }
             }
             partitions::PartitionIoStep::ViewApplied { actions, peer } => {
-                partition.consensus().settle_view_log_proof();
+                let pending = partition.consensus().pending_view_log();
+                crate::reconcile_partition_view_divergence(self.id, partition, pending.as_ref())
+                    .await;
                 if let Some(peer) = peer {
-                    self.finish_partition_view_adoption(namespace, peer, actions)
-                        .await;
+                    if partition.consensus().view_log_unproven() {
+                        self.maybe_request_partition_repair(partition, peer).await;
+                    } else {
+                        self.finish_partition_view_adoption(namespace, peer, actions)
+                            .await;
+                    }
                 } else {
                     self.advance_pending_partition_view(namespace).await;
                 }
@@ -803,6 +809,7 @@ mod tests {
         ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
         IggyTimestamp, PartitionStats, TopicRuntimeOptions, variadic,
     };
+    use journal::Journal;
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::{SuperblockContents, SuperblockStore};
     use message_bus::{IggyMessageBus, MessageBus};
@@ -4161,6 +4168,80 @@ mod tests {
         IggyShard<B, PrepareJournal, (), IoTestMetadata, PapayaShardsTable, HeldSuperblock>;
 
     #[compio::test]
+    async fn given_a_stale_primary_heartbeat_when_the_suffix_cache_is_stale_should_reply_with_fresh_headers()
+     {
+        const HEAD: u64 = 2;
+        const INCARNATION: u64 = 1;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        for replica in [0, 2] {
+            assert!(bus.owner_table().try_claim(replica, 1));
+        }
+        let (mut owner, _sender) = test_owner(&bus, None);
+        owner.partition_consensus.replica_count = 3;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let mut partition = repairing_replica(&bus, namespace, (REPAIR_PRIMARY, 3), 0, 0, 0);
+        partition.repair = None;
+        partition.set_created_revision(INCARNATION);
+        crate::refresh_partition_dvc_suffix(&partition);
+        for prepare in &prepares {
+            partition
+                .log
+                .journal()
+                .inner
+                .append(prepare.clone().into_frozen())
+                .await
+                .unwrap();
+            partition.consensus().note_journal_mutation();
+        }
+        partition.consensus().sequencer().set_sequence(HEAD);
+        assert!(partition.consensus().local_dvc_suffix_stale());
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, partition);
+        sent.borrow_mut().clear();
+        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.partition_incarnation = INCARNATION;
+                header.replica = 0;
+                header.view = REPAIR_VIEW - 1;
+                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
+                header.seal();
+            },
+        );
+
+        owner.on_commit(&heartbeat).await;
+
+        assert_eq!(sent.borrow().len(), 2);
+        let expected: Vec<_> = prepares
+            .iter()
+            .rev()
+            .map(|prepare| *prepare.header())
+            .collect();
+        for frame in sent.borrow().iter() {
+            let reply =
+                Message::<StartViewHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            let suffix = consensus::dvc_suffix_decode(
+                &reply.as_slice()[size_of::<StartViewHeader>()..],
+                HEAD,
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(suffix.headers(), expected);
+        }
+    }
+
+    #[compio::test]
     async fn given_unproven_suffix_when_adopting_start_view_should_repair_before_applying() {
         const APPLIED: u64 = 2;
         const LOCAL_HEAD: u64 = 4;
@@ -4195,21 +4276,138 @@ mod tests {
             .await;
         let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert_eq!(partition.consensus().commit_min(), APPLIED);
-        assert!(!partition.log.journal().inner.holds_op(APPLIED + 1));
+        assert!(partition.log.journal().inner.holds_op(APPLIED + 1));
+        assert!(partition.consensus().view_log_unproven());
+        assert!(!partition.consensus().view_log_entry_proven(APPLIED + 1));
+        for prepare in prepares.iter().rev() {
+            let repaired = prepare.clone().transmute_header(
+                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                    repaired.0 = header;
+                    repaired.0.command = Command::RepairPrepare;
+                },
+            );
+            owner.on_repair_prepare(repaired).await;
+        }
+        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
         assert!(!partition.consensus().view_log_unproven());
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        assert_eq!(partition.consensus().commit_min(), NEW_HEAD);
+    }
+
+    #[compio::test]
+    async fn given_a_divergent_entry_when_removal_is_deferred_should_keep_the_canonical_tail() {
+        const APPLIED: u64 = 2;
+        const DIVERGENT: u64 = 3;
+        const HEAD: u64 = 4;
+        const NEW_VIEW: u32 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let mut partition =
+            repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+        partition.repair = None;
+        for prepare in &prepares {
+            partition.on_replicate(prepare.clone()).await;
+        }
+        partition.consensus().advance_commit_max(APPLIED);
+        partition
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        partition
+            .log
+            .journal()
+            .inner
+            .remove_range(DIVERGENT..=DIVERGENT)
+            .await
+            .unwrap();
+        let divergent = prepares[usize::try_from(DIVERGENT - 1).unwrap()]
+            .clone()
+            .transmute_header(|previous, header: &mut PrepareHeader| {
+                *header = previous;
+                header.client += 1;
+                header.checksum = header.identity_checksum();
+            });
+        partition
+            .log
+            .journal()
+            .inner
+            .append(divergent.into_frozen())
+            .await
+            .unwrap();
+        let partitions = owner.plane.partitions();
+        partitions.remove(&namespace).unwrap();
+        partitions.insert(namespace, partition);
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+
+        owner
+            .on_start_view(start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                HEAD,
+                HEAD,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+        assert!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .view_truncation_pending()
+        );
+        for _ in 0..crate::router::COOPERATIVE_EVENT_BUDGET {
+            owner.service_partition_io().await;
+            if !partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .view_truncation_pending()
+            {
+                break;
+            }
+        }
+        let partition = partitions.get_by_ns(&namespace).unwrap();
+        assert!(!partition.view_truncation_pending());
+        assert!(partition.consensus().view_log_unproven());
+        assert_eq!(partition.consensus().commit_min(), APPLIED);
+        assert!(!partition.log.journal().inner.holds_op(DIVERGENT));
+        assert_eq!(
+            partition.log.journal().inner.header_by_op(HEAD),
+            Some(*prepares.last().unwrap().header())
+        );
+
+        let repaired = prepares[usize::try_from(DIVERGENT - 1).unwrap()]
+            .clone()
+            .transmute_header(
+                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                    repaired.0 = header;
+                    repaired.0.command = Command::RepairPrepare;
+                },
+            );
+        owner.on_repair_prepare(repaired).await;
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        assert!(!partition.consensus().view_log_unproven());
+        partition.commit_journal(partitions.config()).await;
+        assert_eq!(partition.consensus().commit_min(), HEAD);
     }
 
     #[compio::test]
     async fn given_deferred_view_truncation_when_resuming_should_settle_proof_only_after_success() {
         const APPLIED: u64 = 2;
-        const LOCAL_HEAD: u64 = 4;
-        const NEW_HEAD: u64 = 6;
+        const LOCAL_HEAD: u64 = 6;
+        const NEW_HEAD: u64 = 4;
         const NEW_VIEW: u32 = 3;
-        for truncate_fails in [false, true] {
+        for (truncate_fails, repair_fallback) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let bus = Rc::new(IggyMessageBus::new(0));
             let (owner, _sender) = test_owner(&bus, None);
             let namespace = IggyNamespace::new(0, 0, 0);
-            let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
+            let prepares = primary_prepares(&bus, namespace, LOCAL_HEAD).await;
             let mut partition =
                 repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
             partition.repair = None;
@@ -4227,15 +4425,28 @@ mod tests {
                 owner.partition_io.notifier(),
                 owner.partition_io.limits.bytes_max(),
             );
-            owner
-                .on_start_view(start_view_suffix(
-                    namespace,
-                    NEW_VIEW,
-                    NEW_HEAD,
-                    NEW_HEAD,
-                    &[*prepares.last().unwrap().header()],
-                ))
-                .await;
+            let view = start_view_suffix(
+                namespace,
+                NEW_VIEW,
+                NEW_HEAD,
+                NEW_HEAD,
+                &[*prepares[usize::try_from(NEW_HEAD - 1).unwrap()].header()],
+            );
+            if repair_fallback {
+                let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+                partition.consensus().handle_start_view(
+                    consensus::PlaneKind::Partitions,
+                    view.header(),
+                    view.body(),
+                );
+                assert!(
+                    !owner
+                        .maybe_request_partition_repair(partition, REPAIR_PRIMARY)
+                        .await
+                );
+            } else {
+                owner.on_start_view(view).await;
+            }
             let partition = partitions.get_mut_by_ns(&namespace).unwrap();
             assert!(partition.view_truncation_pending());
             assert!(partition.consensus().view_log_unproven());
@@ -4258,9 +4469,12 @@ mod tests {
             assert!(!partition.view_truncation_pending());
             assert_eq!(partition.consensus().view_log_unproven(), truncate_fails);
             partition.commit_journal(partitions.config()).await;
-            assert_eq!(partition.consensus().commit_min(), APPLIED);
             assert_eq!(
-                partition.log.journal().inner.holds_op(APPLIED + 1),
+                partition.consensus().commit_min(),
+                if truncate_fails { APPLIED } else { NEW_HEAD }
+            );
+            assert_eq!(
+                partition.log.journal().inner.holds_op(NEW_HEAD + 1),
                 truncate_fails
             );
         }
@@ -4365,8 +4579,8 @@ mod tests {
         );
         let pending = partition.consensus().pending_view_log();
         assert_eq!(
-            crate::partition_view_divergence_from(0, &partition, pending.as_ref()),
-            Some(STAMPED)
+            crate::partition_view_divergence_from(&partition, pending.as_ref()),
+            None
         );
         assert!(
             partition
@@ -4427,7 +4641,7 @@ mod tests {
             .partitions()
             .get_mut_by_ns(&namespace)
             .unwrap()
-            .defer_view_truncation(3, Vec::new(), None);
+            .defer_view_truncation(3..=u64::MAX, Vec::new(), None);
         owner.on_request_prepares(&request).await;
         assert!(
             sent.borrow().is_empty(),
