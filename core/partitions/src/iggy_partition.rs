@@ -13339,6 +13339,7 @@ mod tests {
             prepare_checksum: Some(prepare.header().checksum),
             checkpoint_prepare: prepare.as_slice().to_vec(),
             next_offset: 1,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
