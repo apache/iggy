@@ -75,6 +75,20 @@ export type SendCommandOptions = {
 };
 
 /**
+ * Connection lifecycle events of a `Client`, with their listener arguments.
+ */
+export type ClientEventMap = {
+  /** A dial to the server starts: the first one, a redial or a redirect */
+  connecting: [],
+  /** The dialed socket is ready: TCP connected, or TLS handshake done */
+  connected: [],
+  /** The connection reported an error, such as a failed dial */
+  error: [error: Error],
+  /** `destroy()` closed the connection. No event follows this one */
+  end: []
+};
+
+/**
  * Low-level client interface for communicating with the Iggy server.
  * Provides direct access to command sending and event handling.
  */

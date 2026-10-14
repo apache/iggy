@@ -44,6 +44,18 @@ describe('e2e -> client', async () => {
     assert.ok(await c.session.logout());
   });
 
+  it('e2e -> client::lifecycle events', async () => {
+    const lc = getTestClient();
+    const events: string[] = [];
+    lc
+      .on('connecting', () => events.push('connecting'))
+      .on('connected', () => events.push('connected'))
+      .on('end', () => events.push('end'));
+    assert.ok(await lc.system.ping());
+    await lc.destroy();
+    assert.deepEqual(events, ['connecting', 'connected', 'end']);
+  });
+
   after(() => {
     c.destroy();
   });

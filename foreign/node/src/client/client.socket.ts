@@ -287,8 +287,16 @@ export class CommandResponseStream extends EventEmitter {
    */
   _init() {
     this.heartbeat(this.options.heartbeatInterval);
+    this.connection.on('connecting', () => this.emit('connecting'));
+    this.connection.on('connect', () => this.emit('connected'));
+    this.connection.on('end', () => this.emit('end'));
     this.connection.on('error', (error: Error) => {
       this._failQueue(error);
+      // Only 'error' needs this guard: EventEmitter throws on an 'error' that
+      // nobody listens for. Without a listener these errors reach callers
+      // through the commands they fail, so the client must not throw.
+      if (this.listenerCount('error') > 0)
+        this.emit('error', error);
     });
     this.connection.on('eviction', (error: VsrEvictionError) => {
       this._resetSession();
