@@ -11153,15 +11153,14 @@ mod probe_answer_divergence_tests {
 
 #[cfg(test)]
 mod metadata_walk_stuck_detector_tests {
-    //! The metadata walk-stall detector in `tick_metadata` must not mistake the
-    //! pipeline head for a header without a body.
+    //! The metadata walk-stall detector in `tick_metadata` must keep the
+    //! pipeline head journaled.
     //!
-    //! `commit_journal` stops, without moving `commit_min`, at the op the
-    //! pipeline holds, because committing it is `on_ack`'s job. A detector that
-    //! read "the walk moved nothing" as "the body is unreadable" would truncate
-    //! the WAL from that op, leaving the primary's pipeline with a committed
-    //! header whose prepare is gone, and the next commit driver would panic
-    //! with `committed prepare ... must be in journal`.
+    //! `commit_journal` stops at the op the pipeline holds and reports
+    //! `CommitWalkStop::PipelineHead`, and the detector truncates only on
+    //! `BodyMissing`. Truncating from the head would leave the primary's
+    //! pipeline with a committed header whose prepare is gone, and the next
+    //! commit driver would panic with `committed prepare ... must be in journal`.
 
     use consensus::Consensus;
 
@@ -11248,9 +11247,10 @@ mod metadata_walk_stuck_detector_tests {
         }
     }
 
-    /// Whether the primary-elect is a normal view-2 primary whose pipeline head
-    /// is committed and is the very next op it owes the state machine. Gated
-    /// like `group_is_walk_stalled`, so a view-change window does not count.
+    /// Whether the primary-elect is a normal primary of view 1 or later whose
+    /// pipeline head is committed and is the very next op it owes the state
+    /// machine. Gated like `group_is_walk_stalled`, so a view-change window
+    /// does not count.
     fn primary_elect_holds_inherited_head(sim: &Simulator) -> bool {
         let consensus = sim
             .metadata_consensus(PRIMARY_ELECT)

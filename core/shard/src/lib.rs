@@ -1489,10 +1489,10 @@ where
     /// metadata group per node (precedent: [`Self::metadata_transfer_attempts`]).
     metadata_gap_ticks: Cell<u32>,
 
-    /// Op last truncated after a `BodyMissing` walk stop, or `0`. The gap probe
-    /// counts it as absent so repair can refetch it. Zeroed by any other
-    /// walk-arm stop; an advance of `commit_min` past it also stops it
-    /// matching `commit_min + 1`.
+    /// Op the last `BodyMissing` drop targeted, or `0`. Recorded before
+    /// `truncate_from` and kept if it fails, so a storage error is not retried
+    /// every tick. The gap probe counts it as absent so repair can refetch it,
+    /// and it goes inert once `commit_min` passes it.
     metadata_walk_stuck_op: Cell<u64>,
 
     /// Serving-side cache of state-transfer offers, both planes, keyed by
@@ -10572,12 +10572,11 @@ where
                     commit_max = probe.commit_max,
                     "metadata commit walk parked over resident committed ops; resuming"
                 );
-                // Truncate on `BodyMissing` alone. A walk that moved nothing is
-                // not proof: `PipelineHead` moves nothing either, and dropping
-                // that prepare panics the pipeline driver that commits it next.
-                // Promotion above can also hand the pipeline ownership after
-                // the stranded-commit driver ran, so the drop re-verifies the
-                // absent body and the pipeline before removing any header.
+                // Truncate on `BodyMissing` alone, which names the unreadable op
+                // even after this walk advanced `commit_min` part of the way.
+                // Promotion above can hand the pipeline ownership after the
+                // stranded-commit driver ran, so the drop re-verifies the absent
+                // body and the pipeline before removing any header.
                 //
                 // Recording the op stops the detector calling this a parked
                 // walk, but arming repair alone cannot refill it: the ingest
@@ -10588,8 +10587,6 @@ where
                 {
                     self.drop_unwalkable_metadata_entry(consensus, journal, stuck_op)
                         .await;
-                } else {
-                    self.metadata_walk_stuck_op.set(0);
                 }
             }
         }
