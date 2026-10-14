@@ -386,6 +386,7 @@ pub enum TransferFileJob {
     Backup {
         directory: String,
         begin: bool,
+        synced_files: std::collections::BTreeSet<std::path::PathBuf>,
     },
     Sweep {
         directory: String,
@@ -876,10 +877,14 @@ impl TransferFileJob {
                 crate::state_transfer::discard_offset_writes(&writes).await;
                 TransferFileResult::Finished(Ok(()))
             }
-            Self::Backup { directory, begin } => {
+            Self::Backup {
+                directory,
+                begin,
+                synced_files,
+            } => {
                 let path = std::path::Path::new(&directory);
                 let outcome = if begin {
-                    crate::install_backup::begin(path).await
+                    crate::install_backup::begin(path, &synced_files).await
                 } else {
                     crate::install_backup::finish(path).await
                 };
