@@ -145,9 +145,7 @@ use tracing::trace;
 ///
 /// # async fn example() -> Result<(), IggyError> {
 /// let config = IggyConsumerConfig::builder()
-///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
-///     .topic_id(Identifier::from_str_value("my-topic")?)
 ///     .topic_name("my-topic")
 ///     .consumer_name("order-workers")
 ///     .consumer_kind(ConsumerKind::ConsumerGroup)
@@ -246,12 +244,15 @@ impl IggyStreamConsumer {
     ///
     /// # Errors
     ///
+    /// - [`IggyError::FeatureUnavailable`] when `config` has
+    ///   [`ConsumerKind::ExternalGroup`].
     /// - [`IggyError::NotConnected`] when the ping that opens the call fails.
     /// - Any error raised while creating the stream or the topic.
     /// - Any error returned by [`IggyConsumer::init()`], such as
     ///   [`IggyError::StreamNameNotFound`] when the stream is still missing once the retries are
     ///   spent.
     ///
+    /// [`ConsumerKind::ExternalGroup`]: crate::prelude::ConsumerKind::ExternalGroup
     /// [`IggyConsumer`]: crate::prelude::IggyConsumer
     /// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
     pub async fn build(
@@ -299,11 +300,14 @@ impl IggyStreamConsumer {
     ///
     /// # Errors
     ///
+    /// - [`IggyError::FeatureUnavailable`] when `config` has
+    ///   [`ConsumerKind::ExternalGroup`].
     /// - [`IggyError::InvalidConnectionString`] when `connection_string` cannot be parsed.
     /// - Any error raised while connecting to the server, or while creating the stream or the
     ///   topic.
     /// - Any error returned by [`IggyConsumer::init()`].
     ///
+    /// [`ConsumerKind::ExternalGroup`]: crate::prelude::ConsumerKind::ExternalGroup
     /// [`IggyClient`]: crate::prelude::IggyClient
     /// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
     pub async fn with_client_from_url(

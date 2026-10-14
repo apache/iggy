@@ -42,8 +42,8 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
 /// The builder requires every field that is not an [`Option`], so
-/// [`init_retries()`](Self::init_retries) and [`encryptor()`](Self::encryptor) are the only two it
-/// lets you leave out.
+/// [`init_retries()`](Self::init_retries), [`encryptor()`](Self::encryptor) and [`partition_id()`](Self::partition_id)
+/// are the only three it lets you leave out.
 ///
 /// # Fields and defaults
 ///
@@ -52,11 +52,11 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 ///
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
-/// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | what is read |
-/// | [`stream_id()`](Self::stream_id), [`topic_id()`](Self::topic_id) | the same two names | the lookup that [`IggyStreamConsumer`] runs to decide whether the stream and the topic exist, and the name it creates them under |
+/// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | name of the stream and topic that is either looked up or automatically created if enabled |
 /// | [`consumer_name()`](Self::consumer_name) | `test_consumer`, or `consumer-{stream}-{topic}` | the name of the consumer, or of its group |
 /// | [`consumer_kind()`](Self::consumer_kind) | [`ConsumerKind::ConsumerGroup`] | whether the consumer joins a group or reads one partition alone |
-/// | [`partitions_count()`](Self::partitions_count) | 1 | two things, see below |
+/// | [`partition_id()`](Self::partition_id) | 0 | partition id for ordinary consumers, ignored by groups |
+/// | [`partitions_count()`](Self::partitions_count) | 1 | see below |
 /// | [`create_stream_if_not_exists()`](Self::create_stream_if_not_exists) | off | creating a missing stream |
 /// | [`create_topic_if_not_exists()`](Self::create_topic_if_not_exists) | off | creating a missing topic |
 /// | [`batch_length()`](Self::batch_length) | 100 | messages fetched per request |
@@ -69,10 +69,10 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 ///
 /// ## Some callouts on defaults
 ///
-/// - [`partitions_count()`](Self::partitions_count) carries two meanings. It is the number of partitions
-///   that the build creates per topic. For [`ConsumerKind::Consumer`] it is also the ID of the
-///   single partition the consumer reads. A [`ConsumerKind::ConsumerGroup`] ignores that second
-///   meaning, because the server assigns its partitions.
+/// - [`partitions_count()`](Self::partitions_count) is the number of partitions that the build
+///   creates per topic. The partition a consumer reads from is
+///   [`partition_id()`](Self::partition_id), which a [`ConsumerKind::ConsumerGroup`] ignores
+///   because the server assigns its partitions instead.
 /// - [`encryptor()`](Self::encryptor) if you build from an [`IggyClient`] that already has an `encryptor` the one you define here
 ///   replaces the encryptor of the [`IggyClient`] for consumer.
 ///   An encryptor also rules out the default [`auto_commit()`](Self::auto_commit), because that setting commits a batch before it is
@@ -85,12 +85,11 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 ///   creates nothing. It waits out [`init_retries()`](Self::init_retries) instead, which covers a
 ///   producer that creates the topic at the same time.
 ///
-/// Keep [`stream_id()`](Self::stream_id) and [`stream_name()`](Self::stream_name) in agreement, and
-/// keep [`topic_id()`](Self::topic_id) and [`topic_name()`](Self::topic_name) in agreement.
-/// [`IggyStreamConsumer`] creates the stream and the topic under the name it reads from the two
-/// identifiers, and [`IggyConsumer::init()`] then looks the two names up. If a pair disagrees, the
-/// build creates one topic and reads another, and [`IggyConsumer::init()`] fails with
-/// [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`].
+/// [`IggyStreamConsumer`] creates the stream and the topic under
+/// [`stream_name()`](Self::stream_name) and [`topic_name()`](Self::topic_name) if the create flags
+/// above ask for it, and [`IggyConsumer::init()`] then looks the stream and the topic up under
+/// those same two names. If neither exists and creation is off, [`IggyConsumer::init()`] fails
+/// with [`IggyError::StreamNameNotFound`] or [`IggyError::TopicNameNotFound`].
 ///
 /// # Examples
 ///
@@ -122,9 +121,7 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 ///
 /// # fn main() -> Result<(), IggyError> {
 /// let config = IggyConsumerConfig::builder()
-///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
-///     .topic_id(Identifier::from_str_value("my-topic")?)
 ///     .topic_name("my-topic")
 ///     .consumer_name("order-workers")
 ///     .consumer_kind(ConsumerKind::ConsumerGroup)
@@ -168,7 +165,7 @@ pub struct IggyConsumerConfig {
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
     auto_commit: AutoCommit,
-    /// The max number of messages to send in a batch. The greater the batch length, the higher the throughput for bulk data.
+    /// The max number of messages fetched in a batch. The greater the batch length, the higher the throughput for bulk data.
     /// Note, there is a tradeoff between batch size and latency.
     batch_length: u32,
     /// Create the stream if it doesn't exist.
@@ -238,12 +235,9 @@ impl IggyConsumerConfig {
     /// ```rust
     /// use iggy::prelude::*;
     ///
-    /// # fn example() -> Result<(), IggyError> {
     /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyConsumerConfig::new(
-    ///     Identifier::from_str_value("my-stream")?,
     ///     "my-stream".to_string(),
-    ///     Identifier::from_str_value("my-topic")?,
     ///     "my-topic".to_string(),
     ///     AutoCommit::When(AutoCommitWhen::ConsumingEachMessage),
     ///     100,
