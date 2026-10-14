@@ -947,6 +947,12 @@ fn main() {
         ..Default::default()
     };
     vectors.insert("vsr.reply.ok".to_owned(), hex(bytemuck::bytes_of(&reply)));
+    let mut committed = reply;
+    committed.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+    vectors.insert(
+        "vsr.reply.committed".to_owned(),
+        hex(bytemuck::bytes_of(&committed)),
+    );
     let denied = ReplyHeader {
         command: Command::Reply,
         operation: Operation::NonReplicated,

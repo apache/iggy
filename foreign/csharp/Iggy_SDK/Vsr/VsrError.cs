@@ -40,6 +40,7 @@ internal static class VsrError
     internal const int INVALID_PERSONAL_ACCESS_TOKEN = 53;
     internal const int TRANSIENT_NOT_COMMITTED = 57;
     internal const int TRANSIENT_NOT_ACCEPTED = 58;
+    internal const int INVALID_SIZE_BYTES = 80;
     internal const int REQUEST_TOO_OLD = 85;
     internal const int HISTORY_UNAVAILABLE = 87;
     internal const int LIFECYCLE_BUSY = 88;
@@ -47,6 +48,7 @@ internal static class VsrError
     internal const int EMPTY_RESPONSE = 304;
     internal const int TOPIC_ID_NOT_FOUND = 2010;
     internal const int CONSUMER_GROUP_MEMBER_NOT_FOUND = 5006;
+    internal const int PARTITION_NOT_FOUND = 3007;
     internal const int CONSUMER_GROUP_PARTITION_NOT_OWNED = 5009;
     internal const int TOO_MANY_CONSUMER_GROUPS = 5010;
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;

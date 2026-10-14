@@ -43,9 +43,7 @@ use bytes::Bytes;
 use consensus::client_table::SessionAttachment;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::PrepareHeader;
-use iggy_binary_protocol::codes::{
-    GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-};
+use iggy_binary_protocol::codes::{GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -136,6 +134,17 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         .await;
         return;
     }
+    // A newer route can name group membership this replica has not applied yet.
+    if header.minimum_metadata_op > metadata_watermark {
+        send_deny_reply(
+            shard,
+            transport_client_id,
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return;
+    }
     let namespace = match resolved_namespace.map_or_else(
         || {
             resolve_partition_request_namespace(
@@ -160,6 +169,8 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
             // in lockstep and would wedge forever.
             warn!(
                 transport_client_id,
+                minimum_metadata_op = header.minimum_metadata_op,
+                metadata_watermark,
                 error = %error,
                 operation = ?header.operation,
                 "partition request with unresolved namespace; replying denied"
@@ -404,9 +415,7 @@ where
             GetConsumerOffsetRequest::decode_from(request.body()).ok()?
         }
         Operation::NonReplicated
-            if request.header().reserved[..4] == POLL_MESSAGES_CODE.to_le_bytes()
-                || request.header().reserved[..4]
-                    == POLL_MESSAGES_ON_PRIMARY_CODE.to_le_bytes() =>
+            if request.header().reserved[..4] == POLL_MESSAGES_CODE.to_le_bytes() =>
         {
             let poll = PollMessagesRequest::decode_from(request.body()).ok()?;
             if !poll.auto_commit && poll.strategy.kind != WirePollingStrategy::next().kind {
@@ -816,10 +825,11 @@ pub(super) fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
 /// denies with a nonzero status instead, so an addressing typo cannot read
 /// back as a fresh consumer. A read that its owner does not answer in time, or
 /// whose owner does not hold the partition, denies with `TransientNotAccepted`.
+/// Primary reads also return `NotPrimary` (89) for a moved primary,
+/// `HistoryUnavailable` (87) for a missing incarnation, or
+/// `TransientNotAccepted` (58) when the context is ahead of local metadata.
 /// The gate runs again after the owner answers, because the session can end
 /// while the read waits.
-// TODO(hubcio): primary-gate binary offset reads when the active Rust clients
-// route GET_CONSUMER_OFFSET to the partition primary.
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -866,8 +876,13 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
-    let body = match resolve_consumer_offset_request(shard, &wire) {
-        Ok(Some((namespace, partition_id, read))) => {
+    let context = PartitionContext {
+        incarnation: request.header().partition_incarnation,
+        owner_generation: 0,
+        metadata_op: request.header().minimum_metadata_op,
+    };
+    let body = match resolve_primary_consumer_offset_request(shard, &wire, context) {
+        Ok((namespace, partition_id, read)) => {
             let reply = shard.partition_read(namespace, read).await;
             if let Err(error) = authorize() {
                 send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
@@ -916,9 +931,6 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                 }
             }
         }
-        // An unresolved group has no offset to report, the one thing the
-        // empty body may mean.
-        Ok(None) => Bytes::new(),
         // Everything the resolve rejects is a client error: an unresolved
         // stream, topic, or partition, or `resolve_partition_namespace`'s
         // generic rejection. All must surface typed -- an empty body decodes as
@@ -1081,6 +1093,76 @@ where
         resolve_partition_namespace(shard, &wire.stream_id, &wire.topic_id, Some(partition_id))?;
     let consumer = polling_consumer_from_wire(&wire.consumer, partition_id)?;
     Ok((namespace, partition_id, consumer, args))
+}
+
+/// A stored offset has no membership fence, but it still belongs to one
+/// partition history. The captured metadata is checked again on the owner.
+pub fn resolve_primary_consumer_offset_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    wire: &GetConsumerOffsetRequest,
+    context: PartitionContext,
+) -> Result<(IggyNamespace, u32, PartitionRead), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let metadata_op = current_metadata_commit(shard);
+    if context.metadata_op > metadata_op {
+        return Err(IggyError::TransientNotAccepted);
+    }
+    let resolved = resolve_consumer_offset_request(shard, wire)?;
+    let (namespace, partition_id) = if let Some((namespace, partition_id, _)) = &resolved {
+        (*namespace, *partition_id)
+    } else {
+        let partition_id = wire.partition_id.unwrap_or(0);
+        (
+            resolve_partition_namespace(
+                shard,
+                &wire.stream_id,
+                &wire.topic_id,
+                Some(partition_id),
+            )?,
+            partition_id,
+        )
+    };
+    let metadata = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_offset_metadata(namespace, None, 0)
+        .ok_or(IggyError::TransientNotAccepted)?;
+    let mut local = metadata.context(metadata_op);
+    local.owner_generation = 0;
+    fence_poll_context(
+        PartitionContext {
+            owner_generation: 0,
+            ..context
+        },
+        local,
+        0,
+        partition_id,
+    )?;
+    let read = match resolved.map(|(_, _, read)| read) {
+        Some(PartitionRead::ConsumerOffset { consumer }) => {
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(consumer),
+                metadata,
+            }
+        }
+        Some(PartitionRead::ExternalGroupOffset { group_id }) => {
+            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, metadata }
+        }
+        None => PartitionRead::ConsumerOffsetOnPrimary {
+            consumer: None,
+            metadata,
+        },
+        _ => return Err(IggyError::InvalidCommand),
+    };
+    Ok((namespace, partition_id, read))
 }
 
 /// Resolve a decoded consumer-offset read into its owning-shard read:
@@ -1536,6 +1618,7 @@ mod tests {
     async fn given_recreate_after_segment_resolution_when_committing_should_report_history_changed()
     {
         const CLIENT: u128 = 1;
+        const REQUEST_CHECKSUM: u128 = (1 << 80) | 0x002A;
         let bus = SpyBus::default();
         let mut shard = test_shard(&bus, 0, 1, 1);
         let (namespace, _) = create_segment_delete_topic(&shard);
@@ -1550,6 +1633,10 @@ mod tests {
         }
         .to_bytes();
         let request = request_message(Operation::DeleteSegments, CLIENT, 1, 1, &body);
+        let header = RoutedRequestHeader {
+            request_checksum: REQUEST_CHECKSUM,
+            ..*request.header()
+        };
         for up_to_offset in [Some(7), None] {
             let created_revision = shard
                 .plane
@@ -1598,10 +1685,11 @@ mod tests {
                 );
             };
             let (resolved, ()) = futures::join!(
-                resolve_delete_segments_truncate(&shard, request.header(), CLIENT, 1, &body),
+                resolve_delete_segments_truncate(&shard, &header, CLIENT, 1, &body),
                 owner,
             );
             let resolved = resolved.unwrap();
+            assert_eq!(resolved.header().request_checksum, REQUEST_CHECKSUM);
             let truncate = TruncatePartitionRequest::decode(request_body(&resolved))
                 .unwrap()
                 .0;
@@ -1875,41 +1963,39 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
         let namespace = create_one_partition(&shard);
         let expected = Some((namespace.inner(), KIND_CONSUMER, CONSUMER as usize));
-        for code in [POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE] {
-            for (strategy, reads_stored) in [
-                (WirePollingStrategy::offset(0), false),
-                (WirePollingStrategy::timestamp(1), false),
-                (WirePollingStrategy::first(), false),
-                (WirePollingStrategy::last(), false),
-                (WirePollingStrategy::next(), true),
-            ] {
-                for auto_commit in [false, true] {
-                    let body = PollMessagesRequest {
-                        consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
-                        stream_id: WireIdentifier::numeric(0),
-                        topic_id: WireIdentifier::numeric(0),
-                        partition_id: Some(0),
-                        strategy: strategy.clone(),
-                        count: 1,
-                        auto_commit,
-                    }
-                    .to_bytes();
-                    let mut request = request_message(Operation::NonReplicated, 1, 1, 1, &body);
-                    bytemuck::checked::from_bytes_mut::<RequestHeader>(
-                        &mut request.as_mut_slice()[..size_of::<RequestHeader>()],
-                    )
-                    .reserved[..4]
-                        .copy_from_slice(&code.to_le_bytes());
-                    assert_eq!(
-                        progress_key(&shard, &request.into_generic()),
-                        if reads_stored || auto_commit {
-                            expected
-                        } else {
-                            None
-                        },
-                        "code {code}, strategy {strategy:?}, auto_commit {auto_commit}",
-                    );
+        for (strategy, reads_stored) in [
+            (WirePollingStrategy::offset(0), false),
+            (WirePollingStrategy::timestamp(1), false),
+            (WirePollingStrategy::first(), false),
+            (WirePollingStrategy::last(), false),
+            (WirePollingStrategy::next(), true),
+        ] {
+            for auto_commit in [false, true] {
+                let body = PollMessagesRequest {
+                    consumer: WireConsumer::consumer(WireIdentifier::numeric(CONSUMER)),
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: Some(0),
+                    strategy: strategy.clone(),
+                    count: 1,
+                    auto_commit,
                 }
+                .to_bytes();
+                let mut request = request_message(Operation::NonReplicated, 1, 1, 1, &body);
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                    &mut request.as_mut_slice()[..size_of::<RequestHeader>()],
+                )
+                .reserved[..4]
+                    .copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
+                assert_eq!(
+                    progress_key(&shard, &request.into_generic()),
+                    if reads_stored || auto_commit {
+                        expected
+                    } else {
+                        None
+                    },
+                    "strategy {strategy:?}, auto_commit {auto_commit}",
+                );
             }
         }
         let requests = [
@@ -2750,6 +2836,98 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_group_offset_ahead_of_local_metadata_when_group_is_unknown_should_report_not_accepted()
+     {
+        const TRANSPORT: u128 = 91;
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const LOCAL_FRONTIER: u64 = 10;
+        const UNKNOWN_GROUP: u32 = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        route_one_partition(&shard);
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(LOCAL_FRONTIER);
+        let attachment = attach_root_session(&shard, CLIENT, SESSION);
+        for operation in [
+            Operation::StoreConsumerOffset,
+            Operation::DeleteConsumerOffset,
+        ] {
+            let offset = GetConsumerOffsetRequest {
+                consumer: WireConsumer::consumer_group(WireIdentifier::numeric(UNKNOWN_GROUP)),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partition_id: Some(0),
+            };
+            let body = if operation == Operation::StoreConsumerOffset {
+                StoreConsumerOffsetRequest {
+                    consumer: offset.consumer,
+                    stream_id: offset.stream_id,
+                    topic_id: offset.topic_id,
+                    partition_id: offset.partition_id,
+                    offset: 0,
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes()
+            } else {
+                DeleteConsumerOffsetRequest {
+                    consumer: offset.consumer,
+                    stream_id: offset.stream_id,
+                    topic_id: offset.topic_id,
+                    partition_id: offset.partition_id,
+                    ack: iggy_binary_protocol::AckLevel::Quorum,
+                }
+                .to_bytes()
+            };
+            for (minimum_metadata_op, expected) in [
+                (
+                    LOCAL_FRONTIER + 1,
+                    IggyError::TransientNotAccepted.as_code(),
+                ),
+                (
+                    LOCAL_FRONTIER,
+                    IggyError::ConsumerGroupIdNotFound(
+                        Identifier::numeric(UNKNOWN_GROUP).unwrap(),
+                        Identifier::numeric(0).unwrap(),
+                    )
+                    .as_code(),
+                ),
+            ] {
+                let request = request_message(operation, CLIENT, SESSION, 1, &body)
+                    .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                        *header = old;
+                        header.minimum_metadata_op = minimum_metadata_op;
+                    });
+                dispatch_partition_request(
+                    &shard,
+                    request,
+                    CLIENT,
+                    SESSION,
+                    TRANSPORT,
+                    Some(DEFAULT_ROOT_USER_ID),
+                    Some((CLIENT, attachment.clone())),
+                    None,
+                    None,
+                )
+                .await;
+                let (client, reply) = bus.client_replies.borrow_mut().pop().unwrap();
+                assert_eq!(client, TRANSPORT);
+                let reply = bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(
+                    &reply[..size_of::<ReplyHeader>()],
+                )
+                .unwrap();
+                assert_eq!(
+                    reply.status, expected,
+                    "{operation:?} at {minimum_metadata_op}"
+                );
+            }
+        }
+    }
+
     /// HTTP polls share this gate with TCP. A context from a node ahead of this
     /// one is refused only as not accepted, whatever incarnation or owner it
     /// names. Once this node has applied that metadata, each mismatch keeps its
@@ -2904,7 +3082,7 @@ mod tests {
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
         let shard = Rc::new(shard);
-        route_one_partition(&shard);
+        let namespace = route_one_partition(&shard);
         let offset_body = GetConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(0),
@@ -2912,7 +3090,11 @@ mod tests {
             partition_id: Some(0),
         }
         .to_bytes();
-        let request = request_message(Operation::NonReplicated, 1, 1, 1, &offset_body);
+        let request = with_partition_incarnation(
+            &shard,
+            namespace,
+            request_message(Operation::NonReplicated, 1, 1, 1, &offset_body),
+        );
         let attachment = attach_root_session(&shard, 1, 1);
 
         handle_get_consumer_offset(
@@ -2949,6 +3131,14 @@ mod tests {
                 IggyError::TransientNotAccepted.as_code(),
             ),
             (
+                PartitionReadReply::Rejected(IggyError::NotPrimary),
+                IggyError::NotPrimary.as_code(),
+            ),
+            (
+                PartitionReadReply::Rejected(IggyError::HistoryUnavailable),
+                IggyError::HistoryUnavailable.as_code(),
+            ),
+            (
                 PartitionReadReply::ConsumerOffset {
                     stored: None,
                     current_offset: 0,
@@ -2961,13 +3151,17 @@ mod tests {
             let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
             shard.attach_senders(vec![sender]);
             let shard = Rc::new(shard);
-            route_one_partition(&shard);
+            let namespace = route_one_partition(&shard);
             let owner_task = compio::runtime::spawn(async move {
-                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
+                let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { read, reply, .. }) =
                     owner_inbox.recv().await.unwrap()
                 else {
                     panic!("the read must have reached the owner");
                 };
+                assert!(matches!(
+                    read,
+                    PartitionRead::ConsumerOffsetOnPrimary { .. }
+                ));
                 reply.try_send(owner_reply).unwrap();
             });
             let offset_body = GetConsumerOffsetRequest {
@@ -2977,7 +3171,11 @@ mod tests {
                 partition_id: Some(0),
             }
             .to_bytes();
-            let request = request_message(Operation::NonReplicated, 1, 1, 1, &offset_body);
+            let request = with_partition_incarnation(
+                &shard,
+                namespace,
+                request_message(Operation::NonReplicated, 1, 1, 1, &offset_body),
+            );
             let attachment = attach_root_session(&shard, 1, 1);
 
             handle_get_consumer_offset(
@@ -2998,6 +3196,163 @@ mod tests {
             let status =
                 u32::from_le_bytes(frame[status_start..status_start + 4].try_into().unwrap());
             assert_eq!(status, expected_status);
+        }
+    }
+
+    #[compio::test]
+    async fn given_an_offset_read_when_history_is_stale_should_reject_before_owner_dispatch() {
+        for consumer in [
+            WireConsumer::consumer(WireIdentifier::numeric(1)),
+            WireConsumer::consumer_group(WireIdentifier::numeric(999)),
+            WireConsumer::external_group(WireIdentifier::numeric(999)),
+        ] {
+            for (ahead, expected) in [
+                (false, IggyError::HistoryUnavailable),
+                (true, IggyError::TransientNotAccepted),
+            ] {
+                let bus = SpyBus::default();
+                let mut shard = test_shard(&bus, 0, 1, 1);
+                let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+                shard.attach_senders(vec![sender]);
+                let shard = Rc::new(shard);
+                let namespace = route_one_partition(&shard);
+                let wire = GetConsumerOffsetRequest {
+                    consumer: consumer.clone(),
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: Some(0),
+                };
+                let request = with_partition_incarnation(
+                    &shard,
+                    namespace,
+                    request_message(Operation::NonReplicated, 1, 1, 1, &wire.to_bytes()),
+                )
+                .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                    *header = old;
+                    if ahead {
+                        header.minimum_metadata_op = current_metadata_commit(&shard) + 1;
+                    } else {
+                        header.partition_incarnation = 0;
+                    }
+                });
+                let attachment = attach_root_session(&shard, 1, 1);
+
+                handle_get_consumer_offset(
+                    &shard,
+                    91,
+                    &request,
+                    Some(DEFAULT_ROOT_USER_ID),
+                    Some(&attachment),
+                )
+                .await;
+
+                let replies = bus.client_replies.borrow();
+                assert_eq!(replies.len(), 1);
+                let frame = &replies[0].1;
+                let status_start = std::mem::offset_of!(ReplyHeader, status);
+                let status =
+                    u32::from_le_bytes(frame[status_start..status_start + 4].try_into().unwrap());
+                assert_eq!(status, expected.as_code(), "consumer {consumer:?}");
+                assert!(owner_inbox.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_missing_group_when_resolving_offset_should_still_require_its_partition_primary() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = route_one_partition(&shard);
+        let context = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .consumer_offset_metadata(namespace, None, 0)
+            .unwrap()
+            .context(current_metadata_commit(&shard));
+        for consumer in [
+            WireConsumer::consumer_group(WireIdentifier::numeric(999)),
+            WireConsumer::external_group(WireIdentifier::numeric(999)),
+        ] {
+            let (resolved, partition, read) = resolve_primary_consumer_offset_request(
+                &shard,
+                &GetConsumerOffsetRequest {
+                    consumer,
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: None,
+                },
+                context,
+            )
+            .unwrap();
+            assert_eq!(resolved, namespace);
+            assert_eq!(partition, 0);
+            assert!(matches!(
+                read,
+                PartitionRead::ConsumerOffsetOnPrimary { consumer: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn given_an_offset_read_ahead_of_metadata_when_namespace_is_missing_should_report_not_accepted()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        route_one_partition(&shard);
+        let local_metadata_op = current_metadata_commit(&shard);
+        for (stream_id, topic_id, partition_id, expected) in [
+            (
+                1,
+                0,
+                0,
+                IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap()),
+            ),
+            (
+                0,
+                1,
+                0,
+                IggyError::TopicIdNotFound(
+                    Identifier::numeric(1).unwrap(),
+                    Identifier::numeric(0).unwrap(),
+                ),
+            ),
+            (
+                0,
+                0,
+                1,
+                IggyError::PartitionNotFound(
+                    1,
+                    Identifier::numeric(0).unwrap(),
+                    Identifier::numeric(0).unwrap(),
+                ),
+            ),
+        ] {
+            let wire = GetConsumerOffsetRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(stream_id),
+                topic_id: WireIdentifier::numeric(topic_id),
+                partition_id: Some(partition_id),
+            };
+            for (metadata_op, expected) in [
+                (local_metadata_op + 1, IggyError::TransientNotAccepted),
+                (local_metadata_op, expected),
+            ] {
+                let result = resolve_primary_consumer_offset_request(
+                    &shard,
+                    &wire,
+                    PartitionContext {
+                        metadata_op,
+                        ..PartitionContext::default()
+                    },
+                );
+                assert_eq!(
+                    result.err(),
+                    Some(expected),
+                    "stream={stream_id}, topic={topic_id}, partition={partition_id}, metadata_op={metadata_op}"
+                );
+            }
         }
     }
 

@@ -125,7 +125,6 @@ func (c *IggyTcpClient) refreshCredentials(userID iggcon.Identifier, username, p
 			login.value.credentials.password = *password
 		}
 	}
-	c.publishPollSession()
 }
 
 func matchesUser(identifier iggcon.Identifier, userID uint32, username string) bool {

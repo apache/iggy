@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ext_php_rs::{error::Error, exception::PhpException, php_class, zend::ce};
+use ext_php_rs::{
+    convert::IntoZval, error::Error, exception::PhpException, flags::PropertyFlags, php_class,
+    php_impl, zend::ce,
+};
 use iggy::prelude::IggyError;
 
 #[php_class]
@@ -48,6 +51,33 @@ pub struct NotFoundException;
 #[derive(Default)]
 pub struct TransientException;
 
+#[php_class]
+#[php(name = "Iggy\\Exception\\PendingOperationException")]
+#[php(extends(IggyException))]
+#[derive(Default)]
+pub struct PendingOperationException {
+    #[php(prop, flags = PropertyFlags::Protected)]
+    message: String,
+    #[php(prop, flags = PropertyFlags::Protected)]
+    code: i32,
+    operation_id: String,
+    kind: String,
+}
+
+#[php_impl]
+impl PendingOperationException {
+    /// Exact unsigned 64-bit operation ID, represented as a decimal string.
+    #[php(getter, change_case = "snake_case")]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    #[php(getter)]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
 pub(crate) trait IntoPhpException {
     fn into_php_exception(self) -> PhpException;
 }
@@ -59,6 +89,25 @@ pub(crate) fn to_php_exception(error: impl IntoPhpException) -> PhpException {
 impl IntoPhpException for IggyError {
     fn into_php_exception(self) -> PhpException {
         let message = self.to_string();
+
+        let pending = match &self {
+            IggyError::OperationUncertain(operation_id) => Some((*operation_id, "uncertain")),
+            IggyError::LaneBlocked(operation_id) => Some((*operation_id, "lane_blocked")),
+            IggyError::OperationNotRetained(operation_id) => Some((*operation_id, "not_retained")),
+            _ => None,
+        };
+        if let Some((operation_id, kind)) = pending {
+            let exception = PendingOperationException {
+                message,
+                code: self.as_code() as i32,
+                operation_id: operation_id.to_string(),
+                kind: kind.to_owned(),
+            };
+            return match exception.into_zval(false) {
+                Ok(object) => PhpException::from_message(String::new()).with_object(object),
+                Err(error) => PhpException::from_class::<IggyException>(error.to_string()),
+            };
+        }
 
         match PhpExceptionKind::from(&self) {
             PhpExceptionKind::Connection => {

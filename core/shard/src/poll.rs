@@ -198,6 +198,19 @@ where
                 {
                     return Some(IggyError::TransientNotAccepted);
                 }
+                if let PartitionRead::ConsumerOffsetOnPrimary { metadata, .. }
+                | PartitionRead::ExternalGroupOffsetOnPrimary { metadata, .. } = &read
+                {
+                    if !metadata
+                        .is_valid_for_offset(self.plane.metadata().mux_stm.streams(), namespace)
+                        || !metadata.matches_partition(self.shards_table.epoch_for(namespace))
+                    {
+                        return Some(IggyError::TransientNotAccepted);
+                    }
+                    if partition.history_deleted() {
+                        return Some(IggyError::HistoryUnavailable);
+                    }
+                }
                 if let PartitionRead::PollOnPrimary {
                     consumer,
                     attachment,
@@ -376,7 +389,10 @@ where
                 }
             }
             PartitionRead::ConsumerOffset { consumer }
-            | PartitionRead::ConsumerOffsetOnPrimary { consumer } => partitions
+            | PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(consumer),
+                ..
+            } => partitions
                 .consumer_offset_read(&namespace, consumer)
                 .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                     PartitionReadReply::ConsumerOffset {
@@ -384,8 +400,14 @@ where
                         current_offset,
                     }
                 }),
+            PartitionRead::ConsumerOffsetOnPrimary { consumer: None, .. } => {
+                PartitionReadReply::ConsumerOffset {
+                    stored: None,
+                    current_offset: 0,
+                }
+            }
             PartitionRead::ExternalGroupOffset { group_id }
-            | PartitionRead::ExternalGroupOffsetOnPrimary { group_id } => partitions
+            | PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
                 .external_group_offset_read(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
                     PartitionReadReply::ConsumerOffset {

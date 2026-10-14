@@ -18,11 +18,11 @@
 //! One QUIC connection that carries each request on its own stream.
 //!
 //! A stream carries one request and its reply. So a caller that goes away
-//! leaves nothing half read on the connection, and a reply needs no request
-//! id to find its caller.
+//! leaves nothing half read on the connection. The echoed request id must
+//! still match before its result can settle that request.
 
 use crate::links::{Frame, Reply};
-use crate::vsr::{decode_eviction, peek_command};
+use crate::vsr::{decode_eviction, peek_command, reply_request_id};
 use bytes::Bytes;
 use iggy_binary_protocol::consensus::{Command, HEADER_SIZE};
 use iggy_common::IggyError;
@@ -130,6 +130,10 @@ impl QuicLink {
         if peek_command(&header) == Command::Eviction {
             self.close();
             return Err(decode_eviction(&header));
+        }
+        if peek_command(&header) != Command::Reply || reply_request_id(&header) != request {
+            self.close();
+            return Err(IggyError::Disconnected);
         }
         Ok(Reply {
             header,
@@ -331,5 +335,27 @@ mod tests {
         let after = send(&link, request(2, BOUND_SESSION), deadline).await;
 
         assert_eq!(after.unwrap_err(), IggyError::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn given_a_reply_for_another_request_when_received_should_fail_and_close_the_connection()
+    {
+        let (link, peer) = quic_link().await;
+        let mismatched = async {
+            let (stream, request) = peer.read_request().await;
+            answer(stream, &reply(request.request + 1, &[])).await;
+        };
+        let deadline = Instant::now() + TEST_BUDGET;
+
+        let (result, ()) =
+            tokio::join!(send(&link, request(1, BOUND_SESSION), deadline), mismatched);
+
+        assert_eq!(result.unwrap_err(), IggyError::Disconnected);
+        assert_eq!(
+            send(&link, request(2, BOUND_SESSION), deadline)
+                .await
+                .unwrap_err(),
+            IggyError::NotConnected
+        );
     }
 }

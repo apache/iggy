@@ -20,12 +20,16 @@
 //! is unknown stays retained in its lane, and the lane admits nothing else
 //! until a resolve or an abandon frees it. So a retained operation is always
 //! the newest operation of its lane, and its replay can never age out.
+//! Auto-commit and Next polls share the partition gate while active. Their
+//! progress is not a replayable mutation, so uncertainty releases that gate.
 
 use super::SessionOwner;
+use super::pending::Reservation;
 use crate::driver::PartitionKey;
 use crate::links::Frame;
 use crate::vsr::encode_request_header;
 use bytes::Bytes;
+use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::consensus::{Operation, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::IggyError;
@@ -48,8 +52,8 @@ pub(crate) enum LaneKey {
 impl LaneKey {
     /// The lane of `code`. A write to a partition takes the lane of the
     /// incarnation that its context carries. Reads, Register and Logout take
-    /// no lane. This includes auto-commit polls: their offset effect does not
-    /// acquire a client mutation lane.
+    /// no lane by code alone. The driver selects the partition lane for
+    /// auto-commit and Next polls from their decoded arguments.
     pub(crate) fn of(code: u32, context: &PartitionContext, partition_id: u32) -> Option<Self> {
         match operation_for_code(code) {
             Operation::NonReplicated | Operation::Register | Operation::Logout => None,
@@ -89,6 +93,7 @@ pub(crate) struct RetainedOperation {
     /// The partition of a partition write, `None` for any other request. A
     /// replay looks up its route by this key.
     pub(crate) partition: Option<PartitionKey>,
+    reservation: Arc<Reservation>,
 }
 
 impl RetainedOperation {
@@ -98,8 +103,9 @@ impl RetainedOperation {
 }
 
 /// The right of one call to send in its lane. Dropping the ticket frees the
-/// lane, except that a frame which left the client without a definitive
-/// outcome stays retained.
+/// lane, except that a mutation which left the client without a definitive
+/// outcome stays retained. A progress poll holds the same gate only while
+/// active; replaying its frame would not resolve its earlier progress.
 #[derive(Debug)]
 pub(crate) struct LaneTicket {
     owner: Arc<SessionOwner>,
@@ -107,6 +113,7 @@ pub(crate) struct LaneTicket {
     key: Option<LaneKey>,
     guard: Option<OwnedMutexGuard<()>>,
     operation: Option<RetainedOperation>,
+    reservation: Option<Arc<Reservation>>,
     fence: u64,
     /// A resume replays an operation that its lane still retains.
     resumed: bool,
@@ -115,6 +122,10 @@ pub(crate) struct LaneTicket {
 }
 
 impl SessionOwner {
+    pub(crate) fn retains_operation(&self, op: u64) -> bool {
+        self.lanes().values().any(|lane| lane.holds(op))
+    }
+
     /// Waits for the lane of `key` in arrival order. A lane that retains an
     /// operation fails at once with `LaneBlocked`, and a lane still busy at
     /// `deadline` fails with `TransientNotAccepted`. Neither failure takes a
@@ -192,6 +203,7 @@ impl SessionOwner {
             return Err(IggyError::OperationNotRetained(op));
         };
         ticket.fence = fence;
+        ticket.reservation = Some(Arc::clone(&retained.reservation));
         ticket.operation = Some(retained.clone());
         Ok((ticket, retained))
     }
@@ -203,7 +215,9 @@ impl SessionOwner {
         let Some((&key, lane)) = lanes.iter_mut().find(|(_, lane)| lane.holds(op)) else {
             return Err(IggyError::OperationNotRetained(op));
         };
-        lane.retained = None;
+        if let Some(retained) = lane.retained.take() {
+            retained.reservation.release_operation();
+        }
         if lane.tickets == 0 {
             lanes.remove(&key);
         }
@@ -227,11 +241,37 @@ impl LaneTicket {
             key,
             guard: None,
             operation: None,
+            reservation: None,
             fence: 0,
             resumed,
             sent: false,
             done: false,
         }
+    }
+
+    /// Reserves client-wide capacity before allocating a request id. Reads and
+    /// transient progress polls only use their ordinary link and lane bounds.
+    pub(crate) async fn reserve(
+        &mut self,
+        code: u32,
+        body_len: usize,
+        deadline: Instant,
+    ) -> Result<(), IggyError> {
+        if !self.is_mutation(code) {
+            return Ok(());
+        }
+        let bytes = HEADER_SIZE
+            .checked_add(body_len)
+            .ok_or(IggyError::InvalidSizeBytes)?;
+        if self
+            .reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.is_current(bytes))
+        {
+            return Ok(());
+        }
+        self.reservation = Some(self.owner.pending.reserve(bytes, deadline).await?);
+        Ok(())
     }
 
     /// Takes the next request id and freezes the frame of the call. A call
@@ -244,17 +284,35 @@ impl LaneTicket {
         partition: Option<PartitionKey>,
     ) -> Result<Frame, IggyError> {
         let mut session = self.owner.session()?;
+        let reservation = if self.is_mutation(code) {
+            let bytes = HEADER_SIZE
+                .checked_add(body.len())
+                .ok_or(IggyError::InvalidSizeBytes)?;
+            Some(
+                self.reservation
+                    .as_ref()
+                    .filter(|reservation| reservation.is_current(bytes))
+                    .ok_or(IggyError::TransientNotAccepted)?,
+            )
+        } else {
+            None
+        };
         let (mut header, _) = encode_request_header(&mut session, code, &body)?;
         context.stamp(&mut header);
         // A reset raises the fence under the session lock, so this fence
         // names the session of the header.
         self.fence = self.owner.fence();
         drop(session);
+        let body = match reservation {
+            Some(reservation) => reservation.freeze_body(body),
+            None => body,
+        };
         let frame = Frame { header, body };
-        self.operation = Some(RetainedOperation {
+        self.operation = reservation.map(|reservation| RetainedOperation {
             code,
             frame: frame.clone(),
             partition,
+            reservation: Arc::clone(reservation),
         });
         self.sent = false;
         Ok(frame)
@@ -262,10 +320,6 @@ impl LaneTicket {
 
     pub(crate) fn fence(&self) -> u64 {
         self.fence
-    }
-
-    pub(crate) fn takes_lane(&self) -> bool {
-        self.key.is_some()
     }
 
     /// The flag that a link sets when the frame leaves the client.
@@ -279,15 +333,22 @@ impl LaneTicket {
         self.done = true;
     }
 
-    /// Ends the call with an unknown outcome. A lane keeps the operation
-    /// retained, and a call without a lane has nothing to retain.
+    /// Ends the call with an unknown outcome. Only mutations remain retained;
+    /// a progress poll's weak acknowledgement cannot be recovered by replay.
     pub(crate) fn retain(self) -> IggyError {
-        let op = self.operation.as_ref().map_or(0, RetainedOperation::op);
-        if self.takes_lane() {
-            IggyError::OperationUncertain(op)
-        } else {
-            IggyError::TransientNotCommitted
-        }
+        self.operation
+            .as_ref()
+            .map_or(IggyError::TransientNotCommitted, |operation| {
+                IggyError::OperationUncertain(operation.op())
+            })
+    }
+
+    fn is_mutation(&self, code: u32) -> bool {
+        self.key.is_some()
+            && !matches!(
+                operation_for_code(code),
+                Operation::NonReplicated | Operation::Register | Operation::Logout
+            )
     }
 }
 
@@ -297,7 +358,9 @@ impl Drop for LaneTicket {
             return;
         };
         let mut lanes = self.owner.lanes();
+        let mut retained = false;
         if let Some(lane) = lanes.get_mut(&key) {
+            let op = self.operation.as_ref().map(RetainedOperation::op);
             if let Some(operation) = self.operation.take() {
                 if self.resumed {
                     if self.done && lane.holds(operation.op()) {
@@ -313,12 +376,16 @@ impl Drop for LaneTicket {
                     lane.retained = Some(operation);
                 }
             }
+            retained = op.is_some_and(|op| lane.holds(op));
             lane.tickets = lane.tickets.saturating_sub(1);
             if lane.tickets == 0 && lane.retained.is_none() {
                 lanes.remove(&key);
             }
         }
         drop(lanes);
+        if !retained && let Some(reservation) = &self.reservation {
+            reservation.release_operation();
+        }
         // The gate opens only after the slot holds the retained operation, so
         // the next call in the lane sees it.
         self.guard.take();
@@ -329,9 +396,10 @@ impl Drop for LaneTicket {
 mod tests {
     use super::*;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, SEND_MESSAGES_CODE,
+        CREATE_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
     };
-    use iggy_common::AutoLogin;
+    use iggy_common::{AutoLogin, PendingOperationsConfig};
+    use std::num::NonZeroUsize;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -339,11 +407,24 @@ mod tests {
     const NEXT_SESSION: u64 = 4;
     const INCARNATION: u64 = 5;
     const PARTITION_ID: u32 = 1;
+    const OTHER_PARTITION_ID: u32 = 2;
     const DEADLINE: Duration = Duration::from_secs(30);
     const SHORT_DEADLINE: Duration = Duration::from_secs(1);
 
     fn bound_owner() -> Arc<SessionOwner> {
         let owner = Arc::new(SessionOwner::new(AutoLogin::Disabled));
+        owner.bind(BOUND_SESSION).unwrap();
+        owner
+    }
+
+    fn owner_with_limits(operations: usize, bytes: usize) -> Arc<SessionOwner> {
+        let owner = Arc::new(SessionOwner::with_pending_operations(
+            AutoLogin::Disabled,
+            PendingOperationsConfig {
+                max_operations: NonZeroUsize::new(operations).unwrap(),
+                max_bytes: NonZeroUsize::new(bytes).unwrap(),
+            },
+        ));
         owner.bind(BOUND_SESSION).unwrap();
         owner
     }
@@ -364,6 +445,10 @@ mod tests {
     /// its send point, so the lane retains the write.
     async fn retain_write(owner: &Arc<SessionOwner>, key: Option<LaneKey>) -> u64 {
         let mut ticket = owner.enter_lane(key, deadline()).await.unwrap();
+        ticket
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
         let frame = ticket
             .freeze(
                 CREATE_STREAM_CODE,
@@ -379,6 +464,268 @@ mod tests {
 
     fn lane_count(owner: &SessionOwner) -> usize {
         owner.lanes().len()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_full_operation_budget_when_replaying_should_reuse_capacity_until_completion() {
+        let owner = owner_with_limits(1, 4 * HEADER_SIZE);
+        let op = retain_write(&owner, Some(LaneKey::Metadata)).await;
+        let next_id = owner.session().unwrap().current_request_id();
+        let mut waiting = owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap();
+        assert_eq!(
+            waiting
+                .reserve(SEND_MESSAGES_CODE, 0, Instant::now() + SHORT_DEADLINE)
+                .await,
+            Err(IggyError::TransientNotAccepted)
+        );
+        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+
+        let (replay, retained) = owner.resume(op, deadline()).await.unwrap();
+        assert_eq!(retained.op(), op);
+        replay.complete();
+        waiting
+            .reserve(SEND_MESSAGES_CODE, 0, deadline())
+            .await
+            .unwrap();
+        waiting.complete();
+        assert!(!owner.retains_operation(op));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_writer_frame_after_abandon_or_reset_when_admitting_should_keep_its_bytes_charged()
+     {
+        for reset in [false, true] {
+            let owner = owner_with_limits(2, HEADER_SIZE);
+            let mut ticket = owner
+                .enter_lane(Some(LaneKey::Metadata), deadline())
+                .await
+                .unwrap();
+            ticket
+                .reserve(CREATE_STREAM_CODE, 0, deadline())
+                .await
+                .unwrap();
+            let writer_frame = ticket
+                .freeze(
+                    CREATE_STREAM_CODE,
+                    Bytes::new(),
+                    PartitionContext::default(),
+                    None,
+                )
+                .unwrap();
+            *ticket.sent_flag() = true;
+            drop(ticket);
+            if reset {
+                owner.reset().unwrap();
+                owner.bind(NEXT_SESSION).unwrap();
+            } else {
+                owner.abandon(writer_frame.header.request).unwrap();
+            }
+            let next_id = owner.session().unwrap().current_request_id();
+            let mut waiting = owner
+                .enter_lane(partition_lane(), deadline())
+                .await
+                .unwrap();
+            assert_eq!(
+                waiting
+                    .reserve(SEND_MESSAGES_CODE, 0, Instant::now() + SHORT_DEADLINE)
+                    .await,
+                Err(IggyError::TransientNotAccepted)
+            );
+            assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+
+            drop(writer_frame);
+            waiting
+                .reserve(SEND_MESSAGES_CODE, 0, deadline())
+                .await
+                .unwrap();
+            waiting.complete();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_reset_with_a_live_ticket_when_it_drops_should_not_release_new_session_capacity()
+    {
+        let owner = owner_with_limits(1, 2 * HEADER_SIZE);
+        let mut old = owner
+            .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        old.reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        let frame = old
+            .freeze(
+                CREATE_STREAM_CODE,
+                Bytes::new(),
+                PartitionContext::default(),
+                None,
+            )
+            .unwrap();
+        *old.sent_flag() = true;
+        owner.reset().unwrap();
+        owner.bind(NEXT_SESSION).unwrap();
+        let next_id = owner.session().unwrap().current_request_id();
+        assert!(matches!(
+            old.freeze(
+                CREATE_STREAM_CODE,
+                Bytes::new(),
+                PartitionContext::default(),
+                None
+            ),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+        let mut current = owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap();
+        current
+            .reserve(SEND_MESSAGES_CODE, 0, deadline())
+            .await
+            .unwrap();
+        drop(old);
+        drop(frame);
+
+        let mut waiting = owner
+            .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        assert_eq!(
+            waiting
+                .reserve(CREATE_STREAM_CODE, 0, Instant::now() + SHORT_DEADLINE)
+                .await,
+            Err(IggyError::TransientNotAccepted)
+        );
+        current.complete();
+        waiting
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        waiting.complete();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_oversized_or_unreserved_mutation_when_admitting_should_fail_before_allocating_an_id()
+     {
+        const BODY_LEN: usize = 3;
+        let owner = owner_with_limits(1, HEADER_SIZE + BODY_LEN);
+        let mut ticket = owner
+            .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        let next_id = owner.session().unwrap().current_request_id();
+        for body_len in [BODY_LEN + 1, usize::MAX] {
+            assert_eq!(
+                ticket
+                    .reserve(CREATE_STREAM_CODE, body_len, deadline())
+                    .await,
+                Err(IggyError::InvalidSizeBytes)
+            );
+        }
+        assert!(matches!(
+            ticket.freeze(
+                CREATE_STREAM_CODE,
+                Bytes::new(),
+                PartitionContext::default(),
+                None
+            ),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+        ticket
+            .reserve(CREATE_STREAM_CODE, BODY_LEN, deadline())
+            .await
+            .unwrap();
+        let body = Bytes::from_static(b"abc");
+        let pointer = body.as_ptr();
+        let frame = ticket
+            .freeze(CREATE_STREAM_CODE, body, PartitionContext::default(), None)
+            .unwrap();
+        assert_eq!(
+            frame.body.as_ptr(),
+            pointer,
+            "reservation must not copy the payload"
+        );
+        ticket.complete();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_cancelled_budget_waiter_when_capacity_returns_should_not_leak_admission() {
+        let owner = owner_with_limits(1, HEADER_SIZE);
+        let mut holder = owner
+            .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        holder
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        let next_id = owner.session().unwrap().current_request_id();
+        let waiting = async {
+            let mut ticket = owner
+                .enter_lane(partition_lane(), deadline())
+                .await
+                .unwrap();
+            ticket.reserve(SEND_MESSAGES_CODE, 0, deadline()).await
+        };
+        assert!(timeout(SHORT_DEADLINE, waiting).await.is_err());
+        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+        holder.complete();
+        let mut next = owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap();
+        next.reserve(SEND_MESSAGES_CODE, 0, deadline())
+            .await
+            .unwrap();
+        next.complete();
+        assert_eq!(lane_count(&owner), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_waiting_mutation_when_the_last_writer_releases_bytes_should_wake_before_deadline()
+     {
+        let owner = owner_with_limits(1, HEADER_SIZE);
+        let mut holder = owner
+            .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        holder
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        let frame = holder
+            .freeze(
+                CREATE_STREAM_CODE,
+                Bytes::new(),
+                PartitionContext::default(),
+                None,
+            )
+            .unwrap();
+        holder.complete();
+        let waiting_owner = Arc::clone(&owner);
+        let started = Instant::now();
+        let waiting = tokio::spawn(async move {
+            let mut ticket = waiting_owner
+                .enter_lane(partition_lane(), deadline())
+                .await
+                .unwrap();
+            ticket
+                .reserve(SEND_MESSAGES_CODE, 0, deadline())
+                .await
+                .unwrap();
+            ticket.complete();
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        drop(frame);
+        waiting.await.unwrap();
+        assert_eq!(Instant::now(), started);
+        assert_eq!(lane_count(&owner), 0);
     }
 
     #[test]
@@ -427,6 +774,10 @@ mod tests {
             .await
             .unwrap();
         holder
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        holder
             .freeze(
                 CREATE_STREAM_CODE,
                 Bytes::new(),
@@ -464,6 +815,10 @@ mod tests {
             .await
             .unwrap();
         ticket
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        ticket
             .freeze(
                 CREATE_STREAM_CODE,
                 Bytes::new(),
@@ -476,6 +831,146 @@ mod tests {
         let entered = owner.enter_lane(Some(LaneKey::Metadata), deadline()).await;
 
         assert!(entered.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_progress_poll_when_waiting_for_reply_should_block_its_partition_only() {
+        let owner = bound_owner();
+        let context = PartitionContext {
+            incarnation: INCARNATION,
+            ..PartitionContext::default()
+        };
+        let mut poll = owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap();
+        poll.freeze(POLL_MESSAGES_CODE, Bytes::new(), context, None)
+            .unwrap();
+        *poll.sent_flag() = true;
+        let next_id = owner.session().unwrap().current_request_id();
+
+        let blocked = owner
+            .enter_lane(partition_lane(), Instant::now() + SHORT_DEADLINE)
+            .await;
+        assert_eq!(blocked.unwrap_err(), IggyError::TransientNotAccepted);
+        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+
+        let pure_read = owner
+            .enter_lane(
+                LaneKey::of(POLL_MESSAGES_CODE, &context, PARTITION_ID),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        let other_partition = owner
+            .enter_lane(
+                LaneKey::of(SEND_MESSAGES_CODE, &context, OTHER_PARTITION_ID),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        pure_read.complete();
+        other_partition.complete();
+        poll.complete();
+
+        owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap()
+            .complete();
+        assert_eq!(lane_count(&owner), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_sent_progress_poll_when_cancelled_or_uncertain_should_release_without_retaining()
+     {
+        for cancelled in [true, false] {
+            let owner = bound_owner();
+            let mut poll = owner
+                .enter_lane(partition_lane(), deadline())
+                .await
+                .unwrap();
+            let frame = poll
+                .freeze(
+                    POLL_MESSAGES_CODE,
+                    Bytes::new(),
+                    PartitionContext {
+                        incarnation: INCARNATION,
+                        ..PartitionContext::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            *poll.sent_flag() = true;
+
+            if cancelled {
+                drop(poll);
+            } else {
+                assert_eq!(poll.retain(), IggyError::TransientNotCommitted);
+            }
+
+            let op = frame.header.request;
+            assert!(matches!(
+                owner.resume(op, deadline()).await,
+                Err(IggyError::OperationNotRetained(missing)) if missing == op
+            ));
+            assert!(matches!(
+                owner.abandon(op),
+                Err(IggyError::OperationNotRetained(missing)) if missing == op
+            ));
+            owner
+                .enter_lane(partition_lane(), deadline())
+                .await
+                .unwrap()
+                .complete();
+            assert_eq!(lane_count(&owner), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_retained_partition_mutation_when_progress_poll_enters_should_remain_blocked() {
+        let owner = bound_owner();
+        let mut mutation = owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap();
+        mutation
+            .reserve(SEND_MESSAGES_CODE, 0, deadline())
+            .await
+            .unwrap();
+        let frame = mutation
+            .freeze(
+                SEND_MESSAGES_CODE,
+                Bytes::new(),
+                PartitionContext {
+                    incarnation: INCARNATION,
+                    ..PartitionContext::default()
+                },
+                None,
+            )
+            .unwrap();
+        *mutation.sent_flag() = true;
+        drop(mutation);
+        let next_id = owner.session().unwrap().current_request_id();
+
+        let progress_poll = owner.enter_lane(partition_lane(), deadline()).await;
+
+        assert!(
+            matches!(progress_poll, Err(IggyError::LaneBlocked(op)) if op == frame.header.request)
+        );
+        assert_eq!(owner.session().unwrap().current_request_id(), next_id);
+        let (replay, retained) = owner
+            .resume(frame.header.request, deadline())
+            .await
+            .unwrap();
+        assert_eq!(retained.code, SEND_MESSAGES_CODE);
+        replay.complete();
+        owner
+            .enter_lane(partition_lane(), deadline())
+            .await
+            .unwrap()
+            .complete();
+        assert_eq!(lane_count(&owner), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -511,6 +1006,10 @@ mod tests {
         let owner = bound_owner();
         let mut ticket = owner
             .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        ticket
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
             .await
             .unwrap();
         ticket

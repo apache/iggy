@@ -3513,6 +3513,10 @@ where
                 build_reply_message_with(&prepare_header, pending.reply_body_len(), |dst| {
                     pending.write_reply_body(dst);
                 })
+                .transmute_header::<ReplyHeader>(|old, header| {
+                    *header = old;
+                    header.reserved[0] = 0;
+                })
             } else {
                 reply
             };
@@ -4547,6 +4551,7 @@ pub fn build_truncate_partition_client_message(
             client: client_id,
             session,
             request: template.request,
+            request_checksum: template.request_checksum,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
@@ -4801,7 +4806,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+    use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
     use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
@@ -5417,6 +5422,97 @@ mod tests {
         );
         consensus.init();
         IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None)
+    }
+
+    #[compio::test]
+    async fn given_committed_lifecycle_intent_when_waiting_for_completion_should_not_prove_final_result()
+     {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ROOT_USER: u32 = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ROOT_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let request_header = RoutedRequestHeader {
+            client: CLIENT,
+            session: SESSION,
+            request: 1,
+            user_id: ROOT_USER,
+            group: server_common::sharding::METADATA_GROUP,
+            ..Default::default()
+        };
+        let body = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        }
+        .to_bytes();
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &request_header, Operation::DeleteTopic, &body),
+            consensus.retry_capacity(&metadata.client_table.borrow()),
+        );
+        let intent_op = prepare.header().op;
+        let pending = metadata
+            .dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .unwrap();
+        assert!(metadata.mux_stm.streams().lifecycle_pending(intent_op));
+        assert_eq!(
+            iggy_binary_protocol::result_code(pending.body()),
+            Some(IggyError::TransientNotCommitted.as_code())
+        );
+        assert!(
+            !pending.header().has_committed_result(),
+            "a committed intent cannot prove its final outcome before every partition finishes"
+        );
+
+        metadata
+            .submit_complete_lifecycle_in_process(
+                CompleteLifecycleRequest::new(
+                    intent_op,
+                    0,
+                    vec![LifecycleCompletion {
+                        topic_id: 0,
+                        partition_id: 0,
+                        partition_op: 1,
+                    }],
+                )
+                .unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(!metadata.mux_stm.streams().lifecycle_pending(intent_op));
+        let final_reply = metadata
+            .client_table
+            .borrow()
+            .get_reply(CLIENT)
+            .unwrap()
+            .clone()
+            .into_message();
+        assert!(final_reply.header().has_committed_result());
+        assert_eq!(
+            iggy_binary_protocol::result_code(final_reply.body()),
+            Some(0)
+        );
     }
 
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {

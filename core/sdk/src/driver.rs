@@ -20,37 +20,39 @@
 //! A frame that can have taken effect is never frozen again, so a retry never
 //! applies a request twice.
 
-// Unused until the clients send through the driver.
-#![allow(dead_code)]
-
-use crate::links::{
-    Frame, Link, OPERATION_TIMEOUT, ReplicaLinks, Target, lost_link, pause_before_retry, read_reply,
-};
+use crate::links::{Frame, Link, ReplicaLinks, Target, lost_link, pause_before_retry, read_reply};
 use crate::session_owner::{LaneKey, LaneTicket, RetainedOperation, SessionOwner};
+use crate::vsr::decode_reply_for;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-    SEND_MESSAGES_CODE,
+    BIND_SESSION_CODE, DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE,
+    GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+    POLL_MESSAGES_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
-use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::requests::messages::{
+    GetPartitionRouteRequest, PollMessagesRequest, SendMessagesHeader,
+};
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{WireDecode, WireEncode};
-use iggy_common::{ClientState, Identifier, IggyError};
+use iggy_binary_protocol::{WireDecode, WireEncode, WirePartitioning, WirePollingStrategy};
+use iggy_common::{ClientState, Credentials, Identifier, IggyError};
 use route_cache::RouteCache;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::time::{Instant, timeout_at};
 use tracing::debug;
 
-mod poll_router;
 mod route_cache;
 
-pub(crate) use poll_router::{
-    PollRouter, PollTransport, ROSTER_READ_TIMEOUT, is_poll_routing_code,
-};
 pub(crate) use route_cache::PartitionKey;
+
+pub(crate) use iggy_common::{
+    binary_operation_deadline as operation_deadline, with_binary_deadline as with_deadline,
+};
 
 /// Where a binary client sends one request.
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +72,7 @@ pub(crate) struct PartitionTarget<'a> {
 }
 
 /// Sends the requests of one client over its replica links.
+#[derive(Debug)]
 pub(crate) struct OperationDriver {
     session: Arc<SessionOwner>,
     links: ReplicaLinks,
@@ -86,6 +89,136 @@ impl OperationDriver {
         }
     }
 
+    pub(crate) fn links(&self) -> &ReplicaLinks {
+        &self.links
+    }
+
+    pub(crate) fn session(&self) -> &Arc<SessionOwner> {
+        &self.session
+    }
+
+    pub(crate) fn partition_count(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Option<u32> {
+        self.routes().partition_count(
+            stream_id,
+            topic_id,
+            self.session.fence(),
+            self.session.metadata_watermark(),
+        )
+    }
+
+    pub(crate) async fn remember(&self, credentials: Credentials, user_id: u32) {
+        if self
+            .session
+            .remember_unless(|| self.stopped().is_some(), credentials, user_id)
+            && let Ok(link) = self.links.link(Target::MetadataPrimary)
+            && let Err(error) = self.links.refresh_roster(&link).await
+        {
+            debug!("Failed to refresh replicas after sign-in: {error}");
+        }
+    }
+
+    pub(crate) async fn poll(
+        &self,
+        request: &PollMessagesRequest,
+        context: Option<PartitionContext>,
+    ) -> Result<Bytes, IggyError> {
+        let stream_id = Identifier::try_from(&request.stream_id)?;
+        let topic_id = Identifier::try_from(&request.topic_id)?;
+        let partition_id = match request.partition_id {
+            Some(partition) => partition,
+            None if request.consumer.kind
+                == iggy_binary_protocol::primitives::consumer::KIND_CONSUMER =>
+            {
+                0
+            }
+            None => return Err(IggyError::InvalidIdentifier),
+        };
+        self.send(
+            POLL_MESSAGES_CODE,
+            request.to_bytes(),
+            RequestTarget::Partition(PartitionTarget {
+                stream_id: &stream_id,
+                topic_id: &topic_id,
+                partition_id,
+                context,
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn send_raw(
+        &self,
+        code: u32,
+        payload: Bytes,
+        context: Option<PartitionContext>,
+    ) -> Result<Bytes, IggyError> {
+        let (stream, topic, partition_id) = match code {
+            SEND_MESSAGES_CODE => {
+                let (metadata_length, body) = payload
+                    .split_first_chunk()
+                    .ok_or(IggyError::InvalidCommand)?;
+                let request = body
+                    .get(..u32::from_le_bytes(*metadata_length) as usize)
+                    .and_then(|metadata| SendMessagesHeader::decode_from(metadata).ok())
+                    .ok_or(IggyError::InvalidCommand)?;
+                let WirePartitioning::PartitionId(partition_id) = request.partitioning else {
+                    return Err(IggyError::FeatureUnavailable);
+                };
+                (request.stream_id, request.topic_id, partition_id)
+            }
+            POLL_MESSAGES_CODE => {
+                let request = PollMessagesRequest::decode_from(&payload)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                return self.poll(&request, context).await;
+            }
+            GET_CONSUMER_OFFSET_CODE => {
+                let request = GetConsumerOffsetRequest::decode_from(&payload)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (
+                    request.stream_id,
+                    request.topic_id,
+                    request.partition_id.unwrap_or(0),
+                )
+            }
+            STORE_CONSUMER_OFFSET_CODE => {
+                let request = StoreConsumerOffsetRequest::decode_from(&payload)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (
+                    request.stream_id,
+                    request.topic_id,
+                    request.partition_id.ok_or(IggyError::InvalidIdentifier)?,
+                )
+            }
+            DELETE_CONSUMER_OFFSET_CODE => {
+                let request = DeleteConsumerOffsetRequest::decode_from(&payload)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                (
+                    request.stream_id,
+                    request.topic_id,
+                    request.partition_id.ok_or(IggyError::InvalidIdentifier)?,
+                )
+            }
+            _ => return self.send(code, payload, RequestTarget::Metadata).await,
+        };
+        let stream_id = Identifier::try_from(&stream)?;
+        let topic_id = Identifier::try_from(&topic)?;
+        self.send(
+            code,
+            payload,
+            RequestTarget::Partition(PartitionTarget {
+                stream_id: &stream_id,
+                topic_id: &topic_id,
+                partition_id,
+                context,
+            }),
+        )
+        .await
+    }
+
     /// Sends one request and returns the body of its reply.
     pub(crate) async fn send(
         &self,
@@ -93,7 +226,7 @@ impl OperationDriver {
         payload: Bytes,
         target: RequestTarget<'_>,
     ) -> Result<Bytes, IggyError> {
-        let deadline = Instant::now() + OPERATION_TIMEOUT;
+        let deadline = operation_deadline();
         self.drive(Call::new(code, payload, target, deadline)).await
     }
 
@@ -131,6 +264,10 @@ impl OperationDriver {
                     }
                 }
                 Next::Fail(error) => return Err(call.end(error)),
+                Next::Committed(error) => {
+                    call.complete();
+                    return Err(error);
+                }
             }
         }
     }
@@ -155,7 +292,15 @@ impl OperationDriver {
         let context = self.context(call, route.as_ref());
         // The lane comes first, so a blocked lane ends the call at once, also
         // while no link is ready.
-        let ticket = self.ticket(call, &context).await?;
+        let mut ticket = self.ticket(call, &context).await?;
+        let body_len = call
+            .frame
+            .as_ref()
+            .map_or(call.payload.len(), |frame| frame.body.len());
+        ticket
+            .reserve(call.code, body_len, call.deadline)
+            .await
+            .map_err(Next::Fail)?;
         let hop = match self.hop(call, route).await {
             Ok(hop) => hop,
             Err(next) => {
@@ -165,9 +310,38 @@ impl OperationDriver {
         };
         let deadline = call.deadline;
         let (frame, ticket) = call.frame(ticket, context)?;
+        let request = frame.header;
         let result = hop.link.send(frame, deadline, ticket.sent_flag()).await;
         let sent = *ticket.sent_flag();
-        let result = result.and_then(|reply| read_reply(&self.session, reply));
+        let result = match result {
+            Ok(reply) => match decode_reply_for(&request, &reply.header, reply.body) {
+                Ok(outcome) => {
+                    self.session.observe_metadata_reply(&reply.header);
+                    if outcome.committed && call.uncertain {
+                        return match outcome.result {
+                            Ok(body) => self.signed_in(call, &hop, body),
+                            Err(error) => Err(Next::Committed(error)),
+                        };
+                    }
+                    if call.uncertain
+                        && !matches!(
+                            request.operation,
+                            Operation::NonReplicated | Operation::Register | Operation::Logout
+                        )
+                        && outcome.result.is_ok()
+                    {
+                        Err(IggyError::TransientNotCommitted)
+                    } else {
+                        outcome.result
+                    }
+                }
+                Err(_) => {
+                    hop.link.close();
+                    Err(IggyError::Disconnected)
+                }
+            },
+            Err(error) => Err(error),
+        };
         self.settle(call, &hop, result, sent).await
     }
 
@@ -241,7 +415,18 @@ impl OperationDriver {
         match call.ticket.take() {
             Some(ticket) => Ok(ticket),
             None => {
-                let key = LaneKey::of(call.code, context, call.partition_id());
+                let key = if call.code == POLL_MESSAGES_CODE {
+                    let poll = PollMessagesRequest::decode_from(&call.payload)
+                        .map_err(|_| Next::Fail(IggyError::InvalidCommand))?;
+                    call.progress_poll =
+                        poll.auto_commit || poll.strategy.kind == WirePollingStrategy::next().kind;
+                    call.progress_poll.then_some(LaneKey::Partition {
+                        incarnation: context.incarnation,
+                        partition_id: call.partition_id(),
+                    })
+                } else {
+                    LaneKey::of(call.code, context, call.partition_id())
+                };
                 self.session
                     .enter_lane(key, call.deadline)
                     .await
@@ -288,6 +473,12 @@ impl OperationDriver {
             Ok(body) => return self.signed_in(call, hop, body),
             Err(error) => error,
         };
+        if call.progress_poll
+            && (error == IggyError::TransientNotCommitted || (sent && lost_link(&error)))
+        {
+            call.uncertain = true;
+            return Err(Next::Fail(IggyError::TransientNotCommitted));
+        }
         let repeated = std::mem::replace(
             &mut call.not_primary,
             matches!(error, IggyError::NotPrimary),
@@ -491,6 +682,8 @@ struct Call {
     deadline: Instant,
     ticket: Option<LaneTicket>,
     frame: Option<Frame>,
+    /// Replaying a progress poll can advance its offset again without delivering the first result.
+    progress_poll: bool,
     /// An attempt of the frame can have taken effect, so the call never
     /// freezes again.
     uncertain: bool,
@@ -522,6 +715,7 @@ enum Next {
     Again,
     Pause,
     Fail(IggyError),
+    Committed(IggyError),
 }
 
 /// How an attempt failed before a definitive outcome.
@@ -547,6 +741,7 @@ impl Call {
             deadline,
             ticket: None,
             frame: None,
+            progress_poll: false,
             uncertain: false,
             refusal: IggyError::TransientNotAccepted,
             retries: 0,
@@ -561,6 +756,7 @@ impl Call {
             code,
             frame,
             partition,
+            ..
         } = retained;
         Self {
             partition: partition.map(|key| PartitionCall { key, context: None }),
@@ -690,15 +886,27 @@ fn retries_lookup(error: &IggyError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::OPERATION_TIMEOUT;
     use crate::links::RETRY_BACKOFF_MAX;
     use crate::links::fake_cluster::{
-        Answer, FakeCluster, Received, UNANSWERED_CODE, connected, endpoint, eventually,
+        Answer, FakeCluster, Received, UNANSWERED_CODE, connected, endpoint, eventually, policy,
+        topic_body,
     };
+    use crate::tcp::tcp_client::TcpClient;
+    use bytes::BytesMut;
     use iggy_binary_protocol::codes::{
-        CREATE_STREAM_CODE, GET_CLUSTER_METADATA_CODE, GET_STREAMS_CODE, POLL_MESSAGES_CODE,
+        CREATE_STREAM_CODE, GET_CLUSTER_METADATA_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
         STORE_CONSUMER_OFFSET_CODE,
     };
+    use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
+    use iggy_binary_protocol::{WireConsumer, WireIdentifier};
+    use iggy_common::{
+        AutoLogin, Credentials, IggyMessage, MessageClient, Partitioning, PendingOperationsConfig,
+    };
+    use secrecy::SecretString;
     use std::iter::repeat_n;
+    use std::num::NonZeroUsize;
+    use std::str::FromStr;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
@@ -763,9 +971,24 @@ mod tests {
         }
 
         async fn call(&self, code: u32, target: RequestTarget<'_>) -> Result<Bytes, IggyError> {
-            self.driver
-                .send(code, Bytes::from_static(PAYLOAD), target)
-                .await
+            let payload = if code == POLL_MESSAGES_CODE {
+                self.poll(false, WirePollingStrategy::first()).to_bytes()
+            } else {
+                Bytes::from_static(PAYLOAD)
+            };
+            self.driver.send(code, payload, target).await
+        }
+
+        fn poll(&self, auto_commit: bool, strategy: WirePollingStrategy) -> PollMessagesRequest {
+            PollMessagesRequest {
+                consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+                stream_id: WireIdentifier::numeric(1),
+                topic_id: WireIdentifier::numeric(2),
+                partition_id: Some(PARTITION_ID),
+                strategy,
+                count: 1,
+                auto_commit,
+            }
         }
 
         async fn send_messages(&self) -> Result<Bytes, IggyError> {
@@ -793,6 +1016,179 @@ mod tests {
             assert_eq!(result.unwrap_err(), IggyError::OperationUncertain(op));
             op
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_raw_send_metadata_when_validating_should_reject_malformed_and_unresolved_before_wire()
+     {
+        let f = Fixture::new().await;
+        for partitioning in [
+            WirePartitioning::Balanced,
+            WirePartitioning::MessagesKey(b"key".to_vec()),
+        ] {
+            let payload = encoded_send(&partitioning);
+            assert_eq!(
+                f.driver.send_raw(SEND_MESSAGES_CODE, payload, None).await,
+                Err(IggyError::FeatureUnavailable)
+            );
+        }
+        let mut invalid = encoded_send(&WirePartitioning::PartitionId(PARTITION_ID)).to_vec();
+        invalid[..size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+        for payload in [Bytes::new(), Bytes::from(invalid)] {
+            assert_eq!(
+                f.driver.send_raw(SEND_MESSAGES_CODE, payload, None).await,
+                Err(IggyError::InvalidCommand)
+            );
+        }
+        assert!(f.sends().is_empty());
+        assert_eq!(f.cluster.count(GET_PARTITION_ROUTE_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_raw_send_with_length_prefixed_metadata_when_sent_should_route_the_unchanged_frame()
+     {
+        let f = Fixture::new().await;
+        let payload = encoded_send(&WirePartitioning::PartitionId(PARTITION_ID));
+        f.driver
+            .send_raw(SEND_MESSAGES_CODE, payload.clone(), None)
+            .await
+            .unwrap();
+        let sends = f.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].endpoint, endpoint(PRIMARY));
+        assert_eq!(sends[0].body, payload);
+        assert_eq!(sends[0].header.partition_incarnation, ROUTE.incarnation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_balanced_send_when_partition_disappears_should_refresh_count_and_reselect_only_once()
+     {
+        for rejected_again in [false, true] {
+            let f = Fixture::new().await;
+            *f.cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+                partitions_count: 2,
+                ..ROUTE
+            });
+            f.cluster.script(
+                &endpoint(0),
+                GET_TOPIC_CODE,
+                [Answer::Body(topic_body(2)), Answer::Body(topic_body(1))],
+            );
+            let missing = IggyError::PartitionNotFound(1, f.topic_id.clone(), f.stream_id.clone());
+            let final_answer = if rejected_again {
+                Answer::Refuse(missing.clone())
+            } else {
+                Answer::Commit(COMMIT)
+            };
+            f.script_sends([
+                Answer::Commit(COMMIT),
+                Answer::Refuse(missing.clone()),
+                final_answer,
+            ]);
+            let client = TcpClient::from_links(f.driver.links);
+            let mut messages = [IggyMessage::from_str("payload").unwrap()];
+            client
+                .send_messages(
+                    &f.stream_id,
+                    &f.topic_id,
+                    &Partitioning::balanced(),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+            let result = client
+                .send_messages(
+                    &f.stream_id,
+                    &f.topic_id,
+                    &Partitioning::balanced(),
+                    &mut messages,
+                )
+                .await;
+            if rejected_again {
+                assert_eq!(result.unwrap_err(), missing);
+            } else {
+                result.unwrap();
+            }
+            let sent = f.cluster.received(SEND_MESSAGES_CODE);
+            assert_eq!(
+                sent.iter().map(sent_partition).collect::<Vec<_>>(),
+                [0, 1, 0]
+            );
+            assert_ne!(sent[1].header.request, sent[2].header.request);
+            assert_eq!(f.cluster.count(GET_TOPIC_CODE), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_explicit_or_uncertain_send_when_partition_is_missing_should_never_choose_another()
+     {
+        for uncertain in [false, true] {
+            let f = Fixture::new().await;
+            f.cluster
+                .script(&endpoint(0), GET_TOPIC_CODE, [Answer::Body(topic_body(2))]);
+            let missing = IggyError::PartitionNotFound(1, f.topic_id.clone(), f.stream_id.clone());
+            let mut answers = Vec::new();
+            if uncertain {
+                answers.push(Answer::Refuse(IggyError::TransientNotCommitted));
+            }
+            answers.push(Answer::Refuse(missing.clone()));
+            f.script_sends(answers);
+            let client = TcpClient::from_links(f.driver.links);
+            let partitioning = if uncertain {
+                Partitioning::balanced()
+            } else {
+                Partitioning::partition_id(PARTITION_ID)
+            };
+            let mut messages = [IggyMessage::from_str("payload").unwrap()];
+            let result = client
+                .send_messages(&f.stream_id, &f.topic_id, &partitioning, &mut messages)
+                .await;
+            let sent = f.cluster.received(SEND_MESSAGES_CODE);
+            if uncertain {
+                assert_eq!(
+                    result.unwrap_err(),
+                    IggyError::OperationUncertain(sent[0].header.request)
+                );
+                assert_eq!(sent.len(), 2);
+                assert_eq!(
+                    bytemuck::bytes_of(&sent[0].header),
+                    bytemuck::bytes_of(&sent[1].header)
+                );
+                assert_eq!(f.cluster.count(GET_TOPIC_CODE), 1);
+            } else {
+                assert_eq!(result.unwrap_err(), missing);
+                assert_eq!(sent.len(), 1);
+                assert_eq!(f.cluster.count(GET_TOPIC_CODE), 0);
+            }
+        }
+    }
+
+    fn sent_partition(sent: &Received) -> u32 {
+        let (length, body) = sent.body.split_first_chunk().unwrap();
+        let header =
+            SendMessagesHeader::decode_from(&body[..u32::from_le_bytes(*length) as usize]).unwrap();
+        let WirePartitioning::PartitionId(partition) = header.partitioning else {
+            panic!("wire send must name a partition");
+        };
+        partition
+    }
+
+    fn encoded_send(partitioning: &WirePartitioning) -> Bytes {
+        let mut payload = BytesMut::new();
+        SendMessagesEncoder::encode(
+            &mut payload,
+            &WireIdentifier::numeric(1),
+            &WireIdentifier::numeric(2),
+            partitioning,
+            &[RawMessage {
+                id: 1,
+                origin_timestamp: 0,
+                headers: None,
+                payload: PAYLOAD,
+            }],
+        )
+        .unwrap();
+        payload.freeze()
     }
 
     fn route_body(route: PartitionRouteResponse) -> Answer {
@@ -987,6 +1383,46 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_committed_lifecycle_refusal_when_retrying_should_restart_only_before_uncertainty()
+     {
+        for uncertain in [false, true] {
+            let fixture = Fixture::new().await;
+            let mut answers = Vec::new();
+            if uncertain {
+                answers.push(Answer::Refuse(IggyError::TransientNotCommitted));
+            }
+            answers.push(Answer::CommitRejected(COMMIT, IggyError::LifecycleBusy));
+            answers.push(Answer::Commit(COMMIT + 1));
+            fixture
+                .cluster
+                .script(&endpoint(0), CREATE_STREAM_CODE, answers);
+
+            let result = fixture
+                .call(CREATE_STREAM_CODE, RequestTarget::Metadata)
+                .await;
+
+            if uncertain {
+                assert_eq!(result, Err(IggyError::LifecycleBusy));
+            } else {
+                result.unwrap();
+            }
+            let requests = fixture.cluster.received(CREATE_STREAM_CODE);
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0].header.request == requests[1].header.request,
+                uncertain
+            );
+            assert_eq!(requests[0].body, requests[1].body);
+            fixture
+                .call(CREATE_STREAM_CODE, RequestTarget::Metadata)
+                .await
+                .unwrap();
+            let next = fixture.cluster.received(CREATE_STREAM_CODE);
+            assert_ne!(next[2].header.request, requests[1].header.request);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_87_on_a_send_when_refreshed_should_start_one_new_operation_under_the_new_incarnation()
      {
         let f = Fixture::new().await;
@@ -1090,6 +1526,220 @@ mod tests {
             .resolve(op, Instant::now() + OPERATION_TIMEOUT)
             .await;
         assert_eq!(again.unwrap_err(), IggyError::OperationNotRetained(op));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_full_mutation_budget_when_resolving_should_reuse_the_retained_reservation() {
+        let mut fixture = Fixture::new().await;
+        let session = Arc::new(SessionOwner::with_pending_operations(
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_owned(),
+                SecretString::from("iggy"),
+            )),
+            PendingOperationsConfig {
+                max_operations: NonZeroUsize::MIN,
+                max_bytes: NonZeroUsize::new(iggy_binary_protocol::HEADER_SIZE + PAYLOAD.len())
+                    .unwrap(),
+            },
+        ));
+        fixture.driver = OperationDriver::new(ReplicaLinks::new(
+            fixture.cluster.dialer(),
+            endpoint(0),
+            policy(),
+            session,
+        ));
+        fixture.driver.links.connect().await.unwrap();
+        let operation = fixture.uncertain_send().await;
+
+        fixture
+            .driver
+            .resolve(operation, Instant::now() + OPERATION_TIMEOUT)
+            .await
+            .unwrap();
+        fixture.send_messages().await.unwrap();
+
+        let sends = fixture.sends();
+        assert_eq!(ops(&sends[..3]), [operation; 3]);
+        assert_eq!(sends[2].body, PAYLOAD);
+        assert_ne!(sends[3].header.request, operation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_store_when_a_committed_rejection_replays_should_return_it_and_free_the_lane()
+     {
+        let f = Fixture::new().await;
+        f.cluster.script(
+            &endpoint(PRIMARY),
+            STORE_CONSUMER_OFFSET_CODE,
+            [
+                Answer::Refuse(IggyError::TransientNotCommitted),
+                Answer::Refuse(IggyError::RequestTooOld),
+                Answer::CommitRejected(COMMIT, IggyError::InvalidOffset(0)),
+            ],
+        );
+        let failed = f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None)).await;
+        let op = f.cluster.received(STORE_CONSUMER_OFFSET_CODE)[0]
+            .header
+            .request;
+        assert_eq!(failed, Err(IggyError::OperationUncertain(op)));
+
+        let resolved = f
+            .driver
+            .resolve(op, Instant::now() + OPERATION_TIMEOUT)
+            .await;
+
+        assert_eq!(resolved, Err(IggyError::InvalidOffset(0)));
+        assert_eq!(
+            f.driver.abandon(op),
+            Err(IggyError::OperationNotRetained(op))
+        );
+        f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+            .await
+            .unwrap();
+        let stores = f.cluster.received(STORE_CONSUMER_OFFSET_CODE);
+        assert_eq!(ops(&stores[..3]), [op; 3]);
+        assert_ne!(stores[3].header.request, op);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_send_when_an_unproved_reply_arrives_should_keep_its_lane() {
+        for answer in [
+            Answer::Refuse(IggyError::Unauthorized),
+            Answer::Body(Vec::new()),
+        ] {
+            let f = Fixture::new().await;
+            let op = f.uncertain_send().await;
+            f.script_sends(repeat_n(answer, ENDLESS));
+
+            let resolved = f.driver.resolve(op, Instant::now() + CALLER_TIMEOUT).await;
+
+            assert_eq!(resolved, Err(IggyError::OperationUncertain(op)));
+            assert_eq!(f.send_messages().await, Err(IggyError::LaneBlocked(op)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_uncertain_poll_progress_when_a_reply_is_lost_should_end_without_replay() {
+        for (auto_commit, strategy, progress) in [
+            (true, WirePollingStrategy::first(), true),
+            (false, WirePollingStrategy::next(), true),
+            (false, WirePollingStrategy::first(), false),
+        ] {
+            for (failure, uncertain) in [
+                (Answer::Refuse(IggyError::TransientNotCommitted), true),
+                (Answer::HangUp, true),
+                (Answer::Refuse(IggyError::TransientNotAccepted), false),
+            ] {
+                let f = Fixture::new().await;
+                f.cluster.script(
+                    &endpoint(PRIMARY),
+                    POLL_MESSAGES_CODE,
+                    [failure, Answer::Body(Vec::new())],
+                );
+                let result = f
+                    .driver
+                    .send(
+                        POLL_MESSAGES_CODE,
+                        f.poll(auto_commit, strategy.clone()).to_bytes(),
+                        f.partition(None),
+                    )
+                    .await;
+                let polls = f.cluster.received(POLL_MESSAGES_CODE);
+                if progress && uncertain {
+                    assert_eq!(result, Err(IggyError::TransientNotCommitted));
+                    assert_eq!(polls.len(), 1, "uncertain progress must not be replayed");
+                    let operation_id = polls[0].header.request;
+                    assert_eq!(
+                        f.driver.abandon(operation_id),
+                        Err(IggyError::OperationNotRetained(operation_id))
+                    );
+                    f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None))
+                        .await
+                        .unwrap();
+                } else {
+                    assert_eq!(result, Ok(Bytes::new()));
+                    assert_eq!(polls.len(), 2, "pure reads and unaccepted polls may retry");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_progress_poll_when_cancelled_should_release_the_barrier_without_retention() {
+        for (auto_commit, strategy) in [
+            (true, WirePollingStrategy::first()),
+            (false, WirePollingStrategy::next()),
+        ] {
+            let f = Fixture::new().await;
+            f.cluster
+                .script(&endpoint(PRIMARY), POLL_MESSAGES_CODE, [Answer::Silence]);
+            let poll = f.driver.send(
+                POLL_MESSAGES_CODE,
+                f.poll(auto_commit, strategy).to_bytes(),
+                f.partition(None),
+            );
+            let store = f.call(STORE_CONSUMER_OFFSET_CODE, f.partition(None));
+            tokio::pin!(store);
+            let expired = timeout(CALLER_TIMEOUT, async {
+                tokio::pin!(poll);
+                tokio::select! {
+                    _ = &mut poll => panic!("the unanswered poll returned"),
+                    () = eventually("the progress poll arrived", || f.cluster.count(POLL_MESSAGES_CODE) == 1) => {}
+                }
+                tokio::select! {
+                    _ = &mut poll => panic!("the unanswered poll returned"),
+                    _ = &mut store => panic!("the store bypassed the progress barrier"),
+                }
+            }).await;
+            assert!(expired.is_err());
+            assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 0);
+            let poll_id = f.cluster.received(POLL_MESSAGES_CODE)[0].header.request;
+            assert_eq!(
+                f.driver.abandon(poll_id),
+                Err(IggyError::OperationNotRetained(poll_id))
+            );
+
+            store.await.unwrap();
+            assert_eq!(f.cluster.count(STORE_CONSUMER_OFFSET_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_retained_mutation_when_progress_poll_enters_should_return_its_blocking_id() {
+        let f = Fixture::new().await;
+        let op = f.uncertain_send().await;
+
+        let polled = f
+            .driver
+            .send(
+                POLL_MESSAGES_CODE,
+                f.poll(false, WirePollingStrategy::next()).to_bytes(),
+                f.partition(None),
+            )
+            .await;
+
+        assert_eq!(polled, Err(IggyError::LaneBlocked(op)));
+        assert_eq!(f.cluster.count(POLL_MESSAGES_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_shared_deadline_when_a_nested_call_runs_should_keep_the_earliest_deadline() {
+        let f = Fixture::new().await;
+        let started = Instant::now();
+        let deadline = started + CALLER_TIMEOUT;
+
+        let result = with_deadline(
+            deadline,
+            with_deadline(
+                started + OPERATION_TIMEOUT,
+                f.call(UNANSWERED_CODE, RequestTarget::Metadata),
+            ),
+        )
+        .await;
+
+        assert_eq!(result, Err(IggyError::TransientNotCommitted));
+        assert_eq!(Instant::now(), deadline);
+        assert!(operation_deadline() > deadline);
     }
 
     #[tokio::test(start_paused = true)]

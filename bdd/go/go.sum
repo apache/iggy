@@ -1,7 +1,5 @@
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
-github.com/avast/retry-go/v5 v5.0.0 h1:kf1Qc2UsTZ4qq8elDymqfbISvkyMuhgRxuJqX2NHP7k=
-github.com/avast/retry-go/v5 v5.0.0/go.mod h1://d+usmKWio1agtZfS1H/ltTqwtIfBnRq9zEwjc3eH8=
 github.com/cucumber/gherkin/go/v42 v42.0.0 h1:Ulh3E2awUUSSja+wonP/IOQ+ycmiZwZbgmzqk5H8JNI=
 github.com/cucumber/gherkin/go/v42 v42.0.0/go.mod h1:CsaumaO2dR9XvBc6ZyiGLMhWCKtTRDxgoxqJigSjSSg=
 github.com/cucumber/godog v0.16.0 h1:ezQbgItuWqZrjPUQwLJ3muwIlvzXBOfZso5QZfG7efE=

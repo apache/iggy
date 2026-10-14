@@ -53,7 +53,9 @@ use crate::server::raw_tcp::TEST_BIND_SECRET;
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use iggy_binary_protocol::codes::{GET_POLL_ROUTING_CODE, PING_CODE, POLL_MESSAGES_CODE};
+use iggy_binary_protocol::codes::{
+    CREATE_STREAM_CODE, GET_PARTITION_ROUTE_CODE, PING_CODE, POLL_MESSAGES_CODE,
+};
 use iggy_binary_protocol::consensus::{
     Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
@@ -61,12 +63,12 @@ use iggy_binary_protocol::consensus::{
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::JoinConsumerGroupRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
-use iggy_binary_protocol::responses::messages::{PollMessagesResponse, PollRoutingResponse};
+use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollMessagesResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireIdentifier, WireName, WireOptions,
@@ -412,7 +414,9 @@ pub(super) async fn commit_request(
     request: u64,
     body: &Bytes,
 ) -> CommittedReply {
-    let header = request_header(Operation::CreateStream, session, request, body.len());
+    let header =
+        RequestHeader::for_request(CREATE_STREAM_CODE, CLIENT_ID, request, session, body).unwrap();
+    assert_ne!(header.request_checksum, header.checksum);
     commit_request_header(stream, &header, body).await
 }
 
@@ -424,7 +428,20 @@ async fn commit_request_header(
     let deadline = Instant::now() + COMMIT_BUDGET;
     loop {
         match exchange(stream, header, body).await.verdict() {
-            Verdict::Success(reply) => return reply,
+            Verdict::Success(reply) => {
+                let receipt =
+                    bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(reply.header.as_ref())
+                        .unwrap();
+                assert!(receipt.has_committed_result());
+                assert_eq!(receipt.client, header.client);
+                assert_eq!(receipt.request, header.request);
+                assert_eq!(receipt.request_checksum, header.request_checksum);
+                assert_eq!(receipt.operation, header.operation);
+                assert_eq!(receipt.partition_incarnation, header.partition_incarnation);
+                assert_ne!(receipt.op, 0);
+                assert_eq!(receipt.op, receipt.commit);
+                return reply;
+            }
             Verdict::Rejected(code) if is_transient(code) && Instant::now() < deadline => {
                 sleep(RETRY_PAUSE).await;
             }
@@ -481,7 +498,9 @@ pub(super) async fn resume_request(
                 continue;
             }
         };
-        let header = request_header(Operation::CreateStream, resumed, request, body.len());
+        let header =
+            RequestHeader::for_request(CREATE_STREAM_CODE, CLIENT_ID, request, resumed, body)
+                .unwrap();
         match exchange(&mut stream, &header, body).await.verdict() {
             Verdict::Success(reply) => {
                 if let Some(original) = expect_replay_of {
@@ -753,16 +772,25 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
         auto_commit: true,
     };
     let first_poll = poll_request.to_bytes();
-    let mut routing_header = request_header(Operation::NonReplicated, session, 0, first_poll.len());
+    let route_request = GetPartitionRouteRequest {
+        stream_id: poll_request.stream_id.clone(),
+        topic_id: poll_request.topic_id.clone(),
+        partition_id: 0,
+    }
+    .to_bytes();
+    let mut routing_header =
+        request_header(Operation::NonReplicated, session, 0, route_request.len());
     routing_header.reserved[..size_of::<u32>()]
-        .copy_from_slice(&GET_POLL_ROUTING_CODE.to_le_bytes());
+        .copy_from_slice(&GET_PARTITION_ROUTE_CODE.to_le_bytes());
     let Exchange::Reply {
         status: 0, body, ..
-    } = exchange(&mut member, &routing_header, &first_poll).await
+    } = exchange(&mut member, &routing_header, &route_request).await
     else {
         panic!("the installed owner must discover its poll context");
     };
-    let context = PollRoutingResponse::decode_from(&body).unwrap().context;
+    let context = PartitionRouteResponse::decode_from(&body)
+        .unwrap()
+        .context();
     let mut first_header = request_header(Operation::NonReplicated, session, 0, first_poll.len());
     first_header.reserved[..size_of::<u32>()].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
     context.stamp(&mut first_header);

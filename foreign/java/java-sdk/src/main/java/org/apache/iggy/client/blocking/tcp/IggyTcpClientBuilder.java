@@ -211,6 +211,12 @@ public final class IggyTcpClientBuilder {
         return this;
     }
 
+    /** Bounds active and retained mutations; admission waits within each call's deadline. */
+    public IggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        asyncBuilder.pendingOperations(count, bytes);
+        return this;
+    }
+
     /**
      * Sets the host, port, credentials and TLS options from a connection string.
      *

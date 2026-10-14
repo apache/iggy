@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-2\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-3\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -1237,6 +1237,7 @@ mod tests {
             b"IGGY-OWNERSHIP-HISTORY-3\n",
             b"IGGY-OWNERSHIP-HISTORY-4\n",
             b"IGGY-OWNERSHIP-HISTORY-5\n",
+            b"IGGY-BOUND-GRANTS-2\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {

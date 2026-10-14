@@ -51,12 +51,13 @@ pub trait Client:
 
     /// Disconnect from the server. Repeated calls are safe.
     ///
-    /// On TCP, QUIC and WebSocket, the disconnect holds until the next `connect()`,
-    /// also on a client that was not connected: nothing reconnects the client on
-    /// its own, even with auto-login credentials. Until then, a request that needs
-    /// a session fails with `IggyError::Disconnected`, and any other request with
-    /// `IggyError::NotConnected`. A connection that drops without this call can
-    /// still reconnect on its own. Over HTTP this call does nothing.
+    /// On TCP, QUIC and WebSocket, the disconnect holds until the next `connect()`
+    /// or explicit username/PAT login, also on a client that was not connected.
+    /// Nothing reconnects the client on its own, even with auto-login credentials.
+    /// Requests requiring a session fail with `IggyError::Disconnected`; other
+    /// requests can return `IggyError::NotConnected`. A connection that drops
+    /// without this call can still reconnect on its own. Over HTTP this call does
+    /// nothing.
     async fn disconnect(&self) -> Result<(), IggyError>;
 
     /// Shut down the client and release all the resources. Repeated calls are safe.
@@ -81,20 +82,20 @@ pub trait Client:
     /// HTTP keeps no connection, so it publishes no events.
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent>;
 
-    /// Replays the retained operation `op` until it commits or `deadline`
-    /// passes. `op` is the request id that `OperationUncertain` or
+    /// Replays the retained operation `op` until its committed result is proved
+    /// or `deadline` passes. `op` is the request id that `OperationUncertain` or
     /// `LaneBlocked` carries.
     ///
-    /// `Ok(())` means that the operation committed exactly once. After
-    /// `OperationUncertain(op)` the outcome is still unknown, and the
-    /// operation stays retained. An operation that is not retained gives
-    /// `OperationNotRetained(op)`. A client that retains no operations
-    /// returns `FeatureUnavailable`.
+    /// `Ok(())` means a successful commit was proved. A proved committed business
+    /// rejection returns its original error. Both release the retained operation
+    /// and its lane. `OperationUncertain(op)` keeps the original frame and lane:
+    /// a later denial without committed-result proof cannot settle an earlier send.
+    /// `OperationNotRetained(op)` means this client no longer has that operation.
+    /// TCP, QUIC and WebSocket support recovery; HTTP returns `FeatureUnavailable`.
     ///
     /// A session reset drops retained operations without settling them.
     /// `OperationNotRetained(op)` after a reset means the outcome is still
     /// unknown and can no longer be recovered through this client.
-    #[doc(hidden)]
     async fn resolve_operation(&self, _op: u64, _deadline: Instant) -> Result<(), IggyError> {
         Err(IggyError::FeatureUnavailable)
     }
@@ -103,7 +104,6 @@ pub trait Client:
     /// of `op` stays unknown. An operation that is not retained gives
     /// `OperationNotRetained(op)`. A client that retains no operations
     /// returns `FeatureUnavailable`.
-    #[doc(hidden)]
     async fn abandon_operation(&self, _op: u64) -> Result<(), IggyError> {
         Err(IggyError::FeatureUnavailable)
     }
