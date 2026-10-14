@@ -41,7 +41,8 @@ import Logging
 /// Every operation throws ``IggyError``, or `CancellationError` when its
 /// task is cancelled. A request that hits a dropped connection is replayed
 /// over a fresh one only when it provably never reached the log, so a
-/// replicated write whose outcome is unknown surfaces the error instead.
+/// replicated write whose outcome is unknown fails with
+/// ``IggyErrorCode/transientNotCommitted`` instead.
 public final class IggyClient: Sendable {
     /// The configuration the client was created with.
     public let configuration: ClientConfiguration
@@ -113,8 +114,10 @@ public final class IggyClient: Sendable {
         get async { await core.serverAddress }
     }
 
+    /// Pings in every state but shutdown, as the Rust SDK does: a ping on a
+    /// client whose connection dropped is what reconnects it between calls.
     private func heartbeat() async {
-        guard await core.state == .authenticated else {
+        guard await core.state != .shutdown else {
             return
         }
         do {
@@ -177,18 +180,8 @@ public final class IggyClient: Sendable {
         try await core.exchange(code: code.rawValue, payload: payload)
     }
 
-    /// Fails fast with the same error the Rust SDK raises for the state.
     func requireAuthenticated() async throws {
-        switch await core.state {
-        case .shutdown:
-            throw IggyError(.clientShutdown)
-        case .disconnected, .connecting, .authenticating:
-            throw IggyError(.disconnected)
-        case .connected:
-            throw IggyError(.unauthenticated)
-        case .authenticated:
-            return
-        }
+        try await core.requireAuthenticated()
     }
 }
 

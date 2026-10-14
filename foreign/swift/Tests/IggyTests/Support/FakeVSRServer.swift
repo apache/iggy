@@ -135,6 +135,7 @@ final class FakeVSRServer: @unchecked Sendable {
         writer.write(UInt32(addresses.count))
         for (index, address) in addresses.enumerated() {
             let endpoint = try! Endpoint(parsing: address)
+            writer.write(UInt8(index))
             try! writer.writeLongString("node-\(index)")
             try! writer.writeLongString(endpoint.host)
             writer.write(UInt16(endpoint.port))

@@ -127,6 +127,11 @@ actor ClientCore {
     /// `requestTimeout` from now, covers the request, the reconnect, the
     /// sign-in, the leader check, and the replay.
     ///
+    /// A replicated write that may have reached the log before the connection
+    /// was lost is not replayed and fails with
+    /// ``IggyErrorCode/transientNotCommitted``, as in the Rust SDK, so it is
+    /// never mistaken for a request that was not sent.
+    ///
     /// A cancelled caller gets `CancellationError`. A request it already wrote
     /// takes the connection with it, since its reply can no longer be told
     /// from the next one, and the next caller reconnects.
@@ -146,13 +151,18 @@ actor ClientCore {
             guard error.isReconnectable else {
                 throw error
             }
+            // A replay over a new connection runs under a new session, and the
+            // server deduplicates by (client, request). Replay only what
+            // provably never reached the log.
+            let replay = replayAfterSessionResetIsSafe(code: code, error: error)
+            let failure = replay ? error : IggyError(.transientNotCommitted, context: "command \(code) may have committed before: \(error)")
             if code == CommandCode.getClusterMetadata.rawValue {
                 // An unauthenticated roster read cannot be repaired by a
                 // reconnect; it would re-issue the same read forever.
                 throw error
             }
             guard configuration.reconnection.enabled else {
-                throw IggyError(.disconnected, context: "automatic reconnection is disabled")
+                throw replay ? IggyError(.disconnected, context: "automatic reconnection is disabled") : failure
             }
             let isLogin = CommandCode.isRegister(code)
             if !isLogin, signInCredentials() == nil {
@@ -161,21 +171,17 @@ actor ClientCore {
                 // unauthenticated. The sign-in itself is the exception: the
                 // server stays silent on a transient register failure and
                 // relies on the client replaying it.
-                throw error
+                throw failure
             }
             if isLogin, connectGate.isActive {
                 // The sign-in ran inside a connect sweep, which owns the
                 // endpoint walk; the sweep reports the failure itself.
                 throw error
             }
-            // A replay over a new connection runs under a new session, and the
-            // server deduplicates by (client, request). Replay only what
-            // provably never reached the log.
-            let replay = replayAfterSessionResetIsSafe(code: code, error: error)
             guard ContinuousClock.now < deadline else {
                 // Nothing is left of the deadline to reconnect in; the next
                 // request does it.
-                throw error
+                throw failure
             }
             let epoch = failedEpoch
             let reconnected: Void? = try await withDeadline(deadline) { [self] in
@@ -184,14 +190,44 @@ actor ClientCore {
                 try await self.reconnect(failedEpoch: epoch, skipAutoLogin: isLogin, cause: error)
             }
             guard reconnected != nil else {
-                throw IggyError(error.code, context: "the request deadline passed while reconnecting after: \(error)")
+                throw IggyError(failure.code, context: "the request deadline passed while reconnecting after: \(error)")
             }
             guard replay else {
-                logger.warning(
-                    "Reconnected, but the outcome of command \(code) is unknown: replaying it could apply it twice, so the original error is returned instead")
-                throw error
+                logger.warning("Reconnected, but the outcome of command \(code) is unknown: replaying it could apply it twice")
+                throw failure
             }
             return try await sendRaw(code: code, payload: payload, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
+        }
+    }
+
+    /// Fails fast with the error the Rust SDK raises for the state, after
+    /// bringing back a connection that dropped on its own. A reply timeout, a
+    /// cancelled request, or an outage longer than the request timeout leaves
+    /// the client disconnected, and with credentials to sign in again the
+    /// next typed call reconnects instead of failing until ``connect()``.
+    func requireAuthenticated() async throws {
+        switch state {
+        case .disconnected, .connecting, .authenticating:
+            if !disconnectedByCaller, configuration.reconnection.enabled, signInCredentials() != nil {
+                let reconnected: Void? = try await withDeadline(ContinuousClock.now + configuration.requestTimeout) { [self] in
+                    try await self.connect()
+                }
+                if reconnected == nil {
+                    throw IggyError(.disconnected, context: "could not reconnect within the request timeout")
+                }
+            }
+        default:
+            break
+        }
+        switch state {
+        case .shutdown:
+            throw IggyError(.clientShutdown)
+        case .disconnected, .connecting, .authenticating:
+            throw IggyError(.disconnected)
+        case .connected:
+            throw IggyError(.unauthenticated)
+        case .authenticated:
+            return
         }
     }
 
@@ -252,7 +288,7 @@ actor ClientCore {
             case .success(let body):
                 return body
             case .failure(let failure):
-                let error = outcome.observe(failure)
+                let error = outcome.observe(Self.graded(failure))
                 guard error.code == .transientNotAccepted, !isLogin, clock.now < deadline else {
                     if error.code == .disconnected, epoch == connectionEpoch, state != .shutdown {
                         // The reply stream is at an unknown boundary; a late
@@ -267,25 +303,38 @@ actor ClientCore {
                     throw error
                 }
                 // The server never admitted the request, so re-issuing it
-                // cannot double-apply: keep the stamped id for same-session
-                // replays; a redirect registers again, so the frame is stamped
-                // afresh.
+                // under a new request id cannot double-apply it.
                 let from = walk
                 guard let step = try await withDeadline(deadline, { [self] in try await self.failOver(from) }) else {
                     throw error
                 }
                 walk = step.walk
-                if step.moved {
-                    request = nil
-                } else if rosterEndpoints.count <= 1 {
+                guard step.moved || rosterEndpoints.count <= 1 else {
+                    throw error
+                }
+                // A caller queued behind this one may have spent the next
+                // request id while the exchange lock was free. Replaying the
+                // old id after it would be refused as too old, so the frame is
+                // stamped afresh.
+                request = nil
+                if !step.moved {
                     // A single node: partition materialisation can outlast the
                     // short retry window, so keep replaying until the budget ends.
-                    continue
-                } else {
-                    throw error
+                    try? await Task.sleep(until: min(clock.now + Self.notReadyRetryInterval, deadline), clock: clock)
                 }
             }
         }
+    }
+
+    /// `notPrimary` takes the `transientNotAccepted` path, as in the Rust SDK:
+    /// neither was admitted, and the primary is found by moving to another
+    /// node. Unlike a not-accepted refusal it is not replayed on the same node
+    /// first, since a backup keeps refusing until the view changes.
+    private static func graded(_ failure: IggyError) -> IggyError {
+        guard failure.code == .notPrimary else {
+            return failure
+        }
+        return IggyError(.transientNotAccepted, context: "\(failure)")
     }
 
     /// The cluster endpoints one request has already been refused on.
@@ -360,11 +409,15 @@ actor ClientCore {
             request = stamped
         }
         let clock = ContinuousClock()
+        // The answer to the last attempt. At the deadline it is the error, as
+        // in the Rust SDK, and with no attempt written the request was never
+        // admitted. Either way the stream sits at a frame boundary, so the
+        // connection stays.
+        var refusal: IggyError?
         while true {
             let remaining = readDeadline - clock.now
             guard remaining > .zero else {
-                await connection.close()
-                return .failure(IggyError(.disconnected, context: "timed out waiting for the reply to command \(code)"))
+                return .failure(refusal ?? IggyError(.transientNotAccepted, context: "the request deadline passed before command \(code) was sent"))
             }
             let raw: RawFrame
             do {
@@ -385,10 +438,11 @@ actor ClientCore {
             }
             do {
                 return .success(Array(try VSRFrame.decodeReply(header: header, body: raw.body[...])))
-            } catch let refusal as IggyError {
+            } catch let answer as IggyError {
                 // Once one attempt left the outcome unknown, a later refusal
                 // of the same request no longer proves it never committed.
-                let error = outcome.observe(refusal)
+                let error = outcome.observe(answer)
+                refusal = error
                 switch error.code {
                 case .transientNotCommitted where clock.now < readDeadline:
                     // The outcome is unknown; only a same-session replay of the
@@ -975,10 +1029,11 @@ actor ClientCore {
 
     /// Runs `body` every heartbeat interval until it returns false, which is
     /// how a client that was dropped without a shutdown ends its heartbeat.
+    /// A heartbeat already running is kept: cancelling it could abort a ping
+    /// in flight and take the connection with it.
     func startHeartbeat(_ body: @escaping @Sendable () async -> Bool) {
-        stopHeartbeat()
         let interval = configuration.heartbeatInterval
-        guard interval > .zero, state != .shutdown else {
+        guard heartbeatTask == nil, interval > .zero, state != .shutdown else {
             return
         }
         heartbeatTask = Task {

@@ -92,10 +92,13 @@ set, and against the host of the address unless `TLSOptions.domain` names anothe
 ### Reconnection
 
 A request that hits a dropped connection reconnects, signs in again, and is replayed,
-all within its `requestTimeout`, and only when it provably never reached the log: reads, pings, and requests the server
-never admitted. A replicated write whose outcome is unknown surfaces the error instead
-of being applied twice. In a cluster the client reads the roster after signing in and
-moves to the leader.
+all within its `requestTimeout`, and only when it provably never reached the log:
+reads, pings, and requests the server never admitted. A replicated write whose outcome
+is unknown fails with `transientNotCommitted` instead of being applied twice. A client
+left disconnected by a timeout or an outage reconnects on its next call or heartbeat
+when it has credentials to sign in with. In a cluster the client reads the roster after
+signing in, moves to the leader, and moves on when a node answers that it is not the
+primary.
 
 ### Errors
 

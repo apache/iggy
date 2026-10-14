@@ -29,13 +29,13 @@ private let shortTimeout: Duration = .milliseconds(500)
 /// not cut a reconnect short.
 private func makeClient(
     _ server: FakeVSRServer, autoLogin: Credentials? = rootLogin, reconnection: Bool = true, maxRetries: UInt32? = nil,
-    requestTimeout: Duration = .seconds(10), connector: any IggyConnector = NIOConnector()
+    requestTimeout: Duration = .seconds(10), heartbeat: Duration = .seconds(60), connector: any IggyConnector = NIOConnector()
 ) -> IggyClient {
     var configuration = ClientConfiguration(address: server.address, autoLogin: autoLogin)
     configuration.reconnection = ReconnectionOptions(enabled: reconnection, maxRetries: maxRetries, interval: .milliseconds(20), reestablishAfter: .zero)
     configuration.requestTimeout = requestTimeout
     configuration.connectTimeout = .seconds(2)
-    configuration.heartbeatInterval = .seconds(60)
+    configuration.heartbeatInterval = heartbeat
     return IggyClient(configuration: configuration, connector: connector, logger: testLogger)
 }
 
@@ -216,6 +216,106 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// The replay after the failover check is stamped afresh. The refused
+    /// request frees the exchange lock for that check, a caller queued behind
+    /// it spends the next request id, and the server refuses an id older than
+    /// one it already applied.
+    @Test func replayAfterTheFailoverCheckTakesANewRequestID() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let applied = Locked<UInt64>(0)
+        await server.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.operation == .nonReplicated, request.code == CommandCode.getClusterMetadata.rawValue {
+                return .ok(FakeVSRServer.rosterBody([server.address]))
+            }
+            switch request.operation {
+            case .deleteStream:
+                applied.withLock { $0 = max($0, request.requestID) }
+                return .ok([])
+            case .deleteTopic:
+                let highest = applied.withLock { $0 }
+                if highest == 0 {
+                    return .status(IggyErrorCode.transientNotAccepted.rawValue)
+                }
+                return request.requestID < highest ? .status(IggyErrorCode.requestTooOld.rawValue) : .ok([])
+            default:
+                return .ok([])
+            }
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        let refused = Task { try await client.deleteTopic(streamID: 1, topicID: 1) }
+        #expect(await eventually { await operations(server).contains(.deleteTopic) })
+        try await client.deleteStream(1)
+        try await refused.value
+        let attempts = await server.requests.filter { $0.operation == .deleteTopic }.map(\.requestID)
+        let queued = await server.requests.first { $0.operation == .deleteStream }?.requestID ?? 0
+        #expect(attempts.first.map { $0 < queued } == true)
+        #expect(attempts.last.map { $0 > queued } == true)
+        #expect(await server.connectionCount == 1)
+        await client.shutdown()
+    }
+
+    /// After a view change a backup refuses a replicated write with "not
+    /// primary". The write was never admitted, so it goes to the new primary
+    /// at once instead of being replayed on the backup.
+    @Test func notPrimaryMovesTheRequestToTheNewPrimary() async throws {
+        let first = try await FakeVSRServer.started()
+        let second = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await first.stop()
+                await second.stop()
+            }
+        }
+        let addresses = [first.address, second.address]
+        let viewChanged = Locked(false)
+        await first.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.getClusterMetadata.rawValue {
+                return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: viewChanged.withLock { $0 } ? 1 : 0))
+            }
+            guard request.operation == .deleteStream else { return .ok([]) }
+            viewChanged.withLock { $0 = true }
+            return .status(IggyErrorCode.notPrimary.rawValue)
+        }
+        await second.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: 1)) }
+            return .ok([])
+        }
+        let client = makeClient(first)
+        try await client.connect()
+        let clock = ContinuousClock()
+        let elapsed = try await clock.measure { try await client.deleteStream(1) }
+        #expect(elapsed < ClientCore.transientFailoverCheckInterval)
+        #expect(await first.requests.filter { $0.operation == .deleteStream }.count == 1)
+        #expect(await second.requests.filter { $0.operation == .deleteStream }.count == 1)
+        #expect(await client.serverAddress == second.address)
+        await client.shutdown()
+    }
+
+    /// With nowhere to move, "not primary" is reported like "not accepted":
+    /// neither was admitted.
+    @Test func notPrimaryWithoutAnotherNodeIsReportedAsNotAccepted() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody([server.address])) }
+            return request.operation == .deleteStream ? .status(IggyErrorCode.notPrimary.rawValue) : .ok([])
+        }
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        try await client.connect()
+        await expectCode(.transientNotAccepted) { try await client.deleteStream(1) }
+        let attempts = await server.requests.filter { $0.operation == .deleteStream }
+        #expect(attempts.count > 1)
+        #expect(Set(attempts.map(\.requestID)).count == attempts.count)
+        #expect(await client.state == .authenticated)
+        await client.shutdown()
+    }
+
     @Test func transientReplayGivesUpAtTheDeadline() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
@@ -227,7 +327,7 @@ struct ClientTransportTests {
         try await client.connect()
         let clock = ContinuousClock()
         let elapsed = await clock.measure {
-            await expectCode(.disconnected) { _ = try await client.createStream(name: "x") }
+            await expectCode(.transientNotCommitted) { _ = try await client.createStream(name: "x") }
         }
         #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
         await client.shutdown()
@@ -426,8 +526,9 @@ struct ClientTransportTests {
         let client = makeClient(server)
         try await client.connect()
         // The outcome is unknown: the client reconnects for later requests
-        // but returns the original error instead of applying it twice.
-        await expectCode(.disconnected) { _ = try await client.createStream(name: "x") }
+        // but reports the write as possibly committed instead of applying it
+        // twice, so it is not mistaken for a request that was never sent.
+        await expectCode(.transientNotCommitted) { _ = try await client.createStream(name: "x") }
         #expect(await operations(server).filter { $0 == .createStream }.count == 1)
         #expect(await client.state == .authenticated)
         #expect(await server.connectionCount == 2)
@@ -498,6 +599,21 @@ struct ClientTransportTests {
         #expect(await client.state == .disconnected)
         #expect(await server.connectionCount == 1)
         await expectCode(.disconnected) { try await client.ping() }
+        await client.shutdown()
+    }
+
+    @Test func reconnectionDisabledReportsAnUnknownOutcome() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            request.operation == .register ? .ok(FakeVSRServer.registerBody()) : request.operation == .deleteStream ? .close : .ok([])
+        }
+        let client = makeClient(server, reconnection: false)
+        try await client.connect()
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+        // A typed call that never reaches the wire still says so.
+        await expectCode(.disconnected) { try await client.deleteStream(1) }
+        #expect(await operations(server).filter { $0 == .deleteStream }.count == 1)
         await client.shutdown()
     }
 
@@ -648,6 +764,68 @@ struct ClientTransportTests {
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()
         #expect(await client.serverAddress == follower.address)
+        await client.shutdown()
+    }
+
+    /// An outage longer than the request timeout leaves the client
+    /// disconnected. Once the server is back the next typed call reconnects and
+    /// signs in again, with no ``IggyClient/connect()`` of its own.
+    @Test func typedCallReconnectsAfterAnOutage() async throws {
+        let server = try await FakeVSRServer.started()
+        let port = try Endpoint(parsing: server.address).port
+        let client = makeClient(server, requestTimeout: shortTimeout)
+        try await client.connect()
+        await server.stop()
+        await expectCode(.disconnected) { try await client.ping() }
+        #expect(await eventually { await client.state == .disconnected })
+
+        let revived = FakeVSRServer()
+        try await revived.startOn(port: port)
+        defer { Task { await revived.stop() } }
+        #expect(try await client.getStreams().isEmpty)
+        #expect(await client.state == .authenticated)
+        #expect(await operations(revived).filter { $0 == .register }.count == 1)
+        await client.shutdown()
+    }
+
+    /// The heartbeat keeps pinging a client that lost its connection, which
+    /// brings it back once the server returns, without any call.
+    @Test func heartbeatReconnectsAfterAnOutage() async throws {
+        let server = try await FakeVSRServer.started()
+        let port = try Endpoint(parsing: server.address).port
+        let client = makeClient(server, requestTimeout: shortTimeout, heartbeat: .milliseconds(30))
+        try await client.connect()
+        await server.stop()
+        #expect(await eventually { await client.state == .disconnected })
+
+        let revived = FakeVSRServer()
+        try await revived.startOn(port: port)
+        defer { Task { await revived.stop() } }
+        #expect(await eventually { await pingCount(revived) >= 1 })
+        #expect(await client.state == .authenticated)
+        #expect(await operations(revived).filter { $0 == .register }.count == 1)
+        await client.shutdown()
+    }
+
+    /// `connect()` on a connected client leaves the heartbeat alone:
+    /// cancelling it would abort a ping in flight and the connection with it.
+    @Test func connectingAgainKeepsTheHeartbeatAndItsPing() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.ping.rawValue {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            return .ok([])
+        }
+        let client = makeClient(server, heartbeat: .milliseconds(20))
+        try await client.connect()
+        #expect(await eventually { await pingCount(server) >= 1 })
+        try await client.connect()
+        #expect(await eventually { await pingCount(server) >= 2 })
+        #expect(await client.state == .authenticated)
+        #expect(await server.connectionCount == 1)
         await client.shutdown()
     }
 
