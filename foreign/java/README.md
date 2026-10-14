@@ -122,22 +122,25 @@ client.users().login("iggy", "iggy");
 
 ### Connection String
 
-`fromConnectionString` builds a blocking TCP client from an `iggy://` connection string:
+`fromConnectionString` configures a TCP client from an `iggy://` connection string:
 
 ```java
+// Blocking client
 var client = Iggy.tcpClientBuilder()
     .fromConnectionString("iggy://iggy:iggy@localhost:8090")
     .buildAndLogin();
 
-// With TLS
-var secureClient = Iggy.tcpClientBuilder()
-    .fromConnectionString("iggy+tcp://admin:secret@iggy-server.example.com:8090?tls=true")
-    .buildAndLogin();
+// Async client, with TLS and a custom CA certificate
+var asyncClient = Iggy.tcpClientBuilder()
+    .async()
+    .fromConnectionString("iggy+tcp://admin:secret@iggy-server.example.com:8090?tls=true&tls_ca_file=/certs/ca.pem")
+    .buildAndLogin()
+    .join();
 ```
 
-The Java SDK accepts `iggy://` and `iggy+tcp://` with `<username>:<password>` credentials and the `tls` option.
-Unlike the Rust, Node and C# SDKs, it does not yet accept a personal access token in place of the credentials,
-or options such as `tls_domain` and `reconnection_retries`. These are rejected with an `IggyInvalidArgumentException`.
+The connection string accepts `iggy://` and `iggy+tcp://` with `<username>:<password>` credentials and the
+`tls` and `tls_ca_file` options, each at most once. Personal access tokens and other options are not supported yet
+and are rejected with an `IggyInvalidArgumentException`.
 
 ### TCP Client (Async)
 
