@@ -28,7 +28,7 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::{Client, Pipeline, RedisError, RedisResult};
+use redis::{Client, ErrorKind, Pipeline, RedisError, RedisResult, ServerErrorKind};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use thiserror::Error as ThisError;
@@ -79,8 +79,8 @@ pub enum PayloadFormat {
     Json,
 }
 
-impl From<Option<&str>> for PayloadFormat {
-    fn from(value: Option<&str>) -> Self {
+impl PayloadFormat {
+    fn from_config(value: Option<&str>) -> Self {
         match value.map(str::to_ascii_lowercase).as_deref() {
             None | Some("binary") => PayloadFormat::Binary,
             Some("text") => PayloadFormat::Text,
@@ -148,19 +148,22 @@ impl RedisSink {
             DEFAULT_RESPONSE_TIMEOUT,
             id,
         );
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+        if max_retries > DEFAULT_MAX_RETRIES {
+            warn!(
+                "{CONNECTOR_NAME} ID: {id} max_retries {max_retries} is above the limit, using {DEFAULT_MAX_RETRIES}"
+            );
+        }
         RedisSink {
             id,
             connection: None,
             verbose: config.verbose_logging.unwrap_or(false),
             batch_size: config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1) as usize,
-            payload_format: PayloadFormat::from(config.payload_format.as_deref()),
+            payload_format: PayloadFormat::from_config(config.payload_format.as_deref()),
             include_metadata: config.include_metadata.unwrap_or(true),
             deterministic_ids: config.deterministic_ids.unwrap_or(true),
             retry_policy: RetryPolicy {
-                max_attempts: config
-                    .max_retries
-                    .unwrap_or(DEFAULT_MAX_RETRIES)
-                    .clamp(1, DEFAULT_MAX_RETRIES),
+                max_attempts: max_retries.clamp(1, DEFAULT_MAX_RETRIES),
                 base_delay: retry_delay,
                 max_delay: MAX_RETRY_DELAY.max(retry_delay),
             },
@@ -224,6 +227,7 @@ impl Sink for RedisSink {
         }
 
         let stream_key = self.target_key(topic_metadata, messages_metadata.partition_id);
+        let mut first_error = None;
         for batch in messages.chunks(self.batch_size) {
             if let Err(error) = self
                 .write_batch(
@@ -239,10 +243,10 @@ impl Sink for RedisSink {
                     "{CONNECTOR_NAME} ID: {} failed to write batch to {stream_key}: {error}",
                     self.id
                 );
-                return Err(error);
+                first_error.get_or_insert(error);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -284,6 +288,7 @@ impl RedisSink {
         pipeline.ignore_errors();
         let mut queued = 0u64;
         let mut invalid = 0u64;
+        let mut invalid_error = None;
         for message in batch {
             let (payload, headers) = match self
                 .payload_bytes(message)
@@ -296,6 +301,10 @@ impl RedisSink {
                         self.id, message.offset
                     );
                     invalid += 1;
+                    invalid_error = Some(Error::InvalidRecordValue(format!(
+                        "offset {}: {reason}",
+                        message.offset
+                    )));
                     continue;
                 }
             };
@@ -316,7 +325,7 @@ impl RedisSink {
             self.errors.fetch_add(invalid, Ordering::Relaxed);
         }
         if queued == 0 {
-            return Ok(());
+            return invalid_error.map_or(Ok(()), Err);
         }
 
         let context = format!("{CONNECTOR_NAME} ID: {} XADD batch", self.id);
@@ -324,9 +333,19 @@ impl RedisSink {
             let mut connection = connection.clone();
             let pipeline = &pipeline;
             async move {
-                pipeline
+                let mut results = pipeline
                     .query_async::<Vec<RedisResult<String>>>(&mut connection)
-                    .await
+                    .await?;
+                // Entry IDs make a resend safe: accepted entries come back as duplicates.
+                let transient = results
+                    .iter()
+                    .position(|result| result.as_ref().is_err_and(is_transient_error));
+                if let (true, Some(position)) = (self.deterministic_ids, transient)
+                    && let Err(error) = results.swap_remove(position)
+                {
+                    return Err(error);
+                }
+                Ok(results)
             }
         })
         .await
@@ -369,7 +388,7 @@ impl RedisSink {
                 &format!("{failed} of {queued} XADD entries rejected"),
                 error,
             )),
-            None => Ok(()),
+            None => invalid_error.map_or(Ok(()), Err),
         }
     }
 
@@ -507,6 +526,16 @@ fn is_transient_error(error: &RedisError) -> bool {
         || error.is_timeout()
         || error.is_connection_dropped()
         || error.is_connection_refusal()
+        || matches!(
+            error.kind(),
+            ErrorKind::Server(
+                ServerErrorKind::BusyLoading
+                    | ServerErrorKind::TryAgain
+                    | ServerErrorKind::MasterDown
+                    | ServerErrorKind::ReadOnly
+                    | ServerErrorKind::ClusterDown
+            )
+        )
 }
 
 fn map_redis_error(operation: &str, error: RedisError) -> Error {
@@ -624,10 +653,28 @@ mod tests {
 
     #[test]
     fn given_payload_format_values_should_select_variant() {
-        assert_eq!(PayloadFormat::from(None), PayloadFormat::Binary);
-        assert_eq!(PayloadFormat::from(Some("TEXT")), PayloadFormat::Text);
-        assert_eq!(PayloadFormat::from(Some("JSON")), PayloadFormat::Json);
-        assert_eq!(PayloadFormat::from(Some("surprise")), PayloadFormat::Binary);
+        assert_eq!(PayloadFormat::from_config(None), PayloadFormat::Binary);
+        assert_eq!(
+            PayloadFormat::from_config(Some("TEXT")),
+            PayloadFormat::Text
+        );
+        assert_eq!(
+            PayloadFormat::from_config(Some("JSON")),
+            PayloadFormat::Json
+        );
+        assert_eq!(
+            PayloadFormat::from_config(Some("surprise")),
+            PayloadFormat::Binary
+        );
+    }
+
+    #[test]
+    fn given_loading_server_reply_should_be_transient() {
+        let error = RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::BusyLoading),
+            "loading",
+        ));
+        assert!(is_transient_error(&error));
     }
 
     #[test]

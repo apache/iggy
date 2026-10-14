@@ -17,6 +17,7 @@ max_len = 100000
 max_retries = 3
 retry_delay = "1s"
 response_timeout = "5s"
+verbose_logging = false
 ```
 
 | Field               | Default  | Description                                                                                                        |
@@ -32,6 +33,7 @@ response_timeout = "5s"
 | `max_retries`       | `3`      | Total attempts for connection failures, including the first attempt and capped at 3                                |
 | `retry_delay`       | `1s`     | Base backoff delay                                                                                                 |
 | `response_timeout`  | `5s`     | Time to wait for Redis to answer one pipeline before the attempt counts as a transient failure                     |
+| `verbose_logging`   | `false`  | Logs every consumed batch at `info` instead of `debug`                                                             |
 
 Each entry holds a `payload` field plus the optional metadata fields. User headers are stored in a `headers` JSON object when `include_metadata` is `true`; raw values use base64 with an `iggy_header_encoding` marker.
 
@@ -47,8 +49,8 @@ With `deterministic_ids = false` Redis assigns IDs (`*`), all messages go to `st
 
 ## Errors
 
-Connection-level failures are retried with backoff. If the retries run out, `consume` returns an error and the sink does not write the remaining chunks of that call.
+Connection-level failures are retried with backoff. If the retries run out for one chunk, the sink still tries the remaining chunks of that call. `consume` then returns the first error.
 
 If Redis rejects some entries of a pipeline for another reason (for example `WRONGTYPE` or an out-of-memory error), the other entries of that pipeline are still written, and `consume` then returns an error. The connectors runtime logs the error and counts it, then carries on with the next batch. It does not redeliver the failed batch, so the rejected entries are not written.
 
-A message that fails the `text` or `json` payload check, or whose headers cannot be encoded, is skipped and counted in the `errors` total. The rest of the batch is still written. The sink skips these messages, like the runtime skips messages it cannot decode, because an error return would drop the valid messages of the same batch too. Skipped messages are logged at `error` with their offset.
+A message that fails the `text` or `json` payload check, or whose headers cannot be encoded, is not written and counted in the `errors` total. The rest of the batch is still written first, then `consume` returns an `InvalidRecordValue` error so that the runtime counts the failure. Rejected messages are logged at `error` with their offset.
