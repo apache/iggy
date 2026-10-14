@@ -522,19 +522,15 @@ impl FlussSource {
             Error::Connection(format!("failed to poll Apache Fluss: {error}"))
         })
     }
-}
 
-#[async_trait]
-impl Source for FlussSource {
-    async fn open(&mut self) -> Result<(), Error> {
+    async fn open_inner(&mut self) -> Result<(), Error> {
         let start = self.validate_config()?;
         if self.unreadable_state {
-            return Err(Error::InitError(format!(
-                "the saved state of {CONNECTOR_NAME} connector with ID: {} cannot be decoded. \
-                 Starting over could skip rows that were never delivered, so remove the state \
-                 file to start again from starting_offset",
-                self.id
-            )));
+            return Err(Error::InitError(
+                "the saved state cannot be decoded. Starting over could skip rows that were never \
+                 delivered, so remove the state file to start again from starting_offset"
+                    .to_owned(),
+            ));
         }
 
         let connection = FlussConnection::new(self.client_config())
@@ -654,6 +650,22 @@ impl Source for FlussSource {
             self.poll_interval
         );
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Source for FlussSource {
+    async fn open(&mut self) -> Result<(), Error> {
+        let opened = self.open_inner().await;
+        // The SDK reports only whether `open` failed and the runtime records a generic
+        // "Plugin initialization failed", so the reason reaches the operator through this log.
+        if let Err(error) = &opened {
+            error!(
+                "Failed to open {CONNECTOR_NAME} connector with ID: {}: {error}",
+                self.id
+            );
+        }
+        opened
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {

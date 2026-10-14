@@ -355,6 +355,49 @@ async fn given_column_under_the_metadata_prefix_should_fail_to_start(
     );
 }
 
+/// Starting over without the saved offsets could skip rows that were never delivered, so a
+/// state that does not decode keeps the source from opening and stays on disk for the operator.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/fluss/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_unreadable_state_when_runtime_restarts_should_refuse_to_open(
+    harness: &mut TestHarness,
+    _fixture: FlussSourceFixture,
+) {
+    let state_path = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .state_path()
+        .join(STATE_FILE);
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    let unreadable = b"not a MessagePack state".to_vec();
+    std::fs::write(&state_path, &unreadable).expect("Failed to write the state file");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let runtime = harness.connectors_runtime().expect("connectors runtime");
+    wait_for_source_status(&Client::new(), &runtime.http_url(), ConnectorStatus::Error).await;
+
+    // The runtime reports a generic initialization failure, so the reason is only in the log.
+    let (stdout, _) = runtime.collect_logs();
+    assert!(
+        stdout.contains("the saved state cannot be decoded"),
+        "The source should log why it refused to open"
+    );
+    assert_eq!(
+        std::fs::read(&state_path).expect("Failed to read the state file"),
+        unreadable,
+        "The unreadable state should be left in place"
+    );
+}
+
 fn test_payloads() -> Vec<String> {
     (0..TEST_ROW_COUNT)
         .map(|index| format!("fluss-payload-{index}"))
