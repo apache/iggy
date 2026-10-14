@@ -411,8 +411,8 @@ docker run -d --name akhq-iggy --network host \
 | ------ | ------ | --------------- |
 | -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
-| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection. ListOffsets with a bridge: partition loading, Iggy refused the read for now, or a lookup by time polled empty without proof that no record matches |
+| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce or ListOffsets with a bridge: missing topic or partition |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection. ListOffsets with a bridge: Iggy unreachable, partition loading, Iggy refused the read for now, or a lookup by time polled empty without proof that no record matches |
 | 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored). ListOffsets with a bridge: past the 100-topic cap, the request deadline passed, or a lookup by time ran out of its time |
 | 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |

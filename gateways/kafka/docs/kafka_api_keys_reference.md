@@ -270,8 +270,8 @@ Key new minimums:
 
 | Category | Count | Notes |
 | ---------- | :-----: | ------- |
-| 🔴 Bridge (data path) | 9 | Produce, Fetch, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
-| 🟠 Required Stub (client state machine) | 13 | ListOffsets, consumer group (8-14), CreateTopics, InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
+| 🔴 Bridge (data path) | 10 | Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
+| 🟠 Required Stub (client state machine) | 10 | Consumer group (10-14), CreateTopics (19), InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
 | Implemented | 2 | DescribeGroups (15), ListGroups (16) |
 | 🟡 Optional Stub (admin/observability) | 39 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
 | ❌ Unadvertised | 5 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28), and DeleteRecords (21). Absent from ApiVersions, so a conforming client never sends one |

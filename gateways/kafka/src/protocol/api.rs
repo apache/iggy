@@ -336,6 +336,9 @@ pub struct GatewayState {
     /// Per Kafka topic and partition, how long probes read it as loading. Fetch and `ListOffsets`
     /// share it, since every consumer sees the same probe.
     pub(crate) loading: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
+    /// proof that no record matches. Only the first of a spell warns.
+    pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
 }
@@ -374,6 +377,7 @@ impl GatewayState {
             produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
+            unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
         }
     }

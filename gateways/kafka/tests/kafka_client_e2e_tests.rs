@@ -1411,11 +1411,11 @@ fn now_millis() -> i64 {
     i64::try_from(elapsed.as_millis()).expect("now fits an i64")
 }
 
-/// `millis` as the `YYYY-MM-DDTHH:mm:SS.sss` that `--to-datetime` reads, in UTC, which is the
-/// client container's zone.
+/// `millis` as the `YYYY-MM-DDTHH:mm:SS.sssZ` that `--to-datetime` reads. The zone is explicit,
+/// so the client container's own zone does not matter.
 fn utc_datetime(millis: i64) -> String {
     let micros = u64::try_from(millis).expect("a time after the epoch") * 1000;
-    IggyTimestamp::from(micros).to_utc_string("%Y-%m-%dT%H:%M:%S%.3f")
+    IggyTimestamp::from(micros).to_utc_string("%Y-%m-%dT%H:%M:%S%.3fZ")
 }
 
 /// Runs `command` under the same GNU `timeout` bound as [`run_client`].
