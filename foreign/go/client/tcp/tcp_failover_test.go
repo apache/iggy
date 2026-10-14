@@ -646,7 +646,7 @@ func TestFailover_DoesNotSettleOnAnEndpointThatFailedTheHandshake(t *testing.T) 
 // cover fails the handshake -- which is every failover, once the addresses
 // differ.
 func TestFailover_UsesTheDialedEndpointAsTheServerName(t *testing.T) {
-	certificate, caPath := SelfSignedCert(t)
+	certificate, caPath := selfSignedCert(t)
 	survivor := listenVSR(t,
 		func(conn net.Conn) net.Conn {
 			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
@@ -671,7 +671,7 @@ func TestFailover_UsesTheDialedEndpointAsTheServerName(t *testing.T) {
 // every attempt, so it has to reach the caller instead of being redialed every
 // interval forever -- which is what the default unlimited retries did with it.
 func TestFailover_AConfigFaultEndsTheConnectInsteadOfRetryingForever(t *testing.T) {
-	certificate, _ := SelfSignedCert(t)
+	certificate, _ := selfSignedCert(t)
 	server := listenVSR(t,
 		func(conn net.Conn) net.Conn {
 			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
@@ -680,7 +680,7 @@ func TestFailover_AConfigFaultEndsTheConnectInsteadOfRetryingForever(t *testing.
 
 	// A CA the server's certificate was not signed by: no retry makes that
 	// certificate acceptable.
-	_, unrelatedCA := SelfSignedCert(t)
+	_, unrelatedCA := selfSignedCert(t)
 	client := NewIggyTcpClient(slog.New(slog.DiscardHandler),
 		WithServerAddress(server.address()),
 		WithTLS(WithTLSCAFile(unrelatedCA), WithTLSValidateCertificate(true)))
@@ -703,7 +703,7 @@ func TestFailover_AConfigFaultEndsTheConnectInsteadOfRetryingForever(t *testing.
 // one misconfigured node in the roster costs the client every endpoint behind
 // it, including the ones that are only down for a moment.
 func TestFailover_APlaintextEndpointDoesNotEndTheSweep(t *testing.T) {
-	certificate, _ := SelfSignedCert(t)
+	certificate, _ := selfSignedCert(t)
 	var accepted atomic.Int32
 	var survivor *testListener
 	survivor = listenVSR(t,
@@ -882,7 +882,7 @@ func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
 // registerMtx, the transaction blocked on the owner -- and callers pass a
 // context with no deadline, so nothing breaks it.
 func TestConnect_DoesNotWaitOnAnAttemptThatSignsIn(t *testing.T) {
-	certificate, _ := SelfSignedCert(t)
+	certificate, _ := selfSignedCert(t)
 	var survivor *testListener
 	survivor = listenVSR(t,
 		func(conn net.Conn) net.Conn {

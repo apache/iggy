@@ -20,13 +20,13 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"strings"
+	"testing"
+
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"strings"
-	"testing"
 )
 
 // streamDetailsBody builds a stream reply with no topics:
@@ -45,9 +45,9 @@ func streamDetailsBody(id uint32, name string) []byte {
 
 func TestCreateStream_DecodesTheCreatedStream(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationCreateStream,
-			append(ResultSection(), streamDetailsBody(9, "orders")...))
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationCreateStream,
+			append(resultSection(), streamDetailsBody(9, "orders")...))
 	})
 
 	stream, err := client.CreateStream(context.Background(), "orders")
@@ -58,21 +58,21 @@ func TestCreateStream_DecodesTheCreatedStream(t *testing.T) {
 
 func TestCreateStream_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationCreateStream, ResultSection())
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationCreateStream, resultSection())
 	})
 
 	for _, name := range []string{"", strings.Repeat("x", MaxStringLength+1)} {
 		_, err := client.CreateStream(context.Background(), name)
 		assert.ErrorIs(t, err, ierror.ErrInvalidStreamName, "name %q", name)
 	}
-	assert.Empty(t, server.Recorded())
+	assert.Empty(t, server.recorded())
 }
 
 func TestGetStream_ReportsAMissingStreamAsATypedError(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationNonReplicated, nil)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, nil)
 	})
 
 	_, err := client.GetStream(context.Background(), numericIdentifier(t, 42))
@@ -82,8 +82,8 @@ func TestGetStream_ReportsAMissingStreamAsATypedError(t *testing.T) {
 func TestGetStreams_DecodesTheRoster(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	body := append(streamDetailsBody(1, "orders"), streamDetailsBody(2, "billing")...)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationNonReplicated, body)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, body)
 	})
 
 	streams, err := client.GetStreams(context.Background())
@@ -95,21 +95,21 @@ func TestGetStreams_DecodesTheRoster(t *testing.T) {
 
 func TestUpdateStream_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationUpdateStream, ResultSection())
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationUpdateStream, resultSection())
 	})
 
 	for _, name := range []string{"", strings.Repeat("x", MaxStringLength+1)} {
 		err := client.UpdateStream(context.Background(), numericIdentifier(t, 1), name)
 		assert.ErrorIs(t, err, ierror.ErrInvalidStreamName, "name %q", name)
 	}
-	assert.Empty(t, server.Recorded())
+	assert.Empty(t, server.recorded())
 }
 
 func TestUpdateStream_AcceptsACommittedRename(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationUpdateStream, ResultSection())
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationUpdateStream, resultSection())
 	})
 
 	assert.NoError(t, client.UpdateStream(
@@ -118,14 +118,14 @@ func TestUpdateStream_AcceptsACommittedRename(t *testing.T) {
 
 func TestCreatePartitions_InvalidatesTheCachedPartitionCount(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, read Request) []byte {
-		switch read.Operation() {
+	serve(serverConn, func(_ int, read request) []byte {
+		switch read.operation() {
 		case vsr.OperationCreatePartitions:
-			return ReplyFrame(vsr.OperationCreatePartitions, ResultSection())
+			return replyFrame(vsr.OperationCreatePartitions, resultSection())
 		case vsr.OperationDeletePartitions:
-			return ReplyFrame(vsr.OperationDeletePartitions, ResultSection())
+			return replyFrame(vsr.OperationDeletePartitions, resultSection())
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
@@ -146,8 +146,8 @@ func TestCreatePartitions_InvalidatesTheCachedPartitionCount(t *testing.T) {
 
 func TestDeleteTopic_DropsTheTopicCacheEntry(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationDeleteTopic, ResultSection())
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationDeleteTopic, resultSection())
 	})
 
 	streamId := numericIdentifier(t, 1)

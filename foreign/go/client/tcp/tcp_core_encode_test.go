@@ -20,12 +20,13 @@ package tcp
 import (
 	"bytes"
 	"errors"
+	"testing"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 // marshalOnlyCmd implements command.Command without AppendBinary; it forces
@@ -72,7 +73,7 @@ func TestAppendCommandFrame_AppenderPathMatchesTheFallback(t *testing.T) {
 	assert.Equal(t, want[vsr.HeaderSize:], got[vsr.HeaderSize:],
 		"the fast path diverges from the MarshalBinary fallback")
 	assert.Len(t, got, vsr.HeaderSize+len(body),
-		"the frame is the reserved prologue followed by the Payload")
+		"the frame is the reserved prologue followed by the payload")
 }
 
 func TestAppendCommandFrame_FallbackPropagatesTheMarshalError(t *testing.T) {
@@ -99,7 +100,7 @@ func TestRequestBufPool_AcquireReleaseRoundTrip(t *testing.T) {
 	require.NotNil(t, bp)
 	require.NotNil(t, *bp)
 	assert.GreaterOrEqual(t, cap(*bp), vsr.HeaderSize,
-		"a fresh buffer already holds the Header prologue")
+		"a fresh buffer already holds the header prologue")
 
 	*bp = append(*bp, []byte("hello")...)
 	releaseRequestBuf(bp)

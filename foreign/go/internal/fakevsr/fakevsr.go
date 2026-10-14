@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Package fakevsr provides the fake VSR server the Go SDK tests drive a
-// full connect-and-login flow against, without a real server. Both the
-// transport tests and the connection-string tests import it, so the wire
-// offsets and the reply builders live in one place instead of drifting
-// copies. It is an internal package, so it never reaches SDK users.
+// Package fakevsr provides the fake VSR server the connection-string
+// tests drive a full connect-and-login flow against, without a real
+// server, and the shared certificate helper the transport tests mint
+// their throwaway TLS certificates with. It is an internal package, so
+// it never reaches SDK users.
 package fakevsr
 
 import (
@@ -51,7 +51,6 @@ import (
 const (
 	FrameOffsetSize      = 48
 	FrameOffsetCommand   = 60
-	FrameOffsetClient    = 128
 	FrameOffsetRequest   = 168
 	FrameOffsetOperation = 176
 	FrameOffsetSession   = 184
@@ -76,11 +75,6 @@ func (r Request) Operation() vsr.Operation {
 // Code reads the request command code.
 func (r Request) Code() uint32 {
 	return binary.LittleEndian.Uint32(r.Header[FrameOffsetReserved:])
-}
-
-// RequestID reads the request correlation identifier.
-func (r Request) RequestID() uint64 {
-	return binary.LittleEndian.Uint64(r.Header[FrameOffsetRequest:])
 }
 
 // SessionID reads the logical session the request carries.
@@ -117,17 +111,6 @@ func StatusReplyFrame(operation vsr.Operation, status uint32, body []byte) []byt
 	binary.LittleEndian.PutUint32(frame[ReplyFrameOffsetStatus:], status)
 	frame[ReplyFrameOffsetOperation] = byte(operation)
 	copy(frame[vsr.HeaderSize:], body)
-	return frame
-}
-
-// EvictionFrame builds a header-only session-terminal frame.
-func EvictionFrame(reason vsr.EvictionReason, version, versionMin uint32) []byte {
-	frame := make([]byte, vsr.HeaderSize)
-	binary.LittleEndian.PutUint32(frame[FrameOffsetSize:], vsr.HeaderSize)
-	frame[FrameOffsetCommand] = 13
-	binary.LittleEndian.PutUint32(frame[144:], version)
-	binary.LittleEndian.PutUint32(frame[148:], versionMin)
-	frame[255] = byte(reason)
 	return frame
 }
 
@@ -174,6 +157,7 @@ func ClusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []
 			role = iggcon.RoleLeader
 		}
 		metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{
+			ReplicaID: uint8(index),
 			Name:      host,
 			IP:        host,
 			Role:      role,
@@ -204,34 +188,6 @@ type Server struct {
 	requests []Request
 	listener net.Listener
 	done     chan struct{}
-}
-
-// Serve reads frames off conn until it closes, answering each with the
-// frame the handler returns. A nil answer leaves the request unanswered.
-func Serve(conn net.Conn, handler func(index int, read Request) []byte) *Server {
-	server := &Server{done: make(chan struct{})}
-	go func() {
-		defer close(server.done)
-		for index := 0; ; index++ {
-			read, err := ReadRequest(conn)
-			if err != nil {
-				return
-			}
-			server.mtx.Lock()
-			server.requests = append(server.requests, read)
-			server.mtx.Unlock()
-
-			answer := handler(index, read)
-			if answer == nil {
-				continue
-			}
-			EchoReplyRequest(answer, read)
-			if _, err := conn.Write(answer); err != nil {
-				return
-			}
-		}
-	}()
-	return server
 }
 
 // Listen answers frames the way a single-node Iggy server does, so a test
@@ -289,45 +245,6 @@ func Listen(t *testing.T, wrap func(net.Conn) net.Conn) *Server {
 		}
 	}()
 	return server
-}
-
-// FrameOffsetContext is the incarnation-slot offset inside a request
-// header, which a few transport tests read directly.
-const FrameOffsetContext = 200
-
-// PartitionID reads the resolved partition out of a recorded SendMessages
-// payload: [metadata length u32][stream id][topic id][partitioning], where
-// the identifiers and the partitioning are each
-// [kind u8][length u8][value]. The frame carries no routing namespace, so
-// the payload is the only place the client partitioning decision is
-// observable.
-func (r Request) PartitionID(t *testing.T) uint32 {
-	t.Helper()
-
-	cursor := 4
-	for range 2 {
-		require.Greater(t, len(r.Payload), cursor+1)
-		cursor += 2 + int(r.Payload[cursor+1])
-	}
-	require.Greater(t, len(r.Payload), cursor+1)
-	require.Equal(t, byte(iggcon.PartitionIdKind), r.Payload[cursor],
-		"the client resolves every strategy to an explicit partition")
-	require.Equal(t, byte(4), r.Payload[cursor+1])
-	require.GreaterOrEqual(t, len(r.Payload), cursor+6)
-	return binary.LittleEndian.Uint32(r.Payload[cursor+2:])
-}
-
-// ClientID reads the request header client identifier.
-func (r Request) ClientID() vsr.ClientID {
-	return vsr.ClientID{
-		Lo: binary.LittleEndian.Uint64(r.Header[FrameOffsetClient:]),
-		Hi: binary.LittleEndian.Uint64(r.Header[FrameOffsetClient+8:]),
-	}
-}
-
-// Incarnation reads the request header incarnation.
-func (r Request) Incarnation() uint64 {
-	return binary.LittleEndian.Uint64(r.Header[FrameOffsetContext:])
 }
 
 // Recorded returns the requests the server read off the wire.

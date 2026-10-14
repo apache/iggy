@@ -20,13 +20,13 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"strings"
+	"testing"
+
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"strings"
-	"testing"
 )
 
 // consumerGroupBody builds one wire consumer group:
@@ -44,8 +44,8 @@ func TestGetConsumerGroups_DecodesTheRoster(t *testing.T) {
 	body := append(
 		consumerGroupBody(1, 3, 2, "billing"),
 		consumerGroupBody(2, 1, 0, "audit")...)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationNonReplicated, body)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, body)
 	})
 
 	groups, err := client.GetConsumerGroups(context.Background(),
@@ -59,8 +59,8 @@ func TestGetConsumerGroups_DecodesTheRoster(t *testing.T) {
 
 func TestGetConsumerGroup_ReportsAMissingGroupAsATypedError(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationNonReplicated, nil)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, nil)
 	})
 
 	_, err := client.GetConsumerGroup(context.Background(),
@@ -70,8 +70,8 @@ func TestGetConsumerGroup_ReportsAMissingGroupAsATypedError(t *testing.T) {
 
 func TestCreateConsumerGroup_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationCreateConsumerGroup, ResultSection())
+	server := serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationCreateConsumerGroup, resultSection())
 	})
 
 	for _, name := range []string{"", strings.Repeat("x", MaxStringLength+1)} {
@@ -79,14 +79,14 @@ func TestCreateConsumerGroup_RejectsAnInvalidNameWithoutWriting(t *testing.T) {
 			numericIdentifier(t, 1), numericIdentifier(t, 2), name)
 		assert.ErrorIs(t, err, ierror.ErrInvalidConsumerGroupName, "name %q", name)
 	}
-	assert.Empty(t, server.Recorded(), "an invalid name never reaches the wire")
+	assert.Empty(t, server.recorded(), "an invalid name never reaches the wire")
 }
 
 func TestCreateConsumerGroup_DecodesTheCreatedGroup(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationCreateConsumerGroup,
-			append(ResultSection(), consumerGroupBody(7, 3, 0, "billing")...))
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationCreateConsumerGroup,
+			append(resultSection(), consumerGroupBody(7, 3, 0, "billing")...))
 	})
 
 	group, err := client.CreateConsumerGroup(context.Background(),
@@ -98,8 +98,8 @@ func TestCreateConsumerGroup_DecodesTheCreatedGroup(t *testing.T) {
 
 func TestDeleteConsumerGroup_MarksTheGroupAsLeft(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationDeleteConsumerGroup, ResultSection())
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationDeleteConsumerGroup, resultSection())
 	})
 
 	streamId := numericIdentifier(t, 1)
@@ -114,8 +114,8 @@ func TestDeleteConsumerGroup_MarksTheGroupAsLeft(t *testing.T) {
 
 func TestSyncConsumerGroup_ReportsANonMemberAsATypedError(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationNonReplicated, nil)
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, nil)
 	})
 
 	assignment, err := client.SyncConsumerGroup(context.Background(),
@@ -126,8 +126,8 @@ func TestSyncConsumerGroup_ReportsANonMemberAsATypedError(t *testing.T) {
 
 func TestSyncConsumerGroup_KeepsAMemberWithoutPartitionsNonNil(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ReplyFrame(vsr.OperationNonReplicated, assignmentBody(6))
+	serve(serverConn, func(_ int, _ request) []byte {
+		return replyFrame(vsr.OperationNonReplicated, assignmentBody(6))
 	})
 
 	assignment, err := client.SyncConsumerGroup(context.Background(),

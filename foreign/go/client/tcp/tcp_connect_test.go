@@ -20,32 +20,41 @@ package tcp
 import (
 	"context"
 	"crypto/tls"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	ierror "github.com/apache/iggy/foreign/go/errors"
-	"github.com/apache/iggy/foreign/go/internal/command"
-	. "github.com/apache/iggy/foreign/go/internal/fakevsr"
-	"github.com/apache/iggy/foreign/go/internal/vsr"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
+	"github.com/apache/iggy/foreign/go/internal/fakevsr"
+	"github.com/apache/iggy/foreign/go/internal/vsr"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// selfSignedCert mints the throwaway loopback certificate through the
+// shared fakevsr helper, so the transport suite and the connection-string
+// suite cannot drift apart.
+func selfSignedCert(t *testing.T) (tls.Certificate, string) {
+	t.Helper()
+	return fakevsr.SelfSignedCert(t)
+}
 
 // testListener is a VSR server on a loopback port. The handler is called with
 // the zero-based index of the accepted connection and of the frame within it.
 type testListener struct {
 	listener net.Listener
 	mtx      sync.Mutex
-	requests []Request
+	requests []request
 	accepted int
 }
 
 func listenVSR(t *testing.T, wrap func(net.Conn) net.Conn,
-	handler func(connection, index int, read Request) []byte,
+	handler func(connection, index int, read request) []byte,
 ) *testListener {
 	t.Helper()
 
@@ -72,7 +81,7 @@ func listenVSR(t *testing.T, wrap func(net.Conn) net.Conn,
 			go func(conn net.Conn, connection int) {
 				defer func() { _ = conn.Close() }()
 				for index := 0; ; index++ {
-					read, err := ReadRequest(conn)
+					read, err := readRequest(conn)
 					if err != nil {
 						return
 					}
@@ -84,7 +93,7 @@ func listenVSR(t *testing.T, wrap func(net.Conn) net.Conn,
 					if answer == nil {
 						return
 					}
-					EchoReplyRequest(answer, read)
+					echoReplyRequest(answer, read)
 					if _, err := conn.Write(answer); err != nil {
 						return
 					}
@@ -97,10 +106,10 @@ func listenVSR(t *testing.T, wrap func(net.Conn) net.Conn,
 
 func (s *testListener) address() string { return s.listener.Addr().String() }
 
-func (s *testListener) recorded() []Request {
+func (s *testListener) recorded() []request {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	return append([]Request(nil), s.requests...)
+	return append([]request(nil), s.requests...)
 }
 
 func (s *testListener) connections() int {
@@ -123,18 +132,18 @@ func newDialingClient(t *testing.T, address string, options ...Option) *IggyTcpC
 
 // singleNodeHandler answers cluster metadata for a one-node roster and signs
 // in any register it sees, so tests can focus on the flow under test.
-func singleNodeHandler(t *testing.T, address func() string) func(int, int, Request) []byte {
+func singleNodeHandler(t *testing.T, address func() string) func(int, int, request) []byte {
 	t.Helper()
-	return func(_, _ int, read Request) []byte {
+	return func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 0, address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 128)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 128)
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	}
 }
@@ -149,15 +158,15 @@ func TestConnect_SignsInAndThenSettlesLeadership(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 2)
-	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation(),
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation(),
 		"the roster read is auth-gated, so the sign-in comes first")
-	assert.Zero(t, recorded[0].Code(), "only a non-replicated frame carries the code")
-	assert.Zero(t, recorded[0].RequestID(), "a register is always Request zero")
-	assert.Zero(t, recorded[0].SessionID())
+	assert.Zero(t, recorded[0].code(), "only a non-replicated frame carries the code")
+	assert.Zero(t, recorded[0].requestID(), "a register is always request zero")
+	assert.Zero(t, recorded[0].sessionID())
 
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].Code(),
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code(),
 		"leadership is settled after the sign-in")
-	assert.Equal(t, uint64(128), recorded[1].SessionID(), "the roster read is authenticated")
+	assert.Equal(t, uint64(128), recorded[1].sessionID(), "the roster read is authenticated")
 
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(128), client.session.SessionID())
@@ -174,9 +183,9 @@ func TestConnect_SignsInWithAPersonalAccessToken(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 2)
-	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation())
-	assert.Contains(t, string(recorded[0].Payload), "token-value")
-	assert.Contains(t, string(recorded[0].Payload), vsr.SDKName)
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation())
+	assert.Contains(t, string(recorded[0].payload), "token-value")
+	assert.Contains(t, string(recorded[0].payload), vsr.SDKName)
 }
 
 func TestConnect_SendsNothingWithoutAutoLogin(t *testing.T) {
@@ -198,16 +207,16 @@ func TestConnect_RedirectsToTheLeaderAfterSigningIn(t *testing.T) {
 
 	// The follower completes the sign-in (the server forwards the register to
 	// the primary) and only then reports the leader elsewhere.
-	follower := listenVSR(t, nil, func(_, _ int, read Request) []byte {
+	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 1, "127.0.0.1:1", leader.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 512)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, "127.0.0.1:1", leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 512)
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
@@ -217,14 +226,14 @@ func TestConnect_RedirectsToTheLeaderAfterSigningIn(t *testing.T) {
 
 	onFollower := follower.recorded()
 	require.Len(t, onFollower, 2, "the follower answered the sign-in and the roster")
-	assert.Equal(t, vsr.OperationRegister, onFollower[0].Operation())
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), onFollower[1].Code())
+	assert.Equal(t, vsr.OperationRegister, onFollower[0].operation())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), onFollower[1].code())
 	assert.Equal(t, leader.address(), client.currentServerAddress)
 
 	onLeader := leader.recorded()
 	require.Len(t, onLeader, 2, "the sign-in replay is followed by a leader re-check")
-	assert.Equal(t, uint32(command.BindSessionCode), onLeader[0].Code())
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), onLeader[1].Code())
+	assert.Equal(t, uint32(command.BindSessionCode), onLeader[0].code())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), onLeader[1].code())
 	assert.True(t, client.session.Bound())
 	assert.Equal(t, uint64(512), client.session.SessionID(),
 		"the leader resumes the original session")
@@ -235,30 +244,30 @@ func TestConnect_RechecksLeadershipAfterTheRedirectedSignIn(t *testing.T) {
 	leader = listenVSR(t, nil, singleNodeHandler(t, func() string { return leader.address() }))
 
 	var intermediate *testListener
-	intermediate = listenVSR(t, nil, func(_, _ int, read Request) []byte {
+	intermediate = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 1, intermediate.address(), leader.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 256)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, intermediate.address(), leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 256)
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
 	var follower *testListener
-	follower = listenVSR(t, nil, func(_, _ int, read Request) []byte {
+	follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 1, follower.address(), intermediate.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 512)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, follower.address(), intermediate.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 512)
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
@@ -286,19 +295,19 @@ func TestConnect_KeepsTheConnectionWhenTheRosterHasOneNode(t *testing.T) {
 
 func TestExchange_ResumesBeforeReplayingANonReplicatedRequest(t *testing.T) {
 	var server *testListener
-	server = listenVSR(t, nil, func(connection, index int, read Request) []byte {
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 0, server.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, uint64(128+connection))
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, uint64(128+connection))
 		case connection == 0 && index == 2:
 			// Drop the first ping to force the reconnect path.
 			return nil
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
@@ -312,32 +321,32 @@ func TestExchange_ResumesBeforeReplayingANonReplicatedRequest(t *testing.T) {
 	recorded := server.recorded()
 	require.Len(t, recorded, 6)
 
-	assert.Equal(t, uint32(command.PingCode), recorded[2].Code(), "the dropped attempt")
-	assert.Equal(t, uint32(command.BindSessionCode), recorded[3].Code(),
-		"the replay resumes before it repeats the Request")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[4].Code())
-	assert.Equal(t, uint32(command.PingCode), recorded[5].Code())
+	assert.Equal(t, uint32(command.PingCode), recorded[2].code(), "the dropped attempt")
+	assert.Equal(t, uint32(command.BindSessionCode), recorded[3].code(),
+		"the replay resumes before it repeats the request")
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[4].code())
+	assert.Equal(t, uint32(command.PingCode), recorded[5].code())
 
-	assert.Equal(t, recorded[2].ClientID(), recorded[5].ClientID(),
+	assert.Equal(t, recorded[2].clientID(), recorded[5].clientID(),
 		"a replacement connection preserves the client identity")
 	assert.Equal(t, uint64(128), client.session.SessionID())
 }
 
 func TestExchange_RefusesToReplayAReplicatedRequestWithAnUnknownOutcome(t *testing.T) {
 	var server *testListener
-	server = listenVSR(t, nil, func(connection, index int, read Request) []byte {
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 0, server.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, uint64(128+connection))
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, uint64(128+connection))
 		case connection == 0 && index == 2:
 			// Drop the reply so the stream creation's outcome is unknown.
 			return nil
 		default:
-			return ReplyFrame(vsr.OperationCreateStream, ResultSection())
+			return replyFrame(vsr.OperationCreateStream, resultSection())
 		}
 	})
 
@@ -352,37 +361,37 @@ func TestExchange_RefusesToReplayAReplicatedRequestWithAnUnknownOutcome(t *testi
 	assert.Equal(t, 1, server.connections(), "no reconnect was attempted")
 	recorded := server.recorded()
 	require.Len(t, recorded, 3)
-	assert.Equal(t, vsr.OperationCreateStream, recorded[2].Operation(),
-		"the Request reached the wire exactly once")
+	assert.Equal(t, vsr.OperationCreateStream, recorded[2].operation(),
+		"the request reached the wire exactly once")
 }
 
 func TestExchange_ReconnectsThroughAKnownFollowerAfterTheLeaderDies(t *testing.T) {
 	var leaderFailed atomic.Bool
 	var follower, leader *testListener
-	follower = listenVSR(t, nil, func(_, _ int, read Request) []byte {
+	follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
 			leaderIndex := 1
 			if leaderFailed.Load() {
 				leaderIndex = 0
 			}
-			return ClusterMetadataFrame(t, leaderIndex, follower.address(), leader.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 256)
+			return clusterMetadataFrame(t, leaderIndex, follower.address(), leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 256)
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
-	leader = listenVSR(t, nil, func(_, _ int, read Request) []byte {
+	leader = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 1, follower.address(), leader.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 128)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, follower.address(), leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 128)
 		default:
 			leaderFailed.Store(true)
 			_ = leader.listener.Close()
@@ -401,22 +410,22 @@ func TestExchange_ReconnectsThroughAKnownFollowerAfterTheLeaderDies(t *testing.T
 	assert.True(t, client.session.Bound())
 	recorded := follower.recorded()
 	require.Len(t, recorded, 5)
-	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation(),
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation(),
 		"the dialed follower completed the initial sign-in")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].Code())
-	assert.Equal(t, uint32(command.BindSessionCode), recorded[2].Code(),
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
+	assert.Equal(t, uint32(command.BindSessionCode), recorded[2].code(),
 		"the reconnect resumed the retained session on the surviving node")
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].Code())
-	assert.Equal(t, uint32(command.PingCode), recorded[4].Code())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[3].code())
+	assert.Equal(t, uint32(command.PingCode), recorded[4].code())
 }
 
 func TestConnect_DropsTheConnectionWhenAutomaticSignInFails(t *testing.T) {
 	var server *testListener
-	server = listenVSR(t, nil, func(_, _ int, read Request) []byte {
-		if read.Code() == uint32(command.GetClusterMetadataCode) {
-			return ClusterMetadataFrame(t, 0, server.address())
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, server.address())
 		}
-		return EvictionFrame(vsr.EvictionInvalidCredentials, 0, 0)
+		return evictionFrame(vsr.EvictionInvalidCredentials, 0, 0)
 	})
 
 	client := newDialingClient(t, server.address(),
@@ -432,13 +441,13 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 	var server *testListener
 	registers := 0
 	var mtx sync.Mutex
-	server = listenVSR(t, nil, func(connection, index int, read Request) []byte {
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 0, server.address())
-		case read.Operation() == vsr.OperationRegister:
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.operation() == vsr.OperationRegister:
 			mtx.Lock()
 			registers++
 			count := registers
@@ -447,9 +456,9 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 			if connection == 0 && count == 2 {
 				return nil
 			}
-			return RegisterReplyFrame(7, uint64(128+connection))
+			return registerReplyFrame(7, uint64(128+connection))
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
@@ -463,7 +472,7 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 
 	var signIns int
 	for _, recorded := range server.recorded() {
-		if recorded.Operation() == vsr.OperationRegister {
+		if recorded.operation() == vsr.OperationRegister {
 			signIns++
 		}
 	}
@@ -477,7 +486,7 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 	require.NoError(t, client.Connect(context.Background()))
 	signIns = 0
 	for _, recorded := range server.recorded() {
-		if recorded.Operation() == vsr.OperationRegister {
+		if recorded.operation() == vsr.OperationRegister {
 			signIns++
 		}
 	}
@@ -486,11 +495,11 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 }
 
 func TestExchange_FailsFastWhenAutoLoginIsOff(t *testing.T) {
-	server := listenVSR(t, nil, func(_, index int, read Request) []byte {
+	server := listenVSR(t, nil, func(_, index int, read request) []byte {
 		if index == 0 {
 			return nil
 		}
-		return ReplyFrame(vsr.OperationNonReplicated, nil)
+		return replyFrame(vsr.OperationNonReplicated, nil)
 	})
 
 	client := newDialingClient(t, server.address())
@@ -505,18 +514,18 @@ func TestExchange_FailsFastWhenAutoLoginIsOff(t *testing.T) {
 
 func TestLogoutUser_ResetsTheSessionSoTheNextSignInIsANewIdentity(t *testing.T) {
 	var server *testListener
-	server = listenVSR(t, nil, func(_, _ int, read Request) []byte {
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
-		case read.Code() == uint32(command.BindSessionCode):
-			return BindReplyFrame(7, read.SessionID())
-		case read.Code() == uint32(command.GetClusterMetadataCode):
-			return ClusterMetadataFrame(t, 0, server.address())
-		case read.Operation() == vsr.OperationRegister:
-			return RegisterReplyFrame(7, 128)
-		case read.Operation() == vsr.OperationLogout:
-			return ReplyFrame(vsr.OperationLogout, nil)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(7, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 128)
+		case read.operation() == vsr.OperationLogout:
+			return replyFrame(vsr.OperationLogout, nil)
 		default:
-			return ReplyFrame(vsr.OperationNonReplicated, nil)
+			return replyFrame(vsr.OperationNonReplicated, nil)
 		}
 	})
 
@@ -530,18 +539,18 @@ func TestLogoutUser_ResetsTheSessionSoTheNextSignInIsANewIdentity(t *testing.T) 
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 5)
-	assert.Equal(t, vsr.OperationLogout, recorded[2].Operation(),
+	assert.Equal(t, vsr.OperationLogout, recorded[2].operation(),
 		"a re-login logs the live session out first")
-	assert.Equal(t, vsr.OperationRegister, recorded[3].Operation())
-	assert.NotEqual(t, first, recorded[3].ClientID(),
+	assert.Equal(t, vsr.OperationRegister, recorded[3].operation())
+	assert.NotEqual(t, first, recorded[3].clientID(),
 		"the re-login presents a new client identity")
 	assert.True(t, client.session.Bound())
 }
 
 func TestHandleLeaderRedirection_StopsAtTheRedirectBudget(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	Serve(serverConn, func(_ int, _ Request) []byte {
-		return ClusterMetadataFrame(t, 0, "10.0.0.1:8090", "10.0.0.2:8090")
+	serve(serverConn, func(_ int, _ request) []byte {
+		return clusterMetadataFrame(t, 0, "10.0.0.1:8090", "10.0.0.2:8090")
 	})
 	for range iggcon.MaxLeaderRedirects {
 		client.leaderRedirectionState.IncrementRedirect("10.0.0.1:8090")
@@ -585,7 +594,7 @@ func TestConnect_UnwindsWhenEveryReadFailsInsideTheConnectFlow(t *testing.T) {
 }
 
 func TestConnect_ExchangesOverTLS(t *testing.T) {
-	certificate, caPath := SelfSignedCert(t)
+	certificate, caPath := selfSignedCert(t)
 
 	var server *testListener
 	server = listenVSR(t,
@@ -606,9 +615,9 @@ func TestConnect_ExchangesOverTLS(t *testing.T) {
 
 	recorded := server.recorded()
 	require.Len(t, recorded, 3)
-	assert.Equal(t, vsr.OperationRegister, recorded[0].Operation())
-	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].Code())
-	assert.Equal(t, uint32(command.PingCode), recorded[2].Code())
+	assert.Equal(t, vsr.OperationRegister, recorded[0].operation())
+	assert.Equal(t, uint32(command.GetClusterMetadataCode), recorded[1].code())
+	assert.Equal(t, uint32(command.PingCode), recorded[2].code())
 	assert.True(t, client.session.Bound())
 }
 
