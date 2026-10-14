@@ -96,7 +96,7 @@ impl IggyBenchDashboardGithubClient {
 
         for i in 0..zip.len() {
             let mut file = zip.by_index(i)?;
-            let outpath = output_dir.join(file.mangled_name());
+            let outpath = output_dir.join(file.mangled_name()?);
 
             if file.is_dir() {
                 std::fs::create_dir_all(&outpath)?;
