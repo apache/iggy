@@ -462,6 +462,7 @@ mod tests {
             send_slot: Arc::new(Semaphore::new(1)),
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            lookup_client: LazyClient::default(),
             offset_pool: OffsetPool {
                 slots: commit_clients
                     .into_iter()

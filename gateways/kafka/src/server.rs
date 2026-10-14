@@ -157,6 +157,8 @@ pub struct GatewayConfig {
     /// Four by default, which stays under the shard count of any node with 16 or fewer physical
     /// cores. A default above that is no bound at all on the deployments most likely to run one
     /// gateway in front of one node; a larger node raises it deliberately.
+    ///
+    /// Client certificate user lookups get the same number of slots again, separate from these.
     pub max_concurrent_authentications: usize,
 }
 
@@ -315,6 +317,9 @@ struct SharedAuth {
     /// Looks up the Iggy user a client certificate names. The bridge, unless a test swaps one in.
     resolver: Option<Arc<dyn PrincipalResolver>>,
     slots: Semaphore,
+    /// Certificate user lookups, kept apart from `slots` so a burst of either kind cannot starve
+    /// the other of its budget.
+    lookup_slots: Semaphore,
     failed_logins: FailedLoginThrottle,
 }
 
@@ -328,6 +333,7 @@ impl SharedAuth {
             authenticator,
             resolver,
             slots: Semaphore::new(max_concurrent),
+            lookup_slots: Semaphore::new(max_concurrent),
             failed_logins: FailedLoginThrottle::default(),
         }
     }
@@ -795,6 +801,7 @@ struct ConnectionContext<'a> {
     authenticator: Option<&'a dyn SaslAuthenticator>,
     resolver: Option<&'a dyn PrincipalResolver>,
     auth_slots: &'a Semaphore,
+    lookup_slots: &'a Semaphore,
     failed_logins: &'a FailedLoginThrottle,
     peer: &'a SocketAddr,
     cancel: &'a CancellationToken,
@@ -962,6 +969,7 @@ where
         authenticator: shared_auth.authenticator.as_deref(),
         resolver: shared_auth.resolver.as_deref(),
         auth_slots: &shared_auth.slots,
+        lookup_slots: &shared_auth.lookup_slots,
         failed_logins: &shared_auth.failed_logins,
         peer: &peer,
         cancel: &cancel,
@@ -1056,11 +1064,17 @@ async fn resolve_certificate_principal(
         error!(%peer, "a client certificate named a principal but nothing can look it up");
         return None;
     };
-    // The lookup is an Iggy call per handshake, so it shares the authentication slots with SASL.
-    let lookup = within_auth_budget(ctx, "certificate identity lookup", |slot| async move {
-        let _slot = slot;
-        resolver.resolve(username).await
-    });
+    // The lookup is an Iggy call per handshake, so it is bounded like a SASL login, but in slots
+    // of its own: it costs no password hash.
+    let lookup = within_auth_budget(
+        ctx,
+        ctx.lookup_slots,
+        "certificate identity lookup",
+        |slot| async move {
+            let _slot = slot;
+            resolver.resolve(username).await
+        },
+    );
     let outcome = tokio::select! {
         () = ctx.cancel.cancelled() => {
             debug!(%peer, "certificate identity lookup abandoned by shutdown");
@@ -1134,7 +1148,7 @@ async fn authenticate_token(
             debug!(%peer, "SASL authentication abandoned by shutdown");
             return (HandleOutcome::Close, None);
         }
-        verified = within_auth_budget(ctx, "SASL authentication", |slot| {
+        verified = within_auth_budget(ctx, ctx.auth_slots, "SASL authentication", |slot| {
             authenticator.authenticate(&credentials, slot)
         }) => verified,
     };
@@ -1226,8 +1240,8 @@ fn describe_acls(
     }
 }
 
-/// Waits for an authentication slot, then runs `work` holding it, each within the
-/// pre-authentication budget. `None` means a budget ran out.
+/// Waits for one of `slots`, then runs `work` holding it, each within the pre-authentication
+/// budget. `None` means a budget ran out.
 ///
 /// Two budgets rather than one shared deadline. The wait needs its own bound so a queued
 /// connection cannot hold a `max_connections` permit for as long as the backlog takes to drain,
@@ -1237,6 +1251,7 @@ fn describe_acls(
 /// and hand its slot to the next one while Iggy is still working.
 async fn within_auth_budget<'a, T, Work, Fut>(
     ctx: &ConnectionContext<'a>,
+    slots: &'a Semaphore,
     operation: &'static str,
     work: Work,
 ) -> Option<T>
@@ -1246,7 +1261,7 @@ where
 {
     let peer = ctx.peer;
     let budget = ctx.config.pre_auth_timeout;
-    let Ok(acquired) = timeout(budget, ctx.auth_slots.acquire()).await else {
+    let Ok(acquired) = timeout(budget, slots.acquire()).await else {
         warn!(%peer, operation, "no authentication slot came free within the pre-authentication budget");
         return None;
     };

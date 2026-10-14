@@ -25,7 +25,7 @@ use iggy::prelude::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
 use crate::bridge::config::IggyBridgeConfig;
@@ -117,8 +117,8 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 /// Owns the connected `IggyClient`s and resolves Kafka topics against them.
 ///
 /// One lockstep client serves Produce, Metadata and `CreateTopics` for every Kafka connection, so
-/// those Iggy calls run one at a time. Topic probes use a client of their own, Fetch polls one per
-/// read slot, and offset calls two per offset slot. A Produce pool is a TODO in `docs/SCOPE.md`.
+/// those Iggy calls run one at a time. Topic probes and certificate user lookups each use a client
+/// of their own, Fetch polls one per read slot, and offset calls two per offset slot. A Produce pool is a TODO in `docs/SCOPE.md`.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -131,6 +131,8 @@ pub struct IggyBridge {
     fetch_pool: Arc<FetchPool>,
     /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
     probe_client: LazyClient,
+    /// The client of every certificate user lookup. See `resolve`.
+    lookup_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
 }
@@ -170,6 +172,7 @@ impl IggyBridge {
             send_slot: Arc::new(Semaphore::new(1)),
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
         })
     }
@@ -226,10 +229,12 @@ impl IggyBridge {
     pub async fn close(self) -> Result<(), BridgeError> {
         let fetch_clients = self.fetch_pool.close().await;
         let probe_client = self.probe_client.close().await;
+        let lookup_client = self.lookup_client.close().await;
         let offset_clients = self.offset_pool.close().await;
         let shared_client = with_request_timeout(self.client.shutdown()).await;
         fetch_clients
             .and(probe_client)
+            .and(lookup_client)
             .and(offset_clients)
             .and(shared_client)
     }
@@ -270,11 +275,25 @@ impl std::fmt::Debug for IggyBridge {
     }
 }
 
-/// The bridge's own session answers for the users client certificates name. It runs as the
+/// A session of the bridge's own answers for the users client certificates name. It runs as the
 /// bridge's Iggy user, so that account needs `read_users` for any certificate to be admitted.
+///
+/// Not the lockstep client: a stuck Produce send would hold every new mTLS connection past its
+/// handshake budget, and a burst of handshakes would queue ahead of Produce.
 #[async_trait]
 impl PrincipalResolver for IggyBridge {
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
-        resolve_principal(self.client.as_ref(), username).await
+        let client = &self.lookup_client;
+        let lookup = async {
+            let connected = client.connected(&self.config).await?;
+            Ok(resolve_principal(connected.as_ref(), username).await)
+        };
+        match client.until(Instant::now() + REQUEST_TIMEOUT, lookup).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(%error, "could not reach Iggy to look up the certificate's user");
+                Err(AuthError::Unavailable)
+            }
+        }
     }
 }

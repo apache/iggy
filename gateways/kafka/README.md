@@ -276,7 +276,9 @@ The certificate's subject alternative names must cover every host in
 `IGGY_KAFKA_ADVERTISED_LISTENERS`: a client verifies the name of each broker address Metadata
 hands it, so a host missing from the certificate fails the client's next connection, not the
 first. Client certificates are checked against the CA only; there is no CRL or OCSP revocation
-checking, so revoke access by deleting or deactivating the Iggy user a certificate maps to.
+checking, so revoke access by deleting or deactivating the Iggy user a certificate maps to. That
+applies to new connections only: an open connection keeps the principal its handshake resolved,
+and the permissions that came with it, until it closes.
 
 ```bash
 kcat -b kafka.example.com:9094 -X security.protocol=SSL -X ssl.ca.location=ca.pem -L
