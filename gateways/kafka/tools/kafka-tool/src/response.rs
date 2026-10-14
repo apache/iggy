@@ -109,6 +109,7 @@ fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
         3 => error_code == 3,     // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
         // CreateTopics / DeleteTopics / DescribeConfigs / AlterConfigs / CreatePartitions stub
         19 | 20 | 32 | 33 | 37 => error_code == 41,
+        47 => error_code == 69, // OffsetDelete: `test-group` holds no offsets
         _ => false,
     }
 }

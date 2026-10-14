@@ -35,6 +35,7 @@ use crate::bridge::topic_map::validate_kafka_topic_name;
 
 mod cluster_id;
 mod fetch;
+mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
@@ -43,6 +44,8 @@ mod topics;
 pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+use group_index::GroupIndex;
+pub use group_index::OffsetGroups;
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 pub(crate) use offsets::{LocatedRecord, RecordLookup};
@@ -163,6 +166,8 @@ pub struct IggyBridge {
     auto_create_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
+    /// The Kafka groups that hold offsets. See `offset_groups`.
+    group_index: GroupIndex,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -205,6 +210,7 @@ impl IggyBridge {
             lookup_client: LazyClient::default(),
             auto_create_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
         })
     }
 
@@ -388,6 +394,7 @@ impl IggyBridge {
             probe_client: LazyClient::default(),
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
         }
     }
 }

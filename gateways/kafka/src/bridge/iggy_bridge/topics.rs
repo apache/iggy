@@ -329,7 +329,7 @@ impl IggyBridge {
     }
 
     /// [`Self::get_kafka_topic`] on `client`.
-    async fn get_kafka_topic_on(
+    pub(super) async fn get_kafka_topic_on(
         &self,
         client: &IggyClient,
         kafka_topic: &str,

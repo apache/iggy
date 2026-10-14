@@ -17,26 +17,36 @@
 
 //! `ListGroups` (API key 16).
 //!
-//! Lists the groups this coordinator holds. v4+ `states_filter` and v5 `types_filter` keep a
-//! group only when the filter is empty or one entry matches, case-insensitively, after trim.
-//! A filter value this coordinator does not use matches nothing, so the group is left out and
-//! the response error stays 0. Kafka 4.0's `listGroups` does the same ("if invalid, no groups
-//! are returned").
+//! Lists the groups this coordinator holds, and as `Empty` each group with no members here that
+//! holds offsets in Iggy. Kafka keeps a group whose consumers left while it has offsets. v4+
+//! `states_filter` and v5 `types_filter` keep a group only when the filter is empty or one entry
+//! matches, case-insensitively, after trim. A filter value this coordinator does not use matches
+//! nothing, so the group is left out and the response error stays 0. Kafka 4.0's `listGroups`
+//! does the same ("if invalid, no groups are returned").
+//!
+//! The groups that hold offsets come from a scan that costs one Iggy call per topic, and one scan
+//! answers for 10 s (`IggyBridge::offset_groups`). A filter that leaves out `Empty` or `classic`
+//! needs no scan. When no scan has found the groups yet, the answer is
+//! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry.
+
+use std::collections::HashSet;
 
 use bytes::Bytes;
 use kafka_protocol::messages::list_groups_response::ListedGroup;
 use kafka_protocol::messages::{GroupId, ListGroupsRequest, ListGroupsResponse};
 use kafka_protocol::protocol::StrBytes;
 
+use crate::bridge::OffsetGroups;
 use crate::error::Result;
-use crate::group::GroupListing;
+use crate::group::{GROUP_STATE_EMPTY, GroupListing};
 use crate::protocol::api::{
-    API_KEY_LIST_GROUPS, ApiVersionRange, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
-    GatewayState, HandleOutcome, is_supported_version,
+    API_KEY_LIST_GROUPS, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+    ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_list_groups_shape;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, respond_or_close, unsupported_version_response,
+    decode_guarded, encode_message, offset_deadline, respond_or_close, unsupported_version_response,
 };
 use crate::protocol::header::response_header_version;
 use crate::protocol::wire_len::{kafka_compact_prefix, kafka_string_len};
@@ -50,7 +60,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// `ListGroups` v5 `group_type` for the classic protocol this coordinator runs.
 const CLASSIC_GROUP_TYPE: &str = "classic";
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_LIST_GROUPS, api_version) {
         return unsupported_version_response(API_KEY_LIST_GROUPS, api_version, |version| {
             encode_error_response(version, ERROR_UNSUPPORTED_VERSION)
@@ -70,10 +85,21 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         }
     };
 
-    let listings: Vec<GroupListing> = state
-        .groups
-        .list_groups()
-        .await
+    let mut listings = state.groups.list_groups().await;
+    let lists_offsets_only = selected(&request.states_filter, GROUP_STATE_EMPTY)
+        && selected(&request.types_filter, CLASSIC_GROUP_TYPE);
+    if lists_offsets_only && let Some(bridge) = &state.bridge {
+        let deadline = offset_deadline(state, connection).await;
+        let Some(offset_groups) = bridge.offset_groups(deadline).await else {
+            tracing::debug!("ListGroups found no scan of the groups that hold offsets yet");
+            return respond_or_close(
+                encode_error_response(api_version, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+                "ListGroups",
+            );
+        };
+        add_offsets_only(&mut listings, &offset_groups);
+    }
+    let listings: Vec<GroupListing> = listings
         .into_iter()
         .filter(|group| {
             selected(&request.states_filter, group.state)
@@ -94,6 +120,22 @@ fn selected(filter: &[StrBytes], value: &str) -> bool {
         || filter
             .iter()
             .any(|wanted| wanted.as_str().trim().eq_ignore_ascii_case(value))
+}
+
+/// Adds each group of `offset_groups` that is not live here, as `Empty`. Keeps the list in group
+/// id order.
+fn add_offsets_only(listings: &mut Vec<GroupListing>, offset_groups: &OffsetGroups) {
+    let live: HashSet<&str> = listings
+        .iter()
+        .map(|group| group.group_id.as_str())
+        .collect();
+    let offsets_only: Vec<GroupListing> = offset_groups
+        .iter()
+        .filter(|group_id| !live.contains(group_id))
+        .map(|group_id| GroupListing::offsets_only(StrBytes::from_string(group_id.to_owned())))
+        .collect();
+    listings.extend(offsets_only);
+    listings.sort_by(|left, right| left.group_id.cmp(&right.group_id));
 }
 
 /// Keeps as many listed groups as fit `max_frame_size`, dropping the rest rather than closing

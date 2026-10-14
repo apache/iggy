@@ -19,8 +19,9 @@
 //!
 //! [`GroupCoordinator`] owns every group this gateway instance coordinates and is the only
 //! module that awaits: `FindCoordinator`/`JoinGroup`/`Heartbeat`/`LeaveGroup`/`SyncGroup`/
-//! `DescribeGroups`/`ListGroups`/`OffsetCommit` handlers translate wire messages into the request types here,
-//! and `state` holds the synchronous state machine those requests drive.
+//! `DescribeGroups`/`ListGroups`/`OffsetCommit`/`DeleteGroups`/`OffsetDelete` handlers translate
+//! wire messages into the request types here, and `state` holds the synchronous state machine
+//! those requests drive.
 //!
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
 //! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
@@ -29,7 +30,7 @@ mod state;
 
 pub use state::{MAX_GROUP_ID_BYTES, is_valid_group_id};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -52,6 +53,16 @@ pub const GROUP_STATE_PREPARING_REBALANCE: &str = "PreparingRebalance";
 pub const GROUP_STATE_COMPLETING_REBALANCE: &str = "CompletingRebalance";
 /// `DescribeGroups` / `ListGroups` state string for a group whose assignment is in effect.
 pub const GROUP_STATE_STABLE: &str = "Stable";
+
+/// Kafka's `ConsumerProtocol.PROTOCOL_TYPE`, the protocol type of a consumer group.
+pub const CONSUMER_PROTOCOL_TYPE: &str = "consumer";
+
+/// Protocol type of a group that only holds offsets in Iggy.
+///
+/// Kafka keeps `consumer` for a group whose consumers left, and Iggy stores no protocol type to say
+/// otherwise. Kafka's admin client takes a group as a consumer group with `consumer` or an empty
+/// type.
+pub const OFFSETS_ONLY_PROTOCOL_TYPE: &str = CONSUMER_PROTOCOL_TYPE;
 
 /// v6 `error_message` when one `DescribeGroups` group does not fit the response budget.
 ///
@@ -369,6 +380,19 @@ pub struct GroupListing {
     pub state: &'static str,
 }
 
+impl GroupListing {
+    /// A group with no members here that holds offsets in Iggy. Kafka keeps a group whose
+    /// consumers left, and lists it as `Empty`.
+    #[must_use]
+    pub const fn offsets_only(group_id: StrBytes) -> Self {
+        Self {
+            group_id,
+            protocol_type: StrBytes::from_static_str(OFFSETS_ONLY_PROTOCOL_TYPE),
+            state: GROUP_STATE_EMPTY,
+        }
+    }
+}
+
 /// One group the coordinator currently holds, as `DescribeGroups` reports it.
 #[derive(Debug, Clone)]
 pub struct GroupDescription {
@@ -383,6 +407,66 @@ pub struct GroupDescription {
     /// described without member metadata.
     pub protocol_name: Option<StrBytes>,
     pub members: Vec<MemberDescription>,
+}
+
+impl GroupDescription {
+    /// [`GroupListing::offsets_only`] as `DescribeGroups` reports it: `Empty`, with no protocol
+    /// and no members.
+    #[must_use]
+    pub const fn offsets_only(group_id: StrBytes) -> Self {
+        Self {
+            group_id,
+            error: ERROR_NONE,
+            state: GROUP_STATE_EMPTY,
+            protocol_type: StrBytes::from_static_str(OFFSETS_ONLY_PROTOCOL_TYPE),
+            protocol_name: None,
+            members: Vec::new(),
+        }
+    }
+}
+
+/// What `DeleteGroups` found for one group on this coordinator, by Kafka's
+/// `ClassicGroup.validateDeleteGroup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupRemoval {
+    /// Not on this coordinator.
+    Absent,
+    /// Has joined members. Kafka refuses with `NON_EMPTY_GROUP`.
+    Live,
+    /// Had no joined members, only ids that wait to join, and is removed.
+    Removed,
+}
+
+/// What `OffsetDelete` may do with the offsets of one group on this coordinator, by Kafka's
+/// `ClassicGroup.validateOffsetDelete`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OffsetDeletion {
+    /// Not on this coordinator.
+    Absent,
+    /// Has members of a protocol other than `consumer`. Kafka refuses with `NON_EMPTY_GROUP`.
+    Refused,
+    /// On this coordinator. The offsets of a topic that a member subscribes to stay.
+    Allowed(Subscribed),
+}
+
+/// The topics that the members of a group subscribe to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Subscribed {
+    /// Empty for a group with no joined members.
+    Topics(HashSet<String>),
+    /// Every topic. A member's subscription does not decode, or the group has not chosen a
+    /// protocol yet. Kafka's `ClassicGroup.isSubscribedToTopic` does the same.
+    All,
+}
+
+impl Subscribed {
+    #[must_use]
+    pub fn contains(&self, topic: &str) -> bool {
+        match self {
+            Self::Topics(topics) => topics.contains(topic),
+            Self::All => true,
+        }
+    }
 }
 
 /// The answer for one `LeavingMember`.
@@ -587,6 +671,23 @@ impl GroupCoordinator {
     pub async fn validate_commit(&self, request: &CommitRequest) -> i16 {
         let mut groups = self.groups.lock().await;
         state::commit_step(&mut groups, request, Instant::now())
+    }
+
+    /// Removes each group of `group_ids` that has no joined members, as `DeleteGroups` does. One
+    /// answer per id, in order. Never parks.
+    pub async fn remove_empty(&self, group_ids: &[StrBytes]) -> Vec<GroupRemoval> {
+        let mut groups = self.groups.lock().await;
+        let now = Instant::now();
+        group_ids
+            .iter()
+            .map(|group_id| state::remove_empty(&mut groups, group_id, now))
+            .collect()
+    }
+
+    /// What `OffsetDelete` may do with the offsets of `group_id`. Never parks.
+    pub async fn offset_deletion(&self, group_id: &StrBytes) -> OffsetDeletion {
+        let mut groups = self.groups.lock().await;
+        state::offset_deletion(&mut groups, group_id, Instant::now())
     }
 
     /// How long an `OffsetCommit` or `OffsetFetch` may hold its connection. A heartbeat there

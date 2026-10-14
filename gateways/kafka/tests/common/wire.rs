@@ -44,8 +44,8 @@ pub fn decode<M: Decodable>(body: Bytes, version: i16) -> M {
     M::decode(&mut buf, version).expect("decode response")
 }
 
-/// Consumer-group and admin keys explicitly out of scope in SCOPE.md.
-pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(21, "DeleteRecords"), (42, "DeleteGroups")];
+/// Admin keys explicitly out of scope in SCOPE.md.
+pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[(21, "DeleteRecords")];
 
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
@@ -634,6 +634,35 @@ pub fn build_describe_groups_request(
     }
     if flexible {
         enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `DeleteGroups` request naming `groups`.
+pub fn build_delete_groups_request(version: i16, groups: &[&str]) -> Bytes {
+    let flexible = version >= 2;
+    let mut enc = Encoder::with_capacity(64);
+    write_array_count(&mut enc, flexible, groups.len());
+    for group in groups {
+        write_string(&mut enc, flexible, Some(group));
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+    enc.freeze()
+}
+
+/// `OffsetDelete` v0 request for `partitions` of each topic.
+pub fn build_offset_delete_request(group_id: &str, topics: &[(&str, &[i32])]) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    write_string(&mut enc, false, Some(group_id));
+    write_array_count(&mut enc, false, topics.len());
+    for (topic, partitions) in topics {
+        write_string(&mut enc, false, Some(topic));
+        write_array_count(&mut enc, false, partitions.len());
+        for partition in *partitions {
+            enc.write_i32(*partition);
+        }
     }
     enc.freeze()
 }
