@@ -790,7 +790,7 @@ mod tests {
     use std::time::Duration;
 
     use consensus::{
-        ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline,
+        ArtifactProgress, Consensus, DvcSuffix, LocalPipeline, PartitionsHandle, Pipeline, Plane,
         Sequencer, StateArtifact, StateTransferStage, VsrAction, VsrConsensus, artifact_kind,
     };
     use futures::FutureExt;
@@ -798,12 +798,14 @@ mod tests {
     use iggy_binary_protocol::namespace::METADATA_GROUP;
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::{
         AckLevel, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader,
         Operation, PrepareHeader, PrepareOkHeader, RepairRangeReplyHeader, ReplyHeader,
         RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
         RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-        StateChunkHeader, StateTransferTargetHeader, WireEncode, WireIdentifier,
+        StateChunkHeader, StateTransferTargetHeader, WireEncode, WireIdentifier, WireName,
+        WireOptions,
     };
     use iggy_common::{
         ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, Durability, IggyByteSize,
@@ -996,9 +998,7 @@ mod tests {
             owner.send_request_state_transfer(&consensus, PEER, 1).await;
             owner
                 .send_request_prepares(
-                    consensus.cluster(),
-                    consensus.replica(),
-                    consensus.view(),
+                    &consensus,
                     PEER,
                     1,
                     1,
@@ -4172,6 +4172,208 @@ mod tests {
         IggyShard<B, PrepareJournal, (), IoTestMetadata, PapayaShardsTable, HeldSuperblock>;
 
     #[compio::test]
+    async fn given_metadata_suffix_mutation_when_stale_commit_arrives_should_publish_fresh_headers()
+    {
+        const VIEW: u32 = 3;
+        const HEAD: u64 = 2;
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        for replica in [1, 2] {
+            assert!(bus.owner_table().try_claim(replica, 1));
+        }
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let mut consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(VIEW);
+        consensus.set_log_view(VIEW);
+        consensus.init();
+        consensus.mark_superblock_durable(VIEW, VIEW);
+        let journal = PrepareJournal::open(&directory.path().join("metadata.wal"), 0)
+            .await
+            .unwrap();
+        owner.plane.inner_mut().0.consensus = Some(consensus);
+        owner.plane.inner_mut().0.journal = Some(journal);
+        let metadata = &owner.plane.inner().0;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        crate::refresh_metadata_dvc_suffix(consensus, metadata.journal.as_ref());
+        let prepares = metadata_prepares(HEAD, VIEW);
+        for prepare in &prepares {
+            metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .append(prepare.clone())
+                .await
+                .unwrap();
+            consensus.note_journal_mutation();
+        }
+        consensus.sequencer().set_sequence(HEAD);
+        assert!(consensus.local_dvc_suffix_stale());
+        let heartbeat = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+            |_, header: &mut CommitHeader| {
+                header.command = Command::Commit;
+                header.cluster = 1;
+                header.group = METADATA_GROUP;
+                header.replica = 2;
+                header.view = VIEW - 1;
+                header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
+                header.seal();
+            },
+        );
+
+        owner.on_commit(&heartbeat).await;
+
+        assert_eq!(sent.borrow().len(), 2);
+        let expected: Vec<_> = prepares
+            .iter()
+            .rev()
+            .map(|prepare| *prepare.header())
+            .collect();
+        for frame in sent.borrow().iter() {
+            let reply =
+                Message::<StartViewHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            let suffix = consensus::dvc_suffix_decode(
+                &reply.as_slice()[size_of::<StartViewHeader>()..],
+                HEAD,
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(suffix.headers(), expected);
+        }
+    }
+
+    #[compio::test]
+    async fn given_metadata_retransmit_below_adopted_head_when_repairing_should_keep_a_valid_range()
+    {
+        const LOCAL_HEAD: u64 = 4;
+        const HEAD: u64 = 8;
+        const VIEW: u32 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&requests);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestPrepares {
+                captured.borrow_mut().push(
+                    Message::<RequestPreparesHeader>::try_from(Owned::copy_from_slice(
+                        frame.as_slice(),
+                    ))
+                    .unwrap(),
+                );
+            }
+            Ok(())
+        }));
+        assert!(bus.owner_table().try_claim(0, 1));
+        let (mut owner, _sender) = test_owner(&bus, None);
+        let mut consensus = VsrConsensus::new(
+            1,
+            2,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(1);
+        consensus.set_log_view(1);
+        consensus.init();
+        let journal = PrepareJournal::open(&directory.path().join("metadata.wal"), 0)
+            .await
+            .unwrap();
+        let prepares = metadata_prepares(HEAD, 1);
+        for prepare in prepares.iter().take(usize::try_from(LOCAL_HEAD).unwrap()) {
+            journal.append(prepare.clone()).await.unwrap();
+        }
+        consensus.sequencer().set_sequence(LOCAL_HEAD);
+        owner.plane.inner_mut().0.consensus = Some(consensus);
+        owner.plane.inner_mut().0.journal = Some(journal);
+        owner
+            .on_start_view(start_view_suffix(
+                IggyNamespace::from_raw(METADATA_GROUP),
+                VIEW,
+                HEAD,
+                0,
+                &[*prepares.last().unwrap().header()],
+            ))
+            .await;
+        let metadata = &owner.plane.inner().0;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        assert!(consensus.view_log_unproven());
+        assert_eq!(consensus.view_log_repair_op(), Some(HEAD - 1));
+        let retransmit = prepares[usize::try_from(LOCAL_HEAD).unwrap()]
+            .clone()
+            .transmute_header(|original, header: &mut PrepareHeader| {
+                *header = original;
+                header.view = VIEW;
+                header.replica = 0;
+                header.checksum = header.identity_checksum();
+            });
+        metadata.on_replicate(retransmit).await;
+        assert_eq!(consensus.sequencer().current_sequence(), LOCAL_HEAD + 1);
+        assert_eq!(consensus.commit_min(), 0);
+        *owner.metadata_repair.borrow_mut() = None;
+        requests.borrow_mut().clear();
+
+        owner.maybe_request_metadata_repair(consensus, 0).await;
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            (requests[0].header().from_op, requests[0].header().to_op),
+            (1, HEAD - 1)
+        );
+        assert_eq!(owner.metadata_repair.borrow().unwrap().to_op, HEAD);
+    }
+
+    fn metadata_prepares(head: u64, view: u32) -> Vec<Message<PrepareHeader>> {
+        let mut parent = 0;
+        (1..=head)
+            .map(|op| {
+                let body = CreateStreamRequest {
+                    name: WireName::new(format!("repaired-stream-{op}")).unwrap(),
+                    options: WireOptions::empty(),
+                }
+                .to_bytes();
+                let size = size_of::<PrepareHeader>() + body.len();
+                let mut prepare = Message::<PrepareHeader>::new(size);
+                prepare.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+                let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+                    header.command = Command::Prepare;
+                    header.operation = Operation::CreateStream;
+                    header.cluster = 1;
+                    header.group = METADATA_GROUP;
+                    header.view = view;
+                    header.replica = (view % 3) as u8;
+                    header.op = op;
+                    header.parent = parent;
+                    header.timestamp = op;
+                    header.size = u32::try_from(size).unwrap();
+                    header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+                    header.checksum = header.identity_checksum();
+                });
+                parent = prepare.header().checksum;
+                prepare
+            })
+            .collect()
+    }
+
+    #[compio::test]
     async fn given_a_stale_primary_heartbeat_when_the_suffix_cache_is_stale_should_reply_with_fresh_headers()
      {
         const HEAD: u64 = 2;
@@ -4249,7 +4451,8 @@ mod tests {
     async fn given_unproven_suffix_when_adopting_start_view_should_repair_before_applying() {
         const APPLIED: u64 = 2;
         const LOCAL_HEAD: u64 = 4;
-        const NEW_HEAD: u64 = 8;
+        const NEW_HEAD: u64 = 2050;
+        const CHUNK: u64 = crate::REPAIR_CHUNK_MAX;
         const NEW_VIEW: u32 = 3;
         const NEW_PRIMARY: u8 = 0;
         let bus = Rc::new(IggyMessageBus::new(0));
@@ -4301,14 +4504,25 @@ mod tests {
         assert!(partition.log.journal().inner.holds_op(APPLIED + 1));
         assert!(partition.consensus().view_log_unproven());
         assert!(!partition.consensus().view_log_entry_proven(APPLIED + 1));
-        for expected_from in (LOCAL_HEAD + 1..NEW_HEAD).rev() {
-            let request = requests
-                .borrow_mut()
-                .pop()
-                .expect("proof progress must request the next gap without a retry tick");
+        let mut rounds = 0;
+        let mut bodies = 0;
+        while partition.consensus().view_log_unproven() {
+            let request = requests.borrow_mut().pop().unwrap_or_else(|| {
+                panic!("missing repair request after {rounds} rounds; hole={:?}, session={:?}, transfer={:?}",
+                    partition.consensus().view_log_repair_op(), partition.repair,
+                    partition.consensus().state_transfer_stage());
+            });
             let request = request.header();
+            let missing = partition.consensus().view_log_repair_op().unwrap();
+            let expected_from = if partition.consensus().view_log_entry_proven(missing) {
+                missing
+            } else {
+                missing.saturating_sub(CHUNK - 1).max(APPLIED + 1)
+            };
             assert_eq!(request.from_op, expected_from);
-            assert_eq!(request.to_op, NEW_HEAD);
+            assert_eq!(request.to_op, missing);
+            rounds += 1;
+            assert!(rounds <= (NEW_HEAD - LOCAL_HEAD).div_ceil(CHUNK) + 1);
             let reply = Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
                 .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
                     header.command = Command::RepairDone;
@@ -4326,6 +4540,7 @@ mod tests {
                 "a terminator without bodies must wait for the retry timer"
             );
             for op in request.from_op..=request.to_op {
+                bodies += 1;
                 let repaired = prepares[usize::try_from(op - 1).unwrap()]
                     .clone()
                     .transmute_header(
@@ -4354,14 +4569,23 @@ mod tests {
                     "a different peer cannot complete or advance this repair session"
                 );
             }
+            if !partition.consensus().view_log_unproven() {
+                let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+                while partition.consensus().commit_min() < NEW_HEAD {
+                    let before = partition.consensus().commit_min();
+                    partition
+                        .commit_journal(owner.plane.partitions().config())
+                        .await;
+                    assert!(partition.consensus().commit_min() > before);
+                }
+            }
             owner.on_repair_range_reply(&reply).await;
         }
+        assert_eq!(rounds, (NEW_HEAD - LOCAL_HEAD).div_ceil(CHUNK) + 1);
+        assert_eq!(bodies, NEW_HEAD - APPLIED);
         assert!(requests.borrow().is_empty());
-        let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+        let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
         assert!(!partition.consensus().view_log_unproven());
-        partition
-            .commit_journal(owner.plane.partitions().config())
-            .await;
         assert_eq!(partition.consensus().commit_min(), NEW_HEAD);
     }
 
@@ -5038,6 +5262,9 @@ mod tests {
             let mut prepare = Message::<PrepareHeader>::new(frozen.len());
             prepare.as_mut_slice().copy_from_slice(frozen.as_slice());
             prepares.push(prepare);
+            // Capture historical bodies beyond one live acknowledgment window.
+            origin.consensus().clear_pipeline();
+            origin.consensus().drain_loopback_into(&mut Vec::new());
         }
         prepares
     }

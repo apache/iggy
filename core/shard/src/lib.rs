@@ -1042,7 +1042,7 @@ pub const REPAIR_CHUNK_MAX: u64 = 128;
 #[derive(Debug, Clone, Copy)]
 struct MetadataRepairSession {
     nonce: u128,
-    /// Lowest op this session must fetch, and the floor its stall retry reopens at.
+    /// Repair cursor: the backward proof hole, otherwise the lowest requested op.
     ///
     /// Not re-derivable from `commit_min + 1`: the merged-log scan opens at
     /// [`merged_log_scan_floor`], above the snapshot floor, while its
@@ -5491,6 +5491,9 @@ where
             }
             let is_primary = consensus.is_primary_for_view(consensus.view());
             let commit_min = consensus.commit_min();
+            let closes_proof_gap = consensus
+                .view_log_repair_op()
+                .is_none_or(|op| op == header.op);
             // In place: runs once per repaired prepare, and the clone is two Vecs.
             let in_scope = consensus
                 .with_pending_view_log(|pending| {
@@ -5565,7 +5568,9 @@ where
                     .is_some_and(|held| held.checksum == header.checksum)
                 {
                     consensus.note_repaired_view_header(header);
-                    self.reconcile_metadata_view_divergence().await;
+                    if closes_proof_gap {
+                        self.reconcile_metadata_view_divergence().await;
+                    }
                 }
                 return;
             }
@@ -5600,7 +5605,9 @@ where
                 consensus.sequencer().set_sequence(frontier);
                 consensus.set_last_prepare_checksum(frontier_checksum);
             }
-            self.reconcile_metadata_view_divergence().await;
+            if closes_proof_gap {
+                self.reconcile_metadata_view_divergence().await;
+            }
             return;
         }
         // A metadata-plane op that did not match above (no metadata consensus on
@@ -5638,9 +5645,15 @@ where
             );
             return;
         }
+        let closes_proof_gap = partition
+            .consensus()
+            .view_log_repair_op()
+            .is_none_or(|op| op == header.op);
         partition.apply_repaired_prepare(msg).await;
-        let pending = partition.consensus().pending_view_log();
-        reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
+        if closes_proof_gap {
+            let pending = partition.consensus().pending_view_log();
+            reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
+        }
     }
 
     /// Repair stream terminator: `RangeEvicted` settles the partition commit
@@ -5683,7 +5696,7 @@ where
                     let done = commit_min >= session.to_op;
                     let proof_advanced = consensus
                         .view_log_repair_op()
-                        .is_some_and(|op| op < session.from_op);
+                        .is_some_and(|op| op != session.from_op);
                     tracing::info!(
                         shard = self.id,
                         through_op = header.op,
@@ -5707,9 +5720,7 @@ where
                             live.from_op = from_op;
                         }
                         self.send_request_prepares(
-                            consensus.cluster(),
-                            consensus.replica(),
-                            consensus.view(),
+                            consensus,
                             session.peer,
                             session.nonce,
                             from_op,
@@ -5897,8 +5908,8 @@ where
                 // `complete_repair` walks the window and clears the session
                 // only when the LOCAL commit frontier reached the requested
                 // op (the peer's served-through claim proves nothing about
-                // delivery on a lossy bus). Proof can move backward through
-                // a gap while fencing commits, so either kind of progress
+                // delivery on a lossy bus). Proof moves backward through gaps,
+                // then may need a higher canonical header's body. Either change
                 // pulls the next chunk without waiting for the retry timer.
                 let before = partition.consensus().commit_min();
                 if let partitions::RepairConclusion::FloorRefused { floor, to_op } =
@@ -5963,19 +5974,15 @@ where
                     let commit_min = partition.consensus().commit_min();
                     let proof_op = partition.consensus().view_log_repair_op();
                     let next = partition.repair.as_mut().and_then(|live| {
-                        let from_op = proof_op.filter(|&op| op < live.from_op).or_else(|| {
+                        let from_op = proof_op.filter(|&op| op != live.from_op).or_else(|| {
                             partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
                         })?;
                         live.from_op = from_op;
                         Some((live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
-                    let cluster = partition.consensus().cluster();
-                    let self_id = partition.consensus().replica();
                     if let Some((peer, nonce, from_op, to_op)) = next {
                         self.send_request_prepares(
-                            cluster,
-                            self_id,
-                            partition.consensus().view(),
+                            partition.consensus(),
                             peer,
                             nonce,
                             from_op,
@@ -5997,11 +6004,9 @@ where
     /// is no longer retained).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
-    async fn send_request_prepares(
+    async fn send_request_prepares<P>(
         &self,
-        cluster: u128,
-        self_id: u8,
-        view: u32,
+        consensus: &VsrConsensus<B, P>,
         target: u8,
         nonce: u128,
         from_op: u64,
@@ -6010,13 +6015,32 @@ where
         partition_incarnation: u64,
     ) where
         B: MessageBus,
+        P: Pipeline<Entry = consensus::PipelineEntry>,
     {
+        // Proof walks backward. End the chunk at its hole instead of re-serving
+        // the already held suffix for every missing predecessor.
+        let (from_op, to_op) = consensus
+            .view_log_repair_op()
+            .map_or((from_op, to_op), |missing| {
+                if consensus.view_log_entry_proven(missing) {
+                    return (missing, to_op.max(missing));
+                }
+                (
+                    missing
+                        .saturating_sub(self.repair_chunk_max.get() - 1)
+                        .max(consensus.commit_min() + 1),
+                    missing,
+                )
+            });
+        if from_op == 0 || from_op > to_op {
+            return;
+        }
         let msg = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
             .transmute_header(|_, h: &mut RequestPreparesHeader| {
                 h.command = Command::RequestPrepares;
-                h.cluster = cluster;
-                h.replica = self_id;
-                h.view = view;
+                h.cluster = consensus.cluster();
+                h.replica = consensus.replica();
+                h.view = consensus.view();
                 h.nonce = nonce;
                 h.from_op = from_op;
                 h.to_op = to_op;
@@ -6323,9 +6347,7 @@ where
                     "metadata repair stalled; re-requesting remaining window"
                 );
                 self.send_request_prepares(
-                    consensus.cluster(),
-                    consensus.replica(),
-                    consensus.view(),
+                    consensus,
                     peer,
                     nonce,
                     from_op,
@@ -6662,9 +6684,7 @@ where
             idle_ticks: 0,
         });
         self.send_request_prepares(
-            consensus.cluster(),
-            consensus.replica(),
-            consensus.view(),
+            consensus,
             peer,
             nonce,
             from_op,
@@ -6721,14 +6741,22 @@ where
             && (consensus.commit_min() < consensus.commit_max() || consensus.view_log_unproven())
             && self.metadata_repair.borrow().is_none()
         {
-            let to_op = if consensus.view_log_unproven() {
-                consensus.sequencer().current_sequence()
-            } else {
-                consensus.commit_max()
-            };
             let from_op = consensus
                 .view_log_repair_op()
                 .unwrap_or_else(|| consensus.commit_min() + 1);
+            let to_op = if consensus.view_log_unproven() {
+                consensus
+                    .sequencer()
+                    .current_sequence()
+                    .max(
+                        consensus
+                            .with_pending_view_log(|pending| pending.op_head)
+                            .unwrap_or(0),
+                    )
+                    .max(from_op)
+            } else {
+                consensus.commit_max()
+            };
             // Spent here rather than at the detector, so the edge-triggered
             // sites spend it too: an edge-armed repair that completes before
             // the next tick would otherwise leave the count saturated and hand
@@ -8025,8 +8053,6 @@ where
                 }
                 let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
-                let cluster = partition.consensus().cluster();
-                let self_id = partition.consensus().replica();
                 // A primary-elect's merged-log session legitimately runs outside
                 // `Normal` (`request_partition_view_repair`). Same predicate as the
                 // two ingest sites, so the arming side and the ingest side cannot
@@ -8084,8 +8110,6 @@ where
                         session.nonce,
                         repair_from,
                         session.fetch_to_op,
-                        cluster,
-                        self_id,
                     ))
                 });
                 // A session pins its peer and fences every arming site while it
@@ -8111,7 +8135,7 @@ where
                     )
                 })
             };
-            if let Some(((peer, nonce, from_op, to_op, cluster, self_id), rotate)) = stalled
+            if let Some(((peer, nonce, from_op, to_op), rotate)) = stalled
                 && from_op <= to_op
             {
                 if rotate
@@ -8150,8 +8174,12 @@ where
                     };
                     let consensus = partition.consensus();
                     let primary = consensus.primary_index(consensus.view());
-                    let next_peer =
-                        next_transfer_peer(self_id, peer, consensus.replica_count(), primary);
+                    let next_peer = next_transfer_peer(
+                        consensus.replica(),
+                        peer,
+                        consensus.replica_count(),
+                        primary,
+                    );
                     tracing::warn!(
                         shard = self.id,
                         namespace_raw = namespace.inner(),
@@ -8211,9 +8239,7 @@ where
                     "partition repair stalled; re-requesting remaining window"
                 );
                 self.send_request_prepares(
-                    cluster,
-                    self_id,
-                    partition.consensus().view(),
+                    partition.consensus(),
                     peer,
                     nonce,
                     from_op,
@@ -9314,9 +9340,7 @@ where
             "partition behind the group frontier; requesting repair"
         );
         self.send_request_prepares(
-            partition.consensus().cluster(),
-            partition.consensus().replica(),
-            partition.consensus().view(),
+            partition.consensus(),
             peer,
             nonce,
             from_op,
@@ -9373,8 +9397,6 @@ where
             return;
         };
         let nonce = iggy_common::random_id::get_uuid();
-        let cluster = consensus.cluster();
-        let self_id = consensus.replica();
         let namespace = consensus.group();
         let view = consensus.view();
         self.partition_repairs_inflight
@@ -9401,9 +9423,7 @@ where
             "repairing toward the merged partition log before starting the view"
         );
         self.send_request_prepares(
-            cluster,
-            self_id,
-            partition.consensus().view(),
+            partition.consensus(),
             peer,
             nonce,
             from_op,

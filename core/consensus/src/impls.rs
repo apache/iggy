@@ -5169,7 +5169,8 @@ mod timestamp_clamp_tests {
     use super::*;
     use crate::LocalPipeline;
 
-    use crate::test_bus::{NoopBus, make_start_view};
+    use crate::test_bus::{NoopBus, make_commit, make_start_view};
+    use iggy_binary_protocol::CommitHeader;
 
     #[test]
     fn observed_log_timestamp_floors_new_primary_stamps() {
@@ -5490,6 +5491,64 @@ mod timestamp_clamp_tests {
             assert_eq!(consensus.sequencer().current_sequence(), HEAD + 1);
             assert!(!consensus.view_log_unproven());
         }
+    }
+
+    #[test]
+    fn given_unproven_same_view_when_commit_and_start_view_arrive_should_refresh_proof() {
+        const VIEW: u32 = 4;
+        const HEAD: u64 = 8;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        let primary = u8::try_from(VIEW % 3).unwrap();
+        let start = make_start_view(VIEW, HEAD, 0, primary, 0);
+        consensus.handle_start_view(PlaneKind::Metadata, start.header(), &[]);
+        consensus.fence_view_log(HEAD - 1, HEAD - 1);
+        let commit = make_commit(VIEW, primary, 1).transmute_header(
+            |original, header: &mut CommitHeader| {
+                *header = original;
+                header.commit = HEAD;
+                header.seal();
+            },
+        );
+        assert!(matches!(
+            consensus.handle_commit(commit.header()),
+            CommitOutcome::Advanced
+        ));
+        assert_eq!(consensus.commit_max(), HEAD);
+        assert_eq!(consensus.commit_min(), 0);
+        assert!(consensus.view_log_unproven());
+        let mut canonical = PrepareHeader {
+            command: Command::Prepare,
+            operation: Operation::CreateStream,
+            size: u32::try_from(size_of::<PrepareHeader>()).unwrap(),
+            op: HEAD,
+            ..PrepareHeader::default()
+        };
+        canonical.checksum = canonical.identity_checksum();
+        let mut suffix = vec![0; size_of::<PrepareHeader>()];
+        crate::encode_prepare_headers(&[canonical], &mut suffix);
+
+        let actions = consensus.handle_start_view(
+            PlaneKind::Metadata,
+            make_start_view(VIEW, HEAD, HEAD, primary, 0).header(),
+            &suffix,
+        );
+
+        assert!(!actions.is_empty());
+        assert_eq!(
+            consensus.pending_view_log().unwrap().headers,
+            vec![canonical]
+        );
+        assert!(consensus.view_log_unproven());
+        assert!(!consensus.view_log_entry_proven(1));
+        assert_eq!(consensus.commit_min(), 0);
     }
 
     #[test]
