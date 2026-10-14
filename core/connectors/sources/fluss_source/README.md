@@ -84,6 +84,7 @@ These are limits of this connector, not of the `fluss-rs` client.
 - **Rows that cannot be converted are skipped.** A value the JSON mapping cannot hold, such as a date beyond what `chrono` represents, fails the same way on every read. Such a row is dropped and logged at error level with its bucket and offset, the offsets move past it, and the number of skipped rows is logged when the connector closes.
 - **A crash right after starting from `latest` can miss rows.** The resolved start offsets stay in memory until the first batch is acknowledged, which normally takes one poll. If the connector crashes in that window, the next start resolves `latest` again and misses the rows written in between.
 - **An unreadable saved state stops the connector at startup.** Starting over from `starting_offset` could skip rows that were never delivered, `latest` above all, so the connector refuses to open until the saved state is removed (the `source_<key>.state` file under the runtime's state path with the default file storage).
+- **The reason a start failed is only in the runtime log.** The runtime reports a failed start as a generic initialization error in `last_error`, so the connector logs the cause at error level.
 - **An offset outside a bucket's range is not reset.** If a configured offset, or one restored from state after retention removed it, falls outside what the bucket still holds, polls keep failing until the offset is changed. The connector does not move to the earliest or latest offset on its own.
 
 ## Build and test
