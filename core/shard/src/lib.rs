@@ -2843,16 +2843,13 @@ where
 /// Whether a transfer descriptor comes from a replica that knows less than this
 /// one. The serving view is compared against `log_view`, not `view`: a replica
 /// that needs state transfer cannot join a view change, so its `view` runs ahead.
-const fn transfer_offer_is_behind<B, P>(
+const fn transfer_offer_is_behind(
     serving_view: u32,
     serving_commit_max: u64,
-    local: &VsrConsensus<B, P>,
-) -> bool
-where
-    B: MessageBus,
-    P: Pipeline<Entry = consensus::PipelineEntry>,
-{
-    serving_view < local.log_view() || serving_commit_max < local.commit_max()
+    local_log_view: u32,
+    local_commit_max: u64,
+) -> bool {
+    serving_view < local_log_view || serving_commit_max < local_commit_max
 }
 
 /// The next replica to try after a transfer against `failed_peer` failed.
@@ -2922,7 +2919,11 @@ where
         && consensus.commit_min() < consensus.commit_max()
         && partition.transfer.is_none()
         && partition.transfer_rearm.is_none())
-    .then_some(consensus.primary_index(consensus.view()))
+    .then(|| {
+        consensus
+            .primary_hint()
+            .unwrap_or_else(|| consensus.primary_index(consensus.view()))
+    })
 }
 
 /// Consecutive transient refusals before the re-arm starts logging at `error`,
@@ -5081,6 +5082,9 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.group() == header.group
         {
+            // Ahead of `handle_commit`, which drops a lower-view heartbeat from
+            // the real primary once this replica's view climbed alone.
+            consensus.observe_primary(header.view, header.replica);
             match consensus.handle_commit(&header) {
                 CommitOutcome::Advanced => {
                     // Mid-transfer the pre-install STM must not walk: the
@@ -5125,14 +5129,6 @@ where
         }
 
         let config = planes.1.0.config();
-        // Before the view filter: a replica whose view climbed through
-        // elections nobody joined drops the real primary's lower-view
-        // heartbeats, and they are how it learns whom to repair from.
-        if let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group)) {
-            partition
-                .consensus()
-                .observe_primary(header.view, header.replica);
-        }
         let Some(partition) = self.resolve_partition_target(
             &planes.1.0,
             header.group,
@@ -5144,6 +5140,10 @@ where
             return;
         };
         let consensus = partition.consensus();
+        // Ahead of `handle_commit`: a replica whose view climbed through
+        // elections nobody joined drops the real primary's lower-view
+        // heartbeats there, and they are how it learns whom to repair from.
+        consensus.observe_primary(header.view, header.replica);
         match consensus.handle_commit(&header) {
             CommitOutcome::Advanced => {
                 if !partition.consensus().is_transferring() {
@@ -6467,12 +6467,12 @@ where
             return;
         }
 
-        let primary = consensus.primary_index(consensus.view());
+        consensus.forget_primary(peer);
         let next_peer = next_transfer_peer(
             consensus.replica(),
             peer,
             consensus.replica_count(),
-            Some(primary),
+            consensus.primary_hint(),
         );
         if next_peer == peer {
             // The ring had nobody else to offer (a solo group, or a two-replica
@@ -8135,32 +8135,39 @@ where
                     continue;
                 }
                 let proof_from = partition.consensus().view_log_repair_op();
-                let pull_from = partition.repair_pull_from();
-                let due = partition.repair.as_mut().and_then(|session| {
+                let retry_due = partition.repair.as_mut().is_some_and(|session| {
                     if !session_live {
-                        return None;
+                        return false;
                     }
                     session.idle_ticks += 1;
                     if session.idle_ticks < repair_retry_ticks {
-                        return None;
+                        return false;
                     }
                     session.idle_ticks = 0;
-                    // A fully resident window puts the pull past `fetch_to_op`,
-                    // yet only a `RepairDone` completes the session. Asking again
-                    // for the last op draws one, and keeps the stall budget able
-                    // to rotate off a dead peer.
-                    let repair_from = match proof_from {
-                        Some(op) => op,
-                        None => pull_from?.min(session.fetch_to_op),
-                    };
-                    session.from_op = repair_from;
-                    Some((
-                        session.peer,
-                        session.nonce,
-                        repair_from,
-                        session.fetch_to_op,
-                    ))
+                    true
                 });
+                let pull_from = retry_due.then(|| partition.repair_pull_from()).flatten();
+                let due = partition
+                    .repair
+                    .as_mut()
+                    .filter(|_| retry_due)
+                    .and_then(|session| {
+                        // A fully resident window puts the pull past `fetch_to_op`,
+                        // yet only a `RepairDone` concludes the session, completing
+                        // or refusing it. Asking again for the last op draws one,
+                        // and keeps the stall budget able to rotate off a dead peer.
+                        let repair_from = match proof_from {
+                            Some(op) => op,
+                            None => pull_from?.min(session.fetch_to_op),
+                        };
+                        session.from_op = repair_from;
+                        Some((
+                            session.peer,
+                            session.nonce,
+                            repair_from,
+                            session.fetch_to_op,
+                        ))
+                    });
                 // A session pins its peer and fences every arming site while it
                 // stands, so a peer that cannot answer wedges the group harder
                 // than having no session at all -- and the gap-stopped-primary
@@ -9601,7 +9608,12 @@ where
                 .await;
             return;
         }
-        if transfer_offer_is_behind(header.view, header.commit_max, partition.consensus()) {
+        if transfer_offer_is_behind(
+            header.view,
+            header.commit_max,
+            local_log_view,
+            local_commit_max,
+        ) {
             tracing::warn!(
                 shard = self.id,
                 namespace_raw = header.group,
@@ -10580,7 +10592,7 @@ where
                 match gap_repair_peer(
                     consensus.replica(),
                     consensus.replica_count(),
-                    Some(consensus.primary_index(consensus.view())),
+                    consensus.primary_hint(),
                 ) {
                     None => {
                         // Restart the debounce so this repeats at its interval,
@@ -10679,13 +10691,13 @@ where
                     consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
                 }
                 metadata.commit_journal().await;
-                // Rotated, not `primary_index` raw: this replica can BE the
+                // Rotated, not the hint raw: this replica can BE the
                 // primary here (a leading replica that transferred to catch up
                 // on a checkpoint it lacked), and the arm refuses self.
                 if let Some(next_peer) = gap_repair_peer(
                     consensus.replica(),
                     consensus.replica_count(),
-                    Some(consensus.primary_index(consensus.view())),
+                    consensus.primary_hint(),
                 ) {
                     self.maybe_request_metadata_repair(consensus, next_peer)
                         .await;
@@ -13817,48 +13829,31 @@ mod transfer_descriptor_gate_tests {
     //! replica behind it.
 
     use super::transfer_offer_is_behind;
-    use consensus::{LocalPipeline, VsrConsensus};
-    use message_bus::IggyMessageBus;
-
-    /// A replica whose log was last adopted in `log_view`, whose own view has
-    /// since moved to `view`, and which knows `commit_max`.
-    fn replica(view: u32, log_view: u32, commit_max: u64) -> VsrConsensus<IggyMessageBus> {
-        let mut consensus =
-            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
-        consensus.init();
-        consensus.set_view(view);
-        consensus.set_log_view(log_view);
-        consensus.advance_commit_max(commit_max);
-        consensus
-    }
 
     #[test]
     fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_should_accept() {
         // Numbers from a reproduction: the lagging replica last adopted view
         // 11, solo elections that nobody heard pushed its view to 58, and the
         // group's primary at view 20 offers more committed state than it holds.
-        let lagging = replica(58, 11, 53_052);
-        assert!(!transfer_offer_is_behind(20, 55_013, &lagging));
+        assert!(!transfer_offer_is_behind(20, 55_013, 11, 53_052));
     }
 
     #[test]
     fn given_an_offer_from_before_the_view_this_log_adopted_when_checked_should_refuse() {
-        let replica = replica(11, 11, 53_052);
-        assert!(transfer_offer_is_behind(10, 55_013, &replica));
+        assert!(transfer_offer_is_behind(10, 55_013, 11, 53_052));
     }
 
     #[test]
     fn given_an_offer_below_the_known_commit_point_when_checked_should_refuse() {
-        let replica = replica(58, 11, 53_052);
-        assert!(transfer_offer_is_behind(20, 53_000, &replica));
+        assert!(transfer_offer_is_behind(20, 53_000, 11, 53_052));
     }
 
     #[test]
     fn given_a_phantom_view_zero_primary_when_checked_should_refuse() {
         // An empty group at view 0 must never unlink a chain this replica
         // holds, whichever comparison catches it.
-        assert!(transfer_offer_is_behind(0, 0, &replica(3, 1, 0)));
-        assert!(transfer_offer_is_behind(0, 0, &replica(0, 0, 42)));
+        assert!(transfer_offer_is_behind(0, 0, 1, 0));
+        assert!(transfer_offer_is_behind(0, 0, 0, 42));
     }
 }
 

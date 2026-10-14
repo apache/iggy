@@ -11908,9 +11908,12 @@ where
         }
     }
 
-    /// Refuse a floor whose window does not connect to recovered durable state,
-    /// or `None` when the walk below makes the floor moot and completion
-    /// proceeds as without one.
+    /// Judge a floor whose window may not connect to recovered durable state.
+    ///
+    /// `Some(FloorRefused)` once the refusal is final, `Some(InProgress)` while
+    /// a frame still to come can land below the anchor and connect, or `None`
+    /// when the walk below makes the floor moot and completion proceeds as
+    /// without one.
     async fn refuse_disconnected_floor(
         &mut self,
         config: &PartitionsConfig,
@@ -11949,6 +11952,7 @@ where
                 plane = "partitions",
                 namespace_raw = self.namespace().inner(),
                 floor,
+                reported_floor = ?session.floor,
                 commit_to_op = session.commit_to_op,
                 anchor_op = ?anchor.map(|anchor| anchor.op),
                 anchor_base_offset = ?anchor.map(|anchor| anchor.base_offset),
@@ -12000,7 +12004,10 @@ where
 
     /// The next chunk to pull right after a `RepairDone` while a floor holds
     /// the walk, or `None` when the resident prefix has not grown since the
-    /// last such pull or reaches past `fetch_to_op`.
+    /// last such pull or reaches past `fetch_to_op`. A returned chunk is
+    /// recorded in the session's `floor_pulled_from`, so the same start is
+    /// never returned twice.
+    #[must_use]
     pub fn next_floor_pull(&mut self) -> Option<u64> {
         let commit_min = self.consensus().commit_min();
         let from_op = self.repair_pull_from()?;
@@ -12027,7 +12034,10 @@ where
             .journal()
             .inner
             .lowest_resident_send_in(from..=commit_to_op)?;
-        let batch = decode_prepare_slice(entry.as_slice())
+        // The batch checksum covers `base_offset` and hashes only each frame's
+        // stored checksum, so a corrupt header still yields no anchor and the
+        // floor is refused, without hashing every message body.
+        let batch = decode_prepare_slice_trusted(entry.as_slice())
             .inspect_err(|error| {
                 tracing::warn!(
                     target: "iggy.partitions.diag",
@@ -12039,6 +12049,19 @@ where
                 );
             })
             .ok()?;
+        let batch_checksum = batch.header.checksum_for_blob(batch.blob());
+        if batch_checksum != batch.header.batch_checksum {
+            tracing::warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                op,
+                stored = batch.header.batch_checksum,
+                computed = batch_checksum,
+                "resident repair batch fails its batch checksum; the window has no anchor"
+            );
+            return None;
+        }
         Some(RepairAnchor {
             op,
             base_offset: batch.header.base_offset,
@@ -12178,7 +12201,7 @@ where
 }
 
 /// The batch a repair window's floor-connect check is judged by.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RepairAnchor {
     op: u64,
     base_offset: u64,
@@ -28789,12 +28812,12 @@ mod tests {
     }
 
     /// Without a prepare WAL a refused floor stays in progress while the
-    /// window is incomplete, and every re-request gets the same chunk back.
-    /// Those frames are held, so the budget must run out and rotate the peer.
-    /// Above a committed prefix, so the walk mark that the first round records
-    /// must not pass for progress in the rounds after it. Every round loses the
-    /// op just above the floor, so the leading edge below the anchor stays open
-    /// and the refusal never turns final.
+    /// window is incomplete. Every round loses op `FLOOR + 1`, so the leading
+    /// edge below the anchor stays open and the refusal never turns final,
+    /// while the rest of each round re-serves frames this journal already
+    /// holds. Held frames are no progress, so the budget must run out and
+    /// rotate the peer. Above a committed prefix, so the walk mark that the
+    /// first round records must not pass for progress in the rounds after it.
     #[compio::test]
     async fn given_walless_refused_floor_when_peer_re_serves_held_frames_should_rotate_session() {
         const COMMIT_MIN: u64 = 5;
@@ -29756,6 +29779,53 @@ mod tests {
         assert!(partition.repair.is_none());
     }
 
+    /// A resident batch whose stamped `base_offset` no longer matches its batch
+    /// checksum says nothing about where the window begins, so it must not
+    /// anchor the floor however well the forged offset would connect.
+    #[compio::test]
+    async fn given_a_resident_batch_with_a_corrupt_base_offset_when_anchoring_should_yield_no_anchor()
+     {
+        const FLOOR: u64 = 5;
+        const OP: u64 = FLOOR + 1;
+        let partition = test_partition();
+        let mut prepare = repaired_send_prepare_at(OP, OP, 0, 0x66);
+        let base_offset_at = std::mem::size_of::<PrepareHeader>() + 8;
+        prepare.as_mut_slice()[base_offset_at..base_offset_at + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .expect("journal append");
+
+        assert_eq!(partition.repair_window_anchor(FLOOR, 300), None);
+    }
+
+    #[compio::test]
+    async fn given_a_resident_batch_with_an_intact_checksum_when_anchoring_should_read_its_base_offset()
+     {
+        const FLOOR: u64 = 5;
+        const OP: u64 = FLOOR + 1;
+        let partition = test_partition();
+        partition
+            .log
+            .journal()
+            .inner
+            .append(repaired_send_prepare_at(OP, OP, 0, 0x66).into_frozen())
+            .await
+            .expect("journal append");
+
+        assert_eq!(
+            partition.repair_window_anchor(FLOOR, 300),
+            Some(RepairAnchor {
+                op: OP,
+                base_offset: OP
+            })
+        );
+    }
+
     /// An op below the anchor is still missing, so a frame for it may yet
     /// connect the window.
     #[compio::test]
@@ -29871,6 +29941,36 @@ mod tests {
         assert!(
             partition.log.journal().inner.holds_op(6),
             "lazy flush keeps the committed headers resident"
+        );
+        assert!(partition.repair.is_some());
+    }
+
+    /// The resident run past the floor is longer than one capped commit walk.
+    /// The floor is moot from the start, because this journal holds every op
+    /// up to it. One walk stops below the floor, and a floor judged there
+    /// reads as disconnected and spends a state transfer on ops already held.
+    #[compio::test]
+    async fn given_resident_run_longer_than_one_walk_when_it_passes_a_disconnected_floor_should_keep_repairing()
+     {
+        const FLOOR: u64 = COMMIT_WALK_OPS_MAX as u64 + 6;
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(300, FLOOR));
+        for op in 1..=FLOOR + 1 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(FLOOR + 2, 0, 0x77))
+            .await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert_eq!(
+            partition.consensus().commit_min(),
+            COMMIT_WALK_OPS_MAX as u64,
+            "one capped walk, the rest resumes on the next"
         );
         assert!(partition.repair.is_some());
     }

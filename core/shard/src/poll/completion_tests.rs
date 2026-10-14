@@ -57,7 +57,10 @@ use partitions::{
 use server_common::MESSAGE_ALIGN;
 use server_common::Message;
 use server_common::iobuf::{Frozen, Owned};
-use server_common::send_messages::decode_batch_slice;
+use server_common::send_messages::{
+    COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    decode_batch_slice,
+};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
 use super::test_support::{
@@ -2472,6 +2475,163 @@ async fn given_a_primary_heard_at_a_newer_view_when_the_partition_gap_stops_shou
     );
 }
 
+/// A gap-stopped metadata backup of a five-replica cluster at view 1.
+#[allow(clippy::future_not_send)]
+async fn gap_stopped_metadata_backup(commit_max: u64) -> (CompletionTestShard, tempfile::TempDir) {
+    let bus = Rc::new(IggyMessageBus::new(0));
+    bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
+    for peer in 1..5 {
+        assert!(bus.owner_table().try_claim(peer, 1));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)
+        .await
+        .unwrap();
+    let mut consensus = VsrConsensus::new(
+        1,
+        0,
+        5,
+        server_common::sharding::METADATA_GROUP,
+        bus.clone(),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    consensus.set_view(1);
+    consensus.set_log_view(1);
+    consensus.advance_commit_max(commit_max);
+    let metadata = IggyMetadata::new(
+        Some(consensus),
+        Some(journal),
+        None,
+        None,
+        PollTestMetadata::default(),
+        None,
+    );
+    let (owner, _sender) = owner_in_cluster(
+        &bus,
+        partitions_config(),
+        IggyNamespace::new(0, 0, 0),
+        metadata,
+        5,
+    );
+    owner.set_repair_gap_debounce_ticks(1);
+    owner.set_repair_retry_ticks(1);
+    (owner, dir)
+}
+
+/// Tick until the metadata repair session targets a peer other than
+/// `previous`, and return it.
+#[allow(clippy::future_not_send)]
+async fn tick_until_metadata_repair_peer_changes(
+    owner: &CompletionTestShard,
+    previous: Option<u8>,
+) -> u8 {
+    for _ in 0..64 {
+        owner.tick_metadata().await;
+        let peer = owner
+            .metadata_repair
+            .borrow()
+            .as_ref()
+            .map(|session| session.peer);
+        if let Some(peer) = peer
+            && Some(peer) != previous
+        {
+            return peer;
+        }
+    }
+    panic!("the metadata repair session never moved off {previous:?}");
+}
+
+/// The metadata plane aims its gap-repair arm and stall rotation at the
+/// primary it last heard from, as the partition plane does.
+#[compio::test]
+async fn given_a_primary_heard_at_a_newer_view_when_the_metadata_gap_stops_should_repair_from_it() {
+    const HEARD_VIEW: u32 = 3;
+    let (owner, _dir) = gap_stopped_metadata_backup(5).await;
+    let (own_view_primary, heard_primary) = {
+        let metadata = owner.plane.metadata();
+        let consensus = metadata
+            .consensus
+            .as_ref()
+            .expect("the fixture builds metadata consensus");
+        (
+            consensus.primary_index(consensus.view()),
+            consensus.primary_index(HEARD_VIEW),
+        )
+    };
+    assert_eq!((own_view_primary, heard_primary), (1, 3));
+    let heartbeat = primary_commit(
+        IggyNamespace::from_raw(server_common::sharding::METADATA_GROUP),
+        heard_primary,
+        HEARD_VIEW,
+        5,
+    );
+    owner.on_commit(&heartbeat).await;
+
+    let armed = tick_until_metadata_repair_peer_changes(&owner, None).await;
+    assert_eq!(armed, heard_primary, "the gap arm asks the heard primary");
+
+    let rotated = tick_until_metadata_repair_peer_changes(&owner, Some(armed)).await;
+    assert_eq!(
+        rotated, own_view_primary,
+        "a stalled heard primary is forgotten, leaving the primary of this view"
+    );
+
+    owner.on_commit(&heartbeat).await;
+    let back = tick_until_metadata_repair_peer_changes(&owner, Some(rotated)).await;
+    assert_eq!(
+        back, heard_primary,
+        "the stall rotation goes to the primary heard again"
+    );
+}
+
+/// The incarnation fence runs before the heartbeat names a primary, so a
+/// stale incarnation's heartbeat cannot steer repair toward its replica.
+#[compio::test]
+async fn given_a_heartbeat_of_another_incarnation_when_it_names_a_newer_primary_should_keep_the_hint()
+ {
+    const HEARD_VIEW: u32 = 3;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, _sent) = gap_stopped_backup(namespace, 5);
+    let primary_hint = || {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition")
+            .consensus()
+            .primary_hint()
+    };
+    let (own_view_primary, heard_primary, hosted_incarnation) = {
+        let partitions = owner.plane.partitions();
+        let partition = partitions
+            .get_by_ns(&namespace)
+            .expect("the fixture registers the partition");
+        let consensus = partition.consensus();
+        (
+            consensus.primary_index(consensus.view()),
+            consensus.primary_index(HEARD_VIEW),
+            partition.created_revision(),
+        )
+    };
+    assert_ne!(own_view_primary, heard_primary);
+    let stale = primary_commit(namespace, heard_primary, HEARD_VIEW, 5).transmute_header(
+        |heartbeat, header: &mut CommitHeader| {
+            *header = heartbeat;
+            header.partition_incarnation = hosted_incarnation + 1;
+            header.seal();
+        },
+    );
+
+    owner.on_commit(&stale).await;
+    assert_eq!(primary_hint(), Some(own_view_primary));
+
+    owner
+        .on_commit(&primary_commit(namespace, heard_primary, HEARD_VIEW, 5))
+        .await;
+    assert_eq!(primary_hint(), Some(heard_primary));
+}
+
 /// A floor holds the walk and the served chunk above it carries no message, so
 /// nothing anchors the window. Pulling again from `commit_min + 1` would
 /// re-serve that same chunk forever.
@@ -2563,6 +2723,22 @@ async fn resident_window_backup(
     floor: u64,
     to_op: u64,
 ) -> (CompletionTestShard, SentFrames) {
+    resident_window_backup_with(namespace, peer, nonce, floor, to_op, |op| {
+        control_prepare(namespace, op)
+    })
+    .await
+}
+
+/// [`resident_window_backup`] with the window's ops built by `prepare_at`.
+#[allow(clippy::future_not_send)]
+async fn resident_window_backup_with(
+    namespace: IggyNamespace,
+    peer: u8,
+    nonce: u128,
+    floor: u64,
+    to_op: u64,
+    prepare_at: impl Fn(u64) -> Message<PrepareHeader>,
+) -> (CompletionTestShard, SentFrames) {
     let (owner, sent) = gap_stopped_backup(namespace, to_op);
     {
         let partitions = owner.plane.partitions();
@@ -2585,7 +2761,7 @@ async fn resident_window_backup(
                 .log
                 .journal()
                 .inner
-                .append(control_prepare(namespace, op).into_frozen())
+                .append(prepare_at(op).into_frozen())
                 .await
                 .expect("journal append");
         }
@@ -2594,8 +2770,8 @@ async fn resident_window_backup(
 }
 
 #[compio::test]
-async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_request_and_conclude()
-{
+async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_request_and_convert_to_state_transfer()
+ {
     const PEER: u8 = 1;
     const NONCE: u128 = 0xf100;
     const FLOOR: u64 = 5;
@@ -2603,26 +2779,7 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
     let namespace = IggyNamespace::new(0, 0, 0);
     let (owner, sent) = resident_window_backup(namespace, PEER, NONCE, FLOOR, TO_OP).await;
 
-    let mut scratch = Vec::new();
-    assert!(owner.tick_partitions(&mut scratch).await.is_none());
-    assert_eq!(
-        drain_prepare_requests(&sent),
-        vec![(PEER, TO_OP, TO_OP)],
-        "the stall retry asks again for the last op to draw a fresh RepairDone"
-    );
-
-    let repair_done = Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
-        .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
-            header.command = Command::RepairDone;
-            header.size = u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
-            header.group = namespace.inner();
-            header.cluster = 1;
-            header.replica = PEER;
-            header.nonce = NONCE;
-            header.op = TO_OP;
-            header.seal();
-        });
-    owner.on_repair_range_reply(&repair_done).await;
+    re_request_lost_repair_done(&owner, &sent, namespace, PEER, NONCE, TO_OP).await;
 
     let partitions = owner.plane.partitions();
     let partition = partitions
@@ -2637,7 +2794,81 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
         consensus::StateTransferStage::Idle,
         "an unanchored floor over a complete window converts to state transfer"
     );
+    assert_eq!(
+        partition.transfer.as_ref().map(|session| session.peer),
+        Some(PEER)
+    );
     assert_eq!(partition.consensus().commit_min(), 0);
+}
+
+/// The first op above the floor is a batch at offset 0, which connects to
+/// the empty log, so the re-served `RepairDone` accepts the floor and the walk
+/// commits the window.
+#[compio::test]
+async fn given_a_connecting_resident_window_when_the_last_repair_done_is_lost_should_re_request_and_commit_it()
+ {
+    const PEER: u8 = 1;
+    const NONCE: u128 = 0xf100;
+    const FLOOR: u64 = 5;
+    const TO_OP: u64 = FLOOR + 10;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let (owner, sent) = resident_window_backup_with(namespace, PEER, NONCE, FLOOR, TO_OP, |op| {
+        if op == FLOOR + 1 {
+            send_messages_prepare(namespace, op, 0)
+        } else {
+            control_prepare(namespace, op)
+        }
+    })
+    .await;
+
+    re_request_lost_repair_done(&owner, &sent, namespace, PEER, NONCE, TO_OP).await;
+
+    let partitions = owner.plane.partitions();
+    let partition = partitions
+        .get_by_ns(&namespace)
+        .expect("the partition stays registered");
+    assert_eq!(partition.consensus().commit_min(), TO_OP);
+    assert!(
+        partition.repair.is_none(),
+        "the re-served RepairDone concludes the session"
+    );
+    assert_eq!(
+        partition.consensus().state_transfer_stage(),
+        consensus::StateTransferStage::Idle
+    );
+}
+
+/// Tick until the stall retry asks again for `to_op`, the last op of a fully
+/// resident window, then deliver the `RepairDone` that request draws.
+#[allow(clippy::future_not_send)]
+async fn re_request_lost_repair_done(
+    owner: &CompletionTestShard,
+    sent: &SentFrames,
+    namespace: IggyNamespace,
+    peer: u8,
+    nonce: u128,
+    to_op: u64,
+) {
+    let mut scratch = Vec::new();
+    assert!(owner.tick_partitions(&mut scratch).await.is_none());
+    assert_eq!(
+        drain_prepare_requests(sent),
+        vec![(peer, to_op, to_op)],
+        "the stall retry asks again for the last op to draw a fresh RepairDone"
+    );
+
+    let repair_done = Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
+        .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
+            header.command = Command::RepairDone;
+            header.size = u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
+            header.group = namespace.inner();
+            header.cluster = 1;
+            header.replica = peer;
+            header.nonce = nonce;
+            header.op = to_op;
+            header.seal();
+        });
+    owner.on_repair_range_reply(&repair_done).await;
 }
 
 #[compio::test]
@@ -2663,6 +2894,45 @@ fn drain_prepare_requests(sent: &SentFrames) -> Vec<(u8, u64, u64)> {
                 .then(|| (peer, request.header().from_op, request.header().to_op))
         })
         .collect()
+}
+
+/// A `SendMessages` prepare at `op` carrying one message at `base_offset`.
+fn send_messages_prepare(
+    namespace: IggyNamespace,
+    op: u64,
+    base_offset: u64,
+) -> Message<PrepareHeader> {
+    let payload = b"repaired";
+    let mut messages = IggyMessages::with_capacity(1);
+    messages.push(IggyMessage {
+        header: IggyMessageHeader {
+            payload_length: u32::try_from(payload.len()).unwrap(),
+            ..Default::default()
+        },
+        payload: payload.to_vec().into(),
+        user_headers: None,
+    });
+    let mut batch =
+        SendMessagesOwned::from_messages(namespace, &messages).expect("encode the batch");
+    batch.header.base_offset = base_offset;
+    batch.header.batch_checksum = batch.header.checksum_for_blob(&batch.blob);
+    let body_start = size_of::<PrepareHeader>();
+    let size = body_start + COMMAND_HEADER_SIZE + batch.blob.len();
+    let mut prepare = Message::<PrepareHeader>::new(size);
+    let body = &mut prepare.as_mut_slice()[body_start..];
+    batch.header.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
+    body[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+    prepare.transmute_header(|_, header: &mut PrepareHeader| {
+        header.command = Command::Prepare;
+        header.retry_capacity = u32::try_from(consensus::PARTITION_DEDUP_CLIENTS_MAX).unwrap();
+        header.client = message_bus::AUTO_COMMIT_CLIENT_ID;
+        header.session = 1;
+        header.request = op;
+        header.op = op;
+        header.operation = Operation::SendMessages;
+        header.group = namespace.inner();
+        header.size = u32::try_from(size).unwrap();
+    })
 }
 
 /// A bare non-`SendMessages` prepare at `op`, as the commit walk skips it.
