@@ -204,9 +204,12 @@ impl IggyStream {
     ///
     /// # Errors
     ///
+    /// - [`IggyError::FeatureUnavailable`] when `config`'s consumer half has
+    ///   [`ConsumerKind::ExternalGroup`].
     /// - [`IggyError::NotConnected`] when the ping that opens the call fails.
     /// - Any error returned by [`IggyProducer::init()`] or [`IggyConsumer::init()`].
     ///
+    /// [`ConsumerKind::ExternalGroup`]: crate::prelude::ConsumerKind::ExternalGroup
     /// [`IggyConsumer`]: crate::prelude::IggyConsumer
     /// [`IggyConsumer::init()`]: crate::prelude::IggyConsumer::init
     /// [`IggyProducer`]: crate::prelude::IggyProducer
@@ -259,10 +262,13 @@ impl IggyStream {
     ///
     /// # Errors
     ///
+    /// - [`IggyError::FeatureUnavailable`] when `config`'s consumer half has
+    ///   [`ConsumerKind::ExternalGroup`].
     /// - [`IggyError::InvalidConnectionString`] when `connection_string` cannot be parsed.
     /// - Any error raised while connecting to the server.
     /// - Any error returned by [`build()`](Self::build).
     ///
+    /// [`ConsumerKind::ExternalGroup`]: crate::prelude::ConsumerKind::ExternalGroup
     /// [`IggyClient`]: crate::prelude::IggyClient
     pub async fn with_client_from_connection_string(
         connection_string: &str,
