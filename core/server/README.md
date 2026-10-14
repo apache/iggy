@@ -52,7 +52,11 @@ can use it.
 Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
 `replicaId` component, changing constructor calls and record patterns. C# callers
 must initialize the required `ReplicaId` property. The CLI's cluster metadata list
-appends a replica ID column. Go, Java, Node.js and C# clients use command 105's new
+appends a replica ID column. Swift's `ClusterNode` initializer now requires
+`replicaID`. C++'s FFI `ClusterNode`, Rust's `iggy_common::ClusterNode` and
+`iggy_binary_protocol::responses::system::ClusterNodeResponse` add the public
+`replica_id` field; update aggregate and struct initializers.
+Go, Java, Node.js and C# clients use command 105's new
 partition routes and refresh on `NotPrimary` (89); use their matching releases.
 
 ## Configuration
