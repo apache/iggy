@@ -42,7 +42,10 @@ const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 const ELASTICSEARCH_CONTAINER_NAME: &str = "iggy-test-elasticsearch";
 // Short probe timeouts: create_http_client() uses 30s + retries and must not
 // be used for readiness. One hung attempt there looks like a 60s+ test hang.
-const CLUSTER_READY_TIMEOUT_SECS: u64 = 60;
+// The overall budget doubles as the creator's startup timeout because
+// attaching to the reused container skips testcontainers' wait, so a test that
+// attaches while another one is still booting ES waits here instead.
+const CLUSTER_READY_TIMEOUT_SECS: u64 = 120;
 const CLUSTER_READY_INTERVAL_MS: u64 = 250;
 const CLUSTER_READY_REQUEST_TIMEOUT_MS: u64 = 2_000;
 const DOCKER_RM_TIMEOUT_SECS: u64 = 15;
@@ -144,7 +147,7 @@ async fn start_shared_container() -> Result<ContainerAsync<GenericImage>, TestBi
                     .with_port(ELASTICSEARCH_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
-            .with_startup_timeout(Duration::from_secs(120))
+            .with_startup_timeout(Duration::from_secs(CLUSTER_READY_TIMEOUT_SECS))
             .with_env_var("discovery.type", "single-node")
             .with_env_var("xpack.security.enabled", "false")
             .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
