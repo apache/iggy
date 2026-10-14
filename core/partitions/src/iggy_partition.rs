@@ -8431,7 +8431,9 @@ where
                 let Some(entry) = pipeline.entry_by_op(op) else {
                     break;
                 };
-                if !self.prepare_body_is_ready(&entry.header, materialize) {
+                if !self.consensus.view_log_entry_proven(entry.header.op)
+                    || !self.prepare_body_is_ready(&entry.header, materialize)
+                {
                     break;
                 }
                 if self.no_ack.front().is_some_and(|head| {
@@ -8510,7 +8512,10 @@ where
             .inner
             .committed_headers_from(from_op, commit_max, max_ops)
             .into_iter()
-            .take_while(|header| self.prepare_body_is_ready(header, materialize))
+            .take_while(|header| {
+                self.consensus.view_log_entry_proven(header.op)
+                    && self.prepare_body_is_ready(header, materialize)
+            })
             .collect()
     }
 
@@ -8783,6 +8788,8 @@ where
         if let Some(persistence) = &self.persistence {
             // The durable WAL is contiguous. A canonical tail beyond a divergent
             // entry is repair-held and must be persisted again after the gap fills.
+            // Truncation invalidates the head certificate. A crash before refill
+            // requires state transfer; the old certificate cannot vouch for a prefix.
             persistence.truncate_from(op);
             self.start_persistence();
             persistence
@@ -10098,6 +10105,9 @@ where
             || headers
                 .windows(2)
                 .any(|pair| pair[0].op.checked_add(1) != Some(pair[1].op))
+            || headers
+                .iter()
+                .any(|header| !self.consensus.view_log_entry_proven(header.op))
         {
             return false;
         }
@@ -11777,6 +11787,15 @@ where
             .floor
             .filter(|&floor| floor > self.consensus().commit_min())
         {
+            // Offset continuity cannot certify that recovered bytes belong to
+            // the adopted history. An evicted proof gap needs state transfer.
+            if self.consensus().view_log_unproven() {
+                self.repair = None;
+                return RepairConclusion::FloorRefused {
+                    floor,
+                    to_op: session.commit_to_op,
+                };
+            }
             // A peer may have evicted past this replica's commit frontier;
             // an unclamped floor would drive commit_min above commit_max and
             // panic the next advance.
@@ -28866,6 +28885,80 @@ mod tests {
         backup.consensus().sequencer().set_sequence(wal_head);
         backup.recovered_durable_offset = Some(wal_head - 1);
         backup
+    }
+
+    #[compio::test]
+    async fn given_durable_unproven_history_when_resuming_io_should_not_select_or_apply_it() {
+        const HEAD: u64 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let config = repair_config();
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        backup.open_persistence().await.unwrap();
+        let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+        let mut parent = 0;
+        let mut headers = Vec::new();
+        for op in 1..=HEAD {
+            let prepare = checksummed_segment_prepare(op, parent, op - 1, b"old-view");
+            parent = prepare.header().checksum;
+            headers.push(*prepare.header());
+            backup
+                .log
+                .journal()
+                .inner
+                .append(prepare.clone().into_frozen())
+                .await
+                .unwrap();
+            persistence.append(prepare.into_frozen(), true).unwrap();
+        }
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable_through(HEAD));
+        backup.consensus().advance_commit_max(HEAD);
+        backup.consensus().fence_view_log(HEAD + 1, HEAD + 1);
+
+        assert!(!backup.select_commit(headers.clone(), &config, false));
+        assert_eq!(
+            backup.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &config),
+            []
+        );
+        for _ in 0..HEAD {
+            backup.resume_io(&config).await;
+            assert_eq!(backup.consensus().commit_min(), 0);
+            assert!(!backup.has_pending_commit());
+        }
+
+        backup.consensus().settle_view_log_proof();
+        assert_eq!(
+            backup.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &config),
+            headers
+        );
+        backup.commit_journal(&config).await;
+        assert_eq!(backup.consensus().commit_min(), HEAD);
+    }
+
+    #[compio::test]
+    async fn given_unproven_history_when_repair_floor_connects_should_require_state_transfer() {
+        const FLOOR: u64 = 2;
+        const HEAD: u64 = 3;
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.consensus().advance_commit_max(HEAD);
+        backup.repair = Some(armed_session(HEAD, FLOOR));
+        backup
+            .apply_repaired_prepare(checksummed_segment_prepare(HEAD, 0, 0, b"connected"))
+            .await;
+        backup.consensus().fence_view_log(FLOOR, FLOOR);
+
+        assert_eq!(
+            backup.complete_repair(&repair_config()).await,
+            RepairConclusion::FloorRefused {
+                floor: FLOOR,
+                to_op: HEAD
+            }
+        );
+        assert_eq!(backup.consensus().commit_min(), 0);
+        assert!(backup.consensus().view_log_unproven());
+        assert!(backup.repair.is_none());
     }
 
     /// The serving peer evicted every op below `RETAINED_FROM` and retains more
