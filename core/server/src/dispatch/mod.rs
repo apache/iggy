@@ -301,9 +301,9 @@ impl Drop for ActiveDrainSlot {
 /// conflict, but cannot pass a queued session or metadata barrier. A PING still waits
 /// behind a frame already suspended in admission or binding.
 ///
-/// `capacity` caps those tasks at `message_bus.client_queue_capacity`, the
-/// outbound queue size of a connection, so their replies never overflow that
-/// queue. A metadata write, a segment delete, a login and a logout also take
+/// `capacity` caps running tasks at `message_bus.client_queue_capacity`.
+/// Permits end when replies are enqueued, so they do not reserve outbound
+/// queue slots. A metadata write, a segment delete, a login and a logout also take
 /// the metadata lane, which holds one of them at a time. The metadata client
 /// table keeps one pending write per client and refuses a lower request id
 /// after a higher one committed, so a second write in flight would fail with
