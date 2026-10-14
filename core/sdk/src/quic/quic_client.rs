@@ -110,6 +110,11 @@ pub struct QuicClient {
     /// connection that drops without a `disconnect()` call leaves it clear, so
     /// that loss still heals.
     disconnected_by_caller: AtomicBool,
+    /// Set when `shutdown()` finishes its cleanup. The state turns `Shutdown`
+    /// before that cleanup and stays there, so it cannot tell a finished
+    /// shutdown from a cancelled one: a cancelled `shutdown()` leaves the
+    /// cleanup to the next call.
+    shutdown_complete: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -679,6 +684,7 @@ impl QuicClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             disconnected_by_caller: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -739,6 +745,27 @@ impl QuicClient {
         self.disconnected_by_caller.load(Ordering::SeqCst)
     }
 
+    /// A reconnect sweep checks this before each dial and after it installs
+    /// the link: once the client is shut down or the caller disconnects,
+    /// nothing in the sweep may bring the client back.
+    async fn sweep_interrupted(&self) -> Option<IggyError> {
+        if self.get_state().await == ClientState::Shutdown {
+            return Some(IggyError::ClientShutdown);
+        }
+        self.caller_disconnected()
+            .then_some(IggyError::NotConnected)
+    }
+
+    async fn fail_connect(&self) {
+        // The state stays `Shutdown`, and a `Disconnected` event would
+        // contradict the `Shutdown` one.
+        if self.get_state().await == ClientState::Shutdown {
+            return;
+        }
+        self.set_state(ClientState::Disconnected).await;
+        self.publish_event(DiagnosticEvent::Disconnected).await;
+    }
+
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         let single_attempt = context.single_attempt();
@@ -786,10 +813,9 @@ impl QuicClient {
             let connection;
             let remote_address;
             loop {
-                if self.caller_disconnected() {
-                    self.set_state(ClientState::Disconnected).await;
-                    self.publish_event(DiagnosticEvent::Disconnected).await;
-                    return Err(IggyError::NotConnected);
+                if let Some(error) = self.sweep_interrupted().await {
+                    self.fail_connect().await;
+                    return Err(error);
                 }
                 let server_address_str = self.current_server_address.lock().await.clone();
                 let server_address = tokio::net::lookup_host(&server_address_str)
@@ -868,18 +894,22 @@ impl QuicClient {
                 break;
             }
 
-            if self.caller_disconnected() {
-                connection.close(0u32.into(), b"");
-                self.set_state(ClientState::Disconnected).await;
-                self.publish_event(DiagnosticEvent::Disconnected).await;
-                return Err(IggyError::NotConnected);
+            let link = QuicLink::new(connection, self.config.response_buffer_size as usize);
+            self.link.lock().await.replace(link);
+            // Checked once the link is installed, not before: `shutdown()` sets
+            // `Shutdown` before it takes the link, so a shutdown during the
+            // dial either takes this link or is seen here.
+            if let Some(error) = self.sweep_interrupted().await {
+                if let Some(link) = self.link.lock().await.take() {
+                    link.close();
+                }
+                self.fail_connect().await;
+                return Err(error);
             }
 
             let now = IggyTimestamp::now();
             info!("{NAME} client has connected to server: {remote_address} at {now}",);
             self.set_state(ClientState::Connected).await;
-            let link = QuicLink::new(connection, self.config.response_buffer_size as usize);
-            self.link.lock().await.replace(link);
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
 
@@ -1043,11 +1073,14 @@ impl QuicClient {
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Shutdown {
+        if self.shutdown_complete.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         info!("Shutting down the {NAME} QUIC client.");
+        // Set before the link is taken: a reconnect sweep that installs a link
+        // after this point sees `Shutdown` and closes it.
+        self.set_state(ClientState::Shutdown).await;
         let link = self.link.lock().await.take();
         if let Some(link) = link {
             link.close();
@@ -1055,8 +1088,8 @@ impl QuicClient {
 
         self.endpoint.wait_idle().await;
         self.reset_vsr_session().await?;
-        self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
+        self.shutdown_complete.store(true, Ordering::SeqCst);
         info!("{NAME} QUIC client has been shutdown.");
         Ok(())
     }
@@ -2395,5 +2428,113 @@ mod tests {
             tokio::time::timeout(TEST_BUDGET, publish).await.is_ok(),
             "a publish waited for room that an unread receiver never frees"
         );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_a_reconnect_sweep_ends_the_sweep() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = Arc::new(
+            QuicClient::create(Arc::new(QuicClientConfig {
+                server_address: endpoint.local_addr().unwrap().to_string(),
+                reconnection: QuicClientReconnectionConfig {
+                    reestablish_after: IggyDuration::from_str("500ms").unwrap(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .unwrap(),
+        );
+        // A connection a moment ago: the sweep first waits out
+        // `reestablish_after`, and the shutdown lands during that wait.
+        client
+            .connected_at
+            .lock()
+            .await
+            .replace(IggyTimestamp::now());
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { QuicClient::connect(&client).await }
+        });
+        while client.get_state().await != ClientState::Connecting {
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        Client::shutdown(&*client).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), sweep)
+            .await
+            .expect("the sweep must end after the shutdown")
+            .expect("the sweep task must not panic");
+
+        assert!(
+            matches!(result, Err(IggyError::ClientShutdown)),
+            "got {result:?}"
+        );
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
+        assert!(
+            client.link.lock().await.is_none(),
+            "no link may be installed after the shutdown"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), endpoint.accept())
+                .await
+                .is_err(),
+            "the sweep must not dial after the shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_shutdown_is_finished_by_the_next_call() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address: endpoint.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let (peer, connected) = tokio::join!(
+            async { endpoint.accept().await.unwrap().await.unwrap() },
+            Client::connect(&client)
+        );
+        connected.unwrap();
+        let mut events = client.subscribe_events().await;
+        {
+            let _transport = client.link.lock().await;
+            // The shutdown waits for the transport lock, and its caller gives up.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), Client::shutdown(&client))
+                    .await
+                    .is_err()
+            );
+        }
+
+        Client::shutdown(&client).await.unwrap();
+
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
+        assert!(client.link.lock().await.is_none());
+        tokio::time::timeout(Duration::from_secs(1), peer.closed())
+            .await
+            .expect("the live connection must be closed");
+        let mut shutdowns = 0;
+        while let Ok(event) = events.try_recv() {
+            if event == DiagnosticEvent::Shutdown {
+                shutdowns += 1;
+            }
+        }
+        assert_eq!(shutdowns, 1);
     }
 }
