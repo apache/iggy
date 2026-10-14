@@ -36,26 +36,27 @@ use std::sync::Arc;
 /// | [`new()`](Self::new) | every field, positional |
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
-/// The builder requires every field that is not an [`Option`], so it requires
-/// [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name),
-/// [`topic_partitions_count()`](Self::topic_partitions_count),
+/// The builder requires every field that is not an [`Option`] and carries no
+/// `#[builder(default)]`, so it requires [`stream_name()`](Self::stream_name),
+/// [`topic_name()`](Self::topic_name), [`topic_partitions_count()`](Self::topic_partitions_count),
 /// [`batch_length()`](Self::batch_length), [`linger_time()`](Self::linger_time) and
-/// [`partitioning()`](Self::partitioning).
+/// [`partitioning()`](Self::partitioning). [`topic_durability()`](Self::topic_durability) is the
+/// one field the builder itself defaults.
 ///
 /// # Fields and defaults
 ///
 /// The defaults below are what [`default()`](Self::default) and
-/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder has no defaults.
+/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder leaves every field but
+/// [`topic_durability()`](Self::topic_durability) unset, so it takes the same default there too.
 ///
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
 /// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | where messages are appended |
 /// | [`topic_partitions_count()`](Self::topic_partitions_count) | 1 | partitions of a topic the build creates |
+/// | [`topic_durability()`](Self::topic_durability) | [`Durability::Replicated`] | durability of a topic the build creates |
 /// | [`batch_length()`](Self::batch_length) | 100 | messages per request |
 /// | [`linger_time()`](Self::linger_time) | 5 milliseconds | smallest gap between two send calls |
 /// | [`partitioning()`](Self::partitioning) | [`Partitioning::balanced()`] | which partition a batch lands in |
-/// | [`send_retries_count()`](Self::send_retries_count) | three retries | retrying a failed request |
-/// | [`send_retries_interval()`](Self::send_retries_interval) | one second | pacing those retries |
 /// | [`encryptor()`](Self::encryptor) | none | encrypting payloads and user headers |
 ///
 /// [`topic_partitions_count()`](Self::topic_partitions_count) applies to a topic that the build
@@ -80,7 +81,6 @@ use std::sync::Arc;
 /// )?;
 ///
 /// assert_eq!(config.topic_partitions_count(), 1);
-/// assert_eq!(config.send_retries_count(), Some(3));
 /// # Ok(())
 /// # }
 /// ```
@@ -98,8 +98,6 @@ use std::sync::Arc;
 ///     .batch_length(100)
 ///     .linger_time(IggyDuration::new_from_secs(1))
 ///     .partitioning(Partitioning::messages_key_str("my-key")?)
-///     .send_retries_count(5)
-///     .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
 ///     .build();
 ///
 /// assert_eq!(config.topic_partitions_count(), 10);
@@ -107,6 +105,7 @@ use std::sync::Arc;
 /// # }
 /// ```
 ///
+/// [`Durability::Replicated`]: crate::prelude::Durability::Replicated
 /// [`IggyClient`]: crate::prelude::IggyClient
 /// [`IggyStream`]: crate::prelude::IggyStream
 /// [`IggyStreamProducer`]: crate::prelude::IggyStreamProducer
@@ -130,11 +129,6 @@ pub struct IggyProducerConfig {
     linger_time: IggyDuration,
     /// Strategy that defines to which partition the messages should be sent.
     partitioning: Partitioning,
-    /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
-    /// Sets the maximum number of send retries in case of a message sending failure.
-    send_retries_count: Option<u32>,
-    /// Sets the interval between send retries in case of a message sending failure.
-    send_retries_interval: Option<NonZeroIggyDuration>,
     /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
     encryptor: Option<Arc<EncryptorKind>>,
@@ -156,7 +150,7 @@ impl Default for IggyProducerConfig {
 }
 
 impl IggyProducerConfig {
-    /// Return a new instance of a `IggyConsumerConfig`.
+    /// Return a new instance of a `IggyProducerConfig`.
     ///
     /// # Examples
     ///
@@ -174,11 +168,9 @@ impl IggyProducerConfig {
     ///     IggyDuration::new_from_secs(1),
     ///     Partitioning::balanced(),
     ///     None,
-    ///     None,
-    ///     None,
     /// );
     ///
-    /// assert_eq!(config.send_retries_count(), None);
+    /// assert_eq!(config.batch_length(), 100);
     /// # Ok(())
     /// # }
     /// ```
