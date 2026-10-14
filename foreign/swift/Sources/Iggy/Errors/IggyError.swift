@@ -76,3 +76,31 @@ public struct IggyError: Error, Sendable, Hashable, CustomStringConvertible {
         hasher.combine(rawCode)
     }
 }
+
+extension IggyError {
+    /// Whether the failure means the connection itself is gone.
+    var isConnectionLoss: Bool {
+        switch code {
+        case .disconnected, .emptyResponse, .notConnected, .cannotEstablishConnection, .tcpError, .staleClient:
+            true
+        default:
+            false
+        }
+    }
+
+    /// Whether a fresh connection and sign-in can recover from this failure.
+    var isReconnectable: Bool {
+        isConnectionLoss || code == .unauthenticated
+    }
+
+    /// Whether a sign-in that failed this way would fail the same way on a
+    /// retry, so the remembered credentials are dropped.
+    var isCredentialRejection: Bool {
+        switch code {
+        case .invalidCredentials, .invalidUsername, .invalidPassword, .unauthenticated:
+            true
+        default:
+            false
+        }
+    }
+}
