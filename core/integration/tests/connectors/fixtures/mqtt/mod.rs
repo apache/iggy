@@ -31,6 +31,8 @@ use container::{
     MqttBrokerContainer,
 };
 
+const SOURCE_CLIENT_ID: &str = "iggy-mqtt-integration-source";
+
 struct MqttFixture {
     // The publisher and source deliberately share protocol and QoS settings so
     // a test never validates a different broker delivery mode by accident.
@@ -95,9 +97,13 @@ impl MqttFixture {
         Ok(fixture)
     }
 
-    async fn restart_broker(&self) -> Result<(), String> {
+    async fn reconnect_source(&self) -> Result<(), String> {
         self.broker
-            .restart()
+            .disconnect_client(SOURCE_CLIENT_ID)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.broker
+            .wait_for_client(SOURCE_CLIENT_ID)
             .await
             .map_err(|error| error.to_string())
     }
@@ -197,7 +203,7 @@ impl MqttFixture {
             ),
             (
                 ENV_SOURCE_CLIENT_ID.to_string(),
-                "iggy-mqtt-integration-source".to_string(),
+                SOURCE_CLIENT_ID.to_string(),
             ),
             (
                 ENV_SOURCE_STREAM.to_string(),
@@ -252,8 +258,8 @@ impl Mqtt5PendingBatchFixture {
         self.0.publish(payload).await
     }
 
-    pub async fn restart_broker(&self) -> Result<(), String> {
-        self.0.restart_broker().await
+    pub async fn reconnect_source(&self) -> Result<(), String> {
+        self.0.reconnect_source().await
     }
 }
 

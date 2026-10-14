@@ -468,6 +468,17 @@ impl Source for MqttSource {
             .await
             .take()
             .ok_or_else(|| Error::InitError("MQTT driver is not initialized".to_string()))?;
+        if let Err(error) = driver
+            .flush_deferred_acknowledgements(self.poll_timeout, self.max_retries())
+            .await
+        {
+            *self.driver.lock().await = Some(driver);
+            debug!(
+                "Deferred MQTT acknowledgements remain queued for connector with ID {}; retrying before reading new messages: {error}",
+                self.id
+            );
+            return Ok(empty_messages());
+        }
         // Move the driver out while polling so network I/O does not occur while
         // holding the source mutex. Restore it before returning.
         let received = self.collect_batch(&mut driver).await;
@@ -477,7 +488,6 @@ impl Source for MqttSource {
             return Ok(empty_messages());
         }
 
-        let mut messages = Vec::with_capacity(received.len());
         let mut replay_messages = Vec::with_capacity(received.len());
         let mut ack_tokens = Vec::with_capacity(received.len());
         for received in received {
@@ -503,32 +513,22 @@ impl Source for MqttSource {
                 headers: Some(received.message.headers.clone()),
                 payload: payload.clone(),
             });
-            messages.push(ProducedMessage {
-                id: None,
-                checksum: None,
-                timestamp: None,
-                origin_timestamp: None,
-                headers: Some(received.message.headers),
-                payload,
-            });
         }
         let schema = if self.config.include_metadata {
             Schema::Json
         } else {
             Schema::Raw
         };
-        *self.pending_batch.lock().await = Some(PendingBatch {
+        let pending_batch = PendingBatch {
             replay_messages,
             schema,
             ack_tokens,
             in_flight: true,
-        });
+        };
+        let produced_messages = pending_batch.replay();
+        *self.pending_batch.lock().await = Some(pending_batch);
 
-        Ok(ProducedMessages {
-            schema,
-            messages,
-            state: None,
-        })
+        Ok(produced_messages)
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
@@ -562,40 +562,19 @@ impl Source for MqttSource {
                 "MQTT driver is not initialized".to_string(),
             ));
         };
-        let mut acknowledgement = driver
-            // MQTT acknowledgements are sent only after Iggy acknowledges the
-            // batch, preserving at-least-once delivery.
-            .acknowledge_batch(
-                &mut pending_batch.ack_tokens,
-                self.poll_timeout,
-                self.batch_size,
-                self.max_retries(),
-            )
+        // MQTT acknowledgements are sent only after Iggy acknowledges the
+        // batch, preserving at-least-once delivery. If rumqttc's request queue
+        // is full, the driver keeps the remaining tokens for a later poll.
+        driver.defer_acknowledgements(&mut pending_batch.ack_tokens);
+        let acknowledgement = driver
+            .flush_deferred_acknowledgements(self.poll_timeout, self.max_retries())
             .await;
-        for _ in 0..driver::ACK_BATCH_RETRY_ATTEMPTS {
-            if acknowledgement.is_ok() || pending_batch.ack_tokens.is_empty() {
-                break;
-            }
-            tokio::time::sleep(driver::ACK_RETRY_DELAY.min(self.poll_timeout)).await;
-            acknowledgement = driver
-                .acknowledge_batch(
-                    &mut pending_batch.ack_tokens,
-                    self.poll_timeout,
-                    self.batch_size,
-                    self.max_retries(),
-                )
-                .await;
-        }
         *self.driver.lock().await = Some(driver);
         if let Err(error) = acknowledgement {
             warn!(
-                "MQTT acknowledgement retries exhausted for connector with ID {}; abandoning the broker acknowledgement and continuing; the broker may redeliver the message later, producing duplicates: {error}",
+                "MQTT acknowledgement retries exhausted for connector with ID {}; retaining the broker acknowledgement for a later poll: {error}",
                 self.id
             );
-            // Iggy already accepted and persisted this batch. Continuing after
-            // the bounded MQTT retry policy prevents a transient broker failure
-            // from stopping the source. Any later broker redelivery is a valid
-            // at-least-once duplicate.
             return Ok(());
         }
         Ok(())
@@ -856,7 +835,7 @@ mod tests {
                 b"payload".as_slice(),
                 None,
             );
-            let ack_token = driver::normalize_mqtt5(publish)
+            let ack_token = driver::normalize_mqtt5(publish, true)
                 .expect("MQTT publish should normalize")
                 .ack_token
                 .expect("QoS 1 publish should have an acknowledgement token");
@@ -986,7 +965,7 @@ mod tests {
             vec![0, 255],
             Some(properties),
         );
-        let message = driver::normalize_mqtt5(publish)
+        let message = driver::normalize_mqtt5(publish, true)
             .expect("MQTT 5 publish should normalize")
             .message;
 
@@ -1010,7 +989,7 @@ mod tests {
             b"payload".to_vec(),
             None,
         );
-        let message = driver::normalize_mqtt5(publish)
+        let message = driver::normalize_mqtt5(publish, true)
             .expect("MQTT 5 publish should normalize")
             .message;
 

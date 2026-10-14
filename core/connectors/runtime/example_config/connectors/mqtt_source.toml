@@ -54,6 +54,11 @@ batch_timeout = "10ms"
 max_retries = 5
 verbose_logging = false
 
+# Optional authenticated connection. Supply these through a local secret or
+# environment overrides; do not commit real credentials here.
+# username = "emqx-user"
+# password = "replace-me"
+
 # Optional TLS configuration for mqtts:// brokers. The client certificate and
 # key must be configured together. The server name must match the broker URL
 # host with the current rumqttc transport API.
@@ -66,7 +71,3 @@ verbose_logging = false
 # subscriptions, and each value must be 0, 1, or 2.
 # [plugin_config.subscription_qos]
 # "devices/+/telemetry" = 2
-
-# Optional authenticated connection:
-# username = "emqx-user"
-# password = "replace-me"

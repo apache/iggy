@@ -42,13 +42,12 @@ use std::{
     sync::{Arc, LazyLock},
     time::Duration,
 };
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 use url::Url;
 
-pub(crate) const ACK_RETRY_DELAY: Duration = Duration::from_millis(10);
-pub(crate) const ACK_BATCH_RETRY_ATTEMPTS: usize = 1;
 const MAX_HEADER_VALUE_LENGTH: usize = 255;
+const RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MQTT_PROTOCOL_HEADER: &str = "mqtt.protocol";
 const MQTT_TOPIC_HEADER: &str = "mqtt.topic";
 
@@ -118,14 +117,10 @@ pub(crate) struct ReceivedMessage {
     pub(crate) ack_token: Option<AckToken>,
 }
 
-/// The original publish packet needed by rumqttc to acknowledge QoS 1 or QoS 2.
 #[derive(Debug)]
-pub(crate) struct AckToken(AckTokenKind);
-
-#[derive(Debug)]
-enum AckTokenKind {
-    Mqtt311(Mqtt311Publish),
-    Mqtt5(Mqtt5Publish),
+pub(crate) enum AckToken {
+    Mqtt311 { qos: Mqtt311Qos, packet_id: u16 },
+    Mqtt5 { qos: Mqtt5Qos, packet_id: u16 },
 }
 
 enum MqttConnection {
@@ -157,6 +152,10 @@ pub(crate) struct MqttDriver {
     connection: MqttConnection,
     subscriptions: Vec<MqttSubscription>,
     buffered_messages: VecDeque<ReceivedMessage>,
+    // Iggy has accepted these batches, but rumqttc could not yet queue their
+    // acknowledgements. Keep them until a later poll can flush them.
+    pending_ack_tokens: Vec<AckToken>,
+    include_metadata: bool,
     max_buffered_messages: usize,
 }
 
@@ -208,6 +207,8 @@ impl MqttDriver {
                     },
                     subscriptions,
                     buffered_messages,
+                    pending_ack_tokens: Vec::new(),
+                    include_metadata: config.include_metadata,
                     max_buffered_messages,
                 })
             }
@@ -235,6 +236,7 @@ impl MqttDriver {
                     &mut event_loop,
                     subscriptions.len(),
                     poll_timeout,
+                    config.include_metadata,
                     max_buffered_messages,
                 )
                 .await?;
@@ -246,6 +248,8 @@ impl MqttDriver {
                     },
                     subscriptions,
                     buffered_messages,
+                    pending_ack_tokens: Vec::new(),
+                    include_metadata: config.include_metadata,
                     max_buffered_messages,
                 })
             }
@@ -265,6 +269,7 @@ impl MqttDriver {
         // Bound each driver poll so the source can flush partial batches and
         // respond to runtime shutdown instead of waiting indefinitely.
         let deadline = tokio::time::Instant::now() + poll_timeout;
+        let include_metadata = self.include_metadata;
         let max_buffered_messages = self.max_buffered_messages;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -286,7 +291,14 @@ impl MqttDriver {
                             .await?
                         }
                         Ok(Err(error)) => {
-                            return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
+                            // rumqttc resets its network state after a
+                            // disconnect. Polling it again performs the
+                            // reconnect and yields the next ConnAck.
+                            warn!(
+                                "MQTT 3.1.1 connection interrupted; retrying event loop: {error}"
+                            );
+                            sleep(RECONNECT_RETRY_DELAY).await;
+                            continue;
                         }
                         Err(_) => return Ok(None),
                     }
@@ -300,12 +312,18 @@ impl MqttDriver {
                                 event,
                                 subscriptions,
                                 remaining,
+                                include_metadata,
                                 max_buffered_messages,
                             )
                             .await?
                         }
                         Ok(Err(error)) => {
-                            return Err(iggy_connector_sdk::Error::Connection(error.to_string()));
+                            // rumqttc resets its network state after a
+                            // disconnect. Polling it again performs the
+                            // reconnect and yields the next ConnAck.
+                            warn!("MQTT 5 connection interrupted; retrying event loop: {error}");
+                            sleep(RECONNECT_RETRY_DELAY).await;
+                            continue;
                         }
                         Err(_) => return Ok(None),
                     }
@@ -328,13 +346,11 @@ impl MqttDriver {
         &mut self,
         ack_tokens: &mut Vec<AckToken>,
         poll_timeout: Duration,
-        max_buffered_messages: usize,
         max_retries: u32,
     ) -> Result<(), iggy_connector_sdk::Error> {
         // Process tokens in order. On failure, remove only tokens already
         // acknowledged so the remaining suffix can be retried.
         let mut acknowledged = 0;
-        let retry_delay = ACK_RETRY_DELAY.min(poll_timeout);
         while acknowledged < ack_tokens.len() {
             let mut last_error = None;
             let mut acknowledged_token = false;
@@ -345,21 +361,24 @@ impl MqttDriver {
                         break;
                     }
                     Err(error) => {
+                        let should_poll_for_progress =
+                            matches!(error, iggy_connector_sdk::Error::Connection(_));
                         last_error = Some(error);
-                        if attempt == max_retries {
+                        if !should_poll_for_progress {
                             break;
                         }
                         // rumqttc may need event-loop progress before try_ack can
-                        // enqueue the acknowledgement.
+                        // enqueue the acknowledgement. This also lets rumqttc
+                        // reconnect before a retained acknowledgement is retried.
                         if let Err(error) = self
-                            .poll_for_ack_progress(poll_timeout, max_buffered_messages)
+                            .poll_for_ack_progress(poll_timeout, self.max_buffered_messages)
                             .await
                         {
                             ack_tokens.drain(..acknowledged);
                             return Err(error);
                         }
-                        if !retry_delay.is_zero() {
-                            tokio::time::sleep(retry_delay).await;
+                        if attempt == max_retries {
+                            break;
                         }
                     }
                 }
@@ -375,16 +394,50 @@ impl MqttDriver {
         Ok(())
     }
 
+    pub(crate) fn defer_acknowledgements(&mut self, ack_tokens: &mut Vec<AckToken>) {
+        retain_acknowledgements(&mut self.pending_ack_tokens, ack_tokens);
+    }
+
+    pub(crate) async fn flush_deferred_acknowledgements(
+        &mut self,
+        poll_timeout: Duration,
+        max_retries: u32,
+    ) -> Result<(), iggy_connector_sdk::Error> {
+        if self.pending_ack_tokens.is_empty() {
+            return Ok(());
+        }
+
+        let mut ack_tokens = std::mem::take(&mut self.pending_ack_tokens);
+        let result = self
+            .acknowledge_batch(&mut ack_tokens, poll_timeout, max_retries)
+            .await;
+        self.pending_ack_tokens = ack_tokens;
+        result
+    }
+
     fn try_acknowledge(&self, ack_token: &AckToken) -> Result<(), iggy_connector_sdk::Error> {
         // A token must be acknowledged by the same protocol client that created
         // it. Mixing MQTT 3.1.1 and MQTT 5 tokens is an invalid internal state.
-        match (&self.connection, &ack_token.0) {
-            (MqttConnection::Mqtt311 { client, .. }, AckTokenKind::Mqtt311(publish)) => client
-                .try_ack(publish)
-                .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string())),
-            (MqttConnection::Mqtt5 { client, .. }, AckTokenKind::Mqtt5(publish)) => client
-                .try_ack(publish)
-                .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string())),
+        match (&self.connection, ack_token) {
+            (MqttConnection::Mqtt311 { client, .. }, AckToken::Mqtt311 { qos, packet_id }) => {
+                // rumqttc derives the MQTT acknowledgement only from QoS and
+                // packet ID, so retaining the received payload is unnecessary.
+                let mut publish = Mqtt311Publish::new("", *qos, []);
+                publish.pkid = *packet_id;
+                client
+                    .try_ack(&publish)
+                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))
+            }
+            (MqttConnection::Mqtt5 { client, .. }, AckToken::Mqtt5 { qos, packet_id }) => {
+                let publish = Mqtt5Publish {
+                    qos: *qos,
+                    pkid: *packet_id,
+                    ..Default::default()
+                };
+                client
+                    .try_ack(&publish)
+                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))
+            }
             _ => Err(iggy_connector_sdk::Error::InvalidState),
         }
     }
@@ -396,45 +449,73 @@ impl MqttDriver {
     ) -> Result<(), iggy_connector_sdk::Error> {
         // A publish can arrive while the event loop is being driven for an ACK.
         // Preserve it for the next source poll, subject to the batch bound.
-        let result = match (&mut self.connection, &self.subscriptions) {
-            (MqttConnection::Mqtt311 { client, event_loop }, subscriptions) => {
-                let event = timeout(poll_timeout, event_loop.poll())
-                    .await
-                    .map_err(|_| {
-                        iggy_connector_sdk::Error::Connection(
-                            "timed out while flushing MQTT acknowledgements".to_string(),
-                        )
-                    })?
-                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-                handle_mqtt311_event(
-                    client,
-                    event_loop,
-                    event,
-                    subscriptions,
-                    poll_timeout,
-                    max_buffered_messages,
-                )
-                .await?
+        let deadline = tokio::time::Instant::now() + poll_timeout;
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(iggy_connector_sdk::Error::Connection(
+                    "timed out while flushing MQTT acknowledgements".to_string(),
+                ));
             }
-            (MqttConnection::Mqtt5 { client, event_loop }, subscriptions) => {
-                let event = timeout(poll_timeout, event_loop.poll())
-                    .await
-                    .map_err(|_| {
-                        iggy_connector_sdk::Error::Connection(
-                            "timed out while flushing MQTT acknowledgements".to_string(),
-                        )
-                    })?
-                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-                handle_mqtt5_event(
-                    client,
-                    event_loop,
-                    event,
-                    subscriptions,
-                    poll_timeout,
-                    max_buffered_messages,
-                )
-                .await?
-            }
+
+            let result = match (&mut self.connection, &self.subscriptions) {
+                (MqttConnection::Mqtt311 { client, event_loop }, subscriptions) => {
+                    match timeout(remaining, event_loop.poll()).await {
+                        Ok(Ok(event)) => {
+                            handle_mqtt311_event(
+                                client,
+                                event_loop,
+                                event,
+                                subscriptions,
+                                remaining,
+                                max_buffered_messages,
+                            )
+                            .await?
+                        }
+                        Ok(Err(error)) => {
+                            warn!(
+                                "MQTT 3.1.1 connection interrupted while flushing acknowledgements; retrying event loop: {error}"
+                            );
+                            sleep(RECONNECT_RETRY_DELAY).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(iggy_connector_sdk::Error::Connection(
+                                "timed out while flushing MQTT acknowledgements".to_string(),
+                            ));
+                        }
+                    }
+                }
+                (MqttConnection::Mqtt5 { client, event_loop }, subscriptions) => {
+                    match timeout(remaining, event_loop.poll()).await {
+                        Ok(Ok(event)) => {
+                            handle_mqtt5_event(
+                                client,
+                                event_loop,
+                                event,
+                                subscriptions,
+                                remaining,
+                                self.include_metadata,
+                                max_buffered_messages,
+                            )
+                            .await?
+                        }
+                        Ok(Err(error)) => {
+                            warn!(
+                                "MQTT 5 connection interrupted while flushing acknowledgements; retrying event loop: {error}"
+                            );
+                            sleep(RECONNECT_RETRY_DELAY).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(iggy_connector_sdk::Error::Connection(
+                                "timed out while flushing MQTT acknowledgements".to_string(),
+                            ));
+                        }
+                    }
+                }
+            };
+            break result;
         };
 
         let mut received = match result {
@@ -633,6 +714,10 @@ fn set_mqtt5_credentials(options: &mut Mqtt5Options, config: &MqttSourceConfig) 
     }
 }
 
+fn retain_acknowledgements(pending_ack_tokens: &mut Vec<AckToken>, ack_tokens: &mut Vec<AckToken>) {
+    pending_ack_tokens.append(ack_tokens);
+}
+
 fn configured_subscriptions(
     config: &MqttSourceConfig,
     default_qos: Qos,
@@ -711,12 +796,13 @@ async fn handle_mqtt5_event(
     event: Mqtt5Event,
     subscriptions: &[MqttSubscription],
     poll_timeout: Duration,
+    include_metadata: bool,
     max_buffered_messages: usize,
 ) -> Result<PollResult, iggy_connector_sdk::Error> {
     match event {
-        Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => {
-            Ok(PollResult::Message(Box::new(normalize_mqtt5(publish)?)))
-        }
+        Mqtt5Event::Incoming(Mqtt5Incoming::Publish(publish)) => Ok(PollResult::Message(Box::new(
+            normalize_mqtt5(publish, include_metadata)?,
+        ))),
         Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(connack)) if !connack.session_present => {
             subscribe_mqtt5(client, subscriptions).await?;
             Ok(PollResult::Buffered(
@@ -724,6 +810,7 @@ async fn handle_mqtt5_event(
                     event_loop,
                     subscriptions.len(),
                     poll_timeout,
+                    include_metadata,
                     max_buffered_messages,
                 )
                 .await?,
@@ -787,6 +874,7 @@ async fn poll_mqtt5(
     event_loop: &mut Mqtt5EventLoop,
     subscription_count: usize,
     poll_timeout: Duration,
+    include_metadata: bool,
     max_buffered_messages: usize,
 ) -> Result<VecDeque<ReceivedMessage>, iggy_connector_sdk::Error> {
     let mut acknowledged_subscriptions = 0;
@@ -824,7 +912,7 @@ async fn poll_mqtt5(
                             .to_string(),
                     ));
                 }
-                buffered_messages.push_back(normalize_mqtt5(publish)?);
+                buffered_messages.push_back(normalize_mqtt5(publish, include_metadata)?);
             }
             Mqtt5Event::Outgoing(_) | Mqtt5Event::Incoming(_) => {}
         }
@@ -853,15 +941,21 @@ fn normalize_mqtt311(
         metadata,
         mqtt5_properties: None,
     };
-    let ack_token = (metadata.qos != Qos::Zero).then_some(AckToken(AckTokenKind::Mqtt311(publish)));
+    let ack_token = match publish.qos {
+        Mqtt311Qos::AtMostOnce => None,
+        qos => Some(AckToken::Mqtt311 {
+            qos,
+            packet_id: publish.pkid,
+        }),
+    };
     Ok(ReceivedMessage { message, ack_token })
 }
 
 pub(crate) fn normalize_mqtt5(
     publish: Mqtt5Publish,
+    include_metadata: bool,
 ) -> Result<ReceivedMessage, iggy_connector_sdk::Error> {
-    // MQTT 5 adds publish properties; common metadata headers are built first
-    // and the optional properties are appended afterward.
+    // MQTT 5 properties are needed only for the optional JSON envelope.
     let qos = publish.qos.into();
     let metadata = MqttMessageMetadata {
         qos,
@@ -871,10 +965,14 @@ pub(crate) fn normalize_mqtt5(
     };
     let topic = topic_string(&publish.topic)?;
     let headers = metadata_headers("mqtt5", &topic, metadata)?;
-    let mqtt5_properties = publish
-        .properties
-        .as_ref()
-        .map(Mqtt5EnvelopeProperties::from);
+    let mqtt5_properties = include_metadata
+        .then(|| {
+            publish
+                .properties
+                .as_ref()
+                .map(Mqtt5EnvelopeProperties::from)
+        })
+        .flatten();
     let message = MqttMessage {
         payload: publish.payload.to_vec(),
         topic,
@@ -882,7 +980,13 @@ pub(crate) fn normalize_mqtt5(
         metadata,
         mqtt5_properties,
     };
-    let ack_token = (metadata.qos != Qos::Zero).then_some(AckToken(AckTokenKind::Mqtt5(publish)));
+    let ack_token = match publish.qos {
+        Mqtt5Qos::AtMostOnce => None,
+        qos => Some(AckToken::Mqtt5 {
+            qos,
+            packet_id: publish.pkid,
+        }),
+    };
     Ok(ReceivedMessage { message, ack_token })
 }
 
@@ -1111,7 +1215,7 @@ mod tests {
             Some(properties),
         );
 
-        let received = normalize_mqtt5(publish).expect("empty property should be tolerated");
+        let received = normalize_mqtt5(publish, true).expect("empty property should be tolerated");
 
         assert_eq!(received.message.payload, b"payload");
         assert!(
@@ -1130,27 +1234,41 @@ mod tests {
 
     #[test]
     fn given_mqtt5_qos_two_should_create_deferred_ack_token() {
-        let publish = Mqtt5Publish::new(
+        let mut publish = Mqtt5Publish::new(
             "devices/test",
             Mqtt5Qos::ExactlyOnce,
             b"payload".as_slice(),
             None,
         );
-        let received = normalize_mqtt5(publish).expect("MQTT 5 publish should normalize");
+        publish.pkid = 42;
+        let received = normalize_mqtt5(publish, false).expect("MQTT 5 publish should normalize");
 
-        assert!(received.ack_token.is_some());
+        assert!(matches!(
+            received.ack_token,
+            Some(AckToken::Mqtt5 {
+                qos: Mqtt5Qos::ExactlyOnce,
+                packet_id: 42,
+            })
+        ));
         assert_eq!(received.message.metadata.qos, Qos::Two);
-        assert_eq!(received.message.metadata.packet_id, Some(0));
+        assert_eq!(received.message.metadata.packet_id, Some(42));
     }
 
     #[test]
     fn given_mqtt311_qos_one_should_create_deferred_ack_token() {
-        let publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"payload");
+        let mut publish = Mqtt311Publish::new("devices/test", Mqtt311Qos::AtLeastOnce, b"payload");
+        publish.pkid = 17;
         let received = normalize_mqtt311(publish).expect("MQTT 3.1.1 publish should normalize");
 
-        assert!(received.ack_token.is_some());
+        assert!(matches!(
+            received.ack_token,
+            Some(AckToken::Mqtt311 {
+                qos: Mqtt311Qos::AtLeastOnce,
+                packet_id: 17,
+            })
+        ));
         assert_eq!(received.message.metadata.qos, Qos::One);
-        assert_eq!(received.message.metadata.packet_id, Some(0));
+        assert_eq!(received.message.metadata.packet_id, Some(17));
     }
 
     #[test]
@@ -1164,6 +1282,39 @@ mod tests {
     }
 
     #[test]
+    fn given_unsent_acknowledgements_should_retain_them_in_order() {
+        let mut first_publish =
+            Mqtt311Publish::new("devices/first", Mqtt311Qos::AtLeastOnce, b"first");
+        first_publish.pkid = 1;
+        let first = normalize_mqtt311(first_publish)
+            .expect("first MQTT publish should normalize")
+            .ack_token
+            .expect("QoS 1 publish should have an acknowledgement token");
+        let mut second_publish =
+            Mqtt311Publish::new("devices/second", Mqtt311Qos::AtLeastOnce, b"second");
+        second_publish.pkid = 2;
+        let second = normalize_mqtt311(second_publish)
+            .expect("second MQTT publish should normalize")
+            .ack_token
+            .expect("QoS 1 publish should have an acknowledgement token");
+        let mut pending_ack_tokens = vec![first];
+        let mut unsent_ack_tokens = vec![second];
+
+        retain_acknowledgements(&mut pending_ack_tokens, &mut unsent_ack_tokens);
+
+        assert!(unsent_ack_tokens.is_empty());
+        assert_eq!(pending_ack_tokens.len(), 2);
+        assert!(matches!(
+            pending_ack_tokens[0],
+            AckToken::Mqtt311 { packet_id: 1, .. }
+        ));
+        assert!(matches!(
+            pending_ack_tokens[1],
+            AckToken::Mqtt311 { packet_id: 2, .. }
+        ));
+    }
+
+    #[test]
     fn given_mqtt5_qos_zero_should_not_create_ack_token() {
         let publish = Mqtt5Publish::new(
             "devices/test",
@@ -1171,7 +1322,7 @@ mod tests {
             b"payload".as_slice(),
             None,
         );
-        let received = normalize_mqtt5(publish).expect("MQTT 5 publish should normalize");
+        let received = normalize_mqtt5(publish, false).expect("MQTT 5 publish should normalize");
 
         assert!(received.ack_token.is_none());
         assert_eq!(received.message.metadata.qos, Qos::Zero);
@@ -1186,7 +1337,7 @@ mod tests {
             b"payload".as_slice(),
             None,
         );
-        let received = normalize_mqtt5(publish).expect("MQTT 5 publish should normalize");
+        let received = normalize_mqtt5(publish, false).expect("MQTT 5 publish should normalize");
 
         assert!(received.ack_token.is_some());
         assert_eq!(received.message.metadata.qos, Qos::One);
@@ -1212,7 +1363,7 @@ mod tests {
             Some(properties),
         );
 
-        let received = normalize_mqtt5(publish).expect("MQTT 5 publish should normalize");
+        let received = normalize_mqtt5(publish, true).expect("MQTT 5 publish should normalize");
         let properties = received
             .message
             .mqtt5_properties
@@ -1233,6 +1384,25 @@ mod tests {
         assert_eq!(properties.subscription_identifiers, vec![7, 9]);
         assert_eq!(properties.content_type.as_deref(), Some("application/json"));
         assert_eq!(received.message.headers.len(), 5);
+    }
+
+    #[test]
+    fn given_mqtt5_metadata_is_disabled_should_not_convert_properties() {
+        let properties = PublishProperties {
+            correlation_data: Some(b"correlation".as_slice().into()),
+            user_properties: vec![("device_id".to_string(), "device-1".to_string())],
+            ..Default::default()
+        };
+        let publish = Mqtt5Publish::new(
+            "devices/test",
+            Mqtt5Qos::AtLeastOnce,
+            b"payload".as_slice(),
+            Some(properties),
+        );
+
+        let received = normalize_mqtt5(publish, false).expect("MQTT 5 publish should normalize");
+
+        assert!(received.message.mqtt5_properties.is_none());
     }
 
     #[test]

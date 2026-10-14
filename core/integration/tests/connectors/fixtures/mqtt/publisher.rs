@@ -142,7 +142,7 @@ async fn publish_mqtt311(
         .await
         .map_err(|error| format!("failed to enqueue MQTT 3.1.1 publish: {error}"))?;
 
-    wait_for_mqtt311_publish(&mut event_loop, qos).await
+    wait_for_mqtt311_publishes(&mut event_loop, qos, 1).await
 }
 
 async fn publish_mqtt5(
@@ -159,7 +159,7 @@ async fn publish_mqtt5(
         .await
         .map_err(|error| format!("failed to enqueue MQTT 5 publish: {error}"))?;
 
-    wait_for_mqtt5_publish(&mut event_loop, qos).await
+    wait_for_mqtt5_publishes(&mut event_loop, qos, 1).await
 }
 
 pub(super) async fn publish_mqtt5_with_properties(
@@ -177,7 +177,7 @@ pub(super) async fn publish_mqtt5_with_properties(
         .await
         .map_err(|error| format!("failed to enqueue MQTT 5 publish: {error}"))?;
 
-    wait_for_mqtt5_publish(&mut event_loop, qos).await
+    wait_for_mqtt5_publishes(&mut event_loop, qos, 1).await
 }
 
 fn qos311(qos: u8) -> Result<Mqtt311Qos, String> {
@@ -196,37 +196,6 @@ fn qos5(qos: u8) -> Result<Mqtt5Qos, String> {
         2 => Ok(Mqtt5Qos::ExactlyOnce),
         qos => Err(format!("unsupported MQTT QoS: {qos}")),
     }
-}
-
-async fn wait_for_mqtt311_publish(
-    event_loop: &mut rumqttc::EventLoop,
-    qos: u8,
-) -> Result<(), String> {
-    // From the publisher's perspective, completion is an outgoing publish for
-    // QoS 0, PUBACK for QoS 1, and PUBCOMP for QoS 2. Iggy persistence is checked
-    // separately by the integration test.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match event_loop
-                .poll()
-                .await
-                .map_err(|error| format!("failed to publish MQTT 3.1.1 message: {error}"))?
-            {
-                rumqttc::Event::Outgoing(Outgoing::Publish(_)) if qos == 0 => {
-                    return Ok::<(), String>(());
-                }
-                Mqtt311Event::Incoming(Mqtt311Incoming::PubAck(_)) if qos == 1 => {
-                    return Ok::<(), String>(());
-                }
-                Mqtt311Event::Incoming(Mqtt311Incoming::PubComp(_)) if qos == 2 => {
-                    return Ok::<(), String>(());
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| format!("timed out waiting for MQTT 3.1.1 QoS {qos} completion"))?
 }
 
 async fn wait_for_mqtt311_publishes(
@@ -298,36 +267,6 @@ async fn wait_for_mqtt311_mixed_publishes(
     })
     .await
     .map_err(|_| "timed out waiting for mixed MQTT 3.1.1 publish completion".to_string())?
-}
-
-async fn wait_for_mqtt5_publish(
-    event_loop: &mut rumqttc::v5::EventLoop,
-    qos: u8,
-) -> Result<(), String> {
-    // Broker completion must not be confused with the later source-to-Iggy
-    // persistence assertion.
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match event_loop
-                .poll()
-                .await
-                .map_err(|error| format!("failed to publish MQTT 5 message: {error}"))?
-            {
-                rumqttc::v5::Event::Outgoing(Outgoing::Publish(_)) if qos == 0 => {
-                    return Ok::<(), String>(());
-                }
-                Mqtt5Event::Incoming(Mqtt5Incoming::PubAck(_)) if qos == 1 => {
-                    return Ok::<(), String>(());
-                }
-                Mqtt5Event::Incoming(Mqtt5Incoming::PubComp(_)) if qos == 2 => {
-                    return Ok::<(), String>(());
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| format!("timed out waiting for MQTT 5 QoS {qos} completion"))?
 }
 
 async fn wait_for_mqtt5_publishes(

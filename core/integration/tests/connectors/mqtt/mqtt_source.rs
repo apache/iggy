@@ -322,13 +322,12 @@ async fn mqtt5_iggy_failure_redelivers_unacknowledged_qos1_message(
     server(connectors_runtime(config_path = "tests/connectors/mqtt/source.toml")),
     seed = seeds::connector_stream
 )]
-async fn mqtt5_emqx_outage_recovers_batch_accumulation(
+async fn mqtt5_forced_disconnect_recovers_batch_accumulation(
     harness: &TestHarness,
     fixture: Mqtt5PendingBatchFixture,
 ) {
-    // Pause/resume interrupts the broker connection while preserving its mapped
-    // port and authentication database. This tests reconnect behavior without
-    // introducing a new container or changing the broker endpoint.
+    // EMQX closes the source socket through its client-management API. The
+    // fixture waits for a fresh connection before this publish checks delivery.
     wait_for_source_running(harness).await;
     let first_payload = b"mqtt5-emqx-restart-first".to_vec();
     let second_payload = b"mqtt5-emqx-restart-second".to_vec();
@@ -336,11 +335,14 @@ async fn mqtt5_emqx_outage_recovers_batch_accumulation(
         .publish(&first_payload)
         .await
         .expect("first MQTT publish should complete");
-    fixture.restart_broker().await.expect("EMQX should restart");
+    fixture
+        .reconnect_source()
+        .await
+        .expect("source should reconnect after EMQX disconnects it");
     fixture
         .publish(&second_payload)
         .await
-        .expect("second MQTT publish should complete after EMQX restart");
+        .expect("second MQTT publish should complete after source reconnect");
 
     assert_payloads_are_persisted(
         harness,

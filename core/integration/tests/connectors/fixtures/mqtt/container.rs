@@ -61,6 +61,7 @@ pub(super) struct MqttBrokerContainer {
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     pub(super) broker_url: String,
+    dashboard_url: String,
 }
 
 impl MqttBrokerContainer {
@@ -113,29 +114,60 @@ impl MqttBrokerContainer {
         Ok(Self {
             container,
             broker_url,
+            dashboard_url,
         })
     }
 
-    pub(super) async fn restart(&self) -> Result<(), TestBinaryError> {
-        // Pause/resume keeps the mapped endpoint and broker state intact while
-        // still forcing clients through their reconnect paths.
-        self.container
-            .pause()
+    pub(super) async fn disconnect_client(&self, client_id: &str) -> Result<(), TestBinaryError> {
+        let token = wait_for_dashboard_token(&self.dashboard_url).await?;
+        let client_url = format!("{}/api/v5/clients/{client_id}", self.dashboard_url);
+        let response = reqwest::Client::new()
+            .delete(client_url)
+            .bearer_auth(token)
+            .send()
             .await
             .map_err(|error| TestBinaryError::FixtureSetup {
                 fixture_type: "MqttBrokerContainer".to_string(),
-                message: format!("Failed to pause EMQX container: {error}"),
-            })?;
-        sleep(Duration::from_secs(2)).await;
-        self.container
-            .unpause()
-            .await
-            .map_err(|error| TestBinaryError::FixtureSetup {
-                fixture_type: "MqttBrokerContainer".to_string(),
-                message: format!("Failed to resume EMQX container: {error}"),
+                message: format!("Failed to disconnect MQTT client {client_id}: {error}"),
             })?;
 
-        wait_for_mqtt(&self.broker_url, MQTT_USERNAME, MQTT_PASSWORD).await
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!(
+                    "Failed to disconnect MQTT client {client_id}: HTTP {}",
+                    response.status()
+                ),
+            })
+        }
+    }
+
+    pub(super) async fn wait_for_client(&self, client_id: &str) -> Result<(), TestBinaryError> {
+        let token = wait_for_dashboard_token(&self.dashboard_url).await?;
+        let client_url = format!("{}/api/v5/clients/{client_id}", self.dashboard_url);
+        let client = reqwest::Client::new();
+
+        timeout(EMQX_START_INTERVAL * EMQX_START_ATTEMPTS as u32, async {
+            for _ in 0..EMQX_START_ATTEMPTS {
+                if let Ok(response) = client.get(&client_url).bearer_auth(&token).send().await
+                    && response.status().is_success()
+                {
+                    return Ok(());
+                }
+                sleep(EMQX_START_INTERVAL).await;
+            }
+            Err(TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!("MQTT client {client_id} did not reconnect after disconnection"),
+            })
+        })
+        .await
+        .map_err(|_| TestBinaryError::FixtureSetup {
+            fixture_type: "MqttBrokerContainer".to_string(),
+            message: format!("Timed out waiting for MQTT client {client_id} after disconnection"),
+        })?
     }
 }
 
