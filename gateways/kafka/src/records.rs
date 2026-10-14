@@ -882,7 +882,7 @@ pub fn declared_records(blob: &[u8]) -> Option<usize> {
 }
 
 /// Record slots the first batch in `blob` takes to decode, when it is not compressed: one per
-/// declared record, plus its headers as [`scan_records`] charges them. Stops at `most`.
+/// declared record, plus its headers as `scan_records` charges them. Stops at `most`.
 ///
 /// Counts the records it can walk. The decode refuses a batch that does not walk, so that batch
 /// holds nothing.

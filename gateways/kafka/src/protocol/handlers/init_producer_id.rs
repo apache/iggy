@@ -67,7 +67,7 @@ const PRODUCER_EPOCH: i16 = 0;
 /// allocation per millisecond of its uptime, the clock stepped back across the restart, or the
 /// clock reads before the Unix epoch and seeds 0. Nothing is persisted.
 ///
-/// Produce keys an Iggy session on the id, and only on an id of this run ([`Self::issued`]). A
+/// Produce keys an Iggy session on the id, and only on an id of this run (`issued`). A
 /// replayed pair then makes two producers share a session, and nothing more. Before deduplication
 /// reads the id, the allocator has to persist a high-water mark or bump the epoch on every start.
 #[derive(Debug)]
