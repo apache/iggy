@@ -1,0 +1,268 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::connectors::fixtures::{DynamoDbOps, DynamoDbSinkFixture, DynamoDbSinkSortKeyFixture};
+use aws_sdk_dynamodb::types::AttributeValue;
+use bytes::Bytes;
+use iggy::prelude::{IggyMessage, Partitioning};
+use iggy_common::{Identifier, MessageClient};
+use integration::harness::{TestHarness, seeds};
+use integration::iggy_harness;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+use tokio::time::sleep;
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_json_messages_when_sink_consumes_should_write_items(
+    harness: &TestHarness,
+    fixture: DynamoDbSinkFixture,
+) {
+    let payloads = [
+        serde_json::json!({"name": "first", "count": 1}),
+        serde_json::json!({"name": "second", "count": 2}),
+    ];
+    send_messages(harness, &payloads).await;
+
+    let items = fixture
+        .wait_for_items(payloads.len())
+        .await
+        .expect("wait for DynamoDB items");
+
+    assert_eq!(items.len(), payloads.len());
+    assert_eq!(
+        string_attribute(&items[0], "iggy_stream"),
+        seeds::names::STREAM
+    );
+    assert_eq!(
+        string_attribute(&items[0], "iggy_topic"),
+        seeds::names::TOPIC
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| string_attribute(item, "name") == "first")
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| string_attribute(item, "name") == "second")
+    );
+    let keys = items
+        .iter()
+        .map(|item| string_attribute(item, "iggy_id"))
+        .collect::<HashSet<_>>();
+    assert_eq!(keys.len(), payloads.len());
+    for item in &items {
+        assert_eq!(string_attribute(item, "iggy_id"), expected_key(item));
+    }
+    assert!(
+        items
+            .iter()
+            .any(|item| number_attribute(item, "count") == "1")
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_table_with_sort_key_when_sink_consumes_should_write_offset_as_sort_key(
+    harness: &TestHarness,
+    fixture: DynamoDbSinkSortKeyFixture,
+) {
+    let payloads = [
+        serde_json::json!({"name": "first"}),
+        serde_json::json!({"name": "second"}),
+    ];
+    send_messages(harness, &payloads).await;
+
+    let items = fixture
+        .wait_for_items(payloads.len())
+        .await
+        .expect("wait for DynamoDB items");
+
+    let mut offsets = items
+        .iter()
+        .map(|item| number_attribute(item, "iggy_offset").to_owned())
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert_eq!(offsets, vec!["0".to_owned(), "1".to_owned()]);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_more_messages_than_a_batch_write_when_sink_consumes_should_write_every_item(
+    harness: &TestHarness,
+    fixture: DynamoDbSinkFixture,
+) {
+    let payloads = (0..30)
+        .map(|index| serde_json::json!({"name": format!("message-{index}"), "count": index}))
+        .collect::<Vec<_>>();
+    send_messages(harness, &payloads).await;
+
+    let items = fixture
+        .wait_for_items(payloads.len())
+        .await
+        .expect("wait for DynamoDB items");
+
+    assert_eq!(items.len(), payloads.len());
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_payload_keys_when_sink_consumes_twice_should_overwrite_the_items(
+    harness: &TestHarness,
+    fixture: DynamoDbSinkFixture,
+) {
+    let first = [
+        serde_json::json!({"iggy_id": "a", "name": "first"}),
+        serde_json::json!({"iggy_id": "b", "name": "second"}),
+    ];
+    send_messages(harness, &first).await;
+    fixture
+        .wait_for_items(first.len())
+        .await
+        .expect("wait for DynamoDB items");
+
+    let second = [
+        serde_json::json!({"iggy_id": "a", "name": "third"}),
+        serde_json::json!({"iggy_id": "b", "name": "fourth"}),
+    ];
+    send_messages(harness, &second).await;
+
+    let items = wait_for_names(&fixture, &["third", "fourth"]).await;
+    assert_eq!(items.len(), first.len());
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_messages_at_new_offsets_when_sink_consumes_twice_should_keep_every_item(
+    harness: &TestHarness,
+    fixture: DynamoDbSinkFixture,
+) {
+    let first = [
+        serde_json::json!({"name": "first"}),
+        serde_json::json!({"name": "second"}),
+    ];
+    send_messages(harness, &first).await;
+    fixture
+        .wait_for_items(first.len())
+        .await
+        .expect("wait for DynamoDB items");
+
+    let second = [
+        serde_json::json!({"name": "third"}),
+        serde_json::json!({"name": "fourth"}),
+    ];
+    send_messages(harness, &second).await;
+
+    let items = fixture
+        .wait_for_items(first.len() + second.len())
+        .await
+        .expect("wait for DynamoDB items");
+    assert_eq!(items.len(), first.len() + second.len());
+}
+
+/// The second batch carries the key of the first one, so the item count stays
+/// the same and only the payload tells the two rounds apart.
+async fn wait_for_names(
+    fixture: &DynamoDbSinkFixture,
+    names: &[&str],
+) -> Vec<HashMap<String, AttributeValue>> {
+    for _ in 0..100 {
+        let items = fixture.scan_items().await.expect("scan DynamoDB items");
+        if names.iter().all(|name| {
+            items
+                .iter()
+                .any(|item| string_attribute(item, "name") == *name)
+        }) {
+            return items;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("DynamoDB items never carried the names: {names:?}");
+}
+
+async fn send_messages(harness: &TestHarness, payloads: &[serde_json::Value]) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    // No explicit ID, which is how most producers send messages, so the sink
+    // has to key the items on something other than the message ID.
+    let mut messages = payloads
+        .iter()
+        .map(|payload| {
+            IggyMessage::builder()
+                .payload(Bytes::from(serde_json::to_vec(payload).expect("serialize")))
+                .build()
+                .expect("build message")
+        })
+        .collect::<Vec<_>>();
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+}
+
+/// Rebuilds the key from the item's own metadata. The connector cannot be a
+/// cargo dependency here, because every sink exports the same `iggy_sink_*`
+/// FFI symbols and the test binary already links one. The format is pinned by
+/// `given_a_message_when_keyed_should_use_the_documented_format` in the sink,
+/// which fails first if it ever changes.
+fn expected_key(item: &HashMap<String, AttributeValue>) -> String {
+    let stream = seeds::names::STREAM;
+    let topic = seeds::names::TOPIC;
+    let partition_id = number_attribute(item, "iggy_partition_id");
+    let offset = number_attribute(item, "iggy_offset");
+
+    format!(
+        "{}:{stream}:{}:{topic}:{partition_id}:{offset}",
+        stream.len(),
+        topic.len()
+    )
+}
+
+fn string_attribute<'a>(item: &'a HashMap<String, AttributeValue>, field: &str) -> &'a str {
+    match item.get(field) {
+        Some(AttributeValue::S(value)) => value,
+        _ => "",
+    }
+}
+
+fn number_attribute<'a>(item: &'a HashMap<String, AttributeValue>, field: &str) -> &'a str {
+    match item.get(field) {
+        Some(AttributeValue::N(value)) => value,
+        _ => "",
+    }
+}
