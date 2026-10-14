@@ -260,6 +260,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     private static void writeNode(ByteBuf body, String name, int port, boolean leader) {
+        body.writeByte("primary".equals(name) ? 0 : 1);
         writeString(body, name);
         writeString(body, InetAddress.getLoopbackAddress().getHostAddress());
         body.writeShortLE(port);

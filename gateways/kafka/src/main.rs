@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = bind_listener(&config.bind_addr)
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
-    let mut server = KafkaGateway::new(config).with_bridge(bridge);
+    let mut server = KafkaGateway::new(config).with_bridge(bridge.clone());
     if sasl_enabled {
         let authenticator = IggyAuthenticator::from_env()?;
         // Unconditional, because the Kafka listener has no TLS at any setting. This is the hop the
@@ -67,17 +67,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = broadcast::channel(1);
     let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
 
-    tokio::select! {
-        result = &mut server_task => {
-            return Ok(result??);
-        }
-        () = shutdown_signal() => {
-            let _ = tx.send(());
-        }
-    }
+    let stopped_alone = tokio::select! {
+        result = &mut server_task => Some(result),
+        () = shutdown_signal() => None,
+    };
+    let outcome = if let Some(outcome) = stopped_alone {
+        outcome
+    } else {
+        let _ = tx.send(());
+        server_task.await
+    };
+    close_bridge(bridge.as_deref()).await;
+    Ok(outcome??)
+}
 
-    server_task.await??;
-    Ok(())
+/// How long shutdown waits for the Iggy clients to sign out. The connection drain before it can
+/// take 25 s of a 30 s grace period.
+const BRIDGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Signs the bridge's Iggy clients out and shuts them down. Without it Iggy keeps each client's
+/// session until its lease runs out.
+async fn close_bridge(bridge: Option<&IggyBridge>) {
+    let Some(bridge) = bridge else {
+        return;
+    };
+    match tokio::time::timeout(BRIDGE_CLOSE_TIMEOUT, bridge.close()).await {
+        Ok(Ok(())) => info!("Iggy bridge closed"),
+        Ok(Err(error)) => warn!("the Iggy bridge did not close cleanly: {error}"),
+        Err(_elapsed) => warn!(
+            "the Iggy bridge did not close within {BRIDGE_CLOSE_TIMEOUT:?}: Iggy ends the \
+             remaining sessions when their leases run out"
+        ),
+    }
 }
 
 /// The `IGGY_KAFKA_*` vars `load_config` itself reads. `IGGY_KAFKA_` is a

@@ -45,12 +45,19 @@ impl RequestHeader {
     /// Builds the header a client sends for `code` with `payload`, given the
     /// identity the session assigned: `client`, `request` and `session`.
     ///
-    /// Every rule the server checks lives here so that each client, and the
-    /// fixtures other SDKs verify against, agree on the bytes: metadata and
-    /// session operations stamp `request_checksum` with the payload hash,
-    /// partition and non-replicated operations leave it zero (send batches
-    /// carry their own checksum and non-replicated requests bypass dedup),
-    /// and a non-replicated request carries its command code in `reserved`.
+    /// Every rule that depends only on the code and the payload lives here so
+    /// that each client, and the fixtures other SDKs verify against, agree on
+    /// the bytes: metadata and session operations stamp `request_checksum`
+    /// with the payload hash, partition and non-replicated operations leave
+    /// it zero (send batches carry their own checksum and non-replicated
+    /// requests bypass dedup), and a non-replicated request carries its
+    /// command code in `reserved`.
+    ///
+    /// The partition context fields stay zero. A client partition operation
+    /// or poll stamps them afterwards with
+    /// [`PartitionContext::stamp`](crate::PartitionContext::stamp). The server
+    /// refuses such a request whose incarnation is not the partition's current
+    /// one, zero included, with `HistoryUnavailable`.
     ///
     /// # Errors
     ///

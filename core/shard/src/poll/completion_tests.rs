@@ -30,6 +30,7 @@ use consensus::{
     encode_state_manifest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::{
     AckLevel, CommitHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
@@ -72,6 +73,45 @@ use crate::{
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+
+#[compio::test]
+async fn given_deleted_history_when_retirement_read_names_old_incarnation_should_refuse_replacement()
+ {
+    const ORIGINAL_REVISION: u64 = 7;
+    const REPLACEMENT_REVISION: u64 = 8;
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let config = partitions_config();
+    let metadata = PollTestMetadata::new((Users::default(), (StreamsInner::default().into(), ())));
+    let (owner, _sender) = owner_with_metadata(&bus, config.clone(), namespace, metadata);
+    let identity = SessionIdentity {
+        client_id: 1,
+        session: 1,
+        metadata_watermark: 100,
+    };
+    for revision in [ORIGINAL_REVISION, REPLACEMENT_REVISION] {
+        let (mut partition, _) =
+            partition_with_messages_at_revision(&bus, namespace, &["message"], revision).await;
+        delete_history(&mut partition, &config, 10).await;
+        owner.plane.partitions().remove(&namespace);
+        owner.plane.partitions().insert(namespace, partition);
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(
+                namespace,
+                PartitionRead::SessionRetired {
+                    identity,
+                    created_revision: ORIGINAL_REVISION,
+                },
+                reply,
+            )
+            .await;
+        assert!(matches!(
+            replies.try_recv().unwrap(),
+            PartitionReadReply::SessionRetired(retired) if retired == (revision == ORIGINAL_REVISION)
+        ));
+    }
+}
 
 #[compio::test]
 #[allow(clippy::too_many_lines)]
@@ -396,14 +436,186 @@ async fn given_other_client_installed_at_same_generation_when_owner_polls_on_pri
     assert_not_owned(&reply);
 }
 
+/// A normal backup names the primary of its view, so the poller or offset
+/// writer goes there at once. A backup in transfer cannot vouch for the view
+/// and stays transient.
+#[compio::test]
+async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_transferring() {
+    const BACKUP_REPLICA: u8 = 1;
+    const REPLICA_COUNT: u8 = 3;
+    const CREATED_REVISION: u64 = 1;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let config = partitions_config();
+    let consensus = VsrConsensus::new(
+        1,
+        BACKUP_REPLICA,
+        REPLICA_COUNT,
+        namespace.inner(),
+        bus.clone(),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(PartitionStats::default()),
+        consensus,
+        config.segment_size,
+    );
+    partition.set_created_revision(CREATED_REVISION);
+    let mut topic = Topic::default();
+    topic.partitions.push(Partition::new(
+        0,
+        namespace.inner(),
+        IggyTimestamp::default(),
+        CREATED_REVISION,
+        0,
+    ));
+    let mut stream = Stream::default();
+    stream.topics.insert(topic);
+    let mut inner = StreamsInner::default();
+    inner.items.insert(stream);
+    let metadata = PollTestMetadata::new((Users::default(), (inner.into(), ())));
+    let (owner, _inbox) = owner_with_metadata(&bus, config, namespace, metadata);
+    owner.shards_table.insert(
+        namespace,
+        PartitionLocation::new(ShardId::new(0), CREATED_REVISION),
+    );
+    owner.plane.partitions().insert(namespace, partition);
+    let mut table = ClientTable::new(1);
+    let registration = PrepareHeader {
+        client: BOUND_CLIENT,
+        user_id: BOUND_USER,
+        operation: Operation::Register,
+        op: 1,
+        ..Default::default()
+    };
+    table
+        .commit_register(
+            BOUND_CLIENT,
+            BOUND_USER,
+            [0x5a; 32],
+            build_reply_message_with(&registration, 0, |_| {}),
+        )
+        .unwrap();
+
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(namespace, PartitionRead::Primary, reply)
+        .await;
+    let reply = replies.try_recv().expect("the owner answers the read");
+    assert!(
+        matches!(
+            reply,
+            PartitionReadReply::Primary {
+                view: 0,
+                primary: 0
+            }
+        ),
+        "the backup must name the primary of view 0, got {reply:?}"
+    );
+
+    for (transferring, expected) in [
+        (false, IggyError::NotPrimary),
+        (true, IggyError::TransientNotAccepted),
+    ] {
+        if transferring {
+            owner
+                .plane
+                .partitions()
+                .with_partition(&namespace, |partition| {
+                    partition.consensus().begin_state_transfer_await();
+                })
+                .unwrap();
+        }
+        let attachment = ConsumerAttachment {
+            session: table.attach_session(BOUND_CLIENT, 1, BOUND_USER).unwrap(),
+            metadata: owner
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .poll_metadata(namespace, None, BOUND_CLIENT)
+                .expect("metadata names the partition"),
+        };
+        let metadata = attachment.metadata;
+        for read in [
+            PartitionRead::PollOnPrimary {
+                consumer: PollingConsumer::Consumer(1, 0),
+                args: PollingArgs::new(PollingStrategy::first(), 1, true),
+                attachment,
+            },
+            PartitionRead::UnboundPollOnPrimary {
+                consumer: PollingConsumer::Consumer(1, 0),
+                args: PollingArgs::new(PollingStrategy::next(), 1, false),
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: PollingConsumer::Consumer(1, 0),
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary { group_id: 1 },
+        ] {
+            let (reply, replies) = channel(1);
+            owner.on_partition_read(namespace, read, reply).await;
+            let reply = replies.try_recv().expect("the owner answers the read");
+            assert!(
+                matches!(&reply, PartitionReadReply::Rejected(error) if *error == expected),
+                "transferring {transferring}: expected {expected:?}, got {reply:?}"
+            );
+        }
+
+        let attachment = ConsumerAttachment {
+            session: table.attach_session(BOUND_CLIENT, 1, BOUND_USER).unwrap(),
+            metadata: owner
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .consumer_offset_metadata(namespace, None, BOUND_CLIENT)
+                .expect("metadata names the partition"),
+        };
+        assert_eq!(
+            owner.validate_partition_attachment(&consumer_offset_store(namespace), &attachment),
+            Err(expected),
+            "transferring {transferring}: an attached offset write"
+        );
+    }
+}
+
+fn consumer_offset_store(namespace: IggyNamespace) -> Message<RoutedRequestHeader> {
+    let body = StoreConsumerOffsetRequest {
+        consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+        stream_id: WireIdentifier::numeric(0),
+        topic_id: WireIdentifier::numeric(0),
+        partition_id: Some(0),
+        offset: 0,
+        ack: AckLevel::Quorum,
+    }
+    .to_bytes();
+    let size = size_of::<RoutedRequestHeader>() + body.len();
+    let mut request = Message::<RoutedRequestHeader>::new(size);
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    request.transmute_header::<RoutedRequestHeader>(|_, header| {
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::StoreConsumerOffset,
+            size: u32::try_from(size).unwrap(),
+            group: namespace.inner(),
+            client: BOUND_CLIENT,
+            session: 1,
+            request: 1,
+            ..Default::default()
+        }
+    })
+}
+
 fn assert_not_owned(reply: &PartitionReadReply) {
     assert!(
         matches!(
             reply,
-            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(group, 0))
-                if u64::from(*group) == BOUND_GROUP
+            PartitionReadReply::Rejected(IggyError::ConsumerGroupPartitionNotOwned(client, 0))
+                if u128::from(*client) == BOUND_CLIENT
         ),
-        "the poller is not the installed owner, got {reply:?}"
+        "the poller, client {BOUND_CLIENT}, is not the installed owner, got {reply:?}"
     );
 }
 
@@ -770,6 +982,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
     const DATA_CLIENT: u128 = PARENT;
     const USER: u32 = 7;
     const GROUP: u64 = 7;
+    const OWNER_OP: u64 = 10;
     #[derive(Clone, Copy, Debug)]
     enum Change {
         None,
@@ -815,7 +1028,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
         let mut member = ConsumerGroupMember::new(0, PARENT);
         member.session = Some(1);
         group.members.insert(member);
-        group.rebalance_members(&topic.partitions, 10, 1);
+        group.rebalance_members(&topic.partitions, OWNER_OP, 1);
         for partition_id in [0, 1] {
             let assignment = &group.assignments[&partition_id];
             let pending = assignment.pending.unwrap();
@@ -902,8 +1115,8 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
                 group: namespace.inner(),
                 client: DATA_CLIENT,
                 partition_incarnation: 1,
-                owner_generation: 1,
-                metadata_watermark: 10,
+                owner_generation: OWNER_OP,
+                metadata_watermark: OWNER_OP,
                 user_id: USER,
                 session: 1,
                 request: 1,
@@ -2280,6 +2493,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
         partition.repair = Some(RepairSession {
             nonce: NONCE,
             view: partition.consensus().view(),
+            from_op: partition.consensus().commit_min() + 1,
             commit_to_op: TO_OP,
             fetch_to_op: TO_OP,
             floor: Some(FLOOR),
@@ -2338,7 +2552,9 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
 }
 
 /// A floor holds the walk and every op up to `fetch_to_op` is resident, so the
-/// pull start lies past the window. Only a `RepairDone` completes the session.
+/// pull start lies past the window. Only a `RepairDone` concludes the session.
+/// No batch above the floor anchors it, so that conclusion is a refusal that
+/// hands recovery to state transfer.
 #[allow(clippy::future_not_send)]
 async fn resident_window_backup(
     namespace: IggyNamespace,
@@ -2356,6 +2572,7 @@ async fn resident_window_backup(
         partition.repair = Some(RepairSession {
             nonce,
             view: partition.consensus().view(),
+            from_op: partition.consensus().commit_min() + 1,
             commit_to_op: to_op,
             fetch_to_op: to_op,
             floor: Some(floor),
@@ -2363,10 +2580,6 @@ async fn resident_window_backup(
             idle_ticks: 0,
             floor_pulled_from: 0,
         });
-        // A replica at counter zero refuses a message-free floor jump, so the
-        // window could only complete through an install.
-        partition.set_offset_space_used(true);
-        partition.offset.store(99, Ordering::Release);
         for op in floor + 1..=to_op {
             partition
                 .log
@@ -2381,7 +2594,7 @@ async fn resident_window_backup(
 }
 
 #[compio::test]
-async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_request_and_complete()
+async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_request_and_conclude()
 {
     const PEER: u8 = 1;
     const NONCE: u128 = 0xf100;
@@ -2417,9 +2630,14 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
         .expect("the partition stays registered");
     assert!(
         partition.repair.is_none(),
-        "the re-served RepairDone completes the session"
+        "the re-served RepairDone concludes the session"
     );
-    assert_eq!(partition.consensus().commit_min(), TO_OP);
+    assert_ne!(
+        partition.consensus().state_transfer_stage(),
+        consensus::StateTransferStage::Idle,
+        "an unanchored floor over a complete window converts to state transfer"
+    );
+    assert_eq!(partition.consensus().commit_min(), 0);
 }
 
 #[compio::test]
