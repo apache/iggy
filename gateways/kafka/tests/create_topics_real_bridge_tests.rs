@@ -331,6 +331,51 @@ async fn create_topics_with_a_config_against_an_existing_topic_answers_already_e
     assert_eq!(error_code, ERROR_TOPIC_ALREADY_EXISTS);
 }
 
+/// Builds a v3 `CreateTopics` request for one topic with no assignments and no configs. v3 is
+/// not flexible, so strings and arrays carry fixed-width lengths.
+fn build_v3_request(name: &str, num_partitions: i32, replication_factor: i16) -> Bytes {
+    let mut enc = Encoder::with_capacity(64);
+    enc.write_i32(1); // one topic
+    enc.write_nullable_string(Some(name))
+        .expect("topic name fits");
+    enc.write_i32(num_partitions);
+    enc.write_i16(replication_factor);
+    enc.write_i32(0); // no assignments
+    enc.write_i32(0); // no configs
+    enc.write_i32(5_000); // timeout_ms
+    enc.write_bool(false); // validate_only
+    enc.freeze()
+}
+
+/// `KafkaJS` `createTopics()` sends `-1` partitions and replication factor at v3. Kafka's
+/// controller accepts them at every version, so the topic is created with the default partition
+/// count.
+#[tokio::test]
+#[serial]
+async fn create_topics_v3_accepts_broker_default_sentinels() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let outcome = create_topics::handle(&state, 3, build_v3_request("orders", -1, -1)).await;
+    let mut d = Decoder::new(outcome.expect_response("CreateTopics request always answers"));
+    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
+    assert_eq!(d.read_i32().expect("topics array count"), 1);
+    assert_eq!(
+        d.read_nullable_string().expect("topic name").as_deref(),
+        Some("orders")
+    );
+    assert_eq!(d.read_i16().expect("error_code"), ERROR_NONE);
+
+    let raw = raw_client(&server).await;
+    let topics = raw
+        .get_topics(&Identifier::named("kafka").expect("valid stream name"))
+        .await
+        .expect("get_topics call");
+    assert_eq!(topics.len(), 1, "the handler must have actually created it");
+    assert_eq!(topics[0].partitions_count, 1);
+}
+
 /// A manual replica assignment resolves the created partition count from its own length, not
 /// from `num_partitions` (`-1` here, per KIP-464).
 #[tokio::test]

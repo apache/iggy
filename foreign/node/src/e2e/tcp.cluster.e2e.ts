@@ -26,6 +26,7 @@ const expectedMeta = {
   name: "single-node",
   nodes: [
     {
+      replicaId: 0,
       name: "iggy-node",
       ip: "127.0.0.1",
       endpoints: {

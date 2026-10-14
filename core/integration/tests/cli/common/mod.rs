@@ -202,6 +202,12 @@ impl IggyCmdTest {
         let mut command = Command::cargo_bin("iggy").unwrap();
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
+        // Clear any IGGY_TOKEN inherited from the test process before the
+        // case's environment is applied: the token takes precedence over
+        // username/password, so an ambient value would override the
+        // credentials a case sets up. A case exercising token auth sets
+        // its own value in its environment.
+        command.env("IGGY_TOKEN", "");
         // Set environment variables for the command
         command.envs(command_args.get_env());
         // Set a fixed terminal width for consistent help output formatting
@@ -267,6 +273,11 @@ impl IggyCmdTest {
         let mut command = Command::cargo_bin("iggy").unwrap();
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
+        // Clear any IGGY_TOKEN inherited from the test process before the
+        // case's environment is applied: the token takes precedence over
+        // username/password, so an ambient value would override the
+        // credentials a case sets up.
+        command.env("IGGY_TOKEN", "");
         // Set environment variables for the command
         command.envs(command_args.get_env());
         // Set COLUMNS environment variable to 200 to avoid truncation of output

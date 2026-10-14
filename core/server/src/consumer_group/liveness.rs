@@ -455,7 +455,10 @@ async fn retire_session<B, MJ, S, SB>(
                 let status = shard
                     .partition_read(
                         *namespace,
-                        shard::PartitionRead::SessionRetired { identity },
+                        shard::PartitionRead::SessionRetired {
+                            identity,
+                            created_revision: *created_revision,
+                        },
                     )
                     .await;
                 let retired = match status {
@@ -521,7 +524,10 @@ async fn retire_session<B, MJ, S, SB>(
                         shard
                             .partition_read(
                                 *namespace,
-                                shard::PartitionRead::SessionRetired { identity }
+                                shard::PartitionRead::SessionRetired {
+                                    identity,
+                                    created_revision: *created_revision,
+                                }
                             )
                             .await,
                         Some(shard::PartitionReadReply::SessionRetired(true))

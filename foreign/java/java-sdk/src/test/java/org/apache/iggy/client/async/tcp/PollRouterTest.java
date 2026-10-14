@@ -44,7 +44,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_POLL_ROUTING_CODE;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.emptyPoll;
@@ -61,10 +61,9 @@ class PollRouterTest {
     private static final int BIND_SECRET_BYTES = 32;
     private static final int PARTITION_KEY_BYTES = 16;
     private static final PartitionContext ROUTE_CONTEXT =
-            new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.ZERO);
-    // route() reads the watermark, then route(), pollOnConnection() and attach() check the
-    // cached route, all before the route check that guards the send.
-    private static final int SEND_CHECK_WATERMARK_READ = 5;
+            new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.valueOf(ROUTE_WATERMARK));
+    // Fire after route freshness checks, at the final attachment check before send.
+    private static final int SEND_CHECK_WATERMARK_READ = 6;
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
     private static final Duration NEVER = Duration.ofDays(1);
 
@@ -110,9 +109,49 @@ class PollRouterTest {
         }
     }
 
+    @Test
+    void shouldRefreshCachedHistoryBeforeANewPollAfterMetadataAdvances() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        try {
+            Coordinator coordinator = new Coordinator(group, timers);
+            Primary primary = new Primary(group);
+            primary.holdAfterFirst = false;
+            PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            coordinator.watermark = ROUTE_WATERMARK + 1;
+            coordinator.context = new PartitionContext(
+                    BigInteger.valueOf(INCARNATION + 1), BigInteger.ZERO, BigInteger.valueOf(coordinator.watermark));
+            router.poll(pollPayload(), Optional.empty())
+                    .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    .release();
+            assertThat(primary.sentContexts).containsExactly(ROUTE_CONTEXT, coordinator.context);
+            assertThat(coordinator.routes).isEqualTo(2);
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        } finally {
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
     private static ByteBuf pollPayload() {
         // The router keys routes by the bytes before the poll parameters and reads nothing else.
-        return Unpooled.buffer().writeZero(PARTITION_KEY_BYTES + PollRouter.POLL_PARAMETERS_BYTES);
+        return Unpooled.buffer()
+                .writeByte(1)
+                .writeByte(1)
+                .writeByte(4)
+                .writeIntLE(0)
+                .writeByte(1)
+                .writeByte(4)
+                .writeIntLE(1)
+                .writeByte(1)
+                .writeByte(4)
+                .writeIntLE(1)
+                .writeByte(1)
+                .writeIntLE(0)
+                .writeZero(PollRouter.POLL_PARAMETERS_BYTES);
     }
 
     private static Thread start(String name, Runnable task) {
@@ -168,6 +207,9 @@ class PollRouterTest {
 
     private static final class Coordinator extends OfflineConnection {
         private final EventLoop timers;
+        private long watermark;
+        private PartitionContext context = ROUTE_CONTEXT;
+        private int routes;
         private final AtomicInteger watermarkReadsLeft = new AtomicInteger();
         private volatile Runnable watermarkHook = () -> {};
 
@@ -197,7 +239,7 @@ class PollRouterTest {
             if (watermarkReadsLeft.decrementAndGet() == 0) {
                 watermarkHook.run();
             }
-            return super.metadataWatermark();
+            return watermark;
         }
 
         @Override
@@ -206,12 +248,23 @@ class PollRouterTest {
         }
 
         @Override
-        public CompletableFuture<ByteBuf> send(CommandCode commandCode, ByteBuf payload) {
+        long[] sessionIdentity() {
+            return new long[] {CLIENT_LOW, CLIENT_HIGH, SESSION};
+        }
+
+        @Override
+        CompletableFuture<ByteBuf> sendRouted(
+                int commandCode, ByteBuf payload, long generation, long deadline, TransientFailoverState state) {
             payload.release();
-            assertThat(commandCode).isEqualTo(CommandCode.Messages.GET_POLL_ROUTING);
+            if (commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
+                return CompletableFuture.completedFuture(AsyncIggyTcpClientTransientFailoverTest.clusterMetadata(
+                        PRIMARY_PORT + 1, PRIMARY_PORT, PRIMARY_PORT + 1));
+            }
+            assertThat(commandCode).isEqualTo(CommandCode.Messages.GET_PARTITION_ROUTE.getValue());
+            routes++;
             Request routing = new Request(
                     OPERATION_NON_REPLICATED,
-                    GET_POLL_ROUTING_CODE,
+                    GET_PARTITION_ROUTE_CODE,
                     0,
                     CLIENT_LOW,
                     CLIENT_HIGH,
@@ -220,8 +273,12 @@ class PollRouterTest {
                     0,
                     new byte[0],
                     0);
-            return CompletableFuture.completedFuture(
-                    pollRoute(routing, SESSION, ROUTE_WATERMARK, PRIMARY_PORT, INCARNATION));
+            return CompletableFuture.completedFuture(pollRoute(
+                    routing,
+                    SESSION,
+                    context.metadataOp().longValue(),
+                    PRIMARY_PORT,
+                    context.incarnation().longValue()));
         }
     }
 
@@ -229,6 +286,7 @@ class PollRouterTest {
     private static final class Primary extends OfflineConnection {
         private final List<PartitionContext> sentContexts = new CopyOnWriteArrayList<>();
         private final CompletableFuture<ByteBuf> unanswered = new CompletableFuture<>();
+        private boolean holdAfterFirst = true;
 
         Primary(IoEventLoopGroup group) {
             super(group);
@@ -240,18 +298,16 @@ class PollRouterTest {
         }
 
         @Override
-        public CompletableFuture<ByteBuf> send(CommandCode commandCode, ByteBuf payload) {
+        CompletableFuture<ByteBuf> sendRouted(
+                int commandCode, ByteBuf payload, long sessionGeneration, long deadline, TransientFailoverState state) {
             payload.release();
-            assertThat(commandCode).isEqualTo(CommandCode.System.BIND_SESSION);
-            return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
-        }
-
-        @Override
-        CompletableFuture<ByteBuf> sendOnPrimary(
-                int commandCode, ByteBuf payload, long sessionGeneration, PartitionContext context) {
-            payload.release();
-            sentContexts.add(context);
-            return sentContexts.size() == 1 ? CompletableFuture.completedFuture(emptyPoll(0)) : unanswered;
+            if (commandCode == CommandCode.System.BIND_SESSION.getValue()) {
+                return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
+            }
+            sentContexts.add(state.context());
+            return !holdAfterFirst || sentContexts.size() == 1
+                    ? CompletableFuture.completedFuture(emptyPoll(0))
+                    : unanswered;
         }
 
         @Override

@@ -21,7 +21,7 @@
 //! `iggy-durability` header, the body-size cap, and cross-request isolation
 //! of concurrent produces on one login session.
 
-use crate::server::http_client::HttpClient;
+use crate::server::http_client::{HttpClient, applied_op, leader_and_follower, node_url};
 use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_common::create_stream::CreateStream;
@@ -57,7 +57,8 @@ const ASYNC_COMMIT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// exercises the listener's produce / poll / consumer-offset behavior, so its
 /// helpers decode `PolledMessages` and drive multi-partition produces.
 trait HttpSessionExt {
-    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32);
+    /// Returns the applied op of the topic create.
+    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32) -> u64;
     async fn produce(
         &self,
         stream: &str,
@@ -93,7 +94,7 @@ trait HttpSessionExt {
 }
 
 impl HttpSessionExt for HttpClient {
-    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32) {
+    async fn create_stream_and_topic(&self, stream: &str, topic: &str, partitions: u32) -> u64 {
         let response = self
             .client
             .post(self.url("/streams"))
@@ -136,15 +137,11 @@ impl HttpSessionExt for HttpClient {
         // Body included on failure: a 500 from a serialization fault names
         // itself only there, and status alone sent this down a long detour.
         let status = response.status();
-        let body = if status.is_success() {
-            String::new()
-        } else {
-            response.text().await.unwrap_or_default()
-        };
-        assert!(
-            status.is_success(),
-            "create topic failed: {status} body={body}"
-        );
+        if status.is_success() {
+            return applied_op(&response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        panic!("create topic failed: {status} body={body}");
     }
 
     async fn produce(
@@ -384,6 +381,41 @@ async fn given_http_session_when_producing_and_polling_should_round_trip(harness
         user_headers.get(&header_key),
         Some(&header_value),
         "user header must survive the round trip"
+    );
+}
+
+/// A fresh partition that only plain consumers read keeps a zero metadata
+/// frontier. The served context must still cover the topic create: below it,
+/// a later poll on a node that has not applied the create passes the frontier
+/// check and drops its position on `HistoryUnavailable`.
+#[iggy_harness]
+async fn given_fresh_topic_when_polling_over_http_should_serve_a_context_at_or_above_the_topic_create(
+    harness: &TestHarness,
+) {
+    const STREAM: &str = "http-context-stream";
+    const TOPIC: &str = "http-context-topic";
+    let http = HttpClient::login_root(harness).await;
+    let topic_create_op = http.create_stream_and_topic(STREAM, TOPIC, 1).await;
+    let response = http
+        .produce(
+            STREAM,
+            TOPIC,
+            PARTITION_ID,
+            vec![text_message(1, "served-context".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "produce must commit"
+    );
+
+    let polled = http.poll(STREAM, TOPIC, PARTITION_ID, 0, 10).await;
+    assert_eq!(polled.messages.len(), 1, "the sent message must come back");
+    assert!(
+        polled.context.metadata_op >= topic_create_op,
+        "the served context {:?} must cover the topic create at op {topic_create_op}",
+        polled.context
     );
 }
 
@@ -1286,4 +1318,30 @@ async fn given_http_sdk_when_sending_should_expose_the_advertised_durability(
         .unwrap();
     assert_eq!(durability, Some(Durability::Persisted));
     assert_eq!(response.confirmations.len(), 1);
+}
+
+/// Without cluster-wide bearer key material, forwarding is off and a follower
+/// cannot relay a control-plane write. Its consensus answers `NotPrimary`, and
+/// replaying on a backup cannot reach the primary, so the follower refuses with
+/// 58 at once instead of replaying until the transient budget ends.
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "0..1"))]
+async fn given_forwarding_off_when_a_follower_takes_a_write_should_refuse_at_once(
+    harness: &TestHarness,
+) {
+    /// Far below the 30 s transient replay budget of the submit path.
+    const REFUSAL_BUDGET: Duration = Duration::from_secs(5);
+    let (_, follower) = leader_and_follower(harness).await;
+    let http = HttpClient::login_root_no_redirect(node_url(harness, follower)).await;
+    let started = Instant::now();
+    let response = http
+        .post_json("/streams", &json!({ "name": "follower-write" }))
+        .await;
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.expect("decode the error body");
+    assert_eq!(body["id"], IggyError::TransientNotAccepted.as_code());
+    assert!(
+        elapsed < REFUSAL_BUDGET,
+        "a follower refused after {elapsed:?}, the replay budget is not for backups"
+    );
 }

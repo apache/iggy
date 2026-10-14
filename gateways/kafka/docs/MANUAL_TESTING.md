@@ -387,8 +387,8 @@ criteria).
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
 | 29 | TOPIC_AUTHORIZATION_FAILED | Produce with a bridge: Iggy user lacks permission |
 | 35 | UNSUPPORTED_VERSION | Out of range: **ApiVersions only** (KIP-511 exception); every other API key's out-of-range version closes the connection instead - see Category B. In range: InitProducerId with a `transactional_id`; Produce with a `transactional_id`, on every partition with or without a bridge (an `acks=0` one closes instead); and, with a bridge, a transactional or control batch - transactions are not supported, see `SCOPE.md` |
-| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
-| 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
+| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` |
+| 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` |
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
 | 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. Not Produce: it closes the connection (H1) |
 | 76 | UNSUPPORTED_COMPRESSION_TYPE | Produce with a bridge: zstd before v7 |

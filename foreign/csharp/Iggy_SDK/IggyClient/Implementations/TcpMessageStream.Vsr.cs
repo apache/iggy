@@ -312,16 +312,23 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             return cached;
         }
 
-        var topic = await GetTopicByIdAsync(streamId, topicId, token);
-        if (topic is null)
+        var routeKey = new PartitionRouteKey(streamId, topicId, 0);
+        RemovePartitionRoute(routeKey);
+        var query = RouteQuery(routeKey);
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        while (true)
         {
-            throw VsrError.Exception(VsrError.TOPIC_ID_NOT_FOUND,
-                $"Topic {topicId} was not found in stream {streamId}.");
+            try
+            {
+                var route = await GetPartitionRouteAsync(routeKey, query, deadline, token);
+                return route.Route.PartitionsCount;
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.TRANSIENT_NOT_ACCEPTED
+                && Environment.TickCount64 + PollRoutingRetryIntervalMs < deadline)
+            {
+                await Task.Delay(PollRoutingRetryIntervalMs, token);
+            }
         }
-
-        _groupState.SetPartitionCount(key, topic.PartitionsCount);
-
-        return topic.PartitionsCount;
     }
 
     /// <summary>
@@ -509,6 +516,22 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             throw new MalformedResponseException("Cluster metadata contains no nodes.");
         }
 
+        var replicas = new Dictionary<byte, string>();
+        foreach (var node in clusterMetadata.Nodes)
+        {
+            if (!replicas.TryAdd(node.ReplicaId, ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp)))
+            {
+                throw new MalformedResponseException($"Duplicate replica id {node.ReplicaId} in cluster metadata.");
+            }
+        }
+        lock (_pollRoutingGate)
+        {
+            _replicaEndpoints.Clear();
+            foreach (var node in clusterMetadata.Nodes.Where(node => node.Endpoints.Tcp != 0))
+            {
+                _replicaEndpoints.Add(node.ReplicaId, replicas[node.ReplicaId]);
+            }
+        }
         Volatile.Write(ref _clusterNodeCount, nodeCount);
         var endpoints = clusterMetadata.Nodes
             .Where(node => node.Endpoints.Tcp != 0)
@@ -641,7 +664,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
                 if (attempt.Error is IggyInvalidStatusCodeException
                     {
-                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED, FromServer: true
+                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY, FromServer: true
                     }
                     && !isLoginRegister
                     && allowRedirect
@@ -657,7 +680,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                         }
                     }
 
-                    if (!moved)
+                    if (!moved && attempt.Error is not IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
                     {
                         moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
                         walkingRoster |= moved;
@@ -666,6 +689,10 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     if (moved)
                     {
                         await ConnectAsync(true, !walkingRoster, token);
+                    }
+                    else if (attempt.Error is IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
+                    {
+                        await Task.Delay(PollRoutingRetryIntervalMs, token);
                     }
                     else if (!walkingRoster && leaderRedirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
                     {
@@ -804,7 +831,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
-        PartitionContext context = default)
+        PartitionContext context = default, SessionFrame? retainedFrame = null, bool retryTransient = true)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -816,7 +843,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                clearSensitiveReply, token, context: context);
+                clearSensitiveReply, token, retryTransient, context, retainedFrame);
         }
         finally
         {

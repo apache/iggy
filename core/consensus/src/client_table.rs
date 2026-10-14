@@ -500,13 +500,14 @@ pub struct DedupWatermark {
 /// [`IggyError::RequestTooOld`] because its outcome is unknown.
 ///
 /// The width is in the CLIENT's request-id space, not in this group's writes:
-/// `ConsensusSession` mints from one counter across every partition, stream and
-/// metadata op, so a slice only ever sees the subset of those ids routed to it.
-/// Coverage in a client's own writes to one group is this width divided by the
-/// number of groups it interleaves, so 128 ids is around 16 writes per group
-/// across 8 partitions, and a replay held back longer than that can be refused
-/// with an unknown outcome. A wider bitmap divides by the same fanout: closing
-/// the gap needs per-group request numbering, which waits on the clients-table follow-up.
+/// `ConsensusSession` uses one counter for mutations, bound reads and pings
+/// across all groups. Reads bypass dedup and do not advance this watermark,
+/// but a later committed mutation brings their skipped ids into the window.
+/// Thus 128 ids is not a guarantee of retaining 128 writes: even 16 writes per
+/// group across 8 partitions assumes no intervening reads or metadata calls.
+/// A delayed replay below that window returns an unknown outcome. A wider
+/// bitmap retains the same limitation; different numbering needs a separate
+/// contract that preserves unique request ids for multiplexed replies.
 pub const COMMITTED_WINDOW_BITS: u64 = 128;
 
 /// VSR client table: per-session fence epoch + request-watermark dedup.

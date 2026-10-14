@@ -57,7 +57,9 @@ pub const SEND_MESSAGES_CODE: u32 = 101;
 // 102 was FLUSH_UNSAVED_BUFFER. Never reuse it: older clients still send it.
 pub const GET_POLL_ROUTING_CODE: u32 = 103;
 pub const POLL_MESSAGES_ON_PRIMARY_CODE: u32 = 104;
-pub const GET_SEND_CONTEXT_CODE: u32 = 105;
+/// The route of one partition: its incarnation, the group view and the primary
+/// of that view. Sends, polls and consumer offsets all route with it.
+pub const GET_PARTITION_ROUTE_CODE: u32 = 105;
 
 // -- Consumer Offsets --
 pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
@@ -144,7 +146,7 @@ mod tests {
         POLL_MESSAGES_CODE,
         GET_POLL_ROUTING_CODE,
         POLL_MESSAGES_ON_PRIMARY_CODE,
-        GET_SEND_CONTEXT_CODE,
+        GET_PARTITION_ROUTE_CODE,
         SEND_MESSAGES_CODE,
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
