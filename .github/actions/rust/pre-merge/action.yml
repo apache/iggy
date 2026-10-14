@@ -312,13 +312,16 @@ runs:
     - name: Run coverage test partition
       if: inputs.task == 'test'
       env:
-        TEST_PARTITION: ${{ inputs.partition }}
-        TEST_PARTITIONS: ${{ inputs.partitions }}
+        # Keep these out of TEST_* and IGGY_*. They reach every test process,
+        # where config env tests panic on unknown TEST_* names and debug
+        # servers refuse to boot on unknown IGGY_* names.
+        PARTITION_INDEX: ${{ inputs.partition }}
+        PARTITION_COUNT: ${{ inputs.partitions }}
       run: |
         set -euo pipefail
-        if [[ ! "$TEST_PARTITION" =~ ^[1-9][0-9]*$ || ! "$TEST_PARTITIONS" =~ ^[1-9][0-9]*$ ]] ||
-          (( TEST_PARTITION > TEST_PARTITIONS )); then
-          echo "::error::Invalid test partition: $TEST_PARTITION/$TEST_PARTITIONS"
+        if [[ ! "$PARTITION_INDEX" =~ ^[1-9][0-9]*$ || ! "$PARTITION_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+          (( PARTITION_INDEX > PARTITION_COUNT )); then
+          echo "::error::Invalid test partition: $PARTITION_INDEX/$PARTITION_COUNT"
           exit 1
         fi
         ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
@@ -385,7 +388,7 @@ runs:
         cargo nextest run --archive-file "$ARTIFACT_DIR/nextest.tar.zst" \
           --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" \
           --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
-          --partition "hash:${TEST_PARTITION}/${TEST_PARTITIONS}"
+          --partition "hash:${PARTITION_INDEX}/${PARTITION_COUNT}"
       shell: bash
 
     # On-disk format backwards compatibility. The script builds an iggy-server
