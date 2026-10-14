@@ -44,7 +44,7 @@ name: PR Triage Reconcile
 
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "41 */6 * * *"
   workflow_dispatch:
 
 permissions:
