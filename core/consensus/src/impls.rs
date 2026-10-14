@@ -18,11 +18,11 @@
 use crate::oneshot::{self, Receiver, Sender};
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
-    AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, DvcSuffix, IgnoreReason,
-    MergeOutcome, MergeQuorums, MergedLog, Pipeline, PlaneKind, PrepareLogEvent, Project,
-    ReplicaLogContext, SimEventKind, StoredDvc, ViewChangeLogEvent, ViewChangeReason, VsrState,
-    dvc_count, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_suffix_decode,
-    emit_replica_event, emit_sim_event, merge_dvc_quorum, seal_prepare_checksum,
+    AckLogEvent, Consensus, ControlActionLogEvent, DvcHeaderKind, DvcQuorumArray, DvcSuffix,
+    IgnoreReason, MergeOutcome, MergeQuorums, MergedLog, Pipeline, PlaneKind, PrepareLogEvent,
+    Project, ReplicaLogContext, SimEventKind, StoredDvc, ViewChangeLogEvent, ViewChangeReason,
+    VsrState, dvc_count, dvc_header_kind, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset,
+    dvc_suffix_decode, emit_replica_event, emit_sim_event, merge_dvc_quorum, seal_prepare_checksum,
 };
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
@@ -4046,10 +4046,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     pub fn note_repaired_view_header(&self, header: PrepareHeader) {
         if let Some(pending) = self.pending_view_log.borrow_mut().as_mut()
-            && pending.headers.is_empty()
             && pending.op_head == header.op
+            && pending
+                .headers
+                .first()
+                .is_none_or(|head| dvc_header_kind(head) == DvcHeaderKind::Blank)
         {
-            pending.headers.push(header);
+            if let Some(head) = pending.headers.first_mut() {
+                *head = header;
+            } else {
+                pending.headers.push(header);
+            }
             self.invalidate_local_dvc_suffix();
         }
     }

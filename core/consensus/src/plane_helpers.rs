@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
-    Status, VsrConsensus,
+    Consensus, DvcHeaderKind, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome,
+    Sequencer, Status, VsrConsensus, dvc_header_kind,
 };
 use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
 use iggy_binary_protocol::{
@@ -927,7 +927,10 @@ pub fn view_log_proof(
     if op_head <= proven {
         return ViewLogProof::Proven;
     }
-    let Some(head) = canonical.first().filter(|head| head.op == op_head) else {
+    let Some(head) = canonical
+        .first()
+        .filter(|head| head.op == op_head && dvc_header_kind(head) != DvcHeaderKind::Blank)
+    else {
         return ViewLogProof::Missing {
             op: op_head,
             unproven_through: op_head,
@@ -938,7 +941,10 @@ pub fn view_log_proof(
     for op in (proven + 1..=op_head).rev() {
         let header = if let Some(local) = header_at(op) {
             local
-        } else if let Some(header) = canonical.iter().find(|header| header.op == op) {
+        } else if let Some(header) = canonical
+            .iter()
+            .find(|header| header.op == op && dvc_header_kind(header) != DvcHeaderKind::Blank)
+        {
             missing.get_or_insert(op);
             *header
         } else {
@@ -2654,5 +2660,82 @@ mod tests {
             }
         );
         assert_eq!(proof(6, &local, &[]), ViewLogProof::Proven);
+    }
+
+    #[test]
+    fn given_blank_view_slots_when_proving_history_should_wait_for_evidence() {
+        const HEAD: u64 = 4;
+        let blank = crate::dvc_blank(HEAD);
+        let local = PrepareHeader {
+            op: HEAD,
+            parent: 3,
+            checksum: 4,
+            ..Default::default()
+        };
+        for held in [None, Some(local)] {
+            assert_eq!(
+                view_log_proof(HEAD - 1, &[blank], HEAD, |_| held),
+                ViewLogProof::Missing {
+                    op: HEAD,
+                    unproven_through: HEAD,
+                },
+                "a blank head cannot prove either a missing or held prepare divergent"
+            );
+        }
+        assert_eq!(
+            view_log_proof(HEAD - 2, &[local, crate::dvc_blank(HEAD - 1)], HEAD, |op| {
+                (op == HEAD).then_some(local)
+            }),
+            ViewLogProof::Missing {
+                op: HEAD - 1,
+                unproven_through: HEAD - 1,
+            },
+            "a blank predecessor cannot bridge a proof gap"
+        );
+    }
+
+    #[test]
+    fn given_commit_stamps_when_proving_history_should_require_a_sealed_contiguous_chain() {
+        const FLOOR: u64 = 2;
+        let headers: Vec<_> = (FLOOR + 1..=6)
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                checksum: u128::from(op),
+                commit: op - 1,
+                ..Default::default()
+            })
+            .collect();
+        let proof = |headers: &[PrepareHeader]| {
+            view_log_proof(FLOOR, &[], 5, |op| {
+                headers.iter().find(|header| header.op == op).copied()
+            })
+        };
+        assert_eq!(proof(&headers), ViewLogProof::Proven);
+        for damaged in [0, 1] {
+            let mut broken = headers.clone();
+            if damaged == 0 {
+                broken[1].checksum = CHECKSUM_UNSEALED;
+            } else {
+                broken[1].parent += 1;
+            }
+            assert_eq!(
+                proof(&broken),
+                ViewLogProof::Missing {
+                    op: 5,
+                    unproven_through: 5
+                },
+                "a later commit stamp must not bridge an unsealed or disconnected prefix"
+            );
+        }
+        let mut gap = headers;
+        gap.remove(1);
+        assert_eq!(
+            proof(&gap),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            }
+        );
     }
 }

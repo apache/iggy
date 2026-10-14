@@ -5227,9 +5227,8 @@ where
         if let Some(ref consensus) = planes.0.consensus
             && consensus.group() == header.group
         {
-            // Served in `ViewChange` too: the replicas holding a missing body are
-            // exactly those in `ViewChange`, so refusing would deadlock the repair
-            // the new primary waits on. Read-only; the requester decides.
+            // A primary-elect can need bodies held only by ViewChange peers.
+            // Other requesters may receive only those peers' committed prefix.
             if consensus.is_transferring() {
                 // Transfer can replace these entries.
                 return;
@@ -5243,11 +5242,7 @@ where
             let journal = journal.handle();
             let cluster = consensus.cluster();
             let self_id = consensus.replica();
-            let to_op = repair_serve_ceiling(
-                header.to_op,
-                consensus.commit_max(),
-                consensus.sequencer().current_sequence(),
-            );
+            let to_op = repair_serve_ceiling(&header, consensus);
             // Skip the compacted prefix (below the snapshot floor) in one
             // RangeEvicted notice, then serve contiguously until the range
             // ends or the WAL runs out.
@@ -5367,11 +5362,7 @@ where
         // until the body is journaled, and the primary's retransmit is dropped
         // by the backup gap check (adoption already advanced its sequencer to
         // the head), so repair is the only channel that can deliver them.
-        let to_op = repair_serve_ceiling(
-            header.to_op,
-            partition.consensus().commit_max(),
-            partition.consensus().sequencer().current_sequence(),
-        );
+        let to_op = repair_serve_ceiling(&header, partition.consensus());
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
         // evicted ring with it, so a freshly installed or freshly restarted
@@ -5524,7 +5515,10 @@ where
                         .headers
                         .iter()
                         .chain(pending.committed_elsewhere.iter())
-                        .find(|expected| expected.op == header.op)
+                        .find(|expected| {
+                            expected.op == header.op
+                                && dvc_header_kind(expected) != DvcHeaderKind::Blank
+                        })
                         .is_some_and(|expected| expected.checksum != header.checksum)
                 })
                 .unwrap_or(false);
@@ -5670,7 +5664,7 @@ where
             let Some(session) = session else {
                 return;
             };
-            if header.nonce != session.nonce {
+            if (header.replica, header.nonce) != (session.peer, session.nonce) {
                 return;
             }
             match header.command {
@@ -5697,7 +5691,7 @@ where
                         done,
                         "metadata journal repair walked"
                     );
-                    // The one attributable credit: fenced on `session.nonce`
+                    // The one attributable credit: fenced on nonce and peer
                     // above, so it came from the targeted peer, and the walk moved.
                     // Gating on the walk and not the frame keeps a peer that
                     // terminates every round while serving nothing useful from
@@ -5715,6 +5709,7 @@ where
                         self.send_request_prepares(
                             consensus.cluster(),
                             consensus.replica(),
+                            consensus.view(),
                             session.peer,
                             session.nonce,
                             from_op,
@@ -5884,7 +5879,7 @@ where
         let Some(session) = partition.repair else {
             return;
         };
-        if header.nonce != session.nonce {
+        if (header.replica, header.nonce) != (session.peer, session.nonce) {
             return;
         }
         // Twin of the `apply_repaired_prepare` gate: a primary-elect's merged-log
@@ -5980,6 +5975,7 @@ where
                         self.send_request_prepares(
                             cluster,
                             self_id,
+                            partition.consensus().view(),
                             peer,
                             nonce,
                             from_op,
@@ -6005,6 +6001,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
+        view: u32,
         target: u8,
         nonce: u128,
         from_op: u64,
@@ -6019,6 +6016,7 @@ where
                 h.command = Command::RequestPrepares;
                 h.cluster = cluster;
                 h.replica = self_id;
+                h.view = view;
                 h.nonce = nonce;
                 h.from_op = from_op;
                 h.to_op = to_op;
@@ -6327,6 +6325,7 @@ where
                 self.send_request_prepares(
                     consensus.cluster(),
                     consensus.replica(),
+                    consensus.view(),
                     peer,
                     nonce,
                     from_op,
@@ -6665,6 +6664,7 @@ where
         self.send_request_prepares(
             consensus.cluster(),
             consensus.replica(),
+            consensus.view(),
             peer,
             nonce,
             from_op,
@@ -8213,6 +8213,7 @@ where
                 self.send_request_prepares(
                     cluster,
                     self_id,
+                    partition.consensus().view(),
                     peer,
                     nonce,
                     from_op,
@@ -9183,7 +9184,7 @@ where
     /// and nothing else is recovering it. The idempotence guards mirror
     /// `maybe_request_metadata_repair`: no-op unless Normal, not
     /// transferring, behind the frontier, and no session live.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     /// Open a journal-repair session against `peer`, if this partition needs
     /// one and the shard has room for it. `true` when a session was recorded.
     ///
@@ -9315,6 +9316,7 @@ where
         self.send_request_prepares(
             partition.consensus().cluster(),
             partition.consensus().replica(),
+            partition.consensus().view(),
             peer,
             nonce,
             from_op,
@@ -9401,6 +9403,7 @@ where
         self.send_request_prepares(
             cluster,
             self_id,
+            partition.consensus().view(),
             peer,
             nonce,
             from_op,
@@ -11006,16 +11009,33 @@ fn repair_op_in_scope(
 
 /// Ceiling on the op range a repair request may ask this replica to walk.
 ///
-/// Not `commit_max` alone: a new primary repairing toward a merged log needs the
-/// uncommitted suffix the view change kept, which sits above every commit point.
+/// Only peers in this view may receive an uncommitted suffix. During view
+/// change only its primary may receive it to repair its parked merged log.
+/// An ordinary backup can accept an unnamed op as committed history.
 ///
 /// Bounded by the local frontier all the same. `RequestPreparesHeader::validate`
 /// accepts any `from_op <= to_op`, so `u64::MAX` is legal, and the metadata serve
 /// path then walks op by op with no `.await` -- on a single-threaded shard pump
 /// that ends the shard rather than merely serving slowly. Nothing above the
 /// frontier is servable, so the clamp costs nothing.
-fn repair_serve_ceiling(requested_to_op: u64, commit_max: u64, head: u64) -> u64 {
-    requested_to_op.min(commit_max.max(head))
+fn repair_serve_ceiling<B, P>(
+    request: &RequestPreparesHeader,
+    consensus: &VsrConsensus<B, P>,
+) -> u64
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    let suffix_allowed = request.view == consensus.view()
+        && (consensus.is_normal() || request.replica == consensus.primary_index(consensus.view()));
+    let ceiling = if suffix_allowed {
+        consensus
+            .commit_max()
+            .max(consensus.sequencer().current_sequence())
+    } else {
+        consensus.commit_min()
+    };
+    request.to_op.min(ceiling)
 }
 
 /// Repair sessions the partition tick sweep will OPEN per pass.
@@ -12244,7 +12264,10 @@ mod persist_gate_tests {
 mod repair_scope_tests {
     //! Who parked the log decides what it means.
 
-    use iggy_binary_protocol::{Command, PrepareHeader};
+    use consensus::{LocalPipeline, Sequencer, VsrConsensus};
+    use iggy_binary_protocol::{Command, PrepareHeader, RequestPreparesHeader};
+    use message_bus::IggyMessageBus;
+    use server_common::Message;
 
     use super::{
         MergedLog, adopted_suffix_head, pending_covers_suffix, repair_op_in_scope,
@@ -12310,15 +12333,34 @@ mod repair_scope_tests {
 
     #[test]
     fn given_a_repair_request_when_serving_should_clamp_to_the_frontier_but_not_below_it() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        consensus.advance_commit_max(40);
+        consensus.sequencer().set_sequence(90);
+        let ceiling = |to_op| {
+            let request = Message::<RequestPreparesHeader>::new(std::mem::size_of::<
+                RequestPreparesHeader,
+            >())
+            .transmute_header(|_, header: &mut RequestPreparesHeader| {
+                header.command = Command::RequestPrepares;
+                header.cluster = consensus.cluster();
+                header.size = u32::try_from(std::mem::size_of::<RequestPreparesHeader>()).unwrap();
+                header.view = consensus.view();
+                header.from_op = 1;
+                header.to_op = to_op;
+            });
+            repair_serve_ceiling(request.header(), &consensus)
+        };
         // `validate` accepts any `to_op >= from_op` and the serve path walks op by
         // op with no `.await`, so an unclamped ceiling hangs the whole shard.
-        assert_eq!(repair_serve_ceiling(u64::MAX, 40, 90), 90);
-        assert_eq!(repair_serve_ceiling(50, 40, 90), 50);
+        assert_eq!(ceiling(u64::MAX), 90);
+        assert_eq!(ceiling(50), 50);
         // The suffix a new primary repairs toward sits above every commit point,
         // so clamping to `commit_max` alone deadlocks the view change.
-        assert_eq!(repair_serve_ceiling(90, 40, 90), 90);
+        assert_eq!(ceiling(90), 90);
         // `commit_max` above the local head still counts: heartbeats outrun prepares.
-        assert_eq!(repair_serve_ceiling(u64::MAX, 120, 90), 120);
+        consensus.advance_commit_max(120);
+        assert_eq!(ceiling(u64::MAX), 120);
     }
 
     #[test]

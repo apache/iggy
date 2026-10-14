@@ -2016,10 +2016,11 @@ mod tests {
 
     /// Build a partition-plane `RepairRangeReply` as the serving peer would
     /// send it. Only the fields the receive path reads are stamped: routing
-    /// (`group`, `partition_incarnation`), session (`nonce`), and verdict.
+    /// (`group`, `partition_incarnation`), session (`peer`, `nonce`), and verdict.
     fn build_repair_range_reply(
         namespace: IggyNamespace,
         partition_incarnation: u64,
+        peer: u8,
         command: Command,
         nonce: u128,
         op: u64,
@@ -2032,6 +2033,7 @@ mod tests {
         .expect("zeroed bytes form a valid RepairRangeReplyHeader");
         header.command = command;
         header.size = u32::try_from(header_size).expect("header size fits u32");
+        header.replica = peer;
         header.nonce = nonce;
         header.op = op;
         header.group = namespace.inner();
@@ -3546,6 +3548,7 @@ mod tests {
     #[compio::test]
     async fn repair_done_over_a_passed_floor_closes_the_session() {
         const NONCE: u128 = 13;
+        const PEER: u8 = 1;
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let mux = TestMux::default();
@@ -3577,7 +3580,7 @@ mod tests {
                 commit_to_op: 8,
                 fetch_to_op: 8,
                 floor: None,
-                peer: 1,
+                peer: PEER,
                 idle_ticks: 0,
             });
             for op in 1..=8 {
@@ -3637,6 +3640,7 @@ mod tests {
                         .on_message(build_repair_range_reply(
                             ns,
                             incarnation,
+                            PEER,
                             Command::RepairDone,
                             NONCE,
                             8,

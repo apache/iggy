@@ -43,11 +43,11 @@ use consensus::Pipeline;
 use consensus::client_table::{CachedReply, ClientTableWireError};
 use consensus::{
     AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus,
-    LocalRequestOrder, PartitionDiagEvent, PipelineEntry, PlaneKind, Project, ReplicaLogContext,
-    RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
-    build_deny_reply_from_request, build_reply_from_request, build_reply_message,
-    emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
-    fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
+    DvcHeaderKind, LocalRequestOrder, PartitionDiagEvent, PipelineEntry, PlaneKind, Project,
+    ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
+    ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
+    build_reply_message, dvc_header_kind, emit_namespace_progress_event, emit_partition_diag,
+    emit_sim_event, fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
     replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
@@ -11643,7 +11643,10 @@ where
                 pending
                     .headers
                     .iter()
-                    .find(|expected| expected.op == header.op)
+                    .find(|expected| {
+                        expected.op == header.op
+                            && dvc_header_kind(expected) != DvcHeaderKind::Blank
+                    })
                     .map(|expected| expected.checksum)
             })
             .flatten();

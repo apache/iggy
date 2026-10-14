@@ -998,6 +998,7 @@ mod tests {
                 .send_request_prepares(
                     consensus.cluster(),
                     consensus.replica(),
+                    consensus.view(),
                     PEER,
                     1,
                     1,
@@ -4335,6 +4336,24 @@ mod tests {
                     );
                 owner.on_repair_prepare(repaired).await;
             }
+            let before = partition.consensus().commit_min();
+            for command in [Command::RangeEvicted, Command::RepairDone] {
+                let foreign_reply = reply.clone().transmute_header(
+                    |header, foreign: &mut RepairRangeReplyHeader| {
+                        *foreign = header;
+                        foreign.command = command;
+                        foreign.replica = REPAIR_PRIMARY;
+                        foreign.seal();
+                    },
+                );
+                owner.on_repair_range_reply(&foreign_reply).await;
+                assert_eq!(partition.consensus().commit_min(), before);
+                assert_eq!(partition.repair.unwrap().floor, None);
+                assert!(
+                    requests.borrow().is_empty(),
+                    "a different peer cannot complete or advance this repair session"
+                );
+            }
             owner.on_repair_range_reply(&reply).await;
         }
         assert!(requests.borrow().is_empty());
@@ -4697,6 +4716,134 @@ mod tests {
             sent.borrow().is_empty(),
             "unproven entries must not reach a peer"
         );
+    }
+
+    #[compio::test]
+    async fn given_abandoned_prepares_when_a_backup_requests_repair_should_serve_only_committed_ops()
+     {
+        const REPLICAS: u8 = 5;
+        const DONOR: u8 = 3;
+        const BACKUP: u8 = 4;
+        const NEXT_VIEW: u32 = 2;
+        const NEXT_PRIMARY: u8 = 2;
+        const COMMITTED: u64 = 2;
+        const HEAD: u64 = 3;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RepairPrepare {
+                let prepare = Message::<iggy_binary_protocol::RepairPrepareHeader>::try_from(
+                    Owned::copy_from_slice(frame.as_slice()),
+                )
+                .unwrap();
+                captured.borrow_mut().push(prepare.header().0);
+            }
+            Ok(())
+        }));
+        for requester in [BACKUP, NEXT_PRIMARY] {
+            assert!(bus.owner_table().try_claim(requester, 1));
+        }
+        let (owner, _sender) = test_owner(&bus, None);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let prepares = primary_prepares(&bus, namespace, HEAD).await;
+        let mut donor = repairing_replica(&bus, namespace, (DONOR, REPLICAS), REPAIR_PRIMARY, 0, 0);
+        donor.repair = None;
+        for prepare in prepares {
+            donor.on_replicate(prepare).await;
+        }
+        donor.consensus().advance_commit_max(COMMITTED);
+        donor
+            .commit_journal(owner.plane.partitions().config())
+            .await;
+        let change =
+            view_control_message(namespace, Command::StartViewChange, NEXT_VIEW, NEXT_PRIMARY);
+        let MessageBag::StartViewChange(change) = change else {
+            unreachable!()
+        };
+        donor
+            .consensus()
+            .handle_start_view_change(consensus::PlaneKind::Partitions, change.header());
+        assert_eq!(donor.consensus().status(), consensus::Status::ViewChange);
+        owner.plane.partitions().remove(&namespace).unwrap();
+        owner.plane.partitions().insert(namespace, donor);
+
+        for (requester, view, through) in [
+            (BACKUP, NEXT_VIEW, COMMITTED),
+            (NEXT_PRIMARY, NEXT_VIEW, HEAD),
+            (NEXT_PRIMARY, REPAIR_VIEW, COMMITTED),
+        ] {
+            let request = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
+                .transmute_header(|_, header: &mut RequestPreparesHeader| {
+                    header.command = Command::RequestPrepares;
+                    header.cluster = 1;
+                    header.group = namespace.inner();
+                    header.replica = requester;
+                    header.view = view;
+                    header.from_op = 1;
+                    header.to_op = HEAD;
+                    header.size = u32::try_from(size_of::<RequestPreparesHeader>()).unwrap();
+                    header.seal();
+                });
+            sent.borrow_mut().clear();
+            owner.on_request_prepares(&request).await;
+            let served: Vec<_> = sent.borrow().iter().map(|header| header.op).collect();
+            assert_eq!(
+                served,
+                (1..=through).collect::<Vec<_>>(),
+                "requester {requester} in view {view}"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_blank_start_view_head_when_repair_arrives_should_preserve_and_prove_history() {
+        const HEAD: u64 = 1;
+        const NEW_VIEW: u32 = 3;
+        for held in [false, true] {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let (owner, _sender) = test_owner(&bus, None);
+            let namespace = IggyNamespace::new(0, 0, 0);
+            let prepares = primary_prepares(&bus, namespace, HEAD).await;
+            let prepare = prepares.into_iter().next().unwrap();
+            let mut partition =
+                repairing_replica(&bus, namespace, (REPAIR_BACKUP, 3), REPAIR_PRIMARY, 0, 0);
+            partition.repair = None;
+            if held {
+                partition.on_replicate(prepare.clone()).await;
+            }
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, partition);
+            owner
+                .on_start_view(start_view_suffix(
+                    namespace,
+                    NEW_VIEW,
+                    HEAD,
+                    HEAD,
+                    &[consensus::dvc_blank(HEAD)],
+                ))
+                .await;
+            let partition = owner.plane.partitions().get_by_ns(&namespace).unwrap();
+            assert!(partition.consensus().view_log_unproven());
+            assert!(!partition.view_truncation_pending());
+            assert_eq!(partition.log.journal().inner.holds_op(HEAD), held);
+            let repaired = prepare.transmute_header(
+                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                    repaired.0 = header;
+                    repaired.0.command = Command::RepairPrepare;
+                },
+            );
+            owner.on_repair_prepare(repaired).await;
+            let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+            assert!(!partition.consensus().view_log_unproven());
+            partition
+                .commit_journal(owner.plane.partitions().config())
+                .await;
+            assert_eq!(partition.consensus().commit_min(), HEAD);
+        }
     }
 
     fn start_view_suffix(
