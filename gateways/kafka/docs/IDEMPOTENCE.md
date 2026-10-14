@@ -51,12 +51,9 @@ Kafka producer id therefore needs one bound session per producer.
 The request id is different. The transmute copies the header and replaces only `group`, `client`,
 `session` and `user_id`, so a caller-supplied request id survives to the `ClientTable`.
 
-One session per producer is a connection pool keyed by producer id. That is the pool the
-README's "Concurrency ceiling" section already owes before
-[#3535](https://github.com/apache/iggy/issues/3535) and
-[#3536](https://github.com/apache/iggy/issues/3536).
-
-Two SDK seams are missing for it:
+One session per producer is a connection pool keyed by producer id. The gateway has that pool, for
+throughput: see the README's "Concurrency ceiling". Retries are still not deduplicated, because two
+SDK seams are missing:
 
 - a caller-chosen client id at build time. `ConsensusSession::with_client_id` is public, but both
   construction sites build with `ConsensusSession::new()`
@@ -103,11 +100,11 @@ refused with `RequestTooOld`.
 
 ## Decision
 
-Allocate only, and defer the pool.
+Allocate only, and defer deduplication.
 
-Rejecting the stock producer to avoid the pool trades away the one requirement the maintainers
+Rejecting the stock producer to avoid that work trades away the one requirement the maintainers
 named. It buys a guarantee nobody is asking for yet. Allocating costs about a day, leaves
-delivery where it already is, and blocks nothing the pool later needs.
+delivery where it already is, and blocks nothing deduplication later needs.
 
 ## Behavior
 
@@ -130,7 +127,7 @@ a birthday collision, not a remote one.
 The id is a pool key, not a dedup identity. Under the design above, the dedup identity is the
 session's own random client id, minted at register. The producer id only decides which connection
 serves a producer. Kafka still requires it to be unique across the cluster, which is what the
-instance number buys. It also has to stay unique across a restart once the pool lands or
+instance number buys. It also has to stay unique across a restart once dedup lands or
 Produce persists, because `producer_epoch` is always 0, so a replayed id is a replayed
 `(producer_id, producer_epoch)` pair a live producer may still hold. The counter therefore starts
 at the wall clock in milliseconds rather than at 0. A restarted gateway starts above every id its
@@ -139,11 +136,13 @@ uptime, or the clock stepped back across the restart. A clock that reads before 
 seeds 0 and replays from the bottom. 2^47 milliseconds leaves the counter space thousands of years
 from running out.
 
-Nothing is persisted for this, so the clock seed narrows the replay window without closing it. That
-is harmless while no code path reads the producer id. It stops being harmless once one does:
-[#3535](https://github.com/apache/iggy/issues/3535) must first either persist a high-water mark
-and seed the counter above it, or bump `producer_epoch` on every gateway start. Either one makes a
-replayed `(producer_id, producer_epoch)` pair impossible rather than unlikely.
+Nothing is persisted for this, so the clock seed narrows the replay window without closing it.
+Produce reads the id as a pool key, and only an id this run handed out: any other id keys by
+connection. A replayed pair therefore makes two producers of one user share a session and send one
+at a time, and nothing more. It stops being harmless once deduplication reads the id. That work
+must first either persist a high-water mark and seed the counter above it, or bump
+`producer_epoch` on every gateway start. Either one makes a replayed
+`(producer_id, producer_epoch)` pair impossible rather than unlikely.
 
 `IGGY_KAFKA_INSTANCE_ID` defaults to 0 so a single gateway needs no configuration. Two gateways
 left on the default draw from the same 47-bit space and can hand out identical ids, on the first
@@ -179,14 +178,15 @@ for consumer groups and has to refuse a `TXN`-type coordinator lookup explicitly
 
 Produce:
 
-- accept `producer_id`, `producer_epoch` and `base_sequence` on the request and ignore them
+- accept `producer_id`, `producer_epoch` and `base_sequence` on the request. The id picks the
+  producer's session when this run handed it out. The epoch and the sequence are ignored
 - never answer `OUT_OF_ORDER_SEQUENCE_NUMBER` (45) or `DUPLICATE_SEQUENCE_NUMBER` (46)
 - reject a non-empty `transactional_id` (v3+) with `UNSUPPORTED_VERSION` (35), at the partition
   level, keeping the connection open. Under `acks=0` there is no response to carry 35, so the
   gateway closes the connection instead, as a Kafka broker does on any `acks=0` produce error.
   The check runs before the `acks=0` branch, so no write path can see a transactional batch
 
-Those first two codes stay unsent even once the pool lands. The watermark accepts any request
+Those first two codes stay unsent even once dedup lands. The watermark accepts any request
 above it without noticing a gap, so a gap cannot be told apart from ordinary traffic. Sending
 either code claims a detection the gateway does not have.
 
@@ -235,8 +235,7 @@ A producer that holds an id believes its retries are deduplicated. They are not.
 network timeout writes the record twice, and both copies reach the stream with their own offsets.
 
 Iggy's own deduplication does not help, because it guards the other hop. Delivery through the
-gateway is at-least-once until the pool lands, and at-least-once across a gateway restart after
-that.
+gateway is at-least-once until dedup lands, and at-least-once across a gateway restart after that.
 
 The README states that limitation under "Delivery guarantees", so a user does not have to infer
 it from the presence of key 22.

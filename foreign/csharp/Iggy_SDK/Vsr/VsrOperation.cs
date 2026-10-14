@@ -98,7 +98,7 @@ internal static class VsrOperations
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,
         CommandCodes.GET_POLL_ROUTING_CODE,
-        CommandCodes.GET_SEND_CONTEXT_CODE,
+        CommandCodes.GET_PARTITION_ROUTE_CODE,
         CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE
     ];
 

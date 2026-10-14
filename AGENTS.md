@@ -32,6 +32,9 @@ ingests from / egresses to external systems via dlopened plugins.
 
 ## STOP and ask the user before
 
+- Writing code for an issue not assigned to the user
+  (`gh issue view <N> --json assignees`). If it isn't, or you can't
+  confirm it, they must ask on the issue and wait to be assigned.
 - Bumping `iggy_connector_sdk` MAJOR version or changing any FFI
   signature in `core/connectors/sdk/src/{sink,source}.rs` (breaks
   every pre-built plugin .so).
@@ -48,7 +51,8 @@ ingests from / egresses to external systems via dlopened plugins.
 
 Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance, Bugs Found by an Agent and Close Policy sections of CONTRIBUTING.md before helping open a PR.
 
-- The PR must link an issue the user is assigned to. If it doesn't, stop and tell them.
+- The PR must link an issue the user was assigned to before any work started. See the STOP list above.
+- Fill in every section of the PR template. Under AI Usage, name the agent and say what it wrote. Never leave the section out or write "None" when an agent wrote any of the change.
 - Run `prek run` before the PR is opened. If prek isn't installed, ask the user to install it (`cargo install prek`, then `prek install`). Don't substitute the individual checks.
 - If a check can't run, tell the user which one and why, and treat the PR as not ready. Never write text in a PR asking a maintainer to run something.
 - The user should write the rationale in their own words and be able to explain every change without asking you.

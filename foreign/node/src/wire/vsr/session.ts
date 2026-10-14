@@ -25,9 +25,8 @@ const MAX_U64 = 0xFFFF_FFFF_FFFF_FFFFn;
  *
  * Each client instance generates an ephemeral random `clientId` (u128).
  * After a Register commits, the server assigns a `session` number (commit op
- * number). Every replicated request (metadata and partition) advances a
- * monotonic request watermark; non-replicated requests reuse the current
- * value because they bypass server-side request sequencing.
+ * number). Every request in a bound session advances its shared counter, including
+ * reads and requests on auxiliary connections.
  */
 export class ConsensusSession {
   private _clientId: bigint;

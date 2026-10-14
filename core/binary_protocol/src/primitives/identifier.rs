@@ -130,6 +130,9 @@ pub enum WireIdentifier {
 }
 
 impl WireIdentifier {
+    /// Kind and length bytes, then the `u32` value.
+    pub(crate) const NUMERIC_ENCODED_SIZE: usize = 2 * size_of::<u8>() + NUMERIC_VALUE_LEN as usize;
+
     #[must_use]
     pub const fn numeric(id: u32) -> Self {
         Self::Numeric(id)

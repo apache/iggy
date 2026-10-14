@@ -330,7 +330,7 @@ func TestSendMessages_KeepsTheContextAfterAFailureThatIsNotARefusal(t *testing.T
 	require.ErrorIs(t, send(), ierror.ErrPartitionNotFound)
 	require.NoError(t, send())
 
-	assert.Equal(t, 1, requestCount(server.recorded(), command.GetSendContextCode),
+	assert.Equal(t, 1, requestCount(server.recorded(), command.GetPartitionRouteCode),
 		"only a refusal of the context itself drops it")
 }
 

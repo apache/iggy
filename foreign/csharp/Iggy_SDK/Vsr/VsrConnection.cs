@@ -96,7 +96,7 @@ internal sealed class VsrConnection : IDisposable
     /// </summary>
     internal async ValueTask<VsrAttempt> SendAttemptAsync(int code, ReadOnlyMemory<byte> body,
         long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
-        bool retryTransient = true, PartitionContext context = default)
+        bool retryTransient = true, PartitionContext context = default, SessionFrame? retainedFrame = null)
     {
         var encoded = false;
         var requestStarted = false;
@@ -104,7 +104,7 @@ internal sealed class VsrConnection : IDisposable
 
         try
         {
-            VsrHeader.EncodeRequestHeader(_requestFrameBuffer, _session, code, body.Span, context);
+            VsrHeader.EncodeRequestHeader(_requestFrameBuffer, _session, code, body.Span, context, retainedFrame);
 
             var frameSize = VsrHeader.HEADER_SIZE + body.Length;
             var coalesced = body.Length <= CoalescedBodyLimit;
@@ -147,12 +147,12 @@ internal sealed class VsrConnection : IDisposable
                     var verdict = uncertain && e is
                     {
                         FromServer: true,
-                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.UNAUTHORIZED or
-                            VsrError.UNAUTHENTICATED or VsrError.STALE_CLIENT or VsrError.HISTORY_UNAVAILABLE
+                        StatusCode: not VsrError.TRANSIENT_NOT_COMMITTED
                     }
                         ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
                             "A later refusal does not resolve the original request outcome.")
                         : e;
+                    verdict.CommandCode = code;
                     if (!retryTransient || !IsReplayableTransient(verdict, transientDeadline, readDeadline))
                     {
                         return VsrAttempt.Failed(encoded, verdict, requestStarted, this);

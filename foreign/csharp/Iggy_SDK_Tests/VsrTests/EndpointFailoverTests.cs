@@ -47,6 +47,9 @@ public sealed class EndpointFailoverTests
     [InlineData(VsrError.UNAUTHORIZED)]
     [InlineData(VsrError.UNAUTHENTICATED)]
     [InlineData(VsrError.STALE_CLIENT)]
+    [InlineData(VsrError.NOT_PRIMARY)]
+    [InlineData(VsrError.LIFECYCLE_BUSY)]
+    [InlineData(VsrError.FEATURE_UNAVAILABLE)]
     public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite(int refusal)
     {
         const int RefusalCount = 50;
@@ -507,8 +510,7 @@ public sealed class EndpointFailoverTests
             {
                 GET_CLUSTER_METADATA_CODE => Reply(OPERATION_NON_REPLICATED,
                     ClusterMetadata(node.Port, node.Port, node.Port)),
-                CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE => RouteReply(request, new PartitionContext(17, 0, 1),
-                    node.Port, true),
+                CommandCodes.GET_PARTITION_ROUTE_CODE => RouteReply(request, new PartitionContext(17, 0, 1), 0),
                 _ => Answer(request)
             };
         });
@@ -738,8 +740,8 @@ public sealed class EndpointFailoverTests
         var body = new List<byte>();
         WriteString(body, "test-cluster");
         body.AddRange(BitConverter.GetBytes(2u));
-        WriteNode(body, "primary", primaryPort, primaryPort == leaderPort);
-        WriteNode(body, "survivor", survivorPort, survivorPort == leaderPort);
+        WriteNode(body, "primary", primaryPort, primaryPort == leaderPort, 0);
+        WriteNode(body, "survivor", survivorPort, survivorPort == leaderPort, 1);
 
         return body.ToArray();
     }
@@ -749,9 +751,9 @@ public sealed class EndpointFailoverTests
         var body = new List<byte>();
         WriteString(body, "test-cluster");
         body.AddRange(BitConverter.GetBytes(3u));
-        WriteNode(body, "metadata-leader", firstPort, true);
-        WriteNode(body, "follower", secondPort, false);
-        WriteNode(body, "partition-primary", thirdPort, false);
+        WriteNode(body, "metadata-leader", firstPort, true, 0);
+        WriteNode(body, "follower", secondPort, false, 1);
+        WriteNode(body, "partition-primary", thirdPort, false, 2);
 
         return body.ToArray();
     }
@@ -763,14 +765,15 @@ public sealed class EndpointFailoverTests
         body.AddRange(BitConverter.GetBytes((uint)ports.Count));
         for (var index = 0; index < ports.Count; index++)
         {
-            WriteNode(body, $"node-{index}", ports[index], ports[index] == leaderPort);
+            WriteNode(body, $"node-{index}", ports[index], ports[index] == leaderPort, checked((byte)index));
         }
 
         return body.ToArray();
     }
 
-    private static void WriteNode(List<byte> body, string name, ushort port, bool leader)
+    private static void WriteNode(List<byte> body, string name, ushort port, bool leader, byte replicaId)
     {
+        body.Add(replicaId);
         WriteString(body, name);
         WriteString(body, "127.0.0.1");
         body.AddRange(BitConverter.GetBytes(port));

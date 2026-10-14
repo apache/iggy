@@ -35,12 +35,15 @@ pub struct ClusterMetadataResponse {
 ///
 /// Wire format:
 /// ```text
-/// [name_len:4 LE][name:N][ip_len:4 LE][ip:N]
+/// [replica_id:1][name_len:4 LE][name:N][ip_len:4 LE][ip:N]
 /// [tcp:2 LE][quic:2 LE][http:2 LE][websocket:2 LE]
 /// [role:1][status:1]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterNodeResponse {
+    /// The node's configured VSR replica id. Clients key nodes by it: the
+    /// position in the node list is not an id.
+    pub replica_id: u8,
     pub name: String,
     pub ip: String,
     pub tcp_port: u16,
@@ -51,7 +54,8 @@ pub struct ClusterNodeResponse {
     pub status: u8,
 }
 
-const NODE_FIXED_SIZE: usize = 4 + 4 + 8 + 1 + 1; // name_len + ip_len + ports + role + status
+// replica_id + name_len + ip_len + ports + role + status
+const NODE_FIXED_SIZE: usize = 1 + 4 + 4 + 8 + 1 + 1;
 
 impl WireEncode for ClusterNodeResponse {
     fn encoded_size(&self) -> usize {
@@ -60,6 +64,7 @@ impl WireEncode for ClusterNodeResponse {
 
     #[allow(clippy::cast_possible_truncation)]
     fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.replica_id);
         buf.put_u32_le(self.name.len() as u32);
         buf.put_slice(self.name.as_bytes());
         buf.put_u32_le(self.ip.len() as u32);
@@ -75,9 +80,12 @@ impl WireEncode for ClusterNodeResponse {
 
 impl WireDecode for ClusterNodeResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let name_len = read_u32_le(buf, 0)? as usize;
-        let name = read_str(buf, 4, name_len)?;
-        let pos = 4 + name_len;
+        let replica_id = read_u8(buf, 0)?;
+        let pos = 1;
+
+        let name_len = read_u32_le(buf, pos)? as usize;
+        let name = read_str(buf, pos + 4, name_len)?;
+        let pos = pos + 4 + name_len;
 
         let ip_len = read_u32_le(buf, pos)? as usize;
         let ip = read_str(buf, pos + 4, ip_len)?;
@@ -92,6 +100,7 @@ impl WireDecode for ClusterNodeResponse {
 
         Ok((
             Self {
+                replica_id,
                 name,
                 ip,
                 tcp_port,
@@ -157,8 +166,9 @@ impl WireDecode for ClusterMetadataResponse {
 mod tests {
     use super::*;
 
-    fn sample_node(name: &str, ip: &str) -> ClusterNodeResponse {
+    fn sample_node(replica_id: u8, name: &str, ip: &str) -> ClusterNodeResponse {
         ClusterNodeResponse {
+            replica_id,
             name: name.to_string(),
             ip: ip.to_string(),
             tcp_port: 8090,
@@ -172,11 +182,24 @@ mod tests {
 
     #[test]
     fn node_roundtrip() {
-        let node = sample_node("node-1", "192.168.1.1");
+        let node = sample_node(7, "node-1", "192.168.1.1");
         let bytes = node.to_bytes();
+        assert_eq!(bytes.len(), node.encoded_size());
+        assert_eq!(bytes[0], 7, "a node must start with its replica id");
         let (decoded, consumed) = ClusterNodeResponse::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, node);
+    }
+
+    #[test]
+    fn truncated_node_returns_error() {
+        let bytes = sample_node(2, "n", "1.2.3.4").to_bytes();
+        for end in 0..bytes.len() {
+            assert!(
+                ClusterNodeResponse::decode(&bytes[..end]).is_err(),
+                "expected error for node truncation at byte {end}"
+            );
+        }
     }
 
     #[test]
@@ -196,9 +219,9 @@ mod tests {
         let resp = ClusterMetadataResponse {
             name: "prod-cluster".to_string(),
             nodes: vec![
-                sample_node("node-1", "10.0.0.1"),
-                sample_node("node-2", "10.0.0.2"),
-                sample_node("node-3", "10.0.0.3"),
+                sample_node(0, "node-1", "10.0.0.1"),
+                sample_node(1, "node-2", "10.0.0.2"),
+                sample_node(2, "node-3", "10.0.0.3"),
             ],
         };
         let bytes = resp.to_bytes();
@@ -211,7 +234,7 @@ mod tests {
     fn truncated_returns_error() {
         let resp = ClusterMetadataResponse {
             name: "c".to_string(),
-            nodes: vec![sample_node("n", "1.2.3.4")],
+            nodes: vec![sample_node(0, "n", "1.2.3.4")],
         };
         let bytes = resp.to_bytes();
         for i in 0..bytes.len() {
