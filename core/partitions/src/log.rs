@@ -112,8 +112,11 @@ where
         self.inner.drain(ops)
     }
 
-    fn truncate_from(&self, from_op: u64) -> impl Future<Output = std::io::Result<usize>> {
-        self.inner.truncate_from(from_op)
+    fn remove_range(
+        &self,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> impl Future<Output = std::io::Result<usize>> {
+        self.inner.remove_range(ops)
     }
 
     fn last_op(&self) -> Option<u64> {

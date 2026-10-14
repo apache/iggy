@@ -23,6 +23,7 @@ use crate::{DiagnosticEvent, IggyError};
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use std::fmt::Debug;
+use std::time::Instant;
 
 /// The client trait which is the main interface to the Iggy server.
 /// It consists of multiple modules, each of which is responsible for a specific set of commands.
@@ -67,5 +68,43 @@ pub trait Client:
     async fn shutdown(&self) -> Result<(), IggyError>;
 
     /// Subscribe to diagnostic events.
+    ///
+    /// The event channel is bounded. When it is full, the client drops the
+    /// oldest event, so publishing never waits for a subscriber. A subscriber
+    /// that falls behind loses old events, not the newest ones.
+    ///
+    /// After a loss, the next `recv()` returns `RecvError::Overflowed` with the
+    /// number of lost events, and the calls after it return the events that are
+    /// left. Thus, after `Overflowed`, call `recv()` again, or read the receiver
+    /// with `StreamExt::next()`, which skips that error.
+    ///
+    /// HTTP keeps no connection, so it publishes no events.
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent>;
+
+    /// Replays the retained operation `op` until it commits or `deadline`
+    /// passes. `op` is the request id that `OperationUncertain` or
+    /// `LaneBlocked` carries.
+    ///
+    /// `Ok(())` means that the operation committed exactly once. After
+    /// `OperationUncertain(op)` the outcome is still unknown, and the
+    /// operation stays retained. An operation that is not retained gives
+    /// `OperationNotRetained(op)`. A client that retains no operations
+    /// returns `FeatureUnavailable`.
+    ///
+    /// A session reset drops retained operations without settling them.
+    /// `OperationNotRetained(op)` after a reset means the outcome is still
+    /// unknown and can no longer be recovered through this client.
+    #[doc(hidden)]
+    async fn resolve_operation(&self, _op: u64, _deadline: Instant) -> Result<(), IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
+
+    /// Frees the lane that the retained operation `op` blocks, and the outcome
+    /// of `op` stays unknown. An operation that is not retained gives
+    /// `OperationNotRetained(op)`. A client that retains no operations
+    /// returns `FeatureUnavailable`.
+    #[doc(hidden)]
+    async fn abandon_operation(&self, _op: u64) -> Result<(), IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }

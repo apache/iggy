@@ -78,6 +78,7 @@ mod tests {
             },
             context: PartitionContext::default(),
             primary: ClusterNodeResponse {
+                replica_id: 2,
                 name: "node-1".to_owned(),
                 ip: "::1".to_owned(),
                 tcp_port: 8090,

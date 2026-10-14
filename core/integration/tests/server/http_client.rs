@@ -40,6 +40,8 @@ pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const LOGIN_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+const APPLIED_OP_HEADER: &str = "iggy-applied-op";
+
 /// One authenticated HTTP session against the test server's shard-0 listener: a
 /// `reqwest` client, the listener base URL, and the bearer to send. The bearer
 /// is either a login JWT or a raw personal access token (the server resolves
@@ -268,4 +270,19 @@ pub async fn access_token(response: Response) -> String {
         .access_token
         .expect("login must return an access token")
         .token
+}
+
+/// The serving node's applied metadata op, as stamped on every authenticated
+/// success. A response without it is a contract violation, not an absence: the
+/// relay records this value as the caller's read-your-writes floor, so a
+/// missing header would silently reopen the stale read it exists to close.
+pub fn applied_op(response: &Response) -> u64 {
+    response
+        .headers()
+        .get(APPLIED_OP_HEADER)
+        .expect("every authenticated success carries iggy-applied-op")
+        .to_str()
+        .expect("iggy-applied-op must be ASCII")
+        .parse()
+        .expect("iggy-applied-op must be an op number")
 }

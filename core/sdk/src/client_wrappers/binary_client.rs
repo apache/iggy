@@ -20,6 +20,7 @@ use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::{DiagnosticEvent, IggyError};
+use std::time::Instant;
 
 #[async_trait]
 impl Client for ClientWrapper {
@@ -62,6 +63,26 @@ impl Client for ClientWrapper {
             ClientWrapper::Tcp(client) => client.subscribe_events().await,
             ClientWrapper::Quic(client) => client.subscribe_events().await,
             ClientWrapper::WebSocket(client) => client.subscribe_events().await,
+        }
+    }
+
+    async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
+        match self {
+            ClientWrapper::Iggy(client) => client.resolve_operation(op, deadline).await,
+            ClientWrapper::Http(client) => client.resolve_operation(op, deadline).await,
+            ClientWrapper::Tcp(client) => client.resolve_operation(op, deadline).await,
+            ClientWrapper::Quic(client) => client.resolve_operation(op, deadline).await,
+            ClientWrapper::WebSocket(client) => client.resolve_operation(op, deadline).await,
+        }
+    }
+
+    async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
+        match self {
+            ClientWrapper::Iggy(client) => client.abandon_operation(op).await,
+            ClientWrapper::Http(client) => client.abandon_operation(op).await,
+            ClientWrapper::Tcp(client) => client.abandon_operation(op).await,
+            ClientWrapper::Quic(client) => client.abandon_operation(op).await,
+            ClientWrapper::WebSocket(client) => client.abandon_operation(op).await,
         }
     }
 }

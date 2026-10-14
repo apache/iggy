@@ -21,6 +21,7 @@ use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, JoinConsumerGroupRequest,
+    LeaveConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -147,7 +148,6 @@ impl SimClient {
             header.partition_incarnation = context.incarnation;
             header.owner_generation = context.owner_generation;
             header.minimum_metadata_op = context.metadata_op;
-            header.metadata_watermark = context.metadata_op;
         }
     }
 
@@ -181,16 +181,17 @@ impl SimClient {
     /// nothing, because `ClientTable` admits anything above the watermark
     /// (`client_table.rs`: "There is no `RequestGap`").
     ///
-    /// `NonReplicated` reads never reach here — the poll path builds its own
-    /// header and reads the counter without advancing it, matching the SDK,
-    /// since the server ignores the id for ops the table never sees.
+    /// `NonReplicated` reads never reach here. The poll path builds its own
+    /// header and reads the counter without advancing it, because the server
+    /// ignores the id for ops the table never sees. The SDK spends one id per
+    /// bound read, so a link can match each reply to its request.
     fn next_request_id(&self) -> u64 {
         let next = self.request_counter.get() + 1;
         self.request_counter.set(next);
         next
     }
 
-    fn session_id(&self) -> u64 {
+    pub(crate) fn session_id(&self) -> u64 {
         let s = self.session.get();
         assert!(
             s > 0,
@@ -488,6 +489,22 @@ impl SimClient {
             group_id: WireIdentifier::named(group).expect("group name must be valid"),
         };
         self.build_request(Operation::JoinConsumerGroup, &wire.to_bytes())
+    }
+
+    /// # Panics
+    /// Panics if any identifier is not a valid name.
+    pub fn leave_consumer_group(
+        &self,
+        stream: &str,
+        topic: &str,
+        group: &str,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = LeaveConsumerGroupRequest {
+            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            group_id: WireIdentifier::named(group).expect("group name must be valid"),
+        };
+        self.build_request(Operation::LeaveConsumerGroup, &wire.to_bytes())
     }
 
     /// # Panics

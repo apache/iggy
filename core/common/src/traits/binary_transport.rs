@@ -45,7 +45,7 @@ pub trait BinaryTransport {
     ///
     /// Partition commands carry the partition context the typed API would send:
     /// - `SendMessages` with an explicit partition id uses the cached send
-    ///   context, or captures one with `GetSendContext`. After a
+    ///   context, or captures one from `GetPartitionRoute`. After a
     ///   `HistoryUnavailable` refusal the topic's cached contexts are dropped and
     ///   one fresh capture is tried. `Balanced` and `MessagesKey` partitioning
     ///   fail with [`IggyError::FeatureUnavailable`] before anything is sent:
@@ -142,20 +142,13 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
         identity: SessionIdentity,
         response: &[u8],
     ) -> Result<LoginRegisterResponse, IggyError> {
-        let bound =
-            LoginRegisterResponse::decode_from(response).map_err(|_| IggyError::InvalidFormat)?;
-        if bound.session == 0 {
-            return Err(IggyError::InvalidSession(bound.session));
-        }
-        if identity.session != 0 && bound.session != identity.session {
-            return Err(IggyError::SessionMismatch(identity.session, bound.session));
-        }
-        Ok(bound)
+        decode_session_binding(&identity, response)
     }
     async fn resume_vsr_session(&self) -> Result<(), IggyError>
     where
         Self: Sync,
     {
+        let fence = self.session_fence();
         let identity = self.session_identity().await?;
         let request = BindSessionRequest {
             version_info: crate::rust_sdk_version_info(self.sdk_version())?,
@@ -169,12 +162,26 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
             )
             .await?;
         let bound = self.decode_session_binding(identity, &response)?;
-        self.bind_vsr_session(bound.session).await?;
+        self.bind_vsr_session_at(fence, bound.session).await?;
         self.set_state(ClientState::Authenticated).await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
         Ok(())
     }
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
+    /// The fence of the current session. A sign-in reads it before it reads
+    /// the session it signs in for, and binds its reply with
+    /// [`Self::bind_vsr_session_at`].
+    #[doc(hidden)]
+    fn session_fence(&self) -> u64 {
+        0
+    }
+    /// [`Self::bind_vsr_session`], but only while the session fence is still
+    /// `fence`. A reply that arrives after a reset, such as the reset of an
+    /// explicit disconnect, must not bind the session that replaced it.
+    #[doc(hidden)]
+    async fn bind_vsr_session_at(&self, _fence: u64, session: u64) -> Result<(), IggyError> {
+        self.bind_vsr_session(session).await
+    }
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
     /// Keep the credentials a sign-in succeeded with, so a transport that
     /// loses its connection can re-establish the session -- on this node or,
@@ -206,21 +213,40 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
 
 pub use vsr_session_sealed::Sealed as VsrSessionSealed;
 
+/// Decodes the reply to a session bind. The reply must name the session that
+/// `identity` asked for.
+#[doc(hidden)]
+pub fn decode_session_binding(
+    identity: &SessionIdentity,
+    response: &[u8],
+) -> Result<LoginRegisterResponse, IggyError> {
+    let bound =
+        LoginRegisterResponse::decode_from(response).map_err(|_| IggyError::InvalidFormat)?;
+    if bound.session == 0 {
+        return Err(IggyError::InvalidSession(bound.session));
+    }
+    if identity.session != 0 && bound.session != identity.session {
+        return Err(IggyError::SessionMismatch(identity.session, bound.session));
+    }
+    Ok(bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ConsumerGroupClientState;
     use bytes::BytesMut;
     use iggy_binary_protocol::codes::{
-        GET_CONSUMER_OFFSET_ROUTING_CODE, GET_POLL_ROUTING_CODE, GET_SEND_CONTEXT_CODE, PING_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE,
+        GET_CONSUMER_OFFSET_ROUTING_CODE, GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE,
+        PING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
     };
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
     use iggy_binary_protocol::requests::messages::{
-        GetSendContextRequest, RawMessage, SendMessagesEncoder,
+        GetPartitionRouteRequest, RawMessage, SendMessagesEncoder,
     };
+    use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
     use iggy_binary_protocol::{
         AckLevel, WireConsumer, WireIdentifier, WirePartitioning, WirePollingStrategy,
     };
@@ -277,8 +303,15 @@ mod tests {
             context: PartitionContext,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Raw(code, payload, context));
-            if code == GET_SEND_CONTEXT_CODE {
-                return Ok(CAPTURED.to_bytes());
+            if code == GET_PARTITION_ROUTE_CODE {
+                return Ok(PartitionRouteResponse {
+                    incarnation: CAPTURED.incarnation,
+                    metadata_op: CAPTURED.metadata_op,
+                    view: 0,
+                    partitions_count: PARTITION + 1,
+                    primary_replica: 0,
+                }
+                .to_bytes());
             }
             Ok(Bytes::from_static(RECEIPT))
         }
@@ -349,7 +382,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response, Bytes::from_static(RECEIPT));
         }
-        let capture = GetSendContextRequest {
+        let capture = GetPartitionRouteRequest {
             stream_id: WireIdentifier::numeric(STREAM),
             topic_id: wire_topic(),
             partition_id: PARTITION,
@@ -358,7 +391,7 @@ mod tests {
             transport.take_calls(),
             vec![
                 Call::Raw(
-                    GET_SEND_CONTEXT_CODE,
+                    GET_PARTITION_ROUTE_CODE,
                     capture.to_bytes(),
                     PartitionContext::default()
                 ),
@@ -454,7 +487,7 @@ mod tests {
         let payload = Bytes::from_static(b"opaque");
         for code in [
             PING_CODE,
-            GET_SEND_CONTEXT_CODE,
+            GET_PARTITION_ROUTE_CODE,
             GET_POLL_ROUTING_CODE,
             POLL_MESSAGES_ON_PRIMARY_CODE,
             GET_CONSUMER_OFFSET_ROUTING_CODE,
