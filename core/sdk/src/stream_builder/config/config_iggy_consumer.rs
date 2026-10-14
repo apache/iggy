@@ -41,14 +41,17 @@ const DEFAULT_PARTITION_ID: u32 = 0;
 /// | [`new()`](Self::new) | every field, positional |
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
-/// The builder requires every field that is not an [`Option`], so
-/// [`init_retries()`](Self::init_retries), [`encryptor()`](Self::encryptor) and [`partition_id()`](Self::partition_id)
-/// are the only three it lets you leave out.
+/// The builder requires every field that is not an [`Option`] and carries no
+/// `#[builder(default)]`, so [`init_retries()`](Self::init_retries),
+/// [`encryptor()`](Self::encryptor) and [`partition_id()`](Self::partition_id) are the only three
+/// it lets you leave out. [`partition_id()`](Self::partition_id) is the one field the builder
+/// itself defaults, to 0.
 ///
 /// # Fields and defaults
 ///
 /// The defaults below are what [`default()`](Self::default) and
-/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder has no defaults.
+/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder leaves every field but
+/// [`partition_id()`](Self::partition_id) unset, so it takes the same default there too.
 ///
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
@@ -419,11 +422,6 @@ impl IggyConsumerConfig {
     }
 
     /// Returns how many partitions a topic created by the build gets.
-    ///
-    /// For [`ConsumerKind::Consumer`] this is also the ID of the single partition that the
-    /// consumer reads.
-    ///
-    /// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
     pub fn partitions_count(&self) -> u32 {
         self.partitions_count
     }

@@ -55,7 +55,8 @@ use tracing::trace;
 /// | [`stream_name()`], [`topic_name()`] | what is read |
 /// | [`consumer_name()`] | the name of the consumer, or of the group for [`ConsumerKind::ConsumerGroup`] |
 /// | [`consumer_kind()`] | whether the consumer joins a group or reads one partition alone |
-/// | [`partitions_count()`] | two things, see below |
+/// | [`partitions_count()`] | the partition count of a topic that this call creates |
+/// | [`partition_id()`], [`with_partition_id()`] | for [`ConsumerKind::Consumer`], the ID of the single partition the consumer reads |
 /// | [`batch_length()`] | messages fetched per request |
 /// | [`polling_interval()`], [`polling_strategy()`] | how often reading happens, and where it starts |
 /// | [`auto_commit()`] | when offsets are committed |
@@ -63,10 +64,9 @@ use tracing::trace;
 /// | [`init_retries()`], [`init_interval()`] | retries for a missing stream or topic |
 /// | [`encryptor()`] | decrypting payloads and user headers, and it replaces the client's own |
 ///
-/// [`partitions_count()`] carries two meanings. It is the partition count of a topic that this
-/// call creates. For [`ConsumerKind::Consumer`] it is also the ID of the single partition the
-/// consumer reads, so a standalone consumer of a topic with three partitions reads partition 3 and
-/// nothing else. Run one consumer per partition to cover such a topic, or use
+/// [`partition_id()`] picks the single partition that a [`ConsumerKind::Consumer`] reads, and it
+/// defaults to 0. Set it through [`with_partition_id()`] when the topic has more than one
+/// partition. Run one consumer per partition to cover such a topic, or use
 /// [`ConsumerKind::ConsumerGroup`] and let the server divide the partitions.
 ///
 /// A consumer built here always creates its group when the group is missing, and always joins it.
@@ -209,12 +209,14 @@ use tracing::trace;
 /// [`encryptor()`]: crate::prelude::IggyConsumerConfig::encryptor
 /// [`init_interval()`]: crate::prelude::IggyConsumerConfig::init_interval
 /// [`init_retries()`]: crate::prelude::IggyConsumerConfig::init_retries
+/// [`partition_id()`]: crate::prelude::IggyConsumerConfig::partition_id
 /// [`partitions_count()`]: crate::prelude::IggyConsumerConfig::partitions_count
 /// [`polling_interval()`]: crate::prelude::IggyConsumerConfig::polling_interval
 /// [`polling_retry_interval()`]: crate::prelude::IggyConsumerConfig::polling_retry_interval
 /// [`polling_strategy()`]: crate::prelude::IggyConsumerConfig::polling_strategy
 /// [`stream_name()`]: crate::prelude::IggyConsumerConfig::stream_name
 /// [`topic_name()`]: crate::prelude::IggyConsumerConfig::topic_name
+/// [`with_partition_id()`]: crate::prelude::IggyConsumerConfig::with_partition_id
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct IggyStreamConsumer;
 

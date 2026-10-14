@@ -37,21 +37,24 @@ use std::sync::Arc;
 /// | [`new()`](Self::new) | every field, positional |
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
-/// The builder requires every field that is not an [`Option`], so it requires
-/// [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name),
-/// [`topic_partitions_count()`](Self::topic_partitions_count),
+/// The builder requires every field that is not an [`Option`] and carries no
+/// `#[builder(default)]`, so it requires [`stream_name()`](Self::stream_name),
+/// [`topic_name()`](Self::topic_name), [`topic_partitions_count()`](Self::topic_partitions_count),
 /// [`batch_length()`](Self::batch_length), [`linger_time()`](Self::linger_time) and
-/// [`partitioning()`](Self::partitioning).
+/// [`partitioning()`](Self::partitioning). [`topic_durability()`](Self::topic_durability) is the
+/// one field the builder itself defaults.
 ///
 /// # Fields and defaults
 ///
 /// The defaults below are what [`default()`](Self::default) and
-/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder has no defaults.
+/// [`from_stream_topic()`](Self::from_stream_topic) set. The builder leaves every field but
+/// [`topic_durability()`](Self::topic_durability) unset, so it takes the same default there too.
 ///
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
 /// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | where messages are appended |
 /// | [`topic_partitions_count()`](Self::topic_partitions_count) | 1 | partitions of a topic the build creates |
+/// | [`topic_durability()`](Self::topic_durability) | [`Durability::Replicated`] | durability of a topic the build creates |
 /// | [`batch_length()`](Self::batch_length) | 100 | messages per request |
 /// | [`linger_time()`](Self::linger_time) | 5 milliseconds | smallest gap between two send calls |
 /// | [`partitioning()`](Self::partitioning) | [`Partitioning::balanced()`] | which partition a batch lands in |
@@ -108,6 +111,7 @@ use std::sync::Arc;
 /// # }
 /// ```
 ///
+/// [`Durability::Replicated`]: crate::prelude::Durability::Replicated
 /// [`IggyClient`]: crate::prelude::IggyClient
 /// [`IggyStream`]: crate::prelude::IggyStream
 /// [`IggyStreamProducer`]: crate::prelude::IggyStreamProducer
@@ -157,7 +161,7 @@ impl Default for IggyProducerConfig {
 }
 
 impl IggyProducerConfig {
-    /// Return a new instance of a `IggyConsumerConfig`.
+    /// Return a new instance of a `IggyProducerConfig`.
     ///
     /// # Examples
     ///

@@ -36,9 +36,9 @@ use bon::Builder;
 ///
 /// The two halves carry their own stream and topic. [`from_stream_topic()`](Self::from_stream_topic)
 /// gives both the same pair. [`new()`](Self::new) and [`builder()`](Self::builder) do not, so they
-/// can point the producer and the consumer at different topics. [`stream_name()`](Self::stream_name)
-/// and [`topic_name()`](Self::topic_name) report what the producer half says. Read
-/// [`consumer_config()`](Self::consumer_config) for the other half.
+/// can point the producer and the consumer at different topics. Read
+/// [`producer_config()`](Self::producer_config) or [`consumer_config()`](Self::consumer_config)
+/// for the half you need.
 ///
 /// # Examples
 ///
@@ -56,7 +56,7 @@ use bon::Builder;
 ///     IggyDuration::new_from_secs(1),
 /// )?;
 ///
-/// assert_eq!(config.stream_name(), "my-stream");
+/// assert_eq!(config.producer_config().stream_name(), "my-stream");
 /// assert_eq!(config.producer_config().batch_length(), 100);
 /// assert_eq!(config.consumer_config().consumer_name(), "consumer-my-stream-my-topic");
 /// # Ok(())
@@ -123,7 +123,7 @@ impl IggyStreamConfig {
     ///     IggyConsumerConfig::default(),
     ///     IggyProducerConfig::default(),
     /// );
-    /// assert_eq!(config.stream_name(), "test_stream");
+    /// assert_eq!(config.producer_config().stream_name(), "test_stream");
     /// ```
     pub fn new(consumer_config: IggyConsumerConfig, producer_config: IggyProducerConfig) -> Self {
         Self {
@@ -153,7 +153,7 @@ impl IggyStreamConfig {
     ///     IggyDuration::new_from_secs(1),
     ///     IggyDuration::new_from_secs(1),
     /// )?;
-    /// assert_eq!(config.topic_name(), "my-topic");
+    /// assert_eq!(config.producer_config().topic_name(), "my-topic");
     /// # Ok(())
     /// # }
     /// ```
@@ -189,22 +189,6 @@ impl IggyStreamConfig {
     /// Returns the half that describes the producer.
     pub fn producer_config(&self) -> &IggyProducerConfig {
         &self.producer_config
-    }
-
-    /// Returns the stream name of the producer half.
-    ///
-    /// The consumer half carries its own, which can differ. Read
-    /// [`consumer_config()`](Self::consumer_config) for it.
-    pub fn stream_name(&self) -> &str {
-        self.producer_config.stream_name()
-    }
-
-    /// Returns the topic name of the producer half.
-    ///
-    /// The consumer half carries its own, which can differ. Read
-    /// [`consumer_config()`](Self::consumer_config) for it.
-    pub fn topic_name(&self) -> &str {
-        self.producer_config.topic_name()
     }
 }
 
