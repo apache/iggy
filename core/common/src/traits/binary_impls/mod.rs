@@ -34,9 +34,16 @@ use crate::IggyError;
 use crate::http::users::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use crate::{BinaryClient, ClientState};
-use iggy_binary_protocol::WireDecode;
-use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
+use crate::{BinaryClient, ClientState, Credentials};
+use bytes::Bytes;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
+use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::{
+    ClientVersionInfo, IGGY_PROTOCOL_VERSION, MAX_WIRE_NAME_LENGTH, WireDecode, WireName,
+};
+use secrecy::ExposeSecret;
 
 /// SDK identifier sent in the login-register version prefix. Foreign SDKs
 /// send their own (e.g. `go-sdk`) once they adopt VSR framing.
@@ -51,6 +58,41 @@ pub fn rust_sdk_version_info(sdk_version: &str) -> Result<ClientVersionInfo, Igg
         sdk_name: WireName::new(RUST_SDK_NAME).expect("RUST_SDK_NAME is 1-255 bytes"),
         sdk_version: WireName::new(sdk_version).map_err(|_| IggyError::InvalidFormat)?,
     })
+}
+
+/// The code and the body of a sign-in with `credentials`. The credentials
+/// pass the bounds that the server enforces, so a long password cannot break
+/// a length prefix on the wire.
+#[doc(hidden)]
+pub fn sign_in_request(
+    credentials: &Credentials,
+    version_info: ClientVersionInfo,
+    bind_secret: BindSecret,
+) -> Result<(u32, Bytes), IggyError> {
+    match credentials {
+        Credentials::UsernamePassword(username, password) => {
+            validate_username(username)?;
+            validate_password(password.expose_secret())?;
+            let request = LoginRegisterRequest {
+                version_info,
+                bind_secret,
+                username: WireName::new(username).map_err(|_| IggyError::InvalidFormat)?,
+                password: password.clone(),
+                client_context: None,
+            };
+            Ok((LOGIN_REGISTER_CODE, request.to_bytes()))
+        }
+        Credentials::PersonalAccessToken(token) => {
+            validate_token(token.expose_secret())?;
+            let request = LoginRegisterWithPatRequest {
+                version_info,
+                bind_secret,
+                token: token.clone(),
+                client_context: None,
+            };
+            Ok((LOGIN_REGISTER_WITH_PAT_CODE, request.to_bytes()))
+        }
+    }
 }
 
 /// Release a live session before a fresh login on the same connection.
@@ -84,6 +126,16 @@ pub(crate) fn validate_password(password: &str) -> Result<(), IggyError> {
 pub(crate) fn validate_username(username: &str) -> Result<(), IggyError> {
     if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username.len()) {
         return Err(IggyError::InvalidUsername);
+    }
+    Ok(())
+}
+
+/// The request stores a `SecretString` rather than a `WireName`, so the
+/// `WireName` bounds are enforced here to keep the u8 length prefix
+/// consistent with the realized bytes.
+pub(crate) fn validate_token(token: &str) -> Result<(), IggyError> {
+    if token.is_empty() || token.len() > MAX_WIRE_NAME_LENGTH {
+        return Err(IggyError::InvalidFormat);
     }
     Ok(())
 }

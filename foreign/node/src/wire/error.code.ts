@@ -89,6 +89,7 @@ export const translateErrorCode = (code: number): string => {
 
     case '87': return "The partition history is no longer available; this request cannot execute again";
     case '88': return "A committed lifecycle operation prevents this mutation. Retry as a new request.";
+    case '89': return "The replica is not the partition primary.";
 
     case '100': return "Client with ID: {0} was not found.";
     case '101': return "Invalid client ID";

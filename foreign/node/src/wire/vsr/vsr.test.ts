@@ -83,7 +83,7 @@ describe('VSR custom request framing', () => {
     );
   });
 
-  it('does not advance for non-replicated operations', () => {
+  it('assigns distinct request ids to bound reads and writes', () => {
     const session = new VsrSession(7n);
     session.bind(42n);
     const custom = session.encode(
@@ -96,7 +96,7 @@ describe('VSR custom request framing', () => {
       COMMAND_CODE.CreateStream,
       Buffer.alloc(0)
     );
-    assert.equal(metadata.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
+    assert.equal(metadata.readBigUInt64LE(REQUEST_OFFSET.request), 2n);
     assert.equal(metadata.length, HEADER_SIZE);
   });
 

@@ -70,7 +70,8 @@ pub struct QuicTuning {
     /// Maximum number of concurrent bidirectional streams per
     /// connection. Each SDK command opens a fresh bidi stream, so
     /// this caps how many commands one client connection may have
-    /// in flight; 1 disables pipelining.
+    /// in flight; 1 disables pipelining. Defaults to
+    /// [`QUIC_MAX_CONCURRENT_STREAMS`].
     pub max_concurrent_bidi_streams: u32,
 
     /// Initial path MTU advertised to the peer, in bytes.
@@ -83,10 +84,10 @@ pub struct QuicTuning {
     pub receive_window: u32,
 
     /// Receive-flow control window per stream, in bytes. Never above
-    /// [`Self::receive_window`], and equal to it under the shipped
-    /// single-stream default. Setting it strictly below is what keeps
-    /// one unread stream from pinning the whole connection window, so
-    /// it only buys anything once several streams share a connection.
+    /// [`Self::receive_window`]. A value strictly below keeps one
+    /// unread stream from pinning the whole connection window. The
+    /// default is equal, because the server reads each stream as soon
+    /// as it opens.
     pub stream_receive_window: u32,
 
     /// Interval between QUIC keep-alive PINGs. `Duration::ZERO`
@@ -265,18 +266,24 @@ fn build_quic_tuning(quic: &configs::quic::QuicConfig) -> QuicTuning {
     }
 }
 
+/// Default stream cap of a client QUIC connection. Equal to the default
+/// `message_bus.client_queue_capacity`, the most requests the server runs
+/// at once for one connection.
+pub const QUIC_MAX_CONCURRENT_STREAMS: u32 = 256;
+
 impl Default for QuicTuning {
     /// Mirrors the `[quic]` defaults in
     /// `core/server/config.toml`: 64 MiB send/receive windows, a per-stream
     /// window equal to the connection receive window, 30 s idle timeout, 10 s
-    /// keep-alive, 1200 B initial MTU, one in-flight command per connection.
+    /// keep-alive, 1200 B initial MTU, [`QUIC_MAX_CONCURRENT_STREAMS`]
+    /// in-flight commands per connection.
     ///
     /// Intended for tests and direct callers; production builds
     /// derive the field from [`ServerConfig`] so the values stay in
     /// lock-step with the on-disk schema.
     fn default() -> Self {
         Self {
-            max_concurrent_bidi_streams: 1,
+            max_concurrent_bidi_streams: QUIC_MAX_CONCURRENT_STREAMS,
             initial_mtu: 1200,
             send_window: 64 * 1024 * 1024,
             receive_window: 64 * 1024 * 1024,

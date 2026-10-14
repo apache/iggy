@@ -433,7 +433,8 @@ pub enum PartitionRecoveryError {
         partition_id: usize,
         reason: PartitionRecoveryRefusal,
     },
-    /// An existing offset directory could not be enumerated.
+    /// An offset directory could not be checked, or an existing one could not
+    /// be enumerated.
     ConsumerOffsetsLoad {
         consumer_kind: &'static str,
         stream_id: usize,

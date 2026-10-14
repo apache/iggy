@@ -25,7 +25,7 @@
 //!
 //! ```text
 //! workload-fuzz [--seed N] [--ticks N] [--clients N] [--replicas N]
-//!               [--plane partition|metadata|mixed|uniform]
+//!               [--plane partition|metadata|mixed|uniform|lifecycle]
 //!               [--faults none|light|heavy|swarm] [--no-quiesce]
 //!               [--crash-prob F] [--restart-prob F] [--crash-primary]
 //!               [network overrides: --packet-loss-prob, --replay-prob, --partition-mode,
@@ -60,7 +60,9 @@ use simulator::packet::{COMMAND_LABELS, PacketSimulatorOptions, PartitionMode, P
 use simulator::workload::actions::Action;
 use simulator::workload::invariants::Invariants;
 use simulator::workload::options::{ActionWeights, WorkloadOptions};
-use simulator::workload::{FaultInjector, Workload, oracle, run_with_faults};
+use simulator::workload::{
+    FaultInjector, Workload, create_fixture_groups, oracle, restore_fixture_topics, run_with_faults,
+};
 use strum::IntoEnumIterator;
 
 /// Exit code for a run that proved nothing.
@@ -68,6 +70,9 @@ use strum::IntoEnumIterator;
 /// Apart from the `101` a panic exits with, because a run under a vacuity floor is
 /// not a failure: every oracle held and none of them had anything to compare.
 const EXIT_VACUOUS: i32 = 3;
+
+/// Tick budget for restoring every fixture topic and fixture group before the drain.
+const FIXTURE_RESTORE_TICKS: u64 = 50_000;
 
 /// Report that the run proved nothing, then exit with [`EXIT_VACUOUS`].
 ///
@@ -157,6 +162,11 @@ struct Args {
     /// with `0`.
     #[arg(long, default_value_t = 1)]
     min_metadata_ops_compared: usize,
+    /// Consumer group owners that the owner oracle must compare in a shell run that
+    /// joins fixture groups. The restore before the drain commits a join on every
+    /// fixture group, so a run below the floor tested no ownership. `0` opts out.
+    #[arg(long, default_value_t = 1)]
+    min_owners_compared: usize,
     /// End the run as vacuous if crash or restart injection was requested but never
     /// happened.
     /// Off by default, since a short run at low probability may legitimately draw
@@ -346,6 +356,9 @@ enum Plane {
     Mixed,
     /// Every action equally likely.
     Uniform,
+    /// Writes and consumer offsets while fixture topics are deleted and recreated,
+    /// and, with `--shell`, while clients join and leave their fixture groups.
+    Lifecycle,
 }
 
 impl Plane {
@@ -355,6 +368,7 @@ impl Plane {
             Self::Metadata => ActionWeights::metadata_only(),
             Self::Mixed => ActionWeights::default(),
             Self::Uniform => ActionWeights::uniform(),
+            Self::Lifecycle => ActionWeights::lifecycle(),
         }
     }
 }
@@ -536,6 +550,7 @@ fn run_quiesce_phase(
     args: &Args,
     sim: &mut Simulator,
     workload: &mut Workload,
+    clients: &[SimClient],
     seed: u64,
     replicas: u8,
     invariants: &mut Invariants,
@@ -555,12 +570,19 @@ fn run_quiesce_phase(
         );
     }
 
+    // The oracle requires a host for every fixture namespace still in metadata, so
+    // a topic left deleted would make it skip one.
+    assert!(
+        restore_fixture_topics(sim, workload, clients, FIXTURE_RESTORE_TICKS, invariants),
+        "fixture topics or their groups were not restored before the drain\n{}",
+        oracle::quiesce_failure_report(sim, workload),
+    );
     // A failed drain is a hard failure, not a warning. It was a warning while a
     // lost request could not be retried, making stalls expected and
     // unactionable; with the client resending, a request unanswered inside the
     // budget is either a wedge or a liveness bug.
     assert!(
-        oracle::drive_to_quiesce(sim, workload, 50_000, invariants),
+        oracle::drive_to_quiesce(sim, workload, clients, 50_000, invariants),
         "{}",
         oracle::quiesce_failure_report(sim, workload),
     );
@@ -586,13 +608,19 @@ fn run_quiesce_phase(
     };
     println!(
         "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
-         evictions={}; ops_compared={} partition_ops_compared={} replicas_compared={} \
-         namespaces_checked={})",
+         evictions={}; ops_compared={} partition_ops_compared={} \
+         deleted_partition_ops_compared={} replicas_compared={} namespaces_checked={} \
+         owners_compared={} offsets_compared_with_shadow={} stale_owner_stores={} owner_fence_refusals={})",
         workload.evictions(),
         convergence.ops_compared,
         convergence.partition_ops_compared,
+        workload.deleted_partition_ops_compared(),
         convergence.replicas_compared,
         convergence.namespaces_checked,
+        convergence.owners_compared,
+        convergence.offsets_compared_with_shadow,
+        workload.stale_owner_stores(),
+        workload.owner_fence_refusals(),
     );
     if args.require_entity_oracle && !workload.strict_outcome_oracle() {
         vacuous(format_args!(
@@ -623,6 +651,23 @@ fn run_quiesce_phase(
              op(s) witnessed by more than one, so the metadata oracle compared an empty chain \
              (seed={seed:#x})",
             args.min_metadata_ops_compared, convergence.ops_compared,
+        ));
+    }
+    if sim.is_shell()
+        && workload.options.weights.draws_fixture_groups()
+        && convergence.owners_compared < args.min_owners_compared
+    {
+        vacuous(format_args!(
+            "--min-owners-compared {}: the run joined fixture groups, but the owner oracle \
+             compared only {} settled owner(s) (seed={seed:#x})",
+            args.min_owners_compared, convergence.owners_compared,
+        ));
+    }
+    if sim.is_shell() && args.plane == Plane::Lifecycle && workload.owner_fence_refusals() == 0 {
+        vacuous(format_args!(
+            "lifecycle --shell requires an owner-fence refusal, but observed none \
+             (stale_owner_stores={}, seed={seed:#x})",
+            workload.stale_owner_stores(),
         ));
     }
     // Again after the drain: the drain both answers outstanding requests and
@@ -692,6 +737,7 @@ fn main() {
     options.ack_quorum_ratio = args.ack_quorum_ratio;
     options.weights = plane.weights();
     let mut workload = Workload::new(options);
+    create_fixture_groups(&mut sim, &mut workload, &sim_clients[0]);
 
     let mut injector = FaultInjector::new(seed, replicas);
     // One checker for the whole run: the drain in `run_quiesce_phase` continues with
@@ -723,6 +769,7 @@ fn main() {
             &args,
             &mut sim,
             &mut workload,
+            &sim_clients,
             seed,
             replicas,
             &mut invariants,
@@ -880,9 +927,11 @@ fn print_command_coverage(sim: &Simulator) {
 /// Reply, rejection and resend counters plus per-action commits.
 fn print_coverage(workload: &Workload) {
     let stats = workload.auditor.stats();
+    let replacements = workload.shadow.replacement_totals();
     println!(
         "coverage: replies_seen={} replies_unknown={} committed_rejections={} \
-         samples_none={} resends={} denials={} transients={} evictions={}",
+         samples_none={} resends={} denials={} transients={} evictions={} redirects={} \
+         fixture_replacements_started={} fixture_replacements_settled={}",
         stats.replies_seen,
         stats.replies_unknown,
         stats.committed_rejections,
@@ -891,6 +940,9 @@ fn print_coverage(workload: &Workload) {
         stats.denials,
         stats.transient_rejections,
         workload.evictions(),
+        workload.redirects(),
+        replacements.started,
+        replacements.settled,
     );
     for action in Action::iter() {
         let commits = stats.commits(action);

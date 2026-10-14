@@ -25,20 +25,26 @@ import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.partition.PartitionContext;
+import org.apache.iggy.partition.PartitionRoute;
 import org.apache.iggy.serde.BytesDeserializer;
+import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 
 import java.io.IOException;
+import java.math.BigInteger;
 import java.time.Duration;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -52,16 +58,14 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Keeps the membership-owning coordinator separate from polls and offset writes,
- * which only the partition primary serves.
+ * Routes partition requests through shared-session connections to their primary,
+ * keeping the membership-owning coordinator separate.
  * Only explicit non-admission permits rerouting.
  */
 final class PollRouter {
     static final int POLL_PARAMETERS_BYTES = 14;
-    /** The session identity that leads every routing reply, before its partition context. */
-    static final int ATTACHMENT_BYTES = 32;
 
-    private static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
+    static final Duration POLL_TIMEOUT = Duration.ofSeconds(30);
     private static final int MAX_ROUTES = 4096;
     private static final int MAX_CONNECTIONS = 256;
     private static final int MAX_PENDING_POLLS = 4096;
@@ -73,7 +77,9 @@ final class PollRouter {
     private final Map<String, Route> routes = new HashMap<>();
     private final Map<ConnectionInfo, Slot> connections = new HashMap<>();
     private final Set<Poll> pending = new HashSet<>();
-    private long metadataWatermark;
+    private volatile int rosterSize;
+    private final Map<Integer, ConnectionInfo> replicas = new HashMap<>();
+    private final Map<String, Long> partitionCounts = new HashMap<>();
 
     PollRouter(Supplier<AsyncTcpConnection> coordinator, Function<ConnectionInfo, AsyncTcpConnection> connectData) {
         this(coordinator, connectData, POLL_TIMEOUT);
@@ -89,33 +95,105 @@ final class PollRouter {
     }
 
     CompletableFuture<ByteBuf> poll(ByteBuf payload, Optional<PartitionContext> context) {
-        byte[] request = takeBytes(payload);
-        return send(new Poll(
-                CommandCode.Messages.GET_POLL_ROUTING,
-                request,
-                CommandCode.Messages.POLL_ON_PRIMARY.getValue(),
-                request,
-                request.length - POLL_PARAMETERS_BYTES,
-                pollTimeout,
-                context));
+        return partitionRequest(CommandCode.Messages.POLL.getValue(), payload, context);
     }
 
-    /**
-     * Sends a store or delete offset request to the partition primary. The route is
-     * looked up by the consumer, stream, topic and partition in the first
-     * {@code targetLength} bytes, as in Rust's {@code write_offset}.
-     */
-    CompletableFuture<ByteBuf> writeOffset(
-            int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
+    CompletableFuture<ByteBuf> partitionRequest(int command, ByteBuf payload, Optional<PartitionContext> context) {
         byte[] request = takeBytes(payload);
-        return send(new Poll(
-                CommandCode.ConsumerOffset.GET_ROUTING,
-                Arrays.copyOf(request, targetLength),
-                command,
-                request,
-                targetLength,
-                pollTimeout,
-                context));
+        try {
+            byte[] query = partitionQuery(command, request);
+            return send(new Poll(query, command, request, pollTimeout, context));
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    CompletableFuture<ByteBuf> sendMessages(ByteBuf payload, ByteBuf query) {
+        byte[] request = takeBytes(payload);
+        byte[] target = takeBytes(query);
+        return send(new Poll(target, CommandCode.Messages.SEND.getValue(), request, pollTimeout, Optional.empty()));
+    }
+
+    CompletableFuture<Long> partitionCount(StreamId stream, TopicId topic) {
+        ByteBuf query = BytesSerializer.toBytes(stream);
+        ByteBuf topicBytes = BytesSerializer.toBytes(topic);
+        try {
+            query.writeBytes(topicBytes);
+            query.writeIntLE(0);
+        } finally {
+            topicBytes.release();
+        }
+        byte[] target = takeBytes(query);
+        String topicKey = ByteBufUtil.hexDump(target, 0, target.length - Integer.BYTES);
+        synchronized (this) {
+            Long count = partitionCounts.get(topicKey);
+            if (count != null) {
+                return CompletableFuture.completedFuture(count);
+            }
+        }
+        Poll lookup = new Poll(
+                target, CommandCode.Messages.GET_PARTITION_ROUTE.getValue(), target, pollTimeout, Optional.empty());
+        return send(lookup).thenApply(response -> {
+            response.release();
+            return lookup.partitionsCount;
+        });
+    }
+
+    synchronized void clear() {
+        routes.clear();
+        partitionCounts.clear();
+    }
+
+    synchronized void observeTopology(ClusterMetadata metadata) {
+        replicas.clear();
+        rosterSize = metadata.nodes().size();
+        for (var node : metadata.nodes()) {
+            if (node.endpoints().tcp() != 0) {
+                replicas.put(
+                        node.replicaId(),
+                        new ConnectionInfo(node.ip(), node.endpoints().tcp()));
+            }
+        }
+    }
+
+    private static byte[] partitionQuery(int command, byte[] request) {
+        ByteBuf body = Unpooled.wrappedBuffer(request);
+        try {
+            int consumerKind = body.readUnsignedByte();
+            skipIdentifier(body);
+            int streamStart = body.readerIndex();
+            skipIdentifier(body);
+            skipIdentifier(body);
+            int partitionStart = body.readerIndex();
+            boolean explicit = body.readUnsignedByte() != 0;
+            long partition = body.readUnsignedIntLE();
+            if (!explicit) {
+                if (command == CommandCode.ConsumerOffset.STORE.getValue()
+                        || command == CommandCode.ConsumerOffset.DELETE.getValue()
+                        || (command == CommandCode.Messages.POLL.getValue() && consumerKind == 2)) {
+                    throw new IggyInvalidArgumentException("A group poll or offset mutation requires a partition id");
+                }
+                partition = 0;
+                body.setByte(partitionStart, 1);
+                body.setIntLE(partitionStart + 1, 0);
+            }
+            ByteBuf query = Unpooled.buffer(partitionStart - streamStart + Integer.BYTES);
+            query.writeBytes(request, streamStart, partitionStart - streamStart).writeIntLE((int) partition);
+            return takeBytes(query);
+        } catch (IndexOutOfBoundsException error) {
+            throw new IggyInvalidArgumentException("Truncated partition target");
+        } finally {
+            body.release();
+        }
+    }
+
+    private static void skipIdentifier(ByteBuf body) {
+        int kind = body.readUnsignedByte();
+        int length = body.readUnsignedByte();
+        if ((kind == 1 && length != Integer.BYTES) || (kind != 1 && kind != 2) || length == 0) {
+            throw new IggyInvalidArgumentException("Invalid partition target identifier");
+        }
+        body.skipBytes(length);
     }
 
     private static byte[] takeBytes(ByteBuf payload) {
@@ -139,7 +217,7 @@ final class PollRouter {
             timeout.cancel(false);
             synchronized (this) {
                 pending.remove(poll);
-                if (error != null) {
+                if (error != null && poll.dataCommand != CommandCode.Messages.SEND.getValue()) {
                     routes.remove(poll.key);
                 }
             }
@@ -151,11 +229,8 @@ final class PollRouter {
         return poll.result;
     }
 
-    synchronized CompletableFuture<Void> clearSession(AsyncTcpConnection previous) {
-        if (previous != null) {
-            observeMetadata(previous.metadataWatermark());
-        }
-        routes.clear();
+    synchronized CompletableFuture<Void> clearSession() {
+        clear();
         for (Poll poll : Set.copyOf(pending)) {
             poll.result.completeExceptionally(uncommitted());
         }
@@ -169,6 +244,7 @@ final class PollRouter {
         if (poll.result.isDone()) {
             return;
         }
+        poll.dataSent = false;
         route(poll).thenCompose(route -> enqueue(route, poll)).whenComplete((response, error) -> {
             if (poll.result.isDone()) {
                 if (response != null) {
@@ -182,21 +258,63 @@ final class PollRouter {
                 }
                 return;
             }
-            synchronized (this) {
-                routes.remove(poll.key);
-            }
-            if (isNotAccepted(error)) {
-                if (!poll.retryRefusal()) {
-                    return;
-                }
-                coordinator
-                        .get()
-                        .eventLoop()
-                        .schedule(() -> attempt(poll), RETRY_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-            } else {
-                poll.result.completeExceptionally(unwrap(error));
-            }
+            failedAttempt(poll, error);
         });
+    }
+
+    private void failedAttempt(Poll poll, Throwable error) {
+        if (poll.retryingRefusal && unwrap(error) instanceof IggyTimeoutException) {
+            poll.result.completeExceptionally(notAccepted());
+            return;
+        }
+        IggyServerException refusal = AsyncTcpConnection.findServerError(error);
+        boolean historyRefresh = poll.canRefreshHistory(refusal);
+        boolean notPrimary = refusal != null && refusal.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY;
+        invalidateRoute(poll, error, historyRefresh, notPrimary);
+        if (poll.isLifecycleRefusal(refusal)) {
+            retryLifecycle(poll, refusal);
+            return;
+        }
+        if (!poll.terminalRoutingRefusal && (isNotAccepted(error) || notPrimary || historyRefresh)) {
+            retry(poll, historyRefresh, notPrimary);
+        } else {
+            poll.result.completeExceptionally(unwrap(error));
+        }
+    }
+
+    private synchronized void invalidateRoute(Poll poll, Throwable error, boolean historyRefresh, boolean notPrimary) {
+        if (historyRefresh) {
+            routes.keySet().removeIf(key -> key.startsWith(poll.topicKey()));
+            partitionCounts.remove(poll.topicKey());
+        } else if (isNotAccepted(error) || notPrimary || poll.dataCommand != CommandCode.Messages.SEND.getValue()) {
+            routes.remove(poll.key);
+        }
+    }
+
+    private void retryLifecycle(Poll poll, IggyServerException refusal) {
+        long delay = poll.lifecycleRetryMillis;
+        if (poll.deadline - System.nanoTime() <= TimeUnit.MILLISECONDS.toNanos(delay)) {
+            poll.result.completeExceptionally(refusal);
+            return;
+        }
+        poll.lifecycleRefusal = refusal;
+        poll.state.renewRequestId();
+        poll.lifecycleRetryMillis = Math.min(delay * 2, AsyncTcpConnection.LIFECYCLE_RETRY_MAX_INTERVAL_MS);
+        coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
+    }
+
+    private void retry(Poll poll, boolean historyRefresh, boolean notPrimary) {
+        if (historyRefresh) {
+            poll.refreshedHistory = true;
+            poll.context.set(null);
+            poll.state = new AsyncTcpConnection.TransientFailoverState();
+        }
+        if (!poll.retryRefusal()) {
+            return;
+        }
+        long delay = (notPrimary && !poll.notPrimarySeen) || historyRefresh ? 0 : RETRY_INTERVAL_MILLIS;
+        poll.notPrimarySeen |= notPrimary;
+        coordinator.get().eventLoop().schedule(() -> attempt(poll), delay, TimeUnit.MILLISECONDS);
     }
 
     private CompletableFuture<Route> route(Poll poll) {
@@ -205,79 +323,114 @@ final class PollRouter {
             return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
         }
         synchronized (this) {
-            observeMetadata(parent.metadataWatermark());
             Route cached = routes.get(poll.key);
             if (cached != null && routeIsCurrent(cached)) {
                 return CompletableFuture.completedFuture(cached);
             }
         }
-        return parent.send(poll.routingCommand, Unpooled.wrappedBuffer(poll.routingBody))
-                .thenApply(response -> decodeRoute(parent, poll, response))
-                .exceptionallyCompose(error -> {
-                    if (!connectionFailed(error) || poll.result.isDone()) {
-                        return CompletableFuture.failedFuture(unwrap(error));
+        CompletableFuture<Void> roster = rosterSize == 0
+                ? refreshRoster(parent, poll.deadline).exceptionallyCompose(error -> {
+                    poll.terminalRoutingRefusal = true;
+                    return CompletableFuture.failedFuture(unwrap(error));
+                })
+                : CompletableFuture.completedFuture(null);
+        return roster.thenCompose(ignored -> parent.sendRouted(
+                        CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
+                        Unpooled.wrappedBuffer(poll.routingBody),
+                        0,
+                        poll.deadline,
+                        new AsyncTcpConnection.TransientFailoverState(new PartitionContext(
+                                BigInteger.ZERO, BigInteger.ZERO, BigInteger.valueOf(parent.metadataWatermark())))))
+                .thenCompose(response -> {
+                    PartitionRoute decoded;
+                    try {
+                        decoded = PartitionRoute.decode(response);
+                    } finally {
+                        response.release();
                     }
-                    return coordinator
-                            .get()
-                            .send(CommandCode.System.PING, Unpooled.EMPTY_BUFFER)
-                            .thenApply(response -> {
-                                response.release();
-                                throw notAccepted();
-                            });
+                    CompletableFuture<Void> known;
+                    synchronized (this) {
+                        known = replicas.containsKey(decoded.primaryReplica()) || connectData == null
+                                ? CompletableFuture.completedFuture(null)
+                                : refreshRoster(parent, poll.deadline);
+                    }
+                    return known.thenApply(ignored -> cacheRoute(parent, poll, decoded));
                 });
     }
 
-    private Route decodeRoute(AsyncTcpConnection parent, Poll poll, ByteBuf response) {
-        try {
-            if (response.readableBytes() < ATTACHMENT_BYTES + PartitionContext.ENCODED_SIZE) {
-                throw new IggyClientException("Truncated primary poll session attachment");
-            }
-            Attachment attachment = new Attachment(
-                    response.readLongLE(), response.readLongLE(), response.readLongLE(), response.readLongLE());
-            long generation = parent.sessionGeneration();
-            byte[] bindSecret = parent.bindSecret(attachment.clientLow, attachment.clientHigh, attachment.session);
-            if (generation != parent.sessionGeneration()) {
-                throw new IggyClientException("Parent session changed while decoding a poll route");
-            }
-            var context = BytesDeserializer.readPartitionContext(response);
-            var node = BytesDeserializer.readClusterNode(response);
-            if (response.isReadable() || node.endpoints().tcp() == 0) {
-                throw new IggyClientException("Invalid TCP primary poll routing response");
-            }
-            synchronized (this) {
-                observeMetadata(parent.metadataWatermark());
-                Route route = new Route(
-                        new ConnectionInfo(node.ip(), node.endpoints().tcp()),
-                        attachment.withWatermark(metadataWatermark),
-                        parent,
-                        generation,
-                        bindSecret,
-                        context);
-                if (routes.size() >= MAX_ROUTES) {
-                    routes.clear();
-                }
-                if (!poll.result.isDone() && coordinator.get() == parent) {
-                    routes.put(poll.key, route);
-                }
-                return route;
-            }
-        } catch (IndexOutOfBoundsException | IggyMalformedResponseException error) {
-            throw new IggyClientException("Invalid TCP primary poll routing response", error);
-        } finally {
-            response.release();
+    private CompletableFuture<Void> refreshRoster(AsyncTcpConnection parent, long deadline) {
+        return parent.sendRouted(
+                        CommandCode.System.GET_CLUSTER_METADATA.getValue(),
+                        Unpooled.EMPTY_BUFFER,
+                        0,
+                        deadline,
+                        new AsyncTcpConnection.TransientFailoverState())
+                .thenAccept(response -> {
+                    try {
+                        observeTopology(BytesDeserializer.readClusterMetadata(response));
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    private synchronized Route cacheRoute(AsyncTcpConnection parent, Poll poll, PartitionRoute decoded) {
+        ConnectionInfo endpoint = replicas.get(decoded.primaryReplica());
+        if (decoded.partitionsCount() == 0) {
+            throw new IggyMalformedResponseException("Partition route contains no partitions");
         }
+        if (rosterSize == 0 || (endpoint == null && connectData != null)) {
+            poll.terminalRoutingRefusal = true;
+            throw notAccepted();
+        }
+        long generation = parent.sessionGeneration();
+        long[] identity = parent.sessionIdentity();
+        Attachment attachment = new Attachment(
+                identity[0], identity[1], identity[2], decoded.metadataOp().longValue());
+        byte[] secret = parent.bindSecret(identity[0], identity[1], identity[2]);
+        Route route = new Route(
+                endpoint,
+                attachment,
+                parent,
+                generation,
+                secret,
+                decoded.context(),
+                decoded.partitionsCount(),
+                rosterSize <= 1 || connectData == null);
+        if (routes.size() >= MAX_ROUTES) {
+            clear();
+        }
+        if (coordinator.get() != parent || parent.sessionGeneration() != generation) {
+            throw notAccepted();
+        }
+        routes.put(poll.key, route);
+        partitionCounts.put(poll.topicKey(), decoded.partitionsCount());
+        return route;
     }
 
     private synchronized boolean routeIsCurrent(Route route) {
         AsyncTcpConnection parent = coordinator.get();
-        observeMetadata(parent.metadataWatermark());
         return route.parent == parent
                 && route.generation == parent.sessionGeneration()
-                && Long.compareUnsigned(route.attachment.watermark, metadataWatermark) >= 0;
+                && Long.compareUnsigned(route.attachment.watermark, parent.metadataWatermark()) >= 0;
     }
 
     private CompletableFuture<ByteBuf> enqueue(Route route, Poll poll) {
+        if (poll.result.isDone()) {
+            return CompletableFuture.failedFuture(notAccepted());
+        }
+        poll.partitionsCount = route.partitionsCount;
+        if (poll.dataCommand == CommandCode.Messages.GET_PARTITION_ROUTE.getValue()) {
+            return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
+        }
         poll.routed();
+        poll.context.compareAndSet(null, route.context);
+        poll.state.setContext(poll.context.get());
+        if (route.local) {
+            poll.dataSent = true;
+            return route.parent.sendRouted(
+                    poll.dataCommand, Unpooled.wrappedBuffer(poll.payload), 0, poll.deadline, poll.state);
+        }
         synchronized (this) {
             Slot slot = connections.get(route.endpoint);
             if (slot == null) {
@@ -302,12 +455,6 @@ final class PollRouter {
             }
         }
         return false;
-    }
-
-    private void observeMetadata(long watermark) {
-        if (Long.compareUnsigned(watermark, metadataWatermark) > 0) {
-            metadataWatermark = watermark;
-        }
     }
 
     private static Throwable unwrap(Throwable error) {
@@ -392,14 +539,19 @@ final class PollRouter {
             if (data == null || attached == null) {
                 return CompletableFuture.failedFuture(notAccepted());
             }
+            if (!attached.covers(data, route.attachment.withWatermark(route.parent.metadataWatermark()))) {
+                return attach(route, poll).thenCompose(ignored -> sendPoll(route, poll));
+            }
             // No poll monitor here: an idle slot sends under the router monitor, while expire()
             // completes the poll, whose callback takes the router, under the poll monitor.
             poll.context.compareAndSet(null, route.context);
-            return data.sendOnPrimary(
+            poll.dataSent = true;
+            return data.sendRouted(
                             poll.dataCommand,
                             Unpooled.wrappedBuffer(poll.payload),
                             attached.generation,
-                            poll.context.get())
+                            poll.deadline,
+                            poll.state)
                     .whenComplete((response, error) -> {
                         if (error != null) {
                             if (isNotAccepted(error)) {
@@ -444,15 +596,21 @@ final class PollRouter {
                 return CompletableFuture.failedFuture(notAccepted());
             }
             AttachedSession current = attachment;
-            if (current != null && current.covers(data, route.attachment)) {
+            Attachment required = route.attachment.withWatermark(route.parent.metadataWatermark());
+            if (current != null && current.covers(data, required)) {
                 return CompletableFuture.completedFuture(null);
             }
-            return data.send(CommandCode.System.BIND_SESSION, route.attachment.encode(route.bindSecret))
+            return data.sendRouted(
+                            CommandCode.System.BIND_SESSION.getValue(),
+                            required.encode(route.bindSecret),
+                            0,
+                            poll.deadline,
+                            new AsyncTcpConnection.TransientFailoverState())
                     .thenAccept(response -> {
                         response.release();
                         synchronized (this) {
                             if (connection == data && activePoll == poll && !poll.result.isDone()) {
-                                attachment = new AttachedSession(data, data.sessionGeneration(), route.attachment);
+                                attachment = new AttachedSession(data, data.sessionGeneration(), required);
                             }
                         }
                     });
@@ -487,7 +645,6 @@ final class PollRouter {
     /** One poll or offset write, routed by the routing command and sent as the data command. */
     private static final class Poll {
         private final String key;
-        private final CommandCode routingCommand;
         private final byte[] routingBody;
         private final int dataCommand;
         private final byte[] payload;
@@ -497,24 +654,42 @@ final class PollRouter {
         // The caller's context, or else the first route's, kept for every retry of this poll.
         private final AtomicReference<PartitionContext> context;
         private boolean retryingRefusal;
+        private boolean notPrimarySeen;
+        private boolean refreshedHistory;
+        private boolean terminalRoutingRefusal;
+        private boolean dataSent;
+        private long lifecycleRetryMillis = RETRY_INTERVAL_MILLIS;
+        private IggyServerException lifecycleRefusal;
+        private long partitionsCount;
+        private AsyncTcpConnection.TransientFailoverState state = new AsyncTcpConnection.TransientFailoverState();
 
         private Poll(
-                CommandCode routingCommand,
                 byte[] routingBody,
                 int dataCommand,
                 byte[] payload,
-                int keyLength,
                 Duration pollTimeout,
                 Optional<PartitionContext> callerContext) {
-            // Rust keys a route by its routing command too, so a poll and an offset
-            // write of one consumer and partition keep separate routes.
-            this.key = routingCommand.getValue() + ":" + ByteBufUtil.hexDump(payload, 0, keyLength);
-            this.routingCommand = routingCommand;
+            this.key = ByteBufUtil.hexDump(routingBody);
             this.routingBody = routingBody;
             this.dataCommand = dataCommand;
             this.payload = payload;
             this.deadline = System.nanoTime() + pollTimeout.toNanos();
             this.context = new AtomicReference<>(callerContext.orElse(null));
+        }
+
+        private boolean isLifecycleRefusal(IggyServerException refusal) {
+            return dataSent && refusal != null && refusal.getRawErrorCode() == IggyErrorCode.LIFECYCLE_BUSY.getCode();
+        }
+
+        private boolean canRefreshHistory(IggyServerException refusal) {
+            return refusal != null
+                    && refusal.getRawErrorCode() == IggyErrorCode.HISTORY_UNAVAILABLE.getCode()
+                    && dataCommand == CommandCode.Messages.SEND.getValue()
+                    && !refreshedHistory;
+        }
+
+        private String topicKey() {
+            return key.substring(0, key.length() - 2 * Integer.BYTES);
         }
 
         private void discardConnection() {
@@ -528,6 +703,7 @@ final class PollRouter {
         // so the flag must survive the route lookup that follows it.
         private synchronized void routed() {
             retryingRefusal = false;
+            lifecycleRefusal = null;
         }
 
         private synchronized boolean retryRefusal() {
@@ -540,7 +716,8 @@ final class PollRouter {
         }
 
         private synchronized void expire() {
-            result.completeExceptionally(retryingRefusal ? notAccepted() : uncommitted());
+            result.completeExceptionally(
+                    lifecycleRefusal != null ? lifecycleRefusal : retryingRefusal ? notAccepted() : uncommitted());
         }
     }
 
@@ -556,7 +733,9 @@ final class PollRouter {
             AsyncTcpConnection parent,
             long generation,
             byte[] bindSecret,
-            PartitionContext context) {}
+            PartitionContext context,
+            long partitionsCount,
+            boolean local) {}
 
     private record Attachment(long clientLow, long clientHigh, long session, long watermark) {
         private Attachment {
