@@ -4952,6 +4952,23 @@ where
             partition
                 .consensus()
                 .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
+        // Checked on every adoption, transferring or not: a transfer that later
+        // fails leaves the applied history the view contradicts in place.
+        if !actions.is_empty()
+            && let Some((diverged_op, agreed_op)) = partition
+                .consensus()
+                .pending_view_log()
+                .as_ref()
+                .and_then(|pending| partition_applied_divergence(partition, pending))
+        {
+            self.resync_diverged_partition(
+                IggyNamespace::from_raw(header.group),
+                partition,
+                diverged_op,
+                agreed_op,
+            );
+            return;
+        }
         if !partition.consensus().is_transferring() && partition.consensus().view_log_unproven() {
             // Any stream armed before this adoption belongs to the superseded
             // view. Repair bodies carry no nonce, so drop the receiving session
@@ -4962,18 +4979,6 @@ where
             // like it, pending-less adoptions (empty StartView suffix) still sweep
             // the relics above the adopted head.
             let pending = partition.consensus().pending_view_log();
-            if let Some((diverged_op, agreed_op)) = pending
-                .as_ref()
-                .and_then(|pending| partition_applied_divergence(partition, pending))
-            {
-                self.resync_diverged_partition(
-                    IggyNamespace::from_raw(header.group),
-                    partition,
-                    diverged_op,
-                    agreed_op,
-                );
-                return;
-            }
             if partition.has_io_dispatcher()
                 && let Some(from_op) = partition_view_divergence_from(partition, pending.as_ref())
             {
@@ -5004,6 +5009,8 @@ where
     ) where
         MJ: JournalHandle,
         MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        B: MessageBus + 'static,
+        T: ShardsTable,
     {
         // Count before borrowing one owner mutably: the scan visits every owner.
         let transfers_inflight =
@@ -5056,11 +5063,12 @@ where
     #[allow(clippy::future_not_send)]
     async fn on_commit(&self, msg: &Message<CommitHeader>)
     where
-        B: MessageBus,
+        B: MessageBus + 'static,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
+        T: ShardsTable,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -9304,7 +9312,8 @@ where
         peer: u8,
     ) -> bool
     where
-        B: MessageBus,
+        B: MessageBus + 'static,
+        T: ShardsTable,
     {
         if !partition.consensus().is_normal()
             || partition.consensus().is_transferring()
@@ -9317,6 +9326,19 @@ where
             && partition.consensus().view_log_repair_op().is_none()
         {
             let pending = partition.consensus().pending_view_log();
+            // Truncation below only reaches ops above the applied floor.
+            if let Some((diverged_op, agreed_op)) = pending
+                .as_ref()
+                .and_then(|pending| partition_applied_divergence(partition, pending))
+            {
+                self.resync_diverged_partition(
+                    IggyNamespace::from_raw(partition.consensus().group()),
+                    partition,
+                    diverged_op,
+                    agreed_op,
+                );
+                return false;
+            }
             if partition.has_io_dispatcher()
                 && let Some(from_op) = partition_view_divergence_from(partition, pending.as_ref())
             {
@@ -10090,7 +10112,8 @@ where
         partition: &mut IggyPartition<B, SB>,
         peer: u8,
     ) where
-        B: MessageBus,
+        B: MessageBus + 'static,
+        T: ShardsTable,
     {
         let failures = partition.record_transfer_failure();
         let after_ticks = transfer_rearm_backoff(self.repair_retry_ticks.get(), failures);
@@ -10123,7 +10146,8 @@ where
         peer: u8,
         rotate: bool,
     ) where
-        B: MessageBus,
+        B: MessageBus + 'static,
+        T: ShardsTable,
     {
         // Deliberately NOT `transfer_rearm_backoff`: a flat interval, so a peer
         // that spends a minute catching up costs a minute of retries rather than
@@ -10174,7 +10198,8 @@ where
         after_ticks: u32,
         rotate: bool,
     ) where
-        B: MessageBus,
+        B: MessageBus + 'static,
+        T: ShardsTable,
     {
         partition.transfer = None;
         let consensus = partition.consensus();

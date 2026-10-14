@@ -4294,13 +4294,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Only meaningful while a merge is parked. These peers and nobody else: a
     /// cleared present bit means the body was never held or cannot be read back,
-    /// and the view change is blocked on the round-trip.
+    /// and the view change is blocked on the round-trip. A sender whose header
+    /// at `op` differs from the merged one holds another body, so it is skipped.
     #[must_use]
     pub fn pending_view_body_sources(&self, op: u64) -> Vec<u8> {
+        let merged_checksum = self
+            .with_pending_view_log(|pending| {
+                pending
+                    .headers
+                    .iter()
+                    .find(|header| {
+                        header.op == op && dvc_header_kind(header) == DvcHeaderKind::Valid
+                    })
+                    .map(|header| header.checksum)
+            })
+            .flatten();
         self.pending_view_sources(|dvc| {
-            dvc.suffix
-                .index_of(dvc.op, op)
-                .is_some_and(|index| dvc.suffix.offers_body(index))
+            dvc.suffix.index_of(dvc.op, op).is_some_and(|index| {
+                dvc.suffix.offers_body(index)
+                    && merged_checksum.is_none_or(|checksum| {
+                        dvc.suffix
+                            .valid_header_at(index)
+                            .is_some_and(|header| header.checksum == checksum)
+                    })
+            })
         })
     }
 

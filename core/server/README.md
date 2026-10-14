@@ -49,6 +49,13 @@ rejects older data directories without modifying them. Existing data requires a
 separately validated offline migration or restore procedure before this release
 can use it.
 
+Builds from #4506 (partition requests routed to their primaries) up to the
+release that adds the untrusted-log flag to `DoViewChange` must not run beside
+newer servers. A replica in that range reads a newer replica's empty view-change
+vote as a log without the latest writes and can drop acknowledged writes. Stop
+the cluster and upgrade every replica together. Older builds are not affected,
+because their frames carry incarnation zero and are rejected.
+
 Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
 `replicaId` component, changing constructor calls and record patterns. C# callers
 must initialize the required `ReplicaId` property. The CLI's cluster metadata list

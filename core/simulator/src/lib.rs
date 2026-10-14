@@ -11515,8 +11515,11 @@ mod applied_divergence_resync_tests {
 
     use super::*;
     use bytes::Bytes;
-    use consensus::Status;
-    use iggy_binary_protocol::{ConsensusHeader, DoViewChangeHeader, StartViewHeader};
+    use consensus::{StateTransferStage, Status};
+    use iggy_binary_protocol::{
+        ConsensusHeader, DoViewChangeHeader, StartViewHeader, StateTransferTargetHeader,
+    };
+    use partitions::state_transfer::PartitionTransferSession;
     use server_common::MessageBag;
 
     const CLIENT_ID: u128 = 1;
@@ -11637,7 +11640,7 @@ mod applied_divergence_resync_tests {
             Some(frontier),
             "the rebuild must record a frontier no history past the agreed ops minted"
         );
-        assert_eq!(shard.metrics().partition_applied_divergence_value(), 1);
+        assert_eq!(shard.metrics().partition_applied_divergences_value(), 1);
         let mut namespace_scratch = Vec::new();
         assert!(
             futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch)).is_none(),
@@ -11706,6 +11709,56 @@ mod applied_divergence_resync_tests {
         // The histories split at op 2 but the view carries only ops 4 and 5, so
         // nothing it holds confirms a shared op and the rebuild accepts any offer.
         adopt_multi_op_divergence(2, 2, &[], 0);
+    }
+
+    #[test]
+    fn given_contradicting_view_adopted_while_transfer_fetching_when_transfer_refused_should_fence_the_partition_for_resync()
+     {
+        const TRANSFER_NONCE: u128 = 0x4500;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let sim = applied_sends(namespace);
+        let live_frontier = offset_frontier(&sim, namespace);
+        let forged = forged_suffix(&sim, namespace, SENDS);
+        let incarnation = sim
+            .partition_incarnation(usize::from(DIVERGED), namespace)
+            .expect("the diverged replica hosts the partition");
+        let shard = sim.replicas[usize::from(DIVERGED)].partition_shard(namespace);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+            partition.transfer = Some(PartitionTransferSession {
+                nonce: TRANSFER_NONCE,
+                peer: 0,
+                commit_op: 0,
+                artifacts: Vec::new(),
+                target_accepted: false,
+                idle_ticks: 0,
+            });
+            let consensus = partition.consensus();
+            consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+            consensus.set_state_transfer_stage(StateTransferStage::Fetching);
+        }
+
+        futures::executor::block_on(
+            shard.on_message(MessageBag::StartView(start_view(&sim, namespace, &forged))),
+        );
+        let refusal =
+            Message::<StateTransferTargetHeader>::new(size_of::<StateTransferTargetHeader>())
+                .transmute_header(|_, header: &mut StateTransferTargetHeader| {
+                    header.command = Command::StateTransferTarget;
+                    header.cluster = 1;
+                    header.replica = 0;
+                    header.view = 3;
+                    header.group = namespace.inner();
+                    header.partition_incarnation = incarnation;
+                    header.nonce = TRANSFER_NONCE;
+                    header.available = 0;
+                    header.size = u32::try_from(size_of::<StateTransferTargetHeader>()).unwrap();
+                    header.seal();
+                });
+        futures::executor::block_on(shard.on_message(MessageBag::StateTransferTarget(refusal)));
+
+        assert_resynced(&sim, namespace, live_frontier - 1);
     }
 
     #[test]

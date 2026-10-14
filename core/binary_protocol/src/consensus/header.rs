@@ -1568,7 +1568,8 @@ pub struct DoViewChangeHeader {
     ///
     /// Every bit is must-understand: `validate` rejects one outside
     /// [`Self::FLAGS_KNOWN`]. `reserved` is not checked, so a later field carved
-    /// from it must be one an older receiver can safely ignore.
+    /// from it must be safe for an older receiver to ignore, or its release must
+    /// forbid mixed versions (see `core/server/README.md`, Upgrading).
     pub flags: u8,
     pub reserved: [u8; 59],
     pub partition_incarnation: u64,
@@ -3306,6 +3307,8 @@ mod tests {
         assert_eq!(prepare.verify_frame(), Ok(()));
     }
 
+    const DVC_PARTITION_INCARNATION: u64 = 0x0123_4567_89ab_cdef;
+
     /// A `DoViewChange` as a sender stamps it, with an empty suffix.
     fn do_view_change(flags: u8) -> DoViewChangeHeader {
         let mut header = control_header::<DoViewChangeHeader>();
@@ -3315,6 +3318,7 @@ mod tests {
         header.commit = 40;
         header.group = 9;
         header.flags = flags;
+        header.partition_incarnation = DVC_PARTITION_INCARNATION;
         header.seal();
         header
     }
@@ -3331,6 +3335,7 @@ mod tests {
         assert_eq!(frame.0[144..152], 9u64.to_le_bytes());
         assert_eq!(frame.0[152..156], 5u32.to_le_bytes());
         assert!(frame.0[157..216].iter().all(|&byte| byte == 0));
+        assert_eq!(frame.0[216..224], DVC_PARTITION_INCARNATION.to_le_bytes());
 
         let decoded = bytemuck::checked::try_from_bytes::<DoViewChangeHeader>(&frame.0)
             .expect("a stamped header is a valid bit pattern");

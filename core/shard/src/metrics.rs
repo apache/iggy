@@ -244,7 +244,7 @@ pub struct ShardMetrics {
     partitions_reconcile_failures_total: Counter,
     partitions_duplicate_builds_discarded_total: Counter,
     partition_transfer_refusals_total: Counter,
-    partition_applied_divergence_total: Counter,
+    partition_applied_divergences_total: Counter,
     partitions_untrusted_log: Gauge,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -322,7 +322,7 @@ impl ShardMetrics {
             partitions_reconcile_failures_total: Counter::default(),
             partitions_duplicate_builds_discarded_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
-            partition_applied_divergence_total: Counter::default(),
+            partition_applied_divergences_total: Counter::default(),
             partitions_untrusted_log: Gauge::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -617,14 +617,14 @@ impl ShardMetrics {
     /// the resync keeps the node serving, but the local copy it quarantined
     /// into `.fenced.N` holds an op the group did not keep.
     pub fn record_partition_applied_divergence(&self) {
-        self.partition_applied_divergence_total.inc();
+        self.partition_applied_divergences_total.inc();
     }
 
     /// Test-only read, mirroring the siblings.
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
-    pub fn partition_applied_divergence_value(&self) -> u64 {
-        self.partition_applied_divergence_total.get()
+    pub fn partition_applied_divergences_value(&self) -> u64 {
+        self.partition_applied_divergences_total.get()
     }
 
     /// Republished by every partition sweep: how many of this shard's
@@ -922,10 +922,10 @@ impl ShardMetrics {
             self.partition_transfer_refusals_total.clone(),
         );
         registry.register(
-            "partition_applied_divergence",
+            "partition_applied_divergences",
             "adopted views that contradicted an applied partition op; non-zero means committed \
              history diverged",
-            self.partition_applied_divergence_total.clone(),
+            self.partition_applied_divergences_total.clone(),
         );
         registry.register(
             "partitions_untrusted_log",

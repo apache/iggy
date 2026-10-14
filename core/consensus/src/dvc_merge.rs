@@ -454,6 +454,15 @@ pub fn merge_view_change(quorum: &DvcQuorumArray, quorums: MergeQuorums) -> Merg
         {
             return outcome;
         }
+        if let MergeOutcome::Deadlocked { undecided_op } = outcome {
+            tracing::warn!(
+                undecided_op,
+                trusted,
+                received,
+                "trusted logs deadlock at op {undecided_op}; merging every replica's log \
+                 without absence nacks instead"
+            );
+        }
     } else if received < quorums.replica_count {
         return MergeOutcome::AwaitingQuorum;
     }
