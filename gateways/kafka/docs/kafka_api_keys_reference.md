@@ -55,7 +55,7 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 0 | **Produce** | 3 † | 12 | v9 | 🔴 Bridge |
 | 1 | **Fetch** | 4 | 17 | v12 | 🔴 Bridge |
-| 2 | **ListOffsets** | 1 | 9 | v6 | 🟠 Required Stub |
+| 2 | **ListOffsets** | 1 | 9 | v6 | 🔴 Bridge |
 | 3 | **Metadata** | 1 | 12 | v9 | 🔴 Bridge |
 
 † See KAFKA-18659 librdkafka workaround above — advertise min=0 in ApiVersions response.
@@ -288,7 +288,7 @@ Key new minimums:
 | ----- | :---: | :---: | :---: |
 | Produce | v3-v9 | v12 | 3 versions behind |
 | Fetch | v4-v12 | v17 | 5 versions behind |
-| ListOffsets | v1-v6 | v9 | 3 versions behind |
+| ListOffsets | v1-v7 | v9 | 2 versions behind |
 | Metadata | v0-v9 | v12 | 3 versions behind |
 | ApiVersions | v0-v3 | v4 | 1 version behind |
 | CreateTopics | v2-v5 | v7 | 2 versions behind |

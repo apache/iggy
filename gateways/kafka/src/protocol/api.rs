@@ -166,14 +166,6 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// be stored. `DescribeConfigs` sends this when a requested key is unknown or a stored expiry
 /// cannot be shown as `retention.ms`.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
-/// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
-///
-/// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
-/// other than the two KIP-79 sentinels, since Iggy has no per-message timestamp index at all.
-/// Non-retriable, so a Java client resolves immediately instead of retrying
-/// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
-pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 =
-    ResponseError::UnsupportedForMessageFormat.code();
 /// `CreateTopics`, `DescribeConfigs`, and `AlterConfigs`: the request addressed more distinct
 /// topics than this bridge admits in one call.
 ///
