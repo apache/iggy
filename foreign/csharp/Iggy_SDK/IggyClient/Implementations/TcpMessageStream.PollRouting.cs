@@ -191,9 +191,9 @@ public sealed partial class TcpMessageStream
                     }
                     generation ??= route.Generation;
                     frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
+                    refusal = null;
                     if (Volatile.Read(ref _clusterNodeCount) <= 1)
                     {
-                        refusal = null;
                         var attempt = await SendVsrAttemptAsync(code, payload, Environment.TickCount64, deadline,
                             false, cancellation.Token, captured.Value, frame,
                             retryTransient: VsrOperations.ForCode(code) != VsrOperation.NonReplicated);
@@ -208,7 +208,6 @@ public sealed partial class TcpMessageStream
                         }
                         return attempt.Response!;
                     }
-                    refusal = null;
                     return await SendPrimaryOnceAsync(target.Key, code, payload, route, captured.Value,
                         frame.Value, deadline, cancellation.Token);
                 }
@@ -238,12 +237,16 @@ public sealed partial class TcpMessageStream
                     refreshHistory = false;
                     captured = null;
                     frame = null;
+                    refusal = error;
                 }
+                // The partition plane does not commit LIFECYCLE_BUSY today. A routed request still handles it, so a
+                // server that starts committing it needs no client change.
                 catch (IggyInvalidStatusCodeException error) when (error.FromServer
                     && error.StatusCode == VsrError.LIFECYCLE_BUSY
                     && error.CommandCode == code
                     && Environment.TickCount64 + lifecycleInterval < deadline)
                 {
+                    refusal = error;
                     await Task.Delay(lifecycleInterval, cancellation.Token);
                     lifecycleInterval = Math.Min(lifecycleInterval * 2, LifecycleRetryMaxIntervalMs);
                     frame = null;
@@ -262,6 +265,15 @@ public sealed partial class TcpMessageStream
             }
 
             throw new VsrRequestOutcomeUnknownException(error);
+        }
+        // The read timer of a route lookup fires at the same deadline as the budget and turns into a timeout
+        // IOException when it wins. A kept refusal means no send started since, so it still decides the outcome.
+        catch (IOException) when (refusal is not null
+            && Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
+        {
+            RemovePartitionRoute(target.Key);
+            ExceptionDispatchInfo.Throw(refusal);
+            throw;
         }
     }
 

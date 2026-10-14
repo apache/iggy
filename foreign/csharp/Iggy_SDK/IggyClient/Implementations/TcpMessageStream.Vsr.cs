@@ -641,6 +641,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         var leaderRedirects = 0;
         var redirectBudgetLogged = false;
         var walkingRoster = false;
+        var rosterWalkRestarted = false;
         HashSet<string> walkedRosterEndpoints = new(StringComparer.OrdinalIgnoreCase);
         VsrConnection? lastConnection = null;
 
@@ -668,7 +669,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     }
                     && !isLoginRegister
                     && allowRedirect
-                    && Environment.TickCount64 < overallDeadline)
+                    && Environment.TickCount64 + PollRoutingRetryIntervalMs < overallDeadline)
                 {
                     var moved = false;
                     if (leaderRedirects < VsrMaxLeaderRedirects && !walkingRoster)
@@ -683,6 +684,16 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     if (!moved && attempt.Error is not IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
                     {
                         moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
+                        if (!moved && walkingRoster && !rosterWalkRestarted)
+                        {
+                            // A node that refused earlier can serve the request once it catches up, like a
+                            // partition primary that had not materialised the partition yet. Every hop also drops
+                            // the poll connections, so the walk restarts once and then stays on the current node.
+                            rosterWalkRestarted = true;
+                            walkedRosterEndpoints.Clear();
+                            moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
+                        }
+
                         walkingRoster |= moved;
                     }
 
@@ -701,7 +712,12 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                             _currentAddress);
                     }
 
-                    continue;
+                    // The redirect and reconnect run without a deadline, so a fresh attempt past the budget
+                    // would read no reply and turn this refusal into an unknown outcome.
+                    if (Environment.TickCount64 + PollRoutingRetryIntervalMs < overallDeadline)
+                    {
+                        continue;
+                    }
                 }
 
                 if (attempt.Error is VsrSessionEvictedException evicted)
@@ -741,7 +757,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// <summary>
     ///     Moves to the next unvisited roster endpoint after a never-admitted refusal. Metadata and partition
     ///     groups elect independently, so the metadata leader is not necessarily the primary for the request's
-    ///     partition. The caller's request deadline and redirect budget bound the walk.
+    ///     partition. The caller's request deadline bounds the walk, and the caller restarts a finished walk once.
     /// </summary>
     private async Task<bool> RedirectToNextRosterNodeAsync(HashSet<string> visited, CancellationToken token)
     {
