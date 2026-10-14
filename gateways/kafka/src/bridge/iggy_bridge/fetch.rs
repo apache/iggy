@@ -31,7 +31,7 @@ use tokio::time::{Instant, timeout_at};
 
 use super::offsets::high_watermark;
 use super::{
-    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, with_request_timeout,
+    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, sign_out_and_shut_down,
 };
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
@@ -77,7 +77,7 @@ impl FetchPool {
         })
     }
 
-    /// Shuts down each client that connected. See [`LazyClient::close_all`].
+    /// Closes each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         LazyClient::close_all(&self.all).await
     }
@@ -99,6 +99,12 @@ impl LazyClient {
         Self(Arc::new(AsyncMutex::new(Some(client))))
     }
 
+    /// Puts `client` in hand, so a test needs no server.
+    #[cfg(test)]
+    pub(super) async fn hold(&self, client: Arc<IggyClient>) {
+        *self.0.lock().await = Some(client);
+    }
+
     /// The client, connected at the first call. Callers that come during a connect wait for it.
     pub(super) async fn connected(
         &self,
@@ -112,6 +118,24 @@ impl LazyClient {
         *held = Some(Arc::clone(&connected));
         drop(held);
         Ok(connected)
+    }
+
+    /// The client, if it connected.
+    pub(super) async fn held(&self) -> Option<Arc<IggyClient>> {
+        self.0.lock().await.clone()
+    }
+
+    /// Forgets `client` and closes its connection once the call running on it ends. For a send
+    /// that was given up on: the SDK goes on writing it, and it must not land after a later send
+    /// on a new connection.
+    ///
+    /// No timeout. The SDK ends a call by its 30 s read deadline, and a new connection opened
+    /// before that could send ahead of it.
+    pub(super) async fn retire(&self, client: &IggyClient) {
+        self.0.lock().await.take();
+        if let Err(error) = client.shutdown().await {
+            tracing::debug!(%error, "failed to shut down a retired Iggy client");
+        }
     }
 
     /// Runs `call` until `deadline`. A call that times out drops the client.
@@ -129,15 +153,15 @@ impl LazyClient {
         result
     }
 
-    /// Shuts the client down, if it connected.
+    /// Signs the client out and shuts it down, if it connected.
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         let Some(client) = self.0.lock().await.take() else {
             return Ok(());
         };
-        with_request_timeout(client.shutdown()).await
+        sign_out_and_shut_down(&client).await
     }
 
-    /// Shuts down each client that connected, and returns the first error. A client that fails to
+    /// Closes each client that connected, and returns the first error. A client that fails to
     /// shut down stops none of the others.
     pub(super) async fn close_all(
         clients: impl IntoIterator<Item = &Self>,

@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, ProduceSessionLimits, TopicMapping,
 };
 use iggy_gateway_kafka::server::bind_listener;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
@@ -334,6 +334,7 @@ async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> B
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        produce_sessions: ProduceSessionLimits::default(),
     };
     let bridge = IggyBridge::connect(config)
         .await

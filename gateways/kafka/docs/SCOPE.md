@@ -193,7 +193,8 @@ below it are still open for the issues that build on top of it.
 - [x] Produce → `send_messages` ([#3535](https://github.com/apache/iggy/issues/3535)) - one call
       per partition, base offset from the send confirmation, one error code per partition. See
       [README.md](../README.md#produce-3535).
-- [ ] Produce: `IggyClient` pool. Pin each partition to one client, so order holds.
+- [x] Produce: `IggyClient` pool, one client per producer, so a producer's batches land in order.
+      See [README.md](../README.md#concurrency-ceiling) and [IDEMPOTENCE.md](IDEMPOTENCE.md).
 - [ ] Produce: write keyed records' header TLVs into one buffer (`records::to_iggy`). Benchmark
       first. Keep Iggy's TLV layout and the 100 KB header check.
 - [ ] Produce: skip the second batch CRC pass (`records::preflight`) only if profiling shows it
@@ -407,8 +408,8 @@ InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
-      transactional request is refused. The producer-id-keyed connection pool that would make
-      retries deduplicated is deferred - delivery stays at-least-once
+      transactional request is refused
+- [ ] Deduplicate an idempotent producer's retries. Delivery stays at-least-once until then
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).

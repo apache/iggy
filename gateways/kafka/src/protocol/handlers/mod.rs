@@ -111,7 +111,7 @@ pub async fn dispatch(
     body: Bytes,
 ) -> HandleOutcome {
     match api_key {
-        API_KEY_PRODUCE => produce::handle(state, api_version, body).await,
+        API_KEY_PRODUCE => produce::handle(state, connection, principal, api_version, body).await,
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
         API_KEY_METADATA => metadata::handle(state, api_version, body).await,
