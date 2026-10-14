@@ -550,10 +550,20 @@ fn nested_table_rows(
             }
             if line == row_boundary {
                 let next_line = lines.next().ok_or("next topic property is missing")?;
-                let (next_key, _) = nested_table_body(next_line)?;
-                if next_key.trim().is_empty() || next_key.trim() == property {
-                    return Err("nested table boundary does not start another property");
+                let (next_key, next_value) = nested_table_body(next_line)?;
+                if property != "Partitions" || next_key.trim() != "Options" {
+                    return Err("nested table boundary does not start the options section");
                 }
+                if next_key.chars().count() != key.chars().count()
+                    || next_value.chars().count() != value.chars().count()
+                {
+                    return Err("options section does not match the outer table widths");
+                }
+                let options_output = std::iter::once(next_line)
+                    .chain(lines)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                nested_table_rows(&options_output, "Options", 2)?;
             }
             return Ok(rows);
         }
@@ -768,6 +778,61 @@ fn nested_rows_reject_boundaries_followed_by_partition_records() {
     let boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
     let stdout = nested_rows_fixture(&[&valid, &boundary, "| | truncated |"]);
     assert!(nested_table_rows(&stdout, "Partitions", 6).is_err());
+}
+
+#[test]
+fn nested_rows_reject_forged_property_boundary() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    let boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
+    let stdout = nested_rows_fixture(&[
+        &valid,
+        &boundary,
+        "| Fake       | irrelevant |",
+        "| | truncated |",
+    ]);
+    assert!(nested_table_rows(&stdout, "Partitions", 6).is_err());
+}
+
+#[test]
+fn nested_rows_validate_complete_options_transition() {
+    let valid = format!("|            | {VALID_PARTITION} |");
+    let stdout = nested_rows_fixture(&[&valid]);
+    let options_start = stdout.find("| Options").unwrap();
+    let (partitions, options) = stdout.split_at(options_start);
+    let options_header = options.lines().next().unwrap();
+    let unclosed_options = options
+        .lines()
+        .filter(|line| !line.starts_with('+'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for malformed_options in [
+        options.replacen("| Options    |", "| Unknown    |", 1),
+        options.replacen(
+            "Option                    | Value",
+            "Bogus                     | Value",
+            1,
+        ),
+        options.replacen('=', "-", 1),
+        options.replacen(
+            "consumer_offset_durability | persisted",
+            "consumer_offset_durability |",
+            1,
+        ),
+        options.replacen(options_header, "| Options    | Option | Value |", 1),
+        format!("{options_header}\n"),
+        unclosed_options,
+    ] {
+        assert!(
+            nested_table_rows(&format!("{partitions}{malformed_options}"), "Partitions", 6)
+                .is_err(),
+            "invalid options section must invalidate partition parsing: {malformed_options}"
+        );
+    }
+    assert_eq!(
+        nested_table_rows(&stdout, "Partitions", 6).unwrap().len(),
+        2
+    );
+    assert_eq!(nested_table_rows(&stdout, "Options", 2).unwrap().len(), 2);
 }
 
 #[test]
