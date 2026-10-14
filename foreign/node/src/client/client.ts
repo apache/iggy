@@ -15,24 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { RawClient, ClientConfig, ClientConfigOrString } from './client.type.js';
-import { getRawClient } from './client.socket.js';
+import type { RawClient, ClientConfig, ClientConfigOrString, ClientEventMap } from './client.type.js';
+import { CommandResponseStream, getRawClient } from './client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { normalizeClientConfig } from './client.config.js';
 
 /** Every facade call shares one session and its independently multiplexed replica links. */
 export class Client extends CommandAPI {
   readonly _config: ClientConfig;
+  private readonly events: CommandResponseStream;
 
   constructor(config: ClientConfigOrString) {
     const normalized = normalizeClientConfig(config);
-    const client = getRawClient(normalized);
+    const client = new CommandResponseStream(normalized);
     super(async () => client);
     this._config = normalized;
+    this.events = client;
   }
 
-  async destroy(): Promise<void> {
-    (await this.clientProvider()).destroy();
+  /** Registers a listener for a connection lifecycle event. */
+  on<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
+    this.events.on(event, listener);
+    return this;
+  }
+
+  /** Registers a listener for the next occurrence only. */
+  once<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
+    this.events.once(event, listener);
+    return this;
+  }
+
+  /** Removes a listener registered with `on` or `once`. */
+  off<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
+    this.events.off(event, listener);
+    return this;
+  }
+
+  /** Alias used by `node:events` to remove its temporary listeners. */
+  removeListener<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
+    return this.off(event, listener);
+  }
+
+  /** Cancels calls immediately and resolves after the final `end` event. */
+  destroy(): Promise<void> {
+    return this.events.destroy();
   }
 }
 

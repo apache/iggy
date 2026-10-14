@@ -127,6 +127,8 @@ export class CommandResponseStream extends EventEmitter {
   private readonly vsrSession = new VsrSession();
   private readonly lanes: MutationLanes;
   private readonly replicas = new Map<number, ReplicaSlot>();
+  private readonly connections = new Set<IggyConnection>();
+  private destroyPromise?: Promise<void>;
   private readonly partitionRoutes = new Map<string, CachedRoute>();
   private readonly changed = new ChangeSignal();
   private readonly lifetime = new AbortController();
@@ -731,7 +733,25 @@ export class CommandResponseStream extends EventEmitter {
   }
 
   private connectionFor(endpoint: Endpoint): IggyConnection {
+    this.lifetime.signal.throwIfAborted();
     const connection = new IggyConnection({ ...this.options, options: { ...this.options.options, ...endpoint } });
+    this.connections.add(connection);
+    connection.on('connecting', () => {
+      if (!this.lifetime.signal.aborted) this.emit('connecting');
+    });
+    connection.on('connect', () => {
+      if (!this.lifetime.signal.aborted) this.emit('connected');
+    });
+    connection.on('error', (error: Error) => {
+      if (!this.lifetime.signal.aborted && this.listenerCount('error') > 0)
+        this.emit('error', error);
+    });
+    connection.once('disconnected', () => {
+      if (!connection.socket || connection.socket.closed)
+        this.connections.delete(connection);
+      else
+        connection.socket.once('close', () => this.connections.delete(connection));
+    });
     connection.on('eviction', (error) => this.emit('eviction', error));
     return connection;
   }
@@ -971,10 +991,18 @@ export class CommandResponseStream extends EventEmitter {
     return connection.socket;
   }
 
-  destroy(): void {
+  destroy(): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
+    const closed = [...this.connections].map((connection) => {
+      const socket = connection.socket;
+      return !socket || socket.closed ? Promise.resolve() :
+        new Promise<void>((resolve) => socket.once('close', () => resolve()));
+    });
+    this.destroyPromise = Promise.all(closed).then(() => { this.emit('end'); });
     this.rememberedCredentials = undefined;
     this.lifetime.abort(new Error('client destroyed'));
     this.resetSession();
+    return this.destroyPromise;
   }
 }
 

@@ -147,6 +147,10 @@ export class IggyConnection extends EventEmitter {
       signal?.throwIfAborted();
       const socket = getTransport(this.config);
       this.socket = socket;
+      process.nextTick(() => {
+        if (!this.ending && !this.failed)
+          this.emit('connecting');
+      });
       const ready = this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
       socket.on('data', (data) => this.onData(data));
       socket.on('error', (error) => this.fail(error));
