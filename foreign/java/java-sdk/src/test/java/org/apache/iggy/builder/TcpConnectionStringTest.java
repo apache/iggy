@@ -34,14 +34,14 @@ class TcpConnectionStringTest {
     void shouldParseDefaultScheme() {
         TcpConnectionString parsed = TcpConnectionString.parse("iggy://iggy:secret@localhost:8090");
 
-        assertThat(parsed).isEqualTo(new TcpConnectionString("localhost", 8090, "iggy", "secret", false));
+        assertThat(parsed).isEqualTo(new TcpConnectionString("localhost", 8090, "iggy", "secret", false, null));
     }
 
     @Test
     void shouldParseTcpScheme() {
         TcpConnectionString parsed = TcpConnectionString.parse("iggy+tcp://user:pass@10.0.0.5:3000");
 
-        assertThat(parsed).isEqualTo(new TcpConnectionString("10.0.0.5", 3000, "user", "pass", false));
+        assertThat(parsed).isEqualTo(new TcpConnectionString("10.0.0.5", 3000, "user", "pass", false, null));
     }
 
     @Test
@@ -52,6 +52,15 @@ class TcpConnectionStringTest {
         assertThat(TcpConnectionString.parse("iggy://iggy:iggy@localhost:8090?tls=false")
                         .tls())
                 .isFalse();
+    }
+
+    @Test
+    void shouldParseTlsCaFileOption() {
+        TcpConnectionString parsed =
+                TcpConnectionString.parse("iggy://iggy:iggy@localhost:8090?tls=true&tls_ca_file=/certs/ca.pem");
+
+        assertThat(parsed.tls()).isTrue();
+        assertThat(parsed.tlsCaFile()).isEqualTo("/certs/ca.pem");
     }
 
     @Test
@@ -141,9 +150,20 @@ class TcpConnectionStringTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"tls", "tls=", "tls=yes", "tls=true&", "tls=true=false"})
-    void shouldRejectInvalidTlsOption(String options) {
+    @ValueSource(strings = {"tls", "tls=", "tls=yes", "tls=true&", "tls=true=false", "tls_ca_file="})
+    void shouldRejectInvalidOptionValue(String options) {
         assertInvalid("iggy://iggy:iggy@localhost:8090?" + options, "Invalid connection string");
+    }
+
+    @Test
+    void shouldRejectEmptyOptions() {
+        assertInvalid("iggy://iggy:iggy@localhost:8090?", "Invalid connection string");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"tls=true&tls=false", "tls_ca_file=a.pem&tls_ca_file=b.pem"})
+    void shouldRejectRepeatedOptions(String options) {
+        assertInvalid("iggy://iggy:iggy@localhost:8090?" + options, "must not be set more than once");
     }
 
     @Test
