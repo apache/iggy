@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -318,9 +319,9 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// `bridge` is `None` until `IGGY_KAFKA_BRIDGE_ENABLED` turns it on. A handler that finds `None`
 /// answers with its stub, so APIs can be wired one at a time.
 ///
-/// Every Iggy call but a Fetch poll, a topic probe and an offset call goes through one lockstep
-/// `IggyClient`, so Kafka connections serialize behind whichever of those calls is in flight. The
-/// `Arc` does not change that. See the README's "Concurrency ceiling".
+/// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
+/// `DescribeConfigs` and `AlterConfigs` share one lockstep `IggyClient`, so those calls run one
+/// at a time across connections. See the README's "Concurrency ceiling".
 pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
@@ -331,8 +332,12 @@ pub struct GatewayState {
     /// Shared across every connection this gateway serves: a producer id has to be unique for
     /// the process, not for the connection that asked for it.
     pub producer_ids: ProducerIdAllocator,
-    /// Produce requests that decode and send at once. Caps their memory.
-    pub(crate) produce_slots: Semaphore,
+    /// `PRODUCE_CAPS` partition caps, in frame bytes, that Produce may hold decoded at once. Caps
+    /// its memory. A request takes what its largest partition may decode, and a send that
+    /// outlives the request keeps it while it owns the decoded partition.
+    pub(crate) produce_memory: Arc<Semaphore>,
+    /// `PRODUCE_LARGE` slots a large Produce request takes before its memory. Small ones skip it.
+    pub(crate) produce_large: Arc<Semaphore>,
     /// Consumer group membership. Process-wide and independent of the bridge: a member outlives
     /// the connection that created it, and group coordination needs no Iggy call.
     pub groups: GroupCoordinator,
@@ -343,9 +348,15 @@ pub struct GatewayState {
     pub(crate) probe_board: ProbeBoard,
 }
 
-/// Each holds one decoded partition at a time, so about 160 MB at the default 8 MiB frame. Sends
-/// run one at a time anyway.
-const PRODUCE_SLOTS: usize = 4;
+/// Large Produce requests that decode and send at once. More at once only contend for the
+/// gateway's workers and for Iggy: at full load they cost CPU and gave no throughput.
+const PRODUCE_LARGE: usize = 4;
+
+/// Partition caps Produce may hold decoded at once, about 200 MB at the default 8 MiB frame.
+///
+/// Counted in bytes, not requests, so a small request takes a small share. One cap more than the
+/// large slots: large requests can hold a cap each, and the small ones still have one.
+const PRODUCE_CAPS: usize = PRODUCE_LARGE + 1;
 
 impl GatewayState {
     #[must_use]
@@ -363,7 +374,12 @@ impl GatewayState {
             max_frame_size,
             sasl_enabled,
             producer_ids: ProducerIdAllocator::new(instance_id),
-            produce_slots: Semaphore::const_new(PRODUCE_SLOTS),
+            produce_memory: Arc::new(Semaphore::new(
+                PRODUCE_CAPS
+                    .saturating_mul(max_frame_size)
+                    .min(Semaphore::MAX_PERMITS),
+            )),
+            produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
             probe_board: ProbeBoard::default(),
@@ -400,9 +416,27 @@ pub struct ConnectionState {
     /// The member that last sent a Heartbeat here. An offset call caps its hold by that member's
     /// session, since its next heartbeat waits behind the call.
     heartbeat_member: Mutex<Option<GroupMember>>,
+    /// Keys the Produce session of a producer without a producer id that this gateway gave out.
+    id: ConnectionId,
+}
+
+/// A Kafka connection's number, unique in the process.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionId(u64);
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 impl ConnectionState {
+    pub(crate) const fn id(&self) -> u64 {
+        self.id.0
+    }
+
     pub(crate) fn note_heartbeat(&self, member: GroupMember) {
         *self
             .heartbeat_member

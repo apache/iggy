@@ -84,5 +84,6 @@ func (c *IggyTcpClient) DeleteStream(ctx context.Context, id iggcon.Identifier) 
 		return err
 	}
 	c.topics.dropStream(encodedStream(id))
+	c.polls.clearRoutes()
 	return nil
 }

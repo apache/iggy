@@ -19,8 +19,17 @@
 //! client- and replica-bound frames instead of writing to sockets, and the
 //! builders below assemble minimal shards and wire frames.
 
-use consensus::{LocalPipeline, VsrConsensus};
-use iggy_binary_protocol::{Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader};
+use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
+use futures::channel::oneshot;
+use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::requests::topics::{
+    CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+};
+use iggy_binary_protocol::{
+    Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireEncode,
+    WireIdentifier, WireName, WireOptions,
+};
 use iggy_common::variadic;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::RequestHandler;
@@ -33,13 +42,14 @@ use message_bus::{
     JoinHandle, MessageBus, ReplicaForwardFn, ReplicaHandshakeDoneFn, SendError,
     SharedTlsServerConfig,
 };
-use metadata::impls::metadata::IggySnapshot;
+use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
+use metadata::stm::StateMachine as _;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use metadata::{IggyMetadata, MuxStateMachine};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
 use server_common::iobuf::Frozen;
-use server_common::sharding::ShardId;
+use server_common::sharding::{IggyNamespace, ShardId};
 use server_common::{MESSAGE_ALIGN, Message};
 use shard::shards_table::PapayaShardsTable;
 use shard::{IggyShard, PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
@@ -67,10 +77,17 @@ pub struct SpyBus {
     /// on this bus.
     pub connection_lost_hooks: Rc<Cell<usize>>,
     /// Resolve [`MessageBus::sleep`] immediately instead of arming a real
-    /// timer. The register forward is the only path here that races a
-    /// timer, and its budget is five seconds -- too long to wait for in a
-    /// unit test, and too long to shorten in production for one.
+    /// timer. The register forward budget of five seconds and the default
+    /// lifecycle relay wait of 1.5 s are too long to wait for in a unit test,
+    /// and too long to shorten in production for one.
     pub instant_timers: Rc<Cell<bool>>,
+    /// Holds the next [`MessageBus::sleep`], whatever its duration, until the
+    /// test sends on or drops the paired sender. Wins over `instant_timers`.
+    pub held_timer: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
+    /// Every [`MessageBus::sleep`] duration, in call order.
+    pub sleeps: Rc<RefCell<Vec<std::time::Duration>>>,
+    /// Pins [`MessageBus::realtime_micros`]. `None` reads the system clock.
+    pub realtime: Rc<Cell<Option<u64>>>,
 }
 
 impl SpyBus {
@@ -118,9 +135,18 @@ impl MessageBus for SpyBus {
         Ok(())
     }
     async fn sleep(&self, duration: std::time::Duration) {
-        if !self.instant_timers.get() {
+        self.sleeps.borrow_mut().push(duration);
+        let held = self.held_timer.borrow_mut().take();
+        if let Some(release) = held {
+            let _ = release.await;
+        } else if !self.instant_timers.get() {
             compio::time::sleep(duration).await;
         }
+    }
+    fn realtime_micros(&self) -> u64 {
+        self.realtime
+            .get()
+            .unwrap_or_else(|| iggy_common::IggyTimestamp::now().as_micros())
     }
     fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
     fn set_replica_forward_fn(&self, _f: ReplicaForwardFn) {}
@@ -323,4 +349,53 @@ pub fn prepare_message(
     // A real identity, not a placeholder: `on_replicate` recomputes it before the
     // prepare reaches the WAL, so an arbitrary value reads as transit corruption.
     consensus::seal_prepare_checksum(message)
+}
+
+/// Creates one stream with one single-partition topic, and returns the
+/// namespace of its partition. No route names the partition yet.
+pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
+    const VSR_CLIENT_ID: u128 = 1;
+    let metadata = shard.plane.metadata();
+    metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+    metadata
+        .mux_stm
+        .update(prepare_message(
+            Operation::CreateStream,
+            VSR_CLIENT_ID,
+            1,
+            &CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes(),
+        ))
+        .unwrap();
+    metadata
+        .mux_stm
+        .update(prepare_message(
+            Operation::CreateTopicWithAssignments,
+            VSR_CLIENT_ID,
+            2,
+            &CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                }],
+                created_view: 0,
+            }
+            .to_bytes(),
+        ))
+        .unwrap();
+    metadata
+        .mux_stm
+        .streams()
+        .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
+        .unwrap()
 }

@@ -36,7 +36,6 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -46,8 +45,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_CLUSTER_METADATA_CODE;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_POLL_ROUTING_CODE;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.GET_PARTITION_ROUTE_CODE;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_NON_REPLICATED;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.POLL_CODE;
@@ -67,19 +67,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientRawRequestTest {
     private static final int SEND_CODE = 101;
-    private static final int GET_SEND_CONTEXT_CODE = 105;
+    private static final int GET_PARTITION_ROUTE_CODE = 105;
     private static final int STORE_OFFSET_CODE = 121;
     private static final int DELETE_OFFSET_CODE = 122;
-    private static final int GET_OFFSET_ROUTING_CODE = 123;
+    private static final int GET_OFFSET_ROUTING_CODE = 105;
     private static final int OPERATION_SEND_MESSAGES = 160;
     private static final int OPERATION_STORE_CONSUMER_OFFSET = 161;
     private static final int OPERATION_DELETE_CONSUMER_OFFSET = 162;
     private static final int INVALID_COMMAND = 3;
     private static final int FEATURE_UNAVAILABLE = 5;
     private static final int HISTORY_UNAVAILABLE = 87;
-    private static final int ROUTE_ATTACHMENT_BYTES = 32;
+    private static final int GET_OFFSET_CODE = 120;
+    private static final int OPTIONAL_PARTITION_BYTES = 5;
     private static final long INCARNATION = 5;
-    private static final long OWNER_GENERATION = 6;
+    private static final long OWNER_GENERATION = 0;
     private static final long METADATA_OP = 7;
     private static final StreamId STREAM = StreamId.of(1L);
     private static final TopicId TOPIC = TopicId.of(2L);
@@ -107,77 +108,94 @@ class AsyncIggyTcpClientRawRequestTest {
 
                     assertThat(requests)
                             .extracting(AsyncIggyTcpClientRawRequestTest::code)
-                            .containsExactly(GET_SEND_CONTEXT_CODE, SEND_CODE, SEND_CODE, SEND_CODE);
+                            .containsExactly(
+                                    GET_PARTITION_ROUTE_CODE,
+                                    SEND_CODE,
+                                    GET_PARTITION_ROUTE_CODE,
+                                    SEND_CODE,
+                                    SEND_CODE);
                     assertThat(requests.get(0).body())
                             .isEqualTo(bytes(
                                     toBytes(STREAM),
                                     toBytes(TOPIC),
                                     Unpooled.buffer().writeIntLE(3)));
-                    assertCapturedContext(requests.subList(1, requests.size()));
+                    assertCapturedContext(requests.stream()
+                            .filter(request -> code(request) == SEND_CODE)
+                            .toList());
                 });
     }
 
     @Test
-    void shouldKeepTheCapturedContextWhenARawSendFailsOverToAnotherNode() throws Exception {
+    void shouldKeepTheRequestIdAndContextWhenARawSendIsRefusedByThePrimary() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
-        try (ServerSocket oldLeaderSocket = new ServerSocket(0, 1, loopback);
-                ServerSocket newLeaderSocket = new ServerSocket(0, 1, loopback)) {
-            int oldPort = oldLeaderSocket.getLocalPort();
-            int newPort = newLeaderSocket.getLocalPort();
-            List<Request> refusedSends = new CopyOnWriteArrayList<>();
-            List<Request> acceptedSends = new CopyOnWriteArrayList<>();
-            CompletableFuture<Void> oldLeader = serve(oldLeaderSocket, request -> {
-                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(
-                            OPERATION_NON_REPLICATED,
-                            clusterMetadata(oldPort, newPort, refusedSends.isEmpty() ? oldPort : newPort));
-                }
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
+                ServerSocket primarySocket = new ServerSocket(0, 4, loopback)) {
+            List<Request> sends = new CopyOnWriteArrayList<>();
+            List<Request> controls = new CopyOnWriteArrayList<>();
+            AtomicInteger routes = new AtomicInteger();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                controls.add(request);
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (code(request) == GET_SEND_CONTEXT_CODE) {
-                    return respond(request);
-                }
-                if (code(request) == SEND_CODE) {
-                    refusedSends.add(request);
-                    return Response.error(OPERATION_SEND_MESSAGES, TRANSIENT_NOT_ACCEPTED);
-                }
-                throw new IllegalStateException("Unexpected request to old leader: " + request);
-            });
-            CompletableFuture<Void> newLeader = serve(newLeaderSocket, request -> {
                 if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, clusterMetadata(oldPort, newPort, newPort));
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(
+                                    coordinatorSocket.getLocalPort(),
+                                    primarySocket.getLocalPort(),
+                                    coordinatorSocket.getLocalPort()));
                 }
-                if (request.operation() == OPERATION_REGISTER) {
-                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                if (code(request) == GET_PARTITION_ROUTE_CODE) {
+                    routes.incrementAndGet();
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            Unpooled.buffer()
+                                    .writeLongLE(INCARNATION + routes.get() - 1)
+                                    .writeLongLE(METADATA_OP)
+                                    .writeIntLE(routes.get())
+                                    .writeIntLE(1)
+                                    .writeByte(1));
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            CompletableFuture<Void> primary = serve(primarySocket, 2, request -> {
+                if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                    controls.add(request);
+                    return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                 }
                 if (code(request) == SEND_CODE) {
-                    acceptedSends.add(request);
-                    return respond(request);
+                    sends.add(request);
+                    return sends.size() == 1
+                            ? Response.error(OPERATION_SEND_MESSAGES, AsyncTcpConnection.NOT_PRIMARY)
+                            : respond(request);
                 }
-                throw new IllegalStateException("Unexpected request to new leader: " + request);
+                throw new IllegalStateException("Unexpected primary request: " + request);
             });
-            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
-                    .host(loopback.getHostAddress())
-                    .port(oldPort)
-                    .credentials("iggy", "iggy")
-                    .requestTimeout(Duration.ofSeconds(10))
-                    .build();
+            AsyncIggyTcpClient client = client(coordinatorSocket);
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
                 client.sendBinaryRequest(SEND_CODE, rawSend(Partitioning.partitionId(3L)))
-                        .get(10, TimeUnit.SECONDS);
-
-                assertThat(client.getConnectionInfo().port()).isEqualTo(newPort);
-                assertThat(acceptedSends).hasSize(1);
-                assertCapturedContext(refusedSends);
-                assertCapturedContext(acceptedSends);
+                        .get(5, TimeUnit.SECONDS);
+                assertThat(client.getConnectionInfo().port()).isEqualTo(coordinatorSocket.getLocalPort());
+                assertThat(routes).hasValue(2);
+                assertThat(sends).hasSize(2);
+                assertThat(sends)
+                        .extracting(Request::requestId)
+                        .containsOnly(sends.get(0).requestId());
+                assertCapturedContext(sends);
+                assertThat(controls.stream()
+                                .filter(request -> request.requestId() != 0)
+                                .map(Request::requestId)
+                                .toList())
+                        .doesNotHaveDuplicates()
+                        .doesNotContain(sends.get(0).requestId());
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
-            oldLeader.get(5, TimeUnit.SECONDS);
-            newLeader.get(5, TimeUnit.SECONDS);
+            coordinator.get(5, TimeUnit.SECONDS);
+            primary.get(5, TimeUnit.SECONDS);
         }
     }
 
@@ -196,8 +214,16 @@ class AsyncIggyTcpClientRawRequestTest {
                     assertThat(requests)
                             .extracting(AsyncIggyTcpClientRawRequestTest::code)
                             .containsExactly(
-                                    GET_POLL_ROUTING_CODE, POLL_CODE, POLL_CODE, GET_POLL_ROUTING_CODE, POLL_CODE);
-                    assertThat(requests.get(0).body()).isEqualTo(rawPoll());
+                                    GET_PARTITION_ROUTE_CODE,
+                                    POLL_CODE,
+                                    POLL_CODE,
+                                    GET_PARTITION_ROUTE_CODE,
+                                    POLL_CODE);
+                    assertThat(requests.get(0).body())
+                            .isEqualTo(bytes(
+                                    toBytes(STREAM),
+                                    toBytes(TOPIC),
+                                    Unpooled.buffer().writeIntLE(0)));
                     assertCapturedContext(List.of(requests.get(1), requests.get(2), requests.get(4)));
                 });
     }
@@ -211,8 +237,49 @@ class AsyncIggyTcpClientRawRequestTest {
             assertThat(requests)
                     .extracting(AsyncIggyTcpClientRawRequestTest::code)
                     .containsExactly(GET_OFFSET_ROUTING_CODE, STORE_OFFSET_CODE, DELETE_OFFSET_CODE);
-            assertThat(requests.get(0).body()).isEqualTo(bytes(offsetTarget()));
+            assertThat(requests.get(0).body())
+                    .isEqualTo(bytes(
+                            toBytes(STREAM), toBytes(TOPIC), Unpooled.buffer().writeIntLE(0)));
             assertCapturedContext(List.of(requests.get(1), requests.get(2)));
+        });
+    }
+
+    @Test
+    void shouldShareOneRouteAcrossEveryPartitionCommand() throws Exception {
+        assertRawRequests(request -> null, (client, requests) -> {
+            client.sendBinaryRequest(SEND_CODE, rawSend(Partitioning.partitionId(0L)))
+                    .get(5, TimeUnit.SECONDS);
+            client.sendBinaryRequest(POLL_CODE, rawPoll()).get(5, TimeUnit.SECONDS);
+            client.sendBinaryRequest(GET_OFFSET_CODE, bytes(offsetTarget())).get(5, TimeUnit.SECONDS);
+            client.sendBinaryRequest(STORE_OFFSET_CODE, rawStoreOffset()).get(5, TimeUnit.SECONDS);
+            client.sendBinaryRequest(DELETE_OFFSET_CODE, rawDeleteOffset()).get(5, TimeUnit.SECONDS);
+            assertThat(requests)
+                    .extracting(AsyncIggyTcpClientRawRequestTest::code)
+                    .containsExactly(
+                            GET_PARTITION_ROUTE_CODE,
+                            SEND_CODE,
+                            POLL_CODE,
+                            GET_OFFSET_CODE,
+                            STORE_OFFSET_CODE,
+                            DELETE_OFFSET_CODE);
+            assertCapturedContext(requests.subList(1, requests.size()));
+        });
+    }
+
+    @Test
+    void shouldRejectMissingMutationAndGroupPartitionsLocally() throws Exception {
+        assertRawRequests(request -> null, (client, requests) -> {
+            byte[] groupPoll = rawPoll();
+            groupPoll[0] = 2;
+            groupPoll[bytes(offsetTarget()).length - OPTIONAL_PARTITION_BYTES] = 0;
+            byte[] store = rawStoreOffset();
+            store[bytes(offsetTarget()).length - OPTIONAL_PARTITION_BYTES] = 0;
+            byte[] delete = rawDeleteOffset();
+            delete[bytes(offsetTarget()).length - OPTIONAL_PARTITION_BYTES] = 0;
+            assertMalformed(client.sendBinaryRequest(POLL_CODE, groupPoll));
+            assertMalformed(client.sendBinaryRequest(STORE_OFFSET_CODE, store));
+            assertMalformed(client.sendBinaryRequest(DELETE_OFFSET_CODE, delete));
+            assertThat(requests).isEmpty();
         });
     }
 
@@ -277,10 +344,16 @@ class AsyncIggyTcpClientRawRequestTest {
 
     private static Response respond(Request request) {
         return switch (code(request)) {
-            case GET_SEND_CONTEXT_CODE -> Response.success(OPERATION_NON_REPLICATED, context(Unpooled.buffer()));
-            case GET_POLL_ROUTING_CODE, GET_OFFSET_ROUTING_CODE ->
+            case GET_PARTITION_ROUTE_CODE ->
                 Response.success(
-                        OPERATION_NON_REPLICATED, context(Unpooled.buffer().writeZero(ROUTE_ATTACHMENT_BYTES)));
+                        OPERATION_NON_REPLICATED,
+                        Unpooled.buffer()
+                                .writeLongLE(INCARNATION)
+                                .writeLongLE(METADATA_OP)
+                                .writeIntLE(0)
+                                .writeIntLE(1)
+                                .writeByte(0));
+            case GET_OFFSET_CODE -> Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
             case SEND_CODE -> Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
             case POLL_CODE -> Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
             case STORE_OFFSET_CODE, DELETE_OFFSET_CODE ->
@@ -347,7 +420,12 @@ class AsyncIggyTcpClientRawRequestTest {
     }
 
     private static byte[] bytes(ByteBuf... parts) {
-        return ByteBufUtil.getBytes(Unpooled.wrappedBuffer(parts));
+        ByteBuf payload = Unpooled.wrappedBuffer(parts);
+        try {
+            return ByteBufUtil.getBytes(payload);
+        } finally {
+            payload.release();
+        }
     }
 
     @FunctionalInterface

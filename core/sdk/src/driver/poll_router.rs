@@ -18,10 +18,11 @@
 //! Auto-commit polls and offset writes use persistent data connections while
 //! the coordinator retains group membership. Only explicit non-admission permits
 //! rerouting. Replicated writes keep the data session's own deduplication identity.
-//! Routes and attachments are fenced by the coordinator's session generation.
+//! Routes and attachments are fenced by the fence of the shared session owner.
 //! Cluster routing requires servers supporting the routing and attachment commands.
 
-use crate::leader_aware::{node_address, transport_port};
+use crate::links::connect::{node_address, transport_port};
+use crate::session_owner::SessionOwner;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_binary_protocol::codes::{
@@ -36,12 +37,9 @@ use iggy_binary_protocol::responses::messages::PollRoutingResponse;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
 use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::ClientState;
-use iggy_common::{
-    BinaryClient, ClusterNode, Credentials, IdKind, Identifier, IggyError, TransportProtocol,
-};
-use secrecy::SecretString;
+use iggy_common::{BinaryClient, ClusterNode, IggyError, TransportProtocol};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
@@ -97,7 +95,7 @@ pub(crate) trait PollTransport: BinaryClient + Send + Sync + Sized {
 
 #[derive(Debug)]
 struct PollRoute {
-    generation: u64,
+    fence: u64,
     endpoint: String,
     consumer_session: SessionIdentity,
     context: PartitionContext,
@@ -115,99 +113,41 @@ type RouteKey = (u32, Bytes);
 
 #[derive(Debug)]
 pub(crate) struct PollRouter<T> {
-    pub(crate) metadata_watermark: Arc<AtomicU64>,
+    session_owner: Arc<SessionOwner>,
     /// Zero means no successful topology read, not a standalone server.
     pub(crate) roster_size: AtomicUsize,
-    session_generation: AtomicU64,
     routes: Mutex<HashMap<RouteKey, Arc<PollRoute>>>,
     connections: Mutex<HashMap<String, ConnectionSlot<T>>>,
-    credentials: Mutex<Option<(Credentials, u32)>>,
     next_heartbeat: Mutex<Option<Instant>>,
 }
 
-impl<T> Default for PollRouter<T> {
-    fn default() -> Self {
+impl<T> PollRouter<T> {
+    pub(crate) fn new(session_owner: Arc<SessionOwner>) -> Self {
         Self {
-            metadata_watermark: Arc::default(),
+            session_owner,
             roster_size: AtomicUsize::new(0),
-            session_generation: AtomicU64::new(0),
             routes: Mutex::default(),
             connections: Mutex::default(),
-            credentials: Mutex::default(),
             next_heartbeat: Mutex::default(),
         }
     }
-}
 
-impl<T> PollRouter<T> {
+    /// The owner raises the fence before a reset calls this, and a route or
+    /// a connection is published only under its lock after a fence check. So
+    /// nothing of the replaced session survives.
     pub(crate) fn clear_session(&self) {
         self.next_heartbeat
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let mut routes = self
-            .routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut connections = self
-            .connections
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Serialize invalidation with route and connection publication.
-        self.session_generation.fetch_add(1, Ordering::AcqRel);
-        routes.clear();
-        connections.clear();
-    }
-
-    pub(crate) fn remember_credentials(&self, credentials: Credentials, user_id: u32) {
-        *self
-            .credentials
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((credentials, user_id));
-    }
-
-    pub(crate) fn forget_credentials(&self) {
-        self.credentials
+        self.routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-    }
-
-    pub(crate) fn remembered_credentials(&self) -> Option<Credentials> {
-        self.credentials
+            .clear();
+        self.connections
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|(credentials, _)| credentials.clone())
-    }
-
-    pub(crate) fn refresh_password(&self, user: &Identifier, new_password: &str) {
-        let mut credentials = self
-            .credentials
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some((Credentials::UsernamePassword(username, password), user_id)) =
-            credentials.as_mut()
-        else {
-            return;
-        };
-        if matches_session_user(user, *user_id, username) {
-            *password = SecretString::from(new_password.to_owned());
-        }
-    }
-
-    pub(crate) fn refresh_username(&self, user: &Identifier, new_username: &str) {
-        let mut credentials = self
-            .credentials
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some((Credentials::UsernamePassword(username, _), user_id)) = credentials.as_mut()
-        else {
-            return;
-        };
-        if matches_session_user(user, *user_id, username) {
-            *username = new_username.to_owned();
-        }
+            .clear();
     }
 }
 
@@ -471,16 +411,16 @@ impl<T: PollTransport> PollRouter<T> {
         key: &RouteKey,
         payload: &Bytes,
     ) -> Result<Arc<PollRoute>, IggyError> {
-        let generation = self.session_generation.load(Ordering::Acquire);
+        let fence = self.session_owner.fence();
         if let Some(route) = self
             .routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key)
             .filter(|route| {
-                route.generation == generation
+                route.fence == fence
                     && route.consumer_session.metadata_watermark
-                        >= self.metadata_watermark.load(Ordering::Acquire)
+                        >= self.session_owner.metadata_watermark()
             })
         {
             return Ok(Arc::clone(route));
@@ -500,7 +440,7 @@ impl<T: PollTransport> PollRouter<T> {
         response.consumer_session.metadata_watermark = response
             .consumer_session
             .metadata_watermark
-            .max(self.metadata_watermark.load(Ordering::Acquire));
+            .max(self.session_owner.metadata_watermark());
         let node = ClusterNode::try_from(response.primary)?;
         let port = transport_port(&node, T::PROTOCOL);
         if port == 0 {
@@ -508,7 +448,7 @@ impl<T: PollTransport> PollRouter<T> {
             return Err(IggyError::FeatureUnavailable);
         }
         let route = Arc::new(PollRoute {
-            generation,
+            fence,
             endpoint: node_address(&node, port),
             consumer_session: response.consumer_session,
             context: response.context,
@@ -526,22 +466,12 @@ impl<T: PollTransport> PollRouter<T> {
     }
 
     fn validate_route(&self, route: &PollRoute) -> Result<(), IggyError> {
-        if route.generation != self.session_generation.load(Ordering::Acquire)
-            || route.consumer_session.metadata_watermark
-                < self.metadata_watermark.load(Ordering::Acquire)
+        if route.fence != self.session_owner.fence()
+            || route.consumer_session.metadata_watermark < self.session_owner.metadata_watermark()
         {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(())
-    }
-}
-
-pub(crate) fn matches_session_user(user: &Identifier, user_id: u32, username: &str) -> bool {
-    match user.kind {
-        IdKind::Numeric => user.get_u32_value().is_ok_and(|id| id == user_id),
-        IdKind::String => user
-            .get_cow_str_value()
-            .is_ok_and(|name| name.as_ref() == username),
     }
 }
 
@@ -573,21 +503,20 @@ fn unaccepted_data_error(error: IggyError) -> IggyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vsr::metadata_reply_header;
     use iggy_binary_protocol::AckLevel;
     use iggy_binary_protocol::codes::{
-        DELETE_CONSUMER_OFFSET_CODE, GET_SEND_CONTEXT_CODE, SEND_MESSAGES_CODE,
+        DELETE_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE, SEND_MESSAGES_CODE,
         STORE_CONSUMER_OFFSET_CODE,
     };
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
+    use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
     use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterNodeResponse;
-    use iggy_binary_protocol::{
-        Command, HEADER_SIZE, Operation, ReplyHeader, WireConsumer, WireIdentifier, WireName,
-        WirePollingStrategy,
-    };
+    use iggy_binary_protocol::{WireConsumer, WireIdentifier, WireName, WirePollingStrategy};
     use iggy_common::{
-        BinaryTransport, Client, ClientState, ConsumerGroupClientState, DiagnosticEvent,
+        AutoLogin, BinaryTransport, Client, ClientState, ConsumerGroupClientState, DiagnosticEvent,
         Identifier, IggyMessage, MessageClient, NonZeroIggyDuration, Partitioning,
         VsrSessionControl, VsrSessionSealed,
     };
@@ -752,7 +681,7 @@ mod tests {
             payload: Bytes,
             context: Option<PartitionContext>,
         ) -> Result<Bytes, IggyError> {
-            PollRouter::default()
+            test_router()
                 .write_offset(self, code, payload, context)
                 .await
         }
@@ -762,7 +691,7 @@ mod tests {
             request: &PollMessagesRequest,
             context: Option<PartitionContext>,
         ) -> Result<Bytes, IggyError> {
-            PollRouter::default().poll(self, request, context).await
+            test_router().poll(self, request, context).await
         }
 
         async fn send_raw_with_context(
@@ -872,9 +801,11 @@ mod tests {
                     result = &mut pending => panic!("request finished before reconnect: {result:?}"),
                     () = pause.reached.notified() => {}
                 }
+                router.session_owner.reset().unwrap();
                 router.clear_session();
-                router.clear_session();
-                router.metadata_watermark.store(11, Ordering::Release);
+                router
+                    .session_owner
+                    .observe_metadata_reply(&metadata_reply_header(11));
                 pause.resume.notify_one();
 
                 assert_eq!(pending.await.unwrap(), "resumed", "{code} at {point:?}");
@@ -957,7 +888,7 @@ mod tests {
             let queued = routed_request(&router, &coordinator, &request, code);
             tokio::pin!(queued);
             assert!(futures::poll!(&mut queued).is_pending());
-            router.clear_session();
+            router.session_owner.reset().unwrap();
             router.clear_session();
             pause.resume.notify_one();
 
@@ -1175,17 +1106,9 @@ mod tests {
             router.poll(&coordinator, &request, None).await.unwrap(),
             "first"
         );
-        let metadata_reply = ReplyHeader {
-            command: Command::Reply,
-            operation: Operation::DeleteTopic,
-            size: u32::try_from(HEADER_SIZE).unwrap(),
-            commit: 11,
-            ..Default::default()
-        };
-        crate::vsr::observe_metadata_reply(
-            &router.metadata_watermark,
-            bytemuck::bytes_of(&metadata_reply).try_into().unwrap(),
-        );
+        router
+            .session_owner
+            .observe_metadata_reply(&metadata_reply_header(11));
         assert_eq!(
             router.poll(&coordinator, &request, None).await.unwrap(),
             "after metadata"
@@ -1483,8 +1406,8 @@ mod tests {
             ),
             (
                 Channel::Recovery,
-                GET_SEND_CONTEXT_CODE,
-                Ok(current.to_bytes()),
+                GET_PARTITION_ROUTE_CODE,
+                Ok(route_reply(current)),
             ),
             (Channel::Recovery, SEND_MESSAGES_CODE, Ok(Bytes::new())),
         ]);
@@ -1530,8 +1453,8 @@ mod tests {
                 exchanges.extend([
                     (
                         Channel::Recovery,
-                        GET_SEND_CONTEXT_CODE,
-                        Ok(current.to_bytes()),
+                        GET_PARTITION_ROUTE_CODE,
+                        Ok(route_reply(current)),
                     ),
                     (Channel::Recovery, SEND_MESSAGES_CODE, Err(expected.clone())),
                 ]);
@@ -1562,10 +1485,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_malformed_send_context_when_decoded_should_report_invalid_format() {
+    async fn given_malformed_partition_route_when_decoded_should_report_invalid_format() {
         let (_, transport, _) = fixture([(
             Channel::Recovery,
-            GET_SEND_CONTEXT_CODE,
+            GET_PARTITION_ROUTE_CODE,
             Ok(Bytes::from_static(b"bad")),
         )]);
         let mut messages = [IggyMessage::from("payload")];
@@ -1581,6 +1504,17 @@ mod tests {
         assert!(transport.script.contexts.lock().unwrap().is_empty());
     }
 
+    fn route_reply(context: PartitionContext) -> Bytes {
+        PartitionRouteResponse {
+            incarnation: context.incarnation,
+            metadata_op: context.metadata_op,
+            view: 0,
+            partitions_count: 1,
+            primary_replica: 0,
+        }
+        .to_bytes()
+    }
+
     fn fixture(
         exchanges: impl IntoIterator<Item = Exchange>,
     ) -> (PollRouter<Transport>, Transport, PollMessagesRequest) {
@@ -1591,7 +1525,7 @@ mod tests {
         (
             PollRouter {
                 roster_size: AtomicUsize::new(2),
-                ..PollRouter::default()
+                ..test_router()
             },
             Transport {
                 channel: Channel::Coordinator,
@@ -1609,6 +1543,10 @@ mod tests {
         )
     }
 
+    fn test_router() -> PollRouter<Transport> {
+        PollRouter::new(Arc::new(SessionOwner::new(AutoLogin::Disabled)))
+    }
+
     fn routing() -> Bytes {
         PollRoutingResponse {
             context: Default::default(),
@@ -1618,6 +1556,7 @@ mod tests {
                 metadata_watermark: 1,
             },
             primary: ClusterNodeResponse {
+                replica_id: 0,
                 name: "primary".to_owned(),
                 ip: "127.0.0.1".to_owned(),
                 tcp_port: 8090,

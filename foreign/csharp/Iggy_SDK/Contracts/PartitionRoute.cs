@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use async_trait::async_trait;
-use iggy_common::IggyError;
+namespace Apache.Iggy.Contracts;
 
-#[async_trait]
-pub trait ConnectionStream {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IggyError>;
-    async fn write(&mut self, buf: &[u8]) -> Result<(), IggyError>;
-    async fn flush(&mut self) -> Result<(), IggyError>;
-    async fn shutdown(&mut self) -> Result<(), IggyError>;
+internal readonly record struct PartitionRoute(ulong Incarnation, ulong MetadataOp, uint View,
+    uint PartitionsCount, byte PrimaryReplica)
+{
+    internal const int ENCODED_SIZE = 25;
+
+    internal PartitionContext Context => new(Incarnation, 0, MetadataOp);
 }

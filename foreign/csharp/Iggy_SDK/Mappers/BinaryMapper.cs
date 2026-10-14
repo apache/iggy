@@ -41,7 +41,7 @@ internal static class BinaryMapper
     private const int MIN_TOPIC_SIZE = 50 + 4 + 4;
     private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 4 + 4;
     private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
-    private const int MIN_CLUSTER_NODE_SIZE = 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
+    private const int MIN_CLUSTER_NODE_SIZE = 1 + 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
 
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
@@ -1425,8 +1425,26 @@ internal static class BinaryMapper
         };
     }
 
+    internal static PartitionRoute MapPartitionRoute(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length != PartitionRoute.ENCODED_SIZE)
+        {
+            throw new MalformedResponseException($"Partition route requires exactly {PartitionRoute.ENCODED_SIZE} bytes.");
+        }
+
+        return new PartitionRoute(BinaryPrimitives.ReadUInt64LittleEndian(payload),
+            BinaryPrimitives.ReadUInt64LittleEndian(payload[8..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(payload[16..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(payload[20..]), payload[24]);
+    }
+
     internal static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
     {
+        if (position >= payload.Length)
+        {
+            throw new MalformedResponseException("Cluster node is missing its replica id.");
+        }
+        var replicaId = payload[position++];
         var name = ReadString(payload, ref position, "Cluster node name");
         var ip = ReadString(payload, ref position, "Cluster node ip");
         if (position + CLUSTER_NODE_TAIL_SIZE > payload.Length)
@@ -1458,6 +1476,7 @@ internal static class BinaryMapper
 
         return new ClusterNode
         {
+            ReplicaId = replicaId,
             Name = name,
             Ip = ip,
             Endpoints = new TransportEndpoints
