@@ -81,6 +81,7 @@ pgwire = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
+redis = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }

@@ -30,6 +30,7 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod rabbitmq;
+mod redis;
 mod redshift;
 mod s3;
 mod surrealdb;
@@ -101,6 +102,7 @@ pub use rabbitmq::{
     RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
     RabbitMqSinkWithoutMetadataFixture,
 };
+pub use redis::{RedisOps, RedisSinkFixture, RedisSinkNoMetadataFixture, RedisSinkRawFixture};
 pub use redshift::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
     RedshiftSinkVarbyteFixture,

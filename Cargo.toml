@@ -45,6 +45,7 @@ members = [
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/rabbitmq_sink",
+    "core/connectors/sinks/redis_sink",
     "core/connectors/sinks/redshift_sink",
     "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
@@ -282,6 +283,11 @@ rand = "0.10.2"
 rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 rcgen = "0.14.10"
+redis = { version = "1.7.1", default-features = false, features = [
+    "aio",
+    "connection-manager",
+    "tokio-comp",
+] }
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }

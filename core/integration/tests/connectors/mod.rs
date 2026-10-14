@@ -32,6 +32,7 @@ mod quickwit;
 mod rabbitmq;
 mod random;
 mod random_source_liveness;
+mod redis;
 mod redshift;
 mod runtime;
 mod s3;
