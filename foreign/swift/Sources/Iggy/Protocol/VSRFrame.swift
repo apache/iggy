@@ -47,6 +47,7 @@ enum VSRFrame {
     enum ReplyOffset {
         static let size = 48
         static let command = 60
+        static let commit = 184
         static let request = 200
         static let operation = 208
         static let status = 216
@@ -178,6 +179,14 @@ enum VSRFrame {
             return nil
         }
         let start = header.startIndex + ReplyOffset.request
+        return UInt64(littleEndianBytes: header[start..<start + 8])
+    }
+
+    static func readReplyCommit(_ header: ArraySlice<UInt8>) -> UInt64? {
+        guard header.count >= ReplyOffset.commit + 8 else {
+            return nil
+        }
+        let start = header.startIndex + ReplyOffset.commit
         return UInt64(littleEndianBytes: header[start..<start + 8])
     }
 

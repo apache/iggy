@@ -206,6 +206,20 @@ struct IdentifierTests {
         try Identifier(numeric: UInt32.max).encode(into: &writer)
         #expect(writer.bytes == [1, 4, 0xFF, 0xFF, 0xFF, 0xFF])
     }
+
+    @Test func decodingReadsWhatEncodingWrites() throws {
+        for identifier: Identifier in [0, 7, "café", Identifier(numeric: UInt32.max)] {
+            var writer = ByteWriter()
+            try identifier.encode(into: &writer)
+            var reader = ByteReader(writer.bytes[...])
+            #expect(try Identifier.decode(from: &reader) == identifier)
+            #expect(reader.isAtEnd)
+        }
+        for malformed: [UInt8] in [[1, 2, 7, 0], [3, 4, 0, 0, 0, 0], [2, 0], [1, 4, 0]] {
+            var reader = ByteReader(malformed[...])
+            #expect(throws: (any Error).self) { try Identifier.decode(from: &reader) }
+        }
+    }
 }
 
 @Suite("Messages")

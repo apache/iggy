@@ -60,7 +60,7 @@ actor ClientCore {
     /// Counts the connections installed so far, so a request that failed on
     /// an old one does not tear down the one that replaced it.
     private var connectionEpoch: UInt64 = 0
-    private var session = ConsensusSession()
+    private var session: ConsensusSession
     private var currentAddress: String
     private var rosterEndpoints: [String] = []
     private var rosterLearned = false
@@ -80,12 +80,22 @@ actor ClientCore {
     private let routingLock = AsyncMutex()
     private let connectGate = SingleFlight()
     private var heartbeatTask: Task<Void, Never>?
+    /// The highest metadata commit a reply reported. A route read before it
+    /// may predate a change the client already saw, so it is read again.
+    /// A session reset keeps it.
+    private(set) var metadataWatermark: UInt64 = 0
+    /// Partitioning and consumer-group state that the typed calls share.
+    nonisolated let groupState = ConsumerGroupState()
+    nonisolated let pollRouter: PollRouter
 
     init(configuration: ClientConfiguration, connector: any IggyConnector, logger: Logger) {
         self.configuration = configuration
         self.connector = connector
         self.logger = logger
         currentAddress = configuration.address
+        let session = ConsensusSession()
+        self.session = session
+        pollRouter = PollRouter(fence: session.clientID)
     }
 
     // MARK: State and events
@@ -135,7 +145,10 @@ actor ClientCore {
     /// A cancelled caller gets `CancellationError`. A request it already wrote
     /// takes the connection with it, since its reply can no longer be told
     /// from the next one, and the next caller reconnects.
-    func exchange(code: UInt32, payload: [UInt8]) async throws -> [UInt8] {
+    ///
+    /// `context` is the partition context a partition request carries; every
+    /// replay keeps it.
+    func exchange(code: UInt32, payload: [UInt8], context: PartitionContext = .empty) async throws -> [UInt8] {
         if disconnectedByCaller {
             throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
         }
@@ -143,7 +156,7 @@ actor ClientCore {
         var outcome = RetryOutcome()
         var failedEpoch = connectionEpoch
         do {
-            return try await sendRaw(code: code, payload: payload, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
+            return try await sendRaw(code: code, payload: payload, context: context, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
         } catch let error as IggyError {
             // A cancelled caller cannot use a new connection: every exchange
             // it starts is abandoned at once.
@@ -196,8 +209,46 @@ actor ClientCore {
                 logger.warning("Reconnected, but the outcome of command \(code) is unknown: replaying it could apply it twice")
                 throw failure
             }
-            return try await sendRaw(code: code, payload: payload, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
+            return try await sendRaw(code: code, payload: payload, context: context, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
         }
+    }
+
+    /// One attempt on the current connection with no reconnect, failover, or
+    /// replay, for the route lookups and the polls that `PollRouter` retries
+    /// itself.
+    func exchangeOnce(code: UInt32, payload: [UInt8], context: PartitionContext) async throws -> [UInt8] {
+        if disconnectedByCaller || state == .shutdown {
+            throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
+        }
+        var request: VSRFrame.EncodedRequest?
+        var epoch = connectionEpoch
+        var outcome = RetryOutcome()
+        let now = ContinuousClock.now
+        let attempted = try await attempt(
+            code: code, payload: payload, context: context, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: now,
+            readDeadline: now + configuration.requestTimeout, replaysUncommitted: false)
+        switch attempted {
+        case .success(let body):
+            return body
+        case .failure(let error):
+            dropConnection(after: error, epoch: epoch)
+            throw error
+        }
+    }
+
+    var bindSecret: [UInt8] { session.bindSecret }
+
+    /// Stamps a frame from the shared session for a data connection, so the
+    /// request ids stay unique across every connection of the session.
+    func stampRequest(code: UInt32, payload: [UInt8], context: PartitionContext) throws -> VSRFrame.EncodedRequest {
+        try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
+    }
+
+    /// Dials `address` with the client's TLS and timeouts, for a data
+    /// connection.
+    func dial(_ address: String) async throws -> any IggyConnection {
+        try await connector.connect(
+            to: try Endpoint(parsing: address), tls: configuration.tls, timeout: configuration.connectTimeout, noDelay: configuration.noDelay)
     }
 
     /// Fails fast with the error the Rust SDK raises for the state, after
@@ -265,7 +316,7 @@ actor ClientCore {
     /// across every same-connection replay and every leader failover. `epoch`
     /// reports the connection the last attempt ran on.
     private func sendRaw(
-        code: UInt32, payload: [UInt8], deadline: ContinuousClock.Instant, epoch: inout UInt64, outcome: inout RetryOutcome
+        code: UInt32, payload: [UInt8], context: PartitionContext, deadline: ContinuousClock.Instant, epoch: inout UInt64, outcome: inout RetryOutcome
     ) async throws -> [UInt8] {
         switch state {
         case .shutdown:
@@ -282,21 +333,15 @@ actor ClientCore {
         while true {
             let transientDeadline = isLogin ? deadline : min(deadline, clock.now + Self.transientFailoverCheckInterval)
             let attempted = try await attempt(
-                code: code, payload: payload, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
-                readDeadline: deadline)
+                code: code, payload: payload, context: context, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
+                readDeadline: deadline, replaysUncommitted: true)
             switch attempted {
             case .success(let body):
                 return body
             case .failure(let failure):
                 let error = outcome.observe(Self.graded(failure))
                 guard error.code == .transientNotAccepted, !isLogin, clock.now < deadline else {
-                    if error.code == .disconnected, epoch == connectionEpoch, state != .shutdown {
-                        // The reply stream is at an unknown boundary; a late
-                        // reply would desync framing for the next request.
-                        connection = nil
-                        state = .disconnected
-                        publish(.disconnected)
-                    }
+                    dropConnection(after: error, epoch: epoch)
                     throw error
                 }
                 if code == CommandCode.getClusterMetadata.rawValue {
@@ -323,6 +368,17 @@ actor ClientCore {
                     try? await Task.sleep(until: min(clock.now + Self.notReadyRetryInterval, deadline), clock: clock)
                 }
             }
+        }
+    }
+
+    /// The reply stream of a connection that failed mid-request is at an
+    /// unknown boundary; a late reply would desync framing for the next
+    /// request.
+    private func dropConnection(after error: IggyError, epoch: UInt64) {
+        if error.code == .disconnected, epoch == connectionEpoch, state != .shutdown {
+            connection = nil
+            state = .disconnected
+            publish(.disconnected)
         }
     }
 
@@ -375,21 +431,23 @@ actor ClientCore {
     /// one request at a time. Throws only for a caller cancelled before its
     /// turn, which leaves the connection untouched.
     private func attempt(
-        code: UInt32, payload: [UInt8], request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, outcome: inout RetryOutcome,
-        transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant
+        code: UInt32, payload: [UInt8], context: PartitionContext, request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64,
+        outcome: inout RetryOutcome, transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant, replaysUncommitted: Bool
     ) async throws -> Result<[UInt8], IggyError> {
         try await exchangeLock.lock()
         defer { exchangeLock.unlock() }
         return await exchangeLocked(
-            code: code, payload: payload, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
-            readDeadline: readDeadline)
+            code: code, payload: payload, context: context, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
+            readDeadline: readDeadline, replaysUncommitted: replaysUncommitted)
     }
 
     /// Stamps the request if it is not stamped yet and exchanges it, replaying
-    /// in place while the server answers transiently.
+    /// in place while the server answers transiently: "not accepted" until
+    /// `transientDeadline`, and "not committed" until `readDeadline` when
+    /// `replaysUncommitted` is set.
     private func exchangeLocked(
-        code: UInt32, payload: [UInt8], request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64, outcome: inout RetryOutcome,
-        transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant
+        code: UInt32, payload: [UInt8], context: PartitionContext, request: inout VSRFrame.EncodedRequest?, epoch: inout UInt64,
+        outcome: inout RetryOutcome, transientDeadline: ContinuousClock.Instant, readDeadline: ContinuousClock.Instant, replaysUncommitted: Bool
     ) async -> Result<[UInt8], IggyError> {
         guard let connection else {
             return .failure(IggyError(.notConnected))
@@ -400,7 +458,7 @@ actor ClientCore {
             stamped = request
         } else {
             do {
-                stamped = try VSRFrame.encodeRequest(session: &session, code: code, payload: payload)
+                stamped = try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
             } catch let error as IggyError {
                 return .failure(error)
             } catch {
@@ -436,6 +494,7 @@ actor ClientCore {
                 let answered = VSRFrame.readReplyRequestID(header).map(String.init) ?? "unknown"
                 return .failure(IggyError(.disconnected, context: "the reply answers request \(answered), expected \(stamped.requestID)"))
             }
+            observeMetadataReply(header)
             do {
                 return .success(Array(try VSRFrame.decodeReply(header: header, body: raw.body[...])))
             } catch let answer as IggyError {
@@ -444,7 +503,7 @@ actor ClientCore {
                 let error = outcome.observe(answer)
                 refusal = error
                 switch error.code {
-                case .transientNotCommitted where clock.now < readDeadline:
+                case .transientNotCommitted where replaysUncommitted && clock.now < readDeadline:
                     // The outcome is unknown; only a same-session replay of the
                     // same request id is safe, which the client table answers
                     // from its reply cache if it did commit.
@@ -462,6 +521,18 @@ actor ClientCore {
                 return .failure(IggyError(.invalidCommand, context: "\(error)"))
             }
         }
+    }
+
+    /// Raises the metadata watermark to the commit of a metadata reply, as
+    /// `observe_metadata_reply` in the Rust SDK. Reads and partition replies
+    /// carry no metadata commit.
+    private func observeMetadataReply(_ header: ArraySlice<UInt8>) {
+        guard VSRFrame.peekCommand(header) == .reply, let operation = VSRFrame.readReplyOperation(header),
+            operation != .nonReplicated, !operation.isPartition, let commit = VSRFrame.readReplyCommit(header)
+        else {
+            return
+        }
+        metadataWatermark = max(metadataWatermark, commit)
     }
 
     // MARK: Connecting
@@ -739,7 +810,7 @@ actor ClientCore {
         // A Register still in flight is retried on the next connection and
         // must arrive under the identity and secret its body was built from.
         if session.isBound {
-            session.reset()
+            resetSession()
         }
         await old?.close()
         publish(.disconnected)
@@ -761,7 +832,7 @@ actor ClientCore {
         stopHeartbeat()
         let old = connection
         connection = nil
-        session.reset()
+        resetSession()
         state = .shutdown
         await old?.close()
         publish(.shutdown)
@@ -821,7 +892,7 @@ actor ClientCore {
         // A connection lost under a bound session leaves that session behind.
         // The sign-in on the next one registers a new session, not a replay.
         if session.isBound {
-            session.reset()
+            resetSession()
         }
         // The login body carries the bind secret of the session the frame
         // encoder registers, and both survive a retry on a new connection.
@@ -830,7 +901,7 @@ actor ClientCore {
         do {
             body = try await exchange(code: code, payload: payload)
         } catch {
-            session.reset()
+            resetSession()
             throw error
         }
         let response: Responses.LoginRegister
@@ -838,9 +909,11 @@ actor ClientCore {
             response = try Responses.loginRegister(body[...])
             try session.bind(response.session)
         } catch {
-            session.reset()
+            resetSession()
             throw error
         }
+        // Nothing synced or routed before the bind belongs to this session.
+        endSessionScope()
         logger.debug(
             "Authenticated against iggy server",
             metadata: ["server_version": "\(response.serverVersion)", "server_protocol_version": "\(response.serverProtocolVersion)"])
@@ -855,9 +928,21 @@ actor ClientCore {
         }
         _ = try await exchange(code: CommandCode.logoutUser.rawValue, payload: [])
         rememberedSignIn = nil
-        session.reset()
+        resetSession()
         state = .connected
         publish(.signedOut)
+    }
+
+    /// Starts a new consensus session. What was synced or routed under the
+    /// old one goes with it.
+    private func resetSession() {
+        session.reset()
+        endSessionScope()
+    }
+
+    private func endSessionScope() {
+        groupState.clearSessionScoped()
+        pollRouter.clearSession(fence: session.clientID)
     }
 
     private func rememberSignIn(_ credentials: Credentials, userID: UInt32) {
@@ -942,10 +1027,20 @@ actor ClientCore {
     private func readTransportEndpoints() async -> [String] {
         do {
             let body = try await exchange(code: CommandCode.getClusterMetadata.rawValue, payload: [])
-            return Self.transportEndpoints(try Responses.clusterMetadata(body[...]))
+            let metadata = try Responses.clusterMetadata(body[...])
+            learnRosterSize(metadata)
+            return Self.transportEndpoints(metadata)
         } catch {
             logger.debug("Failed to read the cluster roster: \(error)")
             return []
+        }
+    }
+
+    /// Tells the router whether polls go to data connections. An empty
+    /// roster says nothing about the cluster, so the router keeps asking.
+    private func learnRosterSize(_ metadata: ClusterMetadata) {
+        if !metadata.nodes.isEmpty {
+            pollRouter.learnRosterSize(metadata.nodes.count)
         }
     }
 
@@ -993,6 +1088,7 @@ actor ClientCore {
                 logger.debug("Failed to get cluster metadata: \(error), continuing on \(currentAddress)")
                 return LeaderCheck(redirect: nil, endpoints: [])
             }
+            learnRosterSize(metadata)
             let endpoints = Self.transportEndpoints(metadata)
             if metadata.nodes.count <= 1 {
                 return LeaderCheck(redirect: nil, endpoints: endpoints)

@@ -144,10 +144,15 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
 
     public var kind: Kind
     public var value: UInt64
+    /// The partition incarnation and owner a continuation offset was read
+    /// under. A poll that carries one is refused once the partition was
+    /// recreated, instead of reading the offset in another incarnation.
+    public var context: PartitionContext?
 
-    public init(kind: Kind, value: UInt64) {
+    public init(kind: Kind, value: UInt64, context: PartitionContext? = nil) {
         self.kind = kind
         self.value = value
+        self.context = context
     }
 
     /// Resume from a specific offset.
@@ -181,6 +186,21 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
     func encode(into writer: inout ByteWriter) {
         writer.write(kind.rawValue)
         writer.write(value)
+    }
+}
+
+/// A checkpoint to commit: the inclusive offset of the last consumed
+/// message, with the partition incarnation and owner of the poll that
+/// delivered it, so a delayed commit cannot land on a recreated partition.
+public struct ConsumerPosition: Sendable, Hashable {
+    public var partitionID: UInt32
+    public var offset: UInt64
+    public var context: PartitionContext
+
+    public init(partitionID: UInt32, offset: UInt64, context: PartitionContext) {
+        self.partitionID = partitionID
+        self.offset = offset
+        self.context = context
     }
 }
 
