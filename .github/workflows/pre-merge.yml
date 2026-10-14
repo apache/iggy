@@ -55,16 +55,12 @@ jobs:
 
   # Rust components
   test-rust:
-    name: Rust • ${{ matrix.component }}/${{ matrix.task }}
+    name: Rust
     needs: detect
-    if: ${{ fromJson(needs.detect.outputs.rust_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.rust_matrix) }}
-    uses: ./.github/workflows/_test.yml
+    if: needs.detect.outputs.rust_plan != ''
+    uses: ./.github/workflows/_rust.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      plan: ${{ needs.detect.outputs.rust_plan }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -211,6 +207,8 @@ jobs:
     with:
       component: ${{ matrix.component }}
       task: ${{ matrix.task }}
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Examples Tests
   test-examples:
@@ -237,10 +235,11 @@ jobs:
         uses: actions/github-script@v9
         with:
           script: |
-            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
               owner: context.repo.owner,
               repo: context.repo.repo,
-              run_id: context.runId
+              run_id: context.runId,
+              per_page: 100
             });
 
             const jobTimes = {};
@@ -263,7 +262,7 @@ jobs:
 
             // Log job names for debugging
             console.log('Job names found:');
-            for (const job of jobs.data.jobs) {
+            for (const job of jobs) {
               console.log(`  - ${job.name}: ${job.status} (conclusion: ${job.conclusion || 'N/A'})`);
               jobStatuses[job.name] = job.conclusion || job.status;
 
@@ -305,7 +304,6 @@ jobs:
             };
 
             // Set outputs for each component
-            const rust = findJobInfo('Rust •');
             const python = findJobInfo('Python •');
             const php = findJobInfo('PHP •');
             const node = findJobInfo('Node •');
@@ -327,7 +325,13 @@ jobs:
               : { time: null, status: 'skipped' };
 
             // Output formatted durations
-            core.setOutput('rust_time', formatJobDuration(rust));
+            const rustJobs = jobs.filter(job => job.name.startsWith('Rust /') &&
+              job.conclusion !== 'skipped' && job.started_at && job.completed_at);
+            const rustDuration = rustJobs.length ? formatDuration(
+              Math.max(...rustJobs.map(job => new Date(job.completed_at).getTime())) -
+              Math.min(...rustJobs.map(job => new Date(job.started_at).getTime()))
+            ) : '-';
+            core.setOutput('rust_time', rustDuration);
             core.setOutput('python_time', formatJobDuration(python));
             core.setOutput('php_time', formatJobDuration(php));
             core.setOutput('node_time', formatJobDuration(node));
@@ -345,7 +349,7 @@ jobs:
             // Calculate total time - find the earliest job start time
             let earliestStart = null;
             let latestEnd = null;
-            for (const job of jobs.data.jobs) {
+            for (const job of jobs) {
               if (job.started_at) {
                 const start = new Date(job.started_at);
                 if (!earliestStart || start < earliestStart) {
