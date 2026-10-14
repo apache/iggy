@@ -60,8 +60,9 @@ internal static class VsrError
     }
 
     /// <summary>
-    ///     A verdict the server reported, on the reply status word or in an eviction frame. Only server verdicts,
-    ///     these and <see cref="FromResultSection" /> ones, may drive retry and failover.
+    ///     A verdict the server reported, on the reply status word or in an eviction frame. Retry and failover act
+    ///     on server verdicts, these and <see cref="FromResultSection" /> ones, plus the TRANSIENT_NOT_ACCEPTED the
+    ///     routed poll path raises itself when a primary does not admit it.
     /// </summary>
     internal static IggyInvalidStatusCodeException FromServer(int code, string message)
     {

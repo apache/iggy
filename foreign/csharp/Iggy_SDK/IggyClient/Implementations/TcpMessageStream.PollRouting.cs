@@ -267,8 +267,10 @@ public sealed partial class TcpMessageStream
             throw new VsrRequestOutcomeUnknownException(error);
         }
         // The read timer of a route lookup fires at the same deadline as the budget and turns into a timeout
-        // IOException when it wins. A kept refusal means no send started since, so it still decides the outcome.
-        catch (IOException) when (refusal is not null
+        // IOException when it wins, and a redial can fail the same way. A kept refusal means no send started
+        // since, so it still decides the outcome.
+        catch (Exception error) when (error is IOException or SocketException
+            && refusal is not null
             && Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
         {
             RemovePartitionRoute(target.Key);

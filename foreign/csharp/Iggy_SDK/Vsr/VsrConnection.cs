@@ -376,12 +376,13 @@ internal sealed class VsrConnection : IDisposable
     /// <summary>
     ///     Whether an unsettled refusal of a replay is final: the primary's preflight answers every replay of the
     ///     same request id with it again, so replaying until the deadline only ends in the same unknown outcome.
+    ///     The metadata plane carries it in the result section and the partition plane on the status word.
     /// </summary>
     private static bool IsFinalRefusal(IggyInvalidStatusCodeException error)
     {
         return error is
         {
-            FromResultSection: true,
+            FromServer: true,
             StatusCode: VsrError.REQUEST_TOO_OLD or VsrError.INVALID_COMMAND
         };
     }
