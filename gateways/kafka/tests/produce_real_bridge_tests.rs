@@ -21,10 +21,12 @@
 //! the same way in both directions cannot pass.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use iggy::prelude::{
-    Consumer, HeaderKey, Identifier, IggyMessage, MessageClient, PollingStrategy, TopicClient,
+    Consumer, HeaderKey, Identifier, IggyClient, IggyMessage, MessageClient, PollingStrategy,
+    SystemClient, TopicClient,
 };
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
@@ -35,11 +37,12 @@ use kafka_protocol::records::{
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::bridge::{IggyBridge, Producer};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_PRODUCE, BrokerAdvertise, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
+    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, BrokerAdvertise, ERROR_NONE,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{KEY_HEADER, MAPPING_VERSION, VERSION_HEADER, from_iggy};
 
@@ -651,7 +654,8 @@ async fn given_a_stopped_server_when_handled_should_answer_retriable() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
-    drop(server);
+    // The Produce session connects at its first send, after this, so the port stays ours.
+    let _port = server.stop();
 
     let entries = [(0, batch(&[record(0, None, b"v", &[])], Compression::None))];
     let [(_, code, _)] = produce(&state, 3, 1, TOPIC, &entries).await[..] else {
@@ -661,6 +665,182 @@ async fn given_a_stopped_server_when_handled_should_answer_retriable() {
         matches!(code, ERROR_NOT_LEADER_OR_FOLLOWER | ERROR_REQUEST_TIMED_OUT),
         "a lost server is retriable, got {code}"
     );
+}
+
+/// Long enough for any one step against a local server.
+const STEP: Duration = Duration::from_secs(10);
+
+fn soon_enough() -> tokio::time::Instant {
+    tokio::time::Instant::now() + STEP
+}
+
+/// A producer id from the gateway's own `InitProducerId`. No other id keys a Produce session.
+async fn issued_producer_id(state: &GatewayState) -> i64 {
+    let mut enc = Encoder::with_capacity(16);
+    enc.write_nullable_string(None).expect("null fits"); // transactional_id
+    enc.write_i32(60_000); // transaction_timeout_ms
+    let response = handle_request_bounded(state, API_KEY_INIT_PRODUCER_ID, 0, enc.freeze())
+        .await
+        .expect_response("InitProducerId is answered");
+    let mut d = Decoder::new(response);
+    assert_eq!(d.read_i32().expect("throttle time"), 0);
+    assert_eq!(d.read_i16().expect("error code"), ERROR_NONE);
+    d.read_i64().expect("producer id")
+}
+
+/// A one-record batch that carries `producer_id`, as an idempotent producer sends it.
+fn idempotent_batch(producer_id: i64, value: &[u8]) -> Bytes {
+    let mut records = [record(0, None, value, &[])];
+    records[0].producer_id = producer_id;
+    records[0].producer_epoch = 0;
+    records[0].sequence = 0;
+    batch(&records, Compression::None)
+}
+
+#[tokio::test]
+#[serial]
+async fn given_a_producers_request_still_running_when_handled_should_hold_back_only_that_producer()
+{
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    let bridge = state.bridge.as_deref().expect("a bridge");
+    let id = issued_producer_id(&state).await;
+    let running = bridge
+        .produce_turn(Producer::Id { id, user: None }, soon_enough())
+        .await
+        .expect("a free turn");
+
+    let other = [(
+        0,
+        batch(&[record(0, None, b"other", &[])], Compression::None),
+    )];
+    assert_eq!(
+        produce(&state, 3, 1, TOPIC, &other).await,
+        vec![(0, ERROR_NONE, 0)],
+        "another producer sends on a session of its own"
+    );
+
+    let own = [(0, idempotent_batch(id, b"own"))];
+    let answer = |acks| {
+        let body = encode_timed_request(3, acks, 100, TOPIC, &own);
+        handle_request_bounded(&state, API_KEY_PRODUCE, 3, body)
+    };
+    assert_eq!(
+        partition_results(3, answer(1).await.expect_response("acks=1 is answered")),
+        vec![(0, ERROR_REQUEST_TIMED_OUT, -1)],
+        "it must not overtake the request that still runs"
+    );
+    assert!(
+        answer(0).await.is_close(),
+        "acks=0 has no response to carry the 7"
+    );
+    assert_eq!(
+        stored(&server, 0, 10).await.len(),
+        1,
+        "nothing of the held producer was written"
+    );
+
+    drop(running);
+    assert_eq!(
+        produce(&state, 3, 1, TOPIC, &own).await,
+        vec![(0, ERROR_NONE, 1)]
+    );
+}
+
+/// Sends `count` one-message batches of `producer` to partition 0, one request after the other.
+async fn send_each(bridge: &IggyBridge, producer: Producer, name: &str, count: usize) {
+    let target = bridge.topic_target(TOPIC).expect("a valid topic");
+    for index in 0..count {
+        let message = IggyMessage::builder()
+            .payload(Bytes::from(format!("{name}-{index}")))
+            .build()
+            .expect("a message");
+        let (sent, held) = bridge
+            .send_records(
+                bridge
+                    .produce_turn(producer.clone(), soon_enough())
+                    .await
+                    .expect("the producer's own turn"),
+                (),
+                &target,
+                0,
+                vec![message],
+                soon_enough(),
+            )
+            .await;
+        sent.expect("the send lands");
+        assert!(held.is_some(), "a send that ends hands its turn back");
+    }
+}
+
+/// How many clients Iggy counts as connected, `raw` among them.
+async fn connected_clients(raw: &IggyClient) -> usize {
+    raw.get_clients().await.expect("list the clients").len()
+}
+
+async fn wait_for_clients(raw: &IggyClient, expected: usize) {
+    let reached = async {
+        while connected_clients(raw).await != expected {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(STEP, reached)
+        .await
+        .unwrap_or_else(|_elapsed| panic!("Iggy never counted {expected} clients"));
+}
+
+#[tokio::test]
+#[serial]
+async fn given_two_producers_when_they_send_at_once_should_keep_the_order_of_each() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    let bridge = state.bridge.as_deref().expect("a bridge");
+
+    tokio::join!(
+        send_each(bridge, Producer::Connection(1), "a", 20),
+        send_each(bridge, Producer::Connection(2), "b", 20),
+    );
+    // This client, the bridge's shared one, and one for each producer.
+    assert_eq!(connected_clients(&raw_client(&server).await).await, 4);
+
+    let payloads: Vec<String> = stored(&server, 0, 100)
+        .await
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect();
+    assert_eq!(payloads.len(), 40);
+    for name in ["a", "b"] {
+        let sent: Vec<String> = (0..20).map(|index| format!("{name}-{index}")).collect();
+        let stored: Vec<String> = payloads
+            .iter()
+            .filter(|payload| payload.starts_with(name))
+            .cloned()
+            .collect();
+        assert_eq!(stored, sent, "producer {name} keeps its order");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn given_open_produce_sessions_when_a_connection_or_the_bridge_ends_should_close_them() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = gateway_with_topic(&server, 1).await;
+    let bridge = state.bridge.as_deref().expect("a bridge");
+    let raw = raw_client(&server).await;
+
+    send_each(bridge, Producer::Connection(1), "a", 1).await;
+    send_each(bridge, Producer::Connection(2), "b", 1).await;
+    // This client, the bridge's shared one, and one for each producer.
+    wait_for_clients(&raw, 4).await;
+
+    bridge.end_connection(1);
+    wait_for_clients(&raw, 3).await;
+
+    bridge.close().await.expect("the bridge closes");
+    wait_for_clients(&raw, 1).await;
 }
 
 #[tokio::test]

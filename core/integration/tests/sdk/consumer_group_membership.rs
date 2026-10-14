@@ -633,13 +633,18 @@ async fn given_weak_offset_durability_when_owner_changes_should_preserve_progres
     let recovered = harness.tcp_root_client().await.unwrap();
     timeout(RESOLVE_TIMEOUT, async {
         loop {
-            let offset = recovered
+            match recovered
                 .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(0))
                 .await
-                .unwrap();
-            if let Some(offset) = offset {
-                assert_eq!(offset.stored_offset, STORED_OFFSET);
-                break;
+            {
+                Ok(Some(offset)) => {
+                    assert_eq!(offset.stored_offset, STORED_OFFSET);
+                    break;
+                }
+                // Right after a whole-cluster restart, every node can refuse
+                // the read while it recovers the partition.
+                Ok(None) | Err(IggyError::TransientNotAccepted) => {}
+                Err(error) => panic!("reading the recovered offset failed: {error}"),
             }
             sleep(ASSIGNMENT_POLL_INTERVAL).await;
         }

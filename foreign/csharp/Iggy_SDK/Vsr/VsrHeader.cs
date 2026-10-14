@@ -67,7 +67,7 @@ internal static class VsrHeader
     ///     different request would let the client table answer that request from the first one's cached reply.
     /// </remarks>
     internal static int EncodeRequestHeader(Span<byte> header, ConsensusSession session, int code,
-        ReadOnlySpan<byte> payload, PartitionContext context = default)
+        ReadOnlySpan<byte> payload, PartitionContext context = default, SessionFrame? retainedFrame = null)
     {
         if (header.Length < HEADER_SIZE)
         {
@@ -84,7 +84,7 @@ internal static class VsrHeader
             throw VsrError.Exception(VsrError.INVALID_COMMAND, "Request body exceeds the maximum frame size.");
         }
 
-        var frame = session.Resolve(operation);
+        var frame = retainedFrame ?? session.Resolve(operation);
         var totalSize = HEADER_SIZE + payload.Length;
 
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);

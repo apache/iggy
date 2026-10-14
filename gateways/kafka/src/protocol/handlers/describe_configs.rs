@@ -39,8 +39,7 @@ use crate::protocol::api::{
 };
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
 use crate::protocol::handlers::topic_config::{
-    CLEANUP_DOC, CLEANUP_POLICY, CLEANUP_POLICY_VALUE, CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_TOPIC,
-    CONFIG_TYPE_LONG, CONFIG_TYPE_STRING, ListedKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC,
+    CONFIG_SOURCE_TOPIC, CONFIG_TYPE_LONG, ListedKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC,
     RETENTION_DOC, RETENTION_MS, bridge_failure, listed_keys, name_reason, retention_ms,
     topic_cap_and_duplicates, topic_cap_message,
 };
@@ -289,14 +288,6 @@ fn described_entries(
                     include_documentation.then_some(RETENTION_DOC),
                 ));
             }
-            ListedKey::Cleanup => configs.push(config_entry(
-                CLEANUP_POLICY,
-                Some(CLEANUP_POLICY_VALUE),
-                true,
-                CONFIG_SOURCE_DEFAULT,
-                CONFIG_TYPE_STRING,
-                include_documentation.then_some(CLEANUP_DOC),
-            )),
             // A resource error makes clients drop every returned config, including
             // retention.ms. An unmodeled name is omitted and the resource stays successful.
             ListedKey::Unknown => {}
@@ -346,9 +337,7 @@ mod tests {
         CompressionAlgorithm, HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp,
         MaxTopicSize, OptionValue, ResourceOptions, TopicDetails, topic_option_keys,
     };
-    use kafka_protocol::messages::describe_configs_response::{
-        DescribeConfigsResourceResult, DescribeConfigsSynonym,
-    };
+    use kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
     use kafka_protocol::protocol::StrBytes;
 
     use super::described_entries;
@@ -401,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn default_describe_returns_retention_and_cleanup() {
+    fn default_describe_returns_retention_only() {
         let expiry = parse_retention_ms("120000").expect("2 minutes in ms");
         let details = topic_details(expiry, true);
         let (configs, bad) = entries(&details, None, false);
@@ -411,14 +400,27 @@ mod tests {
                 .iter()
                 .map(|config| config.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![RETENTION_MS, CLEANUP_POLICY]
+            vec![RETENTION_MS]
         );
         assert_eq!(value_of(&configs, RETENTION_MS), Some("120000"));
-        let cleanup = configs
-            .iter()
-            .find(|config| config.name.as_str() == CLEANUP_POLICY)
-            .expect("cleanup");
-        assert_eq!(cleanup.synonyms, [] as [DescribeConfigsSynonym; 0]);
+    }
+
+    #[test]
+    fn cleanup_policy_is_omitted_even_when_asked_for() {
+        let details = topic_details(IggyExpiry::NeverExpire, false);
+        let only_cleanup = [StrBytes::from_static_str(CLEANUP_POLICY)];
+        let (configs, bad) = entries(&details, Some(&only_cleanup), true);
+        assert!(!bad);
+        assert_eq!(configs, [] as [DescribeConfigsResourceResult; 0]);
+
+        let both = [
+            StrBytes::from_static_str(CLEANUP_POLICY),
+            StrBytes::from_static_str(RETENTION_MS),
+        ];
+        let (configs, bad) = entries(&details, Some(&both), true);
+        assert!(!bad);
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name.as_str(), RETENTION_MS);
     }
 
     #[test]

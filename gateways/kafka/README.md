@@ -53,7 +53,7 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_IDLE_TIMEOUT_SECS` | `600` | Seconds a connection may sit idle before the next frame's length prefix arrives |
 | `IGGY_KAFKA_READ_TIMEOUT_SECS` | `15` | Seconds allowed to read a frame body once its length prefix arrives |
 | `IGGY_KAFKA_WRITE_TIMEOUT_SECS` | `10` | Seconds allowed to write a response frame |
-| `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them |
+| `IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Seconds graceful shutdown waits for in-flight connections before abandoning them. The bridge then signs its Iggy clients out, 5 s at most |
 | `IGGY_KAFKA_INSTANCE_ID` | `0` | This gateway's number among the gateways fronting one Iggy cluster. It is the high half of every producer id `InitProducerId` hands out, and Kafka requires those to be cluster-unique, so give every gateway its own value. A single gateway can leave it at `0`. |
 | `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Connect the Iggy bridge at startup. While false every API answers with its stub, and the `IGGY_KAFKA_IGGY_*` variables below are read by nothing. A failed connection is fatal, not a downgrade to stubs. |
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Require SASL/PLAIN authentication before serving any other API (`true` or `false`, nothing else) |
@@ -205,9 +205,9 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 
 Delivery through this gateway is **at-least-once**, and stays at-least-once across a gateway
 restart. Transactions are not supported, and will not be. An idempotent Kafka producer is given
-a producer id so that it starts, but its retries are not deduplicated: Produce stores idempotent
-batches but ignores their producer id, epoch and sequence, so a retry after a network timeout
-writes the record twice, and both copies reach the stream with their own offsets.
+a producer id so that it starts, but its retries are not deduplicated: Produce uses the producer
+id only to pick the producer's Iggy session, and ignores the epoch and sequence, so a retry after a
+network timeout writes the record twice, and both copies reach the stream with their own offsets.
 
 Iggy deduplicates writes on its own partition plane, and that does not close this gap, because it
 guards the hop from the gateway to Iggy rather than the hop from the producer to the gateway.
@@ -334,7 +334,8 @@ One partition, one Iggy send. Each partition answers for itself.
 | Topics | Creates none. Missing: 3. Bad name: 17. |
 | `timeout_ms` | Honored, max 20 s. Past it: 7. |
 | Compression | gzip, snappy, lz4. zstd from v7, else 76. |
-| Producer id, epoch, sequence | Ignored, so a retry writes twice. |
+| Producer id | Picks the producer's Iggy session. See [Concurrency ceiling](#concurrency-ceiling). |
+| Producer epoch, sequence | Ignored, so a retry writes twice. |
 | Timestamps over about 71 min apart | Clamped into one send. `kafka.ts` keeps the real one. |
 | Several batches in one partition | 87, as Kafka. |
 | Bytes after the batch | 87. |
@@ -350,13 +351,22 @@ One partition, one Iggy send. Each partition answers for itself.
 | 87 | Record the gateway cannot map. Reason in `error_message` from v8. | Fails. |
 | 35 | Transactional or control batch | Fails. |
 | 6 | Request budget ran out. Nothing written. | Retries. |
-| 7 | Deadline passed, or connection lost mid-send. May be written. | Retries. Can duplicate. |
+| 7 | Deadline passed: in the send, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. May be written. | Retries. Can duplicate. |
 
 Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
 per slot. Past it: 10.
 
 Request budget: 8 partition caps, refused partitions included. Past it: 6 for the rest, not
-decoded. 4 requests decode at once.
+decoded.
+
+Decode memory: 5 partition caps across all requests, counted in bytes. A request holds what its
+largest partition may decode: its bytes or 64 per record slot, whichever is more, or a whole cap
+when compressed. One holding 64 KiB or more first takes one of 4 large slots, and holds no memory
+while it waits for one. So large requests hold 4 caps at most, and leave 1 to the small ones.
+
+A request waits for its producer's turn first, and holds no slot and no memory while it does.
+Past its deadline waiting for any of the three: 7. A send that outlives its request keeps its slot
+and its memory until it ends, 45 s at most.
 
 [docs/BRIDGE_MAPPING.md](docs/BRIDGE_MAPPING.md) describes what a record becomes once it is stored.
 
@@ -437,6 +447,8 @@ Limits:
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
 | `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
 | `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE` | `64MiB` | Iggy's `message_bus.max_message_size`. Set both together. Larger partitions answer 10 |
+| `IGGY_KAFKA_PRODUCE_SESSIONS` | `256` | Producers that get an Iggy client of their own. The rest share one. `0`: all share one |
+| `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` | `600` | An unused Produce client closes after this long |
 
 The initial connect retries a fixed, bounded number of times (`RECONNECTION_RETRIES = 3`, not the
 Iggy SDK client's own default of unlimited retries, one dial per second, forever), and the whole
@@ -450,9 +462,13 @@ Iggy becomes unreachable later.
 
 `send_records` uses the Produce deadline instead:
 
-- One send runs in the SDK at a time.
-- A send past its deadline keeps that slot until it ends, up to 45 s. Other sends answer 7 meanwhile.
-- ListOffsets needs no slot, but it waits behind a stuck send in the SDK. Past `REQUEST_TIMEOUT` it answers 7.
+- One request of a producer runs at a time, on that producer's client.
+- A send past its deadline keeps the producer's turn until it ends. That producer's requests answer
+  7 meanwhile. Other producers send on.
+- After 45 s the gateway gives up on the send. It then closes that connection before the turn
+  frees, so the send cannot land after a later one. The SDK ends its write within 30 s more,
+  unless Iggy stopped reading: the producer then waits until that connection breaks.
+- No other API waits behind a stuck send. Each uses another client.
 
 ### Topic mapping
 
@@ -507,15 +523,34 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 
 ### Concurrency ceiling
 
-- One `IggyClient` serves Produce, Metadata, CreateTopics, DescribeConfigs and AlterConfigs for
-  every Kafka connection, one Iggy request at a time. Fetch polls use 4 more, one per read slot.
-  Topic probes use 1 more. Offset  calls use 8 more: a commit client and a read client per offset slot.
+- Each producer sends on an `IggyClient` of its own, one request at a time, so its batches land
+  in order. Different producers send at once.
+- A producer is its producer id, if this gateway gave that id out since it started, plus its user
+  when SASL is on. Every other producer is its Kafka connection: no id, an id from before a
+  gateway restart, or an id from another gateway.
+- Up to `IGGY_KAFKA_PRODUCE_SESSIONS` (256) of these clients are open. A full pool closes its
+  least recently used free client for a new producer, if that client sat unused for 30 s.
+  Otherwise the producer shares 1 more client, one request at a time, and moves to its own at a
+  later request, once there is room and none of its requests runs.
+- `IGGY_KAFKA_MAX_CONNECTIONS` (1024) allows more producers than sessions, so raise the session
+  limit to give each its own.
+- Each client costs Iggy a connection, a slot of `metadata.clients_table_max` (8192), and a slot
+  of `partition.dedup_clients_max` (4096) in each partition it writes.
+- A client whose producer is a connection closes, signed out, when that connection ends. Any
+  other closes after `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` (600) unused, checked every 30 s.
+- 4 clients sign in at once, 80 a second at most. More wait, up to their request's deadline.
+- `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
+- Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
+  Iggy request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
+  Offset calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
-- `IGGY_KAFKA_MAX_CONNECTIONS` does not change that. A Produce client pool is a TODO in
-  [docs/SCOPE.md](docs/SCOPE.md).
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
   can land after later ones.
+- Order after a 7: the send can still run. A producer with a producer id waits behind it on any
+  connection. A producer that is its connection does not once it reconnects, so its retry or its
+  next batch can land first. To keep that order use an idempotent producer, the Java default, or
+  `IGGY_KAFKA_PRODUCE_SESSIONS=0`.
 
 Fetches share topic probes: one `get_topic` per topic at a time, for all consumers together, on
 the probe client. A caught-up consumer of a busy topic can start one per Fetch. A waiting Fetch

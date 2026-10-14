@@ -36,6 +36,9 @@ pub struct DurableConsumerOffsets {
     groups: RefCell<HashMap<u32, DurableOffsetState>>,
     external_groups: RefCell<HashMap<u32, DurableOffsetState>>,
     membership_epoch: Cell<u64>,
+    /// The op of the committed delete that left every kind empty, `0` when
+    /// none is known. Any entry the table gains resets it.
+    emptied_at: Cell<u64>,
 }
 
 impl DurableConsumerOffsets {
@@ -64,6 +67,7 @@ impl DurableConsumerOffsets {
         committed_offset: u64,
         persisted_high_water: u64,
     ) -> bool {
+        self.emptied_at.set(0);
         let created = self
             .entries(kind)
             .borrow_mut()
@@ -88,6 +92,7 @@ impl DurableConsumerOffsets {
         committed_offset: u64,
         persisted_high_water: u64,
     ) {
+        self.emptied_at.set(0);
         let mut entries = self.entries(kind).borrow_mut();
         match entries.entry(id) {
             Entry::Occupied(mut entry) => {
@@ -118,7 +123,16 @@ impl DurableConsumerOffsets {
         self.consumers.borrow_mut().clear();
         self.groups.borrow_mut().clear();
         self.external_groups.borrow_mut().clear();
+        self.emptied_at.set(0);
         self.bump_membership_epoch();
+    }
+
+    pub(crate) const fn emptied_at(&self) -> u64 {
+        self.emptied_at.get()
+    }
+
+    pub(crate) fn set_emptied_at(&self, op: u64) {
+        self.emptied_at.set(op);
     }
 
     #[cfg(any(test, feature = "simulator"))]

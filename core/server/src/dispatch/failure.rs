@@ -28,7 +28,7 @@
 //! | [`FrameChannel::ResyncSentinel`] | status-0 poll reply, body carries `RESYNC_REQUIRED_PARTITION_SENTINEL` | a fenced consumer-group poll: the consumer must re-sync its assignment; HTTP mirrors it as `resync_required_polled_messages` in `crate::http::wire` |
 //! | [`FrameChannel::EmptyFrame`] | status 0 with the 40-byte empty poll | fallback for an unexpected owner reply or a poll encoding failure; this does not prove the partition is empty. Missing owner replies and explicit owner rejections use `TypedDeny` |
 //! | [`FrameChannel::Reply`] | status-0 success frame | host-built success replies: login/register, ping, logout, non-replicated read bodies, committed metadata replies |
-//! | silent drop | no frame | only a header `RequestHeader::validate` rejected, and that one is a GAP, not a contract - the fields decode, so a deny can be echoed under the transport id, and the client instead waits out its read timeout. A metadata submit without a verdict is not silent: it answers `TransientNotCommitted` on `TypedDeny`, which licenses only a replay of the same request id, so it cannot contradict a write that commits moments later |
+//! | silent drop | no frame | two cases. A header `RequestHeader::validate` rejection is a GAP, not a contract - the fields decode, so a deny can be echoed under the transport id, and the client instead waits out its read timeout. A relayed partition write without a verdict is silent by design (`relay_partition_reply`): the owner dropped the reply or `PARTITION_SUBMIT_TIMEOUT` expired, the outcome is unknown, and the client read timeout is the recovery. A metadata submit without a verdict is not silent: it answers `TransientNotCommitted` on `TypedDeny`, which licenses only a replay of the same request id, so it cannot contradict a write that commits moments later |
 //! | HTTP status | HTTP status code | the HTTP spine maps the same rejections in `crate::http::error`; it never rides these frames |
 //!
 //! The last two send nothing, so [`FrameChannel`] has no variant for them.
@@ -56,11 +56,11 @@ use iggy_binary_protocol::{
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::BusMessage;
+use message_bus::{BusMessage, SendError};
 use server_common::Message;
 use std::mem::offset_of;
 use std::rc::Rc;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Labels the channel a host-built frame rides, for the send-failure log.
 /// The taxonomy, including the two channels that never construct a frame,
@@ -102,14 +102,27 @@ pub(in crate::dispatch) async fn send_host_frame<B: ShellBus>(
     channel: FrameChannel,
     context: &'static str,
 ) {
-    if let Err(send_error) = bus.send_to_client(transport_client_id, frame).await {
-        warn!(
-            transport_client_id,
-            error = %send_error,
-            channel = %channel,
-            context,
-            "failed to send host frame to client"
-        );
+    match bus.send_to_client(transport_client_id, frame).await {
+        Ok(()) => {}
+        // Request tasks outlive their connection, and each one fails here.
+        Err(send_error @ SendError::ClientNotFound(_)) => {
+            debug!(
+                transport_client_id,
+                error = %send_error,
+                channel = %channel,
+                context,
+                "host frame target is gone"
+            );
+        }
+        Err(send_error) => {
+            warn!(
+                transport_client_id,
+                error = %send_error,
+                channel = %channel,
+                context,
+                "failed to send host frame to client"
+            );
+        }
     }
 }
 
@@ -430,15 +443,17 @@ pub(in crate::dispatch) async fn send_non_replicated_bytes<B, MJ, S, SB>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::handle_client_request;
+    use crate::dispatch::partition::empty_poll_fallback;
     use crate::dispatch::test_support::{
         FIRST_BOOT, SpyBus, TestShard, UNDECLARED_OPERATION, request_message, test_shard,
     };
+    use crate::dispatch::{ClientDrain, handle_client_request};
     use crate::session_manager::SessionManager;
     use configs::server::ServerConfig;
     use consensus::{LocalPipeline, VsrConsensus};
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_binary_protocol::consensus::REJECTION_SECTION_LEN;
+    use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
     use iggy_binary_protocol::{
         Command, ConsensusHeader, EvictionHeader, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
         Operation, ReplyHeader, result_code,
@@ -457,8 +472,6 @@ mod tests {
     /// Nonzero, so an echoed stamp is distinguishable from a zeroed field.
     const REQUEST_CHECKSUM: u128 = 0x0123_4567_89AB_CDEF;
     const MAX_TOKENS_PER_USER: u32 = 1;
-    /// `[partition_id:4][current_offset:8][count:4]`.
-    const EMPTY_POLL_BODY_LEN: usize = 16;
     /// Send-failure log label only; no exit reads it.
     const CONTEXT: &str = "shape_test";
     /// Consensus context the eviction shard stamps, spelled out so the
@@ -545,17 +558,6 @@ mod tests {
             "a deny must never read as a committed ack"
         );
         assert!(body.is_empty(), "a deny reply carries no body");
-    }
-
-    /// The empty `PolledMessages` body the poll arm sends when a partition
-    /// cannot answer; with the re-sync sentinel as `partition_id` it tells a
-    /// fenced consumer to re-sync its assignment.
-    fn empty_poll_body(partition_id: u32) -> Bytes {
-        let mut body = Vec::with_capacity(EMPTY_POLL_BODY_LEN);
-        body.extend_from_slice(&partition_id.to_le_bytes());
-        body.extend_from_slice(&0u64.to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes());
-        Bytes::from(body)
     }
 
     /// Send one eviction and decode it. The bus is cleared first so each
@@ -645,8 +647,10 @@ mod tests {
             &sessions,
             &server_config,
             MAX_TOKENS_PER_USER,
+            &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             frame,
+            None,
         )
         .await;
 
@@ -834,16 +838,13 @@ mod tests {
     async fn resync_sentinel_must_ride_a_status_zero_poll_body_led_by_the_sentinel() {
         let (bus, shard) = shard_at_commit();
         let request = poll_request();
+        let (body, channel) = empty_poll_fallback(RESYNC_REQUIRED_PARTITION_SENTINEL);
+        assert!(
+            matches!(channel, FrameChannel::ResyncSentinel),
+            "the sentinel poll rides the re-sync channel"
+        );
 
-        send_non_replicated_bytes(
-            &shard,
-            &request,
-            TRANSPORT,
-            empty_poll_body(RESYNC_REQUIRED_PARTITION_SENTINEL),
-            FrameChannel::ResyncSentinel,
-            CONTEXT,
-        )
-        .await;
+        send_non_replicated_bytes(&shard, &request, TRANSPORT, body, channel, CONTEXT).await;
 
         let (header, body) = sole_frame_to_transport::<ReplyHeader>(&bus);
         assert_echoes_request(&header, request.header());
@@ -853,7 +854,7 @@ mod tests {
         );
         assert_eq!(
             body.len(),
-            EMPTY_POLL_BODY_LEN,
+            POLL_RESPONSE_HEADER_SIZE,
             "the body is the empty poll the SDK decoder requires"
         );
         assert_eq!(
@@ -893,8 +894,10 @@ mod tests {
             &sessions,
             &server_config,
             MAX_TOKENS_PER_USER,
+            &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             request.into_generic(),
+            None,
         )
         .await;
 

@@ -28,31 +28,39 @@ use super::register_forwarding::connect_without_login;
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_POLL_ROUTING_CODE,
+    BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE,
     POLL_MESSAGES_ON_PRIMARY_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupDetailsResponse;
-use iggy_binary_protocol::responses::messages::PollRoutingResponse;
+use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollRoutingResponse};
 use iggy_binary_protocol::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireName,
 };
 use iggy_common::locking::IggyRwLockFn;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::wire_conversions::{
     consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
 };
-use iggy_common::{BinaryTransport, RESYNC_REQUIRED_PARTITION_SENTINEL, VsrSessionControl};
-use integration::harness::TestHarness;
+use iggy_common::{
+    BinaryTransport, ConsumerOffsetInfo, IggyMessagesBatch, RESYNC_REQUIRED_PARTITION_SENTINEL,
+    VsrSessionControl,
+};
 use integration::harness::disk::{
     leader_node_index_via, read_metadata_superblock_state, read_partition_superblock_state,
 };
+use integration::harness::{TestBinary, TestHarness};
 use integration::iggy_harness;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
+use reqwest::StatusCode;
+use reqwest::header::RETRY_AFTER;
 use tokio::time::{Instant, sleep, timeout};
+
+use crate::server::http_client::{HttpClient, applied_op, node_url, until_primary_resolved};
 
 const STREAM_NAME: &str = "partition-routing-stream";
 const TOPIC_NAME: &str = "partition-routing-topic";
@@ -60,6 +68,14 @@ const PARTITION_ID: u32 = 0;
 const GROUP_NAME: &str = "partition-routing-group";
 const OFFSET_GROUP_NAME: &str = "offset-routing-group";
 const GROUP_PAYLOADS: [&str; 2] = ["group-poll-first", "group-poll-second"];
+const RELAY_CONSUMER_ID: u32 = 7;
+const RELAYED_PAYLOADS: [&str; 2] = ["relayed-acked", "relayed-unacked"];
+/// The marker and the route of an HTTP request that one node relays to another.
+const FORWARDED_HEADER: &str = "iggy-forwarded";
+const PARTITION_ROUTE_HEADER: &str = "iggy-partition-route";
+/// Partition 0 at incarnation 1, owner generation 0 and metadata op 0, with
+/// 5 s left. Every replica applied op 0, so the metadata hold ends at once.
+const ROUTE_AT_FIRST_OP: &str = "0,1,0,0,5000";
 const GROUP_POLL_BUDGET: Duration = Duration::from_secs(20);
 // QUIC may use the full 30-second response budget before a dead data connection
 // reports an uncertain outcome; recovery then needs a fresh routing attempt.
@@ -83,6 +99,18 @@ const PRECONDITION_POLL: Duration = Duration::from_millis(500);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
+}
+
+fn send_body(payload: &str) -> SendMessages {
+    let messages = vec![message(payload)];
+    SendMessages {
+        metadata_length: 0,
+        stream_id: Identifier::default(),
+        topic_id: Identifier::default(),
+        partitioning: Partitioning::partition_id(PARTITION_ID),
+        batch: IggyMessagesBatch::from(&messages),
+        context: None,
+    }
 }
 
 #[iggy_harness(cluster_nodes = 3)]
@@ -189,6 +217,155 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
     );
 }
 
+/// Any node answers a partition route, so a client that reaches one node
+/// learns where every partition is served. The nodes agree on the partition's
+/// incarnation, count and primary. Send or poll permission is enough, and a
+/// user with neither learns nothing.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_any_node_when_routing_a_partition_should_name_the_same_primary(
+    harness: &mut TestHarness,
+) {
+    const PARTITIONS_COUNT: u32 = 2;
+    const PASSWORD: &str = "route-password";
+    const SENDER: &str = "route-sender";
+    const POLLER: &str = "route-poller";
+    const STRANGER: &str = "route-stranger";
+    let leader = harness.node(0).tcp_addr().unwrap();
+    let root = connect_without_login(leader).await;
+    root.login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    root.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    root.create_topic(
+        &stream,
+        TOPIC_NAME,
+        &TopicCreateOptions {
+            partitions_count: Some(PARTITIONS_COUNT),
+            message_expiry: Some(IggyExpiry::NeverExpire),
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let topic = Identifier::named(TOPIC_NAME).unwrap();
+    for (name, global) in [
+        (
+            SENDER,
+            GlobalPermissions {
+                send_messages: true,
+                ..GlobalPermissions::default()
+            },
+        ),
+        (
+            POLLER,
+            GlobalPermissions {
+                poll_messages: true,
+                ..GlobalPermissions::default()
+            },
+        ),
+        (STRANGER, GlobalPermissions::default()),
+    ] {
+        root.create_user(
+            name,
+            PASSWORD,
+            UserStatus::Active,
+            Some(Permissions {
+                global,
+                streams: None,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let route_request = GetPartitionRouteRequest {
+        stream_id: identifier_to_wire(&stream).unwrap(),
+        topic_id: identifier_to_wire(&topic).unwrap(),
+        partition_id: PARTITION_ID,
+    }
+    .to_bytes();
+
+    let stranger = connect_without_login(leader).await;
+    stranger.login_user(STRANGER, PASSWORD).await.unwrap();
+    let refused = stranger
+        .send_raw_with_response(GET_PARTITION_ROUTE_CODE, route_request.clone())
+        .await;
+    assert!(
+        matches!(refused, Err(IggyError::Unauthorized)),
+        "a user without send or poll permission must not learn the route, got {refused:?}"
+    );
+
+    let mut routes = Vec::new();
+    for name in [SENDER, POLLER] {
+        let member = connect_without_login(leader).await;
+        member.login_user(name, PASSWORD).await.unwrap();
+        let binding = BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("routing-test").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            identity: member.session_identity().await.unwrap(),
+            bind_secret: member.session_bind_secret().await.unwrap(),
+        };
+        for node in 0..harness.cluster_size() {
+            let data = connect_without_login(harness.node(node).tcp_addr().unwrap()).await;
+            data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
+                .await
+                .unwrap();
+            data.bind_vsr_session(binding.identity.session)
+                .await
+                .unwrap();
+            // A node creates its replica of a new partition after it applies
+            // the topic, and answers transient until then.
+            let route = timeout(PRECONDITION_BUDGET, async {
+                loop {
+                    match data
+                        .send_raw_with_response(GET_PARTITION_ROUTE_CODE, route_request.clone())
+                        .await
+                    {
+                        Ok(reply) => break PartitionRouteResponse::decode_from(&reply).unwrap(),
+                        Err(IggyError::TransientNotAccepted) => sleep(PRECONDITION_POLL).await,
+                        Err(error) => panic!("node {node} refused the route for {name}: {error:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("node {node} never routed the partition for {name}"));
+            routes.push((node, name, route));
+        }
+    }
+
+    let (_, _, first) = &routes[0];
+    assert_ne!(
+        first.incarnation, 0,
+        "a created partition has an incarnation"
+    );
+    assert_eq!(first.partitions_count, PARTITIONS_COUNT);
+    assert!(usize::from(first.primary_replica) < harness.cluster_size());
+    for (node, name, route) in &routes {
+        assert_eq!(
+            (
+                route.incarnation,
+                route.partitions_count,
+                route.view,
+                route.primary_replica
+            ),
+            (
+                first.incarnation,
+                first.partitions_count,
+                first.view,
+                first.primary_replica
+            ),
+            "node {node} answered {name} with a different route"
+        );
+        assert!(
+            route.metadata_op > 0,
+            "node {node} applied the topic, so its route reports a metadata op"
+        );
+    }
+}
+
 #[iggy_harness(cluster_nodes = 3, server(
     metadata.journal_slots = "256",
     consumer_group.rebalancing_timeout = "1s",
@@ -260,6 +437,368 @@ async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replica
         assert_eq!(message.payload.as_ref(), expected.as_bytes());
     }
     assert_replicated_offset(harness, &consumer, Some((GROUP_PAYLOADS.len() - 1) as u64)).await;
+}
+
+/// Every partition request an HTTP caller sends to a backup runs on the
+/// partition primary: the backup chooses the partition and relays the request.
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_split_primaries_when_http_calls_a_partition_backup_should_serve_on_the_primary(
+    harness: &mut TestHarness,
+) {
+    let (partition_primary, backup, _) = seed_split_primaries(harness).await;
+    assert_ne!(partition_primary, backup);
+    let http = HttpClient::login_root_no_redirect(node_url(harness, backup)).await;
+    let messages = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+    ));
+    // The relay copies the partition primary's applied op onto each response.
+    let mut primary_applied_op = 0;
+    for (payload, query, status) in [
+        (RELAYED_PAYLOADS[0], "", StatusCode::CREATED),
+        (RELAYED_PAYLOADS[1], "?ack=none", StatusCode::ACCEPTED),
+    ] {
+        let response = http
+            .client
+            .post(format!("{messages}{query}"))
+            .bearer_auth(&http.token)
+            .json(&send_body(payload))
+            .send()
+            .await
+            .expect("send request");
+        assert_eq!(response.status(), status, "send{query} on a backup");
+        primary_applied_op = primary_applied_op.max(applied_op(&response));
+    }
+
+    let expected: Vec<&str> = GROUP_PAYLOADS.into_iter().chain(RELAYED_PAYLOADS).collect();
+    let poll = format!(
+        "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+         &kind=offset&value=0&count={}&auto_commit=false",
+        expected.len() + 1
+    );
+    let polled = timeout(GROUP_POLL_BUDGET, async {
+        loop {
+            let response = http
+                .client
+                .get(&poll)
+                .bearer_auth(&http.token)
+                .send()
+                .await
+                .expect("poll request");
+            assert_eq!(response.status(), StatusCode::OK, "poll on a backup");
+            let polled: PolledMessages = response.json().await.expect("decode PolledMessages");
+            if polled.messages.len() >= expected.len() {
+                break polled;
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .expect("the unacknowledged send must commit on the partition primary");
+    let payloads: Vec<&[u8]> = polled
+        .messages
+        .iter()
+        .map(|message| message.payload.as_ref())
+        .collect();
+    let expected: Vec<&[u8]> = expected.iter().map(|payload| payload.as_bytes()).collect();
+    assert_eq!(payloads, expected);
+    assert!(
+        polled.context.metadata_op >= primary_applied_op,
+        "the relayed poll context {:?} must cover the primary's applied op {primary_applied_op}",
+        polled.context
+    );
+
+    let offsets = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/consumer-offsets"
+    ));
+    let offset = format!("{offsets}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}");
+    let store = StoreConsumerOffset {
+        context: None,
+        consumer: Consumer::new(Identifier::numeric(RELAY_CONSUMER_ID).unwrap()),
+        partition_id: Some(PARTITION_ID),
+        offset: 1,
+    };
+    let response = http
+        .client
+        .put(&offsets)
+        .bearer_auth(&http.token)
+        .json(&store)
+        .send()
+        .await
+        .expect("store offset request");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "store on a backup"
+    );
+    pause_node(harness, partition_primary, true);
+    let (response, poll_response, ()) = tokio::join!(
+        http.client.get(&offset).bearer_auth(&http.token).send(),
+        http.client.get(&poll).bearer_auth(&http.token).send(),
+        async {
+            wait_for_queued_relays(harness, partition_primary, 2).await;
+            pause_node(harness, partition_primary, false);
+        },
+    );
+    let poll_response = poll_response.expect("relayed poll request");
+    assert_eq!(poll_response.status(), StatusCode::OK);
+    let relayed: PolledMessages = poll_response.json().await.expect("decode relayed poll");
+    assert_eq!(relayed.messages.len(), expected.len());
+    let response = response.expect("relayed get offset request");
+    assert_eq!(response.status(), StatusCode::OK, "get on a backup");
+    let info: ConsumerOffsetInfo = response.json().await.expect("decode ConsumerOffsetInfo");
+    assert_eq!(info.stored_offset, store.offset);
+    let response = http
+        .client
+        .delete(format!(
+            "{offsets}/{RELAY_CONSUMER_ID}?partition_id={PARTITION_ID}"
+        ))
+        .bearer_auth(&http.token)
+        .send()
+        .await
+        .expect("delete offset request");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "delete on a backup"
+    );
+    let response = http
+        .client
+        .get(&offset)
+        .bearer_auth(&http.token)
+        .send()
+        .await
+        .expect("get offset request after delete");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "deleted offset");
+}
+
+/// A relayed request carries the partition the contacted node chose. A backup
+/// refuses it with `NotPrimary` instead of relaying it again, a malformed route
+/// is the caller's error, and a route without the relay marker is ignored.
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_split_primaries_when_a_relayed_request_reaches_a_backup_should_refuse_not_primary(
+    harness: &mut TestHarness,
+) {
+    let (partition_primary, backup, _) = seed_split_primaries(harness).await;
+    assert_ne!(partition_primary, backup);
+    let http = HttpClient::login_root_no_redirect(node_url(harness, backup)).await;
+    let messages = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+    ));
+    let poll = format!(
+        "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+         &kind=offset&value=0&count=1&auto_commit=false"
+    );
+    let send = |route: &'static str| {
+        http.client
+            .post(&messages)
+            .bearer_auth(&http.token)
+            .header(PARTITION_ROUTE_HEADER, route)
+            .json(&send_body(RELAYED_PAYLOADS[0]))
+    };
+
+    for (request, name) in [
+        (
+            send(ROUTE_AT_FIRST_OP).header(FORWARDED_HEADER, "1"),
+            "send",
+        ),
+        (
+            http.client
+                .get(&poll)
+                .bearer_auth(&http.token)
+                .header(FORWARDED_HEADER, "1")
+                .header(PARTITION_ROUTE_HEADER, ROUTE_AT_FIRST_OP),
+            "poll",
+        ),
+    ] {
+        let response = request.send().await.expect("relayed request");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relayed {name} on a backup"
+        );
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        let body: serde_json::Value = response.json().await.expect("decode the error body");
+        assert_eq!(
+            body["id"],
+            IggyError::NotPrimary.as_code(),
+            "relayed {name}"
+        );
+    }
+
+    let response = send("0,1")
+        .header(FORWARDED_HEADER, "1")
+        .send()
+        .await
+        .expect("malformed relayed send");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = send(ROUTE_AT_FIRST_OP)
+        .send()
+        .await
+        .expect("send with a route and no relay marker");
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// A read changes no state, so a backup resends a relayed read whose partition
+/// primary died before it answered, and the caller gets the answer of the next
+/// primary. A poll with `auto_commit` may have moved its offset, so its outcome
+/// stays unknown.
+#[iggy_harness(cluster_nodes = 3, server(
+    metadata.journal_slots = "256",
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_split_primaries_when_a_relayed_read_loses_its_primary_should_resend_it(
+    harness: &mut TestHarness,
+) {
+    let (partition_primary, backup, _) = seed_split_primaries(harness).await;
+    assert_ne!(partition_primary, backup);
+    let http = HttpClient::login_root_no_redirect(node_url(harness, backup)).await;
+    let offsets = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/consumer-offsets"
+    ));
+    let store = StoreConsumerOffset {
+        context: None,
+        consumer: Consumer::new(Identifier::numeric(RELAY_CONSUMER_ID).unwrap()),
+        partition_id: Some(PARTITION_ID),
+        offset: 1,
+    };
+    let response = http
+        .client
+        .put(&offsets)
+        .bearer_auth(&http.token)
+        .json(&store)
+        .send()
+        .await
+        .expect("store offset request");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let messages = http.url(&format!(
+        "/streams/{STREAM_NAME}/topics/{TOPIC_NAME}/messages"
+    ));
+    let poll = |auto_commit: bool| {
+        format!(
+            "{messages}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}\
+             &kind=offset&value=0&count={}&auto_commit={auto_commit}",
+            GROUP_PAYLOADS.len()
+        )
+    };
+    let get = |url: String| http.client.get(url).bearer_auth(&http.token).send();
+
+    // A frozen primary takes the relayed requests and never answers them.
+    pause_node(harness, partition_primary, true);
+    let offset = format!("{offsets}?consumer_id={RELAY_CONSUMER_ID}&partition_id={PARTITION_ID}");
+    let (offset_read, read, auto_commit, ()) = tokio::join!(
+        get(offset.clone()),
+        get(poll(false)),
+        get(poll(true)),
+        async {
+            wait_for_queued_relays(harness, partition_primary, 3).await;
+            harness
+                .kill_node(partition_primary)
+                .expect("kill the frozen partition primary");
+        },
+    );
+
+    let response = read.expect("poll without auto_commit");
+    let response = if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        until_primary_resolved(|| async { get(poll(false)).await.expect("read-only poll") }).await
+    } else {
+        response
+    };
+    let (status, body) = status_and_body(response).await;
+    assert_eq!(status, StatusCode::OK, "poll without auto_commit: {body}");
+    let polled: PolledMessages = serde_json::from_str(&body).expect("decode PolledMessages");
+    assert_eq!(polled.messages.len(), GROUP_PAYLOADS.len());
+    let (status, body) = status_and_body(auto_commit.expect("poll with auto_commit")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "poll with auto_commit: {body}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).expect("decode the error body");
+    assert_eq!(body["code"], "forward_failed");
+    let (status, body) = status_and_body(offset_read.expect("offset read")).await;
+    // A new primary refuses to read a stored offset until it applied its view
+    // start. That refusal admits nothing, so the caller resends the read.
+    let (status, body) = if status == StatusCode::SERVICE_UNAVAILABLE {
+        status_and_body(
+            until_primary_resolved(|| async { get(offset.clone()).await.expect("offset read") })
+                .await,
+        )
+        .await
+    } else {
+        (status, body)
+    };
+    assert_eq!(status, StatusCode::OK, "offset read: {body}");
+    let info: ConsumerOffsetInfo = serde_json::from_str(&body).expect("decode ConsumerOffsetInfo");
+    assert_eq!(info.stored_offset, store.offset);
+}
+
+fn pause_node(harness: &TestHarness, node: usize, paused: bool) {
+    let pid = harness.node(node).pid().expect("the node is running");
+    let signal = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+    // SAFETY: the signal targets a child this harness owns and has not reaped.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+}
+
+/// The stopped HTTP listener cannot consume bytes. Nonempty receive queues
+/// prove the relay requests reached it before it is resumed or killed.
+async fn wait_for_queued_relays(harness: &TestHarness, node: usize, expected: usize) {
+    const TCP_ESTABLISHED: &str = "01";
+    let port = harness
+        .node(node)
+        .http_addr()
+        .expect("node HTTP address")
+        .port();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            let queued = ["/proc/net/tcp", "/proc/net/tcp6"]
+                .into_iter()
+                .map(|path| {
+                    std::fs::read_to_string(path)
+                        .expect("read the kernel TCP connection table")
+                        .lines()
+                        .skip(1)
+                        .filter(|line| {
+                            let fields: Vec<_> = line.split_whitespace().collect();
+                            fields.get(3) == Some(&TCP_ESTABLISHED)
+                                && fields
+                                    .get(1)
+                                    .and_then(|address| address.rsplit_once(':'))
+                                    .and_then(|(_, port)| u16::from_str_radix(port, 16).ok())
+                                    == Some(port)
+                                && fields
+                                    .get(4)
+                                    .and_then(|queues| queues.split_once(':'))
+                                    .and_then(|(_, received)| {
+                                        usize::from_str_radix(received, 16).ok()
+                                    })
+                                    .is_some_and(|received| received > 0)
+                        })
+                        .count()
+                })
+                .sum::<usize>();
+            if queued >= expected {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every HTTP relay must reach the paused partition primary");
+}
+
+async fn status_and_body(response: reqwest::Response) -> (StatusCode, String) {
+    let status = response.status();
+    (status, response.text().await.expect("response body"))
 }
 
 #[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
@@ -898,6 +1437,18 @@ async fn assert_data_session_fences(
     data.send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
         .await
         .unwrap();
+    // A caller without the owner generation sends 0, and the primary binds it
+    // to the owner it installed for this session.
+    let mut unbound = route.context;
+    unbound.owner_generation = 0;
+    let response = data
+        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), unbound)
+        .await
+        .expect("owner 0 must bind to the owner installed for this session");
+    assert_eq!(
+        PolledMessages::from_bytes(response).unwrap().partition_id,
+        PARTITION_ID
+    );
 
     member
         .leave_consumer_group(stream, topic, &consumer.id)
@@ -934,6 +1485,15 @@ async fn assert_data_session_fences(
         "the attached session must respect the member leaving"
     );
     assert!(polled.messages.is_empty());
+    let response = data
+        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), unbound)
+        .await
+        .unwrap();
+    assert_eq!(
+        PolledMessages::from_bytes(response).unwrap().partition_id,
+        RESYNC_REQUIRED_PARTITION_SENTINEL,
+        "owner 0 must not outlive the membership"
+    );
     let offset_write = StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer).unwrap(),
         stream_id: identifier_to_wire(stream).unwrap(),

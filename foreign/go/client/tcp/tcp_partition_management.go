@@ -34,6 +34,7 @@ func (c *IggyTcpClient) CreatePartitions(ctx context.Context, streamId iggcon.Id
 		return err
 	}
 	c.topics.invalidateAll()
+	c.polls.clearRoutes()
 	return nil
 }
 
@@ -47,9 +48,11 @@ func (c *IggyTcpClient) DeletePartitions(ctx context.Context, streamId iggcon.Id
 		return err
 	}
 	c.topics.invalidateAll()
+	c.polls.clearRoutes()
 	return nil
 }
 
 func (c *IggyTcpClient) dropTopicCache(streamId, topicId iggcon.Identifier) {
 	c.topics.drop(newTopicKey(streamId, topicId))
+	c.polls.clearRoutes()
 }
