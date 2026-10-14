@@ -28,13 +28,19 @@ name: PR Triage Collect
 # The pull_request lifecycle events replace pull_request_target, which ASF
 # Infra bars on workflows that hold a token and disables for ASF repositories
 # from November 2026 (https://infra.apache.org/github-actions-policy.html).
+# Unlike pull_request_target, pull_request does not run while a PR has a
+# merge conflict, so pr-triage-reconcile.yml applies the lifecycle rules on
+# a schedule for the PRs this collector never saw.
 #
 # SECURITY: no actions/checkout, no exec of PR contents, no token export.
 # The token here is read-only. The artifact is NOT trustworthy: on the
 # pull_request_review and pull_request paths GitHub runs the PR head's copy of
 # this file, so a fork can change it and upload any payload. The consumers
 # take only numeric ids and the event action from the artifact, check the
-# action against a fixed list, and re-fetch everything else from the API.
+# action against a fixed list, check on pull_request that the claimed PR's
+# head is the repository and branch this run fired on and on
+# pull_request_review that the review is on the claimed PR and as new as the
+# run, and re-fetch everything else from the API.
 
 on:
   issue_comment:
