@@ -70,6 +70,15 @@ public final class VsrRequestEncoder {
     }
 
     public ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload, PartitionContext context) {
+        return encode(alloc, commandCode, payload, context, 0);
+    }
+
+    public ByteBuf encode(
+            ByteBufAllocator alloc,
+            int commandCode,
+            ByteBuf payload,
+            PartitionContext context,
+            long retainedRequestId) {
         int operation;
         long requestId;
         long sessionId;
@@ -96,14 +105,14 @@ public final class VsrRequestEncoder {
                 // Non-replicated ops bypass dedup but still need a unique
                 // correlation id. Bootstrap ping and cluster metadata remain
                 // sessionless before login.
-                requestId = session.nextCorrelationId();
+                requestId = retainedRequestId != 0 ? retainedRequestId : session.nextCorrelationId();
                 sessionId = session.sessionOrZero();
             } else {
                 // Partition ops consume the dedup counter too: dedup needs each
                 // send to carry a distinct number, and the metadata watermark
                 // tolerates the gaps.
                 sessionId = session.boundSession();
-                requestId = session.nextRequestId();
+                requestId = retainedRequestId != 0 ? retainedRequestId : session.nextRequestId();
             }
         }
 

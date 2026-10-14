@@ -78,6 +78,13 @@ pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("igg
 pub(in crate::http) const APPLIED_OP_HEADER: HeaderName =
     HeaderName::from_static("iggy-applied-op");
 
+/// Response header attesting what durability a produce response proves:
+/// The completed topic policy after an awaited quorum commit. If namespace
+/// replacement prevents attesting its incarnation, report the proven quorum
+/// guarantee. `none` means `?ack=none` dispatch acceptance.
+pub(in crate::http) const DURABILITY_HEADER: HeaderName =
+    HeaderName::from_static("iggy-durability");
+
 struct RegisteredSessionGuard {
     shard: Rc<ServerShard>,
     identity: Option<(u128, u64)>,

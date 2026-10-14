@@ -55,9 +55,9 @@ public sealed class PartitionContextTests
         var sends = new ConcurrentQueue<MockRequest>();
         node.Serve(request =>
         {
-            if (request.Code == CommandCodes.GET_SEND_CONTEXT_CODE)
+            if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
             {
-                return Reply(OPERATION_NON_REPLICATED, Encode(Polled));
+                return RouteReply(request, Polled, 0);
             }
 
             if (request.Operation == (byte)VsrOperation.SendMessages)
@@ -74,8 +74,8 @@ public sealed class PartitionContextTests
         await SendAsync(client);
         await SendAsync(client);
 
-        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
-        Assert.Equal(new[] { Polled, Polled }, sends.Select(send => send.Context));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(new[] { Polled with { OwnerGeneration = 0 }, Polled with { OwnerGeneration = 0 } }, sends.Select(send => send.Context));
     }
 
     [Fact]
@@ -86,15 +86,15 @@ public sealed class PartitionContextTests
         var sends = new ConcurrentQueue<MockRequest>();
         node.Serve(request =>
         {
-            if (request.Code == CommandCodes.GET_SEND_CONTEXT_CODE)
+            if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
             {
-                return Reply(OPERATION_NON_REPLICATED, Encode(Live()));
+                return RouteReply(request, Live(), 0);
             }
 
             if (request.Operation == (byte)VsrOperation.SendMessages)
             {
                 sends.Enqueue(request);
-                return request.Context == Live()
+                return request.Context == Live() with { OwnerGeneration = 0 }
                     ? Reply(request.Operation, new byte[4])
                     : Reply(request.Operation, [], VsrError.HISTORY_UNAVAILABLE);
             }
@@ -108,8 +108,8 @@ public sealed class PartitionContextTests
         Volatile.Write(ref replaced, 1);
         await SendAsync(client);
 
-        Assert.Equal(2, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
-        Assert.Equal(new[] { Polled, Polled, Replaced }, sends.Select(send => send.Context));
+        Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
+        Assert.Equal(new[] { Polled with { OwnerGeneration = 0 }, Polled with { OwnerGeneration = 0 }, Replaced with { OwnerGeneration = 0 } }, sends.Select(send => send.Context));
         Assert.NotEqual(sends.ElementAt(1).RequestId, sends.ElementAt(2).RequestId);
 
         PartitionContext Live()
@@ -144,7 +144,7 @@ public sealed class PartitionContextTests
             TestContext.Current.CancellationToken);
         await SendAsync(client);
 
-        Assert.Equal(2, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
@@ -169,7 +169,7 @@ public sealed class PartitionContextTests
 
         Assert.Equal(VsrError.HISTORY_UNAVAILABLE, refusal.StatusCode);
         Assert.Equal(2, Volatile.Read(ref sends));
-        Assert.Equal(2, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     /// <summary>
@@ -201,7 +201,7 @@ public sealed class PartitionContextTests
         Assert.Equal(VsrError.HISTORY_UNAVAILABLE, refusal.StatusCode);
         Assert.True(refusal.FromServer);
         Assert.Equal(2, Volatile.Read(ref stores));
-        Assert.Equal(2, node.Requests(CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE));
+        Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
@@ -226,7 +226,7 @@ public sealed class PartitionContextTests
         await StoreAsync(client);
 
         Assert.Equal(2, Volatile.Read(ref stores));
-        Assert.Equal(1, node.Requests(CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
@@ -241,7 +241,7 @@ public sealed class PartitionContextTests
         await PollAsync(client, PollingStrategy.Offset(Offset));
 
         Assert.Equal(2, node.Requests(CommandCodes.POLL_MESSAGES_CODE));
-        Assert.Equal(1, node.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     /// <summary>
@@ -318,11 +318,11 @@ public sealed class PartitionContextTests
         await SendAsync(client);
 
         Assert.Equal(2, Volatile.Read(ref sends));
-        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
-    public async Task given_a_history_refusal_when_sending_should_drop_every_cached_context_of_the_topic()
+    public async Task given_a_history_refusal_when_sending_should_preserve_other_partition_routes()
     {
         using var node = new MockNode();
         var refused = 0;
@@ -346,11 +346,11 @@ public sealed class PartitionContextTests
         await SendAsync(client, PartitionId);
         await SendAsync(client, PartitionId + 1);
 
-        Assert.Equal(4, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(3, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
-    public async Task given_an_unrelated_metadata_commit_by_this_client_when_sending_again_should_keep_the_context()
+    public async Task given_a_metadata_commit_when_sending_again_should_refresh_the_shared_route_floor()
     {
         const ulong UpdateCommit = 50;
         using var node = new MockNode();
@@ -374,7 +374,7 @@ public sealed class PartitionContextTests
         await client.UpdateStreamAsync(Identifier.Numeric(1), "renamed", TestContext.Current.CancellationToken);
         await SendAsync(client);
 
-        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
@@ -398,7 +398,7 @@ public sealed class PartitionContextTests
             token: TestContext.Current.CancellationToken);
         await SendAsync(client);
 
-        Assert.Equal(1, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Theory]
@@ -420,11 +420,11 @@ public sealed class PartitionContextTests
         Assert.Equal(VsrError.FEATURE_UNAVAILABLE, refusal.StatusCode);
         Assert.False(refusal.FromServer);
         Assert.Equal(0, node.Requests(CommandCodes.SEND_MESSAGES_CODE));
-        Assert.Equal(0, node.Requests(CommandCodes.GET_SEND_CONTEXT_CODE));
+        Assert.Equal(0, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
-    public async Task given_a_caller_context_on_a_standalone_poll_should_stamp_it_without_routing()
+    public async Task given_a_caller_context_on_a_standalone_poll_should_preserve_it_while_routing()
     {
         using var node = new MockNode();
         var polls = new ConcurrentQueue<MockRequest>();
@@ -443,7 +443,7 @@ public sealed class PartitionContextTests
         await PollAsync(client, PollingStrategy.Offset(Offset).WithContext(Replaced));
 
         Assert.Equal(Replaced, Assert.Single(polls).Context);
-        Assert.Equal(0, node.Requests(CommandCodes.GET_POLL_ROUTING_CODE));
+        Assert.Equal(1, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
     [Fact]
@@ -547,12 +547,4 @@ public sealed class PartitionContextTests
             strategy, 10, false, TestContext.Current.CancellationToken);
     }
 
-    private static byte[] Encode(PartitionContext context)
-    {
-        var bytes = new byte[PartitionContext.ENCODED_SIZE];
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes, context.Incarnation);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(sizeof(ulong)), context.OwnerGeneration);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(2 * sizeof(ulong)), context.MetadataOp);
-        return bytes;
-    }
 }

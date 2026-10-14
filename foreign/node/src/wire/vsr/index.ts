@@ -97,7 +97,7 @@ export class VsrSession {
       request = this.state.beginRegister();
       session = 0n;
     } else if (operation === Operation.NonReplicated) {
-      request = this.state.currentRequestId();
+      request = this.state.isBound ? this.state.nextRequestId() : this.state.currentRequestId();
       session = this.state.session ?? 0n;
     } else {
       if (this.state.session === null)

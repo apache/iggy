@@ -27,6 +27,9 @@ public class ClusterNode
     /// </summary>
     public required string Name { get; set; }
 
+    /// <summary>Configured replica identity, independent of its position in the cluster roster.</summary>
+    public required byte ReplicaId { get; set; }
+
     /// <summary>
     ///     Node IP address
     /// </summary>

@@ -328,8 +328,10 @@ pub fn new_shard(
     // BEFORE the replay, matching a fresh boot: `CreateStream::apply` takes
     // `vacant_key()`, so seeding after would put a restarted replica's `wl-*` streams
     // below its fillers, the reverse of every peer. Idempotent, so
-    // `materialise_partition`'s own seed is then a no-op.
-    if shard_idx == 0 {
+    // `materialise_partition`'s own seed is then a no-op. Not over a checkpoint:
+    // fixtures are seeded before the first one, so it holds them already, and
+    // seeding again would bring back a fixture topic a committed delete removed.
+    if shard_idx == 0 && !has_checkpoint {
         let streams = metadata.mux_stm.streams();
         for &(namespace, created_view) in seed_namespaces {
             streams.seed_namespace(namespace, namespace.inner(), created_view);
