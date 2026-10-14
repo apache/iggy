@@ -37,8 +37,7 @@ use std::sync::Arc;
 /// | [`default()`](Self::default) | the stream `test_stream` and the topic `test_topic`, for examples and tests |
 ///
 /// The builder requires every field that is not an [`Option`], so it requires
-/// [`stream_id()`](Self::stream_id), [`stream_name()`](Self::stream_name),
-/// [`topic_id()`](Self::topic_id), [`topic_name()`](Self::topic_name),
+/// [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name),
 /// [`topic_partitions_count()`](Self::topic_partitions_count),
 /// [`batch_length()`](Self::batch_length), [`linger_time()`](Self::linger_time) and
 /// [`partitioning()`](Self::partitioning).
@@ -51,7 +50,6 @@ use std::sync::Arc;
 /// | Field | Default | Controls |
 /// | --- | --- | --- |
 /// | [`stream_name()`](Self::stream_name), [`topic_name()`](Self::topic_name) | `test_stream`, `test_topic` | where messages are appended |
-/// | [`stream_id()`](Self::stream_id), [`topic_id()`](Self::topic_id) | the same two names | nothing in the producer, see below |
 /// | [`topic_partitions_count()`](Self::topic_partitions_count) | 1 | partitions of a topic the build creates |
 /// | [`batch_length()`](Self::batch_length) | 100 | messages per request |
 /// | [`linger_time()`](Self::linger_time) | 5 milliseconds | smallest gap between two send calls |
@@ -59,12 +57,6 @@ use std::sync::Arc;
 /// | [`send_retries_count()`](Self::send_retries_count) | three retries | retrying a failed request |
 /// | [`send_retries_interval()`](Self::send_retries_interval) | one second | pacing those retries |
 /// | [`encryptor()`](Self::encryptor) | none | encrypting payloads and user headers |
-///
-/// The build reads the two names, not the two identifiers, so [`stream_id()`](Self::stream_id) and
-/// [`topic_id()`](Self::topic_id) reach neither the producer nor the server. They are there for
-/// your own calls, such as passing [`stream_id()`](Self::stream_id) to
-/// [`StreamClient::delete_stream()`]. Keep each identifier and its name in step, because nothing
-/// checks that they match.
 ///
 /// [`topic_partitions_count()`](Self::topic_partitions_count) applies to a topic that the build
 /// creates. An existing topic keeps the partitions it has.
@@ -100,9 +92,7 @@ use std::sync::Arc;
 ///
 /// # fn main() -> Result<(), IggyError> {
 /// let config = IggyProducerConfig::builder()
-///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
-///     .topic_id(Identifier::from_str_value("my-topic")?)
 ///     .topic_name("my-topic")
 ///     .topic_partitions_count(10)
 ///     .batch_length(100)
@@ -121,7 +111,6 @@ use std::sync::Arc;
 /// [`IggyStream`]: crate::prelude::IggyStream
 /// [`IggyStreamProducer`]: crate::prelude::IggyStreamProducer
 /// [`Partitioning::balanced()`]: crate::prelude::Partitioning::balanced
-/// [`StreamClient::delete_stream()`]: crate::prelude::StreamClient::delete_stream
 #[derive(Builder, Debug, Clone)]
 #[builder(on(String, into))]
 pub struct IggyProducerConfig {
@@ -178,9 +167,7 @@ impl IggyProducerConfig {
     ///
     /// # fn main() -> Result<(), IggyError> {
     /// let config = IggyProducerConfig::new(
-    ///     Identifier::from_str_value("my-stream")?,
     ///     "my-stream".to_string(),
-    ///     Identifier::from_str_value("my-topic")?,
     ///     "my-topic".to_string(),
     ///     3,
     ///     100,

@@ -93,9 +93,7 @@ use tracing::trace;
 /// client.connect().await?;
 ///
 /// let config = IggyProducerConfig::builder()
-///     .stream_id(Identifier::from_str_value("my-stream")?)
 ///     .stream_name("my-stream")
-///     .topic_id(Identifier::from_str_value("my-topic")?)
 ///     .topic_name("my-topic")
 ///     .topic_partitions_count(10)
 ///     .batch_length(100)
@@ -221,7 +219,7 @@ impl IggyStreamProducer {
         config: &IggyProducerConfig,
     ) -> Result<(IggyClient, IggyProducer), IggyError> {
         trace!("Build and connect iggy client");
-        let client = build::build_iggy_client::build_iggy_client(connection_string).await?;
+        let client = build::build_iggy_client(connection_string).await?;
 
         trace!("Build iggy producer");
         // The producer creates stream and topic if it doesn't exist
