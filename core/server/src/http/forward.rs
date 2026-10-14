@@ -448,9 +448,7 @@ pub(in crate::http) async fn route_partition(
                         Some(guard)
                             if request.method == Method::GET && response.status().is_success() =>
                         {
-                            let remaining =
-                                request.deadline.saturating_duration_since(Instant::now());
-                            retain_forward_guard(response, guard, remaining)
+                            retain_forward_guard(response, guard, FORWARD_ATTEMPT_TIMEOUT)
                         }
                         _ => response,
                     });
@@ -800,33 +798,42 @@ fn stream_poll_body(stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 's
     Body::from_stream(SendWrapper::new(stream))
 }
 
-fn retain_forward_guard(response: Response, guard: ForwardGuard, timeout: Duration) -> Response {
+fn retain_forward_guard(
+    response: Response,
+    guard: ForwardGuard,
+    idle_timeout: Duration,
+) -> Response {
     let (parts, body) = response.into_parts();
     let (sender, receiver) = async_channel::bounded(1);
     // The timer must run even when the downstream connection stops polling its
     // body. One queued chunk bounds read-ahead; dropping the body cancels the task.
     let task = compio::runtime::spawn(async move {
         let mut stream = body.into_data_stream();
-        let relay = async {
-            while let Some(chunk) = stream.next().await {
-                if sender
-                    .send(chunk.map_err(std::io::Error::other))
-                    .await
-                    .is_err()
-                {
-                    return;
+        loop {
+            let relay_chunk = async {
+                match stream.next().await {
+                    Some(chunk) => sender
+                        .send(chunk.map_err(std::io::Error::other))
+                        .await
+                        .is_ok(),
+                    None => false,
+                }
+            };
+            match compio::time::timeout(idle_timeout, relay_chunk).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => {
+                    drop(stream);
+                    drop(guard);
+                    // Discard a queued chunk so a stalled reader still receives
+                    // an explicit body error instead of mistaking timeout for EOF.
+                    let _ = sender.force_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "forwarded poll response stalled",
+                    )));
+                    break;
                 }
             }
-        };
-        if compio::time::timeout(timeout, relay).await.is_err() {
-            drop(stream);
-            drop(guard);
-            // Discard a queued chunk so a stalled reader still receives an
-            // explicit body error instead of mistaking the timeout for EOF.
-            let _ = sender.force_send(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "forwarded poll response deadline exceeded",
-            )));
         }
     });
     let stream = futures::stream::unfold((receiver, task), |(receiver, task)| async move {
@@ -1305,6 +1312,26 @@ mod tests {
         assert_eq!(in_flight.get(), 1);
         drop(response);
         compio::time::sleep(CANCEL_TURN).await;
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[compio::test]
+    async fn a_progressing_forwarded_poll_outlives_the_idle_timeout() {
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+        const CHUNK_DELAY: Duration = Duration::from_millis(50);
+        const CHUNKS: usize = 8;
+        let in_flight = Rc::new(Cell::new(0));
+        let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
+        let stream = futures::stream::iter(0..CHUNKS).then(|_| async {
+            compio::time::sleep(CHUNK_DELAY).await;
+            Ok::<_, cyper::Error>(Bytes::from_static(b"chunk"))
+        });
+        let response =
+            retain_forward_guard(Response::new(stream_poll_body(stream)), guard, IDLE_TIMEOUT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("progressing body must not expire");
+        assert_eq!(body.as_ref(), b"chunk".repeat(CHUNKS));
         assert_eq!(in_flight.get(), 0);
     }
 
