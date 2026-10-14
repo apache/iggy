@@ -27,6 +27,7 @@
 pub mod alter_configs;
 pub mod api_versions;
 pub mod create_topics;
+pub mod delete_groups;
 pub mod delete_topics;
 pub mod describe_configs;
 pub mod describe_groups;
@@ -40,6 +41,7 @@ pub mod list_groups;
 pub mod list_offsets;
 pub mod metadata;
 pub mod offset_commit;
+pub mod offset_delete;
 pub mod offset_fetch;
 pub mod produce;
 pub mod sync_group;
@@ -58,13 +60,13 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::BridgeError;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_TOPICS,
-    API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH, API_KEY_FIND_COORDINATOR,
-    API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
-    API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS, API_KEY_METADATA, API_KEY_OFFSET_COMMIT,
-    API_KEY_OFFSET_FETCH, API_KEY_PRODUCE, API_KEY_SYNC_GROUP, ConnectionState,
-    ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
-    is_supported_version, supported_max_version,
+    API_KEY_ALTER_CONFIGS, API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_DELETE_GROUPS,
+    API_KEY_DELETE_TOPICS, API_KEY_DESCRIBE_CONFIGS, API_KEY_DESCRIBE_GROUPS, API_KEY_FETCH,
+    API_KEY_FIND_COORDINATOR, API_KEY_HEARTBEAT, API_KEY_INIT_PRODUCER_ID, API_KEY_JOIN_GROUP,
+    API_KEY_LEAVE_GROUP, API_KEY_LIST_GROUPS, API_KEY_LIST_OFFSETS, API_KEY_METADATA,
+    API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH, API_KEY_PRODUCE,
+    API_KEY_SYNC_GROUP, ConnectionState, ERROR_INVALID_REQUEST, ERROR_UNSUPPORTED_VERSION,
+    GatewayState, HandleOutcome, is_supported_version, supported_max_version,
 };
 
 /// Record encodes and decodes of this many bytes or more run off the async worker.
@@ -127,8 +129,16 @@ pub async fn dispatch(
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,
         API_KEY_SYNC_GROUP => sync_group::handle(state, api_version, body).await,
-        API_KEY_DESCRIBE_GROUPS => describe_groups::handle(state, api_version, body).await,
-        API_KEY_LIST_GROUPS => list_groups::handle(state, api_version, body).await,
+        API_KEY_DESCRIBE_GROUPS => {
+            describe_groups::handle(state, connection, api_version, body).await
+        }
+        API_KEY_LIST_GROUPS => list_groups::handle(state, connection, api_version, body).await,
+        API_KEY_DELETE_GROUPS => {
+            delete_groups::handle(state, connection, principal, api_version, body).await
+        }
+        API_KEY_OFFSET_DELETE => {
+            offset_delete::handle(state, connection, principal, api_version, body).await
+        }
         API_KEY_INIT_PRODUCER_ID => init_producer_id::handle(state, api_version, body).await,
         _ => HandleOutcome::Close,
     }
@@ -141,6 +151,27 @@ pub async fn dispatch(
 /// name either way.
 pub(crate) fn is_transactional(transactional_id: Option<&TransactionalId>) -> bool {
     transactional_id.is_some_and(|id| !id.is_empty())
+}
+
+/// Whether `principal` may delete a group or its offsets. `None` means SASL is off, with no
+/// principal to enforce against, as in `DeleteTopics`.
+///
+/// Kafka asks for `DELETE` on the group. Iggy has no group permission, and lets any reader of a
+/// topic delete a group on it, so the gate asks for `manage_topics`, as `DeleteTopics` does.
+fn may_delete_groups(principal: Option<&AuthenticatedPrincipal>, api: &str) -> bool {
+    let Some(principal) = principal else {
+        return true;
+    };
+    if !principal.permissions_known {
+        // Denying is the fail-closed choice: granting would authorize an irreversible delete off
+        // a value nothing ever actually read.
+        tracing::warn!(
+            principal = %principal.username,
+            "{api} asked on a connection whose permissions were never read; denying"
+        );
+        return false;
+    }
+    principal.permissions.manage_topics
 }
 
 /// When an offset call on `connection` gives up. See `GroupCoordinator::offset_hold`.

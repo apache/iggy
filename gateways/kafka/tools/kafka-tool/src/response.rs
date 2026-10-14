@@ -108,6 +108,7 @@ fn is_acceptable_verify_error(api_key: i16, error_code: i16) -> bool {
         0..=2 => error_code == 6, // Produce/Fetch/ListOffsets stub: NOT_LEADER_OR_FOLLOWER
         3 => error_code == 3,     // Metadata stub: UNKNOWN_TOPIC_OR_PARTITION
         19 | 32 | 33 => error_code == 41, // CreateTopics / DescribeConfigs / AlterConfigs stub
+        47 => error_code == 69,   // OffsetDelete: `test-group` holds no offsets
         _ => false,
     }
 }

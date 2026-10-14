@@ -15,16 +15,20 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `manage_topics`; without it every resource/name in the request fails
 > `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written or deleted. `CreateTopics` has no such
 > gate yet - SASL on does not protect it. Every client reads and writes as the bridge's Iggy user.
-> See [docs/SCOPE.md](docs/SCOPE.md).
+> DeleteGroups and OffsetDelete also run as that user, so with SASL off any client can delete
+> committed offsets. With SASL on, they also require `manage_topics`, and without it they answer
+> `GROUP_AUTHORIZATION_FAILED` (30). See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
 > Consumer group coordination is not a stub either: `FindCoordinator`, `JoinGroup`, `Heartbeat`,
 > `LeaveGroup`, `SyncGroup`, `DescribeGroups` and `ListGroups` are real, with real membership,
 > rebalances, graceful leave, session expiry and admin views of that membership
-> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list`,
-> `--describe --members` and `--describe --state` use those views. The default `--describe`
-> calls OffsetFetch (API key 9), which is not implemented, so that mode does not work. With the bridge off,
+> ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)). `kafka-consumer-groups.sh --list` and
+> `--describe` use those views. With the bridge on, they also show a group whose consumers stopped,
+> as `Empty`, while it holds offsets. The default `--describe` then prints each committed offset
+> and its lag. `--delete` deletes such a group with its offsets, and `--delete-offsets` deletes
+> single offsets. With the bridge off,
 > Metadata reports every topic unknown, so a consumer joins a group and is assigned 0 partitions.
 > With the bridge on, OffsetCommit and OffsetFetch keep each group's offsets in Iggy, so a group
 > resumes from its last commit, also after a gateway restart
@@ -234,10 +238,8 @@ Limits:
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
 - `group.instance.id` is accepted but not honoured. A static member that restarts causes two
   rebalances.
-- No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
-  `kafka-consumer-groups.sh` cannot list or describe a group.
-- No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
-  in Iggy ([docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md#limits)).
+- Offsets never expire. `kafka-consumer-groups.sh --delete` and `--delete-offsets` delete them
+  ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md#deleting-groups-and-offsets)).
 - Delivery is at-least-once. A consumer that stops before it commits reads those records again.
 
 ## Authentication ([#3549](https://github.com/apache/iggy/issues/3549))
