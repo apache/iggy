@@ -21,22 +21,35 @@ package org.apache.iggy.builder;
 
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
+import java.util.HashSet;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * A parsed {@code iggy://} connection string for the TCP transport.
  *
- * <p>Follows {@code parseConnectionString} in the Node SDK, limited to what the Java
- * TCP builders support: {@code username:password} credentials and the {@code tls} option.
+ * <p>The format is {@code iggy://<username>:<password>@<host>:<port>?<options>}, where
+ * {@code iggy+tcp://} is accepted as well and the host may be an IPv6 address in brackets.
+ * The supported options are {@code tls=true|false} and {@code tls_ca_file=<path>}, each at most once.
  * Error messages never include the connection string, because it contains the password.
+ *
+ * @param host the server host
+ * @param port the server port
+ * @param username the username to log in with
+ * @param password the password to log in with
+ * @param tls whether TLS is enabled
+ * @param tlsCaFile the path of the PEM file that validates the server certificate, or null
  */
-record TcpConnectionString(String host, int port, String username, String password, boolean tls) {
+public record TcpConnectionString(
+        String host, int port, String username, String password, boolean tls, String tlsCaFile) {
 
     private static final String DEFAULT_SCHEME = "iggy";
     private static final String SCHEME_PREFIX = "iggy+";
     private static final String TCP_TRANSPORT = "tcp";
     private static final int MAX_PORT = 65535;
+    private static final String TLS_OPTION = "tls";
+    private static final String TLS_CA_FILE_OPTION = "tls_ca_file";
 
     // Matches both "[ipv6]:port" and "host:port", where an unbracketed host may not
     // contain a colon. Multi-colon authorities such as "2001:db8::1:8090" are rejected,
@@ -48,7 +61,14 @@ record TcpConnectionString(String host, int port, String username, String passwo
     // malformed scheme can contain the credentials.
     private static final Pattern TRANSPORT_NAME = Pattern.compile("^[A-Za-z]+$");
 
-    static TcpConnectionString parse(String connectionString) {
+    /**
+     * Parses a TCP connection string.
+     *
+     * @param connectionString the connection string
+     * @return the parsed connection string
+     * @throws IggyInvalidArgumentException if the connection string is invalid or uses an unsupported option
+     */
+    public static TcpConnectionString parse(String connectionString) {
         if (connectionString == null || connectionString.isEmpty()) {
             throw new IggyInvalidArgumentException("Connection string must not be empty");
         }
@@ -70,9 +90,28 @@ record TcpConnectionString(String host, int port, String username, String passwo
             throw invalid("expected at most one '?' before the options");
         }
         Address address = parseAddress(addressAndOptions[0]);
+        Options options = addressAndOptions.length == 2 ? parseOptions(addressAndOptions[1]) : Options.NONE;
 
-        boolean tls = addressAndOptions.length == 2 && parseTlsOption(addressAndOptions[1]);
-        return new TcpConnectionString(address.host(), address.port(), credentials[0], credentials[1], tls);
+        return new TcpConnectionString(
+                address.host(), address.port(), credentials[0], credentials[1], options.tls(), options.tlsCaFile());
+    }
+
+    private static void parseScheme(String scheme) {
+        if (DEFAULT_SCHEME.equals(scheme)) {
+            return;
+        }
+        if (!scheme.startsWith(SCHEME_PREFIX)) {
+            throw invalid("scheme must be iggy:// or iggy+tcp://");
+        }
+        String transport = scheme.substring(SCHEME_PREFIX.length());
+        if (TCP_TRANSPORT.equals(transport)) {
+            return;
+        }
+        if (!TRANSPORT_NAME.matcher(transport).matches()) {
+            throw invalid("scheme must be iggy:// or iggy+tcp://");
+        }
+        throw new IggyInvalidArgumentException(
+                "Unsupported transport '" + transport + "' in connection string, only tcp is supported");
     }
 
     private static String[] parseCredentials(String credentials) {
@@ -99,26 +138,10 @@ record TcpConnectionString(String host, int port, String username, String passwo
         return new Address(host, port);
     }
 
-    private static void parseScheme(String scheme) {
-        if (DEFAULT_SCHEME.equals(scheme)) {
-            return;
-        }
-        if (!scheme.startsWith(SCHEME_PREFIX)) {
-            throw invalid("scheme must be iggy:// or iggy+tcp://");
-        }
-        String transport = scheme.substring(SCHEME_PREFIX.length());
-        if (TCP_TRANSPORT.equals(transport)) {
-            return;
-        }
-        if (!TRANSPORT_NAME.matcher(transport).matches()) {
-            throw invalid("scheme must be iggy:// or iggy+tcp://");
-        }
-        throw new IggyInvalidArgumentException(
-                "Unsupported transport '" + transport + "' in connection string, only tcp is supported");
-    }
-
-    private static boolean parseTlsOption(String options) {
+    private static Options parseOptions(String options) {
         boolean tls = false;
+        String tlsCaFile = null;
+        Set<String> seen = new HashSet<>();
         for (String option : options.split("&", -1)) {
             String[] nameAndValue = option.split("=", -1);
             if (nameAndValue.length != 2) {
@@ -126,25 +149,37 @@ record TcpConnectionString(String host, int port, String username, String passwo
             }
             String name = nameAndValue[0];
             String value = nameAndValue[1];
-            if (!"tls".equals(name)) {
-                // Rejected rather than ignored, so that a string that configures more
-                // in the Rust SDK never silently behaves differently here.
-                throw new IggyInvalidArgumentException(
-                        "Unsupported option '" + name + "' in connection string, only tls is supported");
+            if (TLS_OPTION.equals(name)) {
+                tls = parseBoolean(name, value);
+            } else if (TLS_CA_FILE_OPTION.equals(name)) {
+                if (value.isEmpty()) {
+                    throw invalid("option 'tls_ca_file' must not be empty");
+                }
+                tlsCaFile = value;
+            } else {
+                // Rejected rather than ignored, so that an option is never silently dropped.
+                throw new IggyInvalidArgumentException("Unsupported option '" + name
+                        + "' in connection string, only tls and tls_ca_file are supported");
             }
-            if (!"true".equals(value) && !"false".equals(value)) {
-                throw invalid("option 'tls' must be true or false");
+            if (!seen.add(name)) {
+                throw invalid("option '" + name + "' must not be set more than once");
             }
-            tls = "true".equals(value);
         }
-        return tls;
+        return new Options(tls, tlsCaFile);
+    }
+
+    private static boolean parseBoolean(String name, String value) {
+        if (!"true".equals(value) && !"false".equals(value)) {
+            throw invalid("option '" + name + "' must be true or false");
+        }
+        return "true".equals(value);
     }
 
     /** Keeps the password out of logs; the generated record toString would print it. */
     @Override
     public String toString() {
         return "TcpConnectionString[host=" + host + ", port=" + port + ", username=" + username + ", password=***, tls="
-                + tls + "]";
+                + tls + ", tlsCaFile=" + tlsCaFile + "]";
     }
 
     private static IggyInvalidArgumentException invalid(String reason) {
@@ -152,4 +187,8 @@ record TcpConnectionString(String host, int port, String username, String passwo
     }
 
     private record Address(String host, int port) {}
+
+    private record Options(boolean tls, String tlsCaFile) {
+        private static final Options NONE = new Options(false, null);
+    }
 }
