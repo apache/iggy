@@ -2043,6 +2043,7 @@ mod tests {
 
     fn assignment(partition_id: u32, consensus_group_id: u64) -> CreatedPartitionAssignment {
         CreatedPartitionAssignment {
+            initial_view: 0,
             partition_id,
             consensus_group_id,
         }
@@ -2070,13 +2071,12 @@ mod tests {
         let req = CreateTopicWithAssignmentsRequest {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
-                partitions_count: 1,
+                partitions_count: u32::try_from(assignments.len()).unwrap(),
                 name: WireName::new(name).expect("test topic name fits WireName"),
                 options: WireOptions::empty(),
             },
             derived_options: WireOptions::empty(),
             partitions: assignments,
-            created_view: 0,
         };
         mux.update(build_prepare(
             op,
@@ -3075,7 +3075,6 @@ mod tests {
                         partitions_count: 2,
                     },
                     partitions: vec![assignment(0, 3), assignment(1, 4)],
-                    created_view: 0,
                 },
             ))
             .expect("CreatePartitions apply succeeds");
@@ -5134,7 +5133,6 @@ mod tests {
                     partitions_count: 1,
                 },
                 partitions: vec![assignment(0, 3)],
-                created_view: 0,
             },
         ))
         .expect("CreatePartitions apply succeeds");

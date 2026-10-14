@@ -902,11 +902,9 @@ async fn recover_partition_segments(
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
 ///
-/// `created_view` is the view a group with no durable record of its own starts
-/// in: the metadata plane's view when it committed the create, recorded on
-/// the committed partition so every replica seeds the same value. See the
-/// `seed_view` comment below for why a group left at view 0 is unreachable. A
-/// restart keeps it as a view floor while probing for the live view, without
+/// `created_view` is the committed assignment's initial view, independent of
+/// metadata leadership. Every replica seeds a fresh group from that value.
+/// A restart keeps it as a view floor while probing for the live view, without
 /// assigning it to the recovered log.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and its
@@ -1030,22 +1028,10 @@ pub async fn build_partition_fresh(
             timers: &timers,
             durable_view,
             view_fallback,
-            // Both planes pick their primary as `view % replica_count` from
-            // their OWN view counter. A group left at view 0 while the
-            // metadata plane sits elsewhere therefore names a different node
-            // than the roster advertises as leader, and nothing routes a
-            // partition write across that gap: the client is sent to the
-            // metadata leader and refused there for the whole budget. Seeding
-            // from the view the create was admitted in keeps the two congruent
-            // for a group born after a metadata election.
-            //
-            // The seed comes off the committed partition, not this replica's
-            // live metadata view: the two differ once the metadata plane
-            // elects again, and a seed above the group's real view is an
-            // empty log that outranks committed history in the next DVC
-            // merge. The value rides the create's request body (a header view
-            // is restamped per delivery), so every replica commits the same
-            // one and a late materialiser lands at or below its peers.
+            // Placement chooses this group's initial view independently of
+            // metadata leadership. Use its committed assignment: a late
+            // materializer must not invent a higher empty history that could
+            // outrank acknowledged entries in the next view change.
             seed_view,
             incarnation: None,
             join,

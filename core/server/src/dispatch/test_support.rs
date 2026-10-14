@@ -385,10 +385,10 @@ pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
                 },
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
                 }],
-                created_view: 0,
             }
             .to_bytes(),
         ))

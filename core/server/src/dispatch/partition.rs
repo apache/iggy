@@ -1832,15 +1832,16 @@ mod tests {
                     derived_options: WireOptions::empty(),
                     partitions: vec![
                         CreatedPartitionAssignment {
+                            initial_view: 0,
                             partition_id: 0,
                             consensus_group_id: 1,
                         },
                         CreatedPartitionAssignment {
+                            initial_view: 0,
                             partition_id: 1,
                             consensus_group_id: 2,
                         },
                     ],
-                    created_view: 0,
                 }
                 .to_bytes(),
             ))
@@ -2054,10 +2055,10 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
-            created_view: 0,
         };
         md.mux_stm
             .update(prepare_message(
@@ -2077,7 +2078,6 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: Vec::new(),
-            created_view: 0,
         };
         md.mux_stm
             .update(prepare_message(
@@ -3341,10 +3341,10 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
-            created_view: 0,
         };
         md.mux_stm
             .update(prepare_message(
@@ -3750,10 +3750,10 @@ mod tests {
                 },
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id: 1,
                 }],
-                created_view: 0,
             }
             .to_bytes(),
         )

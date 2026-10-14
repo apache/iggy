@@ -41,6 +41,7 @@ mod consumer_session;
 mod error;
 mod header;
 mod operation;
+mod primary_rebalance;
 mod reply_result;
 mod request;
 
@@ -62,6 +63,7 @@ pub use header::{
     prepare_identity_checksum_bytes, read_size_field,
 };
 pub use operation::Operation;
+pub use primary_rebalance::{PrimaryRebalanceHeader, PrimaryRebalanceKind};
 pub use reply_result::{
     REJECTION_SECTION_LEN, RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len,
     write_rejection_section,

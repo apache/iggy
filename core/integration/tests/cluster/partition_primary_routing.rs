@@ -16,7 +16,7 @@
 // under the License.
 
 //! Metadata and partition consensus groups choose primaries independently.
-//! New partitions must inherit the metadata view, while existing partitions
+//! New partitions use their committed placement views, while existing partitions
 //! can retain a different primary after a metadata-only election. SDK clients
 //! settle on the metadata leader, so both writes to new partitions and group
 //! polls of existing partitions must reach an owner that can commit progress.
@@ -102,6 +102,7 @@ const SEND_BUDGET: Duration = Duration::from_secs(20);
 /// the state this test needs before it can observe anything.
 const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
 const PRECONDITION_POLL: Duration = Duration::from_millis(500);
+const REBALANCE_BUDGET: Duration = Duration::from_secs(120);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
@@ -119,8 +120,406 @@ fn send_body(payload: &str) -> SendMessages {
     }
 }
 
+async fn partition_route(
+    client: &TcpClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition_id: u32,
+) -> PartitionRouteResponse {
+    let request = GetPartitionRouteRequest {
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id,
+    }
+    .to_bytes();
+    timeout(PRECONDITION_BUDGET, async {
+        loop {
+            match client
+                .send_raw_with_response(GET_PARTITION_ROUTE_CODE, request.clone())
+                .await
+            {
+                Ok(reply) => break PartitionRouteResponse::decode_from(&reply).unwrap(),
+                Err(IggyError::TransientNotAccepted) => sleep(PRECONDITION_POLL).await,
+                Err(error) => panic!("route {stream}/{topic}/{partition_id}: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("partition {stream}/{topic}/{partition_id} never became routable"))
+}
+
+#[iggy_harness(cluster_nodes = 3, server(sharding.cpu_allocation = "2"))]
+async fn given_concurrent_creates_when_growing_partitions_should_spread_and_serve_every_partition(
+    harness: &mut TestHarness,
+) {
+    const FIRST_TOPIC: &str = "spread-first";
+    const SECOND_TOPIC: &str = "spread-second";
+    const THIRD_TOPIC: &str = "spread-third";
+    const INITIAL_PARTITIONS: u32 = 3;
+    const ADDED_PARTITIONS: u32 = 3;
+    const SECOND_PARTITIONS: u32 = 2;
+    const THIRD_PARTITIONS: u32 = 4;
+
+    let first = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    first
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let second = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    second
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    first.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(INITIAL_PARTITIONS),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    first
+        .create_topic(&stream, FIRST_TOPIC, &options)
+        .await
+        .unwrap();
+    let first_topic = Identifier::named(FIRST_TOPIC).unwrap();
+    for partition_id in 0..INITIAL_PARTITIONS {
+        let route = partition_route(&first, &stream, &first_topic, partition_id).await;
+        assert_eq!(u32::from(route.primary_replica), partition_id);
+        assert_eq!(route.view, partition_id);
+    }
+
+    let second_options = TopicCreateOptions {
+        partitions_count: Some(SECOND_PARTITIONS),
+        ..options.clone()
+    };
+    let third_options = TopicCreateOptions {
+        partitions_count: Some(THIRD_PARTITIONS),
+        ..options
+    };
+    let (second_result, third_result) = futures::join!(
+        first.create_topic(&stream, SECOND_TOPIC, &second_options),
+        second.create_topic(&stream, THIRD_TOPIC, &third_options),
+    );
+    second_result.unwrap();
+    third_result.unwrap();
+    let mut topics = [
+        (FIRST_TOPIC, INITIAL_PARTITIONS),
+        (SECOND_TOPIC, SECOND_PARTITIONS),
+        (THIRD_TOPIC, THIRD_PARTITIONS),
+    ];
+    assert_initial_spread(&first, &stream, &topics, harness.cluster_size()).await;
+    first
+        .create_partitions(&stream, &first_topic, ADDED_PARTITIONS)
+        .await
+        .unwrap();
+    topics[0].1 += ADDED_PARTITIONS;
+    assert_initial_spread(&first, &stream, &topics, harness.cluster_size()).await;
+
+    let mut original_routes = Vec::new();
+    for (name, count) in topics {
+        let topic = Identifier::named(name).unwrap();
+        for partition_id in 0..count {
+            let route = partition_route(&first, &stream, &topic, partition_id).await;
+            original_routes.push((name, partition_id, route));
+            let payload = format!("{name}-{partition_id}");
+            let mut messages = vec![message(&payload)];
+            first
+                .send_messages(
+                    &stream,
+                    &topic,
+                    &Partitioning::partition_id(partition_id),
+                    &mut messages,
+                )
+                .await
+                .unwrap();
+            assert_partition_payload(&second, &stream, &topic, partition_id, &payload).await;
+        }
+    }
+    drop(first);
+    drop(second);
+    for node in 0..harness.cluster_size() {
+        harness.stop_node(node).unwrap();
+    }
+    for node in 0..harness.cluster_size() {
+        harness.restart_node(node).unwrap();
+    }
+    let recovered = connect_without_login(harness.node(0).tcp_addr().unwrap()).await;
+    recovered
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    for (name, partition_id, original) in original_routes {
+        let topic = Identifier::named(name).unwrap();
+        let route = partition_route(&recovered, &stream, &topic, partition_id).await;
+        assert_eq!(route.incarnation, original.incarnation);
+        assert_eq!(route.partitions_count, original.partitions_count);
+        assert!(route.view >= original.view, "{name}/{partition_id}");
+        let payload = format!("{name}-{partition_id}");
+        assert_partition_payload(&recovered, &stream, &topic, partition_id, &payload).await;
+    }
+}
+
+async fn assert_initial_spread(
+    client: &TcpClient,
+    stream: &Identifier,
+    topics: &[(&str, u32)],
+    replicas: usize,
+) {
+    let mut primary_counts = vec![0_u32; replicas];
+    for &(name, count) in topics {
+        let topic = Identifier::named(name).unwrap();
+        for partition_id in 0..count {
+            let route = partition_route(client, stream, &topic, partition_id).await;
+            assert_eq!(route.view, u32::from(route.primary_replica));
+            primary_counts[usize::from(route.primary_replica)] += 1;
+        }
+    }
+    let total: u32 = topics.iter().map(|(_, count)| count).sum();
+    assert_eq!(
+        primary_counts,
+        vec![total / u32::try_from(replicas).unwrap(); replicas],
+        "create batches and growth must count already admitted assignments"
+    );
+}
+
+async fn assert_partition_payload(
+    client: &TcpClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    partition_id: u32,
+    expected: &str,
+) {
+    let polled = client
+        .poll_messages(
+            stream,
+            topic,
+            Some(partition_id),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.messages.len(), 1, "{topic}/{partition_id}");
+    assert_eq!(polled.messages[0].payload.as_ref(), expected.as_bytes());
+}
+
+#[iggy_harness(cluster_nodes = 5, server(sharding.cpu_allocation = "2"))]
+async fn given_balanced_primaries_when_a_replica_fails_and_returns_should_rebalance_without_data_loss(
+    harness: &mut TestHarness,
+) {
+    const TOPIC_COUNT: usize = 100;
+    const PHASES: [&str; 3] = ["before-failure", "while-absent", "after-return"];
+
+    let client = connect_without_login(harness.node(1).tcp_addr().unwrap()).await;
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let identity = client.session_identity().await.unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
+    let stream = Identifier::named(STREAM_NAME).unwrap();
+    let options = TopicCreateOptions {
+        partitions_count: Some(1),
+        durability: Durability::Persisted,
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    };
+    let mut topics = Vec::with_capacity(TOPIC_COUNT);
+    for index in 0..TOPIC_COUNT {
+        let name = format!("rebalance-{index}");
+        client.create_topic(&stream, &name, &options).await.unwrap();
+        topics.push(Identifier::named(&name).unwrap());
+    }
+    let mut request = RequestHeader {
+        client: identity.client_id,
+        session: identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
+    };
+    let initial =
+        wait_for_balanced_routes(harness, &client, &stream, &topics, &[20; 5], &mut request).await;
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES[..1]).await;
+
+    harness.kill_node(0).unwrap();
+    let surviving = wait_for_balanced_routes(
+        harness,
+        &client,
+        &stream,
+        &topics,
+        &[0, 25, 25, 25, 25],
+        &mut request,
+    )
+    .await;
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES[..2]).await;
+
+    harness.restart_node(0).unwrap();
+    let returned =
+        wait_for_balanced_routes(harness, &client, &stream, &topics, &[20; 5], &mut request).await;
+    for (index, original) in initial.iter().enumerate() {
+        assert_ne!(original.incarnation, 0);
+        for current in [&surviving[index], &returned[index]] {
+            assert_eq!(
+                current.incarnation, original.incarnation,
+                "{}",
+                topics[index]
+            );
+            assert_eq!(current.partitions_count, 1, "{}", topics[index]);
+            assert!(current.view >= original.view, "{}", topics[index]);
+        }
+        assert!(
+            returned[index].view >= surviving[index].view,
+            "{}",
+            topics[index]
+        );
+    }
+    append_and_assert_partition_sentinels(&client, &stream, &topics, &PHASES).await;
+    let current_identity = client.session_identity().await.unwrap();
+    assert_eq!(current_identity.client_id, identity.client_id);
+    assert_eq!(current_identity.session, identity.session);
+}
+
+async fn wait_for_balanced_routes(
+    harness: &TestHarness,
+    client: &TcpClient,
+    stream: &Identifier,
+    topics: &[Identifier],
+    expected_counts: &[usize],
+    request: &mut RequestHeader,
+) -> Vec<PartitionRouteResponse> {
+    let mut last_counts = vec![vec![0; expected_counts.len()]; expected_counts.len()];
+    timeout(REBALANCE_BUDGET, async {
+        let binding = BindSessionRequest {
+            version_info: ClientVersionInfo {
+                protocol_version: IGGY_PROTOCOL_VERSION,
+                sdk_name: WireName::new("routing-test").unwrap(),
+                sdk_version: WireName::new("1.0.0").unwrap(),
+            },
+            identity: client.session_identity().await.unwrap(),
+            bind_secret: client.session_bind_secret().await.unwrap(),
+        }
+        .to_bytes();
+        let route_requests: Vec<_> = topics
+            .iter()
+            .map(|topic| {
+                GetPartitionRouteRequest {
+                    stream_id: identifier_to_wire(stream).unwrap(),
+                    topic_id: identifier_to_wire(topic).unwrap(),
+                    partition_id: PARTITION_ID,
+                }
+                .to_bytes()
+            })
+            .collect();
+        let mut observers = Vec::with_capacity(expected_counts.len());
+        for (node, count) in expected_counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let address = harness.node(node).tcp_addr().unwrap();
+            let mut socket = raw_tcp::connect_to(address).await;
+            loop {
+                match data_request(&mut socket, request, BIND_SESSION_CODE, &binding, None).await {
+                    Ok(_) => break,
+                    Err(IggyError::TransientNotAccepted) => sleep(PRECONDITION_POLL).await,
+                    Err(error) => panic!("node {node} refused the existing session: {error:?}"),
+                }
+            }
+            assert_eq!(socket.peer_addr().unwrap(), address);
+            observers.push((node, socket));
+        }
+        loop {
+            let mut snapshots = Vec::with_capacity(observers.len());
+            for (node, socket) in &mut observers {
+                let mut routes = Vec::with_capacity(topics.len());
+                for body in &route_requests {
+                    match data_request(socket, request, GET_PARTITION_ROUTE_CODE, body, None).await {
+                        Ok(body) => routes.push(PartitionRouteResponse::decode_from(&body).unwrap()),
+                        Err(IggyError::TransientNotAccepted) => break,
+                        Err(error) => panic!("node {node} refused a partition route: {error:?}"),
+                    }
+                }
+                if routes.len() != topics.len() {
+                    break;
+                }
+                let mut counts = vec![0; expected_counts.len()];
+                for route in &routes {
+                    counts[usize::from(route.primary_replica)] += 1;
+                }
+                last_counts[*node].clone_from(&counts);
+                if counts != expected_counts {
+                    break;
+                }
+                snapshots.push(routes);
+            }
+            if snapshots.len() == observers.len()
+                && snapshots.windows(2).all(|pair| {
+                    pair[0].iter().zip(&pair[1]).all(|(left, right)| {
+                        (left.incarnation, left.partitions_count, left.view, left.primary_replica)
+                            == (right.incarnation, right.partitions_count, right.view, right.primary_replica)
+                    })
+                })
+            {
+                return snapshots.remove(0);
+            }
+            sleep(PRECONDITION_POLL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "partition primaries did not converge to {expected_counts:?} within {REBALANCE_BUDGET:?}; \
+             physical-node observations: {last_counts:?}"
+        )
+    })
+}
+
+async fn append_and_assert_partition_sentinels(
+    client: &TcpClient,
+    stream: &Identifier,
+    topics: &[Identifier],
+    phases: &[&str],
+) {
+    timeout(REBALANCE_BUDGET, async {
+        for topic in topics {
+            let payload = format!("{topic}:{}", phases.last().unwrap());
+            client
+                .send_messages(
+                    stream,
+                    topic,
+                    &Partitioning::partition_id(PARTITION_ID),
+                    &mut [message(&payload)],
+                )
+                .await
+                .unwrap();
+            let polled = client
+                .poll_messages(
+                    stream,
+                    topic,
+                    Some(PARTITION_ID),
+                    &Consumer::default(),
+                    &PollingStrategy::offset(0),
+                    u32::try_from(phases.len() + 1).unwrap(),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(polled.messages.len(), phases.len(), "{topic}");
+            for (message, phase) in polled.messages.iter().zip(phases) {
+                assert_eq!(
+                    message.payload.as_ref(),
+                    format!("{topic}:{phase}").as_bytes()
+                );
+            }
+        }
+    })
+    .await
+    .expect("every partition must preserve and serve its history across rebalancing");
+}
+
 #[iggy_harness(cluster_nodes = 3)]
-async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_the_advertised_leader(
+async fn given_metadata_view_moved_when_creating_topic_should_route_to_its_assigned_primary(
     harness: &mut TestHarness,
 ) {
     // Kill node 0: it is the view-0 primary of BOTH planes, so the metadata
@@ -159,9 +558,8 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
         }
     };
 
-    // A brand-new topic. Its partition group is seeded from the metadata view,
-    // so its primary is the advertised leader; left at view 0 it would be
-    // replica 0, the node that was just killed and restarted.
+    // With no existing partitions, the placement tie goes to replica 0,
+    // independently of the metadata primary elected above.
     let setup = harness
         .root_client_for_node(leader)
         .await
@@ -186,6 +584,14 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
         .expect("create topic");
     let topic_id = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let partitioning = Partitioning::partition_id(PARTITION_ID);
+    let route_client = connect_without_login(harness.node(leader).tcp_addr().unwrap()).await;
+    route_client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    let route = partition_route(&route_client, &stream_id, &topic_id, PARTITION_ID).await;
+    assert_eq!(route.primary_replica, 0);
+    assert_eq!(route.view, INITIAL_VIEW);
 
     // Where a client asking for node 0 actually ends up.
     let leader_address = harness
@@ -211,10 +617,8 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
          is testing a different node than this test claims"
     );
 
-    // The contract: the node the roster advertises accepts a partition write.
-    // Seeded from the metadata view the group's primary IS that node; left at
-    // view 0 it would be replica 0, and every client would be steered away
-    // from the only node that could accept.
+    // The session connection follows metadata leadership, while the write
+    // must reach the independently assigned partition primary.
     let accepted_by_leader = send_once(&on_node_zero, &stream_id, &topic_id, &partitioning).await;
     assert!(
         accepted_by_leader.is_ok(),

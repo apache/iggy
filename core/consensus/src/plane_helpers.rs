@@ -2018,6 +2018,102 @@ mod tests {
     }
 
     #[test]
+    fn given_parked_view_repair_when_starting_should_rebuild_only_unapplied_ops() {
+        const MERGED_COMMIT: u64 = 2;
+        const HEAD: u64 = 5;
+        const VIEW: u32 = 3;
+
+        for (applied_before, repaired_to, expected_start) in [
+            (2, 3, Some(4)),
+            (2, 5, None),
+            (2, 2, Some(3)),
+            (0, 0, Some(3)),
+        ] {
+            let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+            consensus.init();
+            consensus.restore_commit_state(applied_before, MERGED_COMMIT);
+            consensus.sequencer().set_sequence(HEAD);
+            install_local_suffix(&consensus, HEAD, MERGED_COMMIT, 0);
+            let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc_header(1, VIEW));
+            let (dvc, body) = dvc_with_full_suffix(2, VIEW, 0, HEAD, MERGED_COMMIT);
+            let _ = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc, &body);
+            let merged = consensus.pending_view_log().expect("the view is parked");
+            assert_eq!(merged.commit_max, MERGED_COMMIT);
+
+            // Repair may apply a verified prefix after the DVC quorum is frozen.
+            for op in applied_before + 1..=repaired_to {
+                consensus.advance_commit_max(op);
+                consensus.advance_commit_min(op);
+            }
+            assert_eq!(consensus.log_view(), 0);
+            consensus.settle_view_log_proof();
+            let actions = consensus.start_pending_view(PlaneKind::Metadata);
+            let mut rebuilt_from = None;
+            for action in actions {
+                match action {
+                    VsrAction::CommitJournal => {
+                        for op in consensus.commit_min() + 1..=consensus.commit_max() {
+                            consensus.advance_commit_min(op);
+                        }
+                    }
+                    VsrAction::RebuildPipeline { from_op, to_op } => {
+                        rebuilt_from = Some(from_op);
+                        assert_eq!(to_op, HEAD);
+                        consensus.with_pipeline_mut(|pipeline| {
+                            for op in from_op..=to_op {
+                                let header = *merged
+                                    .headers
+                                    .iter()
+                                    .find(|header| header.op == op)
+                                    .expect("the decided history is available");
+                                let mut entry = PipelineEntry::new(header);
+                                entry.add_ack(consensus.replica());
+                                pipeline.push(entry);
+                            }
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                rebuilt_from, expected_start,
+                "repair applied through {repaired_to}"
+            );
+
+            for header in merged
+                .headers
+                .iter()
+                .rev()
+                .filter(|header| header.op > repaired_to.max(MERGED_COMMIT))
+            {
+                let ack = PrepareOkHeader {
+                    command: Command::PrepareOk,
+                    view: VIEW,
+                    replica: 1,
+                    op: header.op,
+                    prepare_checksum: header.checksum,
+                    ..Default::default()
+                };
+                assert!(ack_quorum_reached(&consensus, PlaneKind::Metadata, &ack));
+                let ready = peek_committable_head(&consensus)
+                    .expect("the next op must commit in this view");
+                assert_eq!(ready.checksum, header.checksum);
+                assert_eq!(consensus.pop_committed_prepare().unwrap().header, ready);
+                consensus.advance_commit_min(ready.op);
+            }
+            assert_eq!(consensus.view(), VIEW);
+            assert_eq!(consensus.status(), Status::Normal);
+            assert_eq!(consensus.commit_min(), HEAD);
+            assert!(consensus.pipeline_is_empty());
+            assert!(consensus.applied_view_start());
+            assert_eq!(
+                consensus.last_prepare_checksum(),
+                merged.headers[0].checksum
+            );
+        }
+    }
+
+    #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());

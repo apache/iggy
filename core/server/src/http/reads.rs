@@ -614,10 +614,10 @@ mod tests {
                 },
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
                     partition_id: 0,
                     consensus_group_id,
                 }],
-                created_view: 0,
             },
         );
         GetTopicResponse::decode_from(&reply).unwrap().topic.id as usize

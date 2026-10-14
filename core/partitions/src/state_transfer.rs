@@ -3346,6 +3346,7 @@ where
         }
         let pending =
             self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));
@@ -4468,6 +4469,7 @@ where
         let peer = self.consensus().primary_index(self.consensus().view());
         let pending =
             self.prepare_state_transfer_install(commit_op, staged, offsets_bytes, peer)?;
+        self.cancel_primary_transfer();
         self.transition = Some(crate::iggy_partition::PendingPartitionTransition::Install(
             Box::new(pending),
         ));

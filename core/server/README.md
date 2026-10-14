@@ -44,9 +44,11 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-6` storage gate
+complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-7` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 Cached replies now preserve a committed-result marker, which older receipts lack.
+Partition creation records carry an initial view for each assignment, replacing
+the single request-wide view in older metadata WAL entries.
 No in-place upgrade or implicit migration is supported. A separately validated
 offline migration or restore procedure would be required to reuse existing data.
 
@@ -71,6 +73,16 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 ```
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.
+
+New partition primaries are spread across the configured replicas using each
+partition's last observed primary, or its committed initial view before an
+observation arrives. Concurrent creates count pending assignments too. Every
+configured replica remains eligible, including an offline replica; ordinary
+partition failover handles that initial target. After the responsive replica set
+has been stable for five seconds, the metadata primary balances existing primary
+counts one partition at a time. It confirms the source's committed frontier and
+the target's applied history before requesting a persisted consensus view change.
+Recovering partitions delay transfers. Every replica still stores every partition.
 
 Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
 share a logical session across connections. Command 14 is retired. Primary
@@ -200,7 +212,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-OWNERSHIP-HISTORY-6` requires this initialization contract;
+Storage format `IGGY-OWNERSHIP-HISTORY-7` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

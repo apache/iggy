@@ -1811,6 +1811,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.ceded_primaryship.get()
     }
 
+    /// Normal status can persist while a newer view is being confirmed.
+    #[must_use]
+    pub const fn has_observed_newer_view(&self) -> bool {
+        self.observed_newer_view.get() > self.view.get()
+    }
+
     /// Set the per-boot incarnation nonce, at boot before `init`. Production
     /// supplies a random `u128`; the deterministic simulator supplies a
     /// seed-derived value bumped per restart. See the `incarnation` field.
@@ -1836,6 +1842,42 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn is_primary(&self) -> bool {
         self.primary_index(self.view.get()) == self.replica
+    }
+
+    /// Ask the partition quorum to elect `target` in the next view assigned to it.
+    /// A ready backup may initiate this too. Refusal leaves consensus unchanged.
+    /// The caller fences the incarnation, drains history work, refreshes the DVC
+    /// suffix and persists the new view before dispatching the returned actions.
+    pub fn request_primary_transfer(&self, expected_view: u32, target: u8) -> Vec<VsrAction> {
+        let view = self.view();
+        if self.group == METADATA_GROUP
+            || target >= self.replica_count
+            || view != expected_view
+            || !self.is_normal()
+            || self.has_ceded_primaryship()
+            || self.is_transferring()
+            || self.view_log_unproven()
+            || self.observed_newer_view.get() > view
+            || self.commit_min() != self.commit_max()
+            || self.commit_max() < self.recovery_barrier()
+            || !self.applied_view_start()
+        {
+            return Vec::new();
+        }
+        let primary = self.primary_index(view);
+        if target == primary {
+            return Vec::new();
+        }
+        let replicas = u32::from(self.replica_count);
+        let distance = (u32::from(target) + replicas - u32::from(primary)) % replicas;
+        let Some(next_view) = view.checked_add(distance) else {
+            return Vec::new();
+        };
+        self.enter_view_change(
+            PlaneKind::Partitions,
+            next_view,
+            ViewChangeReason::PrimaryTransfer,
+        )
     }
 
     /// Advance `commit_max` - the highest op known to be committed by the cluster.
@@ -4140,6 +4182,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         };
         let new_op = merged.op_head;
         let max_commit = merged.commit_max;
+        // Repair can apply beyond the commit point frozen in the DVC merge.
+        let rebuild_after = self.commit_min().max(max_commit);
 
         // The one view-change exit that skips `reset_view_change_state`, so the DVCs
         // (a suffix `Vec` per sender, per group led) would be held for the whole
@@ -4189,7 +4233,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::CommitMessage);
             // If there are uncommitted ops in the rebuilt pipeline, start the
             // Prepare timeout so that lost PrepareOks trigger retransmission.
-            if max_commit < new_op {
+            if rebuild_after < new_op {
                 timeouts.start(TimeoutKind::Prepare);
             }
         }
@@ -4226,20 +4270,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions.push(VsrAction::CommitJournal);
         // The new primary must rebuild its pipeline from the journal so that
         // incoming PrepareOk messages can be matched and commits can proceed.
-        if max_commit < new_op {
+        if rebuild_after < new_op {
             // `complete_view_change_as_primary` already refused a non-fitting
             // range. Asserted so the sites cannot drift; this one cannot decline.
             debug_assert!(
-                (new_op - max_commit) <= self.prepare_queue_max as u64,
+                (new_op - rebuild_after) <= self.prepare_queue_max as u64,
                 "view change: uncommitted range {}..={} ({} ops) exceeds pipeline capacity ({}); \
                  the merged log claims more in-flight ops than the pipeline can hold",
-                max_commit + 1,
+                rebuild_after + 1,
                 new_op,
-                new_op - max_commit,
+                new_op - rebuild_after,
                 self.prepare_queue_max,
             );
             actions.push(VsrAction::RebuildPipeline {
-                from_op: max_commit + 1,
+                from_op: rebuild_after + 1,
                 to_op: new_op,
             });
         }
@@ -4632,9 +4676,8 @@ mod fresh_group_start_tests {
 
     const CREATED_VIEW: u32 = 4;
 
-    /// The case the seed exists for: a group created after the metadata plane
-    /// elected must not start at view 0, or it names a replica the roster does
-    /// not advertise and no client can be routed to it.
+    /// Fresh replicas must agree on the committed assignment's initial view,
+    /// including a chosen view above zero, before the group starts serving.
     #[test]
     fn given_a_fresh_group_when_created_after_an_election_should_seed_the_creation_view() {
         let start = fresh_group_start(false, None, CREATED_VIEW);
@@ -5629,6 +5672,7 @@ mod timestamp_clamp_tests {
 #[cfg(test)]
 mod vsr_consensus_tests {
     use super::*;
+    use futures::FutureExt;
     use message_bus::BusMessage;
 
     #[test]
@@ -5703,6 +5747,237 @@ mod vsr_consensus_tests {
         assert!(consensus.is_transferring());
         consensus.set_state_transfer_stage(StateTransferStage::Idle);
         assert!(!consensus.is_transferring());
+    }
+
+    #[test]
+    fn given_ready_replica_when_requesting_primary_transfer_should_select_next_target_view() {
+        const REPLICAS: u8 = 5;
+        const INCARNATION: u64 = 17;
+        for (replica, view, target, next_view) in [
+            (1, 0, 3, 3),
+            (3, 6, 3, 8),
+            (1, 6, 4, 9),
+            (2, 9, 1, 11),
+            (2, 4, 0, 5),
+            (2, u32::MAX - 1, 0, u32::MAX),
+        ] {
+            let mut consensus =
+                VsrConsensus::new(1, replica, REPLICAS, 0, StageNoopBus, LocalPipeline::new());
+            consensus.set_view(view);
+            consensus.set_log_view(view);
+            consensus.set_partition_incarnation(INCARNATION);
+            consensus.mark_superblock_durable(view, view);
+            consensus.init();
+
+            let actions = consensus.request_primary_transfer(view, target);
+
+            assert!(matches!(
+                actions.as_slice(),
+                [VsrAction::SendStartViewChange { view, group: 0 }] if *view == next_view
+            ));
+            assert_eq!(consensus.view(), next_view);
+            assert_eq!(consensus.primary_index(next_view), target);
+            assert_eq!(consensus.status(), Status::ViewChange);
+            assert_eq!(consensus.log_view(), view);
+            assert_eq!(consensus.partition_incarnation(), INCARNATION);
+            assert!(consensus.needs_superblock_persist());
+            assert_eq!(consensus.svc_count_excluding_self(), 0);
+            assert!(consensus.sent_own_start_view_change.get());
+        }
+    }
+
+    #[test]
+    fn given_backup_transfer_when_primary_receives_svc_should_join_the_target_election() {
+        const TARGET: u8 = 2;
+        let backup = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        let primary = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        backup.init();
+        primary.init();
+        assert!(!backup.request_primary_transfer(0, TARGET).is_empty());
+        assert_eq!(primary.status(), Status::Normal);
+
+        let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+            .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.cluster = 1;
+                header.replica = backup.replica();
+                header.view = backup.view();
+                header.group = backup.group();
+                header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                header.seal();
+            });
+        let actions = primary.handle_start_view_change(PlaneKind::Partitions, message.header());
+
+        assert_eq!(primary.view(), u32::from(TARGET));
+        assert_eq!(primary.status(), Status::ViewChange);
+        assert_eq!(primary.log_view(), 0);
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                VsrAction::SendStartViewChange { view: 2, group: 0 }
+            ))
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            VsrAction::SendDoViewChange {
+                target: TARGET,
+                view: 2,
+                ..
+            }
+        )));
+        assert!(primary.pending_view_log().is_none());
+    }
+
+    #[test]
+    fn given_pending_mutation_when_requesting_primary_transfer_should_preserve_identity_and_wake_waiter()
+     {
+        const COMMITTED: u64 = 7;
+        const INCARNATION: u64 = 17;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.set_partition_incarnation(INCARNATION);
+        consensus.sequencer().set_sequence(COMMITTED);
+        consensus.restore_commit_state(COMMITTED, COMMITTED);
+        let message = projected_prepare(COMMITTED + 1, 0xfeed).transmute_header(
+            |previous, header: &mut PrepareHeader| {
+                *header = previous;
+                header.operation = Operation::SendMessages;
+                header.client = 31;
+                header.session = 37;
+                header.request = 41;
+                header.partition_incarnation = INCARNATION;
+            },
+        );
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Partitions, &message);
+        let pending = *message.header();
+        let checksum = consensus.last_prepare_checksum();
+
+        assert!(!consensus.request_primary_transfer(0, 2).is_empty());
+
+        assert_eq!(consensus.commit_min(), COMMITTED);
+        assert_eq!(consensus.commit_max(), COMMITTED);
+        assert_eq!(consensus.sequencer().current_sequence(), pending.op);
+        assert_eq!(consensus.last_prepare_checksum(), checksum);
+        consensus.with_pipeline(|pipeline| {
+            let entry = pipeline.entry_by_op(pending.op).unwrap();
+            assert_eq!(
+                bytemuck::bytes_of(&entry.header),
+                bytemuck::bytes_of(&pending)
+            );
+            assert!(!entry.has_reply_sender());
+        });
+        assert!(matches!(
+            receiver.now_or_never(),
+            Some(Err(crate::oneshot::Canceled))
+        ));
+        assert_eq!(consensus.log_view(), 0);
+    }
+
+    #[test]
+    fn given_unready_or_stale_transfer_when_requested_should_leave_consensus_unchanged() {
+        const VIEW: u32 = 6;
+        for reason in [
+            "stale view",
+            "existing primary",
+            "unknown target",
+            "recovering",
+            "view change",
+            "ceded",
+            "state transfer",
+            "unproved history",
+            "newer view observed",
+            "unapplied commit",
+            "recovery barrier",
+            "view start head",
+        ] {
+            let mut consensus = VsrConsensus::new(1, 2, 5, 0, StageNoopBus, LocalPipeline::new());
+            consensus.set_view(VIEW);
+            consensus.set_log_view(VIEW);
+            consensus.mark_superblock_durable(VIEW, VIEW);
+            consensus.init();
+            let mut expected_view = VIEW;
+            let mut target = 3;
+            match reason {
+                "stale view" => expected_view -= 1,
+                "existing primary" => target = consensus.primary_index(VIEW),
+                "unknown target" => target = consensus.replica_count(),
+                "recovering" => consensus.begin_view_probe(),
+                "view change" => {
+                    let _ = consensus.enter_view_change(
+                        PlaneKind::Partitions,
+                        VIEW,
+                        ViewChangeReason::ReceivedStartViewChange,
+                    );
+                }
+                "ceded" => consensus.init_as_backup(),
+                "state transfer" => consensus.begin_state_transfer_await(),
+                "unproved history" => consensus.fence_view_log(1, 1),
+                "newer view observed" => consensus.observe_newer_view(VIEW + 1),
+                "unapplied commit" => consensus.advance_commit_max(1),
+                "recovery barrier" => consensus.set_recovery_barrier(1),
+                "view start head" => consensus.view_start_head.set(1),
+                _ => unreachable!(),
+            }
+            let before = (
+                consensus.view(),
+                consensus.log_view(),
+                consensus.status(),
+                consensus.commit_min(),
+                consensus.commit_max(),
+                consensus.sequencer().current_sequence(),
+                consensus.svc_count_excluding_self(),
+                consensus.sent_own_start_view_change.get(),
+                consensus.needs_superblock_persist(),
+            );
+            let timers = format!("{:?}", consensus.timeouts.borrow());
+
+            assert!(
+                consensus
+                    .request_primary_transfer(expected_view, target)
+                    .is_empty(),
+                "accepted {reason}"
+            );
+
+            assert_eq!(
+                before,
+                (
+                    consensus.view(),
+                    consensus.log_view(),
+                    consensus.status(),
+                    consensus.commit_min(),
+                    consensus.commit_max(),
+                    consensus.sequencer().current_sequence(),
+                    consensus.svc_count_excluding_self(),
+                    consensus.sent_own_start_view_change.get(),
+                    consensus.needs_superblock_persist(),
+                ),
+                "mutated {reason}"
+            );
+            assert_eq!(
+                timers,
+                format!("{:?}", consensus.timeouts.borrow()),
+                "rearmed {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_metadata_or_exhausted_view_when_requesting_primary_transfer_should_refuse() {
+        for (group, view) in [(METADATA_GROUP, 0), (0, u32::MAX)] {
+            let mut consensus =
+                VsrConsensus::new(1, 0, 5, group, StageNoopBus, LocalPipeline::new());
+            consensus.set_view(view);
+            consensus.set_log_view(view);
+            consensus.mark_superblock_durable(view, view);
+            consensus.init();
+
+            assert!(consensus.request_primary_transfer(view, 1).is_empty());
+            assert_eq!(consensus.view(), view);
+            assert_eq!(consensus.log_view(), view);
+            assert_eq!(consensus.status(), Status::Normal);
+            assert!(!consensus.needs_superblock_persist());
+            assert!(!consensus.sent_own_start_view_change.get());
+        }
     }
 
     // A backup left behind on VIEW (partition healed across an election, or a

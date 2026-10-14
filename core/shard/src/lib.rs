@@ -23,6 +23,7 @@ pub mod metrics;
 mod partition_io;
 pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
 mod poll;
+mod primary_rebalance;
 mod router;
 pub mod shards_table;
 
@@ -65,7 +66,7 @@ use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{BusMessage, ConnectionPermit, MessageBus, SharedTlsServerConfig};
 use metadata::IggyMetadata;
-use metadata::impls::metadata::StreamsFrontend;
+use metadata::impls::metadata::{PartitionPlacementView, StreamsFrontend};
 use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::state_transfer::TransferArtifact;
@@ -124,16 +125,18 @@ where
 pub struct PartitionMaterialisation {
     epoch: u64,
     created_view: u32,
+    first_initialization: bool,
     consumer_offsets_max: usize,
 }
 
 #[cfg(feature = "simulator")]
 impl PartitionMaterialisation {
     #[must_use]
-    pub const fn new(epoch: u64, created_view: u32) -> Self {
+    pub const fn new(epoch: u64, created_view: u32, first_initialization: bool) -> Self {
         Self {
             epoch,
             created_view,
+            first_initialization,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
         }
     }
@@ -905,6 +908,9 @@ pub enum LifecycleFrame {
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
     MetadataCommitTick,
+    /// Last-known serving views, retried by a bounded sweep on each owning shard.
+    PartitionPlacementViews(Vec<PartitionPlacementView>),
+    PrimaryRebalance(Box<primary_rebalance::LocalRebalance>),
     PartitionPersistenceCompleted(partitions::PersistenceCompletion),
     /// Wake marker for the reconciler-to-pump funnel. Pump drains the
     /// shard's `reconcile_queue` on receipt; tail drain on every frame
@@ -1674,6 +1680,8 @@ where
     /// cursor the leading groups would spend the whole budget on every pass and
     /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
     partition_walk_cursor: Cell<Option<IggyNamespace>>,
+    partition_placement_cursor: Cell<Option<IggyNamespace>>,
+    primary_rebalance: RefCell<primary_rebalance::PrimaryRebalance>,
 
     /// Consecutive metadata superblock write failures tolerated before the
     /// process fail-stops. Defaults to 0 (disabled) so the simulator and tests
@@ -1912,6 +1920,8 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            partition_placement_cursor: Cell::new(None),
+            primary_rebalance: RefCell::default(),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -2486,6 +2496,8 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
+            partition_placement_cursor: Cell::new(None),
+            primary_rebalance: RefCell::default(),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -3300,7 +3312,11 @@ where
         M: RestorableMetadataStm,
         T: ShardsTable,
     {
+        self.fence_rebalance_authority(&message);
         match message {
+            MessageBag::PrimaryRebalance(message) => {
+                self.on_primary_rebalance(*message.header()).await;
+            }
             MessageBag::Request(request) => {
                 // One header read for the pair; `header()` casts on every call.
                 let routing = {
@@ -4463,8 +4479,8 @@ where
     /// reports `commit_offset` 0, which reads as a regression rather than a
     /// harness that discarded the log.
     ///
-    /// `materialisation` carries the committed `created_revision` and the view
-    /// the metadata plane created the namespace in; see `fresh_group_start`.
+    /// `materialisation` carries the committed `created_revision` and this
+    /// partition's assigned initial view; see `fresh_group_start`.
     ///
     /// Once inserted, this also runs the same parked-frame redispatch as
     /// `ReconcileOp::InsertOwned`. The simulator bypasses the reconciler build,
@@ -4493,6 +4509,7 @@ where
         let PartitionMaterialisation {
             epoch,
             created_view,
+            first_initialization,
             consumer_offsets_max,
         } = materialisation;
         let partitions = self.plane.partitions();
@@ -4509,27 +4526,15 @@ where
             LocalPipeline::new(),
             self.partition_consensus.clock.clone(),
         );
-        // The SAME decision `build_partition_fresh` makes, not a copy of it.
-        // This path cannot call that builder (it does real filesystem work and
-        // this runs on in-memory storage), and while the two decided
-        // separately the simulator exercised neither the creation-view seed
-        // nor the plane split it closes. `retained` is populated only by the
-        // restart path, which is this path's evidence of a prior life.
         let durable_view = recovered_state
             .as_ref()
             .map(|state| (state.view, state.log_view));
-        let recovered_metadata = self
-            .plane
-            .metadata()
-            .applied_frontier()
-            .recovered_revision();
-        // Synthetic seed helpers create revision-zero groups in an explicitly
-        // fresh simulator. A restart always supplies retained state.
-        let allow_bootstrap = epoch > recovered_metadata
-            || (epoch == 0 && recovered_metadata == 0 && retained.is_none());
-        consensus.set_recovery_election_allowed(allow_bootstrap || retained.is_some());
-        let restarted =
-            (retained.is_some() || !allow_bootstrap) && self.partition_consensus.replica_count > 1;
+        // The harness's incarnation-qualified store is its initialization ledger.
+        // Recovered metadata can precede the group's first materialization;
+        // missing retained history alone cannot distinguish that from data loss.
+        consensus.set_recovery_election_allowed(first_initialization || retained.is_some());
+        let restarted = (retained.is_some() || !first_initialization)
+            && self.partition_consensus.replica_count > 1;
         let consensus::FreshGroupStart {
             join,
             view_fallback,
@@ -5846,6 +5851,8 @@ where
                     if consensus.state_transfer_stage() == consensus::StateTransferStage::Idle {
                         *self.metadata_repair.borrow_mut() = None;
                         consensus.begin_state_transfer_await();
+                        *self.primary_rebalance.borrow_mut() =
+                            primary_rebalance::PrimaryRebalance::default();
                         tracing::info!(
                             shard = self.id,
                             peer = header.replica,
@@ -7866,6 +7873,7 @@ where
         // the pump's owned scratch (as `process_loopback` does) so no
         // partitions-plane borrow is held across the tick `.await`.
         namespace_scratch.extend(partitions.namespaces().copied());
+        self.publish_partition_views(namespace_scratch);
         // Resume where the last sweep ran out of walk budget, so the cap below
         // spreads over every group instead of replaying the same prefix.
         rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
@@ -8489,6 +8497,61 @@ where
         }
 
         fatal
+    }
+
+    /// Re-read a bounded range on retry so a full inbox retains no stale payload.
+    fn publish_partition_views(&self, namespaces: &[IggyNamespace]) {
+        if namespaces.is_empty() {
+            self.partition_placement_cursor.set(None);
+            return;
+        }
+        let Some(sender) = self.senders.first() else {
+            return;
+        };
+        let start = self.partition_placement_cursor.get().map_or(0, |cursor| {
+            namespaces.partition_point(|namespace| *namespace < cursor) % namespaces.len()
+        });
+        let visited = namespaces
+            .len()
+            .min(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX);
+        let partitions = self.plane.partitions();
+        let mut reports = Vec::with_capacity(visited);
+        for namespace in namespaces[start..]
+            .iter()
+            .chain(&namespaces[..start])
+            .take(visited)
+        {
+            let Some(partition) = partitions.get_by_ns(namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            let view = consensus.view();
+            if partition.fatal().is_none()
+                && consensus.is_normal()
+                && !consensus.is_transferring()
+                && !(consensus.has_ceded_primaryship()
+                    && consensus.primary_index(view) == consensus.replica())
+            {
+                reports.push(PartitionPlacementView {
+                    namespace: *namespace,
+                    created_revision: partition.created_revision(),
+                    view,
+                });
+            }
+        }
+        if !reports.is_empty()
+            && let Err(error) = sender.try_send(ShardFrame::lifecycle(
+                LifecycleFrame::PartitionPlacementViews(reports),
+            ))
+        {
+            self.metrics.record_frame_drop(
+                metrics::frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
+                coordinator::classify_try_send_err(&error),
+            );
+            return;
+        }
+        self.partition_placement_cursor
+            .set(Some(namespaces[(start + visited) % namespaces.len()]));
     }
 
     /// Whether this shard may build a partition offer for `namespace` without
@@ -10434,7 +10497,8 @@ where
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn tick_metadata(&self)
     where
-        B: MessageBus,
+        B: MessageBus + 'static,
+        T: ShardsTable,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -10457,6 +10521,9 @@ where
             refresh_metadata_dvc_suffix(consensus, metadata.journal.as_ref());
         }
         let actions = consensus.tick(PlaneKind::Metadata);
+        if !consensus.is_primary() || !primary_rebalance::consensus_ready(consensus) {
+            *self.primary_rebalance.borrow_mut() = primary_rebalance::PrimaryRebalance::default();
+        }
 
         let (local_actions, wire_actions) = split_local_actions(actions);
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &local_actions).await;
@@ -10492,6 +10559,8 @@ where
         // would otherwise wait for unrelated traffic. Quiet no-op when
         // nothing is stranded.
         metadata.resume_stranded_commits().await;
+        metadata.refresh_placement().await;
+        self.tick_primary_rebalance().await;
 
         self.advance_pending_metadata_view().await;
         self.expire_idle_state_transfer_offers();
@@ -11111,6 +11180,9 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 /// first group this one turned away, so the eligible set drains in
 /// `ceil(groups / cap)` ticks however many groups are owed at once.
 const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
+
+/// One lifecycle batch per tick; the cursor also bounds visits to ineligible groups.
+const PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX: usize = 64;
 
 /// Floor under the gap detector's debounce, in ticks.
 ///
@@ -13746,6 +13818,478 @@ mod metadata_repair_session_tests {
         // A frame was lost inside the served chunk: re-requesting now would
         // race the retry timer for the same window.
         assert!(!repair_chunk_walked(5, 5, 12));
+    }
+}
+
+#[cfg(test)]
+mod partition_placement_tests {
+    use super::*;
+    use consensus::{CLIENTS_TABLE_MAX, LocalPipeline, build_reply_message_with};
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::{
+        ReplyHeader, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
+    };
+    use iggy_common::{IggyByteSize, PartitionStats};
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::IggyMessageBus;
+    use metadata::MuxStateMachine;
+    use metadata::impls::metadata::IggySnapshot;
+    use metadata::impls::recovery::{ReplicaIdentity, recover};
+    use metadata::stm::stream::Streams;
+    use metadata::stm::user::Users;
+    use partitions::{PartitionPathLayout, PartitionsConfig};
+    use server_common::sharding::METADATA_GROUP;
+    use shards_table::PapayaShardsTable;
+    use std::collections::BTreeSet;
+    use std::mem::size_of;
+    use std::sync::Arc;
+
+    type PlacementShard = IggyShard<
+        Rc<IggyMessageBus>,
+        PrepareJournal,
+        IggySnapshot,
+        MuxStateMachine<variadic!(Users, Streams)>,
+        PapayaShardsTable,
+    >;
+
+    fn owner(shard_id: u16) -> (PlacementShard, Receiver<ShardFrame>) {
+        let bus = Rc::new(IggyMessageBus::new(shard_id));
+        let segment_size = IggyByteSize::from(1_048_576_u64);
+        let partitions = IggyPartitions::new(
+            ShardId::new(shard_id),
+            PartitionsConfig {
+                messages_required_to_save: 100,
+                size_of_messages_required_to_save: segment_size,
+                validate_checksum: true,
+                segment_size,
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let metadata = IggyMetadata::new(
+            None,
+            None,
+            None,
+            None,
+            MuxStateMachine::<variadic!(Users, Streams)>::default(),
+            None,
+        );
+        let mut shard = PlacementShard::without_inbox(
+            ShardIdentity::new(shard_id, "partition-placement-test".to_string()),
+            bus.clone(),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 3), bus),
+        );
+        let (senders, mut inboxes, _reply_inboxes) = shard_mesh_channels(shard_id + 1, 1, 1);
+        let target = inboxes[0].take().expect("shard zero inbox");
+        shard.attach_senders(senders);
+        (shard, target)
+    }
+
+    fn insert(shard: &PlacementShard, id: usize, revision: u64, view: u32) -> IggyNamespace {
+        let namespace = IggyNamespace::new(0, 0, id);
+        let mut consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            namespace.inner(),
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.set_view(view);
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            shard.plane.partitions().config().segment_size,
+        );
+        partition.set_created_revision(revision);
+        shard.plane.partitions().insert(namespace, partition);
+        namespace
+    }
+
+    fn publish(shard: &PlacementShard) {
+        let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
+        shard.publish_partition_views(&namespaces);
+    }
+
+    fn receive(inbox: &Receiver<ShardFrame>) -> Vec<PartitionPlacementView> {
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionPlacementViews(reports)) =
+            inbox.try_recv().expect("placement report queued")
+        else {
+            panic!("expected partition placement observations");
+        };
+        assert!(inbox.try_recv().is_err(), "at most one batch per sweep");
+        reports
+    }
+
+    #[compio::test]
+    async fn given_owned_groups_when_ticking_should_report_only_normal_serving_views_to_shard_zero()
+    {
+        for shard_id in [0, 1] {
+            let (shard, inbox) = owner(shard_id);
+            for id in 0..6 {
+                let view = u32::from(id == 1);
+                insert(&shard, id, 7, view);
+            }
+            let partitions = shard.plane.partitions();
+            partitions
+                .get_by_ns(&IggyNamespace::new(0, 0, 2))
+                .unwrap()
+                .consensus()
+                .begin_view_probe();
+            partitions
+                .get_by_ns(&IggyNamespace::new(0, 0, 3))
+                .unwrap()
+                .consensus()
+                .begin_state_transfer_await();
+            partitions
+                .get_by_ns(&IggyNamespace::new(0, 0, 4))
+                .unwrap()
+                .consensus()
+                .init_as_backup();
+            partitions.tombstone(IggyNamespace::new(0, 0, 5));
+
+            assert!(shard.tick_partitions(&mut Vec::new()).await.is_none());
+
+            let reports = receive(&inbox);
+            assert_eq!(reports.len(), 2);
+            assert_eq!(reports[0].namespace, IggyNamespace::new(0, 0, 0));
+            assert_eq!(reports[0].view, 0, "a normal primary contributes");
+            assert_eq!(reports[1].namespace, IggyNamespace::new(0, 0, 1));
+            assert_eq!(
+                reports[1].view, 1,
+                "a normal backup contributes its known view"
+            );
+            assert!(reports.iter().all(|report| report.created_revision == 7));
+        }
+    }
+
+    #[compio::test]
+    async fn given_more_groups_than_one_batch_when_publishing_should_bound_batches_and_cover_the_tail()
+     {
+        let (shard, inbox) = owner(1);
+        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX * 2 + 3;
+        for id in 0..count {
+            insert(&shard, id, 7, 0);
+        }
+        let mut observed = BTreeSet::new();
+        for _ in 0..count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX) {
+            publish(&shard);
+            let reports = receive(&inbox);
+            assert_eq!(reports.len(), PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX);
+            observed.extend(
+                reports
+                    .into_iter()
+                    .map(|report| report.namespace.partition_id()),
+            );
+        }
+        assert_eq!(observed, (0..count).collect());
+
+        let removed = shard.partition_placement_cursor.get().unwrap();
+        shard.plane.partitions().remove(&removed);
+        publish(&shard);
+        let reports = receive(&inbox);
+        assert_eq!(
+            reports[0].namespace.partition_id(),
+            removed.partition_id() + 1
+        );
+        assert!(reports.iter().all(|report| report.namespace != removed));
+    }
+
+    #[compio::test]
+    async fn given_a_full_inbox_when_retried_should_publish_current_incarnation_without_skipping_groups()
+     {
+        let (shard, inbox) = owner(1);
+        let namespace = insert(&shard, 0, 7, 0);
+        insert(&shard, 1, 7, 0);
+        assert!(
+            shard.senders[0]
+                .try_send(ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick))
+                .is_ok()
+        );
+
+        publish(&shard);
+        assert_eq!(shard.partition_placement_cursor.get(), None);
+        assert_eq!(
+            inbox.len(),
+            1,
+            "no deferred report queue grows behind the full inbox"
+        );
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(ShardFrame::Lifecycle(LifecycleFrame::MetadataCommitTick))
+        ));
+        shard.plane.partitions().remove(&namespace);
+        insert(&shard, 0, 11, 9);
+
+        publish(&shard);
+        let reports = receive(&inbox);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].namespace, namespace);
+        assert_eq!(reports[0].created_revision, 11);
+        assert_eq!(
+            reports[0].view, 9,
+            "retry rereads rather than retaining the old observation"
+        );
+        assert_eq!(reports[1].namespace, IggyNamespace::new(0, 0, 1));
+    }
+
+    #[compio::test]
+    async fn given_an_ineligible_prefix_when_publishing_should_bound_visits_and_reach_live_groups()
+    {
+        let (shard, inbox) = owner(1);
+        for id in 0..=PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX {
+            let namespace = insert(&shard, id, 7, 0);
+            if id < PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX {
+                shard
+                    .plane
+                    .partitions()
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .consensus()
+                    .begin_view_probe();
+            }
+        }
+        publish(&shard);
+        assert!(
+            inbox.try_recv().is_err(),
+            "one sweep visits at most its bounded range"
+        );
+
+        publish(&shard);
+        let reports = receive(&inbox);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].namespace.partition_id(),
+            PARTITION_PLACEMENT_REPORTS_PER_TICK_MAX
+        );
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_reopened_pending_create_when_rebuilding_pipeline_should_restore_placement_reservations()
+     {
+        type PlacementMetadata = IggyMetadata<
+            VsrConsensus<Rc<IggyMessageBus>>,
+            PrepareJournal,
+            IggySnapshot,
+            MuxStateMachine<variadic!(Users, Streams)>,
+        >;
+        const JOURNAL_SLOTS: usize = 128;
+        const FIRST_CLIENT: u128 = 7;
+        const NEXT_CLIENT: u128 = 8;
+        const ADMISSION_BUDGET: Duration = Duration::from_secs(5);
+        let register = |metadata: &PlacementMetadata, client| {
+            let reply = build_reply_message_with(
+                &PrepareHeader {
+                    client,
+                    op: 1,
+                    operation: Operation::Register,
+                    ..Default::default()
+                },
+                0,
+                |_| {},
+            );
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(client, 0, [0x5a; 32], reply)
+                .unwrap();
+        };
+        let request = |client, name: &str| {
+            let body = CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+                name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            let header_size = size_of::<RoutedRequestHeader>();
+            let mut message = Message::<RoutedRequestHeader>::new(header_size + body.len());
+            message.as_mut_slice()[header_size..].copy_from_slice(&body);
+            message.transmute_header(|_, header| {
+                *header = RoutedRequestHeader {
+                    command: Command::Request,
+                    operation: Operation::CreateTopic,
+                    size: u32::try_from(header_size + body.len()).unwrap(),
+                    client,
+                    session: 1,
+                    request: 1,
+                    group: METADATA_GROUP,
+                    ..Default::default()
+                };
+            })
+        };
+        let capture = async |metadata: &PlacementMetadata, request, op| {
+            let mut submit = Box::pin(metadata.submit_request_in_process(request));
+            compio::time::timeout(ADMISSION_BUDGET, async {
+                loop {
+                    assert!(
+                        submit.as_mut().now_or_never().is_none(),
+                        "three replicas need another acknowledgment before commit"
+                    );
+                    let journal = metadata.journal.as_ref().unwrap();
+                    let header = journal.handle().header(op).map(|header| *header);
+                    if let Some(header) = header {
+                        break journal.handle().entry(&header).await.unwrap();
+                    }
+                    compio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("admission must append within its budget")
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_directory = directory.path().join(metadata::impls::METADATA_DIR);
+        std::fs::create_dir(&metadata_directory).unwrap();
+        let inherited = {
+            let journal = PrepareJournal::open_with_slots(
+                &metadata_directory.join("journal.wal"),
+                0,
+                JOURNAL_SLOTS,
+            )
+            .await
+            .unwrap();
+            let consensus = VsrConsensus::new(
+                1,
+                0,
+                3,
+                METADATA_GROUP,
+                Rc::new(IggyMessageBus::new(0)),
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            let metadata = PlacementMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                MuxStateMachine::default(),
+                None,
+            );
+            register(&metadata, FIRST_CLIENT);
+            let prepare = capture(&metadata, request(FIRST_CLIENT, "inherited"), 1).await;
+            assert_eq!(metadata.consensus.as_ref().unwrap().commit_min(), 0);
+            prepare
+        };
+        let original = CreateTopicWithAssignmentsRequest::decode_from(inherited.body())
+            .unwrap()
+            .partitions;
+        assert_eq!(
+            original
+                .iter()
+                .map(|partition| (partition.consensus_group_id, partition.initial_view))
+                .collect::<Vec<_>>(),
+            [(1, 0), (2, 1)]
+        );
+
+        let recovered = recover::<MuxStateMachine<variadic!(Users, Streams)>>(
+            directory.path(),
+            ReplicaIdentity {
+                cluster: 1,
+                replica_id: 0,
+                replica_count: 3,
+            },
+            JOURNAL_SLOTS,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, Some(inherited.header().op));
+        assert_eq!(recovered.chain_break_op, None);
+        let reopened = recovered
+            .journal
+            .handle()
+            .entry(inherited.header())
+            .await
+            .unwrap();
+        assert_eq!(reopened.as_slice(), inherited.as_slice());
+
+        // Enter the recovered-primary seam; the network election itself is covered separately.
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            Rc::new(IggyMessageBus::new(0)),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        consensus
+            .sequencer()
+            .set_sequence(recovered.last_journaled_op.unwrap());
+        consensus.set_last_prepare_checksum(inherited.header().checksum);
+        let metadata = PlacementMetadata::new(
+            Some(consensus),
+            Some(recovered.journal),
+            recovered.snapshot,
+            Some(Rc::new(recovered.superblock)),
+            recovered.mux_stm,
+            None,
+        );
+        register(&metadata, NEXT_CLIENT);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        assert!(consensus.pipeline_is_empty());
+        dispatch_vsr_actions(
+            consensus,
+            metadata.journal.as_ref(),
+            &[VsrAction::RebuildPipeline {
+                from_op: recovered.last_applied_op.unwrap_or(0) + 1,
+                to_op: recovered.last_journaled_op.unwrap(),
+            }],
+        )
+        .await;
+        assert!(consensus.pipeline_holds_entry(inherited.header().op, inherited.header().checksum));
+        let refused = metadata
+            .submit_request_in_process(request(NEXT_CLIENT, "next"))
+            .await
+            .unwrap()
+            .try_into_typed::<ReplyHeader>()
+            .unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(refused.body()),
+            Some(IggyError::TransientNotAccepted.as_code())
+        );
+        assert!(!refused.header().has_committed_result());
+        assert_eq!(metadata.allocator.highest(), 0);
+        metadata.refresh_placement().await;
+        assert_eq!(metadata.allocator.highest(), 2);
+        let next = capture(&metadata, request(NEXT_CLIENT, "next"), 2).await;
+        let assignments = CreateTopicWithAssignmentsRequest::decode_from(next.body())
+            .unwrap()
+            .partitions;
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|partition| (partition.consensus_group_id, partition.initial_view))
+                .collect::<Vec<_>>(),
+            [(3, 2), (4, 0)]
+        );
+        assert_eq!(next.header().parent, inherited.header().checksum);
+        assert!(consensus.pipeline_holds_entry(inherited.header().op, inherited.header().checksum));
+        let retained = metadata
+            .journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .entry(inherited.header())
+            .await
+            .unwrap();
+        assert_eq!(
+            retained.as_slice(),
+            inherited.as_slice(),
+            "reconstruction must preserve the original assignment bytes"
+        );
     }
 }
 

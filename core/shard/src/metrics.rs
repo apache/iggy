@@ -104,6 +104,8 @@ pub mod frame_drop_variant {
     pub const FORWARD_CLIENT_SEND: &str = "forward_client_send";
     pub const FORWARD_REPLICA_SEND: &str = "forward_replica_send";
     pub const METADATA_COMMIT_TICK: &str = "metadata_commit_tick";
+    pub const PARTITION_PLACEMENT_VIEWS: &str = "partition_placement_views";
+    pub const PRIMARY_REBALANCE: &str = "primary_rebalance";
     /// A delegated replica handshake's outcome ack to shard 0 was
     /// dropped; the shard-0 deadline expiry recovers the slot / pending
     /// entry, so this stays informational.

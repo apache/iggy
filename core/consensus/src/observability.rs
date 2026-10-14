@@ -56,6 +56,7 @@ impl ReplicaRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewChangeReason {
     NormalHeartbeatTimeout,
+    PrimaryTransfer,
     /// The current view's primary sent a `RequestStartView` probe: it
     /// cannot lead (restarted, or abandoned the view mid-view-change), so
     /// peers elect without waiting for its heartbeats to stop arriving
@@ -75,6 +76,7 @@ impl ViewChangeReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NormalHeartbeatTimeout => "normal_heartbeat_timeout",
+            Self::PrimaryTransfer => "primary_transfer",
             Self::PrimaryProbedView => "primary_probed_view",
             Self::ViewProbeUnanswered => "view_probe_unanswered",
             Self::ViewChangeStatusTimeout => "view_change_status_timeout",

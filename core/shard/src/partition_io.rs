@@ -724,6 +724,10 @@ where
                 self.on_message(message).await;
                 self.partition_io.continue_ready(namespace, incarnation);
             }
+            partitions::PartitionIoStep::PrimaryTransfer(request) => {
+                self.apply_primary_transfer(namespace, request).await;
+                self.partition_io.continue_ready(namespace, incarnation);
+            }
             partitions::PartitionIoStep::Progress => {
                 self.partition_io.continue_ready(namespace, incarnation);
             }

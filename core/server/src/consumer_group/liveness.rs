@@ -917,9 +917,9 @@ mod tests {
                 name: WireName::new("legacy").unwrap(),
                 options: WireOptions::empty(),
             },
-            created_view: 0,
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 2,
             }],
@@ -1184,9 +1184,9 @@ mod tests {
                 name: WireName::new("topic").unwrap(),
                 options: WireOptions::empty(),
             },
-            created_view: 0,
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
             }],

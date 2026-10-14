@@ -17,6 +17,7 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
+use crate::impls::placement::PlacementState;
 use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
@@ -68,6 +69,7 @@ use message_bus::MessageBus;
 use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
+use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
 use std::io;
 #[cfg(feature = "simulator")]
@@ -85,6 +87,25 @@ fn freeze_client_reply(
     message: Message<GenericHeader>,
 ) -> server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }> {
     message.into_frozen()
+}
+
+/// Last locally observed normal view of one committed partition incarnation.
+/// Absence of a newer report preserves this view; it is not a health signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionPlacementView {
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+    pub view: u32,
+}
+
+/// One suggested transfer, fenced by the observed view and committed incarnation.
+/// Execution must separately confirm source and target partition readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionPrimaryTransfer {
+    pub namespace: IggyNamespace,
+    pub created_revision: u64,
+    pub view: u32,
+    pub target: u8,
 }
 
 pub trait StreamsFrontend {
@@ -993,6 +1014,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// `LeftRight::read` panic. See `server/src/boot::shard_main`.
     pub mux_stm: Rc<M>,
     pub allocator: ConsensusGroupAllocator,
+    placement: RefCell<PlacementState>,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
@@ -1101,6 +1123,7 @@ where
             superblock_retry_after_micros: Cell::new(0),
             mux_stm,
             allocator,
+            placement: RefCell::default(),
             coordinator,
             journal_gate: LocalGate::new(),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
@@ -1354,6 +1377,7 @@ where
             Error = iggy_common::IggyError,
         >,
 {
+    #[allow(clippy::too_many_lines)]
     async fn on_request(
         &self,
         message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
@@ -1439,8 +1463,24 @@ where
             return;
         }
 
+        let request_header = *message.header();
         let prepare = match self.prepare_request(message) {
             Ok(prepare) => prepare,
+            Err(IggyError::TransientNotAccepted) => {
+                let reply = build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotAccepted.as_code(),
+                );
+                if let Err(error) = consensus
+                    .message_bus()
+                    .send_to_client(client_id, freeze_client_reply(reply.into_generic()))
+                    .await
+                {
+                    debug!(%error, client_id, "placement admission refusal could not reach client");
+                }
+                return;
+            }
             Err(error) => {
                 // Structurally-invalid request (not client-allowed, undecodable
                 // body, or partition-id overflow). Evict instead of dropping: a
@@ -3190,13 +3230,22 @@ where
         // The acting-user RBAC stamp lives in the shared `prepare_request`
         // (op-guarded, fail-closed on an unknown session). `request_preflight`
         // above proved this client's session is live, so it resolves there.
-        let Ok(prepare) = self.prepare_request(message) else {
-            // Structurally-invalid request. Return an eviction frame (relayed to
-            // the socket by the home shard) rather than `Canceled`, which leaves
-            // the shard silent and the SDK retrying forever.
-            let reason = eviction_reason_for_invalid(request_header.operation);
-            let ctx = EvictionContext::from_consensus(consensus);
-            return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+        let prepare = match self.prepare_request(message) {
+            Ok(prepare) => prepare,
+            Err(IggyError::TransientNotAccepted) => {
+                return Ok(build_result_rejection_reply(
+                    &request_header,
+                    consensus.commit_max(),
+                    IggyError::TransientNotAccepted.as_code(),
+                )
+                .into_generic());
+            }
+            Err(_) => {
+                // Malformed requests retain the existing session eviction policy.
+                let reason = eviction_reason_for_invalid(request_header.operation);
+                let ctx = EvictionContext::from_consensus(consensus);
+                return Ok(build_eviction_message(ctx, client_id, reason).into_generic());
+            }
         };
 
         // A view change canceled the pending prepare before commit. The op may
@@ -3579,7 +3628,7 @@ where
     /// client's watermark between push and drain (`Duplicate` /
     /// `AlreadyApplied` / `AlreadyRegistered`). Skipping produces a duplicate
     /// prepare and panics.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn drain_request_queue_into_prepares(&self) {
         let consensus = self.consensus.as_ref().unwrap();
         // Promote while prepare slots exist. Requests are queued for two
@@ -3642,8 +3691,26 @@ where
                 continue;
             }
 
+            let request_header = *req.message.header();
             let prepare = match self.prepare_request(req.message) {
                 Ok(prepare) => prepare,
+                Err(IggyError::TransientNotAccepted) => {
+                    let reply = build_result_rejection_reply(
+                        &request_header,
+                        consensus.commit_max(),
+                        IggyError::TransientNotAccepted.as_code(),
+                    );
+                    if let Some(sender) = reply_sender {
+                        let _ = sender.send(reply);
+                    } else if let Err(error) = consensus
+                        .message_bus()
+                        .send_to_client(client_id, freeze_client_reply(reply.into_generic()))
+                        .await
+                    {
+                        debug!(%error, client_id, "queued placement admission refusal could not reach client");
+                    }
+                    continue;
+                }
                 Err(error) => {
                     // Same invariant as `on_request`: a structurally-invalid
                     // request evicts, never a silent drop, or the SDK retries
@@ -3959,6 +4026,129 @@ where
         );
     }
 
+    /// Merge locally published normal views without treating missing reports as
+    /// failures. Incarnation checks keep deleted namespaces from transferring load.
+    pub fn observe_partition_views(&self, reports: &[PartitionPlacementView]) {
+        self.placement
+            .borrow_mut()
+            .observe(self.mux_stm.streams(), reports);
+    }
+
+    /// Suggest one count-balancing move only after normal failover has settled.
+    /// `after` rotates candidates so a recovering target cannot starve other groups.
+    pub fn primary_rebalance_candidate(
+        &self,
+        eligible: &[bool],
+        after: Option<IggyNamespace>,
+    ) -> Option<PartitionPrimaryTransfer> {
+        self.placement.borrow().primary_rebalance_candidate(
+            self.mux_stm.streams(),
+            self.consensus.as_ref()?.replica_count(),
+            eligible,
+            after,
+        )
+    }
+
+    /// Return an observed normal view only for the current, unblocked incarnation.
+    pub fn partition_placement_view(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+    ) -> Option<PartitionPlacementView> {
+        self.placement.borrow().partition_placement_view(
+            self.mux_stm.streams(),
+            namespace,
+            created_revision,
+        )
+    }
+
+    /// Reconstruct at most one missing reservation per metadata tick. Admission
+    /// stays synchronous and refuses creates until every canonical summary exists.
+    #[allow(clippy::future_not_send)]
+    pub async fn refresh_placement(&self) {
+        let (Some(consensus), Some(journal)) = (self.consensus.as_ref(), self.journal.as_ref())
+        else {
+            return;
+        };
+        let Ok(headers) = self.pending_placement_headers() else {
+            return;
+        };
+        let Some(header) = headers
+            .into_iter()
+            .find(|header| !self.placement.borrow().contains(header))
+        else {
+            return;
+        };
+        let view = consensus.view();
+        let Some(prepare) = journal.handle().entry(&header).await else {
+            return;
+        };
+        if prepare.header().op != header.op
+            || prepare.header().checksum != header.checksum
+            || verify_prepare_integrity(prepare.header(), prepare.as_slice()).is_err()
+            || consensus.view() != view
+            || !is_caught_up_primary(consensus)
+            || header.op <= consensus.commit_min()
+            || !consensus.pipeline_holds_entry(header.op, header.checksum)
+        {
+            return;
+        }
+        if let Ok(Some(highest_group_id)) = self
+            .placement
+            .borrow_mut()
+            .remember(&prepare, consensus.replica_count())
+        {
+            self.allocator.observe(highest_group_id);
+        }
+    }
+
+    fn placement_counts(&self) -> Result<Vec<u64>, IggyError> {
+        let headers = self.pending_placement_headers()?;
+        let consensus = self.consensus.as_ref().unwrap();
+        let mut placement = self.placement.borrow_mut();
+        let mut counts =
+            placement.committed_counts(self.mux_stm.streams(), consensus.replica_count());
+        for header in headers {
+            placement.add_reservation(&header, &mut counts)?;
+        }
+        Ok(counts)
+    }
+
+    fn pending_placement_headers(&self) -> Result<Vec<PrepareHeader>, IggyError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(IggyError::TransientNotAccepted)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        self.placement.borrow_mut().prune(|op, checksum| {
+            op > consensus.commit_min() && consensus.pipeline_holds_entry(op, checksum)
+        });
+        consensus.with_pipeline(|pipeline| {
+            let committed = consensus.commit_min();
+            let sequence = consensus.sequencer().current_sequence();
+            if sequence < committed || sequence - committed > pipeline.prepare_queue_max() as u64 {
+                return Err(IggyError::TransientNotAccepted);
+            }
+            let mut headers = Vec::new();
+            for op in committed.saturating_add(1)..=sequence {
+                let header = pipeline
+                    .entry_by_op(op)
+                    .ok_or(IggyError::TransientNotAccepted)?
+                    .header;
+                if matches!(
+                    header.operation,
+                    Operation::CreateTopicWithAssignments
+                        | Operation::CreatePartitionsWithAssignments
+                ) {
+                    headers.push(header);
+                }
+            }
+            Ok(headers)
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn prepare_request(
         &self,
@@ -4097,6 +4287,7 @@ where
                     },
                     &supplied_options,
                 )?;
+                let mut counts = self.placement_counts()?;
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -4107,6 +4298,7 @@ where
                             partition_id: u32::try_from(partition_id)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
+                            initial_view: PlacementState::select(&mut counts)?,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -4114,11 +4306,6 @@ where
                     request,
                     derived_options,
                     partitions,
-                    // Minted once here, on the admitting primary, and sealed by
-                    // `checksum_body`: the header's `view` is restamped on a
-                    // post-view-change retransmit, so a body-carried copy is the
-                    // only per-op view every replica commits identically.
-                    created_view: consensus.view(),
                 }
                 .to_bytes();
                 Ok(build_prepare_message(
@@ -4136,6 +4323,7 @@ where
                 // read here would decide against possibly-uncommitted state and
                 // drop without a reply (TOCTOU + wedge). See the metadata
                 // validation design doc.
+                let mut counts = self.placement_counts()?;
                 let partitions = self
                     .allocator
                     .allocate_many(request.partitions_count as usize)
@@ -4146,14 +4334,13 @@ where
                             partition_id: u32::try_from(offset)
                                 .map_err(|_| IggyError::InvalidCommand)?,
                             consensus_group_id,
+                            initial_view: PlacementState::select(&mut counts)?,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let body = PersistedCreatePartitionsRequest {
                     request,
                     partitions,
-                    // Same body-carried view as `PersistedCreateTopicRequest`.
-                    created_view: consensus.view(),
                 }
                 .to_bytes();
                 Ok(build_prepare_message(
@@ -4169,10 +4356,14 @@ where
             // node default frozen at update time.
             _ => Ok(message.project(consensus)),
         }?;
-        Ok(consensus::seal_prepare_capacity(
+        let prepare = consensus::seal_prepare_capacity(
             prepare,
             consensus.retry_capacity(&self.client_table.borrow()),
-        ))
+        );
+        self.placement
+            .borrow_mut()
+            .remember(&prepare, consensus.replica_count())?;
+        Ok(prepare)
     }
 
     /// Replicate a prepare message to the next replica in the chain.
@@ -5437,9 +5628,19 @@ mod tests {
         stream_id: WireIdentifier,
         name: &str,
     ) -> Message<RoutedRequestHeader> {
+        create_topic_request_with_count(client, wire_user_id, stream_id, name, 1)
+    }
+
+    fn create_topic_request_with_count(
+        client: u128,
+        wire_user_id: u32,
+        stream_id: WireIdentifier,
+        name: &str,
+        partitions_count: u32,
+    ) -> Message<RoutedRequestHeader> {
         let body = CreateTopicRequest {
             stream_id,
-            partitions_count: 1,
+            partitions_count,
             name: WireName::new(name).unwrap(),
             options: WireOptions::empty(),
         }
@@ -5465,6 +5666,441 @@ mod tests {
             };
         }
         message
+    }
+
+    fn placement_metadata() -> IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux> {
+        placement_metadata_with_bus(NoopBus)
+    }
+
+    fn placement_metadata_with_bus<B: MessageBus>(
+        bus: B,
+    ) -> IggyMetadata<VsrConsensus<B>, PrepareJournal, (), TestMux> {
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            bus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata =
+            IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None);
+        for client in 1..=3 {
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(client, 0, [0x5a; 32], register_reply(client, 1))
+                .unwrap();
+        }
+        metadata
+    }
+
+    fn placement_request(client: u128, name: &str, count: u32) -> Message<RoutedRequestHeader> {
+        create_topic_request_with_count(client, 0, WireIdentifier::numeric(0), name, count)
+    }
+
+    fn assigned_views(prepare: &Message<PrepareHeader>) -> Vec<u32> {
+        PersistedCreateTopicRequest::decode_from(prepare.body())
+            .unwrap()
+            .partitions
+            .into_iter()
+            .map(|partition| partition.initial_view)
+            .collect()
+    }
+
+    #[test]
+    fn given_pending_placement_when_admitting_another_batch_should_spread_before_wal_append() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "first", 4))
+            .unwrap();
+        assert_eq!(assigned_views(&first), [0, 1, 2, 0]);
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        let second = metadata
+            .prepare_request(placement_request(2, "second", 2))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&second),
+            [1, 2],
+            "admitted assignments reserve load before append can yield"
+        );
+        assert!(metadata.journal.is_none());
+    }
+
+    #[test]
+    fn given_rolled_back_placement_when_admitting_another_batch_should_release_reservations() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "first", 2))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(first.header()),
+            PrepareRollback::Unwound
+        );
+        let second = metadata
+            .prepare_request(placement_request(2, "second", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&second), [0]);
+    }
+
+    #[test]
+    fn given_rejected_create_when_committed_should_release_its_placement_reservations() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "missing-stream", 2))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.pop().unwrap();
+        });
+        let op = first.header().op;
+        let reply = metadata.apply_prepare(first);
+        assert_ne!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        consensus.advance_commit_max(op);
+        consensus.advance_commit_min(op);
+        let second = metadata
+            .prepare_request(placement_request(2, "next", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&second),
+            [0],
+            "a committed rejection leaves no partition load"
+        );
+    }
+
+    #[test]
+    fn given_committed_create_when_admitting_another_should_count_it_once() {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let first = metadata
+            .prepare_request(placement_request(1, "new-topic", 2))
+            .unwrap();
+        assert_eq!(assigned_views(&first), [1, 2]);
+        consensus.pipeline_message(PlaneKind::Metadata, &first);
+        consensus.with_pipeline_mut(|pipeline| {
+            pipeline.pop().unwrap();
+        });
+        let op = first.header().op;
+        let reply = metadata.apply_prepare(first);
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        consensus.advance_commit_max(op);
+        consensus.advance_commit_min(op);
+        let second = metadata
+            .prepare_request(placement_request(2, "next", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&second), [0]);
+    }
+
+    #[test]
+    fn given_missing_pipeline_entry_when_creating_should_refuse_without_allocating() {
+        let metadata = placement_metadata();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.sequencer().set_sequence(1);
+        assert!(matches!(
+            metadata.prepare_request(placement_request(1, "missing", 2)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        consensus.sequencer().set_sequence(0);
+        let first = metadata
+            .prepare_request(placement_request(1, "ready", 1))
+            .unwrap();
+        let assignments = PersistedCreateTopicRequest::decode_from(first.body())
+            .unwrap()
+            .partitions;
+        assert_eq!(
+            assignments[0].consensus_group_id, 1,
+            "refusal cannot consume group ids"
+        );
+        assert_eq!(assignments[0].initial_view, 0);
+    }
+
+    #[test]
+    fn given_unknown_session_when_creating_should_not_allocate_groups() {
+        let metadata = placement_metadata();
+        assert!(matches!(
+            metadata.prepare_request(placement_request(99, "unauthorized", 2)),
+            Err(IggyError::Unauthenticated)
+        ));
+        let first = metadata
+            .prepare_request(placement_request(1, "authorized", 1))
+            .unwrap();
+        assert_eq!(
+            PersistedCreateTopicRequest::decode_from(first.body())
+                .unwrap()
+                .partitions[0]
+                .consensus_group_id,
+            1
+        );
+    }
+
+    #[test]
+    fn given_partition_observations_when_creating_should_keep_highest_matching_incarnation() {
+        let mut metadata = placement_metadata();
+        let mut streams = stream_with_one_partition();
+        let partition = &mut streams
+            .items
+            .get_mut(0)
+            .unwrap()
+            .topics
+            .get_mut(0)
+            .unwrap()
+            .partitions[0];
+        partition.created_revision = 7;
+        partition.created_view = 2;
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (streams.into(), ()),
+        )));
+        let namespace = IggyNamespace::new(0, 0, 0);
+        metadata.observe_partition_views(&[
+            PartitionPlacementView {
+                namespace,
+                created_revision: 7,
+                view: 6,
+            },
+            PartitionPlacementView {
+                namespace,
+                created_revision: 7,
+                view: 4,
+            },
+            PartitionPlacementView {
+                namespace,
+                created_revision: 6,
+                view: 100,
+            },
+            PartitionPlacementView {
+                namespace,
+                created_revision: 8,
+                view: 101,
+            },
+        ]);
+        let first = metadata
+            .prepare_request(placement_request(1, "observed", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&first),
+            [1],
+            "view 6 keeps load on replica 0 despite older reports"
+        );
+        metadata.observe_partition_views(&[]);
+        let unchanged = metadata
+            .prepare_request(placement_request(2, "missing-report", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&unchanged), [1]);
+
+        let mut recreated = stream_with_one_partition();
+        let partition = &mut recreated
+            .items
+            .get_mut(0)
+            .unwrap()
+            .topics
+            .get_mut(0)
+            .unwrap()
+            .partitions[0];
+        partition.created_revision = 8;
+        partition.created_view = 2;
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (recreated.into(), ()),
+        )));
+        metadata.observe_partition_views(&[PartitionPlacementView {
+            namespace,
+            created_revision: 7,
+            view: 102,
+        }]);
+        let next = metadata
+            .prepare_request(placement_request(3, "recreated", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&next),
+            [0],
+            "recreation falls back to its own committed view 2"
+        );
+        metadata.mux_stm = Rc::new(TestMux::default());
+        let empty = metadata
+            .prepare_request(placement_request(3, "deleted", 1))
+            .unwrap();
+        assert_eq!(assigned_views(&empty), [0]);
+    }
+
+    #[compio::test]
+    async fn given_inherited_create_when_summary_missing_should_refuse_then_restore_from_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let old_primary = placement_metadata();
+        let inherited = old_primary
+            .prepare_request(placement_request(1, "inherited", 2))
+            .unwrap();
+        journal.handle().append(inherited.clone()).await.unwrap();
+        let mut metadata = placement_metadata();
+        metadata.journal = Some(journal);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &inherited);
+        assert!(matches!(
+            metadata.prepare_request(placement_request(2, "waiting", 1)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        let reply = metadata
+            .submit_request_in_process(placement_request(2, "waiting", 1))
+            .await
+            .unwrap()
+            .try_into_typed::<ReplyHeader>()
+            .unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(IggyError::TransientNotAccepted.as_code())
+        );
+        assert!(!reply.header().has_committed_result());
+        metadata.refresh_placement().await;
+        let next = metadata
+            .prepare_request(placement_request(2, "ready", 1))
+            .unwrap();
+        let assignments = PersistedCreateTopicRequest::decode_from(next.body())
+            .unwrap()
+            .partitions;
+        assert_eq!(assignments[0].initial_view, 2);
+        assert_eq!(
+            assignments[0].consensus_group_id, 3,
+            "inherited ids must seed the allocator before admission"
+        );
+    }
+
+    #[compio::test]
+    async fn given_missing_placement_summary_when_wire_or_queue_submits_should_reply_58_without_eviction()
+     {
+        let old_primary = placement_metadata();
+        let inherited = old_primary
+            .prepare_request(placement_request(1, "inherited", 2))
+            .unwrap();
+        let metadata = placement_metadata_with_bus(ClientSendSpyBus::default());
+        let consensus = metadata.consensus.as_ref().unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &inherited);
+        metadata.on_request(placement_request(2, "wire", 1)).await;
+        {
+            let replies = consensus.message_bus().client_replies.borrow();
+            assert_eq!(replies.len(), 1);
+            let frame = replies[0].first();
+            let header =
+                bytemuck::checked::from_bytes::<ReplyHeader>(&frame[..size_of::<ReplyHeader>()]);
+            assert_eq!(header.command, Command::Reply);
+            assert!(!header.has_committed_result());
+            assert_eq!(
+                iggy_binary_protocol::result_code(&frame[size_of::<ReplyHeader>()..]),
+                Some(IggyError::TransientNotAccepted.as_code())
+            );
+        }
+        let (queued, receiver) =
+            consensus::RequestEntry::with_subscriber(placement_request(3, "queued", 1));
+        assert!(consensus.push_queued_request(queued).is_ok());
+        metadata.drain_request_queue_into_prepares().await;
+        let reply = receiver.await.unwrap();
+        assert_eq!(
+            iggy_binary_protocol::result_code(reply.body()),
+            Some(IggyError::TransientNotAccepted.as_code())
+        );
+        assert!(!reply.header().has_committed_result());
+        assert_eq!(metadata.allocator.highest(), 0);
+        assert_eq!(
+            resolve_acting_user_id(Operation::CreateTopic, 2, &metadata.client_table).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_acting_user_id(Operation::CreateTopic, 3, &metadata.client_table).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[compio::test]
+    async fn given_wrong_canonical_wal_body_when_refreshing_placement_should_keep_admission_closed()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let source = placement_metadata();
+        let expected = source
+            .prepare_request(placement_request(1, "expected", 2))
+            .unwrap();
+        let different = source
+            .prepare_request(placement_request(2, "different", 1))
+            .unwrap();
+        assert_eq!(expected.header().op, different.header().op);
+        assert_ne!(expected.header().checksum, different.header().checksum);
+        journal.handle().append(different).await.unwrap();
+        let mut metadata = placement_metadata();
+        metadata.journal = Some(journal);
+        metadata
+            .consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &expected);
+        metadata.refresh_placement().await;
+        assert!(matches!(
+            metadata.prepare_request(placement_request(3, "blocked", 1)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        assert_eq!(
+            metadata.allocator.highest(),
+            0,
+            "an op-only WAL match must not supply assignment ids"
+        );
+    }
+
+    #[compio::test]
+    async fn given_replaced_pipeline_create_when_refreshing_should_discard_old_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = placement_metadata();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let old = metadata
+            .prepare_request(placement_request(1, "old", 2))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &old);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(old.header()),
+            PrepareRollback::Unwound
+        );
+        let source = placement_metadata();
+        let replacement = source
+            .prepare_request(placement_request(2, "replacement", 1))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &replacement);
+        metadata
+            .journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .append(replacement)
+            .await
+            .unwrap();
+        assert!(matches!(
+            metadata.prepare_request(placement_request(3, "blocked", 1)),
+            Err(IggyError::TransientNotAccepted)
+        ));
+        metadata.refresh_placement().await;
+        let next = metadata
+            .prepare_request(placement_request(3, "ready", 1))
+            .unwrap();
+        assert_eq!(
+            assigned_views(&next),
+            [1],
+            "only the replacement's one assignment remains reserved"
+        );
     }
 
     #[test]
@@ -5594,6 +6230,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct ClientSendSpyBus {
         client_sends: RefCell<Vec<u128>>,
+        client_replies: RefCell<Vec<BusMessage>>,
     }
 
     #[allow(clippy::future_not_send)]
@@ -5602,9 +6239,10 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            _data: impl Into<BusMessage>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             self.client_sends.borrow_mut().push(client_id);
+            self.client_replies.borrow_mut().push(data.into());
             Ok(())
         }
         async fn send_to_replica(
@@ -6083,11 +6721,11 @@ mod tests {
                     name: WireName::new("existing").unwrap(),
                     options: WireOptions::empty(),
                 },
-                created_view: 0,
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
                     partition_id: 0,
                     consensus_group_id: 1,
+                    initial_view: 0,
                 }],
             },
             &mut inner,
@@ -7268,7 +7906,6 @@ mod tests {
             &RoutedRequestHeader::default(),
             Operation::CreatePartitionsWithAssignments,
             &PersistedCreatePartitionsRequest {
-                created_view: 0,
                 request: WireCreatePartitionsRequest {
                     stream_id: WireIdentifier::numeric(0),
                     topic_id: WireIdentifier::numeric(0),
@@ -7277,6 +7914,7 @@ mod tests {
                 partitions: vec![CreatedPartitionAssignment {
                     partition_id: 1,
                     consensus_group_id: 2,
+                    initial_view: 0,
                 }],
             }
             .to_bytes(),
@@ -7789,11 +8427,11 @@ mod tests {
                     name: WireName::new("topic").unwrap(),
                     options: WireOptions::empty(),
                 },
-                created_view: 0,
                 derived_options: WireOptions::empty(),
                 partitions: vec![CreatedPartitionAssignment {
                     partition_id: 0,
                     consensus_group_id: 1,
+                    initial_view: 0,
                 }],
             },
             &mut inner,

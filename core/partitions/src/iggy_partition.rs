@@ -527,6 +527,10 @@ pub enum PendingPartitionTransition {
     View {
         drain: Option<crate::PersistenceDrain>,
     },
+    PrimaryTransfer {
+        request: crate::PreparedPrimaryTransfer,
+        drain: Option<crate::PersistenceDrain>,
+    },
     Truncate {
         ops: std::ops::RangeInclusive<u64>,
         drain: Option<crate::PersistenceDrain>,
@@ -1431,6 +1435,7 @@ where
     }
 
     pub fn begin_quarantine(&mut self, frontier: u64) {
+        self.cancel_primary_transfer();
         if self
             .superblock_intent
             .get()
@@ -5577,6 +5582,57 @@ where
             || self.transition.is_some()
     }
 
+    /// Fence new admission while accepted history work drains for this grant.
+    /// Refusal leaves the current history owner unchanged.
+    pub fn defer_primary_transfer(&mut self, request: crate::PreparedPrimaryTransfer) -> bool {
+        if self.transition.is_some()
+            || !self.deferred_views.is_empty()
+            || !self.primary_transfer_is_current(&request)
+        {
+            return false;
+        }
+        self.transition = Some(PendingPartitionTransition::PrimaryTransfer {
+            request,
+            drain: None,
+        });
+        self.notify_io();
+        true
+    }
+
+    fn primary_transfer_is_current(&self, request: &crate::PreparedPrimaryTransfer) -> bool {
+        request.is_active_at(self.consensus.message_bus().monotonic_now())
+            && request.created_revision == self.created_revision()
+            && request.expected_view == self.consensus.view()
+            && request.target < self.consensus.replica_count()
+            && request.target != self.consensus.primary_index(self.consensus.view())
+            && self.consensus.is_normal()
+            && !self.consensus.has_ceded_primaryship()
+            && !self.consensus.is_transferring()
+            && !self.consensus.view_log_unproven()
+            && self.fatal.is_none()
+            && !self.materialization_missing
+            && !self.io_active.is_retiring()
+            && !self.is_shutting_down()
+    }
+
+    pub(crate) fn cancel_primary_transfer(&mut self) {
+        if !matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        ) {
+            return;
+        }
+        if let Some(PendingPartitionTransition::PrimaryTransfer { request, drain }) =
+            self.transition.take()
+        {
+            request.active.store(false, Ordering::Release);
+            if let (Some(persistence), Some(drain)) = (&self.persistence, drain) {
+                persistence.finish_drain(&drain);
+            }
+        }
+        self.notify_io();
+    }
+
     /// Keep the newest frame per phase and sender until history writes drain.
     pub fn defer_view_transition(&mut self, message: server_common::MessageBag) {
         let Some((view, phase, sender)) = deferred_view_order(&message) else {
@@ -5585,6 +5641,7 @@ where
         if sender >= self.consensus.replica_count() {
             return;
         }
+        self.cancel_primary_transfer();
         if let Some(pending) = self.deferred_views.iter_mut().find(|pending| {
             deferred_view_order(pending).is_some_and(|(_, pending_phase, pending_sender)| {
                 pending_phase == phase && pending_sender == sender
@@ -5614,6 +5671,7 @@ where
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
     ) {
+        self.cancel_primary_transfer();
         self.transition = Some(PendingPartitionTransition::Truncate {
             ops,
             drain: None,
@@ -5647,6 +5705,7 @@ where
         match self.resume_io_inner(config).await {
             Ok(step) => step,
             Err(error) => {
+                self.cancel_primary_transfer();
                 self.fail_io_work(&error, false);
                 if self.maintenance.shutdown.is_some() {
                     self.maintenance.shutdown = Some(PartitionShutdownPhase::Complete);
@@ -5661,6 +5720,11 @@ where
         &mut self,
         config: &PartitionsConfig,
     ) -> Result<crate::PartitionIoStep, IggyError> {
+        if let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) = &self.transition
+            && !self.primary_transfer_is_current(request)
+        {
+            self.cancel_primary_transfer();
+        }
         if self.transition.is_none() && !self.deferred_views.is_empty() {
             self.transition = Some(PendingPartitionTransition::View { drain: None });
         }
@@ -5799,7 +5863,33 @@ where
                 return Ok(crate::PartitionIoStep::Progress);
             }
         }
-        if let Some(PendingPartitionTransition::View { drain, .. }) = &mut self.transition {
+        if matches!(
+            self.transition,
+            Some(PendingPartitionTransition::PrimaryTransfer { .. })
+        ) && self.consensus.commit_min() < self.consensus.commit_max()
+        {
+            // Commit selection refuses history transitions. This synchronous
+            // window keeps admission fenced between pump events while draining
+            // the already committed prefix before handing leadership away.
+            let transition = self.transition.take();
+            let mut headers = self.select_persistable_commits(config);
+            let reply = !headers.is_empty() && self.consensus.is_primary();
+            if headers.is_empty() {
+                headers = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, config);
+            }
+            let selected = self.select_commit(headers, config, reply);
+            self.transition = transition;
+            return Ok(if selected {
+                crate::PartitionIoStep::Progress
+            } else {
+                crate::PartitionIoStep::Pending
+            });
+        }
+        if let Some(
+            PendingPartitionTransition::View { drain }
+            | PendingPartitionTransition::PrimaryTransfer { drain, .. },
+        ) = &mut self.transition
+        {
             if let Some(persistence) = &self.persistence {
                 let drain = drain.get_or_insert_with(|| persistence.begin_drain());
                 if !persistence
@@ -5810,7 +5900,11 @@ where
                 }
                 persistence.finish_drain(drain);
             }
-            self.transition = None;
+            if let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) =
+                self.transition.take()
+            {
+                return Ok(crate::PartitionIoStep::PrimaryTransfer(request));
+            }
             let next = self
                 .deferred_views
                 .iter()
@@ -14010,6 +14104,287 @@ mod tests {
         persistence.sync();
         assert!(persistence.start());
         Rc::clone(persistence).run()
+    }
+
+    fn primary_transfer_grant<B: MessageBus, SB: SuperblockStore>(
+        partition: &IggyPartition<B, SB>,
+    ) -> crate::PreparedPrimaryTransfer {
+        const TEST_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        crate::PreparedPrimaryTransfer {
+            created_revision: partition.created_revision(),
+            expected_view: partition.consensus.view(),
+            target: 1,
+            active: Arc::new(AtomicBool::new(true)),
+            expires_at: std::time::Instant::now() + TEST_GRANT_TTL,
+        }
+    }
+
+    #[compio::test]
+    async fn given_busy_wal_when_primary_transfer_drains_should_fence_admission_and_release_pause()
+    {
+        for (cancel, expire) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut partition, replies) = recording_partition_at(0, 3);
+            partition.set_created_revision(7);
+            partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            partition.open_persistence().await.unwrap();
+            let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+            let writer = hold_wal_writer(&persistence);
+            let request = primary_transfer_grant(&partition);
+            for (created_revision, expected_view, active) in [
+                (request.created_revision + 1, request.expected_view, true),
+                (request.created_revision, request.expected_view + 1, true),
+                (request.created_revision, request.expected_view, false),
+            ] {
+                assert!(
+                    !partition.defer_primary_transfer(crate::PreparedPrimaryTransfer {
+                        created_revision,
+                        expected_view,
+                        target: request.target,
+                        active: Arc::new(AtomicBool::new(active)),
+                        expires_at: request.expires_at,
+                    })
+                );
+                assert!(partition.transition.is_none());
+                assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+            }
+            let active = Arc::clone(&request.active);
+            assert!(partition.defer_primary_transfer(request));
+            let config = repair_config();
+            assert!(matches!(
+                partition.resume_io(&config).await,
+                crate::PartitionIoStep::Pending
+            ));
+            assert!(!persistence.has_capacity(size_of::<PrepareHeader>()));
+            partition
+                .on_request(
+                    store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::NoAck),
+                    None,
+                )
+                .await;
+            let status = bytemuck::checked::from_bytes::<ReplyHeader>(
+                &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
+            )
+            .status;
+            assert_eq!(status, IggyError::TransientNotAccepted.as_code());
+            assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
+            assert!(!partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+
+            if cancel || expire {
+                if expire {
+                    let Some(PendingPartitionTransition::PrimaryTransfer { request, .. }) =
+                        &mut partition.transition
+                    else {
+                        panic!("the held writer must keep its grant");
+                    };
+                    request.expires_at = std::time::Instant::now();
+                    assert!(active.load(Ordering::Acquire));
+                } else {
+                    active.store(false, Ordering::Release);
+                }
+                assert!(matches!(
+                    partition.resume_io(&config).await,
+                    crate::PartitionIoStep::Pending
+                ));
+                assert!(partition.transition.is_none());
+                assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+            }
+            writer.await;
+            let step = partition.resume_io(&config).await;
+            if cancel || expire {
+                assert!(matches!(step, crate::PartitionIoStep::Pending));
+            } else {
+                let crate::PartitionIoStep::PrimaryTransfer(request) = step else {
+                    panic!("settled WAL must release the transfer continuation");
+                };
+                assert_eq!(request.created_revision, 7);
+                assert_eq!(request.expected_view, 0);
+                assert_eq!(request.target, 1);
+                assert!(Arc::ptr_eq(&request.active, &active));
+            }
+            assert!(persistence.has_capacity(size_of::<PrepareHeader>()));
+            assert_eq!(partition.consensus.view(), 0);
+            assert!(partition.transition.is_none());
+            assert!(partition.fatal().is_none());
+        }
+    }
+
+    #[compio::test]
+    async fn given_accepted_no_ack_write_when_primary_transfer_drains_should_finish_its_reply() {
+        const CLIENT: u128 = 42;
+        const CONSUMER: u32 = 7;
+        const STEPS_MAX: usize = 32;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, replies) = recording_partition_at(0, 3);
+        set_offset_dirs_under(&mut partition, directory.path());
+        partition.stats.increment_messages_count(1);
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let store = store_offset_request(
+            CLIENT,
+            1,
+            ConsumerKind::Consumer,
+            CONSUMER,
+            0,
+            AckLevel::NoAck,
+        );
+        partition
+            .apply_consumer_offset_no_ack(
+                Box::new(*store.header()),
+                ConsumerKind::Consumer,
+                CONSUMER,
+                Some(0),
+                None,
+            )
+            .await;
+        let config = repair_config();
+        let captured = loop {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    break partition.capture_io(plan, &config).unwrap().unwrap();
+                }
+                _ => panic!("accepted store must reach its file write"),
+            }
+        };
+        assert_eq!(
+            captured.identity.continuation,
+            crate::PartitionIoContinuation::NoAck
+        );
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        assert!(matches!(
+            partition.resume_io(&config).await,
+            crate::PartitionIoStep::Pending
+        ));
+        assert!(replies.borrow().is_empty());
+        let result = captured.job.execute().await;
+        assert!(matches!(
+            partition.resume_io(&config).await,
+            crate::PartitionIoStep::Pending
+        ));
+        partition.accept_io(captured.identity, result).unwrap();
+        if let Some(gate) = captured.gate {
+            gate.release();
+        }
+        let mut finished = false;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::PrimaryTransfer(_) => {
+                    finished = true;
+                    break;
+                }
+                _ => panic!("accepted store must settle before transfer"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(
+            partition.get_consumer_offset(PollingConsumer::Consumer(
+                usize::try_from(CONSUMER).unwrap(),
+                0,
+            )),
+            Some(0)
+        );
+        assert_eq!(replies.borrow().len(), 1);
+        assert_eq!(
+            bytemuck::checked::from_bytes::<ReplyHeader>(
+                &replies.borrow()[0].1.as_slice()[..size_of::<ReplyHeader>()],
+            )
+            .status,
+            0
+        );
+        assert!(partition.no_ack.is_empty());
+        assert_eq!(partition.consensus.view(), 0);
+    }
+
+    #[compio::test]
+    async fn given_unapplied_commit_when_primary_transfer_drains_should_apply_before_handoff() {
+        const STEPS_MAX: usize = 64;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies, config, parent) =
+            partition_with_committed_send(directory.path(), iggy_common::Durability::Replicated, 3)
+                .await;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let prepare = checksummed_segment_prepare(2, parent, 1, b"committed-before-transfer");
+        let header = *prepare.header();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        persistence
+            .append(prepare.clone().into_frozen(), false)
+            .unwrap();
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        partition
+            .consensus
+            .with_pipeline_mut(|pipeline| pipeline.push(PipelineEntry::new(header)));
+        partition
+            .append_repaired_send_messages(prepare)
+            .await
+            .unwrap();
+        partition.consensus.sequencer().set_sequence(header.op);
+        partition
+            .consensus
+            .set_last_prepare_checksum(header.checksum);
+        partition.consensus.advance_commit_max(header.op);
+        assert_eq!(partition.consensus.commit_min(), 1);
+        assert!(partition.defer_primary_transfer(primary_transfer_grant(&partition)));
+        let mut finished = false;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(&config).await {
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Ready(plan) => {
+                    execute_partition_io_plan(&mut partition, &config, plan).await;
+                }
+                crate::PartitionIoStep::PrimaryTransfer(request) => {
+                    assert_eq!(partition.consensus.commit_min(), header.op);
+                    assert!(
+                        !partition
+                            .consensus
+                            .request_primary_transfer(request.expected_view, request.target)
+                            .is_empty()
+                    );
+                    finished = true;
+                    break;
+                }
+                _ => panic!("committed prefix must drain under the admission fence"),
+            }
+        }
+        assert!(finished);
+        assert_eq!(partition.stats.messages_count_inconsistent(), 2);
+        assert!(partition.fatal().is_none());
+    }
+
+    #[compio::test]
+    async fn given_planned_primary_transfer_when_a_view_frame_arrives_should_preserve_real_transition()
+     {
+        let (mut partition, _) = recording_partition_at(0, 3);
+        let request = primary_transfer_grant(&partition);
+        let active = Arc::clone(&request.active);
+        assert!(partition.defer_primary_transfer(request));
+        let message = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+            .transmute_header(|_, header: &mut StartViewHeader| {
+                header.command = Command::StartView;
+                header.size = u32::try_from(size_of::<StartViewHeader>()).unwrap();
+                header.view = 1;
+                header.replica = 1;
+            });
+        partition.defer_view_transition(server_common::MessageBag::StartView(message));
+        assert!(!active.load(Ordering::Acquire));
+        partition.cancel_primary_transfer();
+        assert!(matches!(
+            partition.transition,
+            Some(PendingPartitionTransition::View { .. })
+        ));
+        assert!(matches!(partition.resume_io(&repair_config()).await,
+            crate::PartitionIoStep::Transition(server_common::MessageBag::StartView(message))
+            if message.header().view == 1));
     }
 
     /// The primary's Commit heartbeat, handled as the shard's `on_commit` does.

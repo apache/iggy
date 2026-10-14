@@ -1016,6 +1016,19 @@ where
                     );
                 }
             }
+            LifecycleFrame::PartitionPlacementViews(reports) => {
+                if self.id == 0 {
+                    self.plane.metadata().observe_partition_views(&reports);
+                } else {
+                    self.metrics.record_frame_drop(
+                        frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
+                        frame_drop_reason::MISROUTED,
+                    );
+                }
+            }
+            LifecycleFrame::PrimaryRebalance(frame) => {
+                self.on_local_rebalance(*frame).await;
+            }
             LifecycleFrame::PartitionPersistenceCompleted(completion) => {
                 let namespace = IggyNamespace::from_raw(completion.group);
                 let partitions = self.plane.partitions();

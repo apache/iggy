@@ -684,6 +684,12 @@ pub trait MessageBus {
         iggy_common::IggyTimestamp::now().as_micros()
     }
 
+    /// Monotonic time for local deadlines, independent of message-pump progress.
+    /// Simulator overrides must share one timeline across replicas and restarts.
+    fn monotonic_now(&self) -> Instant {
+        Instant::now()
+    }
+
     /// Drain this bus's plaintext replica socket-read counters.
     ///
     /// The provided default returns zeros so the simulator bus and the
@@ -1359,7 +1365,7 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     }
 
     // Forward the defaulted methods too. Without this, a `Rc`-wrapped bus that
-    // overrides `sleep`/`spawn`/`realtime_micros` (the simulator's virtual timer,
+    // overrides `sleep`/`spawn`/clock reads (the simulator's virtual timer,
     // spawn queue, and virtual clock) would be silently reverted to the defaults
     // through the wrapper. No-op for production, whose `IggyMessageBus` uses those
     // defaults anyway.
@@ -1373,6 +1379,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
 
     fn realtime_micros(&self) -> u64 {
         (**self).realtime_micros()
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        (**self).monotonic_now()
     }
 
     fn take_replica_read_stats(&self) -> ReplicaReadMetrics {

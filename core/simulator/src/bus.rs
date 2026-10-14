@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Convert an inbound Frozen (bus trait payload) into a `Message` for the
 /// simulator's packet layer. The sim keeps `Message<GenericHeader>` in its
@@ -265,6 +265,10 @@ impl MessageBus for SimOutbox {
         // prepare-timestamp clock agree to the microsecond.
         SimClock::new(self.timer.clone()).realtime().as_micros()
     }
+
+    fn monotonic_now(&self) -> Instant {
+        self.timer.monotonic_now()
+    }
 }
 
 /// Newtype wrapper for shared [`SimOutbox`] that implements [`MessageBus`]
@@ -322,6 +326,10 @@ impl MessageBus for SharedSimOutbox {
 
     fn realtime_micros(&self) -> u64 {
         self.0.realtime_micros()
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        self.0.monotonic_now()
     }
 }
 
@@ -413,11 +421,48 @@ impl ConnectionInstaller for SharedSimOutbox {
 mod tests {
     use super::*;
     use message_bus::installer::conn_info::ClientTransportKind;
+    use partitions::PreparedPrimaryTransfer;
     use std::cell::Cell;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_outbox() -> SimOutbox {
         SimOutbox::new(0, TimerHandle::new(), Rc::new(PendingSpawns::default()))
+    }
+
+    #[test]
+    fn given_shared_virtual_clock_when_time_advances_should_expire_grants_without_pump_ticks() {
+        let timer = TimerHandle::new();
+        let spawns = Rc::new(PendingSpawns::default());
+        let bus = Rc::new(SharedSimOutbox(Rc::new(SimOutbox::new(
+            0,
+            timer.clone(),
+            Rc::clone(&spawns),
+        ))));
+        let start = MessageBus::monotonic_now(&bus);
+        let timeout = Duration::from_secs(1);
+        let active = Arc::new(AtomicBool::new(true));
+        let grant = PreparedPrimaryTransfer {
+            created_revision: 1,
+            expected_view: 0,
+            target: 1,
+            active: Arc::clone(&active),
+            expires_at: start + timeout,
+        };
+        assert!(grant.is_active_at(MessageBus::monotonic_now(&bus)));
+        assert_eq!(MessageBus::monotonic_now(&bus), start);
+
+        assert_eq!(timer.advance(timeout / 2), [] as [u64; 0]);
+        let restarted = SharedSimOutbox(Rc::new(SimOutbox::new(0, timer.clone(), spawns)));
+        assert_eq!(restarted.monotonic_now(), start + timeout / 2);
+        assert_eq!(MessageBus::monotonic_now(&bus), restarted.monotonic_now());
+        assert!(grant.is_active_at(restarted.monotonic_now()));
+
+        assert_eq!(timer.advance(timeout / 2), [] as [u64; 0]);
+        assert_eq!(MessageBus::monotonic_now(&bus), start + timeout);
+        assert!(!grant.is_active_at(MessageBus::monotonic_now(&bus)));
+        assert!(active.load(Ordering::Acquire));
     }
 
     #[test]
