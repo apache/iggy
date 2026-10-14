@@ -5902,9 +5902,9 @@ where
                 // `complete_repair` walks the window and clears the session
                 // only when the LOCAL commit frontier reached the requested
                 // op (the peer's served-through claim proves nothing about
-                // delivery on a lossy bus). While the walk makes progress
-                // the next chunk is pulled immediately; a stalled window is
-                // left to the retry timer.
+                // delivery on a lossy bus). Proof can move backward through
+                // a gap while fencing commits, so either kind of progress
+                // pulls the next chunk without waiting for the retry timer.
                 let before = partition.consensus().commit_min();
                 if let partitions::RepairConclusion::FloorRefused { floor, to_op } =
                     partition.complete_repair(&config).await
@@ -5966,9 +5966,13 @@ where
                     );
                 } else {
                     let commit_min = partition.consensus().commit_min();
-                    let next = partition.repair.as_ref().and_then(|live| {
-                        partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
-                            .map(|from_op| (live.peer, live.nonce, from_op, live.fetch_to_op))
+                    let proof_op = partition.consensus().view_log_repair_op();
+                    let next = partition.repair.as_mut().and_then(|live| {
+                        let from_op = proof_op.filter(|&op| op < live.from_op).or_else(|| {
+                            partition_repair_next_chunk(before, commit_min, live.fetch_to_op)
+                        })?;
+                        live.from_op = from_op;
+                        Some((live.peer, live.nonce, from_op, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
                     let self_id = partition.consensus().replica();
@@ -8074,6 +8078,7 @@ where
                         return None;
                     }
                     session.idle_ticks = 0;
+                    session.from_op = repair_from;
                     Some((
                         session.peer,
                         session.nonce,
@@ -9282,7 +9287,6 @@ where
         let from_op = consensus
             .view_log_repair_op()
             .unwrap_or_else(|| consensus.commit_min() + 1);
-        let namespace = consensus.group();
         // Spent here for the same reason the ceiling is: the four edge-triggered
         // sites never touch it, so a short edge-armed repair would leave the
         // count saturated and hand the next real gap an arm on its first tick.
@@ -9292,6 +9296,7 @@ where
         partition.repair = Some(partitions::RepairSession {
             nonce,
             view: consensus.view(),
+            from_op,
             commit_to_op,
             fetch_to_op,
             floor: None,
@@ -9300,7 +9305,7 @@ where
         });
         tracing::info!(
             shard = self.id,
-            namespace_raw = namespace,
+            namespace_raw = partition.consensus().group(),
             from_op,
             commit_to_op,
             fetch_to_op,
@@ -9314,7 +9319,7 @@ where
             nonce,
             from_op,
             fetch_to_op,
-            namespace,
+            partition.consensus().group(),
             partition.created_revision(),
         )
         .await;
@@ -9375,6 +9380,7 @@ where
         partition.repair = Some(partitions::RepairSession {
             nonce,
             view,
+            from_op,
             // Merged-log numbers, not the live frontier: `commit_to_op` is what
             // the walk must reach to finish the session, `fetch_to_op` the head
             // the view will announce.

@@ -2469,6 +2469,7 @@ mod tests {
                 partition.repair = Some(RepairSession {
                     nonce: 1,
                     view: 1,
+                    from_op: 1,
                     commit_to_op: 0,
                     fetch_to_op: 0,
                     floor: None,
@@ -2540,6 +2541,7 @@ mod tests {
         partition.repair = Some(RepairSession {
             nonce: 1,
             view: partition.consensus().view(),
+            from_op: 1,
             commit_to_op: 0,
             fetch_to_op: 0,
             floor: None,
@@ -3184,6 +3186,7 @@ mod tests {
             partition.repair = repair_finished.then_some(partitions::RepairSession {
                 nonce: 1,
                 view: 0,
+                from_op: 1,
                 commit_to_op: commit_max,
                 fetch_to_op: commit_max,
                 floor: None,
@@ -4245,9 +4248,27 @@ mod tests {
     async fn given_unproven_suffix_when_adopting_start_view_should_repair_before_applying() {
         const APPLIED: u64 = 2;
         const LOCAL_HEAD: u64 = 4;
-        const NEW_HEAD: u64 = 6;
+        const NEW_HEAD: u64 = 8;
         const NEW_VIEW: u32 = 3;
+        const NEW_PRIMARY: u8 = 0;
         let bus = Rc::new(IggyMessageBus::new(0));
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&requests);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            let message =
+                Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .unwrap();
+            if message.header().command == Command::RequestPrepares {
+                captured.borrow_mut().push(
+                    Message::<RequestPreparesHeader>::try_from(Owned::copy_from_slice(
+                        frame.as_slice(),
+                    ))
+                    .unwrap(),
+                );
+            }
+            Ok(())
+        }));
+        assert!(bus.owner_table().try_claim(NEW_PRIMARY, 1));
         let (owner, _sender) = test_owner(&bus, None);
         let namespace = IggyNamespace::new(0, 0, 0);
         let prepares = primary_prepares(&bus, namespace, NEW_HEAD).await;
@@ -4279,15 +4300,44 @@ mod tests {
         assert!(partition.log.journal().inner.holds_op(APPLIED + 1));
         assert!(partition.consensus().view_log_unproven());
         assert!(!partition.consensus().view_log_entry_proven(APPLIED + 1));
-        for prepare in prepares.iter().rev() {
-            let repaired = prepare.clone().transmute_header(
-                |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
-                    repaired.0 = header;
-                    repaired.0.command = Command::RepairPrepare;
-                },
+        for expected_from in (LOCAL_HEAD + 1..NEW_HEAD).rev() {
+            let request = requests
+                .borrow_mut()
+                .pop()
+                .expect("proof progress must request the next gap without a retry tick");
+            let request = request.header();
+            assert_eq!(request.from_op, expected_from);
+            assert_eq!(request.to_op, NEW_HEAD);
+            let reply = Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
+                .transmute_header(|_, header: &mut RepairRangeReplyHeader| {
+                    header.command = Command::RepairDone;
+                    header.size = u32::try_from(size_of::<RepairRangeReplyHeader>()).unwrap();
+                    header.cluster = request.cluster;
+                    header.group = request.group;
+                    header.replica = NEW_PRIMARY;
+                    header.nonce = request.nonce;
+                    header.op = request.to_op;
+                    header.seal();
+                });
+            owner.on_repair_range_reply(&reply).await;
+            assert!(
+                requests.borrow().is_empty(),
+                "a terminator without bodies must wait for the retry timer"
             );
-            owner.on_repair_prepare(repaired).await;
+            for op in request.from_op..=request.to_op {
+                let repaired = prepares[usize::try_from(op - 1).unwrap()]
+                    .clone()
+                    .transmute_header(
+                        |header, repaired: &mut iggy_binary_protocol::RepairPrepareHeader| {
+                            repaired.0 = header;
+                            repaired.0.command = Command::RepairPrepare;
+                        },
+                    );
+                owner.on_repair_prepare(repaired).await;
+            }
+            owner.on_repair_range_reply(&reply).await;
         }
+        assert!(requests.borrow().is_empty());
         let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
         assert!(!partition.consensus().view_log_unproven());
         partition
@@ -4800,6 +4850,7 @@ mod tests {
         partition.repair = Some(RepairSession {
             nonce: 1,
             view: REPAIR_VIEW,
+            from_op: commit_min + 1,
             commit_to_op: commit_max,
             fetch_to_op: commit_max,
             floor: None,

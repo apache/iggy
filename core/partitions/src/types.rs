@@ -292,6 +292,9 @@ pub struct RepairSession {
     /// Consensus view in which this session was armed. A later view discards
     /// the session before any delayed repair body can enter its journal.
     pub view: u32,
+    /// Start of the latest request. A proof gap moving below it is progress
+    /// even while the unproven prefix fences the commit walk.
+    pub from_op: u64,
     /// Committed frontier this repair must make locally walkable. Floor
     /// completeness and session completion are bounded here.
     pub commit_to_op: u64,

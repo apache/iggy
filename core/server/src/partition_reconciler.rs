@@ -3573,6 +3573,7 @@ mod tests {
             partition.repair = Some(RepairSession {
                 nonce: NONCE,
                 view: 0,
+                from_op: 1,
                 commit_to_op: 8,
                 fetch_to_op: 8,
                 floor: None,

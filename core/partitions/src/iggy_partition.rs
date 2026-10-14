@@ -28285,6 +28285,7 @@ mod tests {
         RepairSession {
             nonce: 1,
             view: 0,
+            from_op: 1,
             commit_to_op: to_op,
             fetch_to_op,
             floor: Some(floor),
