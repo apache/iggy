@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sync/atomic"
 )
 
 // Session errors. They are programming or protocol faults rather than server
@@ -45,15 +46,14 @@ var (
 // It holds the ephemeral client identifier, the session fence the server
 // assigns once Register commits, and the request watermark.
 //
-// Not safe for concurrent use. The transport owns one per connection and
-// serializes access through its exchange lock, which the lockstep request
-// model already requires.
+// Bound snapshots share an atomic request counter across connections. Binding
+// and resetting still require the owning transport's lock.
 type Session struct {
 	bindSecret       [BindSecretBytes]byte
 	client           ClientID
 	session          uint64
 	bound            bool
-	requestCounter   uint64
+	requestCounter   *atomic.Uint64
 	registerConsumed bool
 }
 
@@ -65,7 +65,15 @@ func NewSession() *Session {
 // NewSessionWithClientID returns an unbound session with a caller-supplied
 // client identifier.
 func NewSessionWithClientID(client ClientID) *Session {
-	return &Session{client: client, requestCounter: 1}
+	counter := &atomic.Uint64{}
+	counter.Store(1)
+	return &Session{client: client, requestCounter: counter}
+}
+
+// Fork keeps the bound identity and counter while isolating connection teardown.
+func (s *Session) Fork() *Session {
+	snapshot := *s
+	return &snapshot
 }
 
 // BindSecret returns the registered session proof.
@@ -92,7 +100,7 @@ func (s *Session) SessionID() uint64 {
 // HasActivity reports whether the session has registered, bound, or issued a
 // replicated request.
 func (s *Session) HasActivity() bool {
-	return s.registerConsumed || s.bound || s.requestCounter > 1
+	return s.registerConsumed || s.bound || s.requestCounter.Load() > 1
 }
 
 // BeginRegister arms the session for a Register and returns its request id,
@@ -120,26 +128,27 @@ func (s *Session) Bind(session uint64) error {
 	return nil
 }
 
-// NextRequestID returns the next replicated-metadata request id and advances
+// NextRequestID returns the next request id and advances
 // the watermark: 1, 2, 3, and so on.
 func (s *Session) NextRequestID() (uint64, error) {
 	if !s.bound {
 		return 0, ErrNotBound
 	}
-	if s.requestCounter == math.MaxUint64 {
-		return 0, ErrRequestCounterExhausted
+	for {
+		id := s.requestCounter.Load()
+		if id == math.MaxUint64 {
+			return 0, ErrRequestCounterExhausted
+		}
+		if s.requestCounter.CompareAndSwap(id, id+1) {
+			return id, nil
+		}
 	}
-	id := s.requestCounter
-	s.requestCounter++
-	return id, nil
 }
 
-// CurrentRequestID returns the watermark without advancing it. Non-replicated
-// requests use it because they never consult the client table: they route by
-// transport identity, and the table accepts any id above the watermark with
-// no contiguity requirement, so reading here gaps nothing.
+// CurrentRequestID returns the next id without advancing it. Unbound reads
+// use it until registration establishes the shared session counter.
 func (s *Session) CurrentRequestID() uint64 {
-	return s.requestCounter
+	return s.requestCounter.Load()
 }
 
 // Reset drops the session and mints a fresh client identifier after logout or
@@ -153,7 +162,8 @@ func (s *Session) reset() {
 	s.client = newClientID()
 	s.session = 0
 	s.bound = false
-	s.requestCounter = 1
+	s.requestCounter = &atomic.Uint64{}
+	s.requestCounter.Store(1)
 	s.registerConsumed = false
 }
 

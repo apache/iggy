@@ -19,13 +19,15 @@
 //! mode build a shard on.
 //!
 //! One [`ServerHost`] per shard owns everything the request plane shares
-//! across its transports: the per-client FIFO queues and their drain slots,
-//! the [`SessionManager`], and the bus connection-lost hook that logs a
-//! dropped connection out. All connections installed on the shard dispatch
-//! through the same instance, which preserves ordering and disconnect
-//! cleanup across transports: the destination shard installs it on delegated
-//! TCP/WS/TCP-TLS/WSS connections, and shard 0 also on its local QUIC
-//! connections.
+//! across its transports: the per-client FIFO queues and their drains, the
+//! [`SessionManager`], and the bus connection-lost hook that logs a dropped
+//! connection out. All connections installed on the shard dispatch through
+//! the same instance, which keeps disconnect cleanup equal across transports:
+//! the destination shard installs it on delegated TCP/WS/TCP-TLS/WSS
+//! connections, and shard 0 also on its local QUIC connections. A drain orders
+//! session changes and partition admissions. Later non-PING frames wait for a
+//! preceding metadata commit; independent reads run in their own tasks (see
+//! `crate::dispatch::ClientDrain`).
 //!
 //! The host also owns a clone of the bus, so every adapter the bus installs,
 //! on client and replica connections alike, keeps the bus alive: accepted,
@@ -33,13 +35,13 @@
 //! upgrade per replica frame.
 
 use crate::consumer_group::lease::ConsumerGroupLiveness;
-use crate::dispatch::submit::handle_metadata_submit;
+use crate::dispatch::submit::{CompletionRelays, handle_metadata_submit};
 use crate::dispatch::{
     ActiveClientRequests, ClientRequestQueues, enqueue_client_request, upgrade_shard_handle,
 };
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShardHandle};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use configs::server::ServerConfig;
 use iggy_binary_protocol::{GenericHeader, PrepareHeader};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
@@ -68,6 +70,8 @@ where
     sessions: Rc<RefCell<SessionManager>>,
     /// Volatile leases shared by replica heartbeat ingress and shard 0's expiry task.
     consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
+    /// Paces the partition completions that shard 0 of a backup relays.
+    completion_relays: Rc<RefCell<CompletionRelays>>,
     server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
     queues: ClientRequestQueues,
@@ -99,11 +103,12 @@ where
         let sessions_for_disconnect = Rc::clone(&sessions);
         bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
             // The socket is gone, so nothing will drain what a live drain task
-            // left queued. The active slot is NOT released here: the transport
+            // left queued. The drain entry is NOT removed here: the transport
             // task runs this hook while a drain may be suspended at an `.await`,
-            // and clearing the slot would let a frame the dispatch task still has
-            // buffered spawn a second drain over the same queue. The drain task's
-            // own guard covers every exit, the panic compio catches included.
+            // and removing the entry would let a frame the dispatch task still
+            // has buffered spawn a second drain over the same queue. The drain
+            // task's own guard covers every exit, the panic compio catches
+            // included.
             queues_for_disconnect.borrow_mut().remove(&client_id);
             sessions_for_disconnect
                 .borrow_mut()
@@ -114,10 +119,16 @@ where
             shard_handle,
             sessions,
             consumer_group_liveness: Rc::default(),
+            completion_relays: Rc::new(RefCell::new(CompletionRelays::new(
+                server_config
+                    .cluster
+                    .commit_broadcast_interval
+                    .get_duration(),
+            ))),
             server_config,
             max_tokens_per_user,
             queues,
-            active: Rc::new(RefCell::new(AHashSet::new())),
+            active: Rc::new(RefCell::new(AHashMap::new())),
         }
     }
 
@@ -176,6 +187,7 @@ where
                 .consumer_group
                 .session_timeout
                 .get_duration(),
+            &self.completion_relays,
         );
     }
 

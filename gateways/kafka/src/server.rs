@@ -630,7 +630,7 @@ async fn route_frame(
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     config: Arc<GatewayConfig>,
     peer: SocketAddr,
     state: Arc<GatewayState>,
@@ -638,7 +638,35 @@ async fn handle_connection(
     cancel: CancellationToken,
 ) -> Result<()> {
     debug!(%peer, "connection accepted");
+    let connection = ConnectionState::default();
+    let bridge = state.bridge.clone();
+    let served = serve_connection(
+        stream,
+        config,
+        peer,
+        state,
+        shared_auth,
+        cancel,
+        &connection,
+    )
+    .await;
+    // A producer without a producer id has its Produce session by connection, so it ends here.
+    if let Some(bridge) = bridge {
+        bridge.end_connection(connection.id());
+    }
+    served
+}
 
+/// Reads and answers the frames of `connection` until it closes.
+async fn serve_connection(
+    mut stream: TcpStream,
+    config: Arc<GatewayConfig>,
+    peer: SocketAddr,
+    state: Arc<GatewayState>,
+    shared_auth: Arc<SharedAuth>,
+    cancel: CancellationToken,
+    connection: &ConnectionState,
+) -> Result<()> {
     // A gateway with SASL off starts every connection already authenticated, so the dispatch path
     // below has one question to ask rather than two.
     let mut sasl_state = if config.sasl_enabled {
@@ -647,11 +675,10 @@ async fn handle_connection(
         SaslState::Authenticated
     };
     let mut principal: Option<AuthenticatedPrincipal> = None;
-    let connection = ConnectionState::default();
     let ctx = ConnectionContext {
         config: &config,
         state: &state,
-        connection: &connection,
+        connection,
         authenticator: shared_auth.authenticator.as_deref(),
         auth_slots: &shared_auth.slots,
         failed_logins: &shared_auth.failed_logins,

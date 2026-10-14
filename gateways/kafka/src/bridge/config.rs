@@ -16,6 +16,7 @@
 // under the License.
 
 use std::path::Path;
+use std::time::Duration;
 
 use iggy::prelude::IggyByteSize;
 use secrecy::SecretString;
@@ -37,6 +38,25 @@ const DEFAULT_IGGY_USERNAME: &str = "iggy";
 /// Iggy's default `message_bus.max_message_size`.
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// How many producers get an Iggy session of their own, and how long one stays open unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProduceSessionLimits {
+    /// Sessions open at once, each an Iggy connection. Producers past it share one more. With 0
+    /// every producer shares that one, and sends run one at a time.
+    pub max: usize,
+    /// A session unused this long closes.
+    pub idle: Duration,
+}
+
+impl Default for ProduceSessionLimits {
+    fn default() -> Self {
+        Self {
+            max: 256,
+            idle: Duration::from_mins(10),
+        }
+    }
+}
+
 /// Connection + topic-mapping config for [`IggyBridge`](crate::bridge::iggy_bridge::IggyBridge).
 ///
 /// `Debug` is safe to derive: `password` is `SecretString`, which redacts on `Debug` by design
@@ -50,6 +70,7 @@ pub struct IggyBridgeConfig {
     pub topic_mapping: TopicMapping,
     /// Iggy's `message_bus.max_message_size`, in bytes. Larger partitions answer 10.
     pub max_message_size: u64,
+    pub produce_sessions: ProduceSessionLimits,
 }
 
 impl IggyBridgeConfig {
@@ -68,6 +89,8 @@ impl IggyBridgeConfig {
         "IGGY_KAFKA_IGGY_STREAM",
         "IGGY_KAFKA_TOPIC_MAP_PATH",
         "IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE",
+        "IGGY_KAFKA_PRODUCE_SESSIONS",
+        "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS",
     ];
 
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
@@ -93,7 +116,8 @@ impl IggyBridgeConfig {
     /// Returns [`BridgeError::InvalidConfig`] if `IGGY_KAFKA_IGGY_PASSWORD` is unset or empty, if
     /// `IGGY_KAFKA_IGGY_USERNAME` is set but empty, or if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but
     /// the file is missing, fails to parse, or fails validation (e.g. a malformed mapping key or
-    /// an empty `default_stream`).
+    /// an empty `default_stream`), or if `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE`,
+    /// `IGGY_KAFKA_PRODUCE_SESSIONS` or `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` does not parse.
     pub fn from_env() -> Result<Self, BridgeError> {
         let address =
             std::env::var("IGGY_KAFKA_IGGY_ADDR").unwrap_or_else(|_| DEFAULT_IGGY_ADDR.to_string());
@@ -162,12 +186,32 @@ impl IggyBridgeConfig {
                 })?,
         };
 
+        let mut produce_sessions = ProduceSessionLimits::default();
+        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSIONS") {
+            produce_sessions.max = value.parse().map_err(|_| {
+                BridgeError::InvalidConfig(format!(
+                    "IGGY_KAFKA_PRODUCE_SESSIONS '{value}' is not a count, for example 256"
+                ))
+            })?;
+        }
+        if let Ok(value) = std::env::var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS") {
+            // 0 would close a session between two requests of a busy producer.
+            let seconds = value.parse().ok().filter(|seconds| *seconds > 0);
+            produce_sessions.idle = seconds.map(Duration::from_secs).ok_or_else(|| {
+                BridgeError::InvalidConfig(format!(
+                    "IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS '{value}' is not a number of seconds \
+                     above 0, for example 600"
+                ))
+            })?;
+        }
+
         Ok(Self {
             address,
             username,
             password: SecretString::from(password),
             topic_mapping,
             max_message_size,
+            produce_sessions,
         })
     }
 }
@@ -186,6 +230,7 @@ mod tests {
             topic_mapping: TopicMapping::new("kafka".to_string(), std::collections::HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            produce_sessions: ProduceSessionLimits::default(),
         }
     }
 
@@ -220,6 +265,8 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
             std::env::remove_var("IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE");
+            std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSIONS");
+            std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS");
         }
         let result = IggyBridgeConfig::from_env();
         unsafe {
@@ -228,6 +275,7 @@ mod tests {
 
         let config = result.expect("valid config from documented defaults alone");
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(config.produce_sessions, ProduceSessionLimits::default());
         assert_eq!(config.address, "127.0.0.1:8090");
         assert_eq!(config.username, "iggy");
         assert_eq!(config.topic_mapping.default_stream(), "kafka");
@@ -260,6 +308,44 @@ mod tests {
 
         assert_eq!(one_mebibyte.unwrap().max_message_size, 1024 * 1024);
         assert!(matches!(garbage, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_produce_session_limits() {
+        // Safety: process-wide, not per-variable - see the note on
+        // from_env_uses_documented_defaults_when_only_password_is_set above.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_PASSWORD", "iggy");
+            std::env::set_var("IGGY_KAFKA_PRODUCE_SESSIONS", "0");
+            std::env::set_var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS", "30");
+        }
+        let set = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_PRODUCE_SESSIONS", "many");
+        }
+        let bad_count = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_PRODUCE_SESSIONS", "8");
+            std::env::set_var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS", "0");
+        }
+        let no_idle = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_PASSWORD");
+            std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSIONS");
+            std::env::remove_var("IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS");
+        }
+
+        assert_eq!(
+            set.unwrap().produce_sessions,
+            ProduceSessionLimits {
+                max: 0,
+                idle: Duration::from_secs(30),
+            },
+            "0 sessions is a choice: every producer on one client"
+        );
+        assert!(matches!(bad_count, Err(BridgeError::InvalidConfig(_))));
+        assert!(matches!(no_idle, Err(BridgeError::InvalidConfig(_))));
     }
 
     #[test]

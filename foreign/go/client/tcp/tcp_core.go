@@ -422,42 +422,30 @@ func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, er
 	if ctx == nil {
 		return nil, ierror.ErrNilContext
 	}
-	captured, route, err := c.capturePartitionContext(ctx, cmd)
-	if err != nil {
-		return nil, err
-	}
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
-
 	frame, err := appendCommandFrame(*bp, cmd)
 	if frame != nil {
-		// Keep the grown buffer even when the encode failed, so the pool gets
-		// it back at its new capacity.
 		*bp = frame
 	}
 	if err != nil {
 		return nil, err
 	}
-
-	response, err := c.exchange(captured, uint32(cmd.Code()), frame)
-	if err != nil && route != "" {
-		// A partition reply never raises the metadata watermark that ages a
-		// route, so without this drop a refused context is stamped again.
-		c.polls.dropRoute(route)
+	if isPartitionCommand(cmd.Code()) {
+		query, err := partitionQuery(cmd.Code(), frame[vsr.HeaderSize:])
+		if err != nil {
+			return nil, err
+		}
+		var captured *iggcon.PartitionContext
+		if value, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
+			captured = &value
+		}
+		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
+			captured = poll.Strategy.Context
+		}
+		return c.sendRouted(ctx, cmd.Code(), query, frame, captured)
 	}
-	if cmd.Code() != command.SendMessagesCode || !errors.Is(err, ierror.ErrHistoryUnavailable) {
-		return response, err
-	}
-	// The partition refused the context before admission, so one resend of
-	// this frame under a fresh context cannot write the batch twice. The frame
-	// is not encoded again, because encoding compresses the payloads in place.
-	// The capture above already read this target, so it cannot fail here.
-	key, _, _ := sendTarget(cmd)
-	c.topics.invalidate(key)
-	if captured, _, err = c.capturePartitionContext(ctx, cmd); err != nil {
-		return nil, err
-	}
-	return c.exchange(captured, uint32(cmd.Code()), frame)
+	return c.exchange(ctx, uint32(cmd.Code()), frame)
 }
 
 // rawRequest carries a SendBinaryRequest through do, so a raw partition
@@ -570,7 +558,7 @@ func (e *localPreconditionError) Unwrap() error { return e.err }
 // the failure is one a fresh connection recovers from.
 func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte) ([]byte, error) {
 	response, generation, err := c.sendFrame(ctx, code, frame)
-	if err == nil || !isReconnectable(err) {
+	if err == nil || code == uint32(command.GetPartitionRouteCode) || !isReconnectable(err) {
 		return response, err
 	}
 
@@ -702,8 +690,7 @@ func (c *IggyTcpClient) sendFrame(
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
-	if code == uint32(command.PollMessagesOnPrimaryCode) ||
-		code == uint32(command.GetPollRoutingCode) ||
+	if code == uint32(command.GetPartitionRouteCode) ||
 		code == uint32(command.BindSessionCode) {
 		response, generation, _, err := c.sendPollFrame(ctx, code, frame)
 		return response, generation, err
@@ -743,21 +730,21 @@ func (c *IggyTcpClient) sendFrame(
 		switch {
 		case err == nil:
 			return response, generation, nil
-		case errors.Is(err, ierror.ErrTransientNotAccepted) &&
+		case (errors.Is(err, ierror.ErrTransientNotAccepted) || errors.Is(err, ierror.ErrNotPrimary)) &&
 			!isRegisterCode(code) && time.Now().Before(deadline):
 			// The server never admitted the request, so re-issuing it cannot
 			// double-apply. A same-connection replay keeps the stamped request
 			// id; a redirect registers again, so the frame is stamped afresh.
 			redirect := false
 			walked := false
-			if !walkingRoster {
+			if !walkingRoster || errors.Is(err, ierror.ErrNotPrimary) {
 				var redirectErr error
 				redirect, redirectErr = c.redirectToLeader(ctx, generation)
 				if redirectErr != nil {
 					return nil, generation, redirectErr
 				}
 			}
-			if !redirect {
+			if !redirect && !errors.Is(err, ierror.ErrNotPrimary) {
 				// The roster names this node as the metadata leader (or said
 				// nothing usable), yet it keeps refusing to admit the
 				// request: its replica of the target partition group is not
@@ -791,6 +778,11 @@ func (c *IggyTcpClient) sendFrame(
 					return nil, generation, connectErr
 				}
 				stamped = false
+			}
+			if errors.Is(err, ierror.ErrNotPrimary) && !redirect {
+				if waitErr := c.pause(ctx, replayInterval); waitErr != nil {
+					return nil, generation, waitErr
+				}
 			}
 		case errors.Is(err, ierror.ErrLifecycleBusy) &&
 			time.Now().Add(lifecycleRetryInterval).Before(lifecycleDeadline):
@@ -834,6 +826,11 @@ func (c *IggyTcpClient) attempt(
 	}
 
 	generation := c.connGeneration
+	if state, ok := ctx.Value(singlePollExchange{}).(*pollExchangeState); ok && state.parent != nil {
+		if c.session == nil || !c.session.Bound() || state.parent.client != c.session.ClientID() || state.parent.session != c.session.SessionID() {
+			return nil, stamped, generation, ierror.ErrUnauthenticated
+		}
+	}
 	switch c.transportState {
 	case iggcon.TransportStateShutdown:
 		c.logger.Debug("Cannot send data. Client is shutdown.")
@@ -859,6 +856,8 @@ func (c *IggyTcpClient) attempt(
 		}
 		if captured, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
 			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), captured)
+		} else {
+			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), iggcon.PartitionContext{MetadataOp: c.metadataWatermark.Load()})
 		}
 		stamped = true
 	}
@@ -925,6 +924,7 @@ func (c *IggyTcpClient) exchangeLocked(
 				return nil, err
 			}
 			pollState.written = true
+			pollState.reusable = false
 		}
 		c.logger.Debug("Sending a TCP request",
 			slog.Int("frame_length", len(frame)), slog.Int("code", int(code)))
@@ -965,12 +965,17 @@ func (c *IggyTcpClient) exchangeLocked(
 			}
 			pollState.reusable = c.conn != nil && vsr.PeekCommand(&c.respHeader) == vsr.FrameReply &&
 				(err == nil || !isReconnectable(err))
-			return response, err
+			if uncertain && err != nil && !errors.Is(err, ierror.ErrTransientNotCommitted) {
+				return nil, ierror.ErrTransientNotCommitted
+			}
+			if !pollState.replay || !errors.Is(err, ierror.ErrTransientNotCommitted) {
+				return response, err
+			}
 		}
 		if errors.Is(err, ierror.ErrTransientNotCommitted) {
 			uncertain = true
 		}
-		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) ||
+		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) || errors.Is(err, ierror.ErrNotPrimary) ||
 			errors.Is(err, ierror.ErrHistoryUnavailable) ||
 			errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) ||
 			errors.Is(err, ierror.ErrUnauthorized)) {

@@ -45,7 +45,7 @@ class LeaderAwarenessTest {
 
     private static ClusterNode node(
             String name, String ip, int tcpPort, ClusterNodeRole role, ClusterNodeStatus status) {
-        return new ClusterNode(name, ip, new TransportEndpoints(tcpPort, 8080, 3000, 8070), role, status);
+        return new ClusterNode(0, name, ip, new TransportEndpoints(tcpPort, 8080, 3000, 8070), role, status);
     }
 
     private static ClusterMetadata cluster(ClusterNode... nodes) {

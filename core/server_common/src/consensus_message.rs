@@ -20,9 +20,9 @@ use crate::sharding::METADATA_GROUP;
 use aligned_vec::{AVec, ConstAlign};
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSessionHeartbeatHeader,
-    DoViewChangeHeader, ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
-    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
+    DoViewChangeHeader, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutResultHeader,
+    ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation,
+    PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
     StateChunkHeader, StateTransferTargetHeader, frame_checksum_bytes,
@@ -647,6 +647,8 @@ pub enum MessageBag {
     ForwardLogoutResult(Message<ForwardLogoutResultHeader>),
     /// A backup reports session liveness to the metadata primary without a reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
+    /// A backup relays a partition completion to the metadata primary without a reply.
+    ForwardCompletion(Message<ForwardCompletionHeader>),
 }
 
 impl MessageBag {
@@ -732,6 +734,7 @@ impl MessageBag {
                 (message.header().operation(), METADATA_GROUP)
             }
             Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardCompletion(message) => (message.header().operation(), METADATA_GROUP),
         }
     }
 
@@ -764,6 +767,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.into_generic(),
             Self::ConsumerSessionHeartbeat(message) => message.into_generic(),
             Self::ForwardLogoutResult(message) => message.into_generic(),
+            Self::ForwardCompletion(message) => message.into_generic(),
         }
     }
 
@@ -790,6 +794,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().command,
             Self::ConsumerSessionHeartbeat(message) => message.header().command,
             Self::ForwardLogoutResult(message) => message.header().command,
+            Self::ForwardCompletion(message) => message.header().command,
         }
     }
 
@@ -816,6 +821,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().size(),
             Self::ConsumerSessionHeartbeat(message) => message.header().size(),
             Self::ForwardLogoutResult(message) => message.header().size(),
+            Self::ForwardCompletion(message) => message.header().size(),
         }
     }
 
@@ -842,6 +848,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().operation(),
             Self::ConsumerSessionHeartbeat(message) => message.header().operation(),
             Self::ForwardLogoutResult(message) => message.header().operation(),
+            Self::ForwardCompletion(message) => message.header().operation(),
         }
     }
 }
@@ -980,6 +987,9 @@ where
                     value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
                 ))
             }
+            Command::ForwardCompletion => Ok(Self::ForwardCompletion(
+                value.try_into_typed::<ForwardCompletionHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command::Reply | Command::Eviction => Err(ConsensusError::ClientBoundCommand(command)),
