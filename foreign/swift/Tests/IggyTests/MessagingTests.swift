@@ -177,9 +177,7 @@ struct MessagingTests {
         let refused = Locked(false)
         await server.respond { request in
             if request.code == CommandCode.pollMessagesOnPrimary.rawValue,
-                !refused.withLock({
-                    defer { $0 = true }; return $0
-                })
+                !refused.exchange(true)
             {
                 return .status(IggyErrorCode.transientNotAccepted.rawValue)
             }
@@ -275,9 +273,7 @@ struct MessagingTests {
             case .syncConsumerGroup:
                 return .ok(FakeVSRServer.assignmentBody(generation: fenced.withLock { $0 } ? 2 : 1, partitions: [1]))
             case .pollMessagesOnPrimary:
-                let first = !fenced.withLock {
-                    defer { $0 = true }; return $0
-                }
+                let first = !fenced.exchange(true)
                 return .ok(FakeVSRServer.polledBody(partitionID: first ? PolledMessages.resyncRequiredPartition : 1))
             default:
                 return FakeVSRServer.defaultReply(request, address: server.address)
@@ -480,9 +476,7 @@ struct MessagingTests {
         let dropped = Locked(false)
         await primary.respond { request in
             if request.code == CommandCode.pollMessagesOnPrimary.rawValue,
-                !dropped.withLock({
-                    defer { $0 = true }; return $0
-                })
+                !dropped.exchange(true)
             {
                 return .close
             }

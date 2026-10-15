@@ -37,6 +37,15 @@ final class Locked<Value>: @unchecked Sendable {
         defer { lock.unlock() }
         return try body(&value)
     }
+
+    /// Stores `newValue` and returns the value it replaced.
+    func exchange(_ newValue: Value) -> Value {
+        withLock { value in
+            let previous = value
+            value = newValue
+            return previous
+        }
+    }
 }
 
 /// Polls `condition` until it holds or `timeout` passes.
