@@ -379,12 +379,10 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagWithStoredOffsetCmd {
                 .await
                 .unwrap()
                 .unwrap();
-            let owns_partition = group.members.iter().any(|member| {
-                member
-                    .partitions
-                    .iter()
-                    .any(|partition_id| *partition_id == 0)
-            });
+            let owns_partition = group
+                .members
+                .iter()
+                .any(|member| member.partitions.contains(&0));
             if group.members_count == 1 && owns_partition {
                 break;
             }
