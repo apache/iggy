@@ -20,9 +20,9 @@ use crate::sharding::METADATA_GROUP;
 use aligned_vec::{AVec, ConstAlign};
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSessionHeartbeatHeader,
-    DoViewChangeHeader, ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
-    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
+    DoViewChangeHeader, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutResultHeader,
+    ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation,
+    PrepareHeader, PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
     StateChunkHeader, StateTransferTargetHeader, frame_checksum_bytes,
@@ -647,6 +647,8 @@ pub enum MessageBag {
     ForwardLogoutResult(Message<ForwardLogoutResultHeader>),
     /// A backup reports session liveness to the metadata primary without a reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
+    /// A backup relays a partition completion to the metadata primary without a reply.
+    ForwardCompletion(Message<ForwardCompletionHeader>),
 }
 
 impl MessageBag {
@@ -732,6 +734,7 @@ impl MessageBag {
                 (message.header().operation(), METADATA_GROUP)
             }
             Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
+            Self::ForwardCompletion(message) => (message.header().operation(), METADATA_GROUP),
         }
     }
 
@@ -764,6 +767,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.into_generic(),
             Self::ConsumerSessionHeartbeat(message) => message.into_generic(),
             Self::ForwardLogoutResult(message) => message.into_generic(),
+            Self::ForwardCompletion(message) => message.into_generic(),
         }
     }
 
@@ -790,6 +794,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().command,
             Self::ConsumerSessionHeartbeat(message) => message.header().command,
             Self::ForwardLogoutResult(message) => message.header().command,
+            Self::ForwardCompletion(message) => message.header().command,
         }
     }
 
@@ -816,6 +821,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().size(),
             Self::ConsumerSessionHeartbeat(message) => message.header().size(),
             Self::ForwardLogoutResult(message) => message.header().size(),
+            Self::ForwardCompletion(message) => message.header().size(),
         }
     }
 
@@ -842,6 +848,7 @@ impl MessageBag {
             Self::ForwardLogout(message) => message.header().operation(),
             Self::ConsumerSessionHeartbeat(message) => message.header().operation(),
             Self::ForwardLogoutResult(message) => message.header().operation(),
+            Self::ForwardCompletion(message) => message.header().operation(),
         }
     }
 }
@@ -980,6 +987,9 @@ where
                     value.try_into_typed::<ConsumerSessionHeartbeatHeader>()?,
                 ))
             }
+            Command::ForwardCompletion => Ok(Self::ForwardCompletion(
+                value.try_into_typed::<ForwardCompletionHeader>()?,
+            )),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command::Reply | Command::Eviction => Err(ConsensusError::ClientBoundCommand(command)),
@@ -1611,7 +1621,7 @@ mod tests {
     // non-replicated op code lives in `reserved[0..4]`) and unset only the
     // routing fields, whatever bytes the client sent in that tail.
     #[test]
-    fn into_routed_keeps_reserved_prefix_and_unsets_group() {
+    fn into_routed_keeps_client_context_and_clears_routing_fields() {
         const RESERVED_OFF: usize = std::mem::offset_of!(RequestHeader, reserved);
 
         let mut owned = header_bytes(Command::Request, 256);
@@ -1636,6 +1646,15 @@ mod tests {
             "the client-sent reserved tail must not leak into `group`"
         );
         assert_eq!(header.metadata_watermark, 0);
+        assert_eq!(
+            header.partition_incarnation,
+            client_header.partition_incarnation
+        );
+        assert_eq!(header.owner_generation, client_header.owner_generation);
+        assert_eq!(
+            header.minimum_metadata_op,
+            client_header.minimum_metadata_op
+        );
         assert_eq!(header.client, client_header.client);
         assert_eq!(header.operation, client_header.operation);
         assert_eq!(header.session, client_header.session);

@@ -36,6 +36,7 @@ use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
 };
 use iggy_binary_protocol::primitives::options::WireOptions;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
@@ -299,6 +300,15 @@ fn request_header(
 fn main() {
     let output = std::env::args().nth(1).expect("output path argument");
     let mut vectors = BTreeMap::new();
+    add(
+        &mut vectors,
+        "partition.context",
+        &PartitionContext {
+            incarnation: 17,
+            owner_generation: 9,
+            metadata_op: 52,
+        },
+    );
 
     let mut lengths: Vec<usize> = (0..=300).collect();
     lengths.extend([
@@ -884,6 +894,17 @@ fn main() {
             &[9, 9, 9, 9],
         ))),
     );
+    let mut fenced_send = request_header(SEND_MESSAGES_CODE, client_id, 2, 99, &[9, 9, 9, 9]);
+    PartitionContext {
+        incarnation: 17,
+        owner_generation: 9,
+        metadata_op: 52,
+    }
+    .stamp(&mut fenced_send);
+    vectors.insert(
+        "vsr.request.send_messages.fenced".to_owned(),
+        hex(bytemuck::bytes_of(&fenced_send)),
+    );
     vectors.insert(
         "vsr.request.logout".to_owned(),
         hex(bytemuck::bytes_of(&request_header(
@@ -969,6 +990,7 @@ fn main() {
     );
     let partitions = vec![
         PartitionResponse {
+            context: Default::default(),
             id: 0,
             created_at: 1_710_000_000_000_000,
             segments_count: 2,
@@ -977,6 +999,7 @@ fn main() {
             messages_count: 100,
         },
         PartitionResponse {
+            context: Default::default(),
             id: 1,
             created_at: 1_710_000_000_000_001,
             segments_count: 1,
@@ -985,6 +1008,7 @@ fn main() {
             messages_count: 0,
         },
         PartitionResponse {
+            context: Default::default(),
             id: 2,
             created_at: 1_710_000_000_000_002,
             segments_count: 3,
@@ -1269,6 +1293,7 @@ fn main() {
             name: "prod-cluster".to_owned(),
             nodes: vec![
                 ClusterNodeResponse {
+                    replica_id: 0,
                     name: "node-1".to_owned(),
                     ip: "10.0.0.1".to_owned(),
                     tcp_port: 8090,
@@ -1279,6 +1304,7 @@ fn main() {
                     status: 0,
                 },
                 ClusterNodeResponse {
+                    replica_id: 1,
                     name: "node-2".to_owned(),
                     ip: "fd00::2".to_owned(),
                     tcp_port: 8091,
@@ -1354,6 +1380,7 @@ fn main() {
         let second = batch_record(7, 102, 6_000, 2_000, &[frame(13, 0, 0, b"c", &[])]);
         let mut body = BytesMut::new();
         PollMessagesResponseHeader {
+            context: Default::default(),
             partition_id: 7,
             current_offset: 102,
             messages_count: 3,
@@ -1364,6 +1391,7 @@ fn main() {
         vectors.insert("response.poll_messages".to_owned(), hex(&body));
         let mut empty = BytesMut::new();
         PollMessagesResponseHeader {
+            context: Default::default(),
             partition_id: 0,
             current_offset: 0,
             messages_count: 0,
@@ -1383,6 +1411,7 @@ fn main() {
         segment_size: Some(IggyByteSize::from(1_048_576)),
         durability: Durability::Persisted,
         consumer_offset_durability: Durability::Replicated,
+        partition_resize_policy: None,
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),

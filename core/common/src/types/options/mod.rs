@@ -54,8 +54,10 @@
 //! rather than a description to interpret.
 
 mod durability;
+mod partition_resize_policy;
 
 pub use durability::Durability;
+pub use partition_resize_policy::PartitionResizePolicy;
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -213,6 +215,8 @@ pub mod topic_option_keys {
     /// Message completion policy: `String`, either `replicated` or `persisted`.
     pub const DURABILITY: &str = "durability";
     pub const CONSUMER_OFFSET_DURABILITY: &str = "consumer_offset_durability";
+    /// Immutable partition-set policy: `String`, either `mutable` or `fixed`.
+    pub const PARTITION_RESIZE_POLICY: &str = "partition_resize_policy";
     /// Flush the journal once it holds this many messages: `Uint32`.
     /// Must be non-zero.
     pub const MESSAGES_REQUIRED_TO_SAVE: &str = "messages_required_to_save";
@@ -446,6 +450,7 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
     topic_option_keys::SEGMENT_SIZE,
     topic_option_keys::DURABILITY,
     topic_option_keys::CONSUMER_OFFSET_DURABILITY,
+    topic_option_keys::PARTITION_RESIZE_POLICY,
     topic_option_keys::MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     topic_option_keys::PREALLOCATE_SEGMENTS,
@@ -715,6 +720,8 @@ pub struct TopicCreateOptions {
     /// Message completion policy, independent of consumer-offset durability.
     pub durability: Durability,
     pub consumer_offset_durability: Durability,
+    /// Immutable after creation. `None` resolves to [`PartitionResizePolicy::Mutable`].
+    pub partition_resize_policy: Option<PartitionResizePolicy>,
     /// Per-topic message-count flush threshold. `None` resolves to 1024.
     /// `0` is rejected.
     pub messages_required_to_save: Option<u32>,
@@ -820,10 +827,13 @@ impl TopicCreateOptions {
                     parsed.segment_size = (size != 0).then_some(IggyByteSize::from(size));
                 }
                 topic_option_keys::DURABILITY => {
-                    parsed.durability = Self::durability_value(entry, key)?;
+                    parsed.durability = Self::string_value(entry, key)?;
                 }
                 topic_option_keys::CONSUMER_OFFSET_DURABILITY => {
-                    parsed.consumer_offset_durability = Self::durability_value(entry, key)?;
+                    parsed.consumer_offset_durability = Self::string_value(entry, key)?;
+                }
+                topic_option_keys::PARTITION_RESIZE_POLICY => {
+                    parsed.partition_resize_policy = Some(Self::string_value(entry, key)?);
                 }
                 topic_option_keys::MESSAGES_REQUIRED_TO_SAVE => {
                     let messages = parse_u32(entry, key)?;
@@ -867,6 +877,9 @@ impl TopicCreateOptions {
             segment_size: self.segment_size.or(defaults.segment_size),
             durability: self.durability,
             consumer_offset_durability: self.consumer_offset_durability,
+            partition_resize_policy: self
+                .partition_resize_policy
+                .or(defaults.partition_resize_policy),
             messages_required_to_save: self
                 .messages_required_to_save
                 .or(defaults.messages_required_to_save),
@@ -901,6 +914,13 @@ impl TopicCreateOptions {
     /// See `raw_options_map`.
     pub fn to_option_map(&self) -> Result<ResourceOptions, IggyError> {
         let mut options = raw_options_map(&self.raw)?;
+        if let Some(policy) = self.partition_resize_policy {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::PARTITION_RESIZE_POLICY)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from_str(policy.as_ref())?),
+            );
+        }
         if let Some(compression_algorithm) = self.compression_algorithm {
             options.insert(
                 HeaderKey::from_str(topic_option_keys::COMPRESSION_ALGORITHM)
@@ -991,6 +1011,12 @@ impl TopicCreateOptions {
         // Typed fields are inserted over the raw entries, matching the
         // collision rule `to_wire` applies.
         let mut options = self.raw.clone();
+        if let Some(policy) = self.partition_resize_policy {
+            options.insert(
+                topic_option_keys::PARTITION_RESIZE_POLICY.to_owned(),
+                policy.to_string(),
+            );
+        }
         if let Some(segment_size) = self.segment_size {
             options.insert(
                 topic_option_keys::SEGMENT_SIZE.to_owned(),
@@ -1048,6 +1074,15 @@ impl TopicCreateOptions {
         supplied: &WireOptions,
     ) -> Result<WireOptions, IggyError> {
         let mut derived = ResourceOptions::new();
+        if self.partition_resize_policy.is_none() {
+            derived.insert(
+                HeaderKey::from_str(topic_option_keys::PARTITION_RESIZE_POLICY)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::derived(HeaderValue::from_str(
+                    PartitionResizePolicy::default().as_ref(),
+                )?),
+            );
+        }
         if self.compression_algorithm.is_none() {
             derived.insert(
                 HeaderKey::from_str(topic_option_keys::COMPRESSION_ALGORITHM)
@@ -1156,10 +1191,10 @@ impl TopicCreateOptions {
         }
         parsed
     }
-    fn durability_value(
+    fn string_value<T: FromStr>(
         entry: &WireUserHeaderEntry<'_>,
         key: &str,
-    ) -> Result<Durability, IggyError> {
+    ) -> Result<T, IggyError> {
         if entry.value_kind.0 != HeaderKind::String.as_code() {
             return Err(IggyError::InvalidOptionValue(key.to_owned()));
         }
@@ -1281,10 +1316,96 @@ mod tests {
             preallocate_segments: Some(false),
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,
+            partition_resize_policy: Some(PartitionResizePolicy::Fixed),
             raw: BTreeMap::new(),
         };
         let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         assert_eq!(parsed, options);
+    }
+
+    #[test]
+    fn given_omitted_resize_policy_when_resolving_defaults_should_persist_mutable_as_derived() {
+        let options = TopicCreateOptions::default();
+        let supplied = options.to_wire().unwrap();
+        let derived = options
+            .derived_block(
+                CompressionAlgorithm::default(),
+                IggyExpiry::default(),
+                MaxTopicSize::default(),
+                TopicRuntimeDefaults::default(),
+                &supplied,
+            )
+            .unwrap();
+        let stored = crate::wire_conversions::resource_options_from_wire(&derived, false).unwrap();
+        let policy =
+            &stored[&HeaderKey::from_str(topic_option_keys::PARTITION_RESIZE_POLICY).unwrap()];
+        assert_eq!(policy.value.as_bytes(), b"mutable");
+        assert!(!policy.explicit);
+        assert_eq!(
+            TopicCreateOptions::from_resource_options(&stored).partition_resize_policy,
+            Some(PartitionResizePolicy::Mutable),
+        );
+        assert!(
+            !supplied
+                .into_iter()
+                .any(|entry| entry.key == topic_option_keys::PARTITION_RESIZE_POLICY.as_bytes())
+        );
+    }
+
+    #[test]
+    fn given_raw_resize_policy_when_encoding_should_match_binary_and_http_values() {
+        let mut options = TopicCreateOptions {
+            raw: BTreeMap::from([(
+                topic_option_keys::PARTITION_RESIZE_POLICY.to_owned(),
+                "fixed".to_owned(),
+            )]),
+            ..TopicCreateOptions::default()
+        };
+        assert_eq!(
+            TopicCreateOptions::parse(&options.to_wire().unwrap())
+                .unwrap()
+                .partition_resize_policy,
+            Some(PartitionResizePolicy::Fixed),
+        );
+        assert_eq!(
+            options.to_string_options().unwrap()[topic_option_keys::PARTITION_RESIZE_POLICY],
+            "fixed"
+        );
+
+        options.partition_resize_policy = Some(PartitionResizePolicy::Mutable);
+        assert_eq!(
+            TopicCreateOptions::parse(&options.to_wire().unwrap())
+                .unwrap()
+                .partition_resize_policy,
+            Some(PartitionResizePolicy::Mutable),
+        );
+        assert_eq!(
+            options.to_string_options().unwrap()[topic_option_keys::PARTITION_RESIZE_POLICY],
+            "mutable"
+        );
+    }
+
+    #[test]
+    fn given_invalid_resize_policy_when_parsing_should_reject_value_and_kind() {
+        for value in [
+            HeaderValue::from_str("unknown").unwrap(),
+            HeaderValue::from(1_u32),
+            HeaderValue::from(true),
+        ] {
+            let options = ResourceOptions::from([(
+                HeaderKey::from_str(topic_option_keys::PARTITION_RESIZE_POLICY).unwrap(),
+                OptionValue::explicit(value),
+            )]);
+            let wire =
+                crate::wire_conversions::resource_options_to_wire(&options, OptionsProvenance::All)
+                    .unwrap();
+            assert_eq!(
+                TopicCreateOptions::parse(&wire),
+                Err(IggyError::InvalidOptionValue(
+                    topic_option_keys::PARTITION_RESIZE_POLICY.to_owned()
+                )),
+            );
+        }
     }
 
     #[test]

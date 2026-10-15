@@ -867,6 +867,38 @@ pub fn is_compressed(blob: &[u8]) -> bool {
         .is_some_and(|attributes| attributes & 0b111 != 0)
 }
 
+/// The producer id of the first batch in `blob`, bytes 43 to 50. `None` when it has none.
+#[must_use]
+pub fn producer_id(blob: &[u8]) -> Option<i64> {
+    let id = i64::from_be_bytes(blob.get(43..51)?.try_into().ok()?);
+    (id != NO_PRODUCER_ID).then_some(id)
+}
+
+/// The record count the first batch in `blob` declares, bytes 57 to 60. `None` when it has none.
+#[must_use]
+pub fn declared_records(blob: &[u8]) -> Option<usize> {
+    let count = i32::from_be_bytes(blob.get(57..BATCH_HEADER_BYTES)?.try_into().ok()?);
+    usize::try_from(count).ok()
+}
+
+/// Record slots the first batch in `blob` takes to decode, when it is not compressed: one per
+/// declared record, plus its headers as `scan_records` charges them. Stops at `most`.
+///
+/// Counts the records it can walk. The decode refuses a batch that does not walk, so that batch
+/// holds nothing.
+#[must_use]
+pub fn record_slots(blob: &[u8], most: usize) -> usize {
+    let mut slots = declared_records(blob).unwrap_or(0);
+    let mut records = blob.get(BATCH_HEADER_BYTES..).unwrap_or_default();
+    while slots < most && !records.is_empty() {
+        let Ok((headers, _)) = take_record(&mut records) else {
+            break;
+        };
+        slots = slots.saturating_add(headers / HEADERS_PER_SLOT);
+    }
+    slots.min(most)
+}
+
 /// Decodes the one record batch a Produce partition carries.
 ///
 /// # Errors
@@ -1075,30 +1107,13 @@ const HEADERS_PER_SLOT: usize = 3;
 ///   (`kafka-protocol-0.18.0/src/records.rs:896`), and that memory is resident.
 /// - Charges headers to the record budget, [`HEADERS_PER_SLOT`] per slot.
 /// - Returns the record count, which `decode_batch` checks against the batch header.
-///
-/// The framing mirrors `Record::decode_new`, field for field.
 fn scan_records(records: &Bytes, budget: &DecompressionBudget) -> Result<usize> {
     let mut blob = records.as_ref();
     let mut walked = 0;
     let mut slots = 0;
     let mut names = Vec::new();
     while !blob.is_empty() {
-        let size = take_varint(&mut blob)?;
-        let size = usize::try_from(size).map_err(|_| RecordCodecError::RecordFieldLength(size))?;
-        let mut record = take_bytes(&mut blob, size)?;
-
-        take_bytes(&mut record, 1)?; // attributes
-        skip_varint(&mut record, MAX_VARLONG_BYTES)?; // timestamp delta
-        skip_varint(&mut record, MAX_VARINT_BYTES)?; // offset delta
-        skip_field(&mut record)?; // key
-        skip_field(&mut record)?; // value
-
-        let count = take_varint(&mut record)?;
-        let limit = record.len();
-        let headers = usize::try_from(count)
-            .ok()
-            .filter(|headers| headers.saturating_mul(MIN_HEADER_BYTES) <= limit)
-            .ok_or(RecordCodecError::HeaderCountTooLarge { count, limit })?;
+        let (headers, mut record) = take_record(&mut blob)?;
         if headers > 1 {
             check_header_names(&mut record, headers, &mut names)?;
         }
@@ -1107,6 +1122,30 @@ fn scan_records(records: &Bytes, budget: &DecompressionBudget) -> Result<usize> 
     }
     budget.charge_records(slots)?;
     Ok(walked)
+}
+
+/// Steps over one record of `blob`. Returns its header count and its header bytes, and refuses a
+/// count those bytes cannot hold.
+///
+/// The framing mirrors `Record::decode_new`, field for field.
+fn take_record<'a>(blob: &mut &'a [u8]) -> Result<(usize, &'a [u8])> {
+    let size = take_varint(blob)?;
+    let size = usize::try_from(size).map_err(|_| RecordCodecError::RecordFieldLength(size))?;
+    let mut record = take_bytes(blob, size)?;
+
+    take_bytes(&mut record, 1)?; // attributes
+    skip_varint(&mut record, MAX_VARLONG_BYTES)?; // timestamp delta
+    skip_varint(&mut record, MAX_VARINT_BYTES)?; // offset delta
+    skip_field(&mut record)?; // key
+    skip_field(&mut record)?; // value
+
+    let count = take_varint(&mut record)?;
+    let limit = record.len();
+    let headers = usize::try_from(count)
+        .ok()
+        .filter(|headers| headers.saturating_mul(MIN_HEADER_BYTES) <= limit)
+        .ok_or(RecordCodecError::HeaderCountTooLarge { count, limit })?;
+    Ok((headers, record))
 }
 
 /// Refuses a record that repeats a header name. `kafka_protocol` keeps only the last value.
@@ -1135,24 +1174,25 @@ fn check_header_names<'a>(
 /// Reads a zigzag varint, five bytes at most, the way `kafka_protocol` reads one.
 fn take_varint(buf: &mut &[u8]) -> Result<i32> {
     let mut value = 0u32;
-    for index in 0..MAX_VARINT_BYTES {
-        let byte = take_bytes(buf, 1)?[0];
+    for (index, &byte) in buf.iter().enumerate().take(MAX_VARINT_BYTES) {
         value |= u32::from(byte & 0x7f) << (index * 7);
-        if byte < 0x80 {
-            break;
+        if byte < 0x80 || index + 1 == MAX_VARINT_BYTES {
+            *buf = &buf[index + 1..];
+            return Ok((value >> 1).cast_signed() ^ -(value & 1).cast_signed());
         }
     }
-    Ok((value >> 1).cast_signed() ^ -(value & 1).cast_signed())
+    Err(RecordCodecError::RecordTruncated)
 }
 
 /// Steps over a zigzag varint of up to `most` bytes, for the fields the scan does not read.
 fn skip_varint(buf: &mut &[u8], most: usize) -> Result<()> {
-    for _ in 0..most {
-        if take_bytes(buf, 1)?[0] < 0x80 {
-            break;
+    for (index, &byte) in buf.iter().enumerate().take(most) {
+        if byte < 0x80 || index + 1 == most {
+            *buf = &buf[index + 1..];
+            return Ok(());
         }
     }
-    Ok(())
+    Err(RecordCodecError::RecordTruncated)
 }
 
 fn take_bytes<'a>(buf: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
@@ -1840,6 +1880,22 @@ mod tests {
     }
 
     #[test]
+    fn given_a_batch_when_its_records_are_counted_should_read_the_declared_count() {
+        let mut records = [record_at_offset(0, b"a"), record_at_offset(1, b"b")];
+        assert_eq!(
+            declared_records(&encode_batch(&mut records).unwrap()),
+            Some(2)
+        );
+        // `encode_batch` set the sequences that keep both records in one batch.
+        assert_eq!(
+            declared_records(&encode_with(&records, Compression::Gzip)),
+            Some(2),
+            "the header counts records before compression"
+        );
+        assert_eq!(declared_records(&[0; BATCH_HEADER_BYTES - 1]), None);
+    }
+
+    #[test]
     fn given_a_gzip_batch_when_decoded_should_read_it() {
         let records = vec![record_at_offset(0, b"compressed")];
         let mut encoded = encode_with(&records, Compression::Gzip);
@@ -2057,6 +2113,45 @@ mod tests {
         ));
         let enough = partition_budget(1024, 3);
         assert!(decode_batch(&mut batch, &enough, Zstd::Allowed).is_ok());
+    }
+
+    /// A record at `offset` with `count` headers.
+    fn record_with_headers(offset: i64, count: usize) -> Record {
+        let names: Vec<String> = (0..count).map(|index| format!("h{index}")).collect();
+        let headers: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), Some(&b"v"[..])))
+            .collect();
+        let mut record = record_with(None, Some(b"v"), &headers);
+        record.offset = offset;
+        record
+    }
+
+    #[test]
+    fn given_headers_when_slots_are_counted_should_match_what_the_decode_charges() {
+        let mut records = [
+            record_with_headers(0, 6),
+            record_with_headers(1, 3),
+            record_with_headers(2, 2),
+        ];
+        let batch = encode_batch(&mut records).unwrap();
+
+        // Three records, two slots for six headers and one for three.
+        assert_eq!(record_slots(&batch, usize::MAX), 6);
+        let exact = partition_budget(4096, 6);
+        assert!(decode_batch(&mut batch.clone(), &exact, Zstd::Allowed).is_ok());
+        let short = partition_budget(4096, 5);
+        assert!(matches!(
+            decode_batch(&mut batch.clone(), &short, Zstd::Allowed),
+            Err(RecordCodecError::RecordBudgetExceeded { count: 6, limit: 5 })
+        ));
+
+        assert_eq!(record_slots(&batch, 4), 4, "the walk stops at the cap");
+        assert_eq!(
+            record_slots(&batch[..BATCH_HEADER_BYTES + 3], usize::MAX),
+            3,
+            "a batch that does not walk counts its declared records"
+        );
     }
 
     /// A one-record v2 batch whose record body declares `headers` headers and carries none.

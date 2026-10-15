@@ -44,20 +44,15 @@ pub const CONFIG_SOURCE_TOPIC: i8 = 1;
 /// Kafka `ConfigSource.DEFAULT_CONFIG`: the value is the gateway default.
 pub const CONFIG_SOURCE_DEFAULT: i8 = 5;
 
-/// Kafka `ConfigType.STRING`.
-pub const CONFIG_TYPE_STRING: i8 = 2;
-
 /// Kafka `ConfigType.LONG`.
 pub const CONFIG_TYPE_LONG: i8 = 5;
 
 pub const RETENTION_MS: &str = "retention.ms";
 pub const CLEANUP_POLICY: &str = "cleanup.policy";
-pub const CLEANUP_POLICY_VALUE: &str = "delete";
 
 pub const ONLY_TOPIC_RESOURCES: &str = "only topic resources are supported";
 
 pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active segment does not expire. -1 means sealed segments never expire.";
-pub const CLEANUP_DOC: &str = "Iggy deletes expired messages and does not compact a topic.";
 
 /// Distinct topic names one `CreateTopics`, `DescribeConfigs`, or `AlterConfigs` request
 /// may address through the bridge.
@@ -73,11 +68,10 @@ pub const MAX_CONFIG_TOPICS: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListedKey {
     Retention,
-    Cleanup,
-    /// An unmodeled name, including `retention.minutes` and `retention.hours`. The name
-    /// itself is never read back out: `DescribeConfigs` omits every `Unknown` entry from
-    /// its response, so carrying the name here would only pay a `String` allocation for a
-    /// value no caller inspects.
+    /// An unmodeled name, including `cleanup.policy`, `retention.minutes` and
+    /// `retention.hours`. The name itself is never read back out: `DescribeConfigs` omits
+    /// every `Unknown` entry from its response, so carrying the name here would only pay a
+    /// `String` allocation for a value no caller inspects.
     Unknown,
 }
 
@@ -319,21 +313,26 @@ pub fn bridge_failure(error: &BridgeError, handler: &str, action: &str) -> (i16,
 
 /// Keys to return for one describe resource.
 ///
-/// `None` and an empty list both mean `retention.ms` and `cleanup.policy`. A name repeated
-/// in `configuration_keys` is collapsed to one entry, in its first position. Any other name,
-/// including `retention.minutes` and `retention.hours`, is [`ListedKey::Unknown`].
-/// `DescribeConfigs` omits those names from the response and does not fail the resource.
+/// `None` and an empty list both mean `retention.ms`. A name repeated in
+/// `configuration_keys` is collapsed to one entry, in its first position. Any other name,
+/// including `cleanup.policy`, `retention.minutes` and `retention.hours`, is
+/// [`ListedKey::Unknown`]. `DescribeConfigs` omits those names from the response and does not
+/// fail the resource.
+///
+/// `cleanup.policy` stays unknown until the gateway stores a policy per topic. Kafka Connect
+/// refuses an internal topic that reports any policy other than `compact`, but it starts when
+/// the entry is missing (`TopicAdmin.verifyTopicCleanupPolicyOnlyCompact`). A fixed `delete`
+/// therefore stops Connect even on topics an operator created for it.
 #[must_use]
 pub fn listed_keys(configuration_keys: Option<&[StrBytes]>) -> Vec<ListedKey> {
     let Some(keys) = configuration_keys.filter(|keys| !keys.is_empty()) else {
-        return vec![ListedKey::Retention, ListedKey::Cleanup];
+        return vec![ListedKey::Retention];
     };
     let mut seen = HashSet::new();
     keys.iter()
         .filter(|key| seen.insert(key.as_str()))
         .map(|key| match key.as_str() {
             RETENTION_MS => ListedKey::Retention,
-            CLEANUP_POLICY => ListedKey::Cleanup,
             _ => ListedKey::Unknown,
         })
         .collect()
@@ -421,23 +420,23 @@ mod tests {
     }
 
     #[test]
-    fn listed_keys_defaults_to_both_and_keeps_an_unknown_name() {
-        assert_eq!(
-            listed_keys(None),
-            vec![ListedKey::Retention, ListedKey::Cleanup]
-        );
-        assert_eq!(
-            listed_keys(Some(&[])),
-            vec![ListedKey::Retention, ListedKey::Cleanup]
-        );
+    fn listed_keys_defaults_to_retention_and_keeps_an_unknown_name() {
+        assert_eq!(listed_keys(None), vec![ListedKey::Retention]);
+        assert_eq!(listed_keys(Some(&[])), vec![ListedKey::Retention]);
         let asked = [
-            StrBytes::from_static_str(CLEANUP_POLICY),
+            StrBytes::from_static_str(RETENTION_MS),
             StrBytes::from_static_str("no.such"),
         ];
         assert_eq!(
             listed_keys(Some(&asked)),
-            vec![ListedKey::Cleanup, ListedKey::Unknown]
+            vec![ListedKey::Retention, ListedKey::Unknown]
         );
+    }
+
+    #[test]
+    fn cleanup_policy_is_an_unknown_name_even_when_asked_for() {
+        let asked = [StrBytes::from_static_str(CLEANUP_POLICY)];
+        assert_eq!(listed_keys(Some(&asked)), vec![ListedKey::Unknown]);
     }
 
     #[test]
@@ -449,7 +448,7 @@ mod tests {
         ];
         assert_eq!(
             listed_keys(Some(&asked)),
-            vec![ListedKey::Retention, ListedKey::Cleanup]
+            vec![ListedKey::Retention, ListedKey::Unknown]
         );
     }
 

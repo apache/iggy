@@ -92,6 +92,39 @@ pub(crate) trait IggyCmdTestCase {
     }
 }
 
+/// Runs the wrapped test case with `--transport ws` against the server's WebSocket address.
+pub(crate) struct OverWebSocket<T>(pub(crate) T);
+
+#[async_trait]
+impl<T: IggyCmdTestCase + Send + Sync> IggyCmdTestCase for OverWebSocket<T> {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        self.0.prepare_server_state(client).await;
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        self.0.get_command().opts(vec!["--transport", "ws"])
+    }
+
+    fn provide_stdin_input(&self) -> Option<Vec<String>> {
+        self.0.provide_stdin_input()
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        self.0.verify_command(command_state);
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        self.0.verify_server_state(client).await;
+    }
+
+    fn protocol(&self, server: &ServerHandle) -> Vec<String> {
+        vec![
+            "--websocket-server-address".into(),
+            server.websocket_addr().unwrap().to_string(),
+        ]
+    }
+}
+
 pub(crate) struct IggyCmdTest {
     harness: TestHarness,
     start_server: bool,
@@ -169,6 +202,12 @@ impl IggyCmdTest {
         let mut command = Command::cargo_bin("iggy").unwrap();
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
+        // Clear any IGGY_TOKEN inherited from the test process before the
+        // case's environment is applied: the token takes precedence over
+        // username/password, so an ambient value would override the
+        // credentials a case sets up. A case exercising token auth sets
+        // its own value in its environment.
+        command.env("IGGY_TOKEN", "");
         // Set environment variables for the command
         command.envs(command_args.get_env());
         // Set a fixed terminal width for consistent help output formatting
@@ -234,6 +273,11 @@ impl IggyCmdTest {
         let mut command = Command::cargo_bin("iggy").unwrap();
         // Get command line arguments and environment variables from test case and execute command
         let command_args = test_case.get_command();
+        // Clear any IGGY_TOKEN inherited from the test process before the
+        // case's environment is applied: the token takes precedence over
+        // username/password, so an ambient value would override the
+        // credentials a case sets up.
+        command.env("IGGY_TOKEN", "");
         // Set environment variables for the command
         command.envs(command_args.get_env());
         // Set COLUMNS environment variable to 200 to avoid truncation of output
@@ -267,6 +311,14 @@ impl IggyCmdTest {
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn get_tcp_server_address(&self) -> Option<String> {
         self.harness.server().raw_tcp_addr()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn get_websocket_server_address(&self) -> Option<String> {
+        self.harness
+            .server()
+            .websocket_addr()
+            .map(|addr| addr.to_string())
     }
 }
 

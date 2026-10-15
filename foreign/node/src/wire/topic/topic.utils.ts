@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionContext } from '../vsr/header.js';
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
 import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
@@ -51,6 +52,8 @@ export type BaseTopic = {
  * Partition information within a topic.
  */
 export type Partition = {
+  /** Partition incarnation, owner generation and metadata op the reply carries */
+  context: PartitionContext,
   /** Partition ID */
   id: number,
   /** Partition creation timestamp */
@@ -180,7 +183,7 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
  */
 export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized => {
   return {
-    bytesRead: 4 + 8 + 4 + 8 + 8 + 8,
+    bytesRead: 40 + PARTITION_CONTEXT_SIZE,
     data: {
       id: p.readUInt32LE(pos),
       createdAt: toDate(p.readBigUint64LE(pos + 4)),
@@ -188,6 +191,7 @@ export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized =>
       currentOffset: p.readBigUint64LE(pos + 16),
       sizeBytes: p.readBigUint64LE(pos + 24),
       messagesCount: p.readBigUint64LE(pos + 32),
+      context: deserializePartitionContext(p, pos + 40),
     }
   }
 };

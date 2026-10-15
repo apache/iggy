@@ -205,8 +205,36 @@ public struct TopicDetails: Sendable, Hashable {
     }
 }
 
+/// Immutable authority captured before a partition operation is sent.
+public struct PartitionContext: Sendable, Hashable {
+    /// Incarnation to which offsets and retry results belong. It changes only
+    /// when a partition id is reused after a delete.
+    public let incarnation: UInt64
+    public let ownerGeneration: UInt64
+    public let metadataOp: UInt64
+
+    public init(incarnation: UInt64, ownerGeneration: UInt64, metadataOp: UInt64) {
+        self.incarnation = incarnation
+        self.ownerGeneration = ownerGeneration
+        self.metadataOp = metadataOp
+    }
+
+    public static let empty = PartitionContext(incarnation: 0, ownerGeneration: 0, metadataOp: 0)
+
+    func encode(into writer: inout ByteWriter) {
+        writer.write(incarnation)
+        writer.write(ownerGeneration)
+        writer.write(metadataOp)
+    }
+
+    static func decode(from reader: inout ByteReader) throws -> PartitionContext {
+        try PartitionContext(incarnation: reader.readUInt64(), ownerGeneration: reader.readUInt64(), metadataOp: reader.readUInt64())
+    }
+}
+
 /// One partition of a topic.
 public struct Partition: Sendable, Hashable {
+    public var context: PartitionContext
     public var id: UInt32
     public var createdAt: IggyTimestamp
     public var segmentsCount: UInt32
@@ -214,7 +242,11 @@ public struct Partition: Sendable, Hashable {
     public var sizeBytes: UInt64
     public var messagesCount: UInt64
 
-    public init(id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64) {
+    public init(
+        id: UInt32, createdAt: IggyTimestamp, segmentsCount: UInt32, currentOffset: UInt64, sizeBytes: UInt64, messagesCount: UInt64,
+        context: PartitionContext = .empty
+    ) {
+        self.context = context
         self.id = id
         self.createdAt = createdAt
         self.segmentsCount = segmentsCount
@@ -551,13 +583,15 @@ public struct TransportEndpoints: Sendable, Hashable {
 
 /// One node of the cluster roster.
 public struct ClusterNode: Sendable, Hashable {
+    public var replicaID: UInt8
     public var name: String
     public var ip: String
     public var endpoints: TransportEndpoints
     public var role: ClusterNodeRole
     public var status: ClusterNodeStatus
 
-    public init(name: String, ip: String, endpoints: TransportEndpoints, role: ClusterNodeRole, status: ClusterNodeStatus) {
+    public init(replicaID: UInt8, name: String, ip: String, endpoints: TransportEndpoints, role: ClusterNodeRole, status: ClusterNodeStatus) {
+        self.replicaID = replicaID
         self.name = name
         self.ip = ip
         self.endpoints = endpoints

@@ -87,6 +87,10 @@ var goOperations = map[string]Operation{
 	"StoreConsumerOffset":             OperationStoreConsumerOffset,
 	"DeleteConsumerOffset":            OperationDeleteConsumerOffset,
 	"RetireSession":                   OperationRetireSession,
+	"CompleteLifecycle":               OperationCompleteLifecycle,
+	"InstallConsumerGroupOwner":       OperationInstallConsumerGroupOwner,
+	"RetireConsumerGroupOwners":       OperationRetireConsumerGroupOwners,
+	"TransitionPartitionHistory":      OperationTransitionPartitionHistory,
 }
 
 // goEvictionReasons names every eviction discriminant the codec declares.
@@ -129,6 +133,10 @@ var goHeaderOffsets = map[string]map[string]int{
 		"operation": requestOffsetOperation,
 		"session":   requestOffsetSession,
 		"reserved":  requestOffsetReserved,
+
+		"partition_incarnation": requestOffsetContext,
+		"owner_generation":      requestOffsetContext + 8,
+		"minimum_metadata_op":   requestOffsetContext + 16,
 	},
 	"ReplyHeader": {
 		"size":      replyOffsetSize,

@@ -33,7 +33,9 @@ use std::time::Duration;
 use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilder};
 use secrecy::SecretString;
 
-use iggy_gateway_kafka::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
+use iggy_gateway_kafka::bridge::{
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, ProduceSessionLimits, TopicMapping,
+};
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
 /// real ephemeral range leaves little room, but this crate never needs more than a handful live
@@ -239,7 +241,8 @@ pub struct TestServer {
     child: Child,
     address: String,
     password: String,
-    _port_guard: PortGuard,
+    /// `None` once [`Self::stop`] handed it to the caller.
+    port_guard: Option<PortGuard>,
 }
 
 impl TestServer {
@@ -306,10 +309,21 @@ impl TestServer {
             child,
             address,
             password: password.to_string(),
-            _port_guard: port_guard,
+            port_guard: Some(port_guard),
         };
         server.wait_ready().await;
         server
+    }
+
+    /// Stops the server and keeps its port until the returned guard drops. Without it, another
+    /// test's server can take the port while a client of this one still retries there.
+    pub fn stop(mut self) -> PortGuard {
+        let port_guard = self
+            .port_guard
+            .take()
+            .expect("a running server holds its port");
+        drop(self);
+        port_guard
     }
 
     /// Polls with a bare TCP connect, not a full `IggyBridge::connect`: the latter carries
@@ -332,6 +346,7 @@ impl TestServer {
             topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            produce_sessions: ProduceSessionLimits::default(),
         }
     }
 }

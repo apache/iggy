@@ -72,15 +72,17 @@ pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
     CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSession,
     ConsumerSessionHeartbeatHeader, DVC_HEADERS_MAX, DoViewChangeHeader, EvictionHeader,
-    EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader,
-    ForwardRegisterHeader, ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader,
-    HEADER_SIZE, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, Operation, PrepareHeader, PrepareOkHeader,
-    REJECTION_SECTION_LEN, RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader,
-    ReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET,
-    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
-    frame_body, frame_checksum_bytes, prepare_identity_checksum_bytes, read_size_field,
-    result_code, result_section_len, write_rejection_section,
+    EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutOutcome,
+    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
+    LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
+    Operation, PrepareHeader, PrepareOkHeader, REJECTION_SECTION_LEN, RESERVED_COMMAND_LEN,
+    RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
+    prepare_identity_checksum_bytes, read_size_field, result_code, result_section_len,
+    write_rejection_section,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
@@ -92,6 +94,7 @@ pub use primitives::consumer::{
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
 pub use primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions, validate_options};
 pub use primitives::partition_assignment::CreatedPartitionAssignment;
+pub use primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};
 pub use primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,

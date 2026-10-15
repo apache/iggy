@@ -217,6 +217,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
         await SendAckAsync(CommandCodes.DELETE_STREAM_CODE, message, token);
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -291,7 +292,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.DeleteTopic(streamId, topicId);
         await SendAckAsync(CommandCodes.DELETE_TOPIC_CODE, message, token);
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -335,18 +336,37 @@ public sealed partial class TcpMessageStream : IIggyClient
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
+        return PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, _ => pollingStrategy, count,
+            autoCommit, token);
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        CancellationToken token = default)
+    {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategyFor,
+            count, autoCommit, token);
+        return BinaryMapper.MaterializeMessages(rental);
+    }
+
+    /// <inheritdoc />
+    public Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId, Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count,
+        bool autoCommit, CancellationToken token = default)
+    {
         ThrowIfAutoCommitWithEncryptor(autoCommit);
 
         // The broker routes explicit partitions only, so a group poll picks one of the member's assigned
         // partitions client-side.
         if (consumer.Type == ConsumerType.ConsumerGroup && partitionId is null)
         {
-            return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategy, count, autoCommit,
+            return PollGroupMessagesRentedAsync(streamId, topicId, consumer, pollingStrategyFor, count, autoCommit,
                 token);
         }
 
-        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategy, count,
-            autoCommit, token);
+        return PollPartitionMessagesRentedAsync(streamId, topicId, partitionId, consumer,
+            pollingStrategyFor(partitionId ?? 0), count, autoCommit, token);
     }
 
     /// <inheritdoc />
@@ -354,14 +374,23 @@ public sealed partial class TcpMessageStream : IIggyClient
         uint? partitionId, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
-        await SendAckAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, token);
+        using var response = await SendWithResponseAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message, token: token);
+    }
+
+    /// <inheritdoc />
+    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
+        uint partitionId, PartitionContext context, CancellationToken token = default)
+    {
+        var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
+        using var response = await SendWithResponseAsync(CommandCodes.STORE_CONSUMER_OFFSET_CODE, message,
+            token: token, capturedContext: context);
     }
 
     /// <inheritdoc />
     public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
         uint? partitionId, CancellationToken token = default)
     {
-        var message = TcpContracts.GetOffset(streamId, topicId, consumer, partitionId);
+        var message = TcpContracts.GetOffset(streamId, topicId, consumer, partitionId ?? 0);
         using IMemoryOwner<byte> responseBuffer
             = await SendWithResponseAsync(CommandCodes.GET_CONSUMER_OFFSET_CODE, message, token: token);
 
@@ -378,7 +407,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         CancellationToken token = default)
     {
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
-        await SendAckAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message, token);
+        using var response = await SendWithResponseAsync(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, message, token: token);
     }
 
     /// <inheritdoc />
@@ -466,7 +495,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.DeletePartitions(streamId, topicId, partitionsCount);
         await SendAckAsync(CommandCodes.DELETE_PARTITIONS_CODE, message, token);
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -475,7 +504,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.CreatePartitions(streamId, topicId, partitionsCount);
         await SendAckAsync(CommandCodes.CREATE_PARTITIONS_CODE, message, token);
-        _groupState.InvalidatePartitionCount(new TopicKey(streamId, topicId));
+        _groupState.InvalidateTopicDiscovery();
     }
 
     /// <inheritdoc />
@@ -814,7 +843,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     ///     Connects and optionally leaves an authenticated roster walk on the endpoint it reached instead of
     ///     settling it back onto the metadata leader.
     /// </summary>
-    private async Task ConnectAsync(bool autoLogin, bool settleOnLeader, CancellationToken token)
+    private async Task ConnectAsync(bool autoLogin, bool settleOnLeader, CancellationToken token,
+        bool sameEndpointOnly = false)
     {
         if (State is ConnectionState.Connected
             or ConnectionState.Authenticating
@@ -846,7 +876,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             }
 
             SetConnectionState(ConnectionState.Connecting);
-            await TryEstablishConnectionAsync(autoLogin, settleOnLeader, token);
+            await TryEstablishConnectionAsync(autoLogin, settleOnLeader, token, sameEndpointOnly);
 
             // Dispose is synchronous and cannot take the sending semaphore, so a Dispose that ran while this
             // connect was dialing already read a connection that did not exist yet. Reading the flag after the
@@ -939,13 +969,11 @@ public sealed partial class TcpMessageStream : IIggyClient
         try
         {
             TcpContracts.GetMessages(payload.AsSpan(0, messageBufferSize), consumer, streamId,
-                topicId, pollingStrategy, count, autoCommit, partitionId);
+                topicId, pollingStrategy, count, autoCommit, partitionId ?? 0);
 
-            responseBuffer = autoCommit
-                ? await PollAutoCommitAsync(new PollRouteKey(streamId, topicId, consumer.Type,
-                        consumer.ConsumerId, partitionId), payload.AsMemory(0, messageBufferSize), token)
-                : await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE,
-                    payload.AsMemory(0, messageBufferSize), token: token);
+            var body = payload.AsMemory(0, messageBufferSize);
+            responseBuffer = await SendWithResponseAsync(CommandCodes.POLL_MESSAGES_CODE, body,
+                token: token, capturedContext: pollingStrategy.Context);
             if (responseBuffer.Memory.Length == 0)
             {
                 responseBuffer.Dispose();
@@ -1031,7 +1059,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         };
     }
 
-    private async Task TryEstablishConnectionAsync(bool autoLogin, bool settleOnLeader, CancellationToken token)
+    private async Task TryEstablishConnectionAsync(bool autoLogin, bool settleOnLeader, CancellationToken token,
+        bool sameEndpointOnly)
     {
         var retryCount = 0;
         var redirects = 0;
@@ -1043,7 +1072,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             _currentAddress = _configuration.BaseAddress;
         }
 
-        var candidates = DialCandidates();
+        var candidates = sameEndpointOnly ? [_currentAddress] : DialCandidates();
         var candidate = 0;
         do
         {
@@ -1078,7 +1107,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 // stack adds one: a node whose syns are dropped - or one that accepts TCP and then never
                 // answers the ClientHello - would hold the sweep, and the connection semaphore with it, for
                 // the whole kernel connect timeout while a survivor goes untried.
-                using var dialCancellation = candidates.Length > 1
+                using var dialCancellation = candidates.Length > 1 || sameEndpointOnly
                     ? CancellationTokenSource.CreateLinkedTokenSource(token)
                     : null;
                 dialCancellation?.CancelAfter(FailoverDialTimeout);
@@ -1196,7 +1225,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 // The sweep is what the reconnection budget applies to, not a single dial: checked per dial,
                 // the last round would try only the endpoint the client started on, and a client with
                 // reconnection turned off would never reach its other endpoints at all.
-                if (!_configuration.ReconnectionSettings.Enabled ||
+                if (sameEndpointOnly || !_configuration.ReconnectionSettings.Enabled ||
                     (_configuration.ReconnectionSettings.MaxRetries > 0 &&
                      retryCount >= _configuration.ReconnectionSettings.MaxRetries))
                 {
@@ -1374,11 +1403,49 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLoginOnReconnect = true, CancellationToken token = default)
+        bool autoLoginOnReconnect = true, CancellationToken token = default, PartitionContext? capturedContext = null)
+    {
+        if (code is CommandCodes.SEND_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_CODE
+            or CommandCodes.GET_CONSUMER_OFFSET_CODE or CommandCodes.STORE_CONSUMER_OFFSET_CODE
+            or CommandCodes.DELETE_CONSUMER_OFFSET_CODE)
+        {
+            return await SendRoutedAsync(code, PartitionTarget(code, body.Span), body, capturedContext, token);
+        }
+        return await SendRetryingLifecycleAsync(code, body, autoLoginOnReconnect, capturedContext ?? default, token);
+    }
+
+    /// <summary>
+    ///     A LifecycleBusy refusal is committed, so the request did not apply and goes out again as a new request
+    ///     with a new request id. The pause starts at <see cref="LifecycleRetryIntervalMs" />, doubles up to
+    ///     <see cref="LifecycleRetryMaxIntervalMs" /> and holds no lock, so other requests of this client keep
+    ///     flowing. The retries stop at the request deadline with the last refusal.
+    /// </summary>
+    private async Task<IMemoryOwner<byte>> SendRetryingLifecycleAsync(int code, ReadOnlyMemory<byte> body,
+        bool autoLoginOnReconnect, PartitionContext context, CancellationToken token)
+    {
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        var interval = LifecycleRetryIntervalMs;
+        while (true)
+        {
+            try
+            {
+                return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, context, token);
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.FromServer
+                && error.StatusCode == VsrError.LIFECYCLE_BUSY && Environment.TickCount64 + interval < deadline)
+            {
+                await Task.Delay(interval, token);
+                interval = Math.Min(interval * 2, LifecycleRetryMaxIntervalMs);
+            }
+        }
+    }
+
+    private async Task<IMemoryOwner<byte>> SendWithReconnectAsync(int code, ReadOnlyMemory<byte> body,
+        bool autoLoginOnReconnect, PartitionContext context, CancellationToken token)
     {
         try
         {
-            return await SendRawAsync(code, body, token);
+            return await SendRawAsync(code, body, token, context: context);
         }
         catch (Exception e) when (IsLostConnection(e) && !IsConnecting && !_disposed)
         {
@@ -1404,7 +1471,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 throw;
             }
 
-            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token);
+            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token, context);
         }
     }
 
@@ -1417,7 +1484,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLogin, CancellationToken token)
+        bool autoLogin, CancellationToken token, PartitionContext context)
     {
         var currentTime = DateTimeOffset.UtcNow;
         await _connectionSemaphore.WaitAsync(token);
@@ -1428,7 +1495,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 && _lastConnectionTime > currentTime)
             {
                 _logger.LogInformation("Connection already established, sending payload");
-                return await SendRawAsync(code, body, token);
+                return await SendRawAsync(code, body, token, context: context);
             }
 
             SetConnectionState(ConnectionState.Disconnected);
@@ -1439,7 +1506,7 @@ public sealed partial class TcpMessageStream : IIggyClient
 
             await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
 
-            return await SendRawAsync(code, body, token);
+            return await SendRawAsync(code, body, token, context: context);
         }
         finally
         {

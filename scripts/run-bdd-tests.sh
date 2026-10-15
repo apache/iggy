@@ -78,7 +78,8 @@ case "$FEATURE" in
 esac
 if [ "$COVERAGE" = "1" ]; then
   COMPOSE_FILES+=(-f docker-compose.coverage.yml)
-  mkdir -p ../reports
+  mkdir -p ../reports ../target
+  export BDD_SERVER_PROFILE_FILE="/profiles/bdd-server-%h-%p-%m.profraw"
 fi
 
 cleanup(){

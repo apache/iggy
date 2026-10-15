@@ -26,12 +26,12 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Bazel with cache
+    - name: Setup Bazel
       if: inputs.task != 'lint'
-      uses: ./.github/actions/utils/setup-cpp-with-cache
+      uses: ./.github/actions/utils/setup-cpp
 
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
 
     - name: Install clang-format
       if: inputs.task == 'lint'

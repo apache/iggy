@@ -43,6 +43,7 @@ import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.SendConfirmation;
 import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.Partition;
+import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.stream.StreamBase;
@@ -82,7 +83,7 @@ public final class BytesDeserializer {
 
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
-    private static final int MIN_CLUSTER_NODE_BYTES = 18;
+    private static final int MIN_CLUSTER_NODE_BYTES = 19;
     // A one-character key (length byte plus a byte of name), a kind byte, and
     // empty length-prefixed default and description.
     private static final int MIN_OPTION_SPEC_BYTES = 2 + 1 + 4 + 4;
@@ -132,6 +133,11 @@ public final class BytesDeserializer {
         return new TopicDetails(topic, partitions);
     }
 
+    public static PartitionContext readPartitionContext(ByteBuf response) {
+        return new PartitionContext(
+                readU64AsBigInteger(response), readU64AsBigInteger(response), readU64AsBigInteger(response));
+    }
+
     public static Partition readPartition(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var createdAt = readU64AsBigInteger(response);
@@ -139,7 +145,14 @@ public final class BytesDeserializer {
         var currentOffset = readU64AsBigInteger(response);
         var size = readU64AsBigInteger(response);
         var messagesCount = readU64AsBigInteger(response);
-        return new Partition(partitionId, createdAt, segmentsCount, currentOffset, size.toString(), messagesCount);
+        return new Partition(
+                partitionId,
+                createdAt,
+                segmentsCount,
+                currentOffset,
+                size.toString(),
+                messagesCount,
+                readPartitionContext(response));
     }
 
     public static Topic readTopic(ByteBuf response) {
@@ -249,11 +262,15 @@ public final class BytesDeserializer {
         var partitionId = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
         var messagesCount = response.readUnsignedIntLE();
+        var context = readPartitionContext(response);
         var messages = new ArrayList<Message>();
         while (response.isReadable()) {
             readBatchRecord(response, messages);
         }
-        return new PolledMessages(partitionId, currentOffset, messagesCount, messages);
+        if (messages.size() != messagesCount) {
+            throw new IggyMalformedResponseException("Poll count does not match its messages");
+        }
+        return new PolledMessages(partitionId, currentOffset, messagesCount, messages, context);
     }
 
     /**
@@ -541,6 +558,7 @@ public final class BytesDeserializer {
     }
 
     public static ClusterNode readClusterNode(ByteBuf response) {
+        int replicaId = response.readUnsignedByte();
         var name = readU32PrefixedString(response, "cluster node name");
         var ip = readU32PrefixedString(response, "cluster node ip");
         var tcpPort = response.readUnsignedShortLE();
@@ -550,7 +568,7 @@ public final class BytesDeserializer {
         var role = ClusterNodeRole.fromCode(response.readUnsignedByte());
         var status = ClusterNodeStatus.fromCode(response.readUnsignedByte());
         return new ClusterNode(
-                name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
+                replicaId, name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
     }
 
     public static UserInfoDetails readUserInfoDetails(ByteBuf response) {

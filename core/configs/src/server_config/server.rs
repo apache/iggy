@@ -57,6 +57,7 @@ const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_HOME",
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
+    "IGGY_TOKEN",
 ];
 
 /// Non-config env vars supported by the server and advertised to operators.

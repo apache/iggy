@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod get_partition_route;
 pub mod poll_messages;
 pub mod send_messages;
 
+pub use get_partition_route::GetPartitionRouteRequest;
 pub use poll_messages::PollMessagesRequest;
 pub use send_messages::{RawMessage, SendMessagesEncoder, SendMessagesHeader};

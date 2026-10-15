@@ -120,6 +120,29 @@ client.connect();
 client.users().login("iggy", "iggy");
 ```
 
+### Connection String
+
+`fromConnectionString` configures a TCP client from an `iggy://` connection string:
+
+```java
+// Blocking client
+var client = Iggy.tcpClientBuilder()
+    .fromConnectionString("iggy://iggy:iggy@localhost:8090")
+    .buildAndLogin();
+
+// Async client, with TLS and a custom CA certificate
+var asyncClient = Iggy.tcpClientBuilder()
+    .async()
+    .fromConnectionString("iggy+tcp://admin:secret@iggy-server.example.com:8090?tls=true&tls_ca_file=/certs/ca.pem")
+    .buildAndLogin()
+    .join();
+```
+
+The connection string accepts `iggy://` and `iggy+tcp://` with `<username>:<password>` credentials and the
+`tls` and `tls_ca_file` options, each at most once. `tls_ca_file` requires `tls=true`, and a string without `tls`
+keeps the TLS setting already on the builder. Personal access tokens and other options are not supported yet
+and are rejected with an `IggyInvalidArgumentException`.
+
 ### TCP Client (Async)
 
 ```java

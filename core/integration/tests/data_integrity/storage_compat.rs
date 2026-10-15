@@ -86,6 +86,7 @@ use iggy_common::wire_conversions::{
 };
 use integration::harness::{
     TestHarness, TestServerConfig, USER_PASSWORD, disk, resolve_config_paths,
+    wait_for_consumer_group_assignment,
 };
 use serial_test::parallel;
 use std::collections::{BTreeMap, HashMap};
@@ -218,12 +219,12 @@ const WAL_TAIL_PAT_EXPIRY_SECS: u64 = 3 * 24 * 60 * 60;
 /// Contiguous messages re-polled after the swap.
 const READBACK_COUNT: u32 = 16;
 
-/// Bound on every [`wait_until`] probe loop.
+/// Bound on every [`wait_until`] probe loop and on the group assignment wait.
 ///
 /// Kept small because the whole test has to finish inside nextest's 300s hard
 /// kill (`slow-timeout` x `terminate-after` in `.config/nextest.toml`, and the
 /// driving script deliberately runs without `--profile ci`). Two boots at 60s
-/// plus two stops at 5s plus five of these waits is 180s. A SIGKILL past
+/// plus two stops at 5s plus six of these waits is 190s. A SIGKILL past
 /// that budget would take the named `wait_until` message with it, losing the
 /// diagnostic in exactly the run that needed it. At a 200ms
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
@@ -423,10 +424,11 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .create_consumer_group(&data_stream, &data_topic, OFFSET_GROUP)
         .await
         .unwrap();
-    // Storing a GROUP offset is a partition op gated on membership: a caller
-    // that only created the group does not own the partition at the current
-    // generation, so the namespace resolve fails and the server replies
-    // ResourceNotFound with an empty body.
+    // Storing a GROUP offset is a partition op gated on ownership: a caller
+    // that only created the group owns no partition, so the server refuses
+    // the store. The join alone is not enough either: the group lists a
+    // partition under the member only once the partition durably installs
+    // that owner.
     client
         .join_consumer_group(
             &data_stream,
@@ -436,6 +438,15 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .await
         .unwrap();
     let offset_group = Consumer::group(Identifier::named(OFFSET_GROUP).unwrap());
+    wait_for_consumer_group_assignment(
+        &client,
+        &data_stream,
+        &data_topic,
+        &offset_group.id,
+        1,
+        SETTLE_TIMEOUT,
+    )
+    .await;
     client
         .store_consumer_offset(
             &offset_group,
@@ -1262,6 +1273,9 @@ async fn assert_topic_recovered(
         segment_size: seed.segment_size.and(recovered.segment_size),
         durability: recovered.durability,
         consumer_offset_durability: recovered.consumer_offset_durability,
+        partition_resize_policy: seed
+            .partition_resize_policy
+            .and(recovered.partition_resize_policy),
         messages_required_to_save: seed
             .messages_required_to_save
             .and(recovered.messages_required_to_save),

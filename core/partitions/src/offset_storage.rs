@@ -616,6 +616,37 @@ pub async fn delete_persisted_offset_with_storage<S: DurableStorage>(
     }
 }
 
+/// File in a partition's offsets directory that names the committed delete
+/// which emptied every offset kind.
+pub(crate) const EMPTIED_MARKER_FILE: &str = "emptied";
+
+/// Leave `emptied_at` in the emptied-table marker at `path`, and remove the
+/// marker for `0`.
+///
+/// Unlike an offset record, the marker is durable on return in every offset
+/// durability mode: a state transfer trusts it to erase a receiver's offsets,
+/// so it cannot wait for a checkpoint. It is replaced, never rewritten in
+/// place, so a hard-linked install backup keeps the prior value.
+///
+/// # Errors
+/// [`IggyError`] when the write, the unlink, or the directory sync fails.
+pub(crate) async fn persist_emptied_marker_with_storage<S: DurableStorage>(
+    storage: &S,
+    path: &str,
+    emptied_at: u64,
+) -> Result<(), IggyError> {
+    if emptied_at == 0 {
+        delete_persisted_offset_with_storage(storage, path).await?;
+    } else {
+        replace_file(storage, path, encode_offset_record(emptied_at), true).await?;
+    }
+    let parent = Path::new(path).parent().ok_or(IggyError::CannotSyncFile)?;
+    storage
+        .sync_directory(parent)
+        .await
+        .map_err(|_| IggyError::CannotSyncFile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

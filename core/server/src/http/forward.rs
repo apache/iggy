@@ -16,7 +16,7 @@
 // under the License.
 
 //! Follower-side forwarding of consensus-needing requests to the VSR
-//! metadata primary.
+//! primary that serves them.
 //!
 //! A load balancer that round-robins HTTP across the cluster lands writes and
 //! linearizable reads on followers, which cannot serve them: a follower can
@@ -26,11 +26,11 @@
 //! response on the original connection, so any node answers any request.
 //!
 //! Control-plane routes share the metadata primary as their forward target.
-//! Partition-write routes use a separate fallback: after a typed
-//! `TransientNotAccepted` response, walk the roster until the retry deadline.
-//! That denial proves the operation never entered a partition pipeline.
-//! Partition primaries can differ from the metadata primary, so this fallback
-//! cannot use the metadata leader as its sole target.
+//! Partition routes find the primary of their partition before dispatch. The
+//! contacted node chooses the partition and its context once, and relays the
+//! request with both in the `iggy-partition-route` header when another replica
+//! is the primary. The hop target serves exactly that partition or refuses
+//! with `NotPrimary`, which proves nothing was admitted, and never relays.
 //!
 //! Safety model, in order:
 //! - The bearer is verified locally (verify-only, no session mint) before any
@@ -42,24 +42,31 @@
 //! - The primary re-authenticates and re-authorizes the forwarded request
 //!   through its ordinary extractor stack; the forward marker header is a loop
 //!   guard only and never a trust input.
-//! - A forwarded request is retried only when it provably never entered the
-//!   primary's pipeline: a connect-phase failure, a 503 whose body carries the
-//!   `TransientNotAccepted` code, or a 307 from a stale target. Every other
-//!   outcome - including a 503 carrying `TransientNotCommitted`, whose op may
-//!   still commit - is relayed as-is, because re-issuing it under a fresh
+//! - The route header, like the marker, carries only values a caller can send
+//!   itself, so the hop target authenticates and authorizes the request again.
+//! - A forwarded write is retried only when it provably never entered the
+//!   primary's pipeline: a connect-phase failure, and for a metadata relay a
+//!   503 whose body carries the `TransientNotAccepted` or `NotPrimary` code or
+//!   a 307 from a stale target, for a partition relay a 503 carrying
+//!   `NotPrimary`. Every other outcome, including `TransientNotCommitted`, is
+//!   relayed as-is: its op may still commit, and re-issuing it under a fresh
 //!   session would defeat the consensus dedup and double-apply the op.
+//! - A partition read changes no state, so a transport failure after its send
+//!   is retried too: the resend cannot apply anything twice.
 //! - The target is always resolved from the local roster + consensus view,
 //!   never from a response `Location`, and the client follows no redirects.
 
 use std::cell::Cell;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
-use axum::extract::{Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -68,6 +75,7 @@ use bytes::Bytes;
 use configs::http::HttpTlsConfig;
 use consensus::MetadataHandle;
 use futures::{Stream, StreamExt};
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_common::IggyError;
 use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -76,15 +84,19 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
+use server_common::sharding::IggyNamespace;
+use shard::{PartitionRead, PartitionReadReply};
 use tracing::{debug, warn};
 
+use crate::dispatch::reads::hold_for_frontier;
 use crate::http::HttpState;
 use crate::http::error::{
     CustomError, error_response, gateway_timeout_response, primary_http_socket, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, resolve_credential};
-use crate::http::handlers::DURABILITY_HEADER;
-use crate::http::state::{APPLIED_OP_HEADER, ForwardState, HttpInner, VIEW_HEADER};
+use crate::http::state::{
+    APPLIED_OP_HEADER, DURABILITY_HEADER, ForwardState, HttpInner, VIEW_HEADER,
+};
 use crate::server_error::ServerError;
 
 /// Marker stamped on every forwarded request. Loop guard only: a node that is
@@ -95,12 +107,25 @@ use crate::server_error::ServerError;
 const FORWARDED_HEADER: HeaderName = HeaderName::from_static("iggy-forwarded");
 const FORWARDED_VALUE: HeaderValue = HeaderValue::from_static("1");
 
-/// Wall-clock bound on one forward attempt, including buffered replies but
-/// only up to the headers for a streamed poll. Above the primary's own 30s
-/// in-flight transient replay budget, so a
+/// The relay inputs a contacted node chose for a partition request, as
+/// `<partition_id>,<incarnation>,<owner_generation>,<metadata_op>,<budget_ms>`.
+const PARTITION_ROUTE_HEADER: HeaderName = HeaderName::from_static("iggy-partition-route");
+
+/// One bound for a partition request on the node that received it: the primary
+/// lookup, every relay attempt and a relayed poll body, the hop target's
+/// metadata hold, and the local lane and reply waits.
+pub(in crate::http) const PARTITION_REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Keeps the hop target's deadline before the contacted node's, so the hop
+/// target answers while the contacted node still waits for it.
+const RELAY_MARGIN: Duration = Duration::from_millis(100);
+
+/// Wall-clock bound on one metadata forward attempt, including its buffered
+/// reply. Above the primary's own 30s in-flight transient replay budget, so a
 /// legitimately slow commit is answered rather than cut mid-flight; without
 /// this cap a hung primary would park the connection for the whole retry
 /// budget with no per-attempt bound (the HTTP client itself has no timeout).
+/// A partition relay attempt ends at the request deadline instead.
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Cadence between retryable attempts, mirroring the binary SDKs' in-client
@@ -147,6 +172,100 @@ const RELAYED_RESPONSE_HEADERS: [HeaderName; 5] = [
     APPLIED_OP_HEADER,
     DURABILITY_HEADER,
 ];
+
+/// What a contacted node chose for a relayed partition request. The hop target
+/// serves exactly this partition under this context, so a keyed or balanced
+/// send is never placed twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::http) struct PartitionRoute {
+    pub(in crate::http) partition_id: u32,
+    pub(in crate::http) context: PartitionContext,
+    budget: Duration,
+}
+
+impl fmt::Display for PartitionRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{},{},{},{},{}",
+            self.partition_id,
+            self.context.incarnation,
+            self.context.owner_generation,
+            self.context.metadata_op,
+            self.budget.as_millis()
+        )
+    }
+}
+
+impl FromStr for PartitionRoute {
+    type Err = IggyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        fn number<T: FromStr>(field: Option<&str>) -> Result<T, IggyError> {
+            field
+                .and_then(|field| field.parse().ok())
+                .ok_or(IggyError::InvalidCommand)
+        }
+        let mut fields = value.split(',');
+        let route = Self {
+            partition_id: number(fields.next())?,
+            context: PartitionContext {
+                incarnation: number(fields.next())?,
+                owner_generation: number(fields.next())?,
+                metadata_op: number(fields.next())?,
+            },
+            budget: Duration::from_millis(number(fields.next())?),
+        };
+        if fields.next().is_some() {
+            return Err(IggyError::InvalidCommand);
+        }
+        Ok(route)
+    }
+}
+
+/// The place of a partition request in its single relay hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::http) enum PartitionHop {
+    /// No relay marker: this node chooses the partition and finds its primary.
+    Contacted,
+    /// Relayed with a route: this node serves that partition or refuses.
+    Target(PartitionRoute),
+    /// Relayed without a route, by an older build or by a caller that set the
+    /// marker: served here with this node's own choices and never relayed.
+    Unrouted,
+}
+
+/// Whether a partition request can change state on its primary, which decides
+/// what a relay may resend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::http) enum PartitionEffect {
+    /// An offset read, or a poll without `auto_commit`.
+    Read,
+    /// A send, an offset store or delete, or a poll with `auto_commit`.
+    Write,
+}
+
+/// A partition request as the route layer buffered it, so that its handler can
+/// relay it once the partition and context are fixed.
+#[derive(Debug)]
+pub(in crate::http) struct PartitionRequest {
+    method: Method,
+    /// Already the forwardable subset, with the relay marker.
+    headers: HeaderMap,
+    path_and_query: String,
+    body: Bytes,
+    pub(in crate::http) hop: PartitionHop,
+    pub(in crate::http) deadline: Instant,
+}
+
+impl PartitionRequest {
+    pub(in crate::http) const fn route(&self) -> Option<PartitionRoute> {
+        match self.hop {
+            PartitionHop::Target(route) => Some(route),
+            PartitionHop::Contacted | PartitionHop::Unrouted => None,
+        }
+    }
+}
 
 /// Build the [`ForwardState`] at listener startup.
 ///
@@ -241,19 +360,106 @@ pub(in crate::http) async fn forward_to_primary(
     SendWrapper::new(forward_or_pass(state, request, next)).await
 }
 
-/// Route-layer fallback for acknowledged partition writes over HTTP.
-///
-/// HTTP has no persistent leader-aware connection to retarget. Execute on the
-/// contacted node first, then retry across the configured HTTP nodes within
-/// the deadline after a typed `TransientNotAccepted` denial. That
-/// denial proves the write never entered a partition pipeline. Every ambiguous
-/// outcome is returned without replay.
-pub(in crate::http) async fn forward_partition_write(
+/// Route layer of the partition routes: buffer the request once and attach it
+/// as a [`PartitionRequest`], so its handler can relay it to the partition
+/// primary with [`route_partition`]. No attempt runs here.
+pub(in crate::http) async fn forward_partition_request(
     State(state): State<HttpState>,
     request: Request,
     next: Next,
 ) -> Response {
-    SendWrapper::new(forward_partition_or_pass(state, request, next)).await
+    SendWrapper::new(attach_partition_request(state, request, next)).await
+}
+
+/// Decide where a partition request runs once its partition and context are
+/// fixed. `None` serves it on this node. `Some` is the final answer: the reply
+/// of the partition primary, or a refusal that proves nothing was admitted.
+///
+/// Until the deadline, every hop waits for a view with a primary, because a
+/// new partition starts on each replica at its own pace. A hop target never
+/// relays: it refuses with `NotPrimary` when another replica is the primary,
+/// so a stale view never chains hops. The contacted node starts another turn
+/// only after such a proven non-admission, a failed connect, or a read that
+/// failed after its send.
+pub(in crate::http) async fn route_partition(
+    state: &HttpInner,
+    request: &PartitionRequest,
+    namespace: IggyNamespace,
+    context: PartitionContext,
+    effect: PartitionEffect,
+) -> Option<Response> {
+    if request.hop == PartitionHop::Unrouted {
+        return None;
+    }
+    let Ok(partition_id) = u32::try_from(namespace.partition_id()) else {
+        return Some(CustomError::from(IggyError::InvalidCommand).into_response());
+    };
+    let mut guard = None;
+    loop {
+        if let Some(primary) = partition_primary(state, namespace).await {
+            if is_local_replica(state, primary) {
+                return None;
+            }
+            if matches!(request.hop, PartitionHop::Target(_)) {
+                return Some(CustomError::from(IggyError::NotPrimary).into_response());
+            }
+            if !state.forward.active {
+                return Some(not_admitted());
+            }
+            if let Some(socket) = primary_http_socket(&state.roster, primary) {
+                let remaining = request.deadline.saturating_duration_since(Instant::now());
+                // A target without time would dispatch a write it cannot wait
+                // for and answer an unknown outcome.
+                if remaining <= RELAY_MARGIN {
+                    return Some(not_admitted());
+                }
+                if guard.is_none() {
+                    guard = ForwardGuard::admit(&state.forward.in_flight);
+                    if guard.is_none() {
+                        return Some(forward_busy());
+                    }
+                }
+                let route = PartitionRoute {
+                    partition_id,
+                    context,
+                    budget: remaining.saturating_sub(RELAY_MARGIN),
+                };
+                let Ok(route) = HeaderValue::try_from(route.to_string()) else {
+                    return Some(not_admitted());
+                };
+                let mut headers = request.headers.clone();
+                headers.insert(PARTITION_ROUTE_HEADER, route);
+                let url = format!(
+                    "{}://{socket}{}",
+                    state.forward.scheme, request.path_and_query
+                );
+                let outcome = attempt(
+                    state,
+                    &request.method,
+                    headers,
+                    &request.body,
+                    &url,
+                    RelayKind::Partition(effect),
+                    remaining,
+                )
+                .await;
+                if let AttemptOutcome::Relay(response) = outcome {
+                    return Some(match guard {
+                        Some(guard)
+                            if request.method == Method::GET && response.status().is_success() =>
+                        {
+                            retain_forward_guard(response, guard, FORWARD_ATTEMPT_TIMEOUT)
+                        }
+                        _ => response,
+                    });
+                }
+            }
+        }
+        if request.deadline.saturating_duration_since(Instant::now()) <= FORWARD_RETRY_INTERVAL {
+            return Some(not_admitted());
+        }
+        compio::time::sleep(FORWARD_RETRY_INTERVAL).await;
+    }
 }
 
 async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Response {
@@ -289,11 +495,7 @@ async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Resp
         Err(rejection) => return rejection.into_response(),
     };
     let Some(_guard) = ForwardGuard::admit(&state.forward.in_flight) else {
-        return with_retry_after(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "forward_busy",
-            "node is at its forward budget; retry with backoff",
-        ));
+        return forward_busy();
     };
     let response = forward(&state, request).await;
     record_relayed_floor(&state, user_id, &response);
@@ -332,18 +534,14 @@ fn record_relayed_floor(state: &HttpInner, user_id: u32, response: &Response) {
     state.metadata_watermarks.record(user_id, applied);
 }
 
-async fn forward_partition_or_pass(state: HttpState, request: Request, next: Next) -> Response {
-    if !state.forward.active || request.headers().contains_key(FORWARDED_HEADER) {
-        return next.run(request).await;
-    }
-    // A read that does not move consumer progress is answered by whichever
-    // replica the caller reached, which is the point of reading from one. Only
-    // an automatic commit needs a replica that can originate the offset
-    // operation, so only that poll pays for the buffering and the credential
-    // resolution below.
-    if request.method() == Method::GET && !wants_auto_commit(request.uri().query()) {
-        return next.run(request).await;
-    }
+async fn attach_partition_request(state: HttpState, request: Request, next: Next) -> Response {
+    let received = Instant::now();
+    let hop = match partition_hop(request.headers()) {
+        Ok(hop) => hop,
+        Err(error) => return CustomError::from(error).into_response(),
+    };
+    // Verify-only, like the metadata relay: an unauthenticated caller gets no
+    // buffered body and no relay. The handler authenticates again.
     let bearer = match bearer_token(request.headers()) {
         Ok(bearer) => bearer,
         Err(error) => return CustomError::from(error).into_response(),
@@ -351,8 +549,15 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
     if let Err(rejection) = resolve_credential(&state, bearer).await {
         return rejection.into_response();
     }
-
-    let (parts, request_body) = request.into_parts();
+    let _guard = if matches!(hop, PartitionHop::Target(_)) {
+        let Some(guard) = ForwardGuard::admit(&state.forward.in_flight) else {
+            return forward_busy();
+        };
+        Some(guard)
+    } else {
+        None
+    };
+    let (mut parts, request_body) = request.into_parts();
     let Ok(body) = to_bytes(request_body, state.forward.body_limit).await else {
         return error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -360,64 +565,38 @@ async fn forward_partition_or_pass(state: HttpState, request: Request, next: Nex
             "request body exceeds http.max_request_size",
         );
     };
-    let method = parts.method.clone();
-    let request_headers = parts.headers.clone();
-    let path_and_query = parts
-        .uri
-        .path_and_query()
-        .map_or("/", |path_and_query| path_and_query.as_str())
-        .to_owned();
-    let local = next
-        .run(Request::from_parts(parts, Body::from(body.clone())))
-        .await;
-    if let AttemptOutcome::Relay(response) = classify_local_partition_reply(local).await {
-        return response;
+    let deadline = received
+        + match hop {
+            PartitionHop::Target(route) => route.budget.min(PARTITION_REQUEST_DEADLINE),
+            PartitionHop::Contacted | PartitionHop::Unrouted => PARTITION_REQUEST_DEADLINE,
+        };
+    // The contacted node chose the partition from metadata at this op. Before
+    // that op is applied here, the topic or the partition may not exist yet,
+    // and the handler would answer 404 for a request it can serve.
+    if let PartitionHop::Target(route) = hop {
+        let frontier = state.shard.plane.metadata().applied_frontier();
+        let budget = compio::time::sleep(deadline.saturating_duration_since(Instant::now()));
+        if hold_for_frontier(frontier, route.context.metadata_op, budget)
+            .await
+            .is_err()
+        {
+            return not_admitted();
+        }
     }
-
-    let Some(guard) = ForwardGuard::admit(&state.forward.in_flight) else {
-        return with_retry_after(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "forward_busy",
-            "node is at its forward budget; retry with backoff",
-        ));
+    let partition_request = PartitionRequest {
+        method: parts.method.clone(),
+        headers: forwarded_headers(&parts.headers),
+        path_and_query: parts
+            .uri
+            .path_and_query()
+            .map_or("/", |path_and_query| path_and_query.as_str())
+            .to_owned(),
+        body: body.clone(),
+        hop,
+        deadline,
     };
-    let self_id = state
-        .shard
-        .plane
-        .metadata()
-        .consensus
-        .as_ref()
-        .map(consensus::VsrConsensus::replica);
-    let deadline = Instant::now() + FORWARD_RETRY_DEADLINE;
-    let mut skip_node = self_id;
-    loop {
-        for socket in partition_http_sockets(&state.roster, skip_node) {
-            if Instant::now() >= deadline {
-                break;
-            }
-            let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
-            match attempt(&state, &method, &request_headers, &body, &url, false).await {
-                AttemptOutcome::Relay(response) => {
-                    return if method == Method::GET && response.status().is_success() {
-                        retain_forward_guard(response, guard, FORWARD_ATTEMPT_TIMEOUT)
-                    } else {
-                        response
-                    };
-                }
-                AttemptOutcome::Retry => {}
-            }
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining <= FORWARD_RETRY_INTERVAL {
-            break;
-        }
-        // The local replica may become primary during a view change. Its
-        // forwarded marker prevents another roster walk on the loopback hop.
-        skip_node = None;
-        compio::time::sleep(FORWARD_RETRY_INTERVAL).await;
-    }
-
-    with_retry_after(CustomError::from(IggyError::TransientNotAccepted).into_response())
+    parts.extensions.insert(Arc::new(partition_request));
+    next.run(Request::from_parts(parts, Body::from(body))).await
 }
 
 /// Buffer the request and drive forward attempts until one yields a relayable
@@ -446,7 +625,16 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
             None => AttemptOutcome::Retry,
             Some(socket) => {
                 let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
-                attempt(state, &parts.method, &parts.headers, &body, &url, true).await
+                attempt(
+                    state,
+                    &parts.method,
+                    forwarded_headers(&parts.headers),
+                    &body,
+                    &url,
+                    RelayKind::Metadata,
+                    FORWARD_ATTEMPT_TIMEOUT,
+                )
+                .await
             }
         };
         match outcome {
@@ -473,19 +661,35 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
 enum AttemptOutcome {
     /// Terminal: hand this response to the client.
     Relay(Response),
-    /// The request provably never entered a pipeline; re-resolve and retry.
+    /// A resend cannot apply anything twice: either nothing was admitted, or
+    /// the request is a read. Re-resolve and retry.
     Retry,
 }
 
-/// Bound connect, send and buffered replies by [`FORWARD_ATTEMPT_TIMEOUT`].
-/// Successful polls return after their headers and have a separate body deadline.
+/// What a relay may retry on besides a failed connect: a reply that proves
+/// nothing was admitted, or a transport failure of a partition read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayKind {
+    /// The target was not the metadata primary: a 307, or a 503 whose op never
+    /// entered a pipeline.
+    Metadata,
+    /// The target was not the partition primary: a 503 carrying `NotPrimary`.
+    /// Any other 503 goes back to the caller, because the target was the
+    /// primary and refused for a reason another turn cannot change. A read
+    /// also retries a transport failure after its send.
+    Partition(PartitionEffect),
+}
+
+/// Bound connect, send and buffered replies by `timeout`. Successful partition
+/// polls return after their headers and have a separate body deadline.
 async fn attempt(
     state: &HttpInner,
     method: &Method,
-    request_headers: &HeaderMap,
+    headers: HeaderMap,
     body: &Bytes,
     url: &str,
-    retry_redirect: bool,
+    kind: RelayKind,
+    timeout: Duration,
 ) -> AttemptOutcome {
     let builder = match state.forward.client.request(method.clone(), url) {
         Ok(builder) => builder,
@@ -494,33 +698,38 @@ async fn attempt(
             return AttemptOutcome::Relay(bad_gateway());
         }
     };
-    let request = builder
-        .headers(forwarded_headers(request_headers))
-        .body(body.clone())
-        .build();
+    let request = builder.headers(headers).body(body.clone()).build();
     let attempt = async {
         let response = match state.forward.client.execute(request).await {
             Ok(response) => response,
-            Err(error) => return classify_transport_error(&error),
+            Err(error) => return classify_transport_error(&error, kind),
         };
-        classify_forwarded_reply(response, method, retry_redirect).await
+        classify_forwarded_reply(response, method, kind).await
     };
-    match compio::time::timeout(FORWARD_ATTEMPT_TIMEOUT, attempt).await {
-        // Elapsed: the request may be mid-commit on the primary. Outcome
-        // unknown, so never retried - 504, same contract as a local commit
-        // wait that timed out.
-        Err(_elapsed) => AttemptOutcome::Relay(gateway_timeout_response(
-            "forward_timeout",
-            "the primary did not answer the forwarded request in time; the outcome is unknown",
-        )),
+    match compio::time::timeout(timeout, attempt).await {
+        Err(_elapsed) => AttemptOutcome::Relay(forward_timeout(kind)),
         Ok(outcome) => outcome,
     }
+}
+
+fn forward_timeout(kind: RelayKind) -> Response {
+    if kind == RelayKind::Partition(PartitionEffect::Read) {
+        return with_retry_after(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forward_timeout",
+            "the primary did not answer the forwarded read in time; retry",
+        ));
+    }
+    gateway_timeout_response(
+        "forward_timeout",
+        "the primary did not answer the forwarded request in time; the outcome is unknown",
+    )
 }
 
 async fn classify_forwarded_reply(
     response: cyper::Response,
     method: &Method,
-    retry_redirect: bool,
+    kind: RelayKind,
 ) -> AttemptOutcome {
     let status = response.status();
     // Only the relayed subset survives; the response is consumed by the
@@ -532,7 +741,7 @@ async fn classify_forwarded_reply(
             Some((name, value))
         })
         .collect();
-    if method == Method::GET && !retry_redirect && status.is_success() {
+    if method == Method::GET && matches!(kind, RelayKind::Partition(_)) && status.is_success() {
         let mut response = Response::new(stream_poll_body(response.bytes_stream()));
         *response.status_mut() = status;
         for (name, value) in relayed_headers {
@@ -560,10 +769,7 @@ async fn classify_forwarded_reply(
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(chunk) => chunk,
-            Err(error) => {
-                warn!(%error, "forward response body read failed; outcome unknown");
-                return AttemptOutcome::Relay(bad_gateway());
-            }
+            Err(error) => return classify_transport_error(&error, kind),
         };
         if body.len() + chunk.len() > RESPONSE_BODY_LIMIT {
             warn!(
@@ -574,7 +780,7 @@ async fn classify_forwarded_reply(
         }
         body.extend_from_slice(&chunk);
     }
-    classify_reply(status, relayed_headers, Bytes::from(body), retry_redirect)
+    classify_reply(status, relayed_headers, Bytes::from(body), kind)
 }
 
 fn stream_poll_body(stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 'static) -> Body {
@@ -592,33 +798,42 @@ fn stream_poll_body(stream: impl Stream<Item = Result<Bytes, cyper::Error>> + 's
     Body::from_stream(SendWrapper::new(stream))
 }
 
-fn retain_forward_guard(response: Response, guard: ForwardGuard, timeout: Duration) -> Response {
+fn retain_forward_guard(
+    response: Response,
+    guard: ForwardGuard,
+    idle_timeout: Duration,
+) -> Response {
     let (parts, body) = response.into_parts();
     let (sender, receiver) = async_channel::bounded(1);
     // The timer must run even when the downstream connection stops polling its
     // body. One queued chunk bounds read-ahead; dropping the body cancels the task.
     let task = compio::runtime::spawn(async move {
         let mut stream = body.into_data_stream();
-        let relay = async {
-            while let Some(chunk) = stream.next().await {
-                if sender
-                    .send(chunk.map_err(std::io::Error::other))
-                    .await
-                    .is_err()
-                {
-                    return;
+        loop {
+            let relay_chunk = async {
+                match stream.next().await {
+                    Some(chunk) => sender
+                        .send(chunk.map_err(std::io::Error::other))
+                        .await
+                        .is_ok(),
+                    None => false,
+                }
+            };
+            match compio::time::timeout(idle_timeout, relay_chunk).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(_) => {
+                    drop(stream);
+                    drop(guard);
+                    // Discard a queued chunk so a stalled reader still receives
+                    // an explicit body error instead of mistaking timeout for EOF.
+                    let _ = sender.force_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "forwarded poll response stalled",
+                    )));
+                    break;
                 }
             }
-        };
-        if compio::time::timeout(timeout, relay).await.is_err() {
-            drop(stream);
-            drop(guard);
-            // Discard a queued chunk so a stalled reader still receives an
-            // explicit body error instead of mistaking the timeout for EOF.
-            let _ = sender.force_send(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "forwarded poll response deadline exceeded",
-            )));
         }
     });
     let stream = futures::stream::unfold((receiver, task), |(receiver, task)| async move {
@@ -633,8 +848,8 @@ fn retain_forward_guard(response: Response, guard: ForwardGuard, timeout: Durati
 
 /// Copy the forwardable request headers: the bearer (the primary
 /// re-authenticates it) and the content type. Everything else - including any
-/// client-supplied forward marker, which `forward_or_pass` already bounced -
-/// is dropped, then the loop-guard marker is stamped fresh.
+/// client-supplied forward marker or partition route - is dropped, then the
+/// loop-guard marker is stamped fresh.
 fn forwarded_headers(request_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for name in [AUTHORIZATION, CONTENT_TYPE] {
@@ -646,19 +861,24 @@ fn forwarded_headers(request_headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
-/// Grade a transport-level failure. Only a connect-phase error - the request
-/// was never written - may retry; anything later (reset mid-request, a broken
-/// body read) leaves the outcome unknown and must surface, because the
-/// primary may have committed the op and a re-issue would double-apply it.
-/// A pooled connection that dies before the request is written also lands in
-/// the relay arm (hyper exposes no sound never-sent predicate): that spurious
-/// 502 is the safe side, and hyper's own canceled-request retry for buffered
-/// bodies absorbs most of it.
-fn classify_transport_error(error: &cyper::Error) -> AttemptOutcome {
+/// Grade a transport-level failure. A connect-phase error - the request was
+/// never written - may retry, and so may any failure of a partition read,
+/// which changes no state. For any other request a later failure (reset
+/// mid-request, a broken body read) leaves the outcome unknown and must
+/// surface, because the primary may have committed the op and a re-issue
+/// would double-apply it. Such a request on a pooled connection that dies
+/// before the request is written also lands in the relay arm (hyper exposes
+/// no sound never-sent predicate): that spurious 502 is the safe side, and
+/// hyper's own canceled-request retry for buffered bodies absorbs most of it.
+fn classify_transport_error(error: &cyper::Error, kind: RelayKind) -> AttemptOutcome {
     if let cyper::Error::HyperClient(client_error) = error
         && client_error.is_connect()
     {
         debug!(%error, "forward connect failed; re-resolving primary");
+        return AttemptOutcome::Retry;
+    }
+    if kind == RelayKind::Partition(PartitionEffect::Read) {
+        debug!(%error, "relayed read failed after its send; re-resolving primary");
         return AttemptOutcome::Retry;
     }
     warn!(%error, "forward transport error after connect; outcome unknown");
@@ -667,22 +887,33 @@ fn classify_transport_error(error: &cyper::Error) -> AttemptOutcome {
 
 /// Grade a complete reply from the target.
 ///
-/// A 307 means the target itself was not primary and knows a better one; the
-/// retry re-resolves from the LOCAL view instead of trusting the `Location`.
-/// A 503 is retried only when its body carries the `TransientNotAccepted`
-/// code (never entered a pipeline; also what the hop guard answers) - a
-/// `TransientNotCommitted` 503 may still commit and is relayed untouched.
-/// Everything else is the primary's answer and is relayed.
+/// A 307 means the target itself was not the metadata primary and knows a
+/// better one; the retry re-resolves from the LOCAL view instead of trusting
+/// the `Location`. A 503 is retried only when its body proves the target was
+/// not the primary for this [`RelayKind`] - a `TransientNotCommitted` 503 may
+/// still commit and is relayed untouched. Everything else is the primary's
+/// answer and is relayed.
 fn classify_reply(
     status: StatusCode,
     relayed_headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
-    retry_redirect: bool,
+    kind: RelayKind,
 ) -> AttemptOutcome {
-    if retry_redirect && status == StatusCode::TEMPORARY_REDIRECT {
-        return AttemptOutcome::Retry;
-    }
-    if status == StatusCode::SERVICE_UNAVAILABLE && is_transient_not_accepted_body(&body) {
+    let not_primary = match kind {
+        RelayKind::Metadata => {
+            status == StatusCode::TEMPORARY_REDIRECT
+                || (status == StatusCode::SERVICE_UNAVAILABLE
+                    && error_code(&body).is_some_and(|code| {
+                        code == IggyError::TransientNotAccepted.as_code()
+                            || code == IggyError::NotPrimary.as_code()
+                    }))
+        }
+        RelayKind::Partition(_) => {
+            status == StatusCode::SERVICE_UNAVAILABLE
+                && error_code(&body) == Some(IggyError::NotPrimary.as_code())
+        }
+    };
+    if not_primary {
         return AttemptOutcome::Retry;
     }
     let mut response = Response::new(Body::from(body));
@@ -693,36 +924,16 @@ fn classify_reply(
     AttemptOutcome::Relay(response)
 }
 
-/// Inspect a response produced on this node without changing any terminal
-/// response. Only the typed never-admitted denial opens the roster fallback.
-async fn classify_local_partition_reply(response: Response) -> AttemptOutcome {
-    if response.status() != StatusCode::SERVICE_UNAVAILABLE {
-        return AttemptOutcome::Relay(response);
-    }
-    let (parts, body) = response.into_parts();
-    let body = match to_bytes(body, RESPONSE_BODY_LIMIT).await {
-        Ok(body) => body,
-        Err(error) => {
-            warn!(%error, "local partition response body read failed; outcome unknown");
-            return AttemptOutcome::Relay(bad_gateway());
-        }
-    };
-    if is_transient_not_accepted_body(&body) {
-        return AttemptOutcome::Retry;
-    }
-    AttemptOutcome::Relay(Response::from_parts(parts, Body::from(body)))
-}
-
-/// True when a 503 body is the JSON `ErrorResponse` whose `id` is the
-/// `TransientNotAccepted` code. Unparsable or foreign bodies are NOT
-/// transient: when in doubt the reply is relayed, never retried.
-fn is_transient_not_accepted_body(body: &[u8]) -> bool {
+/// The `id` of a JSON `ErrorResponse` body. Unparsable or foreign bodies have
+/// none, so when in doubt a reply is relayed, never retried.
+fn error_code(body: &[u8]) -> Option<u32> {
     #[derive(Deserialize)]
     struct ErrorId {
         id: u32,
     }
     serde_json::from_slice::<ErrorId>(body)
-        .is_ok_and(|error| error.id == IggyError::TransientNotAccepted.as_code())
+        .ok()
+        .map(|error| error.id)
 }
 
 /// HTTP socket of the current metadata primary, from the live consensus view
@@ -734,42 +945,57 @@ fn primary_socket(state: &HttpInner) -> Option<SocketAddr> {
     primary_http_socket(&state.roster, primary_index)
 }
 
-/// Private HTTP sockets for every other configured replica, in stable roster
-/// order. The caller tries each once. HTTP-disabled entries are skipped
-/// because they cannot accept the forwarded request.
-fn partition_http_sockets(
-    roster: &crate::cluster_meta::ClusterRoster,
-    self_id: Option<u8>,
-) -> Vec<SocketAddr> {
-    roster
-        .nodes
-        .iter()
-        .filter(|node| Some(node.config().replica_id) != self_id)
-        .filter_map(|node| {
-            Some(SocketAddr::new(
-                node.replica_ip(),
-                node.config().ports.http?,
-            ))
-        })
-        .collect()
+/// Read the relay marker and the partition route of a request. Only a marked
+/// request carries a route, and a malformed one is the caller's error.
+fn partition_hop(headers: &HeaderMap) -> Result<PartitionHop, IggyError> {
+    if !headers.contains_key(FORWARDED_HEADER) {
+        return Ok(PartitionHop::Contacted);
+    }
+    let Some(route) = headers.get(PARTITION_ROUTE_HEADER) else {
+        return Ok(PartitionHop::Unrouted);
+    };
+    route
+        .to_str()
+        .map_err(|_| IggyError::InvalidCommand)?
+        .parse()
+        .map(PartitionHop::Target)
 }
 
-/// Whether a poll asks the server to store its offset after serving it.
-///
-/// Match the handler's URL decoding and boolean parsing. An invalid query
-/// reaches the handler through the forwarding layer for its normal rejection.
-fn wants_auto_commit(query: Option<&str>) -> bool {
-    #[derive(Default, Deserialize)]
-    struct AutoCommitQuery {
-        #[serde(default)]
-        auto_commit: bool,
+/// The primary replica of the partition group in this replica's view. `None`
+/// while the group has no usable view here: view change, state transfer or a
+/// partition that is not materialized yet.
+async fn partition_primary(state: &HttpInner, namespace: IggyNamespace) -> Option<u8> {
+    match state
+        .shard
+        .partition_read(namespace, PartitionRead::Primary)
+        .await?
+    {
+        PartitionReadReply::Primary { primary, .. } => Some(primary),
+        _ => None,
     }
-    query.is_some_and(|query| {
-        let Ok(uri) = format!("/?{query}").parse() else {
-            return true;
-        };
-        Query::<AutoCommitQuery>::try_from_uri(&uri).map_or(true, |Query(query)| query.auto_commit)
-    })
+}
+
+fn is_local_replica(state: &HttpInner, replica: u8) -> bool {
+    state
+        .shard
+        .plane
+        .metadata()
+        .consensus
+        .as_ref()
+        .is_none_or(|consensus| consensus.replica() == replica)
+}
+
+/// The refusal that proves nothing was admitted, safe to re-issue anywhere.
+fn not_admitted() -> Response {
+    CustomError::from(IggyError::TransientNotAccepted).into_response()
+}
+
+fn forward_busy() -> Response {
+    with_retry_after(error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "forward_busy",
+        "node is at its forward budget; retry with backoff",
+    ))
 }
 
 fn wants_linearizable(query: Option<&str>) -> bool {
@@ -870,39 +1096,16 @@ mod tests {
 
     use std::io::{Read, Write};
 
-    use configs::cluster::{ClusterNodeConfig, ResolvedClusterNode, TransportPorts};
-
-    fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
-        ClusterNodeConfig {
-            name: format!("node-{replica_id}"),
-            ip: ip.to_owned(),
-            advertised_address: None,
-            advertised_addresses: Vec::new(),
-            replica_id,
-            ports: TransportPorts {
-                tcp: None,
-                quic: None,
-                http,
-                websocket: None,
-                tcp_replica: None,
-            },
-        }
-    }
-
-    fn roster(nodes: Vec<ClusterNodeConfig>) -> crate::cluster_meta::ClusterRoster {
-        crate::cluster_meta::ClusterRoster {
-            enabled: true,
-            name: "test-cluster".to_owned(),
-            nodes: nodes
-                .into_iter()
-                .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
-                .collect(),
-            self_advertised: "127.0.0.1".to_owned(),
-            configured_ports: TransportPorts::default(),
-            bound_ports: Arc::default(),
-            metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                crate::cluster_meta::METADATA_VIEW_UNKNOWN,
-            )),
+    #[test]
+    fn given_relay_timeout_when_request_is_read_only_should_report_retryable_unavailability() {
+        let response = forward_timeout(RelayKind::Partition(PartitionEffect::Read));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        for kind in [
+            RelayKind::Metadata,
+            RelayKind::Partition(PartitionEffect::Write),
+        ] {
+            assert_eq!(forward_timeout(kind).status(), StatusCode::GATEWAY_TIMEOUT);
         }
     }
 
@@ -916,34 +1119,145 @@ mod tests {
     }
 
     #[test]
-    fn auto_commit_query_matches_handler_decoding() {
-        assert!(wants_auto_commit(Some("auto_commit=true")));
-        assert!(wants_auto_commit(Some("auto_commit=1")));
-        assert!(wants_auto_commit(Some("count=10&auto_commit=true")));
-        assert!(wants_auto_commit(Some("auto_commit=yes")));
-        assert!(!wants_auto_commit(Some("auto_commit=false")));
-        assert!(wants_auto_commit(Some("auto_commit=0")));
-        assert!(!wants_auto_commit(Some("count=10")));
-        assert!(!wants_auto_commit(None));
-        assert!(wants_auto_commit(Some("%61uto_commit=true")));
-        assert!(wants_auto_commit(Some("auto_commit=%74rue")));
-        assert!(!wants_auto_commit(Some("%61uto_commit=%66alse")));
+    fn partition_route_header_round_trips() {
+        let route = PartitionRoute {
+            partition_id: 3,
+            context: PartitionContext {
+                incarnation: 7,
+                owner_generation: 0,
+                metadata_op: 41,
+            },
+            budget: Duration::from_millis(9_900),
+        };
+        assert_eq!(route.to_string(), "3,7,0,41,9900");
+        assert_eq!(route.to_string().parse::<PartitionRoute>(), Ok(route));
     }
 
     #[test]
-    fn transient_not_accepted_body_matches_only_its_code() {
-        let accepted = format!(
-            r#"{{"id":{},"code":"transient_not_accepted","reason":"x","field":null}}"#,
-            IggyError::TransientNotAccepted.as_code()
+    fn partition_route_header_refuses_malformed_values() {
+        for malformed in [
+            "",
+            "3,7,0,41",
+            "3,7,0,41,9900,1",
+            "3,7,0,41,soon",
+            "-3,7,0,41,9900",
+            "3,,0,41,9900",
+            "4294967296,7,0,41,9900",
+        ] {
+            assert_eq!(
+                malformed.parse::<PartitionRoute>(),
+                Err(IggyError::InvalidCommand),
+                "{malformed:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_marked_request_reads_its_partition_route() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            PARTITION_ROUTE_HEADER,
+            HeaderValue::from_static("3,7,0,41,9900"),
         );
-        let committed = format!(
-            r#"{{"id":{},"code":"transient_not_committed","reason":"x","field":null}}"#,
-            IggyError::TransientNotCommitted.as_code()
-        );
-        assert!(is_transient_not_accepted_body(accepted.as_bytes()));
-        assert!(!is_transient_not_accepted_body(committed.as_bytes()));
-        assert!(!is_transient_not_accepted_body(b"not json"));
-        assert!(!is_transient_not_accepted_body(b"{}"));
+        assert_eq!(partition_hop(&headers), Ok(PartitionHop::Contacted));
+
+        headers.insert(FORWARDED_HEADER, FORWARDED_VALUE);
+        let Ok(PartitionHop::Target(parsed)) = partition_hop(&headers) else {
+            panic!("a marked request must carry its route")
+        };
+        assert_eq!(parsed.partition_id, 3);
+        assert_eq!(parsed.context.metadata_op, 41);
+
+        headers.remove(PARTITION_ROUTE_HEADER);
+        assert_eq!(partition_hop(&headers), Ok(PartitionHop::Unrouted));
+
+        headers.insert(PARTITION_ROUTE_HEADER, HeaderValue::from_static("3,7"));
+        assert_eq!(partition_hop(&headers), Err(IggyError::InvalidCommand));
+    }
+
+    #[test]
+    fn each_relay_kind_retries_only_its_proof_of_non_admission() {
+        fn reply(status: StatusCode, code: Option<u32>, kind: RelayKind) -> bool {
+            let body = code.map_or_else(Bytes::new, |code| {
+                Bytes::from(format!(
+                    r#"{{"id":{code},"code":"x","reason":"x","field":null}}"#
+                ))
+            });
+            matches!(
+                classify_reply(status, Vec::new(), body, kind),
+                AttemptOutcome::Retry
+            )
+        }
+        let unavailable = StatusCode::SERVICE_UNAVAILABLE;
+        let redirect = StatusCode::TEMPORARY_REDIRECT;
+        let not_primary = Some(IggyError::NotPrimary.as_code());
+        let not_accepted = Some(IggyError::TransientNotAccepted.as_code());
+        let not_committed = Some(IggyError::TransientNotCommitted.as_code());
+
+        for effect in [PartitionEffect::Read, PartitionEffect::Write] {
+            let kind = RelayKind::Partition(effect);
+            assert!(reply(unavailable, not_primary, kind));
+            assert!(!reply(unavailable, not_accepted, kind));
+            assert!(!reply(unavailable, not_committed, kind));
+            assert!(!reply(redirect, None, kind));
+            assert!(!reply(StatusCode::OK, None, kind));
+        }
+
+        assert!(reply(unavailable, not_accepted, RelayKind::Metadata));
+        assert!(reply(unavailable, not_primary, RelayKind::Metadata));
+        assert!(reply(redirect, None, RelayKind::Metadata));
+        assert!(!reply(unavailable, not_committed, RelayKind::Metadata));
+        assert!(!reply(unavailable, None, RelayKind::Metadata));
+    }
+
+    #[compio::test]
+    async fn only_a_partition_read_retries_a_failure_after_its_send() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let forward =
+            build_forward_state(&HttpTlsConfig::default(), 1024, true).expect("forward client");
+        let kinds = [
+            (RelayKind::Partition(PartitionEffect::Read), true),
+            (RelayKind::Partition(PartitionEffect::Write), false),
+            (RelayKind::Metadata, false),
+        ];
+        let connections = kinds.len();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("HTTP listener");
+        let address = listener.local_addr().expect("listener address");
+        // Each connection closes once its request arrived, as a primary that
+        // dies under a relayed request does.
+        let server = std::thread::spawn(move || {
+            for _ in 0..connections {
+                let (mut socket, _) = listener.accept().expect("client connection");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let mut bytes = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut bytes).expect("request bytes");
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&bytes[..read]);
+                }
+            }
+        });
+        for (kind, retries) in kinds {
+            let error = forward
+                .client
+                .get(format!("http://{address}/consumer-offsets"))
+                .expect("offset request")
+                .send()
+                .await
+                .expect_err("the target closed without a reply");
+            assert_eq!(
+                matches!(
+                    classify_transport_error(&error, kind),
+                    AttemptOutcome::Retry
+                ),
+                retries,
+                "{kind:?} after {error}"
+            );
+        }
+        server.join().expect("HTTP server finished");
     }
 
     #[test]
@@ -956,61 +1270,6 @@ mod tests {
         drop(guards);
         assert_eq!(in_flight.get(), 0);
         assert!(ForwardGuard::admit(&in_flight).is_some());
-    }
-
-    #[test]
-    fn partition_roster_walk_skips_self_and_undialable_nodes_once() {
-        let roster = roster(vec![
-            node(0, "10.0.0.1", Some(8080)),
-            node(1, "10.0.0.2", Some(8081)),
-            node(2, "10.0.0.3", None),
-        ]);
-
-        assert_eq!(
-            partition_http_sockets(&roster, Some(0)),
-            vec!["10.0.0.2:8081".parse().expect("valid socket")]
-        );
-    }
-
-    #[compio::test]
-    async fn partition_fallback_opens_only_for_typed_never_admitted_reply() {
-        let retry = classify_local_partition_reply(
-            CustomError::from(IggyError::TransientNotAccepted).into_response(),
-        )
-        .await;
-        assert!(matches!(retry, AttemptOutcome::Retry));
-
-        let terminal = classify_local_partition_reply(
-            CustomError::from(IggyError::TransientNotCommitted).into_response(),
-        )
-        .await;
-        let AttemptOutcome::Relay(terminal) = terminal else {
-            panic!("an ambiguous commit outcome must never be retried")
-        };
-        assert_eq!(terminal.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[compio::test]
-    async fn successful_local_poll_body_is_not_collected_or_size_limited() {
-        let polled = Rc::new(Cell::new(0));
-        let observed = Rc::clone(&polled);
-        let chunk = Bytes::from(vec![0; 1024 * 1024]);
-        let stream = futures::stream::iter((0..65).map(move |_| {
-            observed.set(observed.get() + 1);
-            Ok::<_, std::io::Error>(chunk.clone())
-        }));
-        let response = Response::new(Body::from_stream(SendWrapper::new(stream)));
-        let AttemptOutcome::Relay(response) = classify_local_partition_reply(response).await else {
-            panic!("successful response must not be retried")
-        };
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(polled.get(), 0);
-        let mut stream = response.into_body().into_data_stream();
-        let mut received = 0;
-        while let Some(chunk) = stream.next().await {
-            received += chunk.expect("successful chunk").len();
-        }
-        assert_eq!(received, 65 * 1024 * 1024);
     }
 
     #[compio::test]
@@ -1053,6 +1312,26 @@ mod tests {
         assert_eq!(in_flight.get(), 1);
         drop(response);
         compio::time::sleep(CANCEL_TURN).await;
+        assert_eq!(in_flight.get(), 0);
+    }
+
+    #[compio::test]
+    async fn a_progressing_forwarded_poll_outlives_the_idle_timeout() {
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(200);
+        const CHUNK_DELAY: Duration = Duration::from_millis(50);
+        const CHUNKS: usize = 8;
+        let in_flight = Rc::new(Cell::new(0));
+        let guard = ForwardGuard::admit(&in_flight).expect("forward admitted");
+        let stream = futures::stream::iter(0..CHUNKS).then(|_| async {
+            compio::time::sleep(CHUNK_DELAY).await;
+            Ok::<_, cyper::Error>(Bytes::from_static(b"chunk"))
+        });
+        let response =
+            retain_forward_guard(Response::new(stream_poll_body(stream)), guard, IDLE_TIMEOUT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("progressing body must not expire");
+        assert_eq!(body.as_ref(), b"chunk".repeat(CHUNKS));
         assert_eq!(in_flight.get(), 0);
     }
 
@@ -1111,8 +1390,12 @@ mod tests {
             .await
             .expect("poll response");
         assert_eq!(response.content_length(), Some(65 * 1024 * 1024));
-        let AttemptOutcome::Relay(response) =
-            classify_forwarded_reply(response, &Method::GET, false).await
+        let AttemptOutcome::Relay(response) = classify_forwarded_reply(
+            response,
+            &Method::GET,
+            RelayKind::Partition(PartitionEffect::Read),
+        )
+        .await
         else {
             panic!("successful poll must not be retried")
         };

@@ -80,7 +80,7 @@ runs:
     # the lane skips the disk cleanup, the apt install, and the cache restore.
     - name: Setup Rust for the golden vectors
       if: inputs.task == 'golden'
-      uses: ./.github/actions/utils/setup-rust-with-cache
+      uses: ./.github/actions/utils/setup-rust
       with:
         free-disk-space: "false"
         read-cache: "false"
