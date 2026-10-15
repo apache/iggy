@@ -352,7 +352,8 @@ export class CommandResponseStream extends EventEmitter {
             if (operation?.retainable) operation.uncertain = true;
             else if (!safeRead) throw new OperationUncertainError(undefined, error);
           }
-          if (error instanceof ResponseError || error instanceof VsrEvictionError || signal.aborted)
+          if (error instanceof TypeError || error instanceof ResponseError ||
+              error instanceof VsrEvictionError || signal.aborted)
             throw error;
           refresh = true;
         }
