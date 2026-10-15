@@ -144,16 +144,19 @@ internal sealed class VsrConnection : IDisposable
                 catch (IggyInvalidStatusCodeException e)
                 {
                     uncertain |= e is { FromServer: true, StatusCode: VsrError.TRANSIENT_NOT_COMMITTED };
-                    var verdict = uncertain && e is
+                    var masked = uncertain && e is
                     {
                         FromServer: true,
                         StatusCode: not VsrError.TRANSIENT_NOT_COMMITTED
-                    }
+                    } && !SettlesOutcome(e);
+                    var verdict = masked
                         ? VsrError.FromServer(VsrError.TRANSIENT_NOT_COMMITTED,
-                            "A later refusal does not resolve the original request outcome.")
+                            $"A later refusal with status {e.StatusCode} does not resolve the original request "
+                            + "outcome.")
                         : e;
                     verdict.CommandCode = code;
-                    if (!retryTransient || !IsReplayableTransient(verdict, transientDeadline, readDeadline))
+                    if (!retryTransient || (masked && IsFinalRefusal(e))
+                        || !IsReplayableTransient(verdict, transientDeadline, readDeadline))
                     {
                         return VsrAttempt.Failed(encoded, verdict, requestStarted, this);
                     }
@@ -162,6 +165,12 @@ internal sealed class VsrConnection : IDisposable
                         : transientDeadline;
                     var remaining = governingDeadline - Environment.TickCount64;
                     await Task.Delay((int)Math.Clamp(remaining, 0, TransientRetryIntervalMs), token);
+                    if (Environment.TickCount64 + TransientRetryIntervalMs >= readDeadline)
+                    {
+                        // A replay written now has too little time left for its reply, and the read timeout would
+                        // turn a refusal the caller can act on into an unknown outcome.
+                        return VsrAttempt.Failed(encoded, verdict, requestStarted, this);
+                    }
                 }
                 catch (Exception e) when (IsConnectionException(e))
                 {
@@ -339,6 +348,42 @@ internal sealed class VsrConnection : IDisposable
             VsrError.TRANSIENT_NOT_COMMITTED => Environment.TickCount64 < readDeadline,
             VsrError.TRANSIENT_NOT_ACCEPTED => Environment.TickCount64 < transientDeadline,
             _ => false
+        };
+    }
+
+    /// <summary>
+    ///     Whether a refusal of a replay settles the outcome of the original request. The primary answers a
+    ///     same-id replay from its session table, so a result-section rejection is the cached reply of the
+    ///     original, the commit of a request that never entered the pipeline, or a refusal of a request neither
+    ///     the session table nor the pipeline holds. The codes below settle nothing: most come from the checks
+    ///     that run before that lookup, and REQUEST_TOO_OLD means the original applied and its reply is gone.
+    ///     PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS settles even as the refusal to replay a token the original
+    ///     minted: either way the name is taken and the caller holds no token. Apply can commit INVALID_COMMAND
+    ///     too, but nothing tells it apart from the preflight one. The server never puts HISTORY_UNAVAILABLE in a
+    ///     result section, and it stays listed because settling on it would be wrong if it ever did. The caller
+    ///     filters TRANSIENT_NOT_COMMITTED out before asking.
+    /// </summary>
+    private static bool SettlesOutcome(IggyInvalidStatusCodeException error)
+    {
+        return error is
+        {
+            FromResultSection: true,
+            StatusCode: not (VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY or VsrError.REQUEST_TOO_OLD
+                or VsrError.INVALID_COMMAND or VsrError.UNAUTHENTICATED or VsrError.HISTORY_UNAVAILABLE)
+        };
+    }
+
+    /// <summary>
+    ///     Whether an unsettled refusal of a replay is final: the primary's preflight answers every replay of the
+    ///     same request id with it again, so replaying until the deadline only ends in the same unknown outcome.
+    ///     The metadata plane carries it in the result section and the partition plane on the status word.
+    /// </summary>
+    private static bool IsFinalRefusal(IggyInvalidStatusCodeException error)
+    {
+        return error is
+        {
+            FromServer: true,
+            StatusCode: VsrError.REQUEST_TOO_OLD or VsrError.INVALID_COMMAND
         };
     }
 }

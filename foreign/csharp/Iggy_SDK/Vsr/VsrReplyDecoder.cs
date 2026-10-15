@@ -180,7 +180,8 @@ internal static class VsrReplyDecoder
 
         if (code != 0)
         {
-            throw VsrError.FromServer((int)code.Value, $"Server rejected the request with status {code.Value}.");
+            throw VsrError.FromResultSection((int)code.Value,
+                $"Server rejected the request with status {code.Value}.");
         }
 
         var payloadStart = ReadResultSectionLength(body.Span)
