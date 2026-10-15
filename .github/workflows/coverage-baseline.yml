@@ -83,87 +83,48 @@ jobs:
     name: Rust coverage baseline
     needs: detect
     if: needs.detect.outputs.rust == 'true'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7.0.1
+    permissions:
+      contents: read
+      issues: read
+    uses: ./.github/workflows/_rust.yml
+    with:
+      plan: '{"checks":[],"tests":true}'
+      test-scope: workspace
+      timeout-minutes: 120
+      save-cache: true
+      build-metadata: true
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-      - name: Install system dependencies
-        run: |
-          ./scripts/ci/apt-install.sh gnome-keyring keyutils dbus-x11 libsecret-tools
-          rm -f "$HOME"/.local/share/keyrings/*
-
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          install-nextest: "true"
-          # Also warms the GitHub Actions build cache for subsequent PR builds
-          save-cache: "true"
-          # llvm-cov instrumentation roughly doubles object sizes; the light
-          # cleanup leaves too little headroom (build hit "No space left on
-          # device" at ~34 MB free).
-          free-disk-space-aggressive: "true"
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.87.26
-        with:
-          tool: cargo-llvm-cov
-
-      # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
-      # Host-only kernel param (no container can raise it). Mirrors the same step in
-      # .github/actions/rust/pre-merge/action.yml; without it every Doris connector
-      # integration test panics at fixture setup.
-      - name: Raise vm.max_map_count for Doris
-        run: sudo sysctl -w vm.max_map_count=2000000 || true
-        shell: bash
-
-      - name: Build and test with coverage
-        run: |
-          source <(cargo llvm-cov show-env --export-prefix)
-          cargo build --locked
-          cargo test --locked --no-run
-
-          # Start D-Bus and unlock keyring right before test execution to avoid
-          # gnome-keyring auto-locking the collection during the build phase.
-          # Previously this ran before `cargo build`, leaving a 7+ minute idle
-          # window that triggered org.freedesktop.Secret.Error.IsLocked ~10% of runs.
-          eval $(dbus-launch --sh-syntax)
-          export DBUS_SESSION_BUS_ADDRESS
-          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
-          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
-
-          cargo nextest run --locked --no-fail-fast --profile ci
-        shell: bash
-
-      - name: Generate coverage report
-        run: |
-          source <(cargo llvm-cov show-env --export-prefix)
-          cargo llvm-cov report --codecov --output-path codecov.json
-        shell: bash
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v7.1.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: codecov.json
-          disable_search: true
-          flags: rust
-          fail_ci_if_error: false
+  rust-bdd-coverage:
+    name: Rust BDD coverage baseline
+    needs: detect
+    if: needs.detect.outputs.rust == 'true'
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/_test_bdd.yml
+    with:
+      component: bdd-rust
+      task: bdd-rust
+      timeout-minutes: 120
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   java-coverage:
     name: Java coverage baseline
     needs: detect
     if: needs.detect.outputs.java == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Setup Java with cache
-        uses: ./.github/actions/utils/setup-java-with-cache
+      - name: Setup Java
+        uses: ./.github/actions/utils/setup-java
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           save-cache: "false"
 
@@ -200,7 +161,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.csharp == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -215,8 +176,8 @@ jobs:
             8.0.x
             10.0.x
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           save-cache: "false"
 
@@ -285,19 +246,40 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
+
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
+        with:
+          save-cache: "false"
+
+      # setup-python changes PKG_CONFIG_PATH and invalidates cached native server dependencies.
+      - name: Build server Docker image for TLS tests
+        run: |
+          # test_tls.py spawns the server in a container; build it from the
+          # same binaries the plain-TCP tests run against.
+          cargo build --locked --bin iggy-server --bin iggy
+          docker build \
+            -f core/server/Dockerfile \
+            --target runtime-prebuilt \
+            --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+            -t iggy-server:local .
+        shell: bash
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+        with:
+          mode: bin
+          bin: target/debug/iggy-server
 
       - name: Setup Python
         uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.11"
-
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          save-cache: "false"
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2.87.26
@@ -325,25 +307,6 @@ jobs:
           echo "Building Python wheel with coverage instrumentation..."
           uv run --no-sync maturin develop
         shell: bash
-
-      - name: Build server Docker image for TLS tests
-        run: |
-          # test_tls.py spawns the server in a container; build it from the
-          # same binaries the plain-TCP tests run against.
-          cargo build --locked --bin iggy-server --bin iggy
-          docker build \
-            -f core/server/Dockerfile \
-            --target runtime-prebuilt \
-            --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
-            --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
-            -t iggy-server:local .
-        shell: bash
-
-      - name: Start Iggy server
-        id: iggy
-        uses: ./.github/actions/utils/server-start
-        with:
-          cargo-bin: iggy-server
 
       - name: Run tests
         run: |
@@ -409,7 +372,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.php == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -432,7 +395,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.node == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -440,14 +403,13 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "23"
-          cache: "npm"
-          cache-dependency-path: foreign/node/package-lock.json
+          package-manager-cache: false
 
       - name: Pin npm to 11 to match Dependabot lockfile format
         run: npm install -g npm@11
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           save-cache: "false"
 
@@ -499,15 +461,15 @@ jobs:
     needs: detect
     if: needs.detect.outputs.go == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Setup Go
-        uses: ./.github/actions/utils/setup-go-with-cache
+        uses: ./.github/actions/utils/setup-go
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           save-cache: "false"
 
@@ -587,7 +549,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.cpp == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -608,17 +570,14 @@ jobs:
   warm-cache-macos:
     name: Warm macOS cache
     needs: detect
-    # Gated on the rust key: the cache goes stale only when Rust sources
-    # change, and the Swatinem key is Cargo.lock-based, so skipping the save
-    # on non-Rust pushes leaves the previous cache valid.
     if: needs.detect.outputs.rust == 'true'
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
         with:
           save-cache: "true"
 
