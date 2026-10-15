@@ -88,8 +88,17 @@ final class RawCommandTest extends TestCase
         assert_same('not_retained', $error->kind);
         assert_same(14008, $error->getCode());
         assert_true(str_contains($error->getMessage(), $operationId));
+        foreach (['message' => $error->getMessage(), 'code' => $error->getCode()] as $name => $value) {
+            $property = new ReflectionProperty($error, $name);
+            assert_true($property->isProtected());
+            assert_same($value, $property->getValue($error));
+            assert_throws(static fn () => $error->$name);
+        }
         assert_throws(static function () use ($error): void {
             $error->operation_id = '0';
+        });
+        assert_throws(static function () use ($error): void {
+            $error->kind = 'uncertain';
         });
     }
 

@@ -785,11 +785,7 @@ namespace Iggy\Exception {
     }
 
     class PendingOperationException extends \Iggy\Exception\IggyException {
-        protected int $code;
-
         public readonly string $kind;
-
-        protected string $message;
 
         /**
          * Exact unsigned 64-bit operation ID, represented as a decimal string.
