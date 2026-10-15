@@ -20,8 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use iggy::prelude::{
-    Identifier, IggyClient, IggyError, IggyExpiry, StreamClient, Topic, TopicClient,
-    TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyClient, IggyError, IggyExpiry, PartitionClient, StreamClient, Topic,
+    TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
@@ -283,6 +283,50 @@ impl IggyBridge {
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
         let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
         with_request_timeout(self.client.delete_topic(&stream_id, &topic_id)).await
+    }
+
+    /// Adds `partitions_count` partitions to the Iggy topic backing `kafka_topic`, resolved
+    /// through the configured [`TopicMapping`](crate::bridge::topic_map::TopicMapping).
+    ///
+    /// Takes the number to add, as Iggy's own `create_partitions` does, not the number to reach
+    /// that a Kafka `CreatePartitions` carries. The caller has already read the current count to
+    /// check Kafka's grow-only rule, and the difference is what it asks for here. Iggy appends
+    /// the new partitions after the current last index, so no existing Kafka partition index
+    /// changes meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::InvalidKafkaTopicName`] if `kafka_topic` fails Kafka's own
+    /// topic-naming rules. Returns [`BridgeError::InvalidPartitionCount`] if `partitions_count`
+    /// is 0, which Iggy would refuse as `TooManyPartitions`, a code whose text says the opposite.
+    /// Returns [`BridgeError::Timeout`] if the call takes longer than `REQUEST_TIMEOUT`. Returns
+    /// [`BridgeError::Iggy`] with `TopicIdNotFound` (2010) or `StreamIdNotFound` (1009) if the
+    /// mapped topic or stream does not exist, `TooManyPartitions` above Iggy's per-call cap of
+    /// 1000, `PartitionsLimitReached` when the node is at `metadata.partitions_max`,
+    /// `PartitionResizeDisabled` for a topic created with a fixed partition count, or for
+    /// connectivity/auth failures.
+    pub async fn create_kafka_partitions(
+        &self,
+        kafka_topic: &str,
+        partitions_count: u32,
+    ) -> Result<(), BridgeError> {
+        validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        if partitions_count == 0 {
+            return Err(BridgeError::InvalidPartitionCount {
+                kafka_topic: kafka_topic.to_string(),
+            });
+        }
+        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+        let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
+        with_request_timeout(self.client.create_partitions(
+            &stream_id,
+            &topic_id,
+            partitions_count,
+        ))
+        .await?;
+        info!("added {partitions_count} partitions to Iggy topic '{topic_name}'");
+        Ok(())
     }
 
     /// Looks up `kafka_topic`, resolved through the configured

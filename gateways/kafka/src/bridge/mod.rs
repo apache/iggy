@@ -19,7 +19,8 @@
 //!
 //! Maps Kafka topics to Iggy streams/topics, exposes create-if-missing provisioning and
 //! high-watermark lookups, group and translates Iggy errors to Kafka wire error codes. `ListOffsets`,
-//! Produce, Fetch, Metadata, `CreateTopics`, `OffsetCommit`, `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
+//! Produce, Fetch, Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`, `OffsetCommit`,
+//! `OffsetFetch`, `DescribeConfigs` and `AlterConfigs` call it.
 
 pub mod config;
 pub mod error;
