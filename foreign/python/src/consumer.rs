@@ -39,6 +39,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
+use crate::awaitable::none_future_into_py;
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{ConsumerPosition, ReceiveMessage};
@@ -113,7 +114,7 @@ impl IggyConsumer {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             state
                 .store_offset(offset, partition_id)
                 .await
@@ -140,7 +141,7 @@ impl IggyConsumer {
     ) -> PyResult<Bound<'a, PyAny>> {
         let state = self.state.clone();
         let position = RustConsumerPosition::from(*position);
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             state
                 .store_position(position)
                 .await
@@ -162,7 +163,7 @@ impl IggyConsumer {
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let state = self.state.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             state
                 .delete_offset(partition_id)
                 .await
@@ -207,7 +208,7 @@ impl IggyConsumer {
         let callback: Py<PyAny> = callback.unbind();
         let shutdown_event: Option<Py<PyAny>> = shutdown_event.map(|e| e.unbind());
 
-        future_into_py(py, async {
+        none_future_into_py(py, async {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
             let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
