@@ -113,7 +113,7 @@ die () {
 ##############################################################################
 
 GRADLE_WRAPPER_VERSION=9.8.1
-REQUIRED_WRAPPER_JAR_CHECKSUM="3b8a25775a69158b5ad2b1d17a80a88dc7b40a352a73eb27d06c612a7ce68e98"
+REQUIRED_WRAPPER_JAR_CHECKSUM="238e777fcddd7e34f9708186085def2abd6e08e658505b38718d79d74c21abd5" # checksum of v9.8.0
 
 for _ in 1 2 3; do
     if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
@@ -135,7 +135,8 @@ for _ in 1 2 3; do
         fi
 
         if [ "$LOCAL_WRAPPER_JAR_CHECKSUM" != "$REQUIRED_WRAPPER_JAR_CHECKSUM" ]; then
-            rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+          echo "bad shasum"
+          rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
         else
             break
         fi
