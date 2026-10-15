@@ -83,15 +83,25 @@ impl CliCommand for GetConsumerGroupCmd {
             })?;
 
         let consumer = Consumer::group(self.group_id.clone());
-        let partitions_count = consumer_group.partitions_count as usize;
-        let mut partitions_by_id: Vec<Option<&Partition>> = vec![None; partitions_count];
+        if consumer_group.partitions_count > iggy_common::MAX_PARTITIONS_COUNT {
+            anyhow::bail!(
+                "Consumer group with ID: {} reports partitions count {} above the limit {}",
+                self.group_id,
+                consumer_group.partitions_count,
+                iggy_common::MAX_PARTITIONS_COUNT
+            );
+        }
+        // Size the indexes from the topic partition list. `partitions_count` is a
+        // wire field, and a huge value must not allocate before the missing-id check.
+        let index_len = topic.partitions.len();
+        let mut partitions_by_id: Vec<Option<&Partition>> = vec![None; index_len];
         for partition in &topic.partitions {
             if let Some(slot) = partitions_by_id.get_mut(partition.id as usize) {
                 *slot = Some(partition);
             }
         }
 
-        let mut owners: Vec<Option<u32>> = vec![None; partitions_count];
+        let mut owners: Vec<Option<u32>> = vec![None; index_len];
         let mut members_table = Table::new();
         let render_members = consumer_group.members_count > 0;
         if render_members {

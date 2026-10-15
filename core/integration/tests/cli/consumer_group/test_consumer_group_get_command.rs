@@ -28,6 +28,7 @@ use iggy::prelude::{Consumer, IggyMessage, Partitioning};
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 struct TestConsumerGroupGetCmd {
     stream_id: u32,
@@ -365,6 +366,34 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagWithStoredOffsetCmd {
             "join_consumer_group failed: {:?}",
             join_result.err()
         );
+
+        // The server fences a group offset write to the calling connection's
+        // membership. Join returns before that assignment is visible.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stream_id = self.stream_id.try_into().unwrap();
+        let topic_id = self.topic_id.try_into().unwrap();
+        let group_id = self.group_id.try_into().unwrap();
+        loop {
+            let group = client
+                .get_consumer_group(&stream_id, &topic_id, &group_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let owns_partition = group.members.iter().any(|member| {
+                member
+                    .partitions
+                    .iter()
+                    .any(|partition_id| *partition_id == 0)
+            });
+            if group.members_count == 1 && owns_partition {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "partition 0 was not assigned: {group:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         let mut messages = (1..=self.messages_count)
             .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
