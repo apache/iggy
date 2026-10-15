@@ -105,9 +105,9 @@ runs:
         fi
         echo "✅ golden.json matches the Rust crates"
 
-    - name: Setup Rust with cache for e2e
+    - name: Setup Rust for e2e
       if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust-with-cache
+      uses: ./.github/actions/utils/setup-rust
 
     - name: Build the end-to-end suite
       shell: bash
