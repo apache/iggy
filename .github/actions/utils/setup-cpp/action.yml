@@ -15,18 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: setup-cpp-with-cache
-description: Setup Bazel toolchain and caching (bazelisk + repository + disk cache)
+name: setup-cpp
+description: Setup Bazel toolchain
 
 runs:
   using: "composite"
   steps:
-    - name: Setup Bazel with cache
+    - name: Setup Bazel
       uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # v0.19.0
       with:
-        bazelisk-cache: true
-        disk-cache: true
-        repository-cache: true
         module-root: foreign/cpp
 
     - name: Verify Bazel installation

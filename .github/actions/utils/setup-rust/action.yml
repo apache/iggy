@@ -15,10 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: setup-rust-with-cache
+name: setup-rust
 description: Setup Rust toolchain with Swatinem/rust-cache
 
 inputs:
+  coverage:
+    description: "Instrument workspace crates for coverage before compiling"
+    required: false
+    default: "false"
   install-nextest:
     description: "Whether to install cargo-nextest"
     required: false
@@ -88,15 +92,35 @@ runs:
           rustup-init -y --no-modify-path --default-toolchain none
         fi
         rustup show
+        # rust-cache hashes every installed toolchain, including unused runner defaults.
+        active_toolchain=$(rustup show active-toolchain)
+        active_toolchain=${active_toolchain%% *}
+        installed_toolchains=$(rustup toolchain list --quiet)
+        while read -r toolchain; do
+          if [[ "$toolchain" != "$active_toolchain" ]]; then
+            rustup toolchain uninstall "$toolchain"
+          fi
+        done <<< "$installed_toolchains"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       shell: bash
 
+    - name: Configure Cargo for CI
+      run: |
+        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
+        echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> "$GITHUB_ENV"
+      shell: bash
+
+    # llvm-cov instruments workspace crates, which rust-cache removes before saving.
+    # External dependencies can share the cache with check, lint and SDK server builds.
     - name: Setup Rust cache
       id: rust-cache
       if: inputs.read-cache == 'true'
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.shared-key }}
+        cache-workspace-crates: "false"
         save-if: ${{ inputs.save-cache == 'true' }}
 
     - name: Cache status
@@ -123,42 +147,32 @@ runs:
       shell: bash
 
     - name: Install cargo-nextest
-      if: runner.os == 'Linux' && inputs.install-nextest == 'true'
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@0.9.148
+
+    - name: Install cargo-llvm-cov
+      if: inputs.coverage == 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov@0.9.1
+
+    - name: Enable coverage for subsequent builds and tests
+      if: inputs.coverage == 'true'
       run: |
-        # A binary restored from the cargo cache can predate the floor in
-        # .config/nextest.toml. `show-config version` exits non-zero below it,
-        # and on a nextest too old to know the subcommand at all, so both fall
-        # through to a fresh install instead of aborting the lane later.
-        if command -v cargo-nextest &> /dev/null && cargo nextest show-config version; then
-          echo "cargo-nextest already installed"
-          exit 0
+        set -euo pipefail
+        rustup component add llvm-tools-preview
+        coverage_env=$(cargo llvm-cov show-env --sh)
+        eval "$coverage_env"
+        if [[ "${{ inputs.read-cache }}" == true ]]; then
+          cargo llvm-cov clean --workspace
         fi
-
-        ARCH="$(uname -m)"
-        case "$ARCH" in
-          x86_64)  NEXTEST_PLATFORM="linux" ;;
-          aarch64) NEXTEST_PLATFORM="linux-arm" ;;
-          *)
-            echo "Unsupported architecture: $ARCH, skipping nextest"
-            exit 0
-            ;;
-        esac
-
-        CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
-        tarball="$(mktemp)"
-        # Staged to a file because curl --retry cannot rewind a pipe.
-        curl -LsSf --retry 5 --retry-all-errors -o "$tarball" "https://get.nexte.st/latest/${NEXTEST_PLATFORM}"
-        tar xzf "$tarball" -C "$CARGO_BIN"
-        rm -f "$tarball"
-        cargo nextest --version
-      shell: bash
-      continue-on-error: true
-
-    - name: Configure Cargo for CI
-      if: inputs.read-cache == 'true'
-      run: |
-        echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
-        echo "CARGO_PROFILE_DEV_DEBUG=0" >> "$GITHUB_ENV"
-        echo "CARGO_PROFILE_TEST_DEBUG=0" >> "$GITHUB_ENV"
-        echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> "$GITHUB_ENV"
+        while IFS= read -r line; do
+          if [[ "$line" =~ ^export\ ([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+            name=${BASH_REMATCH[1]}
+            delimiter="COVERAGE_ENV_${RANDOM}_${RANDOM}"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "${!name}" "$delimiter" >> "$GITHUB_ENV"
+          fi
+        done <<< "$coverage_env"
       shell: bash

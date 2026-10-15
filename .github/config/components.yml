@@ -144,7 +144,7 @@ components:
   # existing deployments, which no other check covers. Matching is literal
   # glob with no crate-graph expansion, so every crate has to be spelled out:
   # `core/server/**` does not cover `core/server_common/**`.
-  # `breaking:storage` on the PR skips it (see .github/workflows/_test.yml).
+  # `breaking:storage` on the PR skips it (see .github/workflows/_rust.yml).
   rust-storage-compat:
     depends_on:
       - "rust-workspace"
@@ -212,9 +212,7 @@ components:
       - "sort"
       - "doctest"
       - "machete"
-      - "test-1"
-      - "test-2"
-      - "test-3"
+      - "test"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"

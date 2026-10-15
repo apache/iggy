@@ -27,7 +27,7 @@ runs:
   using: "composite"
   steps:
     - name: Setup Go
-      uses: ./.github/actions/utils/setup-go-with-cache
+      uses: ./.github/actions/utils/setup-go
 
     - name: Format Check
       shell: bash
@@ -117,9 +117,9 @@ runs:
         # Build the module
         go build -v ./...
 
-    - name: Setup Rust with cache for e2e
+    - name: Setup Rust for e2e
       if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust-with-cache
+      uses: ./.github/actions/utils/setup-rust
 
     # The Go SDK speaks the VSR wire protocol, so every e2e lane runs against
     # a locally built VSR server rather than a container of the legacy one.

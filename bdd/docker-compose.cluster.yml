@@ -52,6 +52,7 @@ x-cluster-node: &cluster-node
       hard: -1
 
 x-cluster-topology: &cluster-topology
+  LLVM_PROFILE_FILE: ${BDD_SERVER_PROFILE_FILE:-}
   IGGY_ROOT_USERNAME: iggy
   IGGY_ROOT_PASSWORD: iggy
   IGGY_CLUSTER_ENABLED: "true"
@@ -116,6 +117,7 @@ services:
         ipv4_address: 172.28.0.101
     volumes:
       - iggy_leader_data:/app/local_data_leader
+      - ../target:/profiles
 
   iggy-follower:
     <<: *cluster-node
@@ -142,6 +144,7 @@ services:
         ipv4_address: 172.28.0.102
     volumes:
       - iggy_follower_data:/app/local_data_follower
+      - ../target:/profiles
 
   rust-bdd:
     <<: *cluster-bdd-deps
