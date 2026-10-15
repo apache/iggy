@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, test-build, test, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime-build, test-build, test, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -54,7 +54,7 @@ runs:
         # Only test jobs execute nextest. Avoid downloading it in lint, metadata,
         # and cross-build jobs.
         install-nextest: ${{ inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
-        coverage: ${{ inputs.task == 'test-build' || inputs.task == 'test' }}
+        coverage: ${{ inputs.task == 'runtime-build' || inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
         # libraries. All compiling tasks keep the existing dependency setup.
         install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
@@ -103,7 +103,7 @@ runs:
     # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
     - name: Plan affected Rust work
       id: rail
-      if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
+      if: inputs.task == 'runtime-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
 
@@ -174,15 +174,24 @@ runs:
         rm -f "$HOME"/.local/share/keyrings/*
       shell: bash
 
-    - name: Build coverage test archive
-      if: inputs.task == 'test-build'
+    - name: Download runtime binaries
+      if: inputs.task == 'test-build' || inputs.task == 'test' || inputs.task == 'test-storage-compat'
+      uses: ./.github/actions/utils/download-runtime
+
+    - name: Build coverage artifacts
+      if: inputs.task == 'runtime-build' || inputs.task == 'test-build'
       env:
         PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         PLAN_STATUS: ${{ steps.rail.outcome }}
         TEST_SELECTION: ${{ inputs.test-scope }}
+        ARTIFACT_TASK: ${{ inputs.task }}
       run: |
         set -euo pipefail
-        ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
+        if [[ "$ARTIFACT_TASK" == runtime-build ]]; then
+          ARTIFACT_DIR="$RUNNER_TEMP/rust-runtime"
+        else
+          ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
+        fi
         mkdir -p "$ARTIFACT_DIR"
 
         # Read only validated selectors. Argument and package selectors are
@@ -196,7 +205,14 @@ runs:
         TEST_CARGO_ARGS=()
         TEST_TARGET_ARGS=()
         TEST_PACKAGES=()
-        if [[ "$TEST_SELECTION" == "workspace" ]]; then
+        if [[ "$ARTIFACT_TASK" == test-build ]]; then
+          # Reuse the producer's selection, including its fail-open workspace fallback.
+          RUNTIME_ARTIFACT_DIR="$RUNNER_TEMP/rust-runtime"
+          TEST_SCOPE=$(cat "$RUNTIME_ARTIFACT_DIR/scope")
+          mapfile -d '' -t TEST_CARGO_ARGS < "$RUNTIME_ARTIFACT_DIR/test-args"
+          mapfile -d '' -t TEST_TARGET_ARGS < "$RUNTIME_ARTIFACT_DIR/test-target-args"
+          mapfile -d '' -t TEST_PACKAGES < "$RUNTIME_ARTIFACT_DIR/test-packages"
+        elif [[ "$TEST_SELECTION" == "workspace" ]]; then
           TEST_SCOPE=workspace
           RUNTIME_SCOPE=workspace
         elif [[ "$TEST_SELECTION" != "affected" ]]; then
@@ -220,23 +236,32 @@ runs:
 
         printf '%s\n' "$TEST_SCOPE" > "$ARTIFACT_DIR/scope"
         git rev-parse HEAD > "$ARTIFACT_DIR/revision"
-        if [[ "$TEST_SCOPE" == "skipped" ]]; then
-          echo "::notice::Cargo-Rail reports no affected Rust tests"
-          exit 0
-        fi
-
-        # Only spawned binaries and dlopened plugins need a separate dev build.
-        # nextest archive compiles the selected tests with their dev-dependency features.
-        BUILD_ARGS=()
-        if [[ "$RUNTIME_SCOPE" == "packages" ]]; then
-          mapfile -d '' -t RUNTIME_PACKAGES < "$SELECTOR_DIR/runtime-packages"
-          for package in "${RUNTIME_PACKAGES[@]}"; do
-            BUILD_ARGS+=(-p "$package")
-          done
-        fi
-        : > "$ARTIFACT_DIR/build.jsonl"
-        : > "$ARTIFACT_DIR/runtime-files"
-        if [[ "$RUNTIME_SCOPE" != "skipped" ]]; then
+        if [[ "$ARTIFACT_TASK" == runtime-build ]]; then
+          : > "$ARTIFACT_DIR/test-args"
+          : > "$ARTIFACT_DIR/test-target-args"
+          : > "$ARTIFACT_DIR/test-packages"
+          if (( ${#TEST_CARGO_ARGS[@]} )); then
+            printf '%s\0' "${TEST_CARGO_ARGS[@]}" > "$ARTIFACT_DIR/test-args"
+          fi
+          if (( ${#TEST_TARGET_ARGS[@]} )); then
+            printf '%s\0' "${TEST_TARGET_ARGS[@]}" > "$ARTIFACT_DIR/test-target-args"
+          fi
+          if (( ${#TEST_PACKAGES[@]} )); then
+            printf '%s\0' "${TEST_PACKAGES[@]}" > "$ARTIFACT_DIR/test-packages"
+          fi
+          # SDK-only changes still need the server and CLI, even when Rail skips Rust tests.
+          BUILD_ARGS=()
+          if [[ "$RUNTIME_SCOPE" != workspace ]]; then
+            BUILD_ARGS=(-p server -p iggy-cli)
+            if [[ "$RUNTIME_SCOPE" == packages ]]; then
+              mapfile -d '' -t RUNTIME_PACKAGES < "$SELECTOR_DIR/runtime-packages"
+              for package in "${RUNTIME_PACKAGES[@]}"; do
+                if [[ "$package" != server && "$package" != iggy-cli ]]; then
+                  BUILD_ARGS+=(-p "$package")
+                fi
+              done
+            fi
+          fi
           cargo build --locked "${BUILD_ARGS[@]}" --message-format=json-render-diagnostics > "$ARTIFACT_DIR/build.jsonl"
           jq -r 'select(.reason == "compiler-artifact") |
             (select(.target.kind | index("bin")) | .executable // empty),
@@ -245,9 +270,18 @@ runs:
             while IFS= read -r artifact; do
               realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
             done > "$ARTIFACT_DIR/runtime-files"
+          test -x target/debug/iggy-server
+          test -x target/debug/iggy
+          xargs -d '\n' sha256sum < "$ARTIFACT_DIR/runtime-files" > "$ARTIFACT_DIR/SHA256SUMS"
+          tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
+          rustc -vV > "$ARTIFACT_DIR/compiler"
+          rm "$ARTIFACT_DIR/build.jsonl" "$ARTIFACT_DIR/runtime-files"
+          exit 0
         fi
-        tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
-        rm "$ARTIFACT_DIR/build.jsonl" "$ARTIFACT_DIR/runtime-files"
+        if [[ "$TEST_SCOPE" == "skipped" ]]; then
+          echo "::notice::Cargo-Rail reports no affected Rust tests"
+          exit 0
+        fi
 
         # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
         # wire fixtures. Master always generates them. On PRs, use the selected
@@ -336,7 +370,6 @@ runs:
           echo "::notice::Cargo-Rail reports no affected Rust tests"
           exit 0
         fi
-        tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
         if [[ "$(cat "$ARTIFACT_DIR/kafka-fixtures")" == true ]]; then
           tar --zstd -xf "$ARTIFACT_DIR/kafka-fixtures.tar.zst"
           # Fixtures are expected to exist from here on; a missing one now means
@@ -385,21 +418,22 @@ runs:
           # BDD targets require features, so a BDD-only scope can contain no runnable tests.
           NO_TESTS=warn
         fi
-        cargo nextest run --archive-file "$ARTIFACT_DIR/nextest.tar.zst" \
-          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" \
+        # nextest can archive non-test binaries with dev-dependency features.
+        # Restore the shared runtime last so every suite executes the same binaries.
+        tar --zstd -xf "$ARTIFACT_DIR/nextest.tar.zst"
+        ./scripts/ci/restore-runtime.sh "$RUNNER_TEMP/rust-runtime"
+        cargo nextest run \
+          --cargo-metadata target/nextest/cargo-metadata.json \
+          --binaries-metadata target/nextest/binaries-metadata.json \
+          --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
           --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
           --partition "hash:${PARTITION_INDEX}/${PARTITION_COUNT}"
       shell: bash
 
-    # On-disk format backwards compatibility. The script builds an iggy-server
-    # from the master tip under the checked-out merge ref (origin/master off a
-    # pull_request run) and one from HEAD, seeds a data directory with the
-    # former and reads it back with the latter. It does its own shallow fetch
-    # of the baseline commit and exits non-zero if it cannot resolve one, so
-    # the default depth-1 checkout is sufficient here.
+    # Compare the shared HEAD runtime with a separately built baseline server.
     - name: Storage format backwards compatibility
       if: inputs.task == 'test-storage-compat'
-      run: ./scripts/ci/storage-compat.sh
+      run: ./scripts/ci/storage-compat.sh --runtime-artifacts "$RUNNER_TEMP/rust-runtime"
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /

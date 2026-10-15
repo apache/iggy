@@ -31,7 +31,7 @@ concurrency:
 
 permissions:
   contents: read
-  # listLabelsOnIssue in _test.yml, for the breaking:storage escape hatch
+  # listLabelsOnIssue in _rust.yml, for the breaking:storage escape hatch
   issues: read
   security-events: write
   pull-requests: write
@@ -53,11 +53,17 @@ jobs:
     name: Detect changes
     uses: ./.github/workflows/_detect.yml
 
+  runtime:
+    name: Runtime binaries
+    needs: detect
+    if: needs.detect.outputs.runtime == 'true'
+    uses: ./.github/workflows/_build_runtime.yml
+
   # Rust components
   test-rust:
     name: Rust
-    needs: detect
-    if: needs.detect.outputs.rust_plan != ''
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && needs.detect.outputs.rust_plan != '' }}
     uses: ./.github/workflows/_rust.yml
     with:
       plan: ${{ needs.detect.outputs.rust_plan }}
@@ -66,168 +72,125 @@ jobs:
 
   # Python SDK
   test-python:
-    name: Python • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.python_matrix) }}
+    name: Python
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.python_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # PHP SDK
   test-php:
-    name: PHP • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.detect.outputs.php_matrix) }}
+    name: PHP
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.php_matrix }}
+      fail-fast: false
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Node SDK
   test-node:
-    name: Node • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.node_matrix) }}
+    name: Node
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.node_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Go SDK
   test-go:
-    name: Go • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.go_matrix) }}
+    name: Go
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.go_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Java SDK
   test-java:
-    name: Java • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.java_matrix) }}
+    name: Java
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.java_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # C# SDK
   test-csharp:
-    name: C# • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.csharp_matrix) }}
+    name: C#
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.csharp_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # C++ SDK
   test-cpp:
-    name: C++ • ${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.cpp_matrix) }}
+    name: C++
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.cpp_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Swift SDK
   test-swift:
-    name: Swift • ${{ matrix.task }}
+    name: Swift
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.swift_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.swift_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.swift_matrix }}
 
   # Other components
   test-other:
-    name: Other • ${{ matrix.component }}/${{ matrix.task }}
+    name: Other
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.other_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.other_matrix }}
 
   # BDD Tests
   test-bdd:
-    name: BDD • ${{ matrix.component }}/${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.bdd_matrix) }}
+    name: BDD
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test_bdd.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.bdd_matrix }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   # Examples Tests
   test-examples:
-    name: Examples • ${{ matrix.component }}/${{ matrix.task }}
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJson(needs.detect.outputs.examples_matrix) }}
+    name: Examples
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test_examples.yml
     with:
-      component: ${{ matrix.component }}
-      task: ${{ matrix.task }}
+      matrix: ${{ needs.detect.outputs.examples_matrix }}
 
   # Final status check
   finalize_pr:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 5
-    needs: [common, detect, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
+    needs: [common, detect, runtime, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
       - name: Get job execution times
@@ -242,109 +205,26 @@ jobs:
               per_page: 100
             });
 
-            const jobTimes = {};
-            const jobStatuses = {};
-
-            const formatDuration = (ms) => {
+            const formatDuration = ms => {
               const seconds = Math.floor(ms / 1000);
-              const minutes = Math.floor(seconds / 60);
-              const hours = Math.floor(minutes / 60);
-              if (hours > 0) {
-                return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
-              } else if (minutes > 0) {
-                return `${minutes}m ${seconds % 60}s`;
-              } else if (seconds > 0) {
-                return `${seconds}s`;
-              } else {
-                return '< 1s';
-              }
+              return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
             };
-
-            // Log job names for debugging
-            console.log('Job names found:');
-            for (const job of jobs) {
-              console.log(`  - ${job.name}: ${job.status} (conclusion: ${job.conclusion || 'N/A'})`);
-              jobStatuses[job.name] = job.conclusion || job.status;
-
-              // Only show duration for jobs that actually ran
-              if (job.started_at && job.completed_at) {
-                const start = new Date(job.started_at);
-                const end = new Date(job.completed_at);
-                const duration = end - start;
-                jobTimes[job.name] = formatDuration(duration);
-              } else if (job.started_at && !job.completed_at) {
-                // Job is still running
-                const start = new Date(job.started_at);
-                const duration = Date.now() - start;
-                jobTimes[job.name] = formatDuration(duration) + ' ⏳';
-              } else {
-                // Job was skipped or hasn't started
-                jobTimes[job.name] = null;
-              }
+            const groups = {
+              rust: 'Rust', python: 'Python', php: 'PHP', node: 'Node',
+              go: 'Go', java: 'Java', csharp: 'C#', cpp: 'C++', swift: 'Swift',
+              bdd: 'BDD', examples: 'Examples', other: 'Other',
+              common: 'Common checks', detect: 'Detect changes', runtime: 'Runtime binaries',
+            };
+            for (const [key, group] of Object.entries(groups)) {
+              const completed = jobs.filter(job =>
+                (job.name === group || job.name.startsWith(`${group} /`)) &&
+                job.conclusion !== 'skipped' && job.started_at && job.completed_at);
+              const duration = completed.length ? formatDuration(
+                Math.max(...completed.map(job => new Date(job.completed_at).getTime())) -
+                Math.min(...completed.map(job => new Date(job.started_at).getTime()))
+              ) : '-';
+              core.setOutput(`${key}_time`, duration);
             }
-
-            // Helper to find job info for a component
-            const findJobInfo = (prefix) => {
-              for (const [name, status] of Object.entries(jobStatuses)) {
-                if (name.startsWith(prefix)) {
-                  return {
-                    time: jobTimes[name],
-                    status: status
-                  };
-                }
-              }
-              return { time: null, status: 'skipped' };
-            };
-
-            // Format duration based on job status
-            const formatJobDuration = (info) => {
-              if (info.status === 'skipped') return '-';
-              if (info.time === null) return '-';
-              return info.time;
-            };
-
-            // Set outputs for each component
-            const python = findJobInfo('Python •');
-            const php = findJobInfo('PHP •');
-            const node = findJobInfo('Node •');
-            const go = findJobInfo('Go •');
-            const java = findJobInfo('Java •');
-            const csharp = findJobInfo('C# •');
-            const cpp = findJobInfo('C++ •');
-            const swift = findJobInfo('Swift •');
-            const bdd = findJobInfo('BDD •');
-            const examples = findJobInfo('Examples •');
-            const other = findJobInfo('Other •');
-
-            // For non-matrix jobs, check by exact name
-            const common = jobStatuses['Common checks']
-              ? { time: jobTimes['Common checks'], status: jobStatuses['Common checks'] }
-              : { time: null, status: 'skipped' };
-            const detect = jobStatuses['Detect changes']
-              ? { time: jobTimes['Detect changes'], status: jobStatuses['Detect changes'] }
-              : { time: null, status: 'skipped' };
-
-            // Output formatted durations
-            const rustJobs = jobs.filter(job => job.name.startsWith('Rust /') &&
-              job.conclusion !== 'skipped' && job.started_at && job.completed_at);
-            const rustDuration = rustJobs.length ? formatDuration(
-              Math.max(...rustJobs.map(job => new Date(job.completed_at).getTime())) -
-              Math.min(...rustJobs.map(job => new Date(job.started_at).getTime()))
-            ) : '-';
-            core.setOutput('rust_time', rustDuration);
-            core.setOutput('python_time', formatJobDuration(python));
-            core.setOutput('php_time', formatJobDuration(php));
-            core.setOutput('node_time', formatJobDuration(node));
-            core.setOutput('go_time', formatJobDuration(go));
-            core.setOutput('java_time', formatJobDuration(java));
-            core.setOutput('csharp_time', formatJobDuration(csharp));
-            core.setOutput('cpp_time', formatJobDuration(cpp));
-            core.setOutput('swift_time', formatJobDuration(swift));
-            core.setOutput('bdd_time', formatJobDuration(bdd));
-            core.setOutput('examples_time', formatJobDuration(examples));
-            core.setOutput('other_time', formatJobDuration(other));
-            core.setOutput('common_time', formatJobDuration(common));
-            core.setOutput('detect_time', formatJobDuration(detect));
 
             // Calculate total time - find the earliest job start time
             let earliestStart = null;
@@ -374,7 +254,6 @@ jobs:
               core.setOutput('total_time', '-');
             }
 
-            return jobTimes;
 
       - name: Check status
         run: |
@@ -422,6 +301,9 @@ jobs:
           echo "| 🔍 Detection | $detect_status | ${{ steps.times.outputs.detect_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 📋 Common Checks | $common_status | ${{ steps.times.outputs.common_time }} |" >> "$GITHUB_STEP_SUMMARY"
 
+          runtime_status=$(format_status "${{ needs.runtime.result }}" "${{ steps.times.outputs.runtime_time }}")
+          echo "| Runtime binaries | $runtime_status | ${{ steps.times.outputs.runtime_time }} |" >> "$GITHUB_STEP_SUMMARY"
+
           # Language/component tests
           rust_status=$(format_status "${{ needs.test-rust.result }}" "${{ steps.times.outputs.rust_time }}")
           python_status=$(format_status "${{ needs.test-python.result }}" "${{ steps.times.outputs.python_time }}")
@@ -454,6 +336,7 @@ jobs:
           # Check for failures
           if [[ "${{ needs.common.result }}" == "failure" ]] || \
              [[ "${{ needs.detect.result }}" == "failure" ]] || \
+             [[ "${{ needs.runtime.result }}" == "failure" ]] || \
              [[ "${{ needs.test-rust.result }}" == "failure" ]] || \
              [[ "${{ needs.test-python.result }}" == "failure" ]] || \
              [[ "${{ needs.test-php.result }}" == "failure" ]] || \
@@ -471,6 +354,7 @@ jobs:
             exit 1
           elif [[ "${{ needs.common.result }}" == "cancelled" ]] || \
                [[ "${{ needs.detect.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.runtime.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-rust.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-python.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-php.result }}" == "cancelled" ]] || \

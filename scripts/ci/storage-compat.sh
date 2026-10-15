@@ -34,19 +34,16 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 # The baseline's own core/server/config.toml is extracted next to its binary and
 # both boots read it, so the swap changes the binary and nothing else.
 #
-# Both binaries MUST be built here. `core/integration` has no dependency on the
-# `server` package; the harness only LOCATES a binary, through
-# `assert_cmd::Command::cargo_bin`, which falls back to whatever file happens to
-# sit at target/debug/iggy-server (assert_cmd 2.2.2 `legacy_cargo_bin`). So
-# `cargo nextest run -p integration` compiles no server at all, and a lane that
-# does not build both halves compares a stale binary against itself and reports
-# green forever.
+# The harness only locates binaries; it never builds them. CI supplies HEAD
+# through a revision-checked runtime archive. Local runs build HEAD here.
+# The baseline is always resolved independently from its own source tree.
 #
 # Exit codes: 0 = compatible, non-zero = build failure or format regression.
 
 # Empty selects the default described above once HEAD is known.
 BASELINE_REF=""
 REBUILD_BASELINE=0
+RUNTIME_ARTIFACTS=""
 
 # The single #[ignore]d test this script exists to drive. The integration crate
 # is one binary built from tests/mod.rs, so tests are selected by module path.
@@ -62,16 +59,22 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
+    --runtime-artifacts)
+      RUNTIME_ARTIFACTS="${2:?--runtime-artifacts requires an archive directory}"
+      RUNTIME_ARTIFACTS="$(realpath "$RUNTIME_ARTIFACTS")"
+      shift 2
+      ;;
     --rebuild-baseline)
       REBUILD_BASELINE=1
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--baseline-ref <ref>] [--rebuild-baseline]"
+      echo "Usage: $0 [--baseline-ref <ref>] [--rebuild-baseline] [--runtime-artifacts <directory>]"
       echo ""
       echo "Options:"
       echo "  --baseline-ref <ref>  Ref to build the baseline server from (default: the merge ref's"
       echo "                        first parent on a pull_request run, origin/master otherwise)"
+      echo "  --runtime-artifacts  Use a revision-checked CI runtime archive for HEAD"
       echo "  --rebuild-baseline    Rebuild the baseline even when its binary is already on disk"
       exit 0
       ;;
@@ -263,14 +266,17 @@ else
   rm -rf "${BASELINE_TARGET_DIR}"
 fi
 
-# The baseline never writes here any more, but a binary left by an earlier run
-# of this script (or by any other build in this tree) would satisfy the
-# existence check below without cargo having produced it now. Delete it so that
-# check means what it says.
-rm -f "${HEAD_SERVER}"
-
-echo "Building HEAD iggy-server from ${HEAD_SHA}..."
-cargo build --locked -p server --bin iggy-server
+if [[ -n "$RUNTIME_ARTIFACTS" ]]; then
+  if [[ "$TARGET_DIR" != "$REPO_ROOT/target" ]]; then
+    echo "Runtime artifacts require CARGO_TARGET_DIR=$REPO_ROOT/target"
+    exit 1
+  fi
+  ./scripts/ci/restore-runtime.sh "$RUNTIME_ARTIFACTS"
+else
+  rm -f "${HEAD_SERVER}"
+  echo "Building HEAD iggy-server from ${HEAD_SHA}..."
+  cargo build --locked -p server --bin iggy-server
+fi
 
 if [ ! -x "${HEAD_SERVER}" ]; then
   echo "HEAD build did not produce ${HEAD_SERVER}"

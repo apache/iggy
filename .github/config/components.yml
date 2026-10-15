@@ -564,6 +564,8 @@ components:
   # CI/CD workflow monitoring (informational, no tasks)
   ci-workflows:
     paths:
+      - "scripts/ci/restore-runtime.sh"
+      - "scripts/ci/test-runtime-artifacts.py"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"

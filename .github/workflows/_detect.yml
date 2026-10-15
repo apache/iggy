@@ -20,6 +20,9 @@ name: _detect
 on:
   workflow_call:
     outputs:
+      runtime:
+        description: "Whether selected tests need shared runtime binaries"
+        value: ${{ jobs.detect.outputs.runtime }}
       third_party_licenses:
         description: "Whether third-party license inputs changed"
         value: ${{ jobs.detect.outputs.third_party_licenses }}
@@ -68,6 +71,7 @@ jobs:
     runs-on: ubuntu-slim
     timeout-minutes: 10
     outputs:
+      runtime: ${{ steps.mk.outputs.runtime }}
       third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
       rust_plan: ${{ steps.mk.outputs.rust_plan }}
       python_matrix: ${{ steps.mk.outputs.python_matrix }}
@@ -425,6 +429,16 @@ jobs:
               const output = `${name}=${value}`;
               require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `${output}\n`);
             };
+
+            const needsRuntime = groups.rust.some(({task}) => task === 'test' || task === 'test-storage-compat') ||
+              groups.bdd.length > 0 || groups.examples.length > 0 ||
+              ['python', 'php', 'java', 'cpp'].some(group => groups[group].some(({task}) => task === 'test')) ||
+              ['node', 'go', 'csharp'].some(group => groups[group].some(({task}) => task.startsWith('e2e')));
+            setOutput('runtime', String(needsRuntime));
+            for (const group of ['bdd', 'examples']) {
+              groups[group] = groups[group].map(entry => ({...entry, name: entry.task.slice(group.length + 1)}));
+            }
+            groups.other = groups.other.map(entry => ({...entry, name: `${entry.component}/${entry.task}`}));
 
             setOutput('rust_plan', groups.rust.length ? JSON.stringify({
               checks: groups.rust.filter(entry => entry.task !== 'test'),

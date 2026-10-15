@@ -160,6 +160,9 @@ runs:
         if [[ -n "${{ inputs.replica-id }}" ]]; then
           CLI_ARGS+=(--replica-id "${{ inputs.replica-id }}")
         fi
+        if [[ "${{ inputs.mode }}" == bin ]]; then
+          export LLVM_PROFILE_FILE="$RUNNER_TEMP/iggy-server-%h-%p-%m.profraw"
+        fi
         nohup "${{ steps.resolve-bin.outputs.bin }}" "${CLI_ARGS[@]}" >"$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "Started server PID $(cat "$PID_FILE") → logs: $LOG_FILE"
