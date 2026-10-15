@@ -592,6 +592,22 @@ public sealed partial class TcpMessageStream
                 {
                     continue;
                 }
+                if (attempt.Error is IggyInvalidStatusCodeException
+                    {
+                        StatusCode: VsrError.STREAM_ID_NOT_FOUND or VsrError.STREAM_NAME_NOT_FOUND
+                        or VsrError.TOPIC_ID_NOT_FOUND or VsrError.TOPIC_NAME_NOT_FOUND or VsrError.PARTITION_NOT_FOUND
+                    })
+                {
+                    lock (_pollRoutingGate)
+                    {
+                        if (_metadataReplica is not { } metadataPrimary
+                            || !_replicaLinks.TryGetValue(metadataPrimary, out var metadataSlot)
+                            || !ReferenceEquals(metadataSlot.Connection, connection))
+                        {
+                            continue;
+                        }
+                    }
+                }
                 ExceptionDispatchInfo.Throw(attempt.Error);
             }
             using var response = attempt.Response!;

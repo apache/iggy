@@ -29,6 +29,7 @@ import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
 import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
 import org.apache.iggy.cluster.ClusterMetadata;
+import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
@@ -90,6 +91,7 @@ final class PollRouter {
     private final Set<Poll> pending = new HashSet<>();
     private volatile int rosterSize;
     private final Map<Integer, ConnectionInfo> replicas = new HashMap<>();
+    private ConnectionInfo metadataPrimary;
     private final Map<String, Long> partitionCounts = new HashMap<>();
 
     PollRouter(Supplier<AsyncTcpConnection> coordinator, Function<ConnectionInfo, AsyncTcpConnection> connectData) {
@@ -354,12 +356,16 @@ final class PollRouter {
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     synchronized void observeTopology(ClusterMetadata metadata) {
         replicas.clear();
+        metadataPrimary = null;
         rosterSize = metadata.nodes().size();
         for (var node : metadata.nodes()) {
             if (node.endpoints().tcp() != 0) {
-                replicas.put(
-                        node.replicaId(),
-                        new ConnectionInfo(node.ip(), node.endpoints().tcp()));
+                ConnectionInfo endpoint =
+                        new ConnectionInfo(node.ip(), node.endpoints().tcp());
+                replicas.put(node.replicaId(), endpoint);
+                if (node.role() == ClusterNodeRole.Leader) {
+                    metadataPrimary = endpoint;
+                }
             }
         }
         if (connectData == null || !coordinator.get().isAuthenticated()) {
@@ -624,11 +630,12 @@ final class PollRouter {
                 : CompletableFuture.completedFuture(null);
         return roster.thenCompose(ignored -> lookupConnection(poll, cached))
                 .thenCompose(source -> source.sendRouted(
-                        CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
-                        Unpooled.wrappedBuffer(poll.routingBody),
-                        0,
-                        poll.deadline,
-                        new AsyncTcpConnection.TransientFailoverState()))
+                                CommandCode.Messages.GET_PARTITION_ROUTE.getValue(),
+                                Unpooled.wrappedBuffer(poll.routingBody),
+                                0,
+                                poll.deadline,
+                                new AsyncTcpConnection.TransientFailoverState())
+                        .exceptionallyCompose(error -> CompletableFuture.failedFuture(lookupFailure(source, error))))
                 .thenCompose(response -> {
                     PartitionRoute decoded;
                     try {
@@ -644,6 +651,37 @@ final class PollRouter {
                     }
                     return known.thenApply(ignored -> cacheRoute(parent, poll, decoded));
                 });
+    }
+
+    private Throwable lookupFailure(AsyncTcpConnection source, Throwable error) {
+        IggyServerException refusal = AsyncTcpConnection.findServerError(error);
+        boolean missing = refusal != null
+                && switch (refusal.getErrorCode()) {
+                    case STREAM_ID_NOT_FOUND,
+                            STREAM_NAME_NOT_FOUND,
+                            TOPIC_ID_NOT_FOUND,
+                            TOPIC_NAME_NOT_FOUND,
+                            PARTITION_NOT_FOUND -> true;
+                    default -> false;
+                };
+        // A backup can lack metadata that the leader is still materializing.
+        return missing && !isMetadataPrimary(source) ? notAccepted() : unwrap(error);
+    }
+
+    private synchronized boolean isMetadataPrimary(AsyncTcpConnection source) {
+        if (connectData == null) {
+            return true;
+        }
+        if (metadataPrimary == null) {
+            return false;
+        }
+        if (source == coordinator.get()
+                && coordinatorEndpoint != null
+                && LeaderAwareness.isSameSpelling(metadataPrimary, coordinatorEndpoint.get())) {
+            return true;
+        }
+        Slot primary = connections.get(metadataPrimary);
+        return primary != null && primary.connection == source;
     }
 
     @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})

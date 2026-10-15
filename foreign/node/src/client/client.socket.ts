@@ -70,6 +70,7 @@ const NOT_PRIMARY = 89;
 const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
 const INVALID_SESSION_BINDING = 14004;
+const ROUTE_NAMESPACE_MISSING = new Set([1009, 1010, 2010, 2011, 3007]);
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
 const IDENTIFIER_PREFIX_SIZE = 2;
 const SEND_METADATA_LENGTH_SIZE = 4;
@@ -467,6 +468,13 @@ export class CommandResponseStream extends EventEmitter {
           throw error;
         }
         this.ensureGeneration(generation, COMMAND_CODE.GetPartitionRoute);
+        if (error instanceof ResponseError && ROUTE_NAMESPACE_MISSING.has(error.errorCode) &&
+            (this.metadataReplica === undefined || this.replicas.get(this.metadataReplica)?.connection !== link)) {
+          // A backup can lag a metadata create while the primary materializes the route.
+          lastRefusal = responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
+          lastRefusal.fromServer = error.fromServer;
+          continue;
+        }
         if (error instanceof DeserializeError || (error instanceof ResponseError && !isTransient(error.errorCode))) throw error;
         if (error instanceof ResponseError) lastRefusal = error;
       }

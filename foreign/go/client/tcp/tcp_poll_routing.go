@@ -146,6 +146,7 @@ func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRo
 		}
 	}
 	c.polls.mu.Unlock()
+	metadataPrimary := c.links.metadata()
 	for _, link := range c.links.lookupCandidates(preferred, after) {
 		if err := c.bindLink(ctx, link); err != nil {
 			if isSessionError(err) {
@@ -165,6 +166,13 @@ func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRo
 				return pollRoute{}, err
 			}
 			if retryBeforeAdmission(err) {
+				c.recordLookupFailure(fence, cached, found, link)
+				continue
+			}
+			// Only the metadata primary can confirm a miss; backups may lag a new namespace.
+			if link != metadataPrimary && (errors.Is(err, ierror.ErrStreamIdNotFound) ||
+				errors.Is(err, ierror.ErrStreamNameNotFound) || errors.Is(err, ierror.ErrTopicIdNotFound) ||
+				errors.Is(err, ierror.ErrTopicNameNotFound) || errors.Is(err, ierror.ErrPartitionNotFound)) {
 				c.recordLookupFailure(fence, cached, found, link)
 				continue
 			}

@@ -601,7 +601,8 @@ impl OperationDriver {
     ) -> Result<PartitionRouteResponse, IggyError> {
         let body = GetPartitionRouteRequest::try_from(key)?.to_bytes();
         let hinted = self.routes().ask_first(key);
-        let first = hinted.or_else(|| self.links.metadata_primary());
+        let metadata_primary = self.links.metadata_primary();
+        let first = hinted.or(metadata_primary);
         let mut replicas = self.links.ready_replicas();
         let start = first.map_or(0, |first| replicas.partition_point(|id| *id < first));
         replicas.rotate_left(start);
@@ -626,6 +627,17 @@ impl OperationDriver {
                     }
                 }
                 Err(error) if retries_lookup(&error) => refusal = error,
+                Err(
+                    IggyError::StreamIdNotFound(_)
+                    | IggyError::StreamNameNotFound(_)
+                    | IggyError::TopicIdNotFound(_, _)
+                    | IggyError::TopicNameNotFound(_, _)
+                    | IggyError::PartitionNotFound(_, _, _),
+                ) if Some(replica) != metadata_primary => {
+                    // A backup can miss metadata that another client just created.
+                    // Only the metadata primary can make this miss terminal.
+                    refusal = IggyError::TransientNotAccepted;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1868,6 +1880,64 @@ mod tests {
         assert_eq!(stamped_context(&f.sends()[1]), current.context());
         let reads = f.cluster.received(GET_STREAMS_CODE);
         assert_eq!(reads[0].header.minimum_metadata_op, COMMIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_lagging_backup_when_the_metadata_primary_is_materialising_should_retry_the_route()
+     {
+        let fixture = Fixture::new().await;
+        let metadata_primary = fixture.driver.links.metadata_primary().unwrap();
+        fixture.cluster.script(
+            &endpoint(metadata_primary),
+            GET_PARTITION_ROUTE_CODE,
+            [Answer::Refuse(IggyError::TransientNotAccepted)],
+        );
+        for replica in 0..REPLICAS {
+            if replica != metadata_primary {
+                fixture.cluster.script(
+                    &endpoint(replica),
+                    GET_PARTITION_ROUTE_CODE,
+                    [Answer::Refuse(IggyError::TopicIdNotFound(
+                        fixture.topic_id.clone(),
+                        fixture.stream_id.clone(),
+                    ))],
+                );
+            }
+        }
+
+        fixture.send_messages().await.unwrap();
+
+        let mut queried: Vec<_> = (0..REPLICAS).map(endpoint).collect();
+        queried.push(endpoint(metadata_primary));
+        assert_eq!(
+            endpoints(&fixture.cluster.received(GET_PARTITION_ROUTE_CODE)),
+            queried
+        );
+        assert_eq!(fixture.sends().len(), 1);
+        assert_eq!(endpoints(&fixture.sends()), [endpoint(PRIMARY)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_missing_topic_on_the_metadata_primary_when_looking_up_should_return_not_found()
+    {
+        let fixture = Fixture::new().await;
+        let metadata_primary = fixture.driver.links.metadata_primary().unwrap();
+        let missing =
+            IggyError::TopicIdNotFound(fixture.topic_id.clone(), fixture.stream_id.clone());
+        fixture.cluster.script(
+            &endpoint(metadata_primary),
+            GET_PARTITION_ROUTE_CODE,
+            [Answer::Refuse(missing.clone())],
+        );
+
+        let error = fixture.send_messages().await.unwrap_err();
+
+        assert_eq!(error.as_code(), missing.as_code());
+        assert_eq!(
+            endpoints(&fixture.cluster.received(GET_PARTITION_ROUTE_CODE)),
+            [endpoint(metadata_primary)]
+        );
+        assert!(fixture.sends().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

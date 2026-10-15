@@ -3171,6 +3171,100 @@ describe('native replica resources and route floors', () => {
     } finally { client.destroy(); await server.close(); }
   });
 
+  for (const status of [1009, 1010, 2010, 2011, 3007]) {
+    it(`ignores a backup namespace miss ${status} while the primary materializes the route`, async (context) => {
+      const lookups: number[] = [];
+      let primaryLookups = 0;
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        lookups.push(7);
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), status));
+        return true;
+      }, (frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        lookups.push(0);
+        socket.write(++primaryLookups === 1
+          ? replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED)
+          : replyFrame(frame, Operation.NonReplicated, routingBody(1n)));
+        return true;
+      });
+      try {
+        await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+        context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+        let backoffStarted!: () => void;
+        const backoff = new Promise<void>((resolve) => { backoffStarted = resolve; });
+        context.mock.method(Math, 'random', () => { backoffStarted(); return 1 - Number.EPSILON; });
+        const pending = cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 500 });
+        await Promise.race([backoff, pending]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(lookups, [0, 7]);
+        context.mock.timers.tick(50);
+        await pending;
+        assert.deepEqual(lookups, [0, 7, 0]);
+        assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+        assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 1);
+      } finally { context.mock.timers.reset(); await cluster.close(); }
+    });
+
+    it(`returns a known metadata primary namespace miss ${status} without sending`, async (context) => {
+      const cluster = await startPollCluster(undefined, (frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), status));
+        return true;
+      });
+      try {
+        await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+        context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+        await assert.rejects(
+          cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 500 }),
+          (error: unknown) => error instanceof ResponseError && error.errorCode === status &&
+            error.commandCode === COMMAND_CODE.SendMessages
+        );
+        assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetPartitionRoute), 0);
+        assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+        assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 0);
+      } finally { context.mock.timers.reset(); await cluster.close(); }
+    });
+  }
+
+  it('keeps backup namespace misses transient until the route deadline expires', async (context) => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 2010));
+      return true;
+    }, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
+      return true;
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+      let backoffStarted!: () => void;
+      const backoff = new Promise<void>((resolve) => { backoffStarted = resolve; });
+      context.mock.method(Math, 'random', () => { backoffStarted(); return 1 - Number.EPSILON; });
+      const routeTimeout = 25;
+      const pending = cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + routeTimeout });
+      await Promise.race([backoff, pending]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetPartitionRoute), 1);
+      const rejected = assert.rejects(pending,
+        (error: unknown) => error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_ACCEPTED
+      );
+      context.mock.timers.tick(routeTimeout);
+      await rejected;
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetPartitionRoute), 1);
+      assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+      assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 0);
+    } finally { context.mock.timers.reset(); await cluster.close(); }
+  });
+
   for (const refusal of ['stale', 'conflicting', 'refused'] as const) {
     it(`visits every ready replica when earlier route replies are ${refusal}`, async () => {
       const incarnation = 17n;

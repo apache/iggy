@@ -1512,6 +1512,63 @@ func TestPartitionLookupUsesReadyReplicaWhenMetadataCannotAnswer(t *testing.T) {
 	require.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.PollMessagesCode))
 }
 
+func TestPartitionLookupDistinguishesLaggingReplicasFromMissingNamespaces(t *testing.T) {
+	for _, missing := range []ierror.IggyError{ierror.ErrStreamIdNotFound, ierror.ErrStreamNameNotFound,
+		ierror.ErrTopicIdNotFound, ierror.ErrTopicNameNotFound, ierror.ErrPartitionNotFound} {
+		t.Run(fmt.Sprint(missing.Code()), func(t *testing.T) {
+			t.Run("lagging_backup", func(t *testing.T) {
+				var primaryLookups atomic.Uint32
+				fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+					if read.code() == uint32(command.GetPartitionRouteCode) {
+						return statusReplyFrame(read.operation(), uint32(missing.Code()), nil), true
+					}
+					return nil, false
+				}, func(_ int, read request) ([]byte, bool) {
+					if read.code() == uint32(command.GetPartitionRouteCode) && primaryLookups.Add(1) == 1 {
+						return statusReplyFrame(read.operation(), uint32(ierror.TransientNotAcceptedCode), nil), true
+					}
+					return nil, false
+				})
+				require.Eventually(t, func() bool {
+					return fixture.client.links.replica(1) != nil && fixture.client.links.replica(2) != nil
+				}, managedLinkTestBudget, managedLinkPoll)
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+				defer cancel()
+
+				_, err := pollPrimaryPartition(ctx, fixture.client, 0)
+
+				require.NoError(t, err)
+				assert.Equal(t, uint32(2), primaryLookups.Load())
+				for _, replica := range fixture.primaries {
+					assert.Equal(t, 1, requestCount(replica.recorded(), command.GetPartitionRouteCode))
+				}
+				assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.PollMessagesCode))
+				assert.Zero(t, requestCount(fixture.primaries[1].recorded(), command.PollMessagesCode))
+			})
+			t.Run("metadata_primary", func(t *testing.T) {
+				fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {
+					if read.code() == uint32(command.GetPartitionRouteCode) {
+						return statusReplyFrame(read.operation(), uint32(missing.Code()), nil), true
+					}
+					return nil, false
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+				defer cancel()
+
+				_, err := pollPrimaryPartition(ctx, fixture.client, 0)
+
+				require.ErrorIs(t, err, missing)
+				assert.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
+				assert.Zero(t, requestCount(fixture.coordinator.recorded(), command.PollMessagesCode))
+				for _, replica := range fixture.primaries {
+					assert.Zero(t, requestCount(replica.recorded(), command.GetPartitionRouteCode))
+					assert.Zero(t, requestCount(replica.recorded(), command.PollMessagesCode))
+				}
+			})
+		})
+	}
+}
+
 func TestPartitionRouteCannotReplaceANewerMetadataFloorOrPartitionCount(t *testing.T) {
 	client, peer := newPipeClient(t)
 	received, release := make(chan struct{}), make(chan struct{})

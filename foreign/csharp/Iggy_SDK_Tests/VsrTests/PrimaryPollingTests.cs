@@ -1272,6 +1272,105 @@ public sealed class PrimaryPollingTests
         Assert.All(cluster.Primaries, node => Assert.Equal(0, node.Registrations));
     }
 
+    [Theory]
+    [InlineData(VsrError.STREAM_ID_NOT_FOUND, false)]
+    [InlineData(VsrError.STREAM_NAME_NOT_FOUND, false)]
+    [InlineData(VsrError.TOPIC_ID_NOT_FOUND, false)]
+    [InlineData(VsrError.TOPIC_NAME_NOT_FOUND, false)]
+    [InlineData(VsrError.PARTITION_NOT_FOUND, false)]
+    [InlineData(VsrError.STREAM_ID_NOT_FOUND, true)]
+    [InlineData(VsrError.STREAM_NAME_NOT_FOUND, true)]
+    [InlineData(VsrError.TOPIC_ID_NOT_FOUND, true)]
+    [InlineData(VsrError.TOPIC_NAME_NOT_FOUND, true)]
+    [InlineData(VsrError.PARTITION_NOT_FOUND, true)]
+    public async Task given_a_backup_route_lookup_miss_when_metadata_is_materializing_should_continue_discovery(
+        int status, bool remainingReplica)
+    {
+        using var cluster = new PollCluster(primaryCount: remainingReplica ? 2 : 1);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+        var metadataLookups = 0;
+        var backupLookups = 0;
+        var resolved = 0;
+        cluster.OnCoordinator = request =>
+        {
+            if (request.Code != CommandCodes.GET_PARTITION_ROUTE_CODE)
+            {
+                return null;
+            }
+            if (Interlocked.Increment(ref metadataLookups) == 1 || remainingReplica)
+            {
+                return Reply(request.Operation, [], VsrError.TRANSIENT_NOT_ACCEPTED);
+            }
+            Volatile.Write(ref resolved, 1);
+            return RouteReply(request, cluster.RouteContext, 1, (uint)cluster.Primaries.Length);
+        };
+        cluster.OnPrimaryControl = request =>
+        {
+            if (request.Code != CommandCodes.GET_PARTITION_ROUTE_CODE)
+            {
+                return null;
+            }
+            if (Interlocked.Increment(ref backupLookups) == 1 || !remainingReplica)
+            {
+                return Reply(request.Operation, [], (uint)status);
+            }
+            Volatile.Write(ref resolved, 1);
+            return RouteReply(request, cluster.RouteContext, 1, (uint)cluster.Primaries.Length);
+        };
+        cluster.OnPrimarySend = request =>
+        {
+            Assert.Equal(1, Volatile.Read(ref resolved));
+            return Reply(request.Operation, new byte[4]);
+        };
+        using var client = await cluster.ConnectAsync();
+        for (byte replica = 1; replica <= cluster.Primaries.Length; replica++)
+        {
+            var connection = await (Task<VsrConnection?>)typeof(TcpMessageStream)
+                .GetMethod("FindReadyReplicaAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(client, [replica, cancellation.Token])!;
+            Assert.NotNull(connection);
+        }
+
+        await client.SendMessagesAsync(Stream, Topic, Partitioning.PartitionId(0),
+            new Message(Guid.NewGuid(), "payload"u8.ToArray()), cancellation.Token);
+
+        Assert.False(cancellation.IsCancellationRequested);
+        Assert.Equal(remainingReplica ? 1 : 2, metadataLookups);
+        Assert.Equal(remainingReplica ? 2 : 1, backupLookups);
+        var routes = cluster.RouteRequests;
+        Assert.Equal(3, routes.Length);
+        var send = Assert.Single(cluster.PrimaryRequests, request => request.Operation == (byte)VsrOperation.SendMessages);
+        Assert.Equal(cluster.RouteContext, send.Context);
+        Assert.All(routes, route => Assert.True(route.RequestId < send.RequestId));
+    }
+
+    [Theory]
+    [InlineData(VsrError.STREAM_ID_NOT_FOUND)]
+    [InlineData(VsrError.STREAM_NAME_NOT_FOUND)]
+    [InlineData(VsrError.TOPIC_ID_NOT_FOUND)]
+    [InlineData(VsrError.TOPIC_NAME_NOT_FOUND)]
+    [InlineData(VsrError.PARTITION_NOT_FOUND)]
+    public async Task given_a_metadata_primary_route_lookup_miss_when_sending_should_surface_it_without_retrying(int status)
+    {
+        using var cluster = new PollCluster();
+        cluster.OnCoordinator = request => request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE
+            ? Reply(request.Operation, [], (uint)status) : null;
+        using var client = await cluster.ConnectAsync();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cancellation.CancelAfter(TimeSpan.FromSeconds(5));
+
+        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => client.SendMessagesAsync(
+            Stream, Topic, Partitioning.PartitionId(0), new Message(Guid.NewGuid(), "payload"u8.ToArray()),
+            cancellation.Token));
+
+        Assert.Equal(status, error.StatusCode);
+        Assert.True(error.FromServer);
+        Assert.False(cancellation.IsCancellationRequested);
+        Assert.Single(cluster.RouteRequests);
+        Assert.DoesNotContain(cluster.PrimaryRequests, request => request.Operation == (byte)VsrOperation.SendMessages);
+    }
+
     [Fact]
     public async Task given_a_malformed_write_reply_when_using_a_primary_should_report_an_unknown_outcome()
     {

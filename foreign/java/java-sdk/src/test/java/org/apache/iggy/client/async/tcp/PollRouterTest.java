@@ -37,10 +37,17 @@ import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
+import org.apache.iggy.message.SendMessagesResponse;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
@@ -78,6 +85,138 @@ class PollRouterTest {
             new PartitionContext(BigInteger.valueOf(INCARNATION), BigInteger.ZERO, BigInteger.valueOf(ROUTE_WATERMARK));
     private static final Duration TIMEOUT = Duration.ofSeconds(5);
     private static final Duration NEVER = Duration.ofDays(1);
+
+    @ParameterizedTest
+    @EnumSource(
+            value = IggyErrorCode.class,
+            names = {
+                "STREAM_ID_NOT_FOUND",
+                "STREAM_NAME_NOT_FOUND",
+                "TOPIC_ID_NOT_FOUND",
+                "TOPIC_NAME_NOT_FOUND",
+                "PARTITION_NOT_FOUND"
+            })
+    void shouldRetryANamespaceMissFromALaggingBackup(IggyErrorCode missing) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        router.coordinatorEndpoint(
+                () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
+        try {
+            coordinator.routeReady = CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0]));
+            primary.routeReply.completeExceptionally(
+                    IggyServerException.fromTcpResponse(missing.getCode(), new byte[0]));
+            var sent = sendMessage(coordinator, router);
+            assertThat(sent).isNotDone();
+            assertThat(coordinator.routes).isEqualTo(1);
+            timers.runLast();
+            assertThat(primary.routes).isEqualTo(1);
+            assertThat(sent).isNotDone();
+            assertThat(primary.sentContexts).isEmpty();
+
+            coordinator.routeReady = CompletableFuture.completedFuture(null);
+            timers.runLast();
+            timers.runLast();
+            sent.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            assertThat(coordinator.routes).isEqualTo(2);
+            assertThat(primary.routes).isEqualTo(1);
+            assertThat(primary.sentContexts).containsExactly(ROUTE_CONTEXT);
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldTreatOnlyTheRosterLeaderNamespaceMissAsAuthoritative(boolean coordinatorIsLeader) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        router.coordinatorEndpoint(
+                () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
+        try {
+            coordinator.metadataLeaderPort = coordinatorIsLeader ? PRIMARY_PORT + 1 : PRIMARY_PORT;
+            var missing = IggyServerException.fromTcpResponse(IggyErrorCode.TOPIC_ID_NOT_FOUND.getCode(), new byte[0]);
+            coordinator.routeReady = CompletableFuture.failedFuture(missing);
+            primary.routeReply.completeExceptionally(missing);
+            var sent = sendMessage(coordinator, router);
+            if (!coordinatorIsLeader) {
+                assertThat(sent).isNotDone();
+                timers.runLast();
+            }
+            assertServerError(sent, IggyErrorCode.TOPIC_ID_NOT_FOUND.getCode());
+            assertThat(coordinator.routes).isEqualTo(1);
+            assertThat(primary.routes).isEqualTo(coordinatorIsLeader ? 0 : 1);
+            assertThat(primary.sentContexts).isEmpty();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = IggyErrorCode.class,
+            names = {"UNAUTHORIZED", "INVALID_CREDENTIALS", "INVALID_FORMAT"})
+    void shouldKeepOtherBackupLookupFailuresTerminal(IggyErrorCode error) throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        router.coordinatorEndpoint(
+                () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
+        try {
+            coordinator.routeReady = CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0]));
+            primary.routeReply.completeExceptionally(IggyServerException.fromTcpResponse(error.getCode(), new byte[0]));
+            var sent = sendMessage(coordinator, router);
+            assertThat(sent).isNotDone();
+            timers.runLast();
+            assertServerError(sent, error.getCode());
+            assertThat(coordinator.routes).isEqualTo(1);
+            assertThat(primary.routes).isEqualTo(1);
+            assertThat(primary.sentContexts).isEmpty();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldKeepAnUnknownLeaderNamespaceMissInsideTheOriginalDeadline() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        Primary primary = new Primary(group);
+        PollRouter router = new PollRouter(() -> coordinator, endpoint -> primary);
+        router.coordinatorEndpoint(
+                () -> new ConnectionInfo(InetAddress.getLoopbackAddress().getHostAddress(), PRIMARY_PORT + 1));
+        try {
+            coordinator.metadataLeaderPort = 0;
+            coordinator.routeReady = CompletableFuture.failedFuture(
+                    IggyServerException.fromTcpResponse(IggyErrorCode.TOPIC_ID_NOT_FOUND.getCode(), new byte[0]));
+            var sent = sendMessage(coordinator, router);
+            assertThat(sent).isNotDone();
+            assertThat(coordinator.routes).isEqualTo(1);
+            timers.scheduled.get(0).run();
+            assertServerError(sent, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+            assertThat(primary.sentContexts).isEmpty();
+        } finally {
+            router.clearSession().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -283,6 +422,12 @@ class PollRouterTest {
         }
     }
 
+    private static CompletableFuture<SendMessagesResponse> sendMessage(Coordinator coordinator, PollRouter router) {
+        return new MessagesTcpClient(() -> coordinator, new ClientRoutingState(), router)
+                .sendMessages(
+                        StreamId.of(1L), TopicId.of(1L), Partitioning.partitionId(0L), List.of(Message.of("message")));
+    }
+
     private static ConsensusSession.Ticket retainOffset(Coordinator coordinator) {
         ByteBuf payload = pollPayload();
         payload.writerIndex(payload.writerIndex() - PollRouter.POLL_PARAMETERS_BYTES);
@@ -361,6 +506,10 @@ class PollRouterTest {
     private static final class ManualTimers extends DefaultEventLoop {
         private final List<Runnable> scheduled = new CopyOnWriteArrayList<>();
 
+        void runLast() {
+            scheduled.get(scheduled.size() - 1).run();
+        }
+
         @Override
         public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
             scheduled.add(command);
@@ -394,6 +543,7 @@ class PollRouterTest {
         private long watermark;
         private PartitionContext context = ROUTE_CONTEXT;
         private int routes;
+        private int metadataLeaderPort = PRIMARY_PORT + 1;
         private CompletableFuture<Void> routeReady = CompletableFuture.completedFuture(null);
 
         Coordinator(IoEventLoopGroup group, EventLoop timers) {
@@ -432,7 +582,7 @@ class PollRouterTest {
             payload.release();
             if (commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()) {
                 return CompletableFuture.completedFuture(AsyncIggyTcpClientTransientFailoverTest.clusterMetadata(
-                        PRIMARY_PORT + 1, PRIMARY_PORT, PRIMARY_PORT + 1));
+                        PRIMARY_PORT + 1, PRIMARY_PORT, metadataLeaderPort));
             }
             assertThat(commandCode).isEqualTo(CommandCode.Messages.GET_PARTITION_ROUTE.getValue());
             routes++;
@@ -461,6 +611,8 @@ class PollRouterTest {
         private final List<PartitionContext> sentContexts = new CopyOnWriteArrayList<>();
         private final List<byte[]> sentFrames = new CopyOnWriteArrayList<>();
         private final CompletableFuture<ByteBuf> unanswered = new CompletableFuture<>();
+        private final CompletableFuture<ByteBuf> routeReply = new CompletableFuture<>();
+        private int routes;
         private CompletableFuture<ByteBuf> binding = CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
         private final AtomicInteger closes = new AtomicInteger();
         private boolean holdAfterFirst = true;
@@ -482,13 +634,18 @@ class PollRouterTest {
             if (commandCode == CommandCode.System.BIND_SESSION.getValue()) {
                 return binding;
             }
+            if (commandCode == GET_PARTITION_ROUTE_CODE) {
+                routes++;
+                return routeReply;
+            }
             sentContexts.add(state.context());
             if (state.ticket() != null) {
                 sentFrames.add(frozenFrame(state.ticket()));
             }
             beforeSend.run();
             return !holdAfterFirst || sentContexts.size() == 1
-                    ? CompletableFuture.completedFuture(emptyPoll(0))
+                    ? CompletableFuture.completedFuture(
+                            commandCode == CommandCode.Messages.SEND.getValue() ? Unpooled.EMPTY_BUFFER : emptyPoll(0))
                     : unanswered;
         }
 
