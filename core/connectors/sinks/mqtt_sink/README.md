@@ -64,11 +64,20 @@ in any order. The connector retries only publications that were not confirmed.
 publications and the MQTT disconnect. If the timeout expires, the connector
 reports the unfinished publication count and returns an error.
 
+Use `username` and `password` in `plugin_config` for broker authentication.
+The connector rejects a `broker_url` that contains a username or password.
+
 `topic_mode = "static"` uses `topic`. `topic_mode = "template"` renders
 `topic_template` with `{stream}` and `{topic}`. `topic_mode = "dynamic"` reads
 `mqtt.topic` from raw-message headers, or reads the topic, payload, and MQTT 5
 publish properties from the versioned JSON envelope. Missing dynamic topics use
 `fallback_topic`, which defaults to `{stream}/{topic}`.
+
+Topic templates support only `{stream}` and `{topic}`. MQTT topics, response
+topics, content types, and user-property strings must be valid MQTT UTF-8
+strings and must not exceed 65,535 bytes. The connector rejects wildcard topic
+names, null characters, invalid payload format indicators, a zero topic alias,
+and outbound subscription identifiers.
 
 Malformed records are logged with their Iggy offset and dropped before MQTT
 publication. Valid records in the same batch are still published. The connector
