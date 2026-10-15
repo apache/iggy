@@ -349,47 +349,82 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_disconnect_during_connect_when_explicit_login_waits_should_not_redial() {
-        let cluster = FakeCluster::new(1);
-        cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
-        let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
-        let (automatic, explicit, ()) = tokio::join!(
-            client.connect(),
-            client.login_user("other", "password"),
-            async {
-                eventually("automatic register reaches the server", || {
-                    cluster.count(LOGIN_REGISTER_CODE) == 1
-                })
-                .await;
-                client.disconnect().await.unwrap();
-            }
-        );
-        assert!(automatic.is_err());
-        assert!(explicit.is_err());
-        assert_eq!(client.get_state().await, ClientState::Disconnected);
-        assert!(!client.driver.session().epoch().bound);
-        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
-        assert_eq!(cluster.dials_to(&endpoint(0)).len(), 1);
+    async fn given_stop_during_connect_when_explicit_login_waits_should_not_redial() {
+        for shutdown in [false, true] {
+            let cluster = FakeCluster::new(1);
+            cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
+            let client = TcpClient::from_links(links(&cluster, &endpoint(0), policy()));
+            let (automatic, explicit, ()) = tokio::join!(
+                client.connect(),
+                client.login_user("other", "password"),
+                async {
+                    eventually("automatic register reaches the server", || {
+                        cluster.count(LOGIN_REGISTER_CODE) == 1
+                    })
+                    .await;
+                    if shutdown {
+                        client.shutdown().await.unwrap();
+                    } else {
+                        client.disconnect().await.unwrap();
+                    }
+                }
+            );
+            assert!(automatic.is_err());
+            assert!(explicit.is_err());
+            assert_eq!(
+                client.get_state().await,
+                if shutdown {
+                    ClientState::Shutdown
+                } else {
+                    ClientState::Disconnected
+                }
+            );
+            assert!(!client.driver.session().epoch().bound);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+            assert_eq!(cluster.dials_to(&endpoint(0)).len(), 1);
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn given_rejected_credentials_when_signing_in_again_should_reconnect_without_retaining() {
-        let cluster = FakeCluster::new(1);
-        cluster.script(
-            &endpoint(0),
-            LOGIN_REGISTER_CODE,
-            [Answer::Evict(EvictionReason::InvalidCredentials)],
-        );
-        let client = manual_client(&cluster);
-        client.connect().await.unwrap();
-        assert_eq!(
-            client.login_user("iggy", "wrong").await.unwrap_err(),
-            IggyError::InvalidCredentials
-        );
-        client.login_user("iggy", "iggy").await.unwrap();
-        assert_eq!(client.get_state().await, ClientState::Authenticated);
-        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
-        assert_eq!(cluster.dials_to(&endpoint(0)).len(), 2);
+        for (replicas, previously_authenticated) in [(1, false), (2, true), (1, true)] {
+            let cluster = FakeCluster::new(replicas);
+            let client = manual_client(&cluster);
+            client.connect().await.unwrap();
+            if previously_authenticated {
+                client.login_user("iggy", "iggy").await.unwrap();
+                eventually("all replica links are ready", || {
+                    client.driver.links().ready_replicas().len() == usize::from(replicas)
+                })
+                .await;
+            }
+            let previous_identity = client.driver.session().identity();
+            cluster.script(
+                &endpoint(0),
+                LOGIN_REGISTER_CODE,
+                [Answer::Evict(EvictionReason::InvalidCredentials)],
+            );
+            assert_eq!(
+                client.login_user("iggy", "wrong").await.unwrap_err(),
+                IggyError::InvalidCredentials
+            );
+            if replicas > 1 {
+                assert!(client.driver.links().ready_replicas().contains(&1));
+            }
+            client.login_user("other", "password").await.unwrap();
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            assert_ne!(client.driver.session().identity(), previous_identity);
+            let requests = cluster.received(LOGIN_REGISTER_CODE);
+            assert_eq!(requests.len(), 2 + usize::from(previously_authenticated));
+            let request =
+                LoginRegisterRequest::decode_from(&requests.last().unwrap().body).unwrap();
+            assert_eq!(request.username.as_str(), "other");
+            assert_eq!(
+                cluster.count(LOGOUT_USER_CODE),
+                usize::from(previously_authenticated)
+            );
+            assert_eq!(cluster.dials_to(&endpoint(0)).len(), 2);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -406,22 +441,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_disconnect_during_explicit_login_when_reply_is_pending_should_not_restore_session()
-     {
-        let cluster = FakeCluster::new(1);
-        cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
-        let client = manual_client(&cluster);
-        let (result, ()) = tokio::join!(client.login_user("iggy", "iggy"), async {
-            eventually("register reaches the server", || {
-                cluster.count(LOGIN_REGISTER_CODE) == 1
-            })
-            .await;
-            client.disconnect().await.unwrap();
-        });
-        assert!(result.is_err());
-        assert_eq!(client.get_state().await, ClientState::Disconnected);
-        assert!(!client.driver.session().epoch().bound);
-        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+    async fn given_stop_during_explicit_login_when_reply_is_pending_should_not_restore_session() {
+        for shutdown in [false, true] {
+            let cluster = FakeCluster::new(1);
+            cluster.script(&endpoint(0), LOGIN_REGISTER_CODE, [Answer::Silence]);
+            let client = manual_client(&cluster);
+            let (result, ()) = tokio::join!(client.login_user("iggy", "iggy"), async {
+                eventually("register reaches the server", || {
+                    cluster.count(LOGIN_REGISTER_CODE) == 1
+                })
+                .await;
+                if shutdown {
+                    client.shutdown().await.unwrap();
+                } else {
+                    client.disconnect().await.unwrap();
+                }
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                client.get_state().await,
+                if shutdown {
+                    ClientState::Shutdown
+                } else {
+                    ClientState::Disconnected
+                }
+            );
+            assert!(!client.driver.session().epoch().bound);
+            assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
     }
 
     #[test]

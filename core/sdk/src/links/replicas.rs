@@ -35,7 +35,7 @@ use super::{
 use crate::SDK_VERSION;
 use crate::session_owner::{SessionEpoch, SessionOwner};
 use async_broadcast::{Receiver, Sender};
-use futures::future::join_all;
+use futures::{FutureExt, future::join_all};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::codes::{BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, PING_CODE};
 use iggy_binary_protocol::requests::system::{
@@ -371,11 +371,7 @@ impl ReplicaLinks {
         let slot = |id: u8| table.slots.get(&id).and_then(|slot| slot.link.as_ref());
         let ready = match target {
             Target::Replica(id) => slot(id),
-            Target::MetadataPrimary => table
-                .metadata_primary
-                .and_then(slot)
-                .filter(|ready| serves(ready, epoch))
-                .or(table.bootstrap.as_ref().map(|bootstrap| &bootstrap.link)),
+            Target::MetadataPrimary => table.primary_link(epoch),
         };
         ready
             .filter(|ready| serves(ready, epoch))
@@ -507,14 +503,23 @@ impl LinksShared {
             self.disconnect();
         }
         let (candidates, stopped) = {
+            let epoch = self.session.epoch();
             let mut table = self.table();
             match table.state {
                 ClientState::Shutdown => return Err(IggyError::ClientShutdown),
                 ClientState::Connected
                 | ClientState::Authenticating
                 | ClientState::Authenticated => {
-                    self.restart_down_slots(&mut table);
-                    return Ok(());
+                    if epoch.bound
+                        || table
+                            .primary_link(epoch)
+                            .is_some_and(|ready| ready.link.closed().now_or_never().is_none())
+                    {
+                        self.restart_down_slots(&mut table);
+                        return Ok(());
+                    }
+                    // Unbound slot tasks wait for a session, so only a
+                    // bootstrap sweep can carry the next sign-in.
                 }
                 ClientState::Disconnected | ClientState::Connecting => {}
             }
@@ -1170,6 +1175,14 @@ impl LinksShared {
 }
 
 impl Table {
+    fn primary_link(&self, epoch: SessionEpoch) -> Option<&ReadyLink> {
+        self.metadata_primary
+            .and_then(|id| self.slots.get(&id))
+            .and_then(|slot| slot.link.as_ref())
+            .filter(|ready| serves(ready, epoch))
+            .or(self.bootstrap.as_ref().map(|bootstrap| &bootstrap.link))
+    }
+
     fn links(&self) -> impl Iterator<Item = &ReadyLink> {
         self.slots
             .values()
