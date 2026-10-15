@@ -26,8 +26,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Java with cache
-      uses: ./.github/actions/utils/setup-java-with-cache
+    - name: Setup Java
+      uses: ./.github/actions/utils/setup-java
       with:
         gradle-cache-disabled: "true"
 
@@ -76,9 +76,9 @@ runs:
         # Exit with build exit code
         exit $BUILD_EXIT_CODE
 
-    - name: Setup Rust with cache
+    - name: Setup Rust
       if: inputs.task == 'test'
-      uses: ./.github/actions/utils/setup-rust-with-cache
+      uses: ./.github/actions/utils/setup-rust
 
     - name: Start Iggy server
       if: inputs.task == 'test'

@@ -53,12 +53,14 @@
 //!       ONE trailing `flush()` per batch. This avoids per-frame TCP/TLS
 //!       record overhead while staying inside the per-record API
 //!       constraints of those transports.
-//!     * **QUIC (per-frame)** uses one bidirectional stream per peer
-//!       and writes each `BusMessage` fragment with a separate
+//!     * **QUIC (per-frame)** answers each request on its own
+//!       bidirectional stream, and serves the streams of a peer at once.
+//!       It writes each `BusMessage` fragment with a separate
 //!       `SendStream::write_all` call; quinn coalesces at the datagram
 //!       layer.
 //!
-//!   In all four cases, any write failure tears the connection down.
+//!   On TCP, TCP-TLS and WS / WSS, any write failure tears the connection
+//!   down. On QUIC, it ends only the stream of that request.
 //! - **Zero-copy `Frozen` ownership**: outbound frames are handed to
 //!   the kernel without intermediate copies on plaintext TCP. WS / QUIC
 //!   / TLS planes pay structural copies in their record layers; see the

@@ -32,7 +32,6 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
-	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -219,17 +218,25 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
 	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
-	partition := uint32(0)
-	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
-		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
+	streamBytes, err := stream.MarshalBinary()
 	require.NoError(t, err)
-	route, err := connected.SendBinaryRequest(ctx, uint32(command.GetPollRoutingCode), payload)
+	topicBytes, err := topic.MarshalBinary()
 	require.NoError(t, err)
-	// The route is [consumer session][partition context][primary node].
-	primaryOffset := vsr.SessionIdentityBytes + iggcon.PartitionContextSize
-	require.Greater(t, len(route), primaryOffset)
-	var primary iggcon.ClusterNode
-	require.NoError(t, primary.UnmarshalBinary(route[primaryOffset:]))
+	payload := binary.LittleEndian.AppendUint32(append(streamBytes, topicBytes...), 0)
+	body, err := connected.SendBinaryRequest(ctx, uint32(command.GetPartitionRouteCode), payload)
+	require.NoError(t, err)
+	var route iggcon.PartitionRoute
+	require.NoError(t, route.UnmarshalBinary(body))
+	metadata, err := connected.GetClusterMetadata(ctx)
+	require.NoError(t, err)
+	var primary *iggcon.ClusterNode
+	for index := range metadata.Nodes {
+		if metadata.Nodes[index].ReplicaID == route.PrimaryReplica {
+			primary = &metadata.Nodes[index]
+			break
+		}
+	}
+	require.NotNil(t, primary, "route primary must be a configured replica")
 	coordinator := connected.GetConnectionInfo().ServerAddress
 	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
 	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
@@ -319,7 +326,7 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
 }
 
-func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
+func TestE2E_MetadataRequestsAcceptCounterGapsFromRawRequests(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 

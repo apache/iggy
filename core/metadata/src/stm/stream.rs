@@ -216,7 +216,7 @@ pub struct Topic {
     /// group's offset key.
     pub next_consumer_group_id: u64,
     /// Op of the last apply that changed `next_consumer_group_id` or the group
-    /// set. A partition expects one owner retirement catalog per op, so a reader
+    /// set. A partition expects one allocation boundary per op, so a reader
     /// takes the catalog and this op from the same published state.
     pub consumer_group_catalog_op: u64,
 }
@@ -397,7 +397,8 @@ impl Stream {
 /// * `WriteCell::apply` is `append(cmd).publish()`, so a batch is one op. Batch
 ///   two and a delete could be absorbed on the second buffer AFTER a create
 ///   that re-minted the same id, and the delete would then evict the new
-///   partition's entry.
+///   partition's entry. The one multi-op batch,
+///   `Streams::remove_consumer_group_members`, touches no entry here.
 /// * `left_right` drains the previous batch's `absorb_second` before the
 ///   current batch's `absorb_first` (0.11.8 `write.rs`), which is an
 ///   implementation detail, not a contract -- which is why the workspace
@@ -1049,6 +1050,11 @@ impl PollMetadata {
     }
 
     #[must_use]
+    pub const fn client_id(&self) -> u128 {
+        self.client_id
+    }
+
+    #[must_use]
     pub fn matches_partition(&self, created_revision: Option<u64>) -> bool {
         created_revision == Some(self.created_revision)
     }
@@ -1229,6 +1235,27 @@ impl Streams {
         })
     }
 
+    /// A partition's incarnation and its topic's partition count, read under
+    /// one guard so a recreated topic never pairs an old incarnation with a
+    /// new count. `None` while a lifecycle operation blocks the topic, as for
+    /// [`Self::poll_metadata`]. The count matches `GetTopic`, so a keyed send
+    /// hashes over the same partitions either way.
+    #[must_use]
+    pub fn partition_route(&self, namespace: IggyNamespace) -> Option<(u64, usize)> {
+        self.read(|inner| {
+            if inner.lifecycle_blocks_consumer(namespace.stream_id(), namespace.topic_id(), None) {
+                return None;
+            }
+            let topic = inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?;
+            let partition = find_partition(&topic.partitions, namespace.partition_id())?;
+            Some((partition.created_revision, topic.partitions.len()))
+        })
+    }
+
     /// A topic's current partition count, or `None` if the stream or topic is
     /// unknown. Update admission reads it to size the floor a `max_topic_size`
     /// has to clear across the whole topic; the update request itself carries
@@ -1390,9 +1417,9 @@ impl Streams {
             .read(|inner| !inner.pending_revocations.is_empty())
     }
 
-    /// The topic's current partition ids, for the join-time in-flight gather
-    /// (the home shard reads each partition's poll/commit state to classify the
-    /// cooperative handoff). `None` if the stream/topic does not resolve.
+    /// The topic's current partition ids, or `None` if the stream or topic
+    /// does not resolve. The server's `resolve_partition_namespace` checks
+    /// only for `None`, to tell a missing partition from a missing topic.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn topic_partition_ids(
@@ -1413,6 +1440,47 @@ impl Streams {
     pub fn consumer_group_pending_revocations(&self) -> Vec<ConsumerGroupOwnershipTransition> {
         self.inner
             .read(|inner| inner.pending_revocations.values().copied().collect())
+    }
+
+    /// The pending revocation of `group_id` on the partition `namespace` names.
+    #[must_use]
+    pub fn consumer_group_pending_revocation(
+        &self,
+        namespace: IggyNamespace,
+        group_id: u64,
+    ) -> Option<ConsumerGroupOwnershipTransition> {
+        self.inner.read(|inner| {
+            inner
+                .pending_revocations
+                .get(&(
+                    namespace.stream_id(),
+                    namespace.topic_id(),
+                    group_id,
+                    namespace.partition_id(),
+                ))
+                .copied()
+        })
+    }
+
+    /// Pending transitions that no lifecycle intent blocks, read under one
+    /// guard. A gate read after the copy can miss an intent that finished in
+    /// between and pass a decision that the finished intent made obsolete.
+    #[must_use]
+    pub fn consumer_group_unblocked_revocations(&self) -> Vec<ConsumerGroupOwnershipTransition> {
+        self.inner.read(|inner| {
+            inner
+                .pending_revocations
+                .values()
+                .filter(|transition| {
+                    !inner.lifecycle_blocks_consumer(
+                        transition.stream_id as usize,
+                        transition.topic_id as usize,
+                        Some(transition.installation.group_id),
+                    )
+                })
+                .copied()
+                .collect()
+        })
     }
 
     /// The group's id (the consumer-group offset key) if `client_id` currently
@@ -1556,19 +1624,37 @@ impl Streams {
         timestamp: IggyTimestamp,
         metadata_op: u64,
     ) {
-        let cmd = StreamsCommand::RemoveConsumerGroupMember(
-            RemoveConsumerGroupMemberRequest { client_id },
-            timestamp,
-            ApplyContext {
-                metadata_op,
-                ..ApplyContext::default()
-            },
-        );
-        if let Err(error) = self.inner.try_apply(cmd) {
+        self.remove_consumer_group_members(&[client_id], timestamp, metadata_op);
+    }
+
+    /// Remove `client_ids` in order, as [`Self::remove_consumer_group_member`]
+    /// would, with one publish. The removals of one op decide owners at the
+    /// same generation, so a reader that installed an owner between two of
+    /// them could never install the final one.
+    pub fn remove_consumer_group_members(
+        &self,
+        client_ids: &[u128],
+        timestamp: IggyTimestamp,
+        metadata_op: u64,
+    ) {
+        if client_ids.is_empty() {
+            return;
+        }
+        let cmds = client_ids.iter().map(|&client_id| {
+            StreamsCommand::RemoveConsumerGroupMember(
+                RemoveConsumerGroupMemberRequest { client_id },
+                timestamp,
+                ApplyContext {
+                    metadata_op,
+                    ..ApplyContext::default()
+                },
+            )
+        });
+        if let Err(error) = self.inner.try_apply_all(cmds) {
             tracing::error!(
-                client_id,
+                ?client_ids,
                 %error,
-                "remove_consumer_group_member dispatched to reader-only Streams STM"
+                "remove_consumer_group_members dispatched to reader-only Streams STM"
             );
         }
     }
@@ -1743,6 +1829,21 @@ impl Streams {
         })
     }
 
+    /// Name of the stream that [`Self::seed_namespace`] creates at `slab`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn seeded_stream_name(slab: usize) -> String {
+        format!("sim-stream-{slab}")
+    }
+
+    /// Name of the topic that [`Self::seed_namespace`] creates at `slab` under
+    /// stream slab `stream_slab`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn seeded_topic_name(stream_slab: usize, slab: usize) -> String {
+        format!("sim-topic-{stream_slab}-{slab}")
+    }
+
     /// Create stream slabs `0..=stream_slab`, skipping those already present.
     #[cfg(any(test, feature = "simulator"))]
     fn seed_stream_slabs(&self, stream_slab: usize) {
@@ -1753,7 +1854,7 @@ impl Streams {
             self.inner
                 .try_apply(StreamsCommand::CreateStream(
                     CreateStreamRequest {
-                        name: WireName::new(format!("sim-stream-{slab}"))
+                        name: WireName::new(Self::seeded_stream_name(slab))
                             .expect("sim stream name is valid"),
                         options: WireOptions::empty(),
                     },
@@ -1798,7 +1899,7 @@ impl Streams {
                             stream_id: stream_wire.clone(),
                             partitions_count: u32::try_from(partitions.len())
                                 .expect("sim partition count fits u32"),
-                            name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
+                            name: WireName::new(Self::seeded_topic_name(stream_slab, slab))
                                 .expect("sim topic name is valid"),
                             options: iggy_common::TopicCreateOptions {
                                 durability: iggy_common::Durability::Persisted,
@@ -2841,8 +2942,8 @@ impl StreamsInner {
             intent.rebuild_partition_index();
         }
         let lifecycle_scopes = lifecycle_intents
-            .iter()
-            .map(|(&op, intent)| intent.scope(op))
+            .values()
+            .map(LifecycleIntent::scope)
             .collect();
         let mut inner = Self {
             index,

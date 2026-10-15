@@ -1063,6 +1063,7 @@ class BytesDeserializerTest {
         }
 
         private void writeClusterNode(ByteBuf buffer, String name, String ip, int tcpPort, int role, int status) {
+            buffer.writeByte(role == 0 ? 1 : 0);
             writeU32PrefixedString(buffer, name);
             writeU32PrefixedString(buffer, ip);
             buffer.writeShortLE(tcpPort);
@@ -1094,12 +1095,14 @@ class BytesDeserializerTest {
             assertThat(metadata.name()).isEqualTo("test-cluster");
             assertThat(metadata.nodes()).hasSize(2);
             var leader = metadata.nodes().get(0);
+            assertThat(leader.replicaId()).isEqualTo(1);
             assertThat(leader.name()).isEqualTo("leader-node");
             assertThat(leader.ip()).isEqualTo("iggy-leader");
             assertThat(leader.endpoints()).isEqualTo(new TransportEndpoints(8091, 8080, 3000, 8070));
             assertThat(leader.role()).isEqualTo(ClusterNodeRole.Leader);
             assertThat(leader.status()).isEqualTo(ClusterNodeStatus.Healthy);
             var follower = metadata.nodes().get(1);
+            assertThat(follower.replicaId()).isZero();
             assertThat(follower.name()).isEqualTo("follower-node");
             assertThat(follower.role()).isEqualTo(ClusterNodeRole.Follower);
             assertThat(follower.status()).isEqualTo(ClusterNodeStatus.Unreachable);

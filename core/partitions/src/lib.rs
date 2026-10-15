@@ -33,8 +33,7 @@ pub mod offset_storage;
 mod partition_storage;
 mod persistence;
 mod poll_plan;
-#[cfg(feature = "simulator")]
-pub use persistence::CheckpointBarrier;
+pub use persistence::FileSyncBarrier;
 pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
@@ -78,6 +77,9 @@ pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
 
 /// Shipped per-kind durable consumer-offset limit for one partition.
 pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
+
+pub(crate) const FILE_SYNC_CONCURRENCY: usize = 16;
+
 pub use iggy_partition::{PollCompletion, PollReplication};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
@@ -128,12 +130,11 @@ pub struct RetainedPartitionState {
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.
     pub write_offset: u64,
-    /// Whether that incarnation ever stamped an offset, i.e. whether the two
-    /// numbers above describe an offset space at all.
-    pub offset_space_used: bool,
+    pub(crate) offset_space: iggy_partition::OffsetSpace,
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
     pub external_group_offsets: Vec<(u32, u64)>,
+    pub(crate) emptied_at: u64,
     pub(crate) consumer_group_owners:
         std::collections::BTreeMap<u64, iggy_partition::InstalledConsumerGroupOwner>,
     pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,

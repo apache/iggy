@@ -32,23 +32,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Per-client cache of the routing facts needed to resolve partitioning and
- * consumer-group polling client-side: topic partition counts, balanced
- * round-robin cursors, and consumer-group assignments. Typed keys retain both
- * the kind and value of every identifier, so numeric identifiers cannot
- * collide with same-text named identifiers.
- *
- * <p>Partition counts and balanced cursors survive reconnects; group
- * assignments are bound to the server-side VSR session (the member is keyed
- * by the connection's client id) and must be cleared whenever that session is
- * reset or the client moves to another node. Partition counts carry their
- * fetch timestamp so callers can refresh them past a staleness budget — a
- * count cached forever would keep hashing keys with the wrong modulus after
- * a partition-count change (the Rust SDK still has that gap).
+ * Per-client balanced cursors and consumer-group assignments. Assignment state
+ * belongs to the current session and is cleared when that session changes.
+ * Typed keys distinguish numeric identifiers from same-text names.
  */
 final class ClientRoutingState {
 
-    private final Map<TopicKey, CachedPartitionCount> partitionCounts = new ConcurrentHashMap<>();
     private final Map<TopicKey, AtomicInteger> balancedCursors = new ConcurrentHashMap<>();
     private final Map<GroupKey, GroupAssignment> assignments = new ConcurrentHashMap<>();
 
@@ -58,23 +47,6 @@ final class ClientRoutingState {
 
     static GroupKey groupKey(StreamId streamId, TopicId topicId, ConsumerId groupId) {
         return new GroupKey(topicKey(streamId, topicId), IdentifierKey.from(groupId));
-    }
-
-    Optional<CachedPartitionCount> partitionCount(TopicKey topicKey) {
-        return Optional.ofNullable(partitionCounts.get(topicKey));
-    }
-
-    void setPartitionCount(TopicKey topicKey, long count, long fetchedAtNanos) {
-        partitionCounts.put(topicKey, new CachedPartitionCount(count, fetchedAtNanos));
-    }
-
-    /**
-     * Drops the cached partition count for a topic. Called when a send that
-     * was routed with the cached count is refused with a not-found error,
-     * meaning the topic shrank or was recreated and the count is stale.
-     */
-    void invalidatePartitionCount(TopicKey topicKey) {
-        partitionCounts.remove(topicKey);
     }
 
     /**
@@ -154,6 +126,4 @@ final class ClientRoutingState {
     record GroupKey(TopicKey topic, IdentifierKey consumer) {}
 
     record GroupAssignment(long generation, List<Long> partitions, int cursor, long syncedAtNanos) {}
-
-    record CachedPartitionCount(long count, long fetchedAtNanos) {}
 }

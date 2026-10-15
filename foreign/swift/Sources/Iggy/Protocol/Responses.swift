@@ -385,6 +385,7 @@ enum Responses {
             let count = try reader.readUInt32()
             var nodes: [ClusterNode] = []
             for _ in 0..<count {
+                let replicaID = try reader.readUInt8()
                 let nodeName = try reader.readLongString()
                 let ip = try reader.readLongString()
                 let endpoints = TransportEndpoints(
@@ -397,7 +398,7 @@ enum Responses {
                 guard let status = ClusterNodeStatus(rawValue: statusCode) else {
                     throw IggyError(.invalidCommand, context: "unknown cluster node status \(statusCode)")
                 }
-                nodes.append(ClusterNode(name: nodeName, ip: ip, endpoints: endpoints, role: role, status: status))
+                nodes.append(ClusterNode(replicaID: replicaID, name: nodeName, ip: ip, endpoints: endpoints, role: role, status: status))
             }
             return ClusterMetadata(name: name, nodes: nodes)
         }

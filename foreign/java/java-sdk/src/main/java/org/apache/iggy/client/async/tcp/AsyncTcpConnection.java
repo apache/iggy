@@ -102,13 +102,13 @@ public class AsyncTcpConnection {
     // and a transient one is not a rejected credential.
     static final int TRANSIENT_NOT_COMMITTED = 57;
     static final int TRANSIENT_NOT_ACCEPTED = 58;
+    static final int NOT_PRIMARY = 89;
+    static final long LIFECYCLE_RETRY_MAX_INTERVAL_MS = 1000;
     // The pool holds one channel, and one channel lives on one loop.
     static final int DEFAULT_IO_THREADS = 1;
 
     private static final int STALE_CLIENT = 30;
     private static final int UNAUTHENTICATED = 40;
-    private static final int UNAUTHORIZED = 41;
-    private static final int HISTORY_UNAVAILABLE = 87;
     private static final int LIFECYCLE_BUSY = 88;
     private static final int REGISTER_RESPONSE_MIN_BYTES = 17;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
@@ -119,7 +119,6 @@ public class AsyncTcpConnection {
     // Each lifecycle retry commits another refusal, so its pause doubles from
     // the transient interval up to this cap; mirrors LIFECYCLE_RETRY_MAX_INTERVAL
     // in core/sdk/src/vsr.rs.
-    private static final long LIFECYCLE_RETRY_MAX_INTERVAL_MS = 1000;
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
     private static final Duration NOT_ACCEPTED_RETRY_BUDGET = Duration.ofSeconds(2);
     private static final String EVENT_LOOP_THREAD_PREFIX = "iggy-tcp-io";
@@ -353,6 +352,10 @@ public class AsyncTcpConnection {
         return consensusSession.metadataWatermark();
     }
 
+    long[] sessionIdentity() {
+        return consensusSession.identity();
+    }
+
     byte[] bindSecret() {
         return consensusSession.bindSecret();
     }
@@ -438,6 +441,7 @@ public class AsyncTcpConnection {
         return send(commandCode, payload, requestDeadlineNanos, failoverState, 0);
     }
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private CompletableFuture<ByteBuf> send(
             int commandCode,
             ByteBuf payload,
@@ -450,10 +454,12 @@ public class AsyncTcpConnection {
         captureLoginPayloadIfNeeded(commandCode, payload);
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
         CompletableFuture<ByteBuf> callerFuture = new CompletableFuture<>();
-        ByteBuf failoverPayload =
-                transientFailoverHandler != null && !isLoginCode(commandCode) && !isPollRoutingCode(commandCode)
-                        ? payload.retainedDuplicate()
-                        : null;
+        ByteBuf failoverPayload = transientFailoverHandler != null
+                        && !failoverState.routed
+                        && !isLoginCode(commandCode)
+                        && !isPollRoutingCode(commandCode)
+                ? payload.retainedDuplicate()
+                : null;
 
         channelPool.acquire().addListener((FutureListener<Channel>) f -> {
             if (!f.isSuccess()) {
@@ -491,13 +497,10 @@ public class AsyncTcpConnection {
         return callerFuture;
     }
 
-    /**
-     * Sends a poll or an offset write on a data connection, refused with 58 when the
-     * attachment of {@code sessionGeneration} no longer holds.
-     */
-    CompletableFuture<ByteBuf> sendOnPrimary(
-            int commandCode, ByteBuf payload, long sessionGeneration, PartitionContext context) {
-        return send(commandCode, payload, 0, new TransientFailoverState(context), sessionGeneration);
+    CompletableFuture<ByteBuf> sendRouted(
+            int commandCode, ByteBuf payload, long sessionGeneration, long deadline, TransientFailoverState state) {
+        state.routed = true;
+        return send(commandCode, payload, deadline, state, sessionGeneration);
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -707,7 +710,8 @@ public class AsyncTcpConnection {
     private static boolean shouldRecheckLeader(
             IggyServerException serverError, ByteBuf failoverPayload, long requestDeadlineNanos) {
         return serverError != null
-                && serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED
+                && (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED
+                        || serverError.getRawErrorCode() == NOT_PRIMARY)
                 && failoverPayload != null
                 && requestDeadlineNanos - System.nanoTime() > 0;
     }
@@ -830,18 +834,18 @@ public class AsyncTcpConnection {
     private static boolean isPollRoutingCode(int commandCode) {
         return commandCode == CommandCode.System.GET_CLUSTER_METADATA.getValue()
                 || commandCode == CommandCode.System.BIND_SESSION.getValue()
-                || commandCode == CommandCode.Messages.GET_POLL_ROUTING.getValue()
-                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue()
-                || commandCode == CommandCode.ConsumerOffset.GET_ROUTING.getValue();
+                || commandCode == CommandCode.Messages.GET_PARTITION_ROUTE.getValue();
     }
 
-    /**
-     * Exchanges a router owns go out once and hand every refusal back to it: poll
-     * routing, and offset writes on a data connection, which Rust sends there without
-     * retries.
-     */
     private boolean isRoutedExchange(int commandCode) {
-        return isPollRoutingCode(commandCode) || (sharedSession && isOffsetWriteCode(commandCode));
+        return isPollRoutingCode(commandCode) || (sharedSession && isPartitionCommand(commandCode));
+    }
+
+    private static boolean isPartitionCommand(int code) {
+        return code == CommandCode.Messages.SEND.getValue()
+                || code == CommandCode.Messages.POLL.getValue()
+                || code == CommandCode.ConsumerOffset.GET.getValue()
+                || isOffsetWriteCode(code);
     }
 
     private static boolean mutatesSessionState(int commandCode) {
@@ -861,8 +865,7 @@ public class AsyncTcpConnection {
         return commandCode == CommandCode.System.PING.getValue()
                 || (sharedSession
                         && (commandCode == CommandCode.System.BIND_SESSION.getValue()
-                                || commandCode == CommandCode.Messages.POLL_ON_PRIMARY.getValue()
-                                || isOffsetWriteCode(commandCode)));
+                                || isPartitionCommand(commandCode)));
     }
 
     private static boolean isOffsetWriteCode(int commandCode) {
@@ -888,9 +891,12 @@ public class AsyncTcpConnection {
                 throw new IggyClientException("Channel missing VsrResponseHandler");
             }
 
-            ByteBuf frame = vsrEncoder.encode(channel.alloc(), commandCode, payload, failoverState.context);
+            ByteBuf frame = vsrEncoder.encode(
+                    channel.alloc(), commandCode, payload, failoverState.context, failoverState.requestId);
+            failoverState.requestId = VsrHeaders.readRequestId(frame);
             long nowNanos = System.nanoTime();
-            long deadlineNanos = nowNanos + TRANSIENT_RETRY_BUDGET.toNanos();
+            long deadlineNanos =
+                    requestDeadlineNanos == 0 ? nowNanos + TRANSIENT_RETRY_BUDGET.toNanos() : requestDeadlineNanos;
             long notAcceptedDeadlineNanos =
                     isLoginCode(commandCode) ? deadlineNanos : nowNanos + NOT_ACCEPTED_RETRY_BUDGET.toNanos();
             writeVsrFrame(
@@ -929,7 +935,7 @@ public class AsyncTcpConnection {
             IggyTimeoutException timeout = responseTimeout(exchange.commandCode());
             handler.closeChannel(channel, timeout);
             frame.release();
-            responseFuture.completeExceptionally(timeout);
+            responseFuture.completeExceptionally(preserveUncertainOutcome(timeout, uncertain));
             return;
         }
         CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
@@ -968,27 +974,34 @@ public class AsyncTcpConnection {
                         error,
                         exchange.deadlineNanos(),
                         exchange.notAcceptedDeadlineNanos(),
-                        exchange.failoverState().retryContextDiscovery,
-                        nextUncertain)
+                        nextUncertain,
+                        exchange.failoverState().routed)
                 && channel.isActive()) {
             try {
                 channel.eventLoop()
                         .schedule(
                                 () -> writeVsrFrame(exchange, frame, nextUncertain, lifecycleRetryIntervalMs),
                                 TRANSIENT_RETRY_INTERVAL_MS,
-                                TimeUnit.MILLISECONDS);
+                                TimeUnit.MILLISECONDS)
+                        .addListener(retry -> {
+                            if (retry.isCancelled()) {
+                                frame.release();
+                                exchange.responseFuture()
+                                        .completeExceptionally(preserveUncertainOutcome(error, nextUncertain));
+                            }
+                        });
                 return;
             } catch (RejectedExecutionException retryRejected) {
                 log.warn("Event loop rejected a VSR retry, failing the request: {}", retryRejected.getMessage());
             }
         }
-        if (scheduleLifecycleRetry(exchange, frame, serverError, nextUncertain, lifecycleRetryIntervalMs)) {
+        if (!exchange.failoverState().routed
+                && scheduleLifecycleRetry(exchange, frame, serverError, nextUncertain, lifecycleRetryIntervalMs)) {
             return;
         }
         frame.release();
         if (error != null) {
-            exchange.responseFuture()
-                    .completeExceptionally(preserveUncertainOutcome(error, serverError, nextUncertain));
+            exchange.responseFuture().completeExceptionally(preserveUncertainOutcome(error, nextUncertain));
         } else {
             exchange.responseFuture().complete(response);
         }
@@ -1008,7 +1021,8 @@ public class AsyncTcpConnection {
             boolean uncertain,
             long lifecycleRetryIntervalMs) {
         int commandCode = exchange.commandCode();
-        if (refusal == null
+        if (uncertain
+                || refusal == null
                 || refusal.getRawErrorCode() != LIFECYCLE_BUSY
                 || isRoutedExchange(commandCode)
                 || mutatesSessionState(commandCode)
@@ -1082,20 +1096,11 @@ public class AsyncTcpConnection {
         return error != null && error.getRawErrorCode() == TRANSIENT_NOT_COMMITTED;
     }
 
-    private static Throwable preserveUncertainOutcome(
-            Throwable error, IggyServerException serverError, boolean uncertain) {
-        if (uncertain && serverError != null && isUnadmittedRefusal(serverError.getRawErrorCode())) {
+    private static Throwable preserveUncertainOutcome(Throwable error, boolean uncertain) {
+        if (uncertain && error != null) {
             return IggyServerException.fromTcpResponse(TRANSIENT_NOT_COMMITTED, new byte[0]);
         }
         return error;
-    }
-
-    private static boolean isUnadmittedRefusal(long code) {
-        return code == TRANSIENT_NOT_ACCEPTED
-                || code == HISTORY_UNAVAILABLE
-                || code == UNAUTHORIZED
-                || code == UNAUTHENTICATED
-                || code == STALE_CLIENT;
     }
 
     private static IggyTimeoutException responseTimeout(int commandCode) {
@@ -1163,24 +1168,28 @@ public class AsyncTcpConnection {
         }
     }
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private boolean shouldRetryTransient(
             int commandCode,
             Throwable error,
             long deadlineNanos,
             long notAcceptedDeadlineNanos,
-            boolean retryContextDiscovery,
-            boolean uncertain) {
-        // Context discovery precedes any admitted poll, including plain polls without a router.
-        if ((isRoutedExchange(commandCode) && !retryContextDiscovery)
-                || !(error instanceof IggyServerException serverError)) {
+            boolean uncertain,
+            boolean routed) {
+        if (!(error instanceof IggyServerException serverError)) {
             return false;
         }
-        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED
-                || (uncertain && serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED)) {
+        if (isPollRoutingCode(commandCode)
+                || (routed
+                        && (commandCode == CommandCode.Messages.POLL.getValue()
+                                || commandCode == CommandCode.ConsumerOffset.GET.getValue()))) {
+            return false;
+        }
+        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED || uncertain) {
             return System.nanoTime() < deadlineNanos;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED) {
-            return System.nanoTime() < notAcceptedDeadlineNanos;
+            return !routed && System.nanoTime() < notAcceptedDeadlineNanos;
         }
         return false;
     }
@@ -1390,8 +1399,9 @@ public class AsyncTcpConnection {
             long notAcceptedDeadlineNanos) {}
 
     static final class TransientFailoverState {
-        private final PartitionContext context;
-        private final boolean retryContextDiscovery;
+        private PartitionContext context;
+        private boolean routed;
+        private long requestId;
         private final Set<ConnectionInfo> visitedTargets = new HashSet<>();
 
         TransientFailoverState() {
@@ -1399,12 +1409,19 @@ public class AsyncTcpConnection {
         }
 
         TransientFailoverState(PartitionContext context) {
-            this(context, false);
+            this.context = context;
         }
 
-        TransientFailoverState(PartitionContext context, boolean retryContextDiscovery) {
+        void renewRequestId() {
+            requestId = 0;
+        }
+
+        PartitionContext context() {
+            return context;
+        }
+
+        void setContext(PartitionContext context) {
             this.context = context;
-            this.retryContextDiscovery = retryContextDiscovery;
         }
 
         Set<ConnectionInfo> visitedTargets() {

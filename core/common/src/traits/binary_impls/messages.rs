@@ -30,13 +30,14 @@ use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
-use iggy_binary_protocol::codes::{GET_SEND_CONTEXT_CODE, SEND_MESSAGES_CODE};
-use iggy_binary_protocol::primitives::partition_history::PartitionContext;
+use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, SEND_MESSAGES_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
-    GetSendContextRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder, SendMessagesHeader,
+    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    SendMessagesHeader,
 };
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
+use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
 
 /// Max attempts to resolve a fenced consumer-group poll: one re-sync after the
@@ -297,7 +298,7 @@ pub(crate) async fn send_raw_messages<B: BinaryTransport + Sync + ?Sized>(
     };
     let stream_id = identifier_from_wire(&header.stream_id)?;
     let topic_id = identifier_from_wire(&header.topic_id)?;
-    let capture = GetSendContextRequest {
+    let capture = GetPartitionRouteRequest {
         stream_id: header.stream_id,
         topic_id: header.topic_id,
         partition_id,
@@ -305,14 +306,14 @@ pub(crate) async fn send_raw_messages<B: BinaryTransport + Sync + ?Sized>(
     send_with_partition_context(client, &stream_id, &topic_id, &capture, payload).await
 }
 
-/// Send under the cached send context, or one captured with `GetSendContext`.
+/// Send under the cached send context, or one captured from a `GetPartitionRoute` reply.
 /// A history refusal means the context is stale: the topic's contexts are
 /// dropped and one fresh capture is tried.
 async fn send_with_partition_context<B: BinaryTransport + Sync + ?Sized>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
-    capture: &GetSendContextRequest,
+    capture: &GetPartitionRouteRequest,
     payload: Bytes,
 ) -> Result<Bytes, IggyError> {
     let state = client.consumer_group_state();
@@ -323,9 +324,9 @@ async fn send_with_partition_context<B: BinaryTransport + Sync + ?Sized>(
             context
         } else {
             let response = client
-                .send_raw_with_response(GET_SEND_CONTEXT_CODE, capture.to_bytes())
+                .send_raw_with_response(GET_PARTITION_ROUTE_CODE, capture.to_bytes())
                 .await?;
-            let context = super::decode_response::<PartitionContext>(&response)?;
+            let context = super::decode_response::<PartitionRouteResponse>(&response)?.context();
             state.set_partition_context(stream_id, topic_id, capture.partition_id, context);
             context
         };
@@ -485,7 +486,7 @@ impl<B: BinaryClient> MessageClient for B {
             }
             _ => IggyError::InvalidCommand,
         })?;
-        let capture = GetSendContextRequest {
+        let capture = GetPartitionRouteRequest {
             stream_id: wire_stream_id,
             topic_id: wire_topic_id,
             partition_id,

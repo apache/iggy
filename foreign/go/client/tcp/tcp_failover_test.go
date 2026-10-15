@@ -102,10 +102,10 @@ func TestReconnect_BindVerdictPreservesOrReplacesOnlyTheLogicalSession(t *testin
 			assert.NotEqual(t, mutations[0].payload, mutations[1].payload)
 			if terminal {
 				assert.NotEqual(t, mutations[0].clientID(), mutations[1].clientID())
-				assert.Equal(t, uint64(1), mutations[1].requestID())
+				assert.Equal(t, uint64(2), mutations[1].requestID())
 			} else {
 				assert.Equal(t, mutations[0].clientID(), mutations[1].clientID())
-				assert.Equal(t, mutations[0].requestID()+1, mutations[1].requestID())
+				assert.Greater(t, mutations[1].requestID(), mutations[0].requestID(), "BindSession and roster reads share the retained counter")
 			}
 		})
 	}

@@ -253,15 +253,13 @@ enabled = true
 address = "127.0.0.1:8080"
 
 # How many bidirectional streams a client may keep open at once on a single
-# QUIC connection. The SDK opens a fresh stream per command, so 1 caps a
-# connection at one in-flight command: commands do not pipeline, and the next
-# one waits for the current reply. The known cost is one stream-credit round
-# trip between back-to-back requests on the same connection. Raising it is a
-# transport decision only: the server's accept loop takes one bidi at a time
-# and waits for its reply before accepting the next, which is what keeps
-# partition operations (they all share the connection's current request id)
-# distinguishable, and a higher cap does not make the handlers concurrent.
-max_concurrent_bidi_streams = 1
+# QUIC connection. The SDK opens a fresh stream per command, so this caps the
+# commands one connection has in flight. The server serves the streams of a
+# connection at once and gives each reply to its stream by request id. 256
+# matches `message_bus.client_queue_capacity`, the most requests the server
+# runs at once for one connection. 1 makes the commands of a connection wait
+# for each other.
+max_concurrent_bidi_streams = 256
 
 # Initial path MTU for QUIC connections, before MTU discovery has run.
 # 1200 bytes is the QUIC minimum and quinn's own default: safe on every
@@ -280,12 +278,10 @@ send_window = "64 MiB"
 # connection, shared by all of its streams. Symmetric with `send_window`.
 receive_window = "64 MiB"
 
-# Per-stream slice of `receive_window`. Equal to it, because
-# `max_concurrent_bidi_streams` is 1: with a single stream per connection a
-# smaller carve-out protects nothing, it only caps the one stream early.
-# Lower it below `receive_window` if that cap is ever raised, so one unread
-# stream cannot pin the whole connection window. Must not exceed
-# `receive_window`; equality is allowed.
+# Per-stream slice of `receive_window`. A value below `receive_window` keeps
+# one unread stream from pinning the whole connection window. It is equal,
+# because the server reads each stream as soon as the stream opens. Must not
+# exceed `receive_window`; equality is allowed.
 stream_receive_window = "64 MiB"
 
 # Interval for sending QUIC keep-alive PINGs. One third of
@@ -553,9 +549,10 @@ repair_chunk_max = 128
 # retries with capped backoff; past this window the process exits with a distinct
 # status so a supervisor restarts or replaces it instead of an operator finding
 # the wedge in logs. It is also the deadline of each running partition file job
-# (see [sharding] partition_io_capacity). "0" disables the fail-stop and leaves
-# the group fenced indefinitely. Nonzero values must be at least 30s so a
-# transient disk hiccup cannot kill the process.
+# (see [sharding] partition_io_capacity); expiry fences the owner and stops the
+# node. "0" disables the fail-stop and leaves the group fenced indefinitely, and
+# it also disables the file-job deadline. Nonzero values must be at least 30s so
+# a transient disk hiccup cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
 
 # Superblock compatibility: 74-byte records include the partition offset
