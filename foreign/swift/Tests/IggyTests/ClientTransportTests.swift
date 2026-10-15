@@ -709,6 +709,32 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A teardown, such as a failover moving the shared connection, waits for
+    /// the reply of a frame another caller already wrote instead of cutting
+    /// it, which would leave the write's outcome unknown and replay it.
+    @Test func aTeardownWaitsForTheExchangeInFlight() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .deleteStream {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            return .ok([])
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        let write = Task { try await client.deleteStream(1) }
+        #expect(await eventually { await operations(server).contains(.deleteStream) })
+        await client.core.disconnectTransport()
+        try await write.value
+        #expect(await operations(server).filter { $0 == .deleteStream }.count == 1)
+        #expect(await client.state == .disconnected)
+        try await client.ping()
+        #expect(await server.connectionCount == 2)
+        await client.shutdown()
+    }
+
     /// An explicit disconnect ends the session, so the next connect signs in
     /// under a new one instead of resuming it.
     @Test func anExplicitDisconnectIsNotResumed() async throws {

@@ -898,23 +898,56 @@ actor ClientCore {
 
     /// Tears the connection down without touching the remembered sign-in or
     /// the session, so a reconnect can resume it.
+    ///
+    /// A frame another caller already wrote keeps the connection until its
+    /// reply, as the Rust client's teardown waits on the link: cutting it would
+    /// leave a request that may commit with an unknown outcome, and its replay
+    /// on the next node could apply it twice.
     func disconnectTransport() async {
-        switch state {
-        case .disconnected, .shutdown:
+        guard canTearDown else {
             return
-        case .connecting:
-            // A connect is already sweeping; tearing down under it would take
-            // the stream it just installed.
-            return
-        default:
-            break
+        }
+        let epoch = connectionEpoch
+        let holdsExchange = connection != nil
+        if holdsExchange {
+            await waitForExchange()
+            guard canTearDown, epoch == connectionEpoch else {
+                // The caller in flight dropped the connection, or a reconnect
+                // replaced it, while this waited.
+                exchangeLock.unlock()
+                return
+            }
         }
         logger.info("Disconnecting from server \(currentAddress)")
         state = .disconnected
         let old = connection
         connection = nil
         await old?.close()
+        if holdsExchange {
+            exchangeLock.unlock()
+        }
         publish(.disconnected)
+    }
+
+    private var canTearDown: Bool {
+        switch state {
+        case .disconnected, .shutdown:
+            false
+        case .connecting:
+            // A connect is already sweeping; tearing down under it would take
+            // the stream it just installed.
+            false
+        default:
+            true
+        }
+    }
+
+    /// Takes the exchange lock once the exchange in flight has its reply. A
+    /// teardown must happen even when the task that asked for it was
+    /// cancelled, so the wait runs outside that task and cannot be abandoned.
+    private func waitForExchange() async {
+        let lock = exchangeLock
+        _ = try? await Task { try await lock.lock() }.value
     }
 
     /// An explicit disconnect ends the session on purpose: the remembered
