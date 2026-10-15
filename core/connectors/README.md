@@ -50,6 +50,8 @@ The mounted `config.toml` must set `[connectors].config_dir` to the connector de
 
 Choose a `-slim` tag when you supply your own plugins and want a smaller image with a narrower dependency surface, and mount the plugin `.so` files into one of the search-path directories (for example `/usr/local/lib`).
 
+Source connectors save their checkpoints under `[state].path`, which is `local_state` by default. In the image this resolves to `/app/local_state`. If you run sources, mount a volume there. Otherwise the checkpoints are lost when the container is replaced.
+
 ## Quick Start
 
 This example runs the Iggy server, the connectors runtime with the Delta Lake sink and [floci](https://github.com/floci-io/floci), a local S3 emulator, then produces random user records and shows them in a Delta table. You need Docker with Compose, and a Rust toolchain for the producer.
@@ -93,7 +95,7 @@ This example runs the Iggy server, the connectors runtime with the Delta Lake si
     docker compose down -v
     ```
 
-The default `apache/iggy-connect:edge` image contains the Delta sink plugin only after the image is rebuilt from a revision that bundles the plugins. Until then, build the default image locally from the repository root and point the example at it:
+The default `apache/iggy-connect:edge` image bundles the Delta sink plugin. To test an unreleased change to the image or the plugins, build the default image locally from the repository root and point the example at it:
 
 ```bash
 docker buildx build -f core/connectors/runtime/Dockerfile --target runtime-fat \
@@ -103,7 +105,7 @@ cd examples/rust/src/sink-data-producer
 IGGY_CONNECT_IMAGE=iggy-connect:fat-local docker compose up -d --build
 ```
 
-IMPORTANT: make sure you have pulled the code from the latest master to ensure connectors and server protocol compatibility. The incompatibility causes obscure errors coming from the connectors' client due to frequent changes done to the protocol at the moment.
+IMPORTANT: make sure you have pulled the code from the latest master to ensure connectors and server protocol compatibility. The incompatibility causes obscure errors coming from the connectors' client due to frequent changes done to the protocol at the moment. Run `docker compose pull` before `docker compose up` so that the `edge` images match your checkout.
 
 The configuration used by the example lives in `examples/rust/src/sink-data-producer/config/`.
 

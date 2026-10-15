@@ -101,9 +101,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     --mount=type=cache,target=/app/target,id=cargo-target-${TARGETPLATFORM}-${LIBC} \
     RUST_TARGET="$(cat /rust-target)" && \
     if [ "$PROFILE" = "debug" ]; then \
-    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild -p iggy-connectors; \
+    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild \
+      --bin iggy-connectors; \
     else \
-    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release -p iggy-connectors; \
+    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release \
+      --bin iggy-connectors; \
     fi
 
 COPY . .
@@ -116,7 +118,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     --mount=type=cache,target=/app/target,id=cargo-target-${TARGETPLATFORM}-${LIBC} \
     RUST_TARGET="$(cat /rust-target)" && \
     if [ "$PROFILE" = "debug" ]; then PROFILE_DIR=debug; PROFILE_FLAG=""; else PROFILE_DIR=release; PROFILE_FLAG="--release"; fi && \
-    cargo zigbuild --locked --target ${RUST_TARGET} -p iggy-connectors $PROFILE_FLAG && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-connectors $PROFILE_FLAG && \
     cp /app/target/${RUST_TARGET}/${PROFILE_DIR}/iggy-connectors /app/iggy-connectors
 
 #
@@ -155,10 +157,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     PLUGIN_FLAGS="$(cat connector-packages.txt)" && \
     if [ "$PROFILE" = "debug" ]; then \
     cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild \
-      -p iggy-connectors $PLUGIN_FLAGS; \
+      --bin iggy-connectors && \
+    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild \
+      $PLUGIN_FLAGS; \
     else \
     cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release \
-      -p iggy-connectors $PLUGIN_FLAGS; \
+      --bin iggy-connectors && \
+    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release \
+      $PLUGIN_FLAGS; \
     fi
 
 COPY . .
@@ -172,7 +178,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     RUST_TARGET="$(cat /rust-target)" && \
     PLUGIN_FLAGS="$(cat connector-packages.txt)" && \
     if [ "$PROFILE" = "debug" ]; then PROFILE_DIR=debug; PROFILE_FLAG=""; else PROFILE_DIR=release; PROFILE_FLAG="--release"; fi && \
-    cargo zigbuild --locked --target ${RUST_TARGET} -p iggy-connectors $PLUGIN_FLAGS $PROFILE_FLAG && \
+    cargo zigbuild --locked --target ${RUST_TARGET} --bin iggy-connectors $PROFILE_FLAG && \
+    cargo zigbuild --locked --target ${RUST_TARGET} $PLUGIN_FLAGS $PROFILE_FLAG && \
     cp /app/target/${RUST_TARGET}/${PROFILE_DIR}/iggy-connectors /app/iggy-connectors && \
     mkdir -p /app/plugins && \
     while IFS= read -r name; do \

@@ -23,9 +23,9 @@
 #   docker compose run --rm delta-tools python show.py
 #   docker compose down -v                               (stop and reset all data)
 #
-# The default apache/iggy-connect:edge image bundles the Delta sink plugin once
-# the plugin bundling change is published. To use a locally built image, set
-# IGGY_CONNECT_IMAGE (see the connectors README for the build command).
+# The default apache/iggy-connect:edge image bundles the Delta sink plugin. To
+# test an unreleased change, set IGGY_CONNECT_IMAGE to a locally built image
+# (see the connectors README for the build command).
 
 services:
   iggy-server:
@@ -96,10 +96,18 @@ services:
     image: floci/floci:2.1.0
     container_name: floci
     restart: unless-stopped
+    environment:
+      # Keep the bucket and the Delta table across `docker compose down`, in step
+      # with the iggy-server volume. Without it the sink resumes from its stored
+      # offset and writes into an empty table.
+      - FLOCI_STORAGE_MODE=persistent
+      - FLOCI_STORAGE_PERSISTENT_PATH=/app/data
     networks:
       - iggy-network
     ports:
       - 4566:4566
+    volumes:
+      - floci:/app/data
 
   # Creates the bucket and the Delta table (the sink requires an existing
   # table). Also used on demand to inspect the table.
@@ -158,6 +166,7 @@ services:
 
 volumes:
   iggy-server:
+  floci:
 
 networks:
   iggy-network:
