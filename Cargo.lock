@@ -7474,6 +7474,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "bigdecimal",
  "chrono",
  "dashmap",
  "humantime",

@@ -15,8 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::Engine;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
@@ -28,9 +34,6 @@ use jni::{JNIEnv, JavaVM};
 use regex::Regex;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 /// Clear any pending Java exception on the current thread. The JNI spec forbids
@@ -61,30 +64,15 @@ fn take_pending_java_exception(env: &mut JNIEnv) -> Option<String> {
 }
 
 /// Reclaim a JNI local frame without masking the operation error that caused the
-/// frame to unwind. JNI can leave an exception pending when `PopLocalFrame`
-/// fails, so clear before and after the pop attempt. When both the operation and
-/// frame cleanup fail, preserve the operation error because it identifies the
-/// original failure.
-fn finish_local_frame<T>(
-    env: &mut JNIEnv,
-    operation_result: Result<T, Error>,
-    context: &str,
-    map_error: impl FnOnce(String) -> Error,
-) -> Result<T, Error> {
+/// frame to unwind.
+fn finish_local_frame<T>(env: &mut JNIEnv, operation_result: Result<T, Error>) -> Result<T, Error> {
     clear_pending_exception(env);
     // SAFETY: callers pass a null result because no local reference escapes the
     // frame; successful operations return owned Rust data or a `GlobalRef`.
-    let pop_result = unsafe { env.pop_local_frame(&JObject::null()) };
-    match pop_result {
-        Ok(_) => operation_result,
-        Err(err) => {
-            clear_pending_exception(env);
-            match operation_result {
-                Ok(_) => Err(map_error(format!("{context}: {err}"))),
-                Err(operation_error) => Err(operation_error),
-            }
-        }
-    }
+    // jni 0.21.1's implementation always returns Ok after invoking
+    // PopLocalFrame, including when a Java exception is pending.
+    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+    operation_result
 }
 
 /// Best-effort `close()` on a JDBC handle used in error/cleanup paths. Clears
@@ -127,14 +115,6 @@ fn lock_mutex<'a, T>(mutex: &'a Mutex<T>, what: &str) -> Result<MutexGuard<'a, T
         .lock()
         .map_err(|_| Error::Connection(format!("{what} mutex poisoned")))
 }
-
-/// Cached compiled regex patterns for password sanitization
-static RE_USER_PASS_AT: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"://([^:/?#]+):([^/?#]*)@").unwrap());
-static RE_PASSWORD_PARAM: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"(?i)(password|pwd|pass)=([^;&\s]+)").unwrap());
-static RE_ORACLE_PASS: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"thin:([^/]+)/([^?#]*)@").unwrap());
 
 /// Regexes that remove the incremental offset predicate `{tracking_column} >
 /// {last_offset}` on the first (no-offset) poll while preserving any other
@@ -268,9 +248,9 @@ pub struct JdbcSourceConfig {
     #[serde(default = "default_login_timeout")]
     pub login_timeout_ms: u64,
 
-    /// Bound on each query execution (default: 30000). Applied through JDBC's
-    /// `Statement.setQueryTimeout`, which uses whole seconds, so the configured
-    /// value is rounded up to at least one second.
+    /// Bound on JDBC network operations and each query execution (default:
+    /// 30000). Applied through `Connection.setNetworkTimeout` in milliseconds
+    /// and `Statement.setQueryTimeout` in whole seconds.
     #[serde(default = "default_query_timeout")]
     pub query_timeout_ms: u64,
 }
@@ -302,10 +282,7 @@ fn default_true() -> bool {
 impl std::fmt::Debug for JdbcSourceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JdbcSourceConfig")
-            .field(
-                "jdbc_url",
-                &sanitize_jdbc_url(self.jdbc_url.expose_secret()),
-            )
+            .field("jdbc_url", &"<redacted>")
             .field("driver_class", &self.driver_class)
             .field("driver_jar_path", &self.driver_jar_path)
             .field("username", &self.username)
@@ -381,23 +358,14 @@ pub struct JdbcSource {
     verbose: bool,
 }
 
-/// Sanitize JDBC URL by masking passwords for logging
-fn sanitize_jdbc_url(url: &str) -> String {
-    // Pattern 1: user:password@host format (MySQL, PostgreSQL)
-    let url = RE_USER_PASS_AT.replace_all(url, "://$1:***@");
-
-    // Pattern 2: password=value format (PostgreSQL, SQL Server, H2)
-    let url = RE_PASSWORD_PARAM.replace_all(&url, "$1=***");
-
-    // Pattern 3: Oracle user/password@host format
-    let url = RE_ORACLE_PASS.replace_all(&url, "thin:$1/***@");
-
-    url.to_string()
-}
-
 fn sanitize_jdbc_error(error: Error, jdbc_url: &str) -> Error {
-    let sanitized_url = sanitize_jdbc_url(jdbc_url);
-    let sanitize = |message: String| message.replace(jdbc_url, &sanitized_url);
+    let sanitize = |message: String| {
+        if jdbc_url.is_empty() {
+            message
+        } else {
+            message.replace(jdbc_url, "<redacted JDBC URL>")
+        }
+    };
     match error {
         Error::InitError(message) => Error::InitError(sanitize(message)),
         Error::Connection(message) => Error::Connection(sanitize(message)),
@@ -460,9 +428,8 @@ impl JdbcSource {
             .map_err(|e| Error::InitError(format!("Failed to attach thread to JVM: {}", e)))?;
 
         info!(
-            "{CONNECTOR_NAME} connector [{}] creating direct connection to: {}",
-            self.id,
-            sanitize_jdbc_url(self.config.jdbc_url.expose_secret())
+            "{CONNECTOR_NAME} connector [{}] creating direct connection",
+            self.id
         );
         let conn = self.create_direct_connection_internal(&mut env)?;
         *lock_mutex(&self.connection, "connection")? = Some(conn);
@@ -484,12 +451,7 @@ impl JdbcSource {
         let result = self
             .create_direct_connection_inner(env)
             .map_err(|error| sanitize_jdbc_error(error, self.config.jdbc_url.expose_secret()));
-        finish_local_frame(
-            env,
-            result,
-            "Failed to pop connection local frame",
-            Error::InitError,
-        )
+        finish_local_frame(env, result)
     }
 
     fn create_direct_connection_inner(&self, env: &mut JNIEnv) -> Result<GlobalRef, Error> {
@@ -687,6 +649,11 @@ impl JdbcSource {
             )
         };
 
+        if let Err(error) = self.configure_connection_network_timeout(env, &connection_obj) {
+            best_effort_close(env, &connection_obj);
+            return Err(error);
+        }
+
         let global_ref = jni!(
             env,
             env.new_global_ref(connection_obj),
@@ -699,6 +666,48 @@ impl JdbcSource {
             self.id
         );
         Ok(global_ref)
+    }
+
+    /// Set a connection-level deadline before the connection is used for polling.
+    /// Unlike `Statement.setQueryTimeout`, this also covers driver metadata calls
+    /// such as `PreparedStatement.getParameterMetaData`.
+    fn configure_connection_network_timeout(
+        &self,
+        env: &mut JNIEnv,
+        connection: &JObject,
+    ) -> Result<(), Error> {
+        let fork_join_pool_class = jni!(
+            env,
+            env.find_class("java/util/concurrent/ForkJoinPool"),
+            "Failed to find ForkJoinPool",
+            Error::InitError
+        );
+        let executor = jni!(
+            env,
+            env.call_static_method(
+                fork_join_pool_class,
+                "commonPool",
+                "()Ljava/util/concurrent/ForkJoinPool;",
+                &[],
+            )
+            .and_then(|value| value.l()),
+            "Failed to get the JVM common executor",
+            Error::InitError
+        );
+        let timeout_ms = self.config.query_timeout_ms.clamp(1, i32::MAX as u64) as i32;
+        jni!(
+            env,
+            env.call_method(
+                connection,
+                "setNetworkTimeout",
+                "(Ljava/util/concurrent/Executor;I)V",
+                &[JValue::Object(&executor), JValue::Int(timeout_ms)],
+            )
+            .and_then(|value| value.v()),
+            "Failed to set JDBC connection network timeout",
+            Error::InitError
+        );
+        Ok(())
     }
 
     /// Acquire the direct connection, transparently re-establishing it if it has
@@ -864,11 +873,6 @@ impl JdbcSource {
             Err(_) => return Err(classify_query_failure(env, "prepare statement")),
         };
 
-        if let Err(error) = bind_offset_parameters(env, &statement, query) {
-            best_effort_close(env, &statement);
-            return Err(error);
-        }
-
         // Use setMaxRows for database-agnostic row limiting instead of SQL LIMIT.
         // Both modes fetch one probe row beyond the batch. Bulk mode uses it to
         // detect unsupported pagination; incremental mode uses it to detect an
@@ -900,6 +904,11 @@ impl JdbcSource {
             return Err(Error::Connection(format!(
                 "Failed to set query timeout: {err}"
             )));
+        }
+
+        if let Err(error) = bind_offset_parameters(env, &statement, query, self.id) {
+            best_effort_close(env, &statement);
+            return Err(error);
         }
 
         let result_set = match env
@@ -956,12 +965,7 @@ impl JdbcSource {
             "Failed to push metadata local frame"
         );
         let result = self.read_column_metadata_inner(env, result_set);
-        finish_local_frame(
-            env,
-            result,
-            "Failed to pop metadata local frame",
-            Error::Connection,
-        )
+        finish_local_frame(env, result)
     }
 
     fn read_column_metadata_inner(
@@ -1103,12 +1107,7 @@ impl JdbcSource {
                 "Failed to push row local frame"
             );
             let row_result = self.read_single_row(env, result_set, columns);
-            let (row_data, offset) = finish_local_frame(
-                env,
-                row_result,
-                "Failed to pop row local frame",
-                Error::Connection,
-            )?;
+            let (row_data, offset) = finish_local_frame(env, row_result)?;
 
             // The extra row is a boundary probe, never part of the emitted batch.
             // If it shares the last in-batch tracking value, advancing with strict
@@ -1160,7 +1159,7 @@ impl JdbcSource {
             if column.is_tracking
                 && let Some(ref tracking_column) = self.config.tracking_column
             {
-                let value = extract_offset_value(&row_data, &column.output_name);
+                let value = extract_offset_value(&row_data, &column.output_name, column.sql_type)?;
                 offset = self.tracking_offset_or_error(value, tracking_column)?;
             }
         }
@@ -1397,7 +1396,7 @@ fn extract_column_value(
                     .and_then(|v| v.f()),
                 "Failed to get float"
             );
-            null_or(env, result_set, serde_json::json!(value))
+            finite_float_or_null(env, result_set, f64::from(value), column_index)
         }
         Types::DOUBLE => {
             let value = jni!(
@@ -1411,7 +1410,7 @@ fn extract_column_value(
                 .and_then(|v| v.d()),
                 "Failed to get double"
             );
-            null_or(env, result_set, serde_json::json!(value))
+            finite_float_or_null(env, result_set, value, column_index)
         }
         // NUMERIC/DECIMAL can carry more precision than an f64 can represent
         // (e.g. money/large decimals), so emit them as strings to avoid
@@ -1443,15 +1442,37 @@ fn extract_column_value(
                 base64::engine::general_purpose::STANDARD.encode(&buf),
             ))
         }
-        // Date/time types are read via their driver string form. Route
-        // through the null-safe getString path so a NULL date/time yields
-        // JSON null instead of failing the whole poll on get_string(null).
-        Types::TIMESTAMP | Types::DATE | Types::TIME => {
-            get_column_as_string(env, result_set, column_index)
-        }
         // Default: getString for all other types (CHAR, VARCHAR, etc.)
         _ => get_column_as_string(env, result_set, column_index),
     }
+}
+
+fn finite_float_or_null(
+    env: &mut JNIEnv,
+    result_set: &JObject,
+    value: f64,
+    column_index: i32,
+) -> Result<serde_json::Value, Error> {
+    let was_null = jni!(
+        env,
+        env.call_method(result_set, "wasNull", "()Z", &[])
+            .and_then(|value| value.z()),
+        "Failed to check wasNull"
+    );
+    if was_null {
+        return Ok(serde_json::Value::Null);
+    }
+    finite_json_number(value, column_index)
+}
+
+fn finite_json_number(value: f64, column_index: i32) -> Result<serde_json::Value, Error> {
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .ok_or_else(|| {
+            Error::InvalidRecordValue(format!(
+                "column {column_index} contains a non-finite floating-point value that JSON cannot represent"
+            ))
+        })
 }
 
 /// Read a column via `ResultSet.getString`, returning JSON `null` when the
@@ -1494,11 +1515,23 @@ fn get_column_as_string(
 fn extract_offset_value(
     row_data: &serde_json::Map<String, serde_json::Value>,
     col_name: &str,
-) -> Option<String> {
+    sql_type: i32,
+) -> Result<Option<String>, Error> {
     match row_data.get(col_name) {
-        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(serde_json::Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(serde_json::Value::String(value)) if !value.is_empty() => {
+            if matches!(sql_type, Types::NUMERIC | Types::DECIMAL) {
+                let canonical = BigDecimal::from_str(value).map_err(|error| {
+                    Error::InvalidRecordValue(format!(
+                        "tracking column '{col_name}' returned invalid decimal '{value}': {error}"
+                    ))
+                })?;
+                Ok(Some(canonical.normalized().to_string()))
+            } else {
+                Ok(Some(value.clone()))
+            }
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1634,11 +1667,8 @@ impl Source for JdbcSource {
     async fn open(&mut self) -> Result<(), Error> {
         info!("Opening JDBC source connector [{}]", self.id);
         info!(
-            "{CONNECTOR_NAME} connector [{}] configuration: JDBC URL={}, Driver={}, Mode={:?}",
-            self.id,
-            sanitize_jdbc_url(self.config.jdbc_url.expose_secret()),
-            self.config.driver_class,
-            self.config.mode
+            "{CONNECTOR_NAME} connector [{}] configuration: Driver={}, Mode={:?}",
+            self.id, self.config.driver_class, self.config.mode
         );
 
         let result = (|| -> Result<(), Error> {
@@ -1704,12 +1734,7 @@ impl Source for JdbcSource {
                     "Failed to push poll local frame"
                 );
                 let result = self.execute_query(&mut env);
-                finish_local_frame(
-                    &mut env,
-                    result,
-                    "Failed to pop poll local frame",
-                    Error::Connection,
-                )
+                finish_local_frame(&mut env, result)
             },
         )?;
 
@@ -1907,14 +1932,15 @@ fn get_or_create_jvm(
     Ok(arc)
 }
 
-/// Bind each incremental offset placeholder using the SQL type the driver
-/// reports for that parameter. Passing the explicit target type lets JDBC
-/// convert the persisted string representation back to an integer, timestamp,
-/// decimal, or text value without embedding dialect-specific literals in SQL.
+/// Bind each incremental offset placeholder using the SQL type reported by the
+/// driver. Drivers such as MySQL Connector/J do not expose parameter types with
+/// their default settings, so that case falls back to `setString` and lets the
+/// database coerce the cursor for the comparison.
 fn bind_offset_parameters(
     env: &mut JNIEnv,
     statement: &JObject,
     query: &PreparedQuery,
+    connector_id: u32,
 ) -> Result<(), Error> {
     if query.offset_parameter_count == 0 {
         return Ok(());
@@ -1924,29 +1950,7 @@ fn bind_offset_parameters(
         Error::InvalidConfigValue("query contains too many {last_offset} placeholders".to_string())
     })?;
 
-    let metadata = jni!(
-        env,
-        env.call_method(
-            statement,
-            "getParameterMetaData",
-            "()Ljava/sql/ParameterMetaData;",
-            &[],
-        )
-        .and_then(|value| value.l()),
-        "Failed to get JDBC parameter metadata"
-    );
-    let actual_count = jni!(
-        env,
-        env.call_method(&metadata, "getParameterCount", "()I", &[])
-            .and_then(|value| value.i()),
-        "Failed to get JDBC parameter count"
-    );
-    if actual_count != expected_count {
-        return Err(Error::InvalidConfigValue(format!(
-            "query contains {actual_count} JDBC parameters but {expected_count} came from \
-             {{last_offset}}; raw '?' parameters are not supported"
-        )));
-    }
+    let parameter_types = offset_parameter_types(env, statement, expected_count, connector_id)?;
 
     let offset_string = jni!(
         env,
@@ -1955,19 +1959,9 @@ fn bind_offset_parameters(
     );
     let offset_object = JObject::from(offset_string);
     for parameter_index in 1..=expected_count {
-        let sql_type = jni!(
-            env,
+        let bind_result = if let Some(parameter_types) = parameter_types.as_ref() {
+            let sql_type = parameter_types[(parameter_index - 1) as usize];
             env.call_method(
-                &metadata,
-                "getParameterType",
-                "(I)I",
-                &[JValue::Int(parameter_index)],
-            )
-            .and_then(|value| value.i()),
-            "Failed to get JDBC parameter type"
-        );
-        if env
-            .call_method(
                 statement,
                 "setObject",
                 "(ILjava/lang/Object;I)V",
@@ -1977,12 +1971,100 @@ fn bind_offset_parameters(
                     JValue::Int(sql_type),
                 ],
             )
-            .is_err()
-        {
+        } else {
+            env.call_method(
+                statement,
+                "setString",
+                "(ILjava/lang/String;)V",
+                &[JValue::Int(parameter_index), JValue::Object(&offset_object)],
+            )
+        };
+        if bind_result.is_err() {
             return Err(classify_query_failure(env, "bind offset parameter"));
         }
     }
     Ok(())
+}
+
+fn offset_parameter_types(
+    env: &mut JNIEnv,
+    statement: &JObject,
+    expected_count: i32,
+    connector_id: u32,
+) -> Result<Option<Vec<i32>>, Error> {
+    let metadata = match env
+        .call_method(
+            statement,
+            "getParameterMetaData",
+            "()Ljava/sql/ParameterMetaData;",
+            &[],
+        )
+        .and_then(|value| value.l())
+    {
+        Ok(metadata) if !metadata.is_null() => metadata,
+        Ok(_) => {
+            debug!(
+                "{CONNECTOR_NAME} connector [{connector_id}] driver returned no parameter metadata; binding offset as a string"
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            let detail = take_pending_java_exception(env).unwrap_or_else(|| error.to_string());
+            debug!(
+                "{CONNECTOR_NAME} connector [{connector_id}] parameter metadata unavailable ({detail}); binding offset as a string"
+            );
+            return Ok(None);
+        }
+    };
+
+    let actual_count = match env
+        .call_method(&metadata, "getParameterCount", "()I", &[])
+        .and_then(|value| value.i())
+    {
+        Ok(actual_count) => actual_count,
+        Err(error) => {
+            let detail = take_pending_java_exception(env).unwrap_or_else(|| error.to_string());
+            debug!(
+                "{CONNECTOR_NAME} connector [{connector_id}] parameter count unavailable ({detail}); binding offset as a string"
+            );
+            return Ok(None);
+        }
+    };
+    if actual_count != expected_count {
+        return Err(Error::InvalidConfigValue(format!(
+            "query contains {actual_count} JDBC parameters but {expected_count} came from \
+             {{last_offset}}; raw '?' parameters are not supported"
+        )));
+    }
+
+    let mut parameter_types = Vec::with_capacity(expected_count as usize);
+    for parameter_index in 1..=expected_count {
+        match env
+            .call_method(
+                &metadata,
+                "getParameterType",
+                "(I)I",
+                &[JValue::Int(parameter_index)],
+            )
+            .and_then(|value| value.i())
+        {
+            Ok(0) => {
+                debug!(
+                    "{CONNECTOR_NAME} connector [{connector_id}] driver reported an unknown parameter type; binding offset as a string"
+                );
+                return Ok(None);
+            }
+            Ok(sql_type) => parameter_types.push(sql_type),
+            Err(error) => {
+                let detail = take_pending_java_exception(env).unwrap_or_else(|| error.to_string());
+                debug!(
+                    "{CONNECTOR_NAME} connector [{connector_id}] parameter type unavailable ({detail}); binding offset as a string"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(parameter_types))
 }
 
 /// Reject a query that still contains an unresolved placeholder, so an invalid
@@ -2096,11 +2178,12 @@ fn query_orders_by_tracking_column(
 fn exact_identifier_final_segment(identifier: &str) -> Option<&str> {
     let mut final_segment = None;
     for segment in identifier.split('.') {
-        let unquoted = if segment.starts_with('"') && segment.ends_with('"')
-            || segment.starts_with('`') && segment.ends_with('`')
-            || segment.starts_with('[') && segment.ends_with(']')
+        let unquoted = if segment.len() >= 2
+            && (segment.starts_with('"') && segment.ends_with('"')
+                || segment.starts_with('`') && segment.ends_with('`')
+                || segment.starts_with('[') && segment.ends_with(']'))
         {
-            &segment[1..segment.len().checked_sub(1)?]
+            &segment[1..segment.len() - 1]
         } else {
             segment
         };
@@ -2329,9 +2412,6 @@ mod java {
             pub const DOUBLE: i32 = 8;
             pub const NUMERIC: i32 = 2;
             pub const DECIMAL: i32 = 3;
-            pub const DATE: i32 = 91;
-            pub const TIME: i32 = 92;
-            pub const TIMESTAMP: i32 = 93;
             pub const BINARY: i32 = -2;
             pub const VARBINARY: i32 = -3;
             pub const LONGVARBINARY: i32 = -4;
@@ -2834,6 +2914,27 @@ mod tests {
     }
 
     #[test]
+    fn given_incomplete_quoted_order_when_opening_should_return_an_error() {
+        let jar = write_temp_jar("jdbc_invalid_quoted_order.jar");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        for order_by in ['"', '`'] {
+            let mut config = base_config();
+            config.driver_jar_path = jar.clone();
+            config.mode = Mode::Incremental;
+            config.tracking_column = Some("id".to_string());
+            config.query =
+                format!("SELECT id FROM t WHERE id > {{last_offset}} ORDER BY {order_by}");
+            let mut source = JdbcSource::new(1, config, None);
+            let error = runtime
+                .block_on(source.open())
+                .expect_err("incomplete quoted identifier must fail open");
+            assert!(
+                matches!(error, Error::InvalidConfigValue(message) if message.to_ascii_lowercase().contains("order by"))
+            );
+        }
+    }
+
+    #[test]
     fn given_empty_query_or_offset_should_be_rejected() {
         let jar = write_temp_jar("jdbc_validate_blanks.jar");
         // Empty query.
@@ -2927,102 +3028,36 @@ mod tests {
     }
 
     #[test]
-    fn given_mysql_url_should_redact_password() {
-        let url = "jdbc:mysql://root:SuperSecret123@localhost:3306/mydb";
-        let sanitized = sanitize_jdbc_url(url);
-        assert_eq!(sanitized, "jdbc:mysql://root:***@localhost:3306/mydb");
-        assert!(!sanitized.contains("SuperSecret123"));
-    }
-
-    #[test]
-    fn given_password_with_at_sign_should_be_fully_redacted() {
-        let url = "jdbc:mysql://root:p@ss@localhost:3306/mydb";
-        let sanitized = sanitize_jdbc_url(url);
-        assert_eq!(sanitized, "jdbc:mysql://root:***@localhost:3306/mydb");
-        assert!(!sanitized.contains("p@ss"));
-    }
-
-    #[test]
     fn given_echoed_jdbc_url_should_be_redacted_from_error() {
         let url = "jdbc:mysql://root:p@ss@localhost:3306/mydb";
         let error = Error::InitError(format!("No suitable driver found for {url}"));
         let sanitized = sanitize_jdbc_error(error, url).to_string();
         assert_eq!(
             sanitized,
-            "Init error: No suitable driver found for jdbc:mysql://root:***@localhost:3306/mydb"
+            "Init error: No suitable driver found for <redacted JDBC URL>"
         );
         assert!(!sanitized.contains("p@ss"));
     }
 
     #[test]
-    fn given_postgres_url_should_redact_password() {
-        let url = "jdbc:postgresql://localhost:5432/mydb?user=admin&password=P@ssw0rd&ssl=true";
-        let sanitized = sanitize_jdbc_url(url);
+    fn given_braced_sql_server_password_should_redact_the_complete_url() {
+        let url = "jdbc:sqlserver://localhost:1433;user=sa;password={;secret};database=Sales";
+        let error = Error::Connection(format!("connection refused for {url}"));
+        let sanitized = sanitize_jdbc_error(error, url).to_string();
         assert_eq!(
             sanitized,
-            "jdbc:postgresql://localhost:5432/mydb?user=admin&password=***&ssl=true"
+            "Connection error: connection refused for <redacted JDBC URL>"
         );
-        assert!(!sanitized.contains("P@ssw0rd"));
-    }
-
-    #[test]
-    fn given_oracle_url_should_redact_password() {
-        let url = "jdbc:oracle:thin:system/oracle123@localhost:1521:XE";
-        let sanitized = sanitize_jdbc_url(url);
-        assert_eq!(sanitized, "jdbc:oracle:thin:system/***@localhost:1521:XE");
-        assert!(!sanitized.contains("oracle123"));
-    }
-
-    #[test]
-    fn given_sql_server_url_should_redact_password() {
-        let url = "jdbc:sqlserver://localhost:1433;user=sa;password=MySecretPass;database=Sales";
-        let sanitized = sanitize_jdbc_url(url);
-        assert_eq!(
-            sanitized,
-            "jdbc:sqlserver://localhost:1433;user=sa;password=***;database=Sales"
-        );
-        assert!(!sanitized.contains("MySecretPass"));
-    }
-
-    #[test]
-    fn given_h2_url_should_redact_password() {
-        let url = "jdbc:h2:mem:testdb;USER=sa;PASSWORD=secret";
-        let sanitized = sanitize_jdbc_url(url);
-        assert_eq!(sanitized, "jdbc:h2:mem:testdb;USER=sa;PASSWORD=***");
         assert!(!sanitized.contains("secret"));
+        assert!(!sanitized.contains("database=Sales"));
     }
 
     #[test]
-    fn given_mixed_case_password_key_should_be_redacted() {
-        let url1 = "jdbc:postgresql://localhost?password=secret";
-        let url2 = "jdbc:postgresql://localhost?PASSWORD=secret";
-        let url3 = "jdbc:postgresql://localhost?pwd=secret";
-        let url4 = "jdbc:postgresql://localhost?PWD=secret";
+    fn given_empty_jdbc_url_should_not_modify_error_message() {
+        let error = Error::Connection("connection refused".to_string());
+        let sanitized = sanitize_jdbc_error(error, "").to_string();
 
-        for url in [url1, url2, url3, url4] {
-            let sanitized = sanitize_jdbc_url(url);
-            assert!(!sanitized.contains("secret"), "Failed for URL: {}", url);
-            assert!(sanitized.contains("***"));
-        }
-    }
-
-    #[test]
-    fn given_url_without_password_should_remain_unchanged() {
-        let url = "jdbc:h2:mem:testdb";
-        let sanitized = sanitize_jdbc_url(url);
-        assert_eq!(sanitized, url);
-    }
-
-    #[test]
-    fn given_multiple_passwords_should_all_be_redacted() {
-        let url = "jdbc:postgresql://localhost?password=secret1&pwd=secret2";
-        let sanitized = sanitize_jdbc_url(url);
-        assert!(!sanitized.contains("secret1"));
-        assert!(!sanitized.contains("secret2"));
-        assert_eq!(
-            sanitized,
-            "jdbc:postgresql://localhost?password=***&pwd=***"
-        );
+        assert_eq!(sanitized, "Connection error: connection refused");
     }
 
     #[test]
@@ -3501,7 +3536,10 @@ mod tests {
     fn given_integer_cursor_should_extract_as_string() {
         let mut row = serde_json::Map::new();
         row.insert("id".to_string(), serde_json::json!(42));
-        assert_eq!(extract_offset_value(&row, "id"), Some("42".to_string()));
+        assert_eq!(
+            extract_offset_value(&row, "id", Types::INTEGER).unwrap(),
+            Some("42".to_string())
+        );
     }
 
     #[test]
@@ -3512,7 +3550,7 @@ mod tests {
             serde_json::json!("2024-06-15 12:00:00"),
         );
         assert_eq!(
-            extract_offset_value(&row, "updated_at"),
+            extract_offset_value(&row, "updated_at", -999).unwrap(),
             Some("2024-06-15 12:00:00".to_string())
         );
     }
@@ -3522,9 +3560,21 @@ mod tests {
         let mut row = serde_json::Map::new();
         row.insert("version".to_string(), serde_json::json!(3.5));
         assert_eq!(
-            extract_offset_value(&row, "version"),
+            extract_offset_value(&row, "version", Types::DOUBLE).unwrap(),
             Some("3.5".to_string())
         );
+    }
+
+    #[test]
+    fn given_equivalent_decimal_cursors_should_have_one_canonical_form() {
+        for value in ["1", "1.0", "1.00"] {
+            let mut row = serde_json::Map::new();
+            row.insert("position".to_string(), serde_json::json!(value));
+            assert_eq!(
+                extract_offset_value(&row, "position", Types::NUMERIC).unwrap(),
+                Some("1".to_string())
+            );
+        }
     }
 
     #[test]
@@ -3532,13 +3582,30 @@ mod tests {
         let mut row = serde_json::Map::new();
         row.insert("id".to_string(), serde_json::Value::Null);
         // A SQL NULL tracking value must not become the persisted offset.
-        assert_eq!(extract_offset_value(&row, "id"), None);
+        assert_eq!(
+            extract_offset_value(&row, "id", Types::INTEGER).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn given_missing_cursor_column_should_not_extract() {
         let row = serde_json::Map::new();
-        assert_eq!(extract_offset_value(&row, "nonexistent"), None);
+        assert_eq!(
+            extract_offset_value(&row, "nonexistent", Types::INTEGER).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn given_non_finite_float_should_be_rejected() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                finite_json_number(value, 2),
+                Err(Error::InvalidRecordValue(message)) if message.contains("non-finite")
+            ));
+        }
+        assert_eq!(finite_json_number(1.5, 2).unwrap(), serde_json::json!(1.5));
     }
 
     // =========================================================================

@@ -15,18 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::postgres::PostgresContainer;
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture, seeds};
 use sha2::{Digest, Sha256};
+use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Pool, Postgres};
-use std::collections::HashMap;
-use std::io::Cursor;
+use testcontainers_modules::testcontainers::core::wait::LogWaitStrategy;
+use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::time::{Instant, sleep};
 use zip::ZipArchive;
 
-const DRIVER_CLASS_ENTRY: &str = "org/postgresql/Driver.class";
+use super::postgres::PostgresContainer;
+use super::unique_container_name;
+
+const POSTGRES_DRIVER_CLASS_ENTRY: &str = "org/postgresql/Driver.class";
 const POSTGRES_DRIVER_SHA256: &str =
     "49bba9c3200d4f64ae73903d56ce1bd09c74517dfe31acb44745506b4fcede53";
+const MYSQL_DRIVER_CLASS_ENTRY: &str = "com/mysql/cj/jdbc/Driver.class";
+const MYSQL_DRIVER_SHA256: &str =
+    "e2a3b2fc726a1ac64e998585db86b30fa8bf3f706195b78bb77c5f99bf877bd9";
+const MYSQL_IMAGE: &str = "mysql";
+const MYSQL_TAG: &str = "8.0.33";
+const MYSQL_PORT: u16 = 3306;
+const MYSQL_DATABASE: &str = "iggy";
+const MYSQL_USERNAME: &str = "iggy";
+const MYSQL_PASSWORD: &str = "iggy_password";
 
 const ENV_JDBC_URL: &str = "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_JDBC_URL";
 const ENV_DRIVER_CLASS: &str = "IGGY_CONNECTORS_SOURCE_JDBC_PG_PLUGIN_CONFIG_DRIVER_CLASS";
@@ -45,6 +64,20 @@ const ENV_STREAM: &str = "IGGY_CONNECTORS_SOURCE_JDBC_PG_STREAMS_0_STREAM";
 const ENV_TOPIC: &str = "IGGY_CONNECTORS_SOURCE_JDBC_PG_STREAMS_0_TOPIC";
 const ENV_SCHEMA: &str = "IGGY_CONNECTORS_SOURCE_JDBC_PG_STREAMS_0_SCHEMA";
 
+const ENV_MYSQL_JDBC_URL: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_JDBC_URL";
+const ENV_MYSQL_DRIVER_CLASS: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_DRIVER_CLASS";
+const ENV_MYSQL_DRIVER_JAR_PATH: &str =
+    "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_DRIVER_JAR_PATH";
+const ENV_MYSQL_USERNAME: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_USERNAME";
+const ENV_MYSQL_PASSWORD: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_PASSWORD";
+const ENV_MYSQL_QUERY: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_QUERY";
+const ENV_MYSQL_POLL_INTERVAL: &str =
+    "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_POLL_INTERVAL";
+const ENV_MYSQL_BATCH_SIZE: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_PLUGIN_CONFIG_BATCH_SIZE";
+const ENV_MYSQL_STREAM: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_STREAMS_0_STREAM";
+const ENV_MYSQL_TOPIC: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_STREAMS_0_TOPIC";
+const ENV_MYSQL_SCHEMA: &str = "IGGY_CONNECTORS_SOURCE_JDBC_MYSQL_STREAMS_0_SCHEMA";
+
 #[derive(Clone, Copy)]
 enum Scenario {
     Empty,
@@ -53,6 +86,7 @@ enum Scenario {
     LargeResult,
     BulkOverflow,
     TieBoundary,
+    NumericTieBoundary,
 }
 
 struct JdbcPostgresFixture {
@@ -105,6 +139,10 @@ impl JdbcPostgresFixture {
             Scenario::TieBoundary => &[
                 "CREATE TABLE tie_test (id INT PRIMARY KEY, position INT NOT NULL)",
                 "INSERT INTO tie_test (id, position) VALUES (1, 1), (2, 2), (3, 2), (4, 3)",
+            ],
+            Scenario::NumericTieBoundary => &[
+                "CREATE TABLE numeric_tie_test (id INT PRIMARY KEY, position NUMERIC NOT NULL)",
+                "INSERT INTO numeric_tie_test (id, position) VALUES (1, 1), (2, 2.0), (3, 2.00), (4, 3)",
             ],
         };
         for statement in statements {
@@ -269,6 +307,15 @@ jdbc_fixture!(
     "position",
     None
 );
+jdbc_fixture!(
+    JdbcNumericTieBoundaryFixture,
+    Scenario::NumericTieBoundary,
+    "SELECT id, position FROM numeric_tie_test WHERE position > {last_offset} ORDER BY position, id",
+    "incremental",
+    2,
+    "position",
+    None
+);
 
 pub struct JdbcQueryTimeoutFixture {
     base: JdbcPostgresFixture,
@@ -291,16 +338,138 @@ impl TestFixture for JdbcQueryTimeoutFixture {
     }
 }
 
+pub struct JdbcMySqlFixture {
+    _container: ContainerAsync<GenericImage>,
+    jdbc_url: String,
+    driver_jar_path: String,
+}
+
+#[async_trait]
+impl TestFixture for JdbcMySqlFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = GenericImage::new(MYSQL_IMAGE, MYSQL_TAG)
+            .with_wait_for(WaitFor::log(
+                LogWaitStrategy::stderr("ready for connections").with_times(2),
+            ))
+            .with_exposed_port(MYSQL_PORT.tcp())
+            .with_env_var("MYSQL_ROOT_PASSWORD", "root_password")
+            .with_env_var("MYSQL_DATABASE", MYSQL_DATABASE)
+            .with_env_var("MYSQL_USER", MYSQL_USERNAME)
+            .with_env_var("MYSQL_PASSWORD", MYSQL_PASSWORD)
+            .with_container_name(unique_container_name("jdbc-mysql"))
+            .start()
+            .await
+            .map_err(|error| fixture_error(format!("failed to start MySQL: {error}")))?;
+        let port = container
+            .get_host_port_ipv4(MYSQL_PORT.tcp())
+            .await
+            .map_err(|error| fixture_error(format!("failed to resolve MySQL port: {error}")))?;
+        let database_url =
+            format!("mysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@127.0.0.1:{port}/{MYSQL_DATABASE}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let pool = loop {
+            match MySqlPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+            {
+                Ok(pool) => break pool,
+                Err(_) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(200)).await;
+                }
+                Err(error) => {
+                    return Err(fixture_error(format!(
+                        "failed to connect to MySQL: {error}"
+                    )));
+                }
+            }
+        };
+        sqlx::query("CREATE TABLE mysql_cursor_test (id INT PRIMARY KEY, name VARCHAR(32))")
+            .execute(&pool)
+            .await
+            .map_err(|error| fixture_error(format!("failed to create MySQL table: {error}")))?;
+        sqlx::query("INSERT INTO mysql_cursor_test (id, name) VALUES (1, 'a'), (2, 'b')")
+            .execute(&pool)
+            .await
+            .map_err(|error| fixture_error(format!("failed to seed MySQL: {error}")))?;
+        pool.close().await;
+
+        Ok(Self {
+            _container: container,
+            jdbc_url: format!(
+                "jdbc:mysql://127.0.0.1:{port}/{MYSQL_DATABASE}?useSSL=false&serverTimezone=UTC"
+            ),
+            driver_jar_path: mysql_driver_jar().await?,
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (ENV_MYSQL_JDBC_URL.to_string(), self.jdbc_url.clone()),
+            (
+                ENV_MYSQL_DRIVER_CLASS.to_string(),
+                "com.mysql.cj.jdbc.Driver".to_string(),
+            ),
+            (
+                ENV_MYSQL_DRIVER_JAR_PATH.to_string(),
+                self.driver_jar_path.clone(),
+            ),
+            (ENV_MYSQL_USERNAME.to_string(), MYSQL_USERNAME.to_string()),
+            (ENV_MYSQL_PASSWORD.to_string(), MYSQL_PASSWORD.to_string()),
+            (
+                ENV_MYSQL_QUERY.to_string(),
+                "SELECT id, name FROM mysql_cursor_test WHERE id > {last_offset} ORDER BY id"
+                    .to_string(),
+            ),
+            (ENV_MYSQL_POLL_INTERVAL.to_string(), "100ms".to_string()),
+            (ENV_MYSQL_BATCH_SIZE.to_string(), "2".to_string()),
+            (
+                ENV_MYSQL_STREAM.to_string(),
+                seeds::names::STREAM.to_string(),
+            ),
+            (ENV_MYSQL_TOPIC.to_string(), seeds::names::TOPIC.to_string()),
+            (ENV_MYSQL_SCHEMA.to_string(), "json".to_string()),
+        ])
+    }
+}
+
 async fn postgres_driver_jar() -> Result<String, TestBinaryError> {
+    jdbc_driver_jar(
+        "postgresql-42.7.1.jar",
+        "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar",
+        POSTGRES_DRIVER_SHA256,
+        POSTGRES_DRIVER_CLASS_ENTRY,
+    )
+    .await
+}
+
+async fn mysql_driver_jar() -> Result<String, TestBinaryError> {
+    jdbc_driver_jar(
+        "mysql-connector-j-8.0.33.jar",
+        "https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.0.33/mysql-connector-j-8.0.33.jar",
+        MYSQL_DRIVER_SHA256,
+        MYSQL_DRIVER_CLASS_ENTRY,
+    )
+    .await
+}
+
+async fn jdbc_driver_jar(
+    file_name: &str,
+    download_url: &str,
+    expected_sha256: &str,
+    driver_class_entry: &str,
+) -> Result<String, TestBinaryError> {
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let jdbc_test_dir = format!("{target_dir}/test-jdbc-drivers");
-    let jar_path = format!("{jdbc_test_dir}/postgresql-42.7.1.jar");
+    let jar_path = format!("{jdbc_test_dir}/{file_name}");
     std::fs::create_dir_all(&jdbc_test_dir)
         .map_err(|error| fixture_error(format!("failed to create driver cache: {error}")))?;
 
     if std::path::Path::new(&jar_path).exists() {
         match std::fs::read(&jar_path) {
-            Ok(bytes) if is_expected_driver_jar(&bytes) => return canonical_path(&jar_path),
+            Ok(bytes) if is_expected_driver_jar(&bytes, expected_sha256, driver_class_entry) => {
+                return canonical_path(&jar_path);
+            }
             _ => {
                 std::fs::remove_file(&jar_path).map_err(|error| {
                     fixture_error(format!("failed to remove invalid cached driver: {error}"))
@@ -309,20 +478,18 @@ async fn postgres_driver_jar() -> Result<String, TestBinaryError> {
         }
     }
 
-    let response = reqwest::get(
-        "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar",
-    )
-    .await
-    .map_err(|error| fixture_error(format!("failed to download JDBC driver: {error}")))?
-    .error_for_status()
-    .map_err(|error| fixture_error(format!("JDBC driver download failed: {error}")))?;
+    let response = reqwest::get(download_url)
+        .await
+        .map_err(|error| fixture_error(format!("failed to download JDBC driver: {error}")))?
+        .error_for_status()
+        .map_err(|error| fixture_error(format!("JDBC driver download failed: {error}")))?;
     let bytes = response
         .bytes()
         .await
         .map_err(|error| fixture_error(format!("failed to read JDBC driver: {error}")))?;
-    if !is_expected_driver_jar(&bytes) {
+    if !is_expected_driver_jar(&bytes, expected_sha256, driver_class_entry) {
         return Err(fixture_error(format!(
-            "downloaded JDBC driver failed SHA-256 or archive validation for {DRIVER_CLASS_ENTRY}"
+            "downloaded JDBC driver failed SHA-256 or archive validation for {driver_class_entry}"
         )));
     }
 
@@ -334,14 +501,14 @@ async fn postgres_driver_jar() -> Result<String, TestBinaryError> {
     canonical_path(&jar_path)
 }
 
-fn is_expected_driver_jar(bytes: &[u8]) -> bool {
-    if format!("{:x}", Sha256::digest(bytes)) != POSTGRES_DRIVER_SHA256 {
+fn is_expected_driver_jar(bytes: &[u8], expected_sha256: &str, driver_class_entry: &str) -> bool {
+    if format!("{:x}", Sha256::digest(bytes)) != expected_sha256 {
         return false;
     }
     let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return false;
     };
-    archive.by_name(DRIVER_CLASS_ENTRY).is_ok()
+    archive.by_name(driver_class_entry).is_ok()
 }
 
 fn canonical_path(path: &str) -> Result<String, TestBinaryError> {
@@ -352,7 +519,7 @@ fn canonical_path(path: &str) -> Result<String, TestBinaryError> {
 
 fn fixture_error(message: impl Into<String>) -> TestBinaryError {
     TestBinaryError::FixtureSetup {
-        fixture_type: "JDBC PostgreSQL".to_string(),
+        fixture_type: "JDBC".to_string(),
         message: message.into(),
     }
 }

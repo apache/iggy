@@ -1,6 +1,6 @@
 # JDBC Source Connector
 
-A JDBC source connector for Iggy designed to work with JDBC-compliant relational databases. PostgreSQL is covered by the runtime integration suite; the other driver examples below are configuration guides and are not yet exercised in CI.
+A JDBC source connector for Iggy designed to work with JDBC-compliant relational databases. PostgreSQL and MySQL are covered by the runtime integration suite; the other driver examples below are configuration guides and are not yet exercised in CI.
 
 ## Overview
 
@@ -18,13 +18,12 @@ This connector reads data from relational databases using JDBC (Java Database Co
 
 ## Supported Databases
 
-PostgreSQL bulk and incremental modes are covered by end-to-end tests with a
-real database and the PostgreSQL JDBC driver. The connector is designed around
-standard JDBC APIs, so the following databases are expected to work with a
-compatible driver, but they are not currently part of the integration test
-matrix:
+PostgreSQL bulk and incremental modes and MySQL incremental mode are covered by
+end-to-end tests with real databases and their JDBC drivers. The connector is
+designed around standard JDBC APIs, so the following databases are expected to
+work with a compatible driver, but they are not currently part of the
+integration test matrix:
 
-- MySQL / MariaDB
 - Oracle Database
 - Microsoft SQL Server
 - H2 Database
@@ -85,6 +84,10 @@ wget https://repo1.maven.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar
 type = "source"
 key = "jdbc_mysql_source"
 enabled = true
+version = 0
+name = "JDBC MySQL Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
 
 [plugin_config]
 jdbc_url = "jdbc:mysql://localhost:3306/ecommerce"
@@ -97,8 +100,8 @@ poll_interval = "30s"
 batch_size = 1000
 # updated_at is a timestamp and may not be unique. If equal timestamps cross a
 # batch boundary, the poll fails closed (see "Unique / strictly increasing"
-# below). Prefer a unique auto-increment key, or keep batch_size larger than any
-# same-timestamp group.
+# below). Prefer a unique key whose rows become visible in cursor order, or keep
+# batch_size larger than any same-timestamp group.
 tracking_column = "updated_at"
 initial_offset = "2024-01-01 00:00:00"
 mode = "incremental"
@@ -109,6 +112,7 @@ verbose_logging = false
 [[streams]]
 stream = "ecommerce"
 topic = "orders"
+schema = "json"
 ```
 
 ### Bulk Mode Configuration
@@ -117,6 +121,10 @@ topic = "orders"
 type = "source"
 key = "jdbc_bulk_source"
 enabled = true
+version = 0
+name = "JDBC PostgreSQL Bulk Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
 
 [plugin_config]
 jdbc_url = "jdbc:postgresql://localhost:5432/warehouse"
@@ -134,6 +142,7 @@ include_metadata = true
 [[streams]]
 stream = "warehouse"
 topic = "products"
+schema = "json"
 ```
 
 ### Oracle Database Example
@@ -142,6 +151,10 @@ topic = "products"
 type = "source"
 key = "jdbc_oracle_source"
 enabled = true
+version = 0
+name = "JDBC Oracle Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
 
 [plugin_config]
 jdbc_url = "jdbc:oracle:thin:@localhost:1521:XE"
@@ -160,6 +173,7 @@ jvm_options = ["-Xmx256m", "-Xms128m"]
 [[streams]]
 stream = "crm"
 topic = "customers"
+schema = "json"
 ```
 
 ### SQL Server Example
@@ -168,6 +182,10 @@ topic = "customers"
 type = "source"
 key = "jdbc_sqlserver_source"
 enabled = true
+version = 0
+name = "JDBC SQL Server Source"
+path = "target/release/libiggy_connector_jdbc_source"
+plugin_config_format = "toml"
 
 [plugin_config]
 jdbc_url = "jdbc:sqlserver://localhost:1433;databaseName=Sales;encrypt=false"
@@ -179,8 +197,8 @@ query = "SELECT * FROM Orders WHERE OrderDate > {last_offset} ORDER BY OrderDate
 poll_interval = "15s"
 batch_size = 2000
 # OrderDate is a timestamp and may not be unique; see the uniqueness note on the
-# MySQL example above. Prefer a unique key, or keep batch_size above any
-# same-timestamp group.
+# MySQL example above. Prefer a unique key whose rows become visible in cursor
+# order, or keep batch_size above any same-timestamp group.
 tracking_column = "OrderDate"
 initial_offset = "2024-01-01"
 mode = "incremental"
@@ -188,6 +206,7 @@ mode = "incremental"
 [[streams]]
 stream = "sales"
 topic = "orders"
+schema = "json"
 ```
 
 ## Configuration Parameters
@@ -207,7 +226,7 @@ topic = "orders"
 | `mode` | string | No | "incremental" | Sync mode: "incremental" or "bulk" |
 | `connection_timeout_ms` | u64 | No | 5000 | Timeout (ms) for the per-poll `isValid` liveness check; converted to seconds and capped at 5s |
 | `login_timeout_ms` | u64 | No | 30000 | Bound on establishing the connection (`DriverManager.setLoginTimeout`); rounded up to whole seconds. Stops an unreachable database from hanging startup |
-| `query_timeout_ms` | u64 | No | 30000 | Positive bound on each query execution (`Statement.setQueryTimeout`); rounded up to whole seconds |
+| `query_timeout_ms` | u64 | No | 30000 | Positive bound on JDBC network operations (`Connection.setNetworkTimeout`) and query execution (`Statement.setQueryTimeout`); query execution is rounded up to whole seconds |
 | `jvm_options` | array | No | [] | Custom JVM options (e.g., ["-Xmx1g"]) |
 | `snake_case_columns` | bool | No | false | Convert column names to snake_case |
 | `include_metadata` | bool | No | true | Wrap each row with metadata (operation type, timestamp). `table_name` is a reserved field and is currently always null |
@@ -217,7 +236,7 @@ topic = "orders"
 
 The `query` parameter supports placeholders for dynamic queries:
 
-- `{last_offset}`: Replaced with a JDBC `PreparedStatement` parameter and bound using the parameter's reported SQL type
+- `{last_offset}`: Replaced with a JDBC `PreparedStatement` parameter and bound using the parameter's reported SQL type; drivers that do not expose parameter types use `setString`
 - `{tracking_column}`: Replaced with the configured `tracking_column` (validated as a plain SQL identifier)
 
 Incremental mode is validated at `open()` and enforces the following (the
@@ -260,9 +279,15 @@ The tracking column must also be:
   has the same tracking value as the last row in the batch, the entire poll
   fails before emitting messages or advancing the checkpoint. This prevents
   silent skips, but the source cannot progress until `batch_size` exceeds that
-  equal-value group or the query uses a unique, strictly-increasing key. An
-  auto-increment ID is ideal. Keyset pagination with a tie-break is a planned
-  follow-up.
+  equal-value group or the query uses a unique, strictly-increasing key. A
+  unique auto-increment ID works only when rows become visible in that same
+  cursor order. Keyset pagination with a tie-break is a planned follow-up.
+- **Visible in cursor order.** A generated ID can be allocated before its
+  transaction commits. If a row with a higher cursor becomes visible first,
+  the connector can checkpoint it and permanently skip a lower cursor that
+  commits later. Use a source table or publication process that makes rows
+  visible in cursor order; an auto-increment column by itself does not guarantee
+  commit order.
 - **Monotonic under the database's own ordering.** Because the cursor is the last
   ordered row and is fed back as a bound parameter in `WHERE {tracking_column} >
   ?`, the column
@@ -388,10 +413,12 @@ JDBC SQL types are automatically mapped to JSON:
   dropped. The check runs on the shared `block_in_place` worker, so its timeout
   (`connection_timeout_ms`) is intentionally converted to whole seconds and
   capped at 5s: a dead connection must not block the worker for tens of seconds.
-- **Bounded query execution.** Every prepared statement receives
-  `query_timeout_ms` through `Statement.setQueryTimeout`. JDBC drivers implement
-  cancellation differently, so verify timeout behavior for drivers outside the
-  PostgreSQL integration matrix.
+- **Bounded database operations.** Each connection receives
+  `query_timeout_ms` through `Connection.setNetworkTimeout`, covering parameter
+  metadata and other driver network requests. Prepared statements also receive
+  it through `Statement.setQueryTimeout`. JDBC drivers implement cancellation
+  differently, so verify timeout behavior for drivers outside the PostgreSQL
+  and MySQL integration matrix.
 - **`SQLState` classification is informational today.** Query failures are
   classified into transient vs permanent error variants, but the runtime does
   not yet apply differentiated backoff based on that distinction; it currently

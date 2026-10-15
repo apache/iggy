@@ -17,8 +17,8 @@
 
 use crate::connectors::fixtures::{
     JdbcBulkFixture, JdbcBulkOverflowFixture, JdbcBulkRowsFixture, JdbcIncrementalFixture,
-    JdbcLargeResultFixture, JdbcMetadataFixture, JdbcQueryTimeoutFixture, JdbcRecoveryFixture,
-    JdbcTextCursorFixture, JdbcTieBoundaryFixture,
+    JdbcLargeResultFixture, JdbcMetadataFixture, JdbcMySqlFixture, JdbcNumericTieBoundaryFixture,
+    JdbcQueryTimeoutFixture, JdbcRecoveryFixture, JdbcTextCursorFixture, JdbcTieBoundaryFixture,
 };
 use iggy::prelude::IggyClient;
 use iggy_common::{Consumer, Identifier, MessageClient, PollingStrategy};
@@ -230,6 +230,43 @@ async fn incremental_tie_at_batch_boundary_fails_closed(
 ) {
     assert_source_running(harness).await;
     assert_no_messages_for(harness, "jdbc_tie_boundary", Duration::from_millis(600)).await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/jdbc/config_postgres.toml")),
+    seed = seeds::connector_stream
+)]
+async fn equivalent_numeric_cursors_at_batch_boundary_fail_closed(
+    harness: &TestHarness,
+    _fixture: JdbcNumericTieBoundaryFixture,
+) {
+    assert_source_running(harness).await;
+    assert_no_messages_for(
+        harness,
+        "jdbc_numeric_tie_boundary",
+        Duration::from_millis(600),
+    )
+    .await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/jdbc/config_mysql.toml")),
+    seed = seeds::connector_stream
+)]
+async fn mysql_default_parameter_metadata_configuration_advances_offset(
+    harness: &TestHarness,
+    _fixture: JdbcMySqlFixture,
+) {
+    let client = harness.root_client().await.expect("root client");
+    let (ids, received) =
+        poll_until_ids_seen(&client, &consumer("jdbc_mysql"), &[1, 2], POLL_TIMEOUT).await;
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "expected ids 1,2 from MySQL, got {ids:?} from {received} messages"
+    );
 }
 
 #[iggy_harness(

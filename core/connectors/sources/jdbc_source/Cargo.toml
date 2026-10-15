@@ -38,6 +38,7 @@ default = []
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bigdecimal = { workspace = true }
 chrono = { workspace = true }
 
 # Required by source_connector! macro
