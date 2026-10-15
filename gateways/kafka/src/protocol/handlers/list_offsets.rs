@@ -552,7 +552,7 @@ fn lookup_answer(
             .with_offset(record.offset),
         Err(error) => {
             tracing::warn!(topic, partition, %error, "ListOffsets record lookup by time failed");
-            error_response(partition_index, error.to_list_offsets_error_code())
+            error_response(partition_index, retriable_code(&error))
         }
         Ok(None) => {
             let proven = match (lookup, last) {
@@ -1029,6 +1029,28 @@ mod tests {
             last.as_ref(),
         );
         assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn a_failed_first_poll_answers_like_a_failed_last_poll() {
+        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
+        for (error, code) in [
+            (BridgeError::Timeout, ERROR_REQUEST_TIMED_OUT),
+            (
+                BridgeError::InvalidConfig("bad".to_string()),
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+            ),
+        ] {
+            let shown = format!("{error:?}");
+            let resp = lookup_answer(
+                &Mutex::default(),
+                "orders",
+                pending(time, 42, 42),
+                Err(error),
+                None,
+            );
+            assert_eq!(resp.error_code, code, "{shown}");
+        }
     }
 
     #[test]

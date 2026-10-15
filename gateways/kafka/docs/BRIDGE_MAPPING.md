@@ -315,7 +315,7 @@ one was set, otherwise the append time.
 | A timestamp | The first record Iggy appended at or after it |
 | A timestamp past the last record, or any time on a partition that retains no message | No error, offset and timestamp `-1`, as Kafka answers |
 | A lookup that polls empty without proof that no record matches (below) | `NOT_LEADER_OR_FOLLOWER` (6), which clients retry |
-| `MAX_TIMESTAMP` (`-3`, v7) | The last record |
+| `MAX_TIMESTAMP` (`-3`, a v7 sentinel, answered at every version) | The last record |
 | A negative time other than the sentinels | The first record, as on a Kafka broker |
 
 Iggy searches by the time it appended each batch, not by the producer timestamp. A Kafka broker
