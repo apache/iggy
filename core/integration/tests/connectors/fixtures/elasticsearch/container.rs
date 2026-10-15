@@ -42,9 +42,11 @@ const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 const ELASTICSEARCH_CONTAINER_NAME: &str = "iggy-test-elasticsearch";
 // Short probe timeouts: create_http_client() uses 30s + retries and must not
 // be used for readiness. One hung attempt there looks like a 60s+ test hang.
-// The overall budget doubles as the creator's startup timeout because
-// attaching to the reused container skips testcontainers' wait, so a test that
-// attaches while another one is still booting ES waits here instead.
+// The overall budget covers one start attempt, from create or attach to a
+// yellow cluster. Attaching to the reused container skips testcontainers' wait,
+// so a test that attaches while another one still boots ES spends it waiting
+// for readiness. One deadline per attempt keeps a failed start() (two attempts
+// plus the lock wait) under nextest's 300s kill.
 const CLUSTER_READY_TIMEOUT_SECS: u64 = 120;
 const CLUSTER_READY_INTERVAL_MS: u64 = 250;
 const CLUSTER_READY_REQUEST_TIMEOUT_MS: u64 = 2_000;
@@ -229,6 +231,7 @@ impl ElasticsearchContainer {
     /// via [`start_shared_container`]), then verifies it is actually ready to
     /// serve traffic before handing it back to the caller.
     async fn try_start() -> Result<Self, TestBinaryError> {
+        let deadline = Instant::now() + Duration::from_secs(CLUSTER_READY_TIMEOUT_SECS);
         let container = start_shared_container().await?;
 
         info!("Started Elasticsearch container");
@@ -258,12 +261,12 @@ impl ElasticsearchContainer {
         };
         // ReuseDirective::Always can attach to a days-old container without
         // re-running HttpWaitStrategy; verify cluster health on every setup.
-        started.wait_until_ready().await?;
+        started.wait_until_ready(deadline).await?;
         started.sweep_stale_indices().await;
         Ok(started)
     }
 
-    async fn wait_until_ready(&self) -> Result<(), TestBinaryError> {
+    async fn wait_until_ready(&self, deadline: Instant) -> Result<(), TestBinaryError> {
         #[derive(Deserialize)]
         struct ClusterHealth {
             timed_out: bool,
@@ -289,11 +292,12 @@ impl ElasticsearchContainer {
             "{}{ELASTICSEARCH_HEALTH_ENDPOINT}?wait_for_status=yellow&timeout=1s",
             self.base_url
         );
-        let mut last_error = String::from("no attempts made");
-        let deadline = Instant::now() + Duration::from_secs(CLUSTER_READY_TIMEOUT_SECS);
+        let mut last_error: String;
         let mut attempt: u32 = 0;
 
-        while Instant::now() < deadline {
+        // Probe at least once: the image pull counts against the deadline, so
+        // a slow pull can use it up before the cluster had a chance to answer.
+        loop {
             attempt += 1;
             match client.get(&health_url).send().await {
                 Ok(response) if response.status().is_success() => {
@@ -328,6 +332,9 @@ impl ElasticsearchContainer {
                     last_error =
                         format!("cluster health request failed on attempt {attempt}: {error}");
                 }
+            }
+            if Instant::now() >= deadline {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(CLUSTER_READY_INTERVAL_MS)).await;
         }

@@ -206,6 +206,9 @@ fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
 /// rather than about how long Doris takes to boot.
 const CONTAINER_START_ATTEMPTS: u32 = 30;
 const CONTAINER_START_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Bounds the creating test's FE health wait. Attaching skips testcontainers'
+/// wait. Same headroom over the 60s default as the Elasticsearch fixture.
+const CONTAINER_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Creates the shared Doris container, or attaches to it if another test won
 /// the race.
@@ -244,7 +247,7 @@ async fn start_shared_container(
                     .with_port(FE_HTTP_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
-            .with_startup_timeout(Duration::from_secs(120))
+            .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
             .with_env_var("SKIP_CHECK_ULIMIT", "true")
             .with_cmd(["-c", entrypoint_cmd])
             .with_mapped_port(0, FE_HTTP_PORT.tcp())
