@@ -139,7 +139,8 @@ var asyncClient = Iggy.tcpClientBuilder()
 ```
 
 The connection string accepts `iggy://` and `iggy+tcp://` with `<username>:<password>` credentials and the
-`tls` and `tls_ca_file` options, each at most once. Personal access tokens and other options are not supported yet
+`tls` and `tls_ca_file` options, each at most once. `tls_ca_file` requires `tls=true`, and a string without `tls`
+keeps the TLS setting already on the builder. Personal access tokens and other options are not supported yet
 and are rejected with an `IggyInvalidArgumentException`.
 
 ### TCP Client (Async)
