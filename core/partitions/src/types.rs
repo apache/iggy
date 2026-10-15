@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
+use iggy_common::{EncryptorKind, IggyByteSize, PollingKind, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -103,7 +103,8 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
 pub struct PollingArgs {
-    pub strategy: PollingStrategy,
+    pub kind: PollingKind,
+    pub value: u64,
     pub count: u32,
     pub auto_commit: bool,
 }
@@ -115,7 +116,8 @@ impl PollingArgs {
     #[must_use]
     pub const fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
         Self {
-            strategy,
+            kind: strategy.kind,
+            value: strategy.value,
             count,
             auto_commit,
         }
@@ -290,6 +292,9 @@ pub struct RepairSession {
     /// Consensus view in which this session was armed. A later view discards
     /// the session before any delayed repair body can enter its journal.
     pub view: u32,
+    /// Latest repair cursor: the proof hole for backward chunks, otherwise
+    /// the first requested op. A changed proof hole is progress despite fenced commits.
+    pub from_op: u64,
     /// Committed frontier this repair must make locally walkable. Floor
     /// completeness and session completion are bounded here.
     pub commit_to_op: u64,
@@ -303,13 +308,6 @@ pub struct RepairSession {
     pub floor: Option<u64>,
     /// The peer serving this stream (re-request target on stall).
     pub peer: u8,
-    /// Lowest `base_offset` among the repaired `SendMessages` batches:
-    /// where the served window begins in offset space. Compared against the
-    /// boot-recovered durable end when a commit floor arrives -- a window
-    /// starting above `recovered_durable_offset + 1` means ops below the
-    /// floor are neither locally durable nor repaired (state-transfer
-    /// territory), and the floor must be refused.
-    pub first_batch_offset: Option<u64>,
     /// Ticks since the stream last made progress; at
     /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
     pub idle_ticks: u32,

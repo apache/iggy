@@ -19,6 +19,9 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Mappers;
+using Apache.Iggy.Utils;
 using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
@@ -32,6 +35,7 @@ internal static class MockFrames
     internal const int REQUEST_ID_OFFSET = 168;
     internal const int REQUEST_OPERATION_OFFSET = 176;
     internal const int REQUEST_RESERVED_OFFSET = 196;
+    internal const int REQUEST_CONTEXT_OFFSET = 200;
     internal const int REPLY_REQUEST_ID_OFFSET = 200;
     internal const int REPLY_OPERATION_OFFSET = 208;
     internal const int REPLY_STATUS_OFFSET = 216;
@@ -50,6 +54,10 @@ internal static class MockFrames
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
+        if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
+        {
+            return RouteReply(request, new PartitionContext(17, 0, 1), 0);
+        }
         if (request.Code == BIND_SESSION_CODE)
         {
             return Reply(OPERATION_NON_REPLICATED, RegisterBody(request.Session)[4..]);
@@ -76,6 +84,60 @@ internal static class MockFrames
         return frame;
     }
 
+    /// <summary>The roster a standalone server reports: itself, as the leader.</summary>
+    internal static byte[] StandaloneRoster(ushort port)
+    {
+        var body = new List<byte>();
+        WriteString(body, "standalone");
+        body.AddRange(BitConverter.GetBytes(1u));
+        WriteNode(body, port, true);
+        return Reply(OPERATION_NON_REPLICATED, body.ToArray());
+    }
+
+    internal static byte[] RouteReply(MockRequest request, PartitionContext context, byte primaryReplica,
+        uint partitionsCount = 1, uint view = 0)
+    {
+        var body = new byte[PartitionRoute.ENCODED_SIZE];
+        BinaryPrimitives.WriteUInt64LittleEndian(body, context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(8), context.MetadataOp);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(16), view);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(20), partitionsCount);
+        body[24] = primaryReplica;
+        return Reply(OPERATION_NON_REPLICATED, body);
+    }
+
+    /// <summary>A SyncConsumerGroup reply body: the assignment generation and the member's partitions.</summary>
+    internal static byte[] AssignmentBody(ulong generation, uint[] partitions)
+    {
+        var body = new byte[12 + partitions.Length * 4];
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(0, 8), generation);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(8, 4), (uint)partitions.Length);
+        for (var index = 0; index < partitions.Length; index++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(12 + index * 4, 4), partitions[index]);
+        }
+
+        return body;
+    }
+
+    internal static void WriteNode(List<byte> body, ushort port, bool leader, byte replicaId = 0)
+    {
+        body.Add(replicaId);
+        WriteString(body, $"node-{port}");
+        WriteString(body, "127.0.0.1");
+        body.AddRange(BitConverter.GetBytes(port));
+        body.AddRange(new byte[6]);
+        body.Add(leader ? (byte)0 : (byte)1);
+        body.Add(0);
+    }
+
+    internal static void WriteString(List<byte> body, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        body.AddRange(BitConverter.GetBytes((uint)bytes.Length));
+        body.AddRange(bytes);
+    }
+
     /// <summary>
     ///     A register reply carries a committed result section, so its four leading zero bytes announce zero
     ///     entries and the typed payload starts right after them. A non-replicated read carries none.
@@ -99,6 +161,7 @@ internal readonly record struct MockRequest(byte Operation, int Code, ulong Requ
 {
     internal UInt128 ClientId { get; init; }
     internal ulong Session { get; init; }
+    internal PartitionContext Context { get; init; }
     internal byte[] Body { get; init; } = [];
 }
 
@@ -220,6 +283,7 @@ internal sealed class MockNode : IDisposable
                 {
                     ClientId = BinaryPrimitives.ReadUInt128LittleEndian(header.AsSpan(128)),
                     Session = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(184)),
+                    Context = BinaryMapper.MapPartitionContext(header.AsSpan(REQUEST_CONTEXT_OFFSET)),
                     Body = body
                 };
                 lock (_recorded)

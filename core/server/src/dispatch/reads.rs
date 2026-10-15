@@ -34,7 +34,7 @@ use crate::dispatch::failure::{
 use crate::dispatch::partition::{
     handle_get_consumer_offset, handle_poll_messages, resolve_poll_request,
 };
-use crate::namespace::fence_and_resolve_offset_namespace;
+use crate::namespace::{fence_and_resolve_offset_namespace, resolve_partition_namespace};
 use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
@@ -52,14 +52,14 @@ use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
     GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
-    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-    SYNC_CONSUMER_GROUP_CODE,
+    GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE,
+    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
@@ -67,7 +67,7 @@ use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfo
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::responses::messages::PollRoutingResponse;
+use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollRoutingResponse};
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
@@ -277,15 +277,13 @@ pub async fn hold_for_frontier(
 /// every shard of a node reads one shared frontier and gates identically.
 ///
 /// Fast path is a single `Acquire` load and no await, which is what keeps an
-/// uncontended read shared-nothing. A park costs this connection more than the
-/// read itself: the per-connection drain loop serves one frame at a time, so
-/// the client's queued `SendMessages`, `PollMessages` and `PING` wait behind
-/// the held read, and a client that keeps pipelining through the hold is
-/// answered `TransientNotAccepted` once its queue hits
-/// [`MAX_QUEUED_CLIENT_REQUESTS`](crate::dispatch::MAX_QUEUED_CLIENT_REQUESTS)
-/// rather than growing it unbounded. No OTHER connection waits, and the budget
-/// bounds the hold itself. Expiry fails loud and retryable rather than serving
-/// state the client already saw replaced.
+/// uncontended read shared-nothing. A held read parks only its own task, which
+/// counts against the in-flight cap of its connection
+/// ([`ClientDrain`](crate::dispatch::ClientDrain)). A held `BIND_SESSION` parks
+/// the drain of its connection instead, because every later frame waits for
+/// the session it binds. No OTHER connection waits, and the budget bounds the
+/// hold itself. Expiry fails loud and retryable rather than serving state the
+/// client already saw replaced.
 ///
 /// The wait ends on the commit that closes the gap, not on a poll: the budget
 /// timer is the only timer armed, so a read that resumes costs one wake.
@@ -323,8 +321,8 @@ where
 
 /// Authorize a metadata read, then hold it for this node's applied frontier.
 ///
-/// Authorization first: a denial is terminal, and parking the connection for
-/// the whole budget before answering one buys nothing. Then again on a wait
+/// Authorization first: a denial is terminal, and holding the read for the
+/// whole budget before answering one buys nothing. Then again on a wait
 /// that parked -- the rule resolves its scope and the caller's grants off the
 /// state machine, and a park is exactly the case where both moved under it.
 #[allow(clippy::future_not_send)]
@@ -365,7 +363,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     // connection arrives with a floor of `0`: it was promised nothing, so its
     // reads wait for nothing.
     ConnectionContext {
-        bound,
+        bound: _,
         user_id,
         address: client_address,
         metadata_watermark: watermark,
@@ -378,6 +376,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
+    // A client that reads on a connection bound before its last write saw
+    // commit carries that commit in `minimum_metadata_op`, and the connection
+    // floor alone would let the read miss it.
+    let watermark = watermark.max(request.header().minimum_metadata_op);
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
         PING_CODE => {
@@ -504,9 +506,14 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         GET_SNAPSHOT_FILE_CODE => {
             handle_get_snapshot(shard, server_config, transport_client_id, &request, user_id).await;
         }
-        GET_POLL_ROUTING_CODE | GET_CONSUMER_OFFSET_ROUTING_CODE | BIND_SESSION_CODE => {
+        GET_POLL_ROUTING_CODE
+        | GET_CONSUMER_OFFSET_ROUTING_CODE
+        | BIND_SESSION_CODE
+        | GET_PARTITION_ROUTE_CODE => {
             let result = if code == BIND_SESSION_CODE {
                 bind_session(shard, sessions, transport_client_id, &request).await
+            } else if code == GET_PARTITION_ROUTE_CODE {
+                partition_route(shard, &request, user_id, watermark).await
             } else {
                 consumer_routing(
                     shard,
@@ -527,7 +534,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                         transport_client_id,
                         bytes,
                         FrameChannel::Reply,
-                        "consumer_routing",
+                        "partition_context",
                     )
                     .await;
                 }
@@ -538,16 +545,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             }
         }
         POLL_MESSAGES_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => {
-            let consumer_client = if code == POLL_MESSAGES_ON_PRIMARY_CODE {
-                sessions
-                    .borrow()
-                    .consumer_session(transport_client_id)
-                    .map(|(client_id, attachment)| (client_id, Some(attachment)))
-            } else {
-                bound
-                    .map(|(client_id, _)| (client_id, None))
-                    .ok_or(IggyError::Unauthenticated)
-            };
+            let consumer_client = sessions.borrow().consumer_session(transport_client_id);
             match consumer_client {
                 Ok((consumer_client_id, attachment)) => {
                     handle_poll_messages(
@@ -648,6 +646,78 @@ where
     .to_bytes())
 }
 
+/// One replica's route to a partition: the incarnation and partition count
+/// from metadata at or above `watermark`, and this replica's view of the
+/// partition group with the primary of that view.
+///
+/// Any bound replica answers, so a client finds the primary without knowing
+/// one. Send or poll permission on the topic is enough, because every
+/// partition request needs one of them. The applied op is read before any
+/// state, so the state behind the route reflects at least the op it reports:
+/// a route never pairs a new incarnation with an op older than its creation.
+#[allow(clippy::future_not_send)]
+async fn partition_route<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &Message<RoutedRequestHeader>,
+    user_id: Option<u32>,
+    watermark: u64,
+) -> Result<Bytes, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let wire = GetPartitionRouteRequest::decode_from(request_body(request))
+        .map_err(|_| IggyError::InvalidCommand)?;
+    authorize_and_hold_read(shard, GET_PARTITION_ROUTE_CODE, watermark, || {
+        authorize_partition_read(
+            shard,
+            &wire.stream_id,
+            &wire.topic_id,
+            user_id,
+            |permissioner, user_id, stream_id, topic_id| {
+                permissioner
+                    .append_messages(user_id, stream_id, topic_id)
+                    .or_else(|_| permissioner.poll_messages(user_id, stream_id, topic_id))
+            },
+        )
+        .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
+    })
+    .await?;
+    let metadata_op = shard.plane.metadata().applied_frontier().get();
+    let namespace = resolve_partition_namespace(
+        shard,
+        &wire.stream_id,
+        &wire.topic_id,
+        Some(wire.partition_id),
+    )?;
+    let (incarnation, partitions_count) = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partition_route(namespace)
+        .ok_or(IggyError::TransientNotAccepted)?;
+    let partitions_count =
+        u32::try_from(partitions_count).map_err(|_| IggyError::TransientNotAccepted)?;
+    let Some(PartitionReadReply::Primary { view, primary }) = shard
+        .partition_read(namespace, PartitionRead::Primary)
+        .await
+    else {
+        return Err(IggyError::TransientNotAccepted);
+    };
+    Ok(PartitionRouteResponse {
+        incarnation,
+        metadata_op,
+        view,
+        partitions_count,
+        primary_replica: primary,
+    }
+    .to_bytes())
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn consumer_routing<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -668,9 +738,6 @@ where
     let poll = if code == GET_POLL_ROUTING_CODE {
         let poll = PollMessagesRequest::decode_from(request_body(request))
             .map_err(|_| IggyError::InvalidCommand)?;
-        if !poll.auto_commit {
-            return Err(IggyError::InvalidCommand);
-        }
         Some(poll)
     } else {
         None
@@ -707,11 +774,29 @@ where
             client_id,
         )?
     };
+    let group_id = if wire.consumer.kind == iggy_binary_protocol::KIND_CONSUMER_GROUP {
+        Some(crate::namespace::resolve_offset_group_id(
+            shard.plane.metadata().mux_stm.streams(),
+            &wire.stream_id,
+            &wire.topic_id,
+            &wire.consumer.id,
+        )?)
+    } else {
+        None
+    };
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let metadata = if code == GET_POLL_ROUTING_CODE {
+        streams.poll_metadata(namespace, group_id, client_id)
+    } else {
+        streams.consumer_offset_metadata(namespace, group_id, client_id)
+    }
+    .ok_or(IggyError::TransientNotAccepted)?;
+    let context = metadata.context(shard.plane.metadata().applied_frontier().get());
     let primary = match shard
         .partition_read(namespace, PartitionRead::Primary)
         .await
     {
-        Some(PartitionReadReply::Primary(primary)) => primary,
+        Some(PartitionReadReply::Primary { primary, .. }) => primary,
         Some(PartitionReadReply::Rejected(error)) => return Err(error),
         _ => return Err(IggyError::TransientNotAccepted),
     };
@@ -723,6 +808,7 @@ where
         .find(|node| node.role == ClusterNodeRole::Leader)
         .ok_or(IggyError::TransientNotAccepted)?;
     Ok(PollRoutingResponse {
+        context,
         consumer_session: SessionIdentity {
             client_id,
             session,

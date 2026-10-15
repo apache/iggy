@@ -96,19 +96,30 @@ pub(crate) struct CliOptions {
     pub(crate) debug: Option<PathBuf>,
 
     /// Iggy server username
-    #[clap(short, long, group = "credentials")]
+    ///
+    /// When no credential flags are supplied, set both IGGY_USERNAME and
+    /// IGGY_PASSWORD. This environment pair does not fill omitted flags.
+    #[clap(short, long, group = "credentials", verbatim_doc_comment)]
     pub(crate) username: Option<String>,
 
     /// Iggy server password
     ///
-    /// An optional parameter to specify the password for authentication.
-    /// If not provided, user will be prompted interactively to enter the
-    /// password securely.
+    /// With --username and no --password, read the password from the terminal
+    /// or stdin. IGGY_PASSWORD does not supply a password for --username.
+    ///
+    /// When no credential flags are supplied, set both IGGY_USERNAME and
+    /// IGGY_PASSWORD. This environment pair does not fill omitted flags.
     #[clap(short, long, verbatim_doc_comment)]
     pub(crate) password: Option<String>,
 
     /// Iggy server personal access token
-    #[clap(short, long, group = "credentials")]
+    ///
+    /// Can also be provided with the IGGY_TOKEN environment variable.
+    /// An empty IGGY_TOKEN is treated as unset.
+    /// Command line credentials take precedence over the environment
+    /// variables, and IGGY_TOKEN takes precedence over the IGGY_USERNAME and
+    /// IGGY_PASSWORD pair.
+    #[clap(short, long, group = "credentials", verbatim_doc_comment)]
     pub(crate) token: Option<String>,
 
     #[cfg(feature = "login-session")]

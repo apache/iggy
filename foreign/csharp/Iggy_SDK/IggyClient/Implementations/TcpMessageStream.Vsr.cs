@@ -56,6 +56,15 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     private const int VsrTransientFailoverCheckMs = 2_000;
 
     /// <summary>
+    ///     First pause before a <see cref="VsrError.LIFECYCLE_BUSY" /> request goes out again. Every retry is a
+    ///     new request that commits another refusal, so the pause doubles up to
+    ///     <see cref="LifecycleRetryMaxIntervalMs" />.
+    /// </summary>
+    private const int LifecycleRetryIntervalMs = 50;
+
+    private const int LifecycleRetryMaxIntervalMs = 1_000;
+
+    /// <summary>
     ///     How long a transiently leaderless roster is polled before the connection proceeds on the current
     ///     node anyway. A restarted node cedes the primaryship its stale view assigns it, and the peers need
     ///     about one heartbeat timeout to elect.
@@ -303,24 +312,33 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             return cached;
         }
 
-        var topic = await GetTopicByIdAsync(streamId, topicId, token);
-        if (topic is null)
+        var routeKey = new PartitionRouteKey(streamId, topicId, 0);
+        RemovePartitionRoute(routeKey);
+        var query = RouteQuery(routeKey);
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        while (true)
         {
-            throw VsrError.Exception(VsrError.TOPIC_ID_NOT_FOUND,
-                $"Topic {topicId} was not found in stream {streamId}.");
+            try
+            {
+                var route = await GetPartitionRouteAsync(routeKey, query, deadline, token);
+                return route.Route.PartitionsCount;
+            }
+            catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.TRANSIENT_NOT_ACCEPTED
+                && Environment.TickCount64 + PollRoutingRetryIntervalMs < deadline)
+            {
+                await Task.Delay(PollRoutingRetryIntervalMs, token);
+            }
         }
-
-        _groupState.SetPartitionCount(key, topic.PartitionsCount);
-
-        return topic.PartitionsCount;
     }
 
     /// <summary>
-    ///     Polls one of the group member's assigned partitions, round-robin. A fence rejection - either the typed
-    ///     error or the sentinel partition id an empty poll carries - re-syncs the assignment and retries once.
+    ///     Polls one of the group member's assigned partitions, round-robin, with the strategy
+    ///     <paramref name="pollingStrategyFor" /> gives for it. A fence rejection - either the typed error or the
+    ///     sentinel partition id an empty poll carries - re-syncs the assignment and retries once.
     /// </summary>
     private async Task<PolledMessagesRental> PollGroupMessagesRentedAsync(Identifier streamId, Identifier topicId,
-        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token)
+        Consumer consumer, Func<uint, PollingStrategy> pollingStrategyFor, uint count, bool autoCommit,
+        CancellationToken token)
     {
         var key = new GroupKey(streamId, topicId, consumer.ConsumerId);
         if (!_groupState.HasAssignment(key))
@@ -341,6 +359,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 return NoAssignedPartitionPolledMessages;
             }
 
+            // Asked per attempt: a fence retry can land on another partition.
+            var pollingStrategy = pollingStrategyFor(partitionId);
             PolledMessagesRental? rental = null;
             try
             {
@@ -354,7 +374,14 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             })
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
-                // re-sync below.
+                // re-sync below. A caller context names the owner the poll was meant for, so the caller gets the
+                // fence instead of a poll of another partition.
+                if (pollingStrategy.Context is not null)
+                {
+                    _groupState.InvalidateAssignment(key);
+                    await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
+                    throw;
+                }
             }
 
             if (rental is not null)
@@ -489,6 +516,22 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             throw new MalformedResponseException("Cluster metadata contains no nodes.");
         }
 
+        var replicas = new Dictionary<byte, string>();
+        foreach (var node in clusterMetadata.Nodes)
+        {
+            if (!replicas.TryAdd(node.ReplicaId, ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp)))
+            {
+                throw new MalformedResponseException($"Duplicate replica id {node.ReplicaId} in cluster metadata.");
+            }
+        }
+        lock (_pollRoutingGate)
+        {
+            _replicaEndpoints.Clear();
+            foreach (var node in clusterMetadata.Nodes.Where(node => node.Endpoints.Tcp != 0))
+            {
+                _replicaEndpoints.Add(node.ReplicaId, replicas[node.ReplicaId]);
+            }
+        }
         Volatile.Write(ref _clusterNodeCount, nodeCount);
         var endpoints = clusterMetadata.Nodes
             .Where(node => node.Endpoints.Tcp != 0)
@@ -582,7 +625,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     redirection for the handshake, and reconnecting from underneath it would recurse.
     /// </remarks>
     private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
-        CancellationToken token, bool allowRedirect = true)
+        CancellationToken token, bool allowRedirect = true, PartitionContext context = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -598,6 +641,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         var leaderRedirects = 0;
         var redirectBudgetLogged = false;
         var walkingRoster = false;
+        var rosterWalkRestarted = false;
         HashSet<string> walkedRosterEndpoints = new(StringComparer.OrdinalIgnoreCase);
         VsrConnection? lastConnection = null;
 
@@ -610,7 +654,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
                 var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
-                    clearSensitiveReply, token);
+                    clearSensitiveReply, token, context);
                 requestEncoded |= attempt.Encoded;
                 lastConnection = attempt.Connection;
 
@@ -621,11 +665,11 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
                 if (attempt.Error is IggyInvalidStatusCodeException
                     {
-                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED, FromServer: true
+                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY, FromServer: true
                     }
                     && !isLoginRegister
                     && allowRedirect
-                    && Environment.TickCount64 < overallDeadline)
+                    && Environment.TickCount64 + PollRoutingRetryIntervalMs < overallDeadline)
                 {
                     var moved = false;
                     if (leaderRedirects < VsrMaxLeaderRedirects && !walkingRoster)
@@ -637,15 +681,29 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                         }
                     }
 
-                    if (!moved)
+                    if (!moved && attempt.Error is not IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
                     {
                         moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
+                        if (!moved && walkingRoster && !rosterWalkRestarted)
+                        {
+                            // A node that refused earlier can serve the request once it catches up, like a
+                            // partition primary that had not materialised the partition yet. Every hop also drops
+                            // the poll connections, so the walk restarts once and then stays on the current node.
+                            rosterWalkRestarted = true;
+                            walkedRosterEndpoints.Clear();
+                            moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
+                        }
+
                         walkingRoster |= moved;
                     }
 
                     if (moved)
                     {
                         await ConnectAsync(true, !walkingRoster, token);
+                    }
+                    else if (attempt.Error is IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
+                    {
+                        await Task.Delay(PollRoutingRetryIntervalMs, token);
                     }
                     else if (!walkingRoster && leaderRedirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
                     {
@@ -654,7 +712,12 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                             _currentAddress);
                     }
 
-                    continue;
+                    // The redirect and reconnect run without a deadline, so a fresh attempt past the budget
+                    // would read no reply and turn this refusal into an unknown outcome.
+                    if (Environment.TickCount64 + PollRoutingRetryIntervalMs < overallDeadline)
+                    {
+                        continue;
+                    }
                 }
 
                 if (attempt.Error is VsrSessionEvictedException evicted)
@@ -694,7 +757,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// <summary>
     ///     Moves to the next unvisited roster endpoint after a never-admitted refusal. Metadata and partition
     ///     groups elect independently, so the metadata leader is not necessarily the primary for the request's
-    ///     partition. The caller's request deadline and redirect budget bound the walk.
+    ///     partition. The caller's request deadline bounds the walk, and the caller restarts a finished walk once.
     /// </summary>
     private async Task<bool> RedirectToNextRosterNodeAsync(HashSet<string> visited, CancellationToken token)
     {
@@ -783,7 +846,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     connection from a replacement a reconnect installed since.
     /// </summary>
     private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
+        PartitionContext context = default, SessionFrame? retainedFrame = null, bool retryTransient = true)
     {
         await _sendingSemaphore.WaitAsync(token);
         try
@@ -795,7 +859,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
 
             return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                clearSensitiveReply, token);
+                clearSensitiveReply, token, retryTransient, context, retainedFrame);
         }
         finally
         {

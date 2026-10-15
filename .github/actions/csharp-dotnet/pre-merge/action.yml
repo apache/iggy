@@ -33,9 +33,9 @@ runs:
           8.0.x
           10.0.x
 
-    - name: Setup Rust with cache
-      if: inputs.task == 'test' || startsWith(inputs.task, 'e2e')
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      if: startsWith(inputs.task, 'e2e')
+      uses: ./.github/actions/utils/setup-rust
 
     - name: Restore dependencies
       run: |

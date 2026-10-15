@@ -733,6 +733,37 @@ func (e RequestTooOld) Is(target error) bool {
 	return ok
 }
 
+type HistoryUnavailable struct{}
+
+func (e HistoryUnavailable) Error() string {
+	return "request history is no longer available; retry cannot execute it again"
+}
+func (e HistoryUnavailable) Code() Code { return 87 }
+func (e HistoryUnavailable) Is(target error) bool {
+	_, ok := target.(HistoryUnavailable)
+	return ok
+}
+
+type LifecycleBusy struct{}
+
+func (e LifecycleBusy) Error() string {
+	return "a committed lifecycle operation prevents this mutation; retry as a new request"
+}
+func (e LifecycleBusy) Code() Code { return 88 }
+func (e LifecycleBusy) Is(target error) bool {
+	_, ok := target.(LifecycleBusy)
+	return ok
+}
+
+type NotPrimary struct{}
+
+func (e NotPrimary) Error() string { return "the replica is not the primary of the target group" }
+func (e NotPrimary) Code() Code    { return 89 }
+func (e NotPrimary) Is(target error) bool {
+	_, ok := target.(NotPrimary)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -1377,6 +1408,17 @@ func (e PartitionsLimitReached) Error() string {
 func (e PartitionsLimitReached) Code() Code { return 2022 }
 func (e PartitionsLimitReached) Is(target error) bool {
 	_, ok := target.(PartitionsLimitReached)
+	return ok
+}
+
+type PartitionResizeDisabled struct{}
+
+func (e PartitionResizeDisabled) Error() string {
+	return "partition resizing is disabled for this fixed topic"
+}
+func (e PartitionResizeDisabled) Code() Code { return 2023 }
+func (e PartitionResizeDisabled) Is(target error) bool {
+	_, ok := target.(PartitionResizeDisabled)
 	return ok
 }
 
@@ -2349,6 +2391,15 @@ func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
 	return ok
 }
 
+type TooManyConsumerGroups struct{}
+
+func (e TooManyConsumerGroups) Error() string { return "too many consumer groups" }
+func (e TooManyConsumerGroups) Code() Code    { return 5010 }
+func (e TooManyConsumerGroups) Is(target error) bool {
+	_, ok := target.(TooManyConsumerGroups)
+	return ok
+}
+
 type MissingBaseOffsetRetainedMessageBatch struct{}
 
 func (e MissingBaseOffsetRetainedMessageBatch) Error() string { return "base offset is missing" }
@@ -2780,6 +2831,9 @@ var (
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
 	ErrRequestTooOld                              = RequestTooOld{}
+	ErrHistoryUnavailable                         = HistoryUnavailable{}
+	ErrLifecycleBusy                              = LifecycleBusy{}
+	ErrNotPrimary                                 = NotPrimary{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2836,6 +2890,7 @@ var (
 	ErrTopicDirectoryNotFound                     = TopicDirectoryNotFound{}
 	ErrTooManyTopics                              = TooManyTopics{}
 	ErrPartitionsLimitReached                     = PartitionsLimitReached{}
+	ErrPartitionResizeDisabled                    = PartitionResizeDisabled{}
 	ErrCannotCreatePartition                      = CannotCreatePartition{}
 	ErrCannotCreatePartitionsDirectory            = CannotCreatePartitionsDirectory{}
 	ErrCannotCreatePartitionDirectory             = CannotCreatePartitionDirectory{}
@@ -2919,6 +2974,7 @@ var (
 	ErrCannotCreateConsumerGroupInfo              = CannotCreateConsumerGroupInfo{}
 	ErrCannotDeleteConsumerGroupInfo              = CannotDeleteConsumerGroupInfo{}
 	ErrConsumerGroupPartitionNotOwned             = ConsumerGroupPartitionNotOwned{}
+	ErrTooManyConsumerGroups                      = TooManyConsumerGroups{}
 	ErrMissingBaseOffsetRetainedMessageBatch      = MissingBaseOffsetRetainedMessageBatch{}
 	ErrMissingLastOffsetDeltaRetainedMessageBatch = MissingLastOffsetDeltaRetainedMessageBatch{}
 	ErrMissingMaxTimestampRetainedMessageBatch    = MissingMaxTimestampRetainedMessageBatch{}
@@ -3029,6 +3085,9 @@ const (
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
 	RequestTooOldCode                              Code = 85
+	HistoryUnavailableCode                         Code = 87
+	LifecycleBusyCode                              Code = 88
+	NotPrimaryCode                                 Code = 89
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3085,6 +3144,7 @@ const (
 	TopicDirectoryNotFoundCode                     Code = 2020
 	TooManyTopicsCode                              Code = 2021
 	PartitionsLimitReachedCode                     Code = 2022
+	PartitionResizeDisabledCode                    Code = 2023
 	CannotCreatePartitionCode                      Code = 3000
 	CannotCreatePartitionsDirectoryCode            Code = 3001
 	CannotCreatePartitionDirectoryCode             Code = 3002
@@ -3168,6 +3228,7 @@ const (
 	CannotCreateConsumerGroupInfoCode              Code = 5007
 	CannotDeleteConsumerGroupInfoCode              Code = 5008
 	ConsumerGroupPartitionNotOwnedCode             Code = 5009
+	TooManyConsumerGroupsCode                      Code = 5010
 	MissingBaseOffsetRetainedMessageBatchCode      Code = 6000
 	MissingLastOffsetDeltaRetainedMessageBatchCode Code = 6001
 	MissingMaxTimestampRetainedMessageBatchCode    Code = 6002
@@ -3346,6 +3407,12 @@ func (c Code) String() string {
 		return "InvalidNumberValue"
 	case RequestTooOldCode:
 		return "RequestTooOld"
+	case HistoryUnavailableCode:
+		return "HistoryUnavailable"
+	case LifecycleBusyCode:
+		return "LifecycleBusy"
+	case NotPrimaryCode:
+		return "NotPrimary"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3458,6 +3525,8 @@ func (c Code) String() string {
 		return "TooManyTopics"
 	case PartitionsLimitReachedCode:
 		return "PartitionsLimitReached"
+	case PartitionResizeDisabledCode:
+		return "PartitionResizeDisabled"
 	case CannotCreatePartitionCode:
 		return "CannotCreatePartition"
 	case CannotCreatePartitionsDirectoryCode:
@@ -3624,6 +3693,8 @@ func (c Code) String() string {
 		return "CannotDeleteConsumerGroupInfo"
 	case ConsumerGroupPartitionNotOwnedCode:
 		return "ConsumerGroupPartitionNotOwned"
+	case TooManyConsumerGroupsCode:
+		return "TooManyConsumerGroups"
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return "MissingBaseOffsetRetainedMessageBatch"
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:
@@ -3841,6 +3912,12 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidNumberValue
 	case RequestTooOldCode:
 		return ErrRequestTooOld
+	case HistoryUnavailableCode:
+		return ErrHistoryUnavailable
+	case LifecycleBusyCode:
+		return ErrLifecycleBusy
+	case NotPrimaryCode:
+		return ErrNotPrimary
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -3953,6 +4030,8 @@ func FromCode(code Code) IggyError {
 		return ErrTooManyTopics
 	case PartitionsLimitReachedCode:
 		return ErrPartitionsLimitReached
+	case PartitionResizeDisabledCode:
+		return ErrPartitionResizeDisabled
 	case CannotCreatePartitionCode:
 		return ErrCannotCreatePartition
 	case CannotCreatePartitionsDirectoryCode:
@@ -4119,6 +4198,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotDeleteConsumerGroupInfo
 	case ConsumerGroupPartitionNotOwnedCode:
 		return ErrConsumerGroupPartitionNotOwned
+	case TooManyConsumerGroupsCode:
+		return ErrTooManyConsumerGroups
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return ErrMissingBaseOffsetRetainedMessageBatch
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:

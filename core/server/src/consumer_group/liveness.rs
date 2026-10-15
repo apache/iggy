@@ -371,7 +371,10 @@ async fn retire_session<B, MJ, S, SB>(
     if remote_quorum {
         // The metadata primary need not belong to the common reporting quorum.
         // Every reporter already proved retirement in every allocated group.
-        if let Err(error) = metadata.submit_session_finalization(identity).await {
+        if let Err(error) = metadata
+            .submit_session_finalization(identity, revision)
+            .await
+        {
             trace!(
                 ?error,
                 client_id = identity.client_id,
@@ -452,7 +455,10 @@ async fn retire_session<B, MJ, S, SB>(
                 let status = shard
                     .partition_read(
                         *namespace,
-                        shard::PartitionRead::SessionRetired { identity },
+                        shard::PartitionRead::SessionRetired {
+                            identity,
+                            created_revision: *created_revision,
+                        },
                     )
                     .await;
                 let retired = match status {
@@ -518,7 +524,10 @@ async fn retire_session<B, MJ, S, SB>(
                         shard
                             .partition_read(
                                 *namespace,
-                                shard::PartitionRead::SessionRetired { identity }
+                                shard::PartitionRead::SessionRetired {
+                                    identity,
+                                    created_revision: *created_revision,
+                                }
                             )
                             .await,
                         Some(shard::PartitionReadReply::SessionRetired(true))
@@ -574,7 +583,11 @@ async fn retire_session<B, MJ, S, SB>(
             progress.reporters.insert(consensus.replica());
             progress.reporters.len() >= consensus.quorum_replication()
         };
-        if ready && let Err(error) = metadata.submit_session_finalization(identity).await {
+        if ready
+            && let Err(error) = metadata
+                .submit_session_finalization(identity, revision)
+                .await
+        {
             trace!(
                 ?error,
                 client_id = identity.client_id,
@@ -921,8 +934,8 @@ mod tests {
             topic_id: WireIdentifier::numeric(1),
             group_id: WireIdentifier::numeric(0),
             client_id: CLIENT,
-            in_flight: Vec::new(),
-            session: None,
+
+            session: 1,
         };
         for (operation, body) in [
             (Operation::CreateTopicWithAssignments, topic.to_bytes()),
@@ -1045,10 +1058,12 @@ mod tests {
             .collect();
         let tracker = RefCell::new(ConsumerGroupLiveness::default());
         tracker.borrow_mut().reconcile(0, &members, now);
-        metadata
-            .mux_stm
-            .streams()
-            .refresh_consumer_group_session(CLIENT, SESSION + 1);
+        metadata.mux_stm.streams().refresh_consumer_group_session(
+            CLIENT,
+            SESSION + 1,
+            SESSION + 1,
+            iggy_common::IggyTimestamp::default(),
+        );
         let mut table = ClientTable::new(MAX_LOGOUTS_PER_PASS + 1);
         for index in 0..=MAX_LOGOUTS_PER_PASS {
             let client_id = CLIENT + index as u128;
@@ -1210,8 +1225,8 @@ mod tests {
                 topic_id: WireIdentifier::numeric(0),
                 group_id: WireIdentifier::numeric(0),
                 client_id,
-                in_flight: Vec::new(),
-                session: None,
+
+                session: 1,
             };
             assert_eq!(
                 metadata
@@ -1226,10 +1241,12 @@ mod tests {
                     .code,
                 0
             );
-            metadata
-                .mux_stm
-                .streams()
-                .refresh_consumer_group_session(client_id, SESSION);
+            metadata.mux_stm.streams().refresh_consumer_group_session(
+                client_id,
+                SESSION,
+                SESSION,
+                iggy_common::IggyTimestamp::default(),
+            );
         }
         (dir, Rc::new(shard))
     }

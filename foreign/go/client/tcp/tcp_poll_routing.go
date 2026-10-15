@@ -22,8 +22,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -39,14 +37,22 @@ const (
 	consumerSessionSize   = 32
 	pollParametersSize    = 1 + 8 + 4 + 1
 	pollHeartbeatInterval = 5 * time.Second
+	// Offset writes end with the offset and the ack level, a delete with the
+	// ack level only.
+	storeOffsetSuffixSize  = 8 + 1
+	deleteOffsetSuffixSize = 1
 )
 
 // Primary polls have no deduplication key, including within one VSR session.
 type singlePollExchange struct{}
+type capturedPartitionContext struct{}
 
 type pollExchangeState struct {
+	stamped  bool
 	written  bool
 	reusable bool
+	replay   bool
+	parent   *consumerSession
 }
 
 // Published under c.mtx after authentication, then immutable. Warm data polls
@@ -55,6 +61,7 @@ type activePollSession struct {
 	bindSecret    [vsr.BindSecretBytes]byte
 	parent        consumerSession
 	configuration config
+	session       *vsr.Session
 }
 
 func (c *IggyTcpClient) publishPollSession() {
@@ -67,6 +74,7 @@ func (c *IggyTcpClient) publishPollSession() {
 		bindSecret:    c.session.BindSecret(),
 		parent:        consumerSession{client: c.session.ClientID(), session: c.session.SessionID()},
 		configuration: configuration,
+		session:       c.session.Fork(),
 	})
 }
 
@@ -91,6 +99,7 @@ func (s consumerSession) bytes() []byte {
 }
 
 type pollRoute struct {
+	context  iggcon.PartitionContext
 	endpoint string
 	parent   consumerSession
 }
@@ -125,6 +134,7 @@ type pollRouter struct {
 	routes        map[string]pollRoute
 	connections   map[string]*pollConnection
 	nextHeartbeat time.Time
+	endpoints     map[uint8]string
 }
 
 func (p *pollRouter) clear() {
@@ -136,6 +146,12 @@ func (p *pollRouter) clear() {
 	}
 	clear(p.connections)
 	p.nextHeartbeat = time.Time{}
+}
+
+func (p *pollRouter) clearRoutes() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	clear(p.routes)
 }
 
 func (p *pollRouter) dropRoute(key string) {
@@ -153,7 +169,9 @@ func (p *pollRouter) dropConnection(endpoint string, connection *pollConnection)
 	connection.retire()
 }
 
-func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.PollMessages) (response []byte, err error) {
+// sendRouted keeps the coordinator and its membership in place. Retries after
+// a primary move retain the stamped identity and captured history context.
+func (c *IggyTcpClient) sendRouted(caller context.Context, code command.Code, query, frame []byte, captured *iggcon.PartitionContext) (response []byte, err error) {
 	if caller == nil {
 		return nil, ierror.ErrNilContext
 	}
@@ -162,18 +180,16 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 		if err != nil && ctx.Err() != nil {
 			if caller.Err() != nil {
 				err = caller.Err()
-			} else if !errors.Is(err, ierror.ErrTransientNotAccepted) {
+			} else if !errors.Is(err, ierror.ErrTransientNotAccepted) && !errors.Is(err, ierror.ErrNotPrimary) {
 				err = ierror.ErrTransientNotCommitted
 			}
 		}
 		cancel()
 	}()
-	payload, err := request.MarshalBinary()
-	if err != nil {
+	if err := c.ensureTopology(ctx); err != nil {
 		return nil, err
 	}
-	key := string(payload[:len(payload)-pollParametersSize])
-
+	key := string(query)
 	c.polls.mu.Lock()
 	now := time.Now()
 	heartbeatDue := !c.polls.nextHeartbeat.IsZero() && !now.Before(c.polls.nextHeartbeat)
@@ -183,28 +199,88 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 	c.polls.mu.Unlock()
 	if heartbeatDue {
 		if _, _, err := c.sendPollRequest(ctx, uint32(command.PingCode), nil); err != nil {
-			if !isReconnectable(err) {
-				return nil, err
-			}
-			if _, err := c.do(ctx, &command.Ping{}); err != nil {
-				return nil, err
-			}
+			return nil, err
 		}
 	}
-
+	stamped, refreshed, repeatedPrimary := false, false, false
+	lifecycleRetryInterval := replayInterval
+	var requestParent *consumerSession
+	exact := captured != nil
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		route, err := c.pollRoute(ctx, key, payload)
-		var response []byte
-		if err == nil {
-			response, err = c.pollOnRoute(ctx, key, payload, route)
+		if requestParent != nil && !c.matchesPollParent(*requestParent) {
+			return nil, ierror.ErrUnauthenticated
 		}
-		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
+		state := pollExchangeState{stamped: stamped, replay: isPartitionMutation(code)}
+		route, err := c.consumerRoute(ctx, query)
+		if err == nil {
+			if requestParent != nil && (requestParent.client != route.parent.client || requestParent.session != route.parent.session) {
+				return nil, ierror.ErrUnauthenticated
+			}
+			if captured == nil {
+				value := route.context
+				captured = &value
+			}
+			route.context = *captured
+			if !exact {
+				route.context.MetadataOp = max(route.context.MetadataOp, route.parent.watermark)
+			}
+			if !stamped {
+				snapshot := c.pollSession.Load()
+				if snapshot == nil || snapshot.parent.client != route.parent.client || snapshot.parent.session != route.parent.session {
+					return nil, ierror.ErrUnauthenticated
+				}
+				parent := route.parent
+				requestParent = &parent
+			}
+			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), route.context)
+			if c.clustered.Load() {
+				response, err = c.pollOnRoute(ctx, code, key, frame, route, &state)
+				stamped = state.stamped
+			} else {
+				state.parent = requestParent
+				exchangeCtx := context.WithValue(ctx, capturedPartitionContext{}, route.context)
+				response, stamped, _, err = c.attempt(context.WithValue(exchangeCtx, singlePollExchange{}, &state), uint32(code), frame, stamped, time.Now(), time.Now().Add(responseReadTimeout))
+				if state.written && !state.reusable && err != nil {
+					err = ierror.ErrTransientNotCommitted
+				}
+			}
+		}
+		if errors.Is(err, ierror.ErrHistoryUnavailable) && code == command.SendMessagesCode && !exact && !refreshed {
+			refreshed = true
+			captured = nil
+			stamped = false
+			c.polls.dropRoute(key)
+			continue
+		}
+		if !errors.Is(err, ierror.ErrTransientNotAccepted) && !errors.Is(err, ierror.ErrNotPrimary) && !errors.Is(err, ierror.ErrLifecycleBusy) {
+			if errors.Is(err, ierror.ErrHistoryUnavailable) {
+				c.polls.dropRoute(key)
+			}
 			return response, err
 		}
 		c.polls.dropRoute(key)
+		if errors.Is(err, ierror.ErrLifecycleBusy) {
+			if !state.written {
+				return nil, err
+			}
+			deadline, _ := ctx.Deadline()
+			if time.Until(deadline) <= lifecycleRetryInterval {
+				return nil, err
+			}
+			if waitErr := c.pause(ctx, lifecycleRetryInterval); waitErr != nil {
+				return nil, waitErr
+			}
+			lifecycleRetryInterval = min(2*lifecycleRetryInterval, lifecycleRetryMaxInterval)
+			stamped = false
+			continue
+		}
+		if errors.Is(err, ierror.ErrNotPrimary) && !repeatedPrimary {
+			repeatedPrimary = true
+			continue
+		}
 		deadline, _ := ctx.Deadline()
 		if time.Until(deadline) <= replayInterval {
 			return nil, err
@@ -218,7 +294,11 @@ func (c *IggyTcpClient) pollPrimary(caller context.Context, request *command.Pol
 	}
 }
 
-func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []byte, route pollRoute) ([]byte, error) {
+func isPartitionMutation(code command.Code) bool {
+	return code == command.SendMessagesCode || code == command.StoreOffsetCode || code == command.DeleteConsumerOffsetCode
+}
+
+func (c *IggyTcpClient) pollOnRoute(ctx context.Context, code command.Code, key string, frame []byte, route pollRoute, state *pollExchangeState) ([]byte, error) {
 	c.polls.mu.Lock()
 	if !c.matchesPollParent(route.parent) {
 		c.polls.mu.Unlock()
@@ -323,8 +403,11 @@ func (c *IggyTcpClient) pollOnRoute(ctx context.Context, key string, payload []b
 	if !c.pollParentCurrent(route.parent) {
 		return nil, ierror.ErrTransientNotAccepted
 	}
-	response, state, err := slot.client.sendPollRequest(exchangeCtx, uint32(command.PollMessagesOnPrimaryCode), payload)
-	err = slot.exchangeError(ctx, state, err)
+	exchangeCtx = context.WithValue(exchangeCtx, capturedPartitionContext{}, route.context)
+	response, stamped, _, err := slot.client.attempt(context.WithValue(exchangeCtx, singlePollExchange{}, state),
+		uint32(code), frame, state.stamped, time.Now(), time.Now().Add(responseReadTimeout))
+	state.stamped = stamped
+	err = slot.exchangeError(ctx, *state, err)
 	if errors.Is(err, ierror.ErrTransientNotAccepted) {
 		slot.attached = false
 	}
@@ -349,29 +432,51 @@ func (c *IggyTcpClient) pollParentCurrent(parent consumerSession) bool {
 	return c.matchesPollParent(parent) && parent.watermark >= c.metadataWatermark.Load()
 }
 
-func (c *IggyTcpClient) pollRoute(ctx context.Context, key string, payload []byte) (pollRoute, error) {
+func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRoute, error) {
+	key := string(query)
 	c.polls.mu.Lock()
 	route, cached := c.polls.routes[key]
 	c.polls.mu.Unlock()
 	if cached && c.pollParentCurrent(route.parent) {
 		return route, nil
 	}
-	// This control command can recover a failed coordinator, but its one-exchange
-	// sendFrame path never moves a healthy coordinator after partition refusal.
-	body, err := c.SendBinaryRequest(ctx, uint32(command.GetPollRoutingCode), payload)
+	snapshot := c.pollSession.Load()
+	if snapshot == nil {
+		return pollRoute{}, ierror.ErrUnauthenticated
+	}
+	body, _, err := c.sendPollRequest(ctx, uint32(command.GetPartitionRouteCode), query)
 	if err != nil {
 		return pollRoute{}, err
 	}
-	route, err = decodePollRoute(body)
-	if err != nil {
+	var decoded iggcon.PartitionRoute
+	if err := decoded.UnmarshalBinary(body); err != nil {
 		return pollRoute{}, err
+	}
+	if decoded.PartitionsCount == 0 {
+		return pollRoute{}, ierror.ErrInvalidCommand
 	}
 	c.polls.mu.Lock()
+	endpoint, known := c.polls.endpoints[decoded.PrimaryReplica]
+	c.polls.mu.Unlock()
+	if c.clustered.Load() && !known {
+		if _, err := c.GetClusterMetadata(ctx); err != nil {
+			return pollRoute{}, err
+		}
+		c.polls.mu.Lock()
+		endpoint, known = c.polls.endpoints[decoded.PrimaryReplica]
+		c.polls.mu.Unlock()
+		if !known {
+			return pollRoute{}, ierror.ErrTransientNotAccepted
+		}
+	}
+	parent := snapshot.parent
+	parent.watermark = decoded.MetadataOp
+	route = pollRoute{context: decoded.Context(), endpoint: endpoint, parent: parent}
+	c.polls.mu.Lock()
 	defer c.polls.mu.Unlock()
-	if !c.matchesPollParent(route.parent) {
+	if !c.matchesPollParent(parent) {
 		return pollRoute{}, ierror.ErrTransientNotAccepted
 	}
-	route.parent.watermark = max(route.parent.watermark, c.metadataWatermark.Load())
 	if c.polls.routes == nil {
 		c.polls.routes = make(map[string]pollRoute)
 	}
@@ -379,28 +484,10 @@ func (c *IggyTcpClient) pollRoute(ctx context.Context, key string, payload []byt
 		clear(c.polls.routes)
 	}
 	c.polls.routes[key] = route
+	streamEnd := fieldPrefixSize + int(query[1])
+	topicEnd := len(query) - partitionIdSize
+	c.topics.setPartitionsCount(topicKey{stream: string(query[:streamEnd]), topic: string(query[streamEnd:topicEnd])}, decoded.PartitionsCount)
 	return route, nil
-}
-
-func decodePollRoute(body []byte) (pollRoute, error) {
-	if len(body) < consumerSessionSize {
-		return pollRoute{}, ierror.ErrInvalidCommand
-	}
-	var node iggcon.ClusterNode
-	if err := node.UnmarshalBinary(body[consumerSessionSize:]); err != nil {
-		return pollRoute{}, err
-	}
-	if node.Endpoints.Tcp == 0 {
-		return pollRoute{}, ierror.ErrFeatureUnavailable
-	}
-	return pollRoute{
-		endpoint: net.JoinHostPort(strings.Trim(node.IP, "[]"), strconv.Itoa(int(node.Endpoints.Tcp))),
-		parent: consumerSession{
-			client:    vsr.ClientID{Lo: binary.LittleEndian.Uint64(body), Hi: binary.LittleEndian.Uint64(body[8:])},
-			session:   binary.LittleEndian.Uint64(body[16:]),
-			watermark: binary.LittleEndian.Uint64(body[24:]),
-		},
-	}, nil
 }
 
 func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) (*IggyTcpClient, error) {
@@ -417,14 +504,8 @@ func (c *IggyTcpClient) connectPollClient(ctx context.Context, route pollRoute) 
 		return nil, err
 	}
 	client.mtx.Lock()
-	client.session = vsr.NewSessionWithClientID(route.parent.client)
-	err := client.session.Bind(route.parent.session)
-	client.session.SetBindSecret(snapshot.bindSecret)
+	client.session = snapshot.session.Fork()
 	client.mtx.Unlock()
-	if err != nil {
-		_ = client.Close()
-		return nil, err
-	}
 	return client, nil
 }
 

@@ -39,6 +39,26 @@ cargo run --bin iggy-server --release -- --replica-id 0
 
 Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
+## Upgrading
+
+Deploy matching server and SDK releases together. Rolling upgrades and mixed
+server versions are unsupported. Partition control frames from older servers
+carry incarnation zero and are rejected, so a mixed-version cluster cannot
+complete partition view changes. The `IGGY-OWNERSHIP-HISTORY-5` storage gate also
+rejects older data directories without modifying them. Existing data requires a
+separately validated offline migration or restore procedure before this release
+can use it.
+
+Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
+`replicaId` component, changing constructor calls and record patterns. C# callers
+must initialize the required `ReplicaId` property. The CLI's cluster metadata list
+appends a replica ID column. Swift's `ClusterNode` initializer now requires
+`replicaID`. C++'s FFI `ClusterNode`, Rust's `iggy_common::ClusterNode` and
+`iggy_binary_protocol::responses::system::ClusterNodeResponse` add the public
+`replica_id` field; update aggregate and struct initializers.
+Go, Java, Node.js and C# clients use command 105's new
+partition routes and refresh on `NotPrimary` (89); use their matching releases.
+
 ## Configuration
 
 Settings are read from [config.toml](config.toml), resolved relative to the working directory. Set `IGGY_CONFIG_PATH` to load a different file.
@@ -87,6 +107,14 @@ offset writes support the configured policy. Crash-safe send retries require
 receipt still replays its original result, but a lost receipt cannot prevent
 another execution. NoAck and internal auto-commit polls retain their weaker
 completion contracts.
+
+Topics have an immutable `partition_resize_policy` creation option. The default,
+`mutable`, permits partition addition and deletion without a bounded cutover or
+per-key ordering across partition layouts. `fixed` rejects both operations with
+`PartitionResizeDisabled` (2023). Existing messages stay in their original
+partitions. Neither policy prevents retention or deletion of the topic.
+Set the option through `TopicCreateOptions::partition_resize_policy`, HTTP's
+`options` map, or the CLI's `--set partition_resize_policy=fixed`.
 
 ## Upgrade recovery
 
@@ -171,7 +199,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-NO-PURGE-1` requires this initialization contract;
+Storage format `IGGY-OWNERSHIP-HISTORY-5` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

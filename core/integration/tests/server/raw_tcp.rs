@@ -66,6 +66,24 @@ pub(crate) async fn connect_to(addr: SocketAddr) -> TcpStream {
     TcpStream::connect(addr).await.unwrap()
 }
 
+pub(crate) async fn partition_context(
+    client: &IggyClient,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: u32,
+) -> PartitionContext {
+    client
+        .get_topic(stream_id, topic_id)
+        .await
+        .expect("discover partition context")
+        .expect("topic exists")
+        .partitions
+        .into_iter()
+        .find(|partition| partition.id == partition_id)
+        .expect("partition exists")
+        .context
+}
+
 pub(crate) fn request_header(
     operation: Operation,
     client: u128,
@@ -136,6 +154,12 @@ pub(crate) async fn exchange_raw(
     body: &[u8],
 ) -> ([u8; HEADER_SIZE], Vec<u8>) {
     write_raw_frame(stream, header, body).await;
+    read_reply(stream).await
+}
+
+/// Read the next server frame, which must be a Reply, with the body sized by
+/// the reply's size field.
+pub(crate) async fn read_reply(stream: &mut TcpStream) -> ([u8; HEADER_SIZE], Vec<u8>) {
     let reply_header = read_frame_header(stream).await;
     let command = frame_command(&reply_header);
     assert_eq!(
@@ -227,4 +251,5 @@ pub(crate) async fn register_root(stream: &mut TcpStream, client: u128) -> u64 {
 fn is_transient(code: u32) -> bool {
     code == IggyError::TransientNotCommitted.as_code()
         || code == IggyError::TransientNotAccepted.as_code()
+        || code == IggyError::NotPrimary.as_code()
 }

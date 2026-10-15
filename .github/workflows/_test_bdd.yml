@@ -27,6 +27,14 @@ on:
         type: string
         required: true
         description: "Task to run (e.g., 'bdd-rust', 'bdd-python', etc.)"
+      timeout-minutes:
+        type: number
+        default: 60
+        description: "Job timeout in minutes"
+
+    secrets:
+      CODECOV_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -35,7 +43,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -44,9 +52,11 @@ jobs:
         if: inputs.component == 'noop'
         run: echo "No changes detected, skipping tests"
 
-      - name: Setup Rust with cache for BDD
+      - name: Setup Rust for BDD
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
-        uses: ./.github/actions/utils/setup-rust-with-cache
+        uses: ./.github/actions/utils/setup-rust
+        with:
+          coverage: ${{ inputs.task == 'bdd-rust' }}
 
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
@@ -88,13 +98,37 @@ jobs:
           export IGGY_CLI_PATH="target/debug/iggy"
           export IGGY_ROOT_USERNAME="iggy"
           export IGGY_ROOT_PASSWORD="iggy"
-          ./scripts/run-bdd-tests.sh "$SDK_NAME"
+          COVERAGE_ARGS=()
+          if [[ "$SDK_NAME" == rust ]]; then
+            COVERAGE_ARGS=(--coverage)
+          fi
+          ./scripts/run-bdd-tests.sh "${COVERAGE_ARGS[@]}" "$SDK_NAME"
 
       - name: Clean up Docker resources (BDD)
         if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
           ./scripts/run-bdd-tests.sh clean || true
           docker system prune -f || true
+
+      - name: Generate Rust coverage report
+        if: always() && !cancelled() && inputs.task == 'bdd-rust'
+        run: |
+          if compgen -G 'target/*.profraw' > /dev/null; then
+            cargo llvm-cov report --codecov --output-path codecov.json
+          else
+            echo "::notice::No coverage profiles found; skipping report"
+          fi
+
+      - name: Upload Rust coverage to Codecov
+        if: always() && !cancelled() && inputs.task == 'bdd-rust' && hashFiles('codecov.json', 'reports/rust-bdd-coverage.lcov') != ''
+        uses: codecov/codecov-action@v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json,reports/rust-bdd-coverage.lcov
+          disable_search: true
+          flags: rust-bdd
+          fail_ci_if_error: false
+          override_pr: ${{ github.event.pull_request.number }}
 
       - name: Upload reports
         if: always()
@@ -105,5 +139,6 @@ jobs:
             reports/**
             target/llvm-cov/**
             coverage.lcov
+            codecov.json
           if-no-files-found: ignore
           retention-days: 7

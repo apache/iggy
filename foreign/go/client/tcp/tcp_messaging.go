@@ -19,14 +19,24 @@ package tcp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/hash"
+)
+
+// SendMessages payload layout a raw request is parsed by.
+const (
+	sendMetadataLengthSize = 4
+	fieldPrefixSize        = 2
+	partitionIdSize        = 4
 )
 
 func (c *IggyTcpClient) SendMessages(
@@ -62,8 +72,7 @@ func (c *IggyTcpClient) SendMessages(
 		if errors.Is(err, ierror.ErrPartitionNotFound) {
 			// The cached count pointed this send at a partition the server
 			// does not have, so the topic was likely recreated smaller.
-			// Nothing else invalidates a count another client changed.
-			c.topics.invalidatePartitionsCount(newTopicKey(streamId, topicId))
+			c.topics.forgetCount(newTopicKey(streamId, topicId))
 		}
 		return nil, err
 	}
@@ -91,7 +100,7 @@ func (c *IggyTcpClient) resolvePartitioning(
 	}
 
 	key := newTopicKey(streamId, topicId)
-	partitionsCount, err := c.topicPartitionsCount(ctx, key, streamId, topicId)
+	partitionsCount, err := c.topicPartitionsCount(ctx, key)
 	if err != nil {
 		return iggcon.Partitioning{}, err
 	}
@@ -111,22 +120,39 @@ func (c *IggyTcpClient) resolvePartitioning(
 func (c *IggyTcpClient) topicPartitionsCount(
 	ctx context.Context,
 	key topicKey,
-	streamId, topicId iggcon.Identifier,
 ) (uint32, error) {
 	if cached, ok := c.topics.partitionsCount(key); ok {
 		return cached, nil
 	}
 
-	topic, err := c.GetTopic(ctx, streamId, topicId)
-	if err != nil {
+	query := binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), 0)
+	if err := c.ensureTopology(ctx); err != nil {
 		return 0, err
 	}
-	if topic == nil || topic.PartitionsCount == 0 {
+	ctx, cancel := context.WithTimeout(ctx, responseReadTimeout)
+	defer cancel()
+	c.polls.dropRoute(string(query))
+	for {
+		_, err := c.consumerRoute(ctx, query)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ierror.ErrTransientNotAccepted) {
+			return 0, err
+		}
+		deadline, _ := ctx.Deadline()
+		if time.Until(deadline) <= replayInterval {
+			return 0, err
+		}
+		if err := c.waitBeforeReplay(ctx, deadline); err != nil {
+			return 0, err
+		}
+	}
+	count, _ := c.topics.partitionsCount(key)
+	if count == 0 {
 		return 0, ierror.ErrTopicIdNotFound
 	}
-
-	c.topics.setPartitionsCount(key, topic.PartitionsCount)
-	return topic.PartitionsCount, nil
+	return count, nil
 }
 
 func (c *IggyTcpClient) PollMessages(
@@ -139,10 +165,8 @@ func (c *IggyTcpClient) PollMessages(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
-	if autoCommit && !c.topologyKnown.Load() {
-		if _, err := c.GetClusterMetadata(ctx); err != nil {
-			return nil, err
-		}
+	if err := c.ensureTopology(ctx); err != nil {
+		return nil, err
 	}
 	// A group poll that names no partition is orchestrated client-side: the
 	// member fetches its assignment and polls the partitions it owns in turn.
@@ -172,17 +196,123 @@ func (c *IggyTcpClient) pollPartition(
 		Count:       count,
 		PartitionId: partitionId,
 	}
-	routed := autoCommit && c.clustered.Load()
-	var buffer []byte
-	var err error
-	if routed {
-		buffer, err = c.pollPrimary(ctx, request)
-	} else {
-		buffer, err = c.do(ctx, request)
-	}
+	buffer, err := c.do(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 
 	return binaryserialization.DeserializeFetchMessagesResponse(buffer, c.MessageCompression)
+}
+
+// sendTarget reads the topic and the explicit partition of a SendMessages. A
+// raw payload is [metadata length u32][stream id][topic id][partitioning],
+// each of the last three [kind u8][length u8][value].
+func sendTarget(cmd command.Command) (topicKey, uint32, error) {
+	switch request := cmd.(type) {
+	case *command.SendMessages:
+		if request.Partitioning.Kind != iggcon.PartitionIdKind || len(request.Partitioning.Value) != partitionIdSize {
+			return topicKey{}, 0, ierror.ErrInvalidCommand
+		}
+		stream, err := request.StreamId.MarshalBinary()
+		if err != nil {
+			return topicKey{}, 0, err
+		}
+		topic, err := request.TopicId.MarshalBinary()
+		if err != nil {
+			return topicKey{}, 0, err
+		}
+		return topicKey{stream: string(stream), topic: string(topic)},
+			binary.LittleEndian.Uint32(request.Partitioning.Value), nil
+	case rawRequest:
+		var fields [3][]byte
+		cursor := sendMetadataLengthSize
+		for index := range fields {
+			if len(request.payload) < cursor+fieldPrefixSize {
+				return topicKey{}, 0, ierror.ErrInvalidCommand
+			}
+			end := cursor + fieldPrefixSize + int(request.payload[cursor+1])
+			if len(request.payload) < end {
+				return topicKey{}, 0, ierror.ErrInvalidCommand
+			}
+			fields[index] = request.payload[cursor:end]
+			cursor = end
+		}
+		partitioning := fields[2]
+		switch iggcon.PartitioningKind(partitioning[0]) {
+		case iggcon.PartitionIdKind:
+			if len(partitioning) != fieldPrefixSize+partitionIdSize {
+				return topicKey{}, 0, ierror.ErrInvalidCommand
+			}
+			return topicKey{stream: string(fields[0]), topic: string(fields[1])},
+				binary.LittleEndian.Uint32(partitioning[fieldPrefixSize:]), nil
+		case iggcon.Balanced, iggcon.MessageKey:
+			// A raw send cannot pick the partition, and a zero context is
+			// always refused, so it fails before anything is written.
+			return topicKey{}, 0, fmt.Errorf("%w: a raw SendMessages needs an explicit partition id; "+
+				"use SendMessages for balanced or key partitioning", ierror.ErrFeatureUnavailable)
+		default:
+			return topicKey{}, 0, ierror.ErrInvalidCommand
+		}
+	default:
+		return topicKey{}, 0, ierror.ErrInvalidCommand
+	}
+}
+
+func isPartitionCommand(code command.Code) bool {
+	switch code {
+	case command.SendMessagesCode, command.PollMessagesCode, command.GetOffsetCode, command.StoreOffsetCode, command.DeleteConsumerOffsetCode:
+		return true
+	default:
+		return false
+	}
+}
+
+// partitionQuery validates the routing target before any network request. The
+// returned encoding is also the cache key, shared by sends, polls and offsets.
+func partitionQuery(code command.Code, payload []byte) ([]byte, error) {
+	if code == command.SendMessagesCode {
+		key, partition, err := sendTarget(rawRequest{code: code, payload: payload})
+		if err != nil {
+			return nil, err
+		}
+		return binary.LittleEndian.AppendUint32([]byte(key.stream+key.topic), partition), nil
+	}
+	if len(payload) < 1 {
+		return nil, ierror.ErrInvalidCommand
+	}
+	var fields [3][]byte
+	position := 1
+	for index := range fields {
+		if len(payload)-position < fieldPrefixSize {
+			return nil, ierror.ErrInvalidCommand
+		}
+		end := position + fieldPrefixSize + int(payload[position+1])
+		if end > len(payload) {
+			return nil, ierror.ErrInvalidCommand
+		}
+		fields[index] = payload[position:end]
+		position = end
+	}
+	suffix := 0
+	switch code {
+	case command.PollMessagesCode:
+		suffix = pollParametersSize
+	case command.StoreOffsetCode:
+		suffix = storeOffsetSuffixSize
+	case command.DeleteConsumerOffsetCode:
+		suffix = deleteOffsetSuffixSize
+	}
+	if len(payload)-position != 1+partitionIdSize+suffix || payload[position] > 1 {
+		return nil, ierror.ErrInvalidCommand
+	}
+	partition := binary.LittleEndian.Uint32(payload[position+1:])
+	if payload[position] == 0 {
+		if code == command.StoreOffsetCode || code == command.DeleteConsumerOffsetCode ||
+			(code == command.PollMessagesCode && payload[0] == byte(iggcon.ConsumerKindGroup)) {
+			return nil, ierror.ErrInvalidCommand
+		}
+		partition = 0
+	}
+	query := append(append(make([]byte, 0, len(fields[1])+len(fields[2])+partitionIdSize), fields[1]...), fields[2]...)
+	return binary.LittleEndian.AppendUint32(query, partition), nil
 }

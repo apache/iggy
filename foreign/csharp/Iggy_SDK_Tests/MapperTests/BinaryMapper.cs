@@ -18,6 +18,8 @@
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Encryption;
@@ -39,6 +41,36 @@ namespace Apache.Iggy.Tests.MapperTests;
 
 public sealed class BinaryMapper
 {
+    [Theory]
+    [InlineData(null)]
+    [InlineData("null")]
+    [InlineData("0")]
+    [InlineData("7")]
+    [InlineData("255")]
+    public void given_cluster_json_when_reading_replica_identity_should_require_an_explicit_id(string? replica)
+    {
+        var identity = replica is null ? "" : $",\"replica_id\":{replica}";
+        var json = """
+                   {"name":"node","ip":"127.0.0.1","endpoints":{"tcp":8090,"quic":8080,"http":3000,"web_socket":8092},
+                    "role":"leader","status":"healthy"
+                   """ + identity + "}";
+        var options = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
+        };
+        if (replica is null or "null")
+        {
+            Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<ClusterNode>(json, options));
+        }
+        else
+        {
+            var node = JsonSerializer.Deserialize<ClusterNode>(json, options);
+            Assert.NotNull(node);
+            Assert.Equal(byte.Parse(replica), node.ReplicaId);
+        }
+    }
+
     [Fact]
     public void MapPersonalAccessTokens_ReturnsValidPersonalAccessTokenResponse()
     {
@@ -86,9 +118,9 @@ public sealed class BinaryMapper
         var msgTwoFrame = BinaryFactory.CreateMessageFrame(checkSum2, guid1, 1, 5, [], payload1);
         var record = BinaryFactory.CreateBatchRecord(offset, timestamp, timestamp, msgOneFrame, msgTwoFrame);
 
-        var combinedPayload = new byte[16 + record.Length];
+        var combinedPayload = new byte[40 + record.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(combinedPayload.AsSpan(12, 4), 2);
-        record.CopyTo(combinedPayload.AsSpan(16));
+        record.CopyTo(combinedPayload.AsSpan(40));
 
         // Act
         var responses
@@ -265,6 +297,31 @@ public sealed class BinaryMapper
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
         Assert.Equal(CompressionAlgorithm.None, response.CompressionAlgorithm);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsAPartitionRecordWithItsContext()
+    {
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var context = new PartitionContext(17, 9, 52);
+        byte[] payload =
+        [
+            ..BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName, sizeBytes,
+                messagesCount, createdAt, maxTopicSize, 1),
+            ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context)
+        ];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.NotNull(response.Partitions);
+        var partition = Assert.Single(response.Partitions);
+        Assert.Equal(3u, partition.Id);
+        Assert.Equal(7u, partition.SegmentsCount);
+        Assert.Equal(101ul, partition.CurrentOffset);
+        Assert.Equal(2048ul, partition.Size);
+        Assert.Equal(102ul, partition.MessagesCount);
+        Assert.Equal(context, partition.Context);
     }
 
     [Fact]
@@ -544,11 +601,11 @@ public sealed class BinaryMapper
         var frame2 = BuildEncryptedFrame(encryptor, 1, payload2, ReadOnlySpan<byte>.Empty);
         var record = BinaryFactory.CreateBatchRecord(100, 12345, 12345, frame1, frame2);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
         BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 101);
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 2);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         using var rental = Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance,
             encryptor);
@@ -585,11 +642,11 @@ public sealed class BinaryMapper
         BinaryPrimitives.WriteInt32LittleEndian(frame.AsSpan(36, 4), -48); // payloadLength
         var record = BinaryFactory.CreateBatchRecord(1, 12345, 12345, frame);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
         BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 1);
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         Assert.Throws<MalformedResponseException>(() =>
             Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance, encryptor));
@@ -602,9 +659,9 @@ public sealed class BinaryMapper
         BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(40, 8), 1);
         var record = BinaryFactory.CreateBatchRecord(1, 12345, 12345, frame);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         Assert.Throws<MalformedResponseException>(() =>
             Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance));
@@ -619,11 +676,11 @@ public sealed class BinaryMapper
         frame[48 + 12] ^= 0xFF;
         var record = BinaryFactory.CreateBatchRecord(42, 12345, 12345, frame);
 
-        var combined = new byte[16 + record.Length];
+        var combined = new byte[40 + record.Length];
         BinaryPrimitives.WriteInt32LittleEndian(combined.AsSpan(0, 4), 7);
         BinaryPrimitives.WriteUInt64LittleEndian(combined.AsSpan(4, 8), 42);
         BinaryPrimitives.WriteUInt32LittleEndian(combined.AsSpan(12, 4), 1);
-        record.CopyTo(combined.AsSpan(16));
+        record.CopyTo(combined.AsSpan(40));
 
         var ex = Assert.Throws<MessageDecryptionException>(() =>
             Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance, encryptor));
@@ -719,6 +776,27 @@ public sealed class BinaryMapper
     }
 
     [Fact]
+    public void MapPartitionRoute_PreservesEveryFieldWithoutUsingThePositionContextLayout()
+    {
+        byte[] payload = [.. BitConverter.GetBytes(17ul), .. BitConverter.GetBytes(52ul),
+            .. BitConverter.GetBytes(7u), .. BitConverter.GetBytes(3u), 99];
+
+        var route = Mappers.BinaryMapper.MapPartitionRoute(payload);
+
+        Assert.Equal(new PartitionRoute(17, 52, 7, 3, 99), route);
+        Assert.Equal(new PartitionContext(17, 0, 52), route.Context);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(24)]
+    [InlineData(26)]
+    public void MapPartitionRoute_RejectsTruncatedAndTrailingBytes(int length)
+    {
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapPartitionRoute(new byte[length]));
+    }
+
+    [Fact]
     public void MapClusterMetadata_OversizedNodesCount_Throws()
     {
         var payload = new byte[8];
@@ -739,6 +817,8 @@ public sealed class BinaryMapper
 
         Assert.Equal("cluster", metadata.Name);
         Assert.Equal(2, metadata.Nodes.Length);
+        Assert.Equal((byte)0, metadata.Nodes[0].ReplicaId);
+        Assert.Equal((byte)1, metadata.Nodes[1].ReplicaId);
         Assert.Equal("nödé-1", metadata.Nodes[0].Name);
         Assert.Equal("10.0.0.1", metadata.Nodes[0].Ip);
         Assert.Equal(8090, metadata.Nodes[0].Endpoints.Tcp);
@@ -761,7 +841,7 @@ public sealed class BinaryMapper
     {
         var payload = CreateClusterMetadataPayload("cluster", ("node-1", "10.0.0.1", 8090, 1, 1));
         // cut inside the u32 length prefix of the node ip, right after the node name
-        var cut = 4 + "cluster".Length + 4 + 4 + "node-1".Length + 2;
+        var cut = 4 + "cluster".Length + 4 + 1 + 4 + "node-1".Length + 2;
         var truncated = payload.AsSpan(0, cut).ToArray();
 
         Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
@@ -910,8 +990,10 @@ public sealed class BinaryMapper
         var buffer = new List<byte>();
         WriteString(buffer, clusterName);
         buffer.AddRange(BitConverter.GetBytes((uint)nodes.Length));
+        byte replicaId = 0;
         foreach (var (name, ip, tcp, role, status) in nodes)
         {
+            buffer.Add(replicaId++);
             WriteString(buffer, name);
             WriteString(buffer, ip);
             buffer.AddRange(BitConverter.GetBytes(tcp));
