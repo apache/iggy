@@ -21,7 +21,9 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, PoisonError};
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::sleep;
 
 /// Bound on one name lookup made to compare two addresses.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -173,6 +175,11 @@ pub(crate) struct ConnectCoordinator {
     generation: AtomicU64,
     result: StdMutex<Option<(u64, Result<(), IggyError>)>>,
     changed: Notify,
+    /// Counts the calls to `interrupt`. The owner reads it when it starts,
+    /// so a pause can tell an interrupt of this connect from an older one.
+    interrupts: AtomicU64,
+    interrupts_at_owner_start: AtomicU64,
+    interrupted: Notify,
 }
 
 impl ConnectCoordinator {
@@ -186,6 +193,9 @@ impl ConnectCoordinator {
             generation: AtomicU64::new(0),
             result: StdMutex::new(None),
             changed: Notify::new(),
+            interrupts: AtomicU64::new(0),
+            interrupts_at_owner_start: AtomicU64::new(0),
+            interrupted: Notify::new(),
         }
     }
 
@@ -202,6 +212,33 @@ impl ConnectCoordinator {
                 return;
             }
             changed.await;
+        }
+    }
+
+    /// Ends the pauses of the connect that runs, the current one and every
+    /// later one. The connect then reaches its next check at once, and that
+    /// check finds why it must stop.
+    pub(crate) fn interrupt(&self) {
+        self.interrupts.fetch_add(1, Ordering::SeqCst);
+        self.interrupted.notify_waiters();
+    }
+
+    /// Waits for `duration`, or less if `interrupt` is called after the
+    /// connect that runs started.
+    pub(crate) async fn pause(&self, duration: Duration) {
+        let interrupted = self.interrupted.notified();
+        tokio::pin!(interrupted);
+        // Registered before the count is read: an interrupt between the two
+        // still wakes this pause.
+        interrupted.as_mut().enable();
+        if self.interrupts.load(Ordering::SeqCst)
+            != self.interrupts_at_owner_start.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        tokio::select! {
+            () = sleep(duration) => {}
+            () = interrupted => {}
         }
     }
 
@@ -244,6 +281,8 @@ impl ConnectCoordinator {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
+            self.interrupts_at_owner_start
+                .store(self.interrupts.load(Ordering::SeqCst), Ordering::SeqCst);
             let abandoned = self.abandoned.swap(false, Ordering::SeqCst);
             let token = self.next_token.fetch_add(1, Ordering::SeqCst).max(1);
             self.active_token.store(token, Ordering::SeqCst);
@@ -495,6 +534,69 @@ mod tests {
             .await
             .unwrap();
         assert!(observed_abandoned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_ends_the_pause_of_the_running_connect() {
+        let coordinator = Arc::new(ConnectCoordinator::new());
+        let started = Arc::new(Notify::new());
+        let owner = {
+            let coordinator = Arc::clone(&coordinator);
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                let pausing = Arc::clone(&coordinator);
+                coordinator
+                    .run(|_, _token| async move {
+                        started.notify_one();
+                        pausing.pause(Duration::from_secs(60)).await;
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        started.notified().await;
+
+        coordinator.interrupt();
+
+        tokio::time::timeout(Duration::from_secs(1), owner)
+            .await
+            .expect("the interrupt must end the pause")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_before_a_pause_of_the_same_connect_ends_it_at_once() {
+        let coordinator = ConnectCoordinator::new();
+
+        let connect = coordinator.run(|_, _token| async {
+            coordinator.interrupt();
+            coordinator.pause(Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), connect)
+            .await
+            .expect("an interrupt of this connect must end its later pauses")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_before_a_connect_starts_does_not_shorten_its_pauses() {
+        let coordinator = ConnectCoordinator::new();
+        coordinator.interrupt();
+
+        let connect = coordinator.run(|_, _token| async {
+            coordinator.pause(Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), connect)
+                .await
+                .is_err(),
+            "an interrupt of an earlier connect must not end this pause"
+        );
     }
 
     #[tokio::test]

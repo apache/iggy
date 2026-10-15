@@ -56,7 +56,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, trace, warn};
 
@@ -175,6 +174,13 @@ impl Client for TcpClient {
         // remembered sign-in goes with it. Involuntary drops (a dead socket,
         // a failover) go through `disconnect_transport` and keep it.
         self.forget_session_credentials().await;
+        // A sweep in flight stops at its next check. Woken from its pause
+        // and waited for, it is over before the teardown, so no dial runs
+        // during it and none outlives this call.
+        self.connect_coordinator.interrupt();
+        self.connect_coordinator
+            .wait_until_inactive(|| self.caller_disconnected())
+            .await;
         TcpClient::disconnect_transport(self).await?;
         self.reset_vsr_session().await
     }
@@ -667,7 +673,9 @@ impl TcpClient {
                     && let Some(remaining) = self.reestablish_wait().await
                 {
                     info!("Trying to connect to the server: {server_address} in: {remaining}");
-                    sleep(remaining.get_duration()).await;
+                    self.connect_coordinator
+                        .pause(remaining.get_duration())
+                        .await;
                 }
 
                 if let Some(error) = self.sweep_interrupted().await {
@@ -793,7 +801,9 @@ impl TcpClient {
                          {} endpoint(s) in: {interval_str}",
                         candidates.len(),
                     );
-                    sleep(self.config.reconnection.interval.get_duration()).await;
+                    self.connect_coordinator
+                        .pause(self.config.reconnection.interval.get_duration())
+                        .await;
                     continue;
                 }
 
@@ -1333,10 +1343,14 @@ impl TcpClient {
         // Set before the link is taken: a reconnect sweep that installs a link
         // after this point sees `Shutdown` and drops it.
         self.set_state(ClientState::Shutdown).await;
+        self.connect_coordinator.interrupt();
         let link = self.link.lock().await.take();
         if let Some(link) = link {
             link.shutdown().await;
         }
+        // The sweep that this shutdown stops can still be dialing or signing
+        // in. Once it is over, nothing installs a link after the cleanup.
+        self.connect_coordinator.wait_until_inactive(|| true).await;
         self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         self.shutdown_complete.store(true, Ordering::SeqCst);
@@ -1744,6 +1758,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinHandle;
+    use tokio::time::sleep;
 
     const SESSION_USER_ID: u32 = 7;
 
@@ -4031,5 +4047,73 @@ mod tests {
             }
         }
         assert_eq!(shutdowns, 1);
+    }
+
+    /// A client whose sweep waits a minute between two dials to an endpoint
+    /// that refuses them, with that sweep started and in its pause.
+    async fn sweep_in_a_retry_pause() -> (Arc<TcpClient>, JoinHandle<Result<(), IggyError>>) {
+        let client = Arc::new(
+            TcpClient::create(Arc::new(TcpClientConfig {
+                server_address: dead_endpoint().await,
+                reconnection: TcpClientReconnectionConfig {
+                    enabled: true,
+                    max_retries: None,
+                    interval: NonZeroIggyDuration::from_str("60s").expect("duration"),
+                    reestablish_after: IggyDuration::new(Duration::ZERO),
+                },
+                ..TcpClientConfig::default()
+            }))
+            .expect("create the client"),
+        );
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { TcpClient::connect(&client).await }
+        });
+        while client.get_state().await != ClientState::Connecting {
+            sleep(Duration::from_millis(10)).await;
+        }
+        // The first dial is refused at once.
+        sleep(Duration::from_millis(100)).await;
+        (client, sweep)
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_a_retry_pause_returns_once_the_sweep_stops() {
+        let (client, sweep) = sweep_in_a_retry_pause().await;
+
+        tokio::time::timeout(Duration::from_secs(1), Client::disconnect(&*client))
+            .await
+            .expect("the disconnect must not wait out the pause")
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(50), sweep)
+            .await
+            .expect("no sweep may run after the disconnect")
+            .unwrap();
+        assert!(
+            matches!(result, Err(IggyError::NotConnected)),
+            "got {result:?}"
+        );
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_a_retry_pause_returns_once_the_sweep_stops() {
+        let (client, sweep) = sweep_in_a_retry_pause().await;
+
+        tokio::time::timeout(Duration::from_secs(1), Client::shutdown(&*client))
+            .await
+            .expect("the shutdown must not wait out the pause")
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(50), sweep)
+            .await
+            .expect("no sweep may run after the shutdown")
+            .unwrap();
+        assert!(
+            matches!(result, Err(IggyError::ClientShutdown)),
+            "got {result:?}"
+        );
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
     }
 }
