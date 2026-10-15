@@ -104,56 +104,58 @@ final class PollRouter: Sendable {
     /// Sends a poll or an offset write on its route. `context` is the
     /// partition context the caller captured, else the route's is taken and
     /// kept for every retry.
+    ///
+    /// The budget is checked between attempts and caps each exchange instead
+    /// of cancelling one in flight, which would take the coordinator
+    /// connection, and the session's group membership, with it.
     func send(
         _ code: CommandCode, payload: [UInt8], key: RouteKey, routePayload: [UInt8], context: PartitionContext?, coordinator: ClientCore
     ) async throws -> [UInt8] {
-        let clustered = try await isClustered(coordinator)
         let clock = ContinuousClock()
         let now = clock.now
         let deadline = now + Self.pollTimeout
-        let routed: [UInt8]? = try await withDeadline(deadline) { [self] in
-            if clustered, heartbeatDue(at: now, interval: coordinator.configuration.heartbeatInterval) {
-                // The requests leave the coordinator connection idle, so it is
-                // pinged here once per heartbeat interval too.
-                _ = try await control(.ping, [], coordinator: coordinator)
-            }
-            var captured = context
-            var interval = Self.retryInterval
-            while true {
-                do {
-                    if clustered {
-                        return try await sendOnPrimary(
-                            code, payload: payload, key: key, routePayload: routePayload, context: &captured, coordinator: coordinator)
-                    }
-                    return try await sendOnCoordinator(
-                        code, payload: payload, key: key, routePayload: routePayload, context: &captured, coordinator: coordinator)
-                } catch let error as IggyError where error.code == .transientNotAccepted {
-                    removeRoute(key)
-                    guard clock.now + interval < deadline else {
-                        throw error
-                    }
-                    try await Task.sleep(for: interval)
-                    interval = min(interval * 2, Self.maxRetryInterval)
+        let clustered = try await isClustered(coordinator, deadline: deadline)
+        if clustered, heartbeatDue(at: now, interval: coordinator.configuration.heartbeatInterval) {
+            // The requests leave the coordinator connection idle, so it is
+            // pinged here once per heartbeat interval too.
+            _ = try await control(.ping, [], coordinator: coordinator, deadline: deadline)
+        }
+        let request = Request(code: code, payload: payload, key: key, routePayload: routePayload, deadline: deadline)
+        var captured = context
+        var interval = Self.retryInterval
+        while clock.now < deadline {
+            do {
+                if clustered {
+                    return try await sendOnPrimary(request, context: &captured, coordinator: coordinator)
                 }
+                return try await sendOnCoordinator(request, context: &captured, coordinator: coordinator)
+            } catch let error as IggyError where error.code == .transientNotAccepted {
+                removeRoute(key)
+                guard clock.now + interval < deadline else {
+                    throw error
+                }
+                try await Task.sleep(for: interval)
+                interval = min(interval * 2, Self.maxRetryInterval)
             }
         }
-        guard let routed else {
-            removeRoute(key)
-            throw IggyError(.transientNotCommitted, context: "command \(code.rawValue) did not complete within \(Self.pollTimeout)")
-        }
-        return routed
+        removeRoute(key)
+        throw IggyError(.transientNotCommitted, context: "command \(code.rawValue) did not complete within \(Self.pollTimeout)")
+    }
+
+    private struct Request {
+        let code: CommandCode
+        let payload: [UInt8]
+        let key: RouteKey
+        let routePayload: [UInt8]
+        let deadline: ContinuousClock.Instant
     }
 
     /// Whether the roster has more than one node, reading it once when no
     /// leader check reported it yet.
-    private func isClustered(_ coordinator: ClientCore) async throws -> Bool {
+    private func isClustered(_ coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> Bool {
         if state.withLockedValue({ $0.rosterSize }) == 0 {
-            let body: [UInt8]? = try await withDeadline(ContinuousClock.now + Self.rosterReadTimeout) { [self] in
-                try await control(.getClusterMetadata, [], coordinator: coordinator)
-            }
-            guard let body else {
-                throw IggyError(.transientNotAccepted, context: "reading the cluster roster took longer than \(Self.rosterReadTimeout)")
-            }
+            let readDeadline = min(deadline, ContinuousClock.now + Self.rosterReadTimeout)
+            let body = try await control(.getClusterMetadata, [], coordinator: coordinator, deadline: readDeadline)
             let metadata = try Responses.clusterMetadata(body[...])
             guard !metadata.nodes.isEmpty else {
                 throw IggyError(.transientNotAccepted, context: "the cluster roster is empty")
@@ -176,47 +178,44 @@ final class PollRouter: Sendable {
     /// One exchange on the coordinator connection. A connection that is gone
     /// is brought back by a ping, which reconnects, and the exchange runs
     /// once more.
-    private func control(_ code: CommandCode, _ payload: [UInt8], coordinator: ClientCore) async throws -> [UInt8] {
+    private func control(_ code: CommandCode, _ payload: [UInt8], coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> [UInt8] {
         do {
-            return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: .empty)
-        } catch let error as IggyError where error.isReconnectable {
-            _ = try await coordinator.exchange(code: CommandCode.ping.rawValue, payload: [])
-            return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: .empty)
+            return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: .empty, deadline: deadline)
+        } catch let error as IggyError where error.isReconnectable && ContinuousClock.now < deadline {
+            _ = try await coordinator.exchange(code: CommandCode.ping.rawValue, payload: [], deadline: deadline)
+            return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: .empty, deadline: deadline)
         }
     }
 
     /// The single-node path: the request goes over the coordinator connection
     /// with the context of its route.
-    private func sendOnCoordinator(
-        _ code: CommandCode, payload: [UInt8], key: RouteKey, routePayload: [UInt8], context: inout PartitionContext?, coordinator: ClientCore
-    ) async throws -> [UInt8] {
-        let route = try await route(key, routePayload: routePayload, coordinator: coordinator)
+    private func sendOnCoordinator(_ request: Request, context: inout PartitionContext?, coordinator: ClientCore) async throws -> [UInt8] {
+        let route = try await route(request.key, routePayload: request.routePayload, coordinator: coordinator, deadline: request.deadline)
         let captured = context ?? route.context
         context = captured
         do {
-            if code == .pollMessagesOnPrimary {
-                return try await coordinator.exchangeOnce(code: code.rawValue, payload: payload, context: captured)
+            if request.code == .pollMessagesOnPrimary {
+                return try await coordinator.exchangeOnce(
+                    code: request.code.rawValue, payload: request.payload, context: captured, deadline: request.deadline)
             }
-            return try await coordinator.exchange(code: code.rawValue, payload: payload, context: captured)
-        } catch {
-            removeRoute(key)
-            throw error
+            return try await coordinator.exchange(code: request.code.rawValue, payload: request.payload, context: captured, deadline: request.deadline)
+        } catch let error as IggyError {
+            removeRoute(request.key)
+            throw Self.gradedLoss(error, on: "the coordinator")
         }
     }
 
     /// The cluster path: the request goes over a data connection to the
-    /// partition primary, bound to the coordinator's session first.
-    private func sendOnPrimary(
-        _ code: CommandCode, payload: [UInt8], key: RouteKey, routePayload: [UInt8], context: inout PartitionContext?, coordinator: ClientCore
-    ) async throws -> [UInt8] {
-        let route = try await route(key, routePayload: routePayload, coordinator: coordinator)
+    /// partition primary, bound to the coordinator's session first. Every
+    /// frame is stamped under a check that the route's session is still the
+    /// client's, so nothing is written for a session that was replaced.
+    private func sendOnPrimary(_ request: Request, context: inout PartitionContext?, coordinator: ClientCore) async throws -> [UInt8] {
+        let route = try await route(request.key, routePayload: request.routePayload, coordinator: coordinator, deadline: request.deadline)
         let captured = context ?? route.context
         context = captured
-        try await validate(route, coordinator: coordinator)
         let slot = try slot(for: route)
         try await slot.lock.lock()
         defer { slot.lock.unlock() }
-        try await validate(route, coordinator: coordinator)
 
         var data = slot.connection.withLockedValue { $0 }
         if data?.usable == false {
@@ -229,7 +228,6 @@ final class PollRouter: Sendable {
             } catch let error as IggyError where error.isReconnectable {
                 throw IggyError(.transientNotAccepted, context: "cannot reach the partition primary at \(route.endpoint): \(error)")
             }
-            try await validate(route, coordinator: coordinator)
             data = DataConnection(connection: connection, consumerSession: nil, usable: true)
         }
         guard var data else {
@@ -242,17 +240,18 @@ final class PollRouter: Sendable {
 
         if data.consumerSession.map({ !Self.covers($0, route.consumerSession) }) ?? true {
             do {
-                try await bind(data.connection, to: route.consumerSession, coordinator: coordinator)
+                try await bind(data.connection, to: route.consumerSession, coordinator: coordinator, deadline: request.deadline)
             } catch let error as IggyError where error.isReconnectable {
                 throw IggyError(.transientNotAccepted, context: "binding the session on \(route.endpoint) failed: \(error)")
             }
             data.consumerSession = route.consumerSession
             slot.connection.withLockedValue { $0 = data }
         }
-        try await validate(route, coordinator: coordinator)
 
         do {
-            let body = try await exchange(on: data.connection, code: code.rawValue, payload: payload, context: captured, coordinator: coordinator)
+            let body = try await exchange(
+                on: data.connection, code: request.code.rawValue, payload: request.payload, context: captured, identity: route.consumerSession,
+                coordinator: coordinator, deadline: request.deadline)
             data.usable = true
             slot.connection.withLockedValue { $0 = data }
             return body
@@ -262,12 +261,23 @@ final class PollRouter: Sendable {
                 data.consumerSession = nil
             }
             slot.connection.withLockedValue { $0 = data }
-            removeRoute(key)
-            if error.isReconnectable {
-                // The request was written, so it may have been applied.
-                throw IggyError(.transientNotCommitted, context: "the data connection to \(route.endpoint) failed: \(error)")
+            removeRoute(request.key)
+            throw Self.gradedLoss(error, on: route.endpoint)
+        }
+    }
+
+    /// A request that lost its connection after it was written may have been
+    /// applied, so its outcome is unknown on either path. One that found no
+    /// connection or no session was not written and is routed again.
+    private static func gradedLoss(_ error: IggyError, on endpoint: String) -> IggyError {
+        switch error.code {
+        case .notConnected, .cannotEstablishConnection, .unauthenticated:
+            return IggyError(.transientNotAccepted, context: "\(endpoint) took no request: \(error)")
+        default:
+            guard error.isReconnectable else {
+                return error
             }
-            throw error
+            return IggyError(.transientNotCommitted, context: "the connection to \(endpoint) failed: \(error)")
         }
     }
 
@@ -276,11 +286,15 @@ final class PollRouter: Sendable {
         bound.clientID == wanted.clientID && bound.session == wanted.session && bound.metadataWatermark >= wanted.metadataWatermark
     }
 
-    private func bind(_ connection: any IggyConnection, to identity: Responses.SessionIdentity, coordinator: ClientCore) async throws {
+    private func bind(
+        _ connection: any IggyConnection, to identity: Responses.SessionIdentity, coordinator: ClientCore, deadline: ContinuousClock.Instant
+    ) async throws {
         let payload = try Requests.bindSession(
             clientID: identity.clientID, session: identity.session, metadataWatermark: identity.metadataWatermark,
             bindSecret: await coordinator.bindSecret)
-        let body = try await exchange(on: connection, code: CommandCode.bindSession.rawValue, payload: payload, context: .empty, coordinator: coordinator)
+        let body = try await exchange(
+            on: connection, code: CommandCode.bindSession.rawValue, payload: payload, context: .empty, identity: identity, coordinator: coordinator,
+            deadline: deadline)
         let bound = try Responses.loginRegister(body[...])
         if bound.session == 0 {
             throw IggyError(.invalidSession, context: "the server bound session 0")
@@ -291,29 +305,39 @@ final class PollRouter: Sendable {
     }
 
     /// One lockstep exchange on a data connection, stamped from the shared
-    /// session, with no replay.
+    /// session for `identity`, with no replay. `notPrimary` is graded as on
+    /// the coordinator.
     private func exchange(
-        on connection: any IggyConnection, code: UInt32, payload: [UInt8], context: PartitionContext, coordinator: ClientCore
+        on connection: any IggyConnection, code: UInt32, payload: [UInt8], context: PartitionContext, identity: Responses.SessionIdentity,
+        coordinator: ClientCore, deadline: ContinuousClock.Instant
     ) async throws -> [UInt8] {
-        let request = try await coordinator.stampRequest(code: code, payload: payload, context: context)
-        let raw = try await connection.exchange(request.bytes, timeout: coordinator.configuration.requestTimeout)
+        let timeout = min(coordinator.configuration.requestTimeout, deadline - .now)
+        guard timeout > .zero else {
+            throw IggyError(.transientNotAccepted, context: "the budget ran out before command \(code) was sent")
+        }
+        let request = try await coordinator.stampRequest(code: code, payload: payload, context: context, for: identity)
+        let raw = try await connection.exchange(request.bytes, timeout: timeout)
         let header = raw.header[...]
         if VSRFrame.peekCommand(header) == .reply, VSRFrame.readReplyRequestID(header) != request.requestID {
             await connection.close()
             throw IggyError(.disconnected, context: "the data connection answered another request")
         }
-        return Array(try VSRFrame.decodeReply(header: header, body: raw.body[...]))
+        do {
+            return Array(try VSRFrame.decodeReply(header: header, body: raw.body[...]))
+        } catch let error as IggyError {
+            throw ClientCore.graded(error)
+        }
     }
 
     /// The cached route of `key` if the session still holds it, else a new
     /// lookup on the coordinator.
-    private func route(_ key: RouteKey, routePayload: [UInt8], coordinator: ClientCore) async throws -> Route {
+    private func route(_ key: RouteKey, routePayload: [UInt8], coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> Route {
         let watermark = await coordinator.metadataWatermark
         let (fence, cached) = state.withLockedValue { ($0.fence, $0.routes[key]) }
         if let cached, cached.fence == fence, cached.consumerSession.metadataWatermark >= watermark {
             return cached
         }
-        let body = try await control(key.code, routePayload, coordinator: coordinator)
+        let body = try await control(key.code, routePayload, coordinator: coordinator, deadline: deadline)
         var response = try Responses.pollRoute(body[...])
         response.consumerSession.metadataWatermark = max(response.consumerSession.metadataWatermark, watermark)
         guard response.primary.endpoints.tcp != 0 else {

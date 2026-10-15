@@ -172,14 +172,17 @@ public struct PollingStrategy: Sendable, Hashable, CustomStringConvertible {
         self.context = context
     }
 
-    /// Resume from a specific offset.
-    public static func offset(_ offset: UInt64) -> PollingStrategy {
-        PollingStrategy(kind: .offset, value: offset)
+    /// Resume from a specific offset. Pass the ``PolledMessages/context`` of
+    /// the poll the offset came from to have the poll refused once the
+    /// partition was recreated.
+    public static func offset(_ offset: UInt64, context: PartitionContext? = nil) -> PollingStrategy {
+        PollingStrategy(kind: .offset, value: offset, context: context)
     }
 
-    /// Resume from the first message at or after a timestamp.
-    public static func timestamp(_ timestamp: IggyTimestamp) -> PollingStrategy {
-        PollingStrategy(kind: .timestamp, value: timestamp.microseconds)
+    /// Resume from the first message at or after a timestamp, under
+    /// `context` as for ``offset(_:context:)``.
+    public static func timestamp(_ timestamp: IggyTimestamp, context: PartitionContext? = nil) -> PollingStrategy {
+        PollingStrategy(kind: .timestamp, value: timestamp.microseconds, context: context)
     }
 
     /// Start from the beginning of the partition.

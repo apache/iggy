@@ -269,6 +269,18 @@ final class FakeVSRServer: @unchecked Sendable {
     /// The partition context the default script routes every partition to.
     static let routeContext = PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10)
 
+    /// The answer to a register and to a resume: the session is bound, as on
+    /// a node that holds it. Nil for any other request.
+    static func sessionReply(_ request: Request) -> Reply? {
+        if request.operation == .register {
+            return .ok(registerBody())
+        }
+        if request.code == CommandCode.bindSession.rawValue {
+            return .ok(registerBody(session: request.session))
+        }
+        return nil
+    }
+
     /// Answers every request successfully with an empty body, a bound
     /// session for a register and a bind, a single-node roster for the
     /// metadata read, routes to this server under ``routeContext``, and an

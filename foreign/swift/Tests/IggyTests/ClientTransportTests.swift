@@ -169,7 +169,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let counter = Locked(0)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.operation == .deleteStream {
                 let seen = counter.withLock {
                     $0 += 1; return $0
@@ -194,7 +194,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let counter = Locked(0)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.operation == .nonReplicated, request.code == CommandCode.getClusterMetadata.rawValue {
                 return .ok(FakeVSRServer.rosterBody([server.address]))
             }
@@ -225,7 +225,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let applied = Locked<UInt64>(0)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.operation == .nonReplicated, request.code == CommandCode.getClusterMetadata.rawValue {
                 return .ok(FakeVSRServer.rosterBody([server.address]))
             }
@@ -272,7 +272,7 @@ struct ClientTransportTests {
         let addresses = [first.address, second.address]
         let viewChanged = Locked(false)
         await first.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getClusterMetadata.rawValue {
                 return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: viewChanged.withLock { $0 } ? 1 : 0))
             }
@@ -281,7 +281,7 @@ struct ClientTransportTests {
             return .status(IggyErrorCode.notPrimary.rawValue)
         }
         await second.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody(addresses, leaderIndex: 1)) }
             return .ok([])
         }
@@ -302,7 +302,7 @@ struct ClientTransportTests {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody([server.address])) }
             return request.operation == .deleteStream ? .status(IggyErrorCode.notPrimary.rawValue) : .ok([])
         }
@@ -341,7 +341,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let stallOnce = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.operation == .nonReplicated, request.code == CommandCode.getStats.rawValue,
                 stallOnce.withLock({
                     let stall = $0; $0 = false; return stall
@@ -362,7 +362,9 @@ struct ClientTransportTests {
         #expect(await server.connectionCount == 1)
         try await client.ping()
         #expect(await server.connectionCount == 2)
-        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        // The new connection resumes the session instead of registering one.
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
         #expect(await client.state == .authenticated)
         await client.shutdown()
     }
@@ -376,7 +378,9 @@ struct ClientTransportTests {
         await server.stop()
         let clock = ContinuousClock()
         let elapsed = await clock.measure {
-            await expectCode(.disconnected) { try await client.ping() }
+            // The server closed the connection first, so the ping was never
+            // written.
+            await expectCode(.notConnected) { try await client.ping() }
         }
         #expect(elapsed >= .milliseconds(450) && elapsed < .seconds(10))
         // No caller waits for the sweep any more, so it ends too.
@@ -400,7 +404,7 @@ struct ClientTransportTests {
         let roster = FakeVSRServer.rosterBody([first.address, second.address], leaderIndex: 0)
         let seen = Locked(0)
         await first.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(roster) }
             guard request.operation == .createStream else { return .ok([]) }
             let count = seen.withLock {
@@ -409,7 +413,7 @@ struct ClientTransportTests {
             return .status((count == 1 ? IggyErrorCode.transientNotCommitted : .transientNotAccepted).rawValue)
         }
         await second.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(roster) }
             return .ok([])
         }
@@ -429,7 +433,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.ping.rawValue,
                 once.withLock({
                     let first = $0; $0 = false; return first
@@ -452,7 +456,8 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.operation == .deleteStream,
                 once.withLock({
                     let first = $0; $0 = false; return first
@@ -464,8 +469,9 @@ struct ClientTransportTests {
         }
         let client = makeClient(server)
         try await client.connect()
-        // An unauthenticated eviction means the request never reached the
-        // log, so the delete is replayed under the new session.
+        // The evicted session cannot be resumed. An unauthenticated eviction
+        // means the request never reached the log, so the delete is replayed
+        // under the new session.
         try await client.deleteStream(1)
         let ops = await operations(server)
         #expect(ops.filter { $0 == .register }.count == 2)
@@ -479,7 +485,8 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.ping.rawValue,
                 once.withLock({
                     let first = $0; $0 = false; return first
@@ -508,28 +515,53 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
-    @Test func replicatedRequestIsNotReplayedAfterAConnectionDrop() async throws {
+    /// A resumed session keeps the client table entry, so a replicated write
+    /// lost with its connection goes again under its own request id, and the
+    /// server answers it from its reply cache if it committed.
+    @Test func replicatedRequestIsReplayedUnderTheResumedSession() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
-            if request.operation == .createStream,
-                once.withLock({
-                    let first = $0; $0 = false; return first
-                })
-            {
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .deleteStream, once.exchange(false) {
                 return .close
             }
             return .ok([])
         }
         let client = makeClient(server)
         try await client.connect()
-        // The outcome is unknown: the client reconnects for later requests
-        // but reports the write as possibly committed instead of applying it
-        // twice, so it is not mistaken for a request that was never sent.
+        try await client.deleteStream(1)
+        let writes = await server.requests.filter { $0.operation == .deleteStream }
+        #expect(writes.count == 2)
+        #expect(Set(writes.map(\.requestID)).count == 1)
+        #expect(Set(writes.map(\.clientID)).count == 1)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
+        await client.shutdown()
+    }
+
+    @Test func replicatedRequestIsNotReplayedUnderANewSession() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let once = Locked(true)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .createStream, once.exchange(false) {
+                return .close
+            }
+            return .ok([])
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        // The server no longer holds the session, so the client signs in
+        // under a new one. The outcome is unknown: the client reports the
+        // write as possibly committed instead of applying it twice, so it is
+        // not mistaken for a request that was never sent.
         await expectCode(.transientNotCommitted) { _ = try await client.createStream(name: "x") }
         #expect(await operations(server).filter { $0 == .createStream }.count == 1)
+        #expect(await operations(server).filter { $0 == .register }.count == 2)
         #expect(await client.state == .authenticated)
         #expect(await server.connectionCount == 2)
         try await client.ping()
@@ -569,7 +601,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getStats.rawValue,
                 once.withLock({
                     let first = $0; $0 = false; return first
@@ -630,6 +662,23 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// An explicit disconnect ends the session, so the next connect signs in
+    /// under a new one instead of resuming it.
+    @Test func anExplicitDisconnectIsNotResumed() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        try await client.connect()
+        await client.disconnect()
+        try await client.connect()
+        try await client.ping()
+        let registers = await server.requests.filter { $0.operation == .register }
+        #expect(registers.count == 2)
+        #expect(Set(registers.map(\.clientID)).count == 2)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.isEmpty)
+        await client.shutdown()
+    }
+
     @Test func serverInitiatedCloseIsRepairedByTheNextRequest() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
@@ -640,7 +689,8 @@ struct ClientTransportTests {
         try await Task.sleep(for: .milliseconds(20))
         try await client.ping()
         #expect(await server.connectionCount == 2)
-        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
         await client.shutdown()
         var seen: [DiagnosticEvent] = []
         for await event in events {
@@ -674,9 +724,19 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// A server that lost every session, as after a restart, so a reconnect
+    /// signs in again instead of resuming.
+    private static func forgetSessions(on server: FakeVSRServer) async {
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+    }
+
     @Test func passwordChangeUpdatesTheReconnectCredentials() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
         try await client.changePassword("iggy", currentPassword: "iggy", newPassword: "new-secret")
@@ -698,6 +758,7 @@ struct ClientTransportTests {
     @Test func userRenameUpdatesTheReconnectCredentials() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
+        await Self.forgetSessions(on: server)
         let client = makeClient(server)
         try await client.connect()
         try await client.updateUser("iggy", username: "renamed")
@@ -746,7 +807,7 @@ struct ClientTransportTests {
         let roster = FakeVSRServer.rosterBody([follower.address, leader.address], leaderIndex: 1)
         for server in [leader, follower] {
             await server.respond { request in
-                if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+                if let reply = FakeVSRServer.sessionReply(request) { return reply }
                 if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(roster) }
                 return .ok([])
             }
@@ -769,14 +830,14 @@ struct ClientTransportTests {
 
     /// An outage longer than the request timeout leaves the client
     /// disconnected. Once the server is back the next typed call reconnects and
-    /// signs in again, with no ``IggyClient/connect()`` of its own.
+    /// resumes the session, with no ``IggyClient/connect()`` of its own.
     @Test func typedCallReconnectsAfterAnOutage() async throws {
         let server = try await FakeVSRServer.started()
         let port = try Endpoint(parsing: server.address).port
         let client = makeClient(server, requestTimeout: shortTimeout)
         try await client.connect()
         await server.stop()
-        await expectCode(.disconnected) { try await client.ping() }
+        await expectCode(.notConnected) { try await client.ping() }
         #expect(await eventually { await client.state == .disconnected })
 
         let revived = FakeVSRServer()
@@ -784,7 +845,7 @@ struct ClientTransportTests {
         defer { Task { await revived.stop() } }
         #expect(try await client.getStreams().isEmpty)
         #expect(await client.state == .authenticated)
-        #expect(await operations(revived).filter { $0 == .register }.count == 1)
+        #expect(await codes(revived).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
         await client.shutdown()
     }
 
@@ -803,7 +864,7 @@ struct ClientTransportTests {
         defer { Task { await revived.stop() } }
         #expect(await eventually { await pingCount(revived) >= 1 })
         #expect(await client.state == .authenticated)
-        #expect(await operations(revived).filter { $0 == .register }.count == 1)
+        #expect(await codes(revived).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
         await client.shutdown()
     }
 
@@ -813,7 +874,7 @@ struct ClientTransportTests {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.ping.rawValue {
                 try? await Task.sleep(for: .milliseconds(300))
             }
@@ -850,7 +911,7 @@ struct ClientTransportTests {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             try? await Task.sleep(for: .milliseconds(2))
             return .ok([])
         }
@@ -882,7 +943,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             guard request.code == CommandCode.getStats.rawValue else { return .ok([]) }
             let first = once.withLock {
                 let first = $0; $0 = false; return first
@@ -903,7 +964,8 @@ struct ClientTransportTests {
             try await group.waitForAll()
         }
         #expect(await server.connectionCount == 2)
-        #expect(await operations(server).filter { $0 == .register }.count == 2)
+        #expect(await operations(server).filter { $0 == .register }.count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
         await client.shutdown()
     }
 
@@ -916,7 +978,7 @@ struct ClientTransportTests {
         let seen = Locked(0)
         let refuseUntil = Locked<ContinuousClock.Instant?>(nil)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             if request.code == CommandCode.getClusterMetadata.rawValue { return .ok(FakeVSRServer.rosterBody([server.address])) }
             guard request.code == CommandCode.getStats.rawValue else { return .ok([]) }
             let count = seen.withLock {
@@ -948,7 +1010,7 @@ struct ClientTransportTests {
         defer { Task { await server.stop() } }
         let once = Locked(true)
         await server.respond { request in
-            if request.operation == .register { return .ok(FakeVSRServer.registerBody()) }
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
             guard request.code == CommandCode.getStats.rawValue else { return .ok([]) }
             let first = once.withLock {
                 let first = $0; $0 = false; return first

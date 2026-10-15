@@ -323,6 +323,7 @@ struct PartitioningTests {
     /// dumped from `core/common`, so the golden lane catches drift.
     @Test func noAssignedPartitionMatchesTheServerConstant() {
         #expect(PolledMessages.noAssignedPartition == GoldenFixture.shared.noAssignedPartition)
+        #expect(PolledMessages.resyncRequiredPartition == GoldenFixture.shared.resyncRequiredPartition)
         #expect(GoldenFixture.shared.resyncRequiredPartition != GoldenFixture.shared.noAssignedPartition)
     }
 

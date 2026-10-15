@@ -49,6 +49,13 @@ private func polledPartition(_ request: FakeVSRServer.Request) -> UInt32 {
 
 private let otherContext = PartitionContext(incarnation: 8, ownerGeneration: 4, metadataOp: 30)
 
+private func contains(_ payload: [UInt8], _ id: MessageID) -> Bool {
+    var writer = ByteWriter()
+    writer.write(id)
+    let needle = writer.bytes
+    return payload.indices.contains { payload[$0...].starts(with: needle) }
+}
+
 @Suite("Messaging", .serialized)
 struct MessagingTests {
     // MARK: Sends
@@ -57,8 +64,8 @@ struct MessagingTests {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let client = try await connectedClient(server)
-        try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
-        try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["b"])
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["b"])
         let routes = await requests(server, .getPartitionRoute)
         #expect(routes.count == 1)
         #expect(routes.first?.payload == (try Requests.partitionRoute(streamID: 1, topicID: 2, partitionID: 1)))
@@ -66,6 +73,25 @@ struct MessagingTests {
         #expect(sends.count == 2)
         // A route names no consumer, so the send carries owner 0.
         #expect(sends.allSatisfy { $0.context == FakeVSRServer.routeContext })
+        await client.shutdown()
+    }
+
+    @Test func mintedIdsAreWrittenBackAndSentAgainUnchanged() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = try await connectedClient(server)
+        let chosen = MessageID(low: 9, high: 0)
+        var batch: [IggyMessage] = ["minted", try IggyMessage("chosen", id: chosen)]
+        try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .partition(1), messages: &batch)
+        let minted = batch[0].id
+        #expect(!minted.isZero)
+        #expect(batch[1].id == chosen)
+        // A retry of the same batch carries the same ids.
+        try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .partition(1), messages: &batch)
+        #expect(batch[0].id == minted)
+        let sends = await requests(server, .sendMessages)
+        #expect(sends.count == 2)
+        #expect(sends.allSatisfy { contains($0.payload, minted) && contains($0.payload, chosen) })
         await client.shutdown()
     }
 
@@ -91,7 +117,7 @@ struct MessagingTests {
             }
         }
         let client = try await connectedClient(server)
-        try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .partition(0), messages: ["a"])
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(0), messages: ["a"])
         let sends = await requests(server, .sendMessages)
         #expect(sends.map(\.context) == [FakeVSRServer.routeContext, PartitionContext(incarnation: 8, ownerGeneration: 0, metadataOp: 30)])
         #expect(sends[0].requestID != sends[1].requestID)
@@ -99,7 +125,7 @@ struct MessagingTests {
         // A second refusal in a row ends the send.
         refusals.withLock { $0 = 2 }
         await expectCode(.historyUnavailable) {
-            try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .partition(0), messages: ["b"])
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(0), messages: ["b"])
         }
         #expect(await requests(server, .sendMessages).count == 4)
         #expect(routes.withLock { $0 } == 3)
@@ -118,7 +144,7 @@ struct MessagingTests {
         }
         let client = try await connectedClient(server)
         for text in ["a", "b", "c", "d"] {
-            try await client.sendMessages(streamID: 1, topicID: 2, messages: [IggyMessage(stringLiteral: text)])
+            try await client.sendBatch(streamID: 1, topicID: 2, messages: [IggyMessage(stringLiteral: text)])
         }
         let sends = await requests(server, .sendMessages)
         #expect(sends.map(sentPartition) == [0, 1, 2, 0])
@@ -127,12 +153,12 @@ struct MessagingTests {
         #expect(await requests(server, .getTopic).count == 1)
         #expect(await requests(server, .getPartitionRoute).isEmpty)
 
-        try await client.sendMessages(streamID: 1, topicID: 2, partitioning: .messagesKey("user-1"), messages: ["e"])
+        try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .messagesKey("user-1"), messages: ["e"])
         #expect(await requests(server, .sendMessages).last.map(sentPartition) == XXH32.hash(Array("user-1".utf8)) % 3)
 
         // A deleted topic can come back with other partitions.
         try await client.deleteTopic(streamID: 1, topicID: 9)
-        try await client.sendMessages(streamID: 1, topicID: 2, messages: ["f"])
+        try await client.sendBatch(streamID: 1, topicID: 2, messages: ["f"])
         #expect(await requests(server, .getTopic).count == 2)
         await client.shutdown()
     }
@@ -141,7 +167,7 @@ struct MessagingTests {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let client = try await connectedClient(server)
-        await expectCode(.topicIdNotFound) { try await client.sendMessages(streamID: 1, topicID: 2, messages: ["a"]) }
+        await expectCode(.topicIdNotFound) { try await client.sendBatch(streamID: 1, topicID: 2, messages: ["a"]) }
         #expect(await requests(server, .sendMessages).isEmpty)
         await client.shutdown()
     }
@@ -155,7 +181,7 @@ struct MessagingTests {
         let polled = try await client.pollMessages(
             streamID: 1, topicID: 2, partitionID: 1, consumer: .consumer(5), strategy: .next, count: 10, autoCommit: true)
         #expect(polled.context == FakeVSRServer.routeContext)
-        let continued = PollingStrategy(kind: .offset, value: 3, context: otherContext)
+        let continued = PollingStrategy.offset(3, context: otherContext)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, consumer: .consumer(5), strategy: continued, count: 10, autoCommit: true)
 
         let lookups = await requests(server, .getPollRouting)
@@ -187,6 +213,25 @@ struct MessagingTests {
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
         #expect(await requests(server, .getPollRouting).count == 2)
         #expect(await requests(server, .pollMessagesOnPrimary).count == 2)
+        await client.shutdown()
+    }
+
+    /// The poll may have been applied, with auto-commit, before the
+    /// connection went: its outcome is unknown, as on a data connection.
+    @Test func aSingleNodePollLostAfterItWasWrittenIsAnUnknownOutcome() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let dropped = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.pollMessagesOnPrimary.rawValue, !dropped.exchange(true) {
+                return .close
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await connectedClient(server)
+        let poll = { _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: true) }
+        await expectCode(.transientNotCommitted) { try await poll() }
+        try await poll()
         await client.shutdown()
     }
 
@@ -232,6 +277,104 @@ struct MessagingTests {
         let lookups = await requests(server, .getPollRouting)
         #expect(lookups.count == 2)
         #expect(lookups[0].clientID != lookups[1].clientID)
+        await client.shutdown()
+    }
+
+    // MARK: Sessions
+
+    /// A lost connection resumes the session, so the member keeps polling
+    /// without joining again.
+    @Test func aReconnectResumesTheSessionAndKeepsTheMembership() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if request.code == CommandCode.syncConsumerGroup.rawValue {
+                return .ok(FakeVSRServer.assignmentBody(generation: 1, partitions: [0]))
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await connectedClient(server)
+        let poll = {
+            try await client.pollMessages(streamID: 1, topicID: 2, partitionID: nil, consumer: .group(3), strategy: .next, count: 1, autoCommit: true)
+        }
+        _ = try await poll()
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        _ = try await poll()
+        #expect(client.core.groupState.isRegistered(.init(stream: 1, topic: 2, group: 3)))
+        #expect(await server.connectionCount == 2)
+        #expect(await server.requests.filter { $0.operation == .register }.count == 1)
+        let binds = await requests(server, .bindSession)
+        #expect(binds.count == 1)
+        let polls = await requests(server, .pollMessagesOnPrimary)
+        #expect(polls.count == 2)
+        #expect(Set(polls.map(\.clientID)).count == 1)
+        #expect(polls.allSatisfy { $0.clientID == binds[0].clientID })
+        await client.shutdown()
+    }
+
+    /// When the server no longer holds the session the client signs in under
+    /// a new one, which is not a member until the caller joins again.
+    @Test func aSessionTheServerLostEndsTheMembership() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let member = Locked<UInt128Value?>(nil)
+        await server.respond { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .bindSession:
+                return .status(IggyErrorCode.unauthenticated.rawValue)
+            case .syncConsumerGroup:
+                let joined = member.withLock { joined in
+                    if joined == nil { joined = request.clientID }
+                    return joined == request.clientID
+                }
+                return .ok(joined ? FakeVSRServer.assignmentBody(generation: 1, partitions: [0]) : [])
+            default:
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+        }
+        let client = try await connectedClient(server)
+        let poll = {
+            try await client.pollMessages(streamID: 1, topicID: 2, partitionID: nil, consumer: .group(3), strategy: .next, count: 1, autoCommit: true)
+        }
+        _ = try await poll()
+        await server.closeAllConnections()
+        try await Task.sleep(for: .milliseconds(20))
+        try await client.ping()
+        #expect(await server.requests.filter { $0.operation == .register }.count == 2)
+        #expect(!client.core.groupState.isRegistered(.init(stream: 1, topic: 2, group: 3)))
+        await expectCode(.consumerGroupMemberNotFound) { _ = try await poll() }
+        await client.shutdown()
+    }
+
+    /// A data-connection frame is stamped only for the session its route was
+    /// read under, and only while no newer metadata commit was seen: anything
+    /// else is refused before it is written.
+    @Test func dataConnectionFramesAreStampedOnlyForTheLiveSession() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if request.operation == .deleteStream {
+                return .committed([], commit: 5)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await connectedClient(server)
+        try await client.ping()
+        let live = await server.requests.last!
+        let stamp = { (watermark: UInt64) in
+            _ = try await client.core.stampRequest(
+                code: CommandCode.ping.rawValue, payload: [], context: .empty,
+                for: Responses.SessionIdentity(clientID: live.clientID, session: live.session, metadataWatermark: watermark))
+        }
+        try await stamp(0)
+        try await client.deleteStream(1)
+        await expectCode(.transientNotAccepted) { try await stamp(4) }
+        try await stamp(5)
+        try await client.logout()
+        await expectCode(.transientNotAccepted) { try await stamp(5) }
+        _ = try await client.login(username: "iggy", password: "iggy")
+        await expectCode(.transientNotAccepted) { try await stamp(5) }
         await client.shutdown()
     }
 
@@ -337,7 +480,7 @@ struct MessagingTests {
         // A continuation of the lost partition cannot move to another one.
         syncs.withLock { $0 = 0 }
         client.core.groupState.invalidateAssignment(.init(stream: 1, topic: 2, group: 3))
-        let continued = PollingStrategy(kind: .offset, value: 4, context: otherContext)
+        let continued = PollingStrategy.offset(4, context: otherContext)
         await expectCode(.consumerGroupPartitionNotOwned) {
             _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: nil, consumer: .group(3), strategy: continued, count: 1, autoCommit: true)
         }
@@ -421,7 +564,30 @@ struct MessagingTests {
         }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.pollMessages.rawValue, payload: Array(poll.dropLast())) }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.storeConsumerOffset.rawValue, payload: [1, 9]) }
+        await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.bindSession.rawValue, payload: []) }
         #expect(await server.requests.count == before)
+        await client.shutdown()
+    }
+
+    /// The routing protocol goes once on the current connection, as the Rust
+    /// client sends it: a replay after a reconnect would run under another
+    /// connection's binding.
+    @Test func rawRoutingRequestsAreSentOnce() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let dropped = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.getPollRouting.rawValue, !dropped.exchange(true) {
+                return .close
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await connectedClient(server)
+        let poll = try Requests.pollMessages(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1, strategy: .first, count: 1, autoCommit: false)
+        await expectCode(.disconnected) { _ = try await client.sendRawRequest(code: CommandCode.getPollRouting.rawValue, payload: poll) }
+        #expect(await requests(server, .getPollRouting).count == 1)
+        let body = try await client.sendRawRequest(code: CommandCode.getPollRouting.rawValue, payload: poll)
+        #expect(try Responses.pollRoute(body[...]).context == FakeVSRServer.routeContext)
         await client.shutdown()
     }
 
@@ -498,6 +664,33 @@ struct MessagingTests {
         // The next poll dials the primary again and binds the new connection.
         #expect(await primary.connectionCount == 2)
         #expect(await requests(primary, .bindSession).count == 2)
+        await client.shutdown()
+    }
+
+    /// A backup answers "not primary" after a view change. The poll was never
+    /// admitted, so it is routed again instead of failing.
+    @Test func aPrimaryThatIsNoLongerPrimaryIsRoutedAgain() async throws {
+        let primary = try await FakeVSRServer.started()
+        let coordinator = try await Self.coordinator(routingTo: primary)
+        defer {
+            Task {
+                await coordinator.stop()
+                await primary.stop()
+            }
+        }
+        let refused = Locked(false)
+        await primary.respond { request in
+            if request.code == CommandCode.pollMessagesOnPrimary.rawValue, !refused.exchange(true) {
+                return .status(IggyErrorCode.notPrimary.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: primary.address)
+        }
+        let client = try await connectedClient(coordinator)
+        _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+        #expect(await requests(coordinator, .getPollRouting).count == 2)
+        #expect(await requests(primary, .pollMessagesOnPrimary).count == 2)
+        // The refusal left the data connection at a frame boundary.
+        #expect(await primary.connectionCount == 1)
         await client.shutdown()
     }
 

@@ -185,3 +185,64 @@ runs:
       with:
         pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
         log-file: ${{ steps.iggy-tls.outputs.log_file }}
+
+    # Both replicas of the roster in `core/server/config.toml`: a two-replica
+    # cluster commits on two acks, so a lone node would commit nothing. The
+    # suite then runs the cluster paths for real: sign-in through the
+    # roster, data connections to partition primaries bound with
+    # BindSession, and the session they share.
+    - name: Start Iggy VSR cluster node 0
+      id: iggy-cluster-0
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
+        replica-id: "0"
+        pid-file: ${{ runner.temp }}/iggy-swift-cluster-0.pid
+        log-file: ${{ runner.temp }}/iggy-swift-cluster-0.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_PATH: ${{ runner.temp }}/iggy-swift-cluster-0-data
+
+    - name: Start Iggy VSR cluster node 1
+      id: iggy-cluster-1
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
+        replica-id: "1"
+        tcp_address: 127.0.0.1:8091
+        http_address: 127.0.0.1:3001
+        pid-file: ${{ runner.temp }}/iggy-swift-cluster-1.pid
+        log-file: ${{ runner.temp }}/iggy-swift-cluster-1.log
+        wait-timeout-seconds: "90"
+      env:
+        IGGY_CLUSTER_ENABLED: "true"
+        IGGY_PATH: ${{ runner.temp }}/iggy-swift-cluster-1-data
+
+    - name: Run cluster e2e tests
+      shell: bash
+      if: inputs.task == 'e2e'
+      env:
+        IGGY_TCP_ADDRESS: 127.0.0.1:8090
+        IGGY_ROOT_USERNAME: iggy
+        IGGY_ROOT_PASSWORD: iggy
+      run: |
+        echo "🗳️ Running Swift e2e tests against a two-node cluster..."
+        cd foreign/swift
+        swift test --skip-build --filter IggyE2ETests
+
+    - name: Stop Iggy VSR cluster node 1
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-1.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-1.outputs.log_file }}
+
+    - name: Stop Iggy VSR cluster node 0
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-cluster-0.outputs.pid_file }}
+        log-file: ${{ steps.iggy-cluster-0.outputs.log_file }}

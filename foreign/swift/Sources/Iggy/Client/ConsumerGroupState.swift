@@ -42,13 +42,13 @@ final class ConsumerGroupState: Sendable {
     private struct Assignment {
         var partitions: [UInt32] = []
         var generation: UInt64 = 0
-        var cursor = 0
+        var cursor: UInt = 0
     }
 
     private struct TopicPartitions {
         var count: UInt32?
         var contexts: [UInt32: PartitionContext] = [:]
-        var cursor = 0
+        var cursor: UInt = 0
     }
 
     private struct Storage {
@@ -57,6 +57,9 @@ final class ConsumerGroupState: Sendable {
         /// The groups the last sync found this client a member of, so the
         /// heartbeat can sync them again.
         var joinedGroups: Set<GroupKey> = []
+        /// Moves on with every session that ends, so a sync answered under a
+        /// replaced session is told apart.
+        var sessionScope: UInt64 = 0
     }
 
     private let storage = NIOLockedValueBox(Storage())
@@ -68,17 +71,37 @@ final class ConsumerGroupState: Sendable {
         storage.withLockedValue { $0.assignments[key].map { !$0.partitions.isEmpty } ?? false }
     }
 
-    /// Replaces the group's assignment. A new generation, a rebalance,
-    /// restarts the round-robin.
-    func setAssignment(_ key: GroupKey, generation: UInt64, partitions: [UInt32]) {
+    /// The session scope a sync reads before it is sent and hands to
+    /// ``applySync(_:member:scope:)``.
+    var sessionScope: UInt64 {
+        storage.withLockedValue { $0.sessionScope }
+    }
+
+    /// Records what a sync read under `scope` found: the member's assignment,
+    /// or nil for a client that is not a member. A new generation, a
+    /// rebalance, restarts the round-robin. A reply of a session that ended
+    /// since is dropped, so it cannot repopulate the session that replaced
+    /// it. Reports whether the reply was applied.
+    @discardableResult
+    func applySync(_ key: GroupKey, member: (generation: UInt64, partitions: [UInt32])?, scope: UInt64) -> Bool {
         storage.withLockedValue { storage in
+            guard storage.sessionScope == scope else {
+                return false
+            }
+            guard let member else {
+                storage.assignments.removeValue(forKey: key)
+                storage.joinedGroups.remove(key)
+                return true
+            }
+            storage.joinedGroups.insert(key)
             var assignment = storage.assignments[key] ?? Assignment()
-            if assignment.generation != generation {
+            if assignment.generation != member.generation {
                 assignment.cursor = 0
             }
-            assignment.generation = generation
-            assignment.partitions = partitions
+            assignment.generation = member.generation
+            assignment.partitions = member.partitions
             storage.assignments[key] = assignment
+            return true
         }
     }
 
@@ -93,7 +116,7 @@ final class ConsumerGroupState: Sendable {
             guard var assignment = storage.assignments[key], !assignment.partitions.isEmpty else {
                 return nil
             }
-            let partition = assignment.partitions[assignment.cursor % assignment.partitions.count]
+            let partition = assignment.partitions[Int(assignment.cursor % UInt(assignment.partitions.count))]
             assignment.cursor &+= 1
             storage.assignments[key] = assignment
             return partition
@@ -102,13 +125,7 @@ final class ConsumerGroupState: Sendable {
 
     // MARK: Membership
 
-    /// Records a group the client is a member of, so the heartbeat syncs it.
-    func registerGroup(_ key: GroupKey) {
-        _ = storage.withLockedValue { $0.joinedGroups.insert(key) }
-    }
-
-    /// Forgets a group after leaving it, or after a sync found the client no
-    /// longer a member.
+    /// Forgets a group after leaving it.
     func deregisterGroup(_ key: GroupKey) {
         _ = storage.withLockedValue { $0.joinedGroups.remove(key) }
     }
@@ -132,7 +149,7 @@ final class ConsumerGroupState: Sendable {
         }
         return storage.withLockedValue { storage in
             var topic = storage.topics[key] ?? TopicPartitions()
-            let partition = UInt32(topic.cursor % Int(partitionCount))
+            let partition = UInt32(topic.cursor % UInt(partitionCount))
             topic.cursor &+= 1
             storage.topics[key] = topic
             return partition
@@ -200,6 +217,7 @@ final class ConsumerGroupState: Sendable {
         storage.withLockedValue { storage in
             storage.assignments.removeAll()
             storage.joinedGroups.removeAll()
+            storage.sessionScope &+= 1
         }
     }
 }

@@ -27,16 +27,15 @@ extension IggyClient {
     /// The server routes explicit partitions only, so `balanced` and
     /// `messagesKey` partitioning are resolved on the client: balanced
     /// round-robins over the topic's partitions, a key is hashed with XXH32.
-    /// A zero message id is replaced with a random one for this send only;
-    /// `messages` is not changed. A caller that retries a failed send and
-    /// wants each attempt to carry the same ids sets them first, for example
-    /// with ``UInt128Value/random()``.
+    /// A zero message id is replaced with a random one and written back into
+    /// `messages`, as the Rust client does, so a send retried after
+    /// ``IggyErrorCode/transientNotCommitted`` carries the same ids.
     ///
     /// The returned confirmations may be empty: the server can commit a batch
     /// it has no offsets to describe.
     @discardableResult
     public func sendMessages(
-        streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: [IggyMessage]
+        streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: inout [IggyMessage]
     ) async throws -> SendMessagesResponse {
         try await requireAuthenticated()
         // Checked before a balanced or keyed send reads the topic.
@@ -47,10 +46,12 @@ extension IggyClient {
         // length is checked first.
         try partitioning.validate()
         let partitionID = try await resolvePartition(partitioning, streamID: streamID, topicID: topicID)
+        for index in messages.indices where messages[index].id.isZero {
+            messages[index].id = .random()
+        }
         let outgoing = messages.map { message in
             Batch.OutgoingMessage(
-                id: message.id.isZero ? .random() : message.id, originTimestamp: message.originTimestamp.microseconds, payload: message.payload,
-                userHeaders: message.rawUserHeaders)
+                id: message.id, originTimestamp: message.originTimestamp.microseconds, payload: message.payload, userHeaders: message.rawUserHeaders)
         }
         let payload = try Batch.encodeSend(streamID: streamID, topicID: topicID, partitioning: .partition(partitionID), messages: outgoing)
         let body = try await sendWithPartitionContext(streamID: streamID, topicID: topicID, partitionID: partitionID, payload: payload)
@@ -173,23 +174,23 @@ extension IggyClient {
     // MARK: Consumer-group polling
 
     /// Syncs the member's assignment from the coordinator into the cache. An
-    /// empty reply means the client is not a member.
+    /// empty reply means the client is not a member. A reply that arrives
+    /// after the session was replaced is dropped.
     func syncGroupAssignment(streamID: Identifier, topicID: Identifier, groupID: Identifier) async throws {
+        let state = core.groupState
+        let scope = state.sessionScope
         let body = try await send(.syncConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID))
         let key = ConsumerGroupState.GroupKey(stream: streamID, topic: topicID, group: groupID)
-        let state = core.groupState
         if body.isEmpty {
             // The coordinator answers any member, even one holding no
             // partitions, with an assignment, so this observes a removal: a
             // deleted group or an evicted member. Without the deregister every
             // later poll would come back empty instead of telling the caller.
-            state.invalidateAssignment(key)
-            state.deregisterGroup(key)
+            state.applySync(key, member: nil, scope: scope)
             return
         }
         let assignment = try Responses.consumerGroupAssignment(body[...])
-        state.registerGroup(key)
-        state.setAssignment(key, generation: assignment.generation, partitions: assignment.partitions)
+        state.applySync(key, member: (assignment.generation, assignment.partitions), scope: scope)
     }
 
     /// Syncs every joined group, so a member picks up a widened assignment
@@ -330,6 +331,12 @@ extension IggyClient {
             let command: CommandCode = code == CommandCode.storeConsumerOffset.rawValue ? .storeConsumerOffset : .deleteConsumerOffset
             let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: prefix[...])
             return try await core.pollRouter.send(command, payload: payload, key: key, routePayload: prefix, context: nil, coordinator: core)
+        case .getPollRouting, .pollMessagesOnPrimary, .getConsumerOffsetRouting:
+            // The routing protocol itself, sent once as the Rust client sends
+            // it: a replay after a reconnect could run under another session.
+            // A dropped client reconnects first, as for a typed call.
+            try await requireAuthenticated()
+            return try await core.exchangeOnce(code: code, payload: payload, context: .empty)
         default:
             return nil
         }

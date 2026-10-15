@@ -47,16 +47,16 @@ struct ConsumerGroupStateTests {
 
     @Test func groupPartitionsRoundRobinThenWrap() {
         let state = ConsumerGroupState()
-        state.setAssignment(group, generation: 1, partitions: [0, 1, 2])
+        state.applySync(group, member: (1, [0, 1, 2]), scope: state.sessionScope)
         #expect((0..<4).map { _ in state.nextGroupPartition(group) } == [0, 1, 2, 0])
     }
 
     @Test func aGenerationChangeRestartsTheCursor() {
         let state = ConsumerGroupState()
-        state.setAssignment(group, generation: 1, partitions: [0, 1, 2])
+        state.applySync(group, member: (1, [0, 1, 2]), scope: state.sessionScope)
         #expect(state.nextGroupPartition(group) == 0)
         #expect(state.nextGroupPartition(group) == 1)
-        state.setAssignment(group, generation: 2, partitions: [5, 6])
+        state.applySync(group, member: (2, [5, 6]), scope: state.sessionScope)
         #expect(state.nextGroupPartition(group) == 5)
     }
 
@@ -88,8 +88,7 @@ struct ConsumerGroupStateTests {
 
     @Test func aMemberHoldingNoPartitionsStaysRegistered() {
         let state = ConsumerGroupState()
-        state.registerGroup(group)
-        state.setAssignment(group, generation: 1, partitions: [])
+        state.applySync(group, member: (1, []), scope: state.sessionScope)
         #expect(!state.hasAssignment(group))
         #expect(state.isRegistered(group))
         state.deregisterGroup(group)
@@ -98,8 +97,7 @@ struct ConsumerGroupStateTests {
 
     @Test func aSessionResetDropsMembershipAndKeepsTopicState() {
         let state = ConsumerGroupState()
-        state.registerGroup(group)
-        state.setAssignment(group, generation: 1, partitions: [0])
+        state.applySync(group, member: (1, [0]), scope: state.sessionScope)
         state.setTopicPartitions(topic, partitions: Self.partitions(2))
         #expect(state.nextBalancedPartition(topic, partitionCount: 2) == 0)
         state.clearSessionScoped()
@@ -108,5 +106,17 @@ struct ConsumerGroupStateTests {
         #expect(!state.hasAssignment(group))
         #expect(state.partitionCount(topic) == 2)
         #expect(state.nextBalancedPartition(topic, partitionCount: 2) == 1)
+    }
+
+    @Test func aSyncAnsweredUnderAnEndedSessionIsDropped() {
+        let state = ConsumerGroupState()
+        let scope = state.sessionScope
+        state.clearSessionScoped()
+        #expect(!state.applySync(group, member: (1, [0]), scope: scope))
+        #expect(!state.isRegistered(group))
+        #expect(!state.hasAssignment(group))
+        state.applySync(group, member: (1, [0]), scope: state.sessionScope)
+        #expect(!state.applySync(group, member: nil, scope: scope))
+        #expect(state.isRegistered(group))
     }
 }

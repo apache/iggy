@@ -355,7 +355,7 @@ struct MessagingE2ETests {
 
             var baseOffsets: [UInt64] = []
             for _ in 0..<3 {
-                let response = try await client.sendMessages(
+                let response = try await client.sendBatch(
                     streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: try E2EEnvironment.messages(4))
                 let confirmation = try #require(response.confirmations.first)
                 #expect(confirmation.streamID == scratch.streamID)
@@ -400,7 +400,7 @@ struct MessagingE2ETests {
             let headers: UserHeaders = ["trace-id": "abc-123", "attempt": .uint32(3), "urgent": true, "ratio": 0.5, "raw": try .raw([1, 2, 3])]
             let message = try IggyMessage("with headers", id: id, userHeaders: headers)
             let binary = try IggyMessage(payload: [0x00, 0xFF, 0x10, 0x80])
-            _ = try await client.sendMessages(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: [message, binary])
+            _ = try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: [message, binary])
 
             let polled = try await client.pollMessages(
                 streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, count: 10, autoCommit: false)
@@ -423,15 +423,15 @@ struct MessagingE2ETests {
 
             var balancedPartitions: [UInt32] = []
             for _ in 0..<3 {
-                let response = try await client.sendMessages(
+                let response = try await client.sendBatch(
                     streamID: scratch.stream, topicID: scratch.topic, partitioning: .balanced, messages: try E2EEnvironment.messages(1))
                 balancedPartitions.append(try #require(response.confirmations.first).partitionID)
             }
             #expect(Set(balancedPartitions) == [0, 1, 2])
 
-            let first = try await client.sendMessages(
+            let first = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .messagesKey("order-key-1"), messages: try E2EEnvironment.messages(1))
-            let second = try await client.sendMessages(
+            let second = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .messagesKey("order-key-1"), messages: try E2EEnvironment.messages(1))
             #expect(try #require(first.confirmations.first).partitionID == (try #require(second.confirmations.first).partitionID))
         }
@@ -442,15 +442,15 @@ struct MessagingE2ETests {
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
 
-            let first = try await client.sendMessages(
+            let first = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .balanced, messages: try E2EEnvironment.messages(1))
             #expect(try #require(first.confirmations.first).partitionID == 0)
             try await client.createPartitions(streamID: scratch.stream, topicID: scratch.topic, count: 2)
-            let second = try await client.sendMessages(
+            let second = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .balanced, messages: try E2EEnvironment.messages(1))
             #expect(try #require(second.confirmations.first).partitionID == 1)
             try await client.deletePartitions(streamID: scratch.stream, topicID: scratch.topic, count: 2)
-            let third = try await client.sendMessages(
+            let third = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .balanced, messages: try E2EEnvironment.messages(1))
             #expect(try #require(third.confirmations.first).partitionID == 0)
         }
@@ -460,7 +460,7 @@ struct MessagingE2ETests {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
-            _ = try await client.sendMessages(
+            _ = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: try E2EEnvironment.messages(5))
 
             let consumer = Consumer.consumer("swift-offsets")
@@ -489,7 +489,7 @@ struct MessagingE2ETests {
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 2)
             let consumer = Consumer.consumer("swift-positions")
-            _ = try await client.sendMessages(
+            _ = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(1), messages: try E2EEnvironment.messages(3))
             let polled = try await client.pollMessages(
                 streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: .first, count: 3, autoCommit: false)
@@ -497,7 +497,7 @@ struct MessagingE2ETests {
             let position = ConsumerPosition(partitionID: 1, offset: 2, context: polled.context)
             try await client.storeConsumerPosition(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, position: position)
             #expect(try await client.getConsumerOffset(consumer: consumer, streamID: scratch.stream, topicID: scratch.topic, partitionID: 1)?.storedOffset == 2)
-            let continued = PollingStrategy(kind: .offset, value: 1, context: polled.context)
+            let continued = PollingStrategy.offset(1, context: polled.context)
             let more = try await client.pollMessages(
                 streamID: scratch.stream, topicID: scratch.topic, partitionID: 1, consumer: consumer, strategy: continued, count: 10, autoCommit: false)
             #expect(more.messages.map(\.offset) == [1, 2])
@@ -510,7 +510,7 @@ struct MessagingE2ETests {
             try await other.createPartitions(streamID: scratch.stream, topicID: scratch.topic, count: 1)
 
             // The send under the stale cached context reads the new route.
-            _ = try await client.sendMessages(
+            _ = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(1), messages: try E2EEnvironment.messages(1))
             // Neither a checkpoint nor a continuation of the old incarnation
             // lands on the new one.
@@ -532,7 +532,7 @@ struct MessagingE2ETests {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
-            _ = try await client.sendMessages(
+            _ = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: try E2EEnvironment.messages(2))
             let target = Self.rawConsumerTarget(consumer: 7, stream: scratch.streamID, topic: scratch.topicID)
             // Strategy first, count 10, no auto-commit.
@@ -572,7 +572,7 @@ struct MessagingE2ETests {
 
             try await client.joinConsumerGroup(streamID: scratch.stream, topicID: scratch.topic, groupID: groupID)
             for partition: UInt32 in 0..<3 {
-                _ = try await client.sendMessages(
+                _ = try await client.sendBatch(
                     streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(partition), messages: try E2EEnvironment.messages(2))
             }
             // The server installs the member's partitions after the join, so
@@ -599,7 +599,7 @@ struct MessagingE2ETests {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
-            _ = try await client.sendMessages(
+            _ = try await client.sendBatch(
                 streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: try E2EEnvironment.messages(3))
             // Only closed segments can be deleted; a fresh partition has one open
             // segment, so the request is accepted and removes nothing.
@@ -615,7 +615,7 @@ struct MessagingE2ETests {
             let scratch = try await session.scratchTopic(partitions: 1)
             let big = try IggyMessage(payload: [UInt8](repeating: 0xAB, count: 512 * 1024))
             let many = try (0..<1000).map { try IggyMessage("message \($0)") }
-            _ = try await client.sendMessages(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: [big] + many)
+            _ = try await client.sendBatch(streamID: scratch.stream, topicID: scratch.topic, partitioning: .partition(0), messages: [big] + many)
             let polled = try await client.pollMessages(
                 streamID: scratch.stream, topicID: scratch.topic, partitionID: 0, consumer: .default, strategy: .first, count: 1001, autoCommit: false)
             #expect(polled.messages.count == 1001)
@@ -628,10 +628,12 @@ struct MessagingE2ETests {
         try await E2EEnvironment.withSession() { session in
             let client = session.client
             await #expect(throws: IggyError(.invalidMessagesCount)) {
-                try await client.sendMessages(streamID: 1, topicID: 1, partitioning: .balanced, messages: [])
+                try await client.sendBatch(streamID: 1, topicID: 1, partitioning: .balanced, messages: [])
             }
-            await #expect(throws: IggyError.self) {
-                try await client.sendMessages(streamID: "no-such-stream", topicID: 1, partitioning: .balanced, messages: ["x"])
+            // The balanced send reads the topic first and finds none, as the
+            // Rust client does.
+            await #expect(throws: IggyError(.topicIdNotFound)) {
+                try await client.sendBatch(streamID: "no-such-stream", topicID: 1, partitioning: .balanced, messages: ["x"])
             }
         }
     }

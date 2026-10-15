@@ -198,3 +198,15 @@ func expectIggyError(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_s
         Issue.record("expected \(code), got \(error)", sourceLocation: sourceLocation)
     }
 }
+
+extension IggyClient {
+    /// ``sendMessages(streamID:topicID:partitioning:messages:)`` for a batch
+    /// the test does not read back, so the call can take a literal.
+    @discardableResult
+    func sendBatch(
+        streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: [IggyMessage]
+    ) async throws -> SendMessagesResponse {
+        var batch = messages
+        return try await sendMessages(streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &batch)
+    }
+}

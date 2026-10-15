@@ -92,6 +92,10 @@ enum VSRFrame {
         let bytes: [UInt8]
         let requestID: UInt64
         let operation: ConsensusOperation
+        /// The session the frame was stamped under, which decides whether it
+        /// can be replayed as it is after a reconnect.
+        let clientID: UInt128Value
+        let session: UInt64
     }
 
     /// Builds the complete request frame for a command code and its encoded
@@ -152,7 +156,7 @@ enum VSRFrame {
             buffer.storeBytes(of: partitionContext.metadataOp.littleEndian, toByteOffset: RequestOffset.minimumMetadataOp, as: UInt64.self)
         }
         frame.append(contentsOf: payload)
-        return EncodedRequest(bytes: frame, requestID: requestID, operation: operation)
+        return EncodedRequest(bytes: frame, requestID: requestID, operation: operation, clientID: session.clientID, session: sessionID)
     }
 
     /// Reads the total frame length, header included, from any consensus

@@ -170,8 +170,9 @@ public final class IggyClient: Sendable {
 
     /// Sends a command code with an already-encoded payload and returns the
     /// raw reply body. For commands without a typed method; the caller owns
-    /// the wire format. Session-control codes are rejected because they must
-    /// go through ``login(username:password:)`` and ``logout()``.
+    /// the wire format. Session-control codes, `BindSession` among them, are
+    /// rejected because they must go through ``login(username:password:)``
+    /// and ``logout()``.
     ///
     /// Partition requests carry the partition context their typed call
     /// sends: `SendMessages` with an explicit partition id, `PollMessages`,
@@ -181,7 +182,9 @@ public final class IggyClient: Sendable {
     /// and the offset calls. A raw send with balanced or key partitioning
     /// fails with ``IggyErrorCode/featureUnavailable``, and a partition
     /// payload that does not decode fails with ``IggyErrorCode/invalidCommand``,
-    /// before anything is sent.
+    /// before anything is sent. The routing codes `GetPollRouting`,
+    /// `PollMessagesOnPrimary`, and `GetConsumerOffsetRouting` are sent once
+    /// on the current connection, with no reconnect or replay.
     public func sendRawRequest(code: UInt32, payload: [UInt8]) async throws -> [UInt8] {
         guard !CommandCode.isSessionControl(code) else {
             throw IggyError(.invalidCommand, context: "code \(code) controls the session; use login and logout")

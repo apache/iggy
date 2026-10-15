@@ -147,16 +147,21 @@ actor ClientCore {
     /// from the next one, and the next caller reconnects.
     ///
     /// `context` is the partition context a partition request carries; every
-    /// replay keeps it.
-    func exchange(code: UInt32, payload: [UInt8], context: PartitionContext = .empty) async throws -> [UInt8] {
+    /// replay keeps it. `limit` caps the request timeout for a caller with a
+    /// budget of its own.
+    func exchange(
+        code: UInt32, payload: [UInt8], context: PartitionContext = .empty, deadline limit: ContinuousClock.Instant? = nil
+    ) async throws -> [UInt8] {
         if disconnectedByCaller {
             throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
         }
-        let deadline = ContinuousClock.now + configuration.requestTimeout
+        let deadline = requestDeadline(within: limit)
         var outcome = RetryOutcome()
         var failedEpoch = connectionEpoch
+        var request: VSRFrame.EncodedRequest?
         do {
-            return try await sendRaw(code: code, payload: payload, context: context, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
+            return try await sendRaw(
+                code: code, payload: payload, context: context, deadline: deadline, request: &request, epoch: &failedEpoch, outcome: &outcome)
         } catch let error as IggyError {
             // A cancelled caller cannot use a new connection: every exchange
             // it starts is abandoned at once.
@@ -164,8 +169,8 @@ actor ClientCore {
             guard error.isReconnectable else {
                 throw error
             }
-            // A replay over a new connection runs under a new session, and the
-            // server deduplicates by (client, request). Replay only what
+            // The server deduplicates by (client, request). A replay under a
+            // new session gets a new identity, so it is safe only for what
             // provably never reached the log.
             let replay = replayAfterSessionResetIsSafe(code: code, error: error)
             let failure = replay ? error : IggyError(.transientNotCommitted, context: "command \(code) may have committed before: \(error)")
@@ -205,18 +210,28 @@ actor ClientCore {
             guard reconnected != nil else {
                 throw IggyError(failure.code, context: "the request deadline passed while reconnecting after: \(error)")
             }
-            guard replay else {
-                logger.warning("Reconnected, but the outcome of command \(code) is unknown: replaying it could apply it twice")
+            if let retained = request, retained.clientID == session.clientID,
+                retained.session == (session.session ?? 0) || retained.operation == .register
+            {
+                // The session was resumed: the request goes again as it was
+                // stamped, and the server answers it from its reply cache if
+                // it committed.
+            } else if replay {
+                request = nil
+            } else {
+                logger.warning("Reconnected under a new session, but the outcome of command \(code) is unknown: replaying it could apply it twice")
                 throw failure
             }
-            return try await sendRaw(code: code, payload: payload, context: context, deadline: deadline, epoch: &failedEpoch, outcome: &outcome)
+            return try await sendRaw(
+                code: code, payload: payload, context: context, deadline: deadline, request: &request, epoch: &failedEpoch, outcome: &outcome)
         }
     }
 
     /// One attempt on the current connection with no reconnect, failover, or
     /// replay, for the route lookups and the polls that `PollRouter` retries
-    /// itself.
-    func exchangeOnce(code: UInt32, payload: [UInt8], context: PartitionContext) async throws -> [UInt8] {
+    /// itself, bounded by `limit` when the caller has a budget. `notPrimary`
+    /// is graded as on the retried path.
+    func exchangeOnce(code: UInt32, payload: [UInt8], context: PartitionContext, deadline limit: ContinuousClock.Instant? = nil) async throws -> [UInt8] {
         if disconnectedByCaller || state == .shutdown {
             throw IggyError(state == .shutdown ? .clientShutdown : .notConnected)
         }
@@ -226,22 +241,38 @@ actor ClientCore {
         let now = ContinuousClock.now
         let attempted = try await attempt(
             code: code, payload: payload, context: context, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: now,
-            readDeadline: now + configuration.requestTimeout, replaysUncommitted: false)
+            readDeadline: requestDeadline(within: limit), replaysUncommitted: false)
         switch attempted {
         case .success(let body):
             return body
         case .failure(let error):
             dropConnection(after: error, epoch: epoch)
-            throw error
+            throw Self.graded(error)
         }
+    }
+
+    private func requestDeadline(within limit: ContinuousClock.Instant?) -> ContinuousClock.Instant {
+        let full = ContinuousClock.now + configuration.requestTimeout
+        return limit.map { min($0, full) } ?? full
     }
 
     var bindSecret: [UInt8] { session.bindSecret }
 
-    /// Stamps a frame from the shared session for a data connection, so the
-    /// request ids stay unique across every connection of the session.
-    func stampRequest(code: UInt32, payload: [UInt8], context: PartitionContext) throws -> VSRFrame.EncodedRequest {
-        try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
+    /// Stamps a frame for a data connection from the shared session, for the
+    /// session `identity` names. Replicated requests take the next id of the
+    /// session's counter; reads carry its current value. A session that was
+    /// replaced or is not bound, or a route older than the newest metadata
+    /// commit, is refused as not accepted, since nothing was written.
+    func stampRequest(
+        code: UInt32, payload: [UInt8], context: PartitionContext, for identity: Responses.SessionIdentity
+    ) throws -> VSRFrame.EncodedRequest {
+        guard session.clientID == identity.clientID, session.session == identity.session else {
+            throw IggyError(.transientNotAccepted, context: "the route belongs to a replaced session")
+        }
+        guard identity.metadataWatermark >= metadataWatermark else {
+            throw IggyError(.transientNotAccepted, context: "the route predates metadata commit \(metadataWatermark)")
+        }
+        return try VSRFrame.encodeRequest(session: &session, code: code, payload: payload, partitionContext: context)
     }
 
     /// Dials `address` with the client's TLS and timeouts, for a data
@@ -316,7 +347,8 @@ actor ClientCore {
     /// across every same-connection replay and every leader failover. `epoch`
     /// reports the connection the last attempt ran on.
     private func sendRaw(
-        code: UInt32, payload: [UInt8], context: PartitionContext, deadline: ContinuousClock.Instant, epoch: inout UInt64, outcome: inout RetryOutcome
+        code: UInt32, payload: [UInt8], context: PartitionContext, deadline: ContinuousClock.Instant, request: inout VSRFrame.EncodedRequest?,
+        epoch: inout UInt64, outcome: inout RetryOutcome
     ) async throws -> [UInt8] {
         switch state {
         case .shutdown:
@@ -328,9 +360,14 @@ actor ClientCore {
         }
         let clock = ContinuousClock()
         let isLogin = CommandCode.isRegister(code)
-        var request: VSRFrame.EncodedRequest?
         var walk = RosterWalk()
+        var refused: IggyError?
         while true {
+            if let refused, deadline - clock.now < Self.notReadyRetryInterval {
+                // An attempt sent with a sliver of the budget would time out,
+                // and the timeout takes the connection with it.
+                throw refused
+            }
             let transientDeadline = isLogin ? deadline : min(deadline, clock.now + Self.transientFailoverCheckInterval)
             let attempted = try await attempt(
                 code: code, payload: payload, context: context, request: &request, epoch: &epoch, outcome: &outcome, transientDeadline: transientDeadline,
@@ -349,6 +386,7 @@ actor ClientCore {
                 }
                 // The server never admitted the request, so re-issuing it
                 // under a new request id cannot double-apply it.
+                refused = error
                 let from = walk
                 guard let step = try await withDeadline(deadline, { [self] in try await self.failOver(from) }) else {
                     throw error
@@ -373,9 +411,11 @@ actor ClientCore {
 
     /// The reply stream of a connection that failed mid-request is at an
     /// unknown boundary; a late reply would desync framing for the next
-    /// request.
+    /// request. One found closed before the request was written is dropped
+    /// too, so the next request dials.
     private func dropConnection(after error: IggyError, epoch: UInt64) {
-        if error.code == .disconnected, epoch == connectionEpoch, state != .shutdown {
+        let lost = error.code == .disconnected || (error.code == .notConnected && connection != nil)
+        if lost, epoch == connectionEpoch, state != .shutdown {
             connection = nil
             state = .disconnected
             publish(.disconnected)
@@ -386,7 +426,7 @@ actor ClientCore {
     /// neither was admitted, and the primary is found by moving to another
     /// node. Unlike a not-accepted refusal it is not replayed on the same node
     /// first, since a backup keeps refusing until the view changes.
-    private static func graded(_ failure: IggyError) -> IggyError {
+    static func graded(_ failure: IggyError) -> IggyError {
         guard failure.code == .notPrimary else {
             return failure
         }
@@ -474,7 +514,9 @@ actor ClientCore {
         var refusal: IggyError?
         while true {
             let remaining = readDeadline - clock.now
-            guard remaining > .zero else {
+            // A replay sent with a sliver of the budget would time out, and the
+            // timeout takes the connection with it: the refusal stands instead.
+            guard remaining > .zero, refusal == nil || remaining >= Self.notReadyRetryInterval else {
                 return .failure(refusal ?? IggyError(.transientNotAccepted, context: "the request deadline passed before command \(code) was sent"))
             }
             let raw: RawFrame
@@ -482,7 +524,12 @@ actor ClientCore {
                 raw = try await connection.exchange(stamped.bytes, timeout: remaining)
             } catch let error as IggyError {
                 logger.error("Request failed", metadata: ["code": "\(code)", "error": "\(error)"])
-                return .failure(error.code == .disconnected || error.code == .tcpError ? error : IggyError(.disconnected, context: "\(error)"))
+                switch error.code {
+                case .disconnected, .tcpError, .notConnected:
+                    return .failure(error)
+                default:
+                    return .failure(IggyError(.disconnected, context: "\(error)"))
+                }
             } catch {
                 return .failure(IggyError(.disconnected, context: "\(error)"))
             }
@@ -699,6 +746,21 @@ actor ClientCore {
             logger.info("Skipping automatic sign-in for a retried login request")
             return false
         }
+        if session.isBound {
+            do {
+                try await resumeSession()
+                return settleOffLeader ? false : try await settleAfterSignIn()
+            } catch let error as IggyError where error.code == .unauthenticated || error.code == .transientNotCommitted {
+                // The server no longer holds the session, or cannot tell yet:
+                // the client signs in under a new one.
+                logger.info("Cannot resume the session, signing in again: \(error)")
+                resetSession()
+            } catch let error as IggyError {
+                let connectionLost = error.isConnectionLoss || error.code == .transientNotAccepted
+                await disconnectTransport()
+                throw SignInFailure(error: error, connectionLost: connectionLost)
+            }
+        }
         state = .authenticating
         do {
             switch credentials {
@@ -717,11 +779,41 @@ actor ClientCore {
             // back on the node whose partition replica keeps refusing.
             return false
         }
+        return try await settleAfterSignIn()
+    }
+
+    private func settleAfterSignIn() async throws -> Bool {
         do {
             return try await handleLeaderRedirection()
         } catch let error as IggyError {
             throw SignInFailure(error: error, connectionLost: false)
         }
+    }
+
+    /// Binds a new connection to the session the lost one carried, as
+    /// `resume_vsr_session` in the Rust SDK, so the session keeps its group
+    /// memberships, routes, and request ids.
+    private func resumeSession() async throws {
+        guard let bound = session.session else {
+            return
+        }
+        let clientID = session.clientID
+        state = .authenticating
+        let payload = try Requests.bindSession(
+            clientID: clientID, session: bound, metadataWatermark: metadataWatermark, bindSecret: session.bindSecret)
+        let body = try await exchangeOnce(code: CommandCode.bindSession.rawValue, payload: payload, context: .empty)
+        let resumed = try Responses.loginRegister(body[...])
+        guard resumed.session == bound else {
+            throw IggyError(.sessionMismatch, context: "asked to resume session \(bound), the server bound \(resumed.session)")
+        }
+        // An explicit disconnect or a shutdown while the bind was in flight
+        // replaced the session, and the reply must not revive it.
+        guard session.clientID == clientID, !disconnectedByCaller, state == .authenticating else {
+            throw IggyError(.notConnected, context: "the session was ended while it was being resumed")
+        }
+        logger.info("Resumed session \(bound)")
+        state = .authenticated
+        publish(.signedIn)
     }
 
     private func failSignIn(_ error: IggyError) async -> SignInFailure {
@@ -790,8 +882,8 @@ actor ClientCore {
         return elapsed < interval ? interval - elapsed : nil
     }
 
-    /// Tears the connection down without touching the remembered sign-in, so
-    /// a reconnect can restore the session.
+    /// Tears the connection down without touching the remembered sign-in or
+    /// the session, so a reconnect can resume it.
     func disconnectTransport() async {
         switch state {
         case .disconnected, .shutdown:
@@ -807,22 +899,19 @@ actor ClientCore {
         state = .disconnected
         let old = connection
         connection = nil
-        // A Register still in flight is retried on the next connection and
-        // must arrive under the identity and secret its body was built from.
-        if session.isBound {
-            resetSession()
-        }
         await old?.close()
         publish(.disconnected)
     }
 
     /// An explicit disconnect ends the session on purpose: the remembered
-    /// sign-in goes with it so the next reconnect does not resurrect it.
+    /// sign-in and the session go with it so the next connect does not
+    /// resurrect it.
     func disconnect() async {
         disconnectedByCaller = true
         rememberedSignIn = nil
         stopHeartbeat()
         await disconnectTransport()
+        resetSession()
     }
 
     func shutdown() async {
@@ -889,8 +978,8 @@ actor ClientCore {
         if state == .authenticated {
             try await logout()
         }
-        // A connection lost under a bound session leaves that session behind.
-        // The sign-in on the next one registers a new session, not a replay.
+        // A sign-in on a connection that is not bound to the session, as after
+        // a reconnect with nothing to resume it with, registers a new session.
         if session.isBound {
             resetSession()
         }
@@ -1162,6 +1251,13 @@ struct RetryOutcome {
     private(set) var isUncertain = false
 
     mutating func observe(_ error: IggyError) -> IggyError {
+        if error.code == .requestTooOld {
+            // The server took a later request id of this session first, which
+            // a replay or a data connection can cause. An earlier attempt of
+            // this one may have committed.
+            isUncertain = true
+            return IggyError(.transientNotCommitted, context: "the server already took a later request: \(error)")
+        }
         if error.code == .transientNotCommitted {
             isUncertain = true
         }
