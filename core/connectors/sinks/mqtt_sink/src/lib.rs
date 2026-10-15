@@ -200,6 +200,13 @@ impl MqttSink {
                 "request_capacity must be greater than zero".to_string(),
             ));
         }
+        let request_capacity = self.config.request_capacity.unwrap_or(32);
+        let max_in_flight = self.config.max_in_flight.unwrap_or(1);
+        if max_in_flight > request_capacity {
+            return Err(Error::InvalidConfigValue(
+                "max_in_flight must not exceed request_capacity".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -238,54 +245,69 @@ impl MqttSink {
             .await
             .take()
             .ok_or_else(|| Error::InitError("MQTT driver is not initialized".into()))?;
-        let mut published = 0;
-        for publication in publications {
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                let result = driver
-                    .publish(
-                        &publication.topic,
-                        qos,
-                        self.config.retain,
-                        publication.payload.clone(),
-                        publication.properties.clone(),
-                        self.publish_timeout,
-                    )
-                    .await;
+        let mut confirmed = vec![false; publications.len()];
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let pending_indices: Vec<usize> = confirmed
+                .iter()
+                .enumerate()
+                .filter_map(|(index, is_confirmed)| (!is_confirmed).then_some(index))
+                .collect();
+            let mut failure = None;
 
-                match result {
-                    Ok(()) => {
-                        published += 1;
-                        break;
-                    }
-                    // An uncertain publish is retried after reconnecting. This
-                    // favors duplicate delivery over silently losing a message.
-                    Err(error) if attempts < self.max_retries => {
-                        warn!(
-                            "Retrying MQTT publish for connector ID: {} (attempt {attempts}/{}): {error}",
-                            self.id, self.max_retries
-                        );
-                        if let Err(reconnect_error) = driver.reconnect().await {
-                            *self.driver.lock().await = Some(driver);
-                            return Err(reconnect_error);
+            for window_indices in pending_indices.chunks(self.max_in_flight) {
+                let window: Vec<_> = window_indices
+                    .iter()
+                    .map(|&index| &publications[index])
+                    .collect();
+                match driver
+                    .publish_window(&window, qos, self.config.retain, self.publish_timeout)
+                    .await
+                {
+                    Ok(window_confirmed) => {
+                        for local_index in window_confirmed {
+                            confirmed[window_indices[local_index]] = true;
                         }
-                        let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
-                        tokio::time::sleep(delay).await;
                     }
-                    Err(error) => {
-                        // Return the driver before propagating so a later
-                        // runtime call can attempt recovery or close cleanly.
-                        self.publish_errors.fetch_add(1, Ordering::Relaxed);
-                        *self.driver.lock().await = Some(driver);
-                        return Err(error);
+                    Err(window_error) => {
+                        for local_index in window_error.confirmed {
+                            confirmed[window_indices[local_index]] = true;
+                        }
+                        failure = Some(window_error.error);
+                        break;
                     }
                 }
             }
-        }
 
-        *self.driver.lock().await = Some(driver);
-        Ok(published)
+            if failure.is_none() {
+                *self.driver.lock().await = Some(driver);
+                return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64);
+            }
+
+            let Some(error) = failure else {
+                continue;
+            };
+            if attempts >= self.max_retries {
+                self.publish_errors.fetch_add(
+                    confirmed.iter().filter(|confirmed| !**confirmed).count() as u64,
+                    Ordering::Relaxed,
+                );
+                *self.driver.lock().await = Some(driver);
+                return Err(error);
+            }
+
+            warn!(
+                "Retrying MQTT publish window for connector ID: {} (attempt {attempts}/{}): {error}",
+                self.id, self.max_retries
+            );
+            if let Err(reconnect_error) = driver.reconnect().await {
+                *self.driver.lock().await = Some(driver);
+                return Err(reconnect_error);
+            }
+            let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
+            tokio::time::sleep(delay).await;
+        }
     }
 }
 
@@ -445,6 +467,20 @@ mod tests {
         config.qos = 3;
         let sink = MqttSink::new(1, config);
         assert!(matches!(sink.qos(), Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[test]
+    fn given_max_in_flight_above_request_capacity_when_validating_should_return_configuration_error()
+     {
+        let mut config = test_config();
+        config.request_capacity = Some(2);
+        config.max_in_flight = Some(3);
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 
     #[test]
