@@ -89,7 +89,7 @@ public final class TcpClientBuilder {
      * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090}
      * @return a new IggyTcpClientBuilder configured from the connection string
      * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the connection string is invalid
-     * @see TcpConnectionString
+     * @see org.apache.iggy.config.TcpConnectionString
      */
     public IggyTcpClientBuilder fromConnectionString(String connectionString) {
         return blocking().fromConnectionString(connectionString);
