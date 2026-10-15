@@ -30,6 +30,7 @@ use axum::response::Response;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
@@ -38,14 +39,14 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::user::User;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::warn;
 
 use crate::cluster_meta::ClusterRoster;
 use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
 use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 
-use crate::http::jwt::JwtManager;
+use crate::http::jwt::{JwtManager, TrustedIssuer};
 use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
@@ -383,23 +384,20 @@ impl HttpInner {
     }
 
     /// `(id, created_at)` of the account a trusted issuer's tokens act as: the
-    /// user named `username`, looked up per request. See
+    /// user named by the issuer, looked up per request. See
     /// [`trusted_issuer_account`].
     pub(in crate::http) fn trusted_issuer_user(
         &self,
-        username: &str,
+        issuer: &TrustedIssuer,
     ) -> Result<(u32, IggyTimestamp), IggyError> {
         self.shard
             .plane
             .metadata()
             .mux_stm
             .users()
-            .read(|users| trusted_issuer_account(users.user_by_name(username)))
+            .read(|users| trusted_issuer_account(users.user_by_name(&issuer.config.username)))
             .ok_or_else(|| {
-                debug!(
-                    username,
-                    "refusing a trusted issuer token whose user is missing, inactive or root"
-                );
+                issuer.warn_invalid_account();
                 IggyError::Unauthenticated
             })
     }
@@ -501,9 +499,15 @@ impl HttpInner {
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
-            let verifier =
-                consensus::client_table::bind_verifier(client_id, user_id, &rand::random());
-            let result = submit_register_on_owner(&shard, client_id, user_id, verifier).await;
+            let registration = RegisterRequest {
+                user_created_at: user_created_at.as_micros(),
+                bind_verifier: consensus::client_table::bind_verifier(
+                    client_id,
+                    user_id,
+                    &rand::random(),
+                ),
+            };
+            let result = submit_register_on_owner(&shard, client_id, user_id, registration).await;
             if let Err(Ok(bound)) = result_slot.send(result)
                 && bound.watermark == FRESH_ENTRY_WATERMARK
             {
@@ -638,6 +642,9 @@ const fn register_submit_auth_error(error: &MetadataSubmitError) -> AuthError {
         | MetadataSubmitError::PipelineFull
         | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
         MetadataSubmitError::ClientIdOwnedByAnotherUser => AuthError::SessionIdOwnedByAnotherUser,
+        MetadataSubmitError::Unauthenticated => {
+            AuthError::Unauthenticated(IggyError::Unauthenticated)
+        }
         // The proposal may still commit. Unknown future outcomes fail closed
         // into the same client-only retry class.
         MetadataSubmitError::InProgress
@@ -683,10 +690,6 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
 fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
     let user = user?;
     if user.id == DEFAULT_ROOT_USER_ID {
-        error!(
-            username = %user.username,
-            "a trusted issuer maps onto the root user, refusing its token"
-        );
         return None;
     }
     (user.status == UserStatus::Active).then_some((user.id, user.created_at))

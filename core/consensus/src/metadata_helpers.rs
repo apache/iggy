@@ -21,9 +21,10 @@
 
 use crate::client_table::{ClientTable, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_binary_protocol::{
     EvictionHeader, EvictionReason, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
-    Operation, PrepareHeader,
+    Operation, PrepareHeader, WireDecode,
 };
 use iggy_common::IggyError;
 use message_bus::MessageBus;
@@ -250,6 +251,7 @@ pub fn register_preflight<B, P>(
     user_id: u32,
     verifier_body: &[u8],
     request_checksum: u128,
+    account_is_active: impl FnOnce(u64) -> bool,
 ) -> PreflightOutcome
 where
     B: MessageBus,
@@ -258,11 +260,14 @@ where
     if !is_caught_up_primary(consensus) {
         return PreflightOutcome::NotReady;
     }
-    let Ok(verifier) = verifier_body.try_into() else {
+    let Ok(registration) = RegisterRequest::decode_from(verifier_body) else {
         return PreflightOutcome::Reject(IggyError::InvalidCommand.as_code());
     };
+    if !account_is_active(registration.user_created_at) {
+        return PreflightOutcome::Reject(IggyError::Unauthenticated.as_code());
+    }
     let table = client_table.borrow();
-    match table.registered_session(client_id, user_id, verifier) {
+    match table.registered_session(client_id, user_id, registration.bind_verifier) {
         Ok(Some(epoch)) => {
             let header = PrepareHeader {
                 cluster: consensus.cluster(),
@@ -452,6 +457,7 @@ pub async fn send_eviction_to_client<B, P>(
 
 #[cfg(test)]
 mod tests {
+    use iggy_binary_protocol::WireEncode;
     use std::rc::Rc;
 
     use super::*;
@@ -542,8 +548,13 @@ mod tests {
                     &client_table,
                     client_id,
                     ACTING_USER_ID,
-                    &[0x5a; 32],
-                    0
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32]
+                    }
+                    .to_bytes(),
+                    0,
+                    |_| true
                 ),
                 PreflightOutcome::Replay(_)
             ),
@@ -551,6 +562,28 @@ mod tests {
         );
         let sends = consensus.message_bus().client_sends.borrow();
         assert!(sends.is_empty(), "preflight itself sends nothing");
+        assert!(
+            matches!(
+                register_preflight(
+                    &consensus,
+                    &client_table,
+                    client_id,
+                    ACTING_USER_ID,
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    }
+                    .to_bytes(),
+                    0,
+                    |created_at| {
+                        assert_eq!(created_at, 1);
+                        false
+                    },
+                ),
+                PreflightOutcome::Reject(code) if code == IggyError::Unauthenticated.as_code()
+            ),
+            "a stale account cannot recover an existing session"
+        );
     }
 
     // No-session: non-Register from unknown client -> Eviction(NoSession).
@@ -928,8 +961,13 @@ mod tests {
                     &client_table,
                     client_id,
                     IMPOSTOR,
-                    &[0x5a; 32],
-                    0
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32]
+                    }
+                    .to_bytes(),
+                    0,
+                    |_| true
                 ),
                 PreflightOutcome::Reject(40)
             ),
@@ -937,7 +975,19 @@ mod tests {
         );
         assert!(
             matches!(
-                register_preflight(&consensus, &client_table, client_id, OWNER, &[0x5a; 32], 0),
+                register_preflight(
+                    &consensus,
+                    &client_table,
+                    client_id,
+                    OWNER,
+                    &RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32]
+                    }
+                    .to_bytes(),
+                    0,
+                    |_| true
+                ),
                 PreflightOutcome::Replay(_)
             ),
             "the owner must recover the original session"
@@ -1007,8 +1057,13 @@ mod tests {
             &client_table,
             client_id,
             ACTING_USER_ID,
-            &[0x5a; 32],
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
             0,
+            |_| true,
         );
         assert!(
             matches!(result, PreflightOutcome::NotReady),
@@ -1070,8 +1125,13 @@ mod tests {
             &client_table,
             client_id,
             ACTING_USER_ID,
-            &[0x5a; 32],
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
             0,
+            |_| true,
         );
         assert!(
             matches!(result, PreflightOutcome::Dispatch),

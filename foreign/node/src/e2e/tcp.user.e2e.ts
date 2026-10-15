@@ -18,6 +18,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { getTestClient } from './test-client.utils.js';
+import { ResponseError } from '../wire/error.utils.js';
 
 describe('e2e -> user', async () => {
 
@@ -143,8 +144,42 @@ describe('e2e -> user', async () => {
     assert.ok(await c.user.delete({ userId: user.id }));
   });
 
+  it('e2e -> user::rejectDanglingGrantsAndPruneDeletedResources', async () => {
+    const MISSING_RESOURCE_ID = 0xffff_ffff;
+    const STREAM_NOT_FOUND = 1009;
+    const TOPIC_NOT_FOUND = 2010;
+    const grantUser = await c.user.create({ ...cUser, username: 'grant-user' });
+    for (const [streamId, topicId, code] of [
+      [MISSING_RESOURCE_ID, topic.id, STREAM_NOT_FOUND],
+      [stream.id, MISSING_RESOURCE_ID, TOPIC_NOT_FOUND]
+    ]) {
+      const dangling = {
+        ...permissions,
+        streams: [{
+          ...permissions.streams[0],
+          streamId,
+          topics: [{ ...permissions.streams[0].topics[0], topicId }]
+        }]
+      };
+      const refused = (error: unknown) => error instanceof ResponseError && error.errorCode === code;
+      await assert.rejects(c.user.create({ ...cUser, username: 'dangling-grant', permissions: dangling }), refused);
+      await assert.rejects(c.user.updatePermissions({ userId: grantUser.id, permissions: dangling }), refused);
+      assert.deepEqual((await c.user.get({ userId: grantUser.id }))?.permissions, permissions);
+    }
+    await c.topic.delete({ streamId: stream.id, topicId: topic.id, partitionsCount: 1 });
+    const afterTopic = await c.user.get({ userId: grantUser.id });
+    assert.ok(afterTopic?.permissions);
+    assert.deepEqual(afterTopic.permissions.streams[0].topics, []);
+    assert.deepEqual(afterTopic.permissions.streams[0].permissions, permissions.streams[0].permissions);
+    await c.stream.delete({ streamId: stream.id });
+    const afterStream = await c.user.get({ userId: grantUser.id });
+    assert.ok(afterStream?.permissions);
+    assert.deepEqual(afterStream.permissions.streams, []);
+    assert.deepEqual(afterStream.permissions.global, permissions.global);
+    await c.user.delete({ userId: grantUser.id });
+  });
+
   it('e2e -> user::cleanup', async () => {
-    assert.ok(await c.stream.delete({ streamId: stream.id }));
     assert.ok(await c.session.logout());
   });
 

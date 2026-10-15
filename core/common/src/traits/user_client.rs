@@ -39,8 +39,9 @@ pub trait UserClient {
     /// Every stream and topic that `permissions` grants on must exist. If one
     /// does not, a binary transport returns `IggyError::StreamIdNotFound` or
     /// `IggyError::TopicIdNotFound`, and `HttpClient` returns
-    /// `IggyError::ResourceNotFound`. A delete of a stream or topic removes
-    /// every grant on it.
+    /// `IggyError::ResourceNotFound`. Binary refusals carry only the error code,
+    /// so their decoded identifier is a placeholder (zero), not the missing
+    /// resource ID. A delete of a stream or topic removes every grant on it.
     async fn create_user(
         &self,
         username: &str,

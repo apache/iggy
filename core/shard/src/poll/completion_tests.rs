@@ -126,7 +126,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         Delete,
         RevokePermissions,
     }
-    for change in [
+    for (change, unbound) in [
         Change::Logout,
         Change::Leave,
         Change::OtherLeave,
@@ -134,7 +134,10 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         Change::Rejoin,
         Change::Delete,
         Change::RevokePermissions,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|change| [(change, false), (change, true)])
+    {
         let namespace = IggyNamespace::new(0, 0, 0);
         let bus = Rc::new(IggyMessageBus::new(0));
         let (mut partition, config) = partition_with_messages(&bus, namespace, &["message"]).await;
@@ -198,10 +201,22 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         let session = table.attach_session(CLIENT, header.op, USER).unwrap();
         let streams = owner.plane.metadata().mux_stm.streams();
         let mut completions = Vec::new();
-        for group in [None, Some(GROUP)] {
+        for group in [None, Some(GROUP)]
+            .into_iter()
+            .filter(|group| !unbound || group.is_none())
+        {
             let attachment = ConsumerAttachment {
                 session: session.clone(),
                 metadata: streams.poll_metadata(namespace, group, CLIENT).unwrap(),
+            };
+            let attachment = if unbound {
+                super::PollAttachment::Unbound {
+                    user_id: USER,
+                    user_created_at: 0,
+                    metadata: attachment.metadata,
+                }
+            } else {
+                super::PollAttachment::Bound(attachment)
             };
             let (reply, replies) = channel(1);
             let completion = owner
@@ -266,10 +281,9 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             ),
         }
         for (group, completion, replies, result) in completions {
-            let stale = matches!(
-                change,
-                Change::Logout | Change::Delete | Change::RevokePermissions
-            ) || (matches!(change, Change::Leave) && group.is_some());
+            let stale = matches!(change, Change::Delete | Change::RevokePermissions)
+                || (matches!(change, Change::Logout) && !unbound)
+                || (matches!(change, Change::Leave) && group.is_some());
             completion.complete(result);
             assert!(futures::poll!(pump.as_mut()).is_pending());
             let reply = replies
@@ -570,6 +584,8 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
             PartitionRead::UnboundPollOnPrimary {
                 consumer: PollingConsumer::Consumer(1, 0),
                 args: PollingArgs::new(PollingStrategy::next(), 1, false),
+                user_id: BOUND_USER,
+                user_created_at: 1,
                 metadata,
             },
             PartitionRead::ConsumerOffsetOnPrimary {

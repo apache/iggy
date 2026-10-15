@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use iggy_common::{IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId};
@@ -78,7 +80,25 @@ pub struct JwtManager {
     /// Trusted external issuers keyed by normalized issuer URL. Empty unless
     /// `[[http.jwt.trusted_issuers]]` is configured, in which case `decode`
     /// takes the JWKS verification path for tokens from these issuers.
-    trusted_issuers: HashMap<String, TrustedIssuerConfig>,
+    trusted_issuers: HashMap<String, Arc<TrustedIssuer>>,
+}
+
+#[derive(Debug)]
+pub(in crate::http) struct TrustedIssuer {
+    pub config: TrustedIssuerConfig,
+    warned_account: AtomicBool,
+}
+
+impl TrustedIssuer {
+    pub fn warn_invalid_account(&self) {
+        if !self.warned_account.swap(true, Ordering::Relaxed) {
+            warn!(
+                issuer = %self.config.issuer,
+                username = %self.config.username,
+                "refusing trusted issuer tokens: configured user is missing, inactive or root"
+            );
+        }
+    }
 }
 
 impl JwtManager {
@@ -141,7 +161,10 @@ impl JwtManager {
             .map(|issuer_config| {
                 (
                     normalize_issuer_url(&issuer_config.issuer),
-                    issuer_config.clone(),
+                    Arc::new(TrustedIssuer {
+                        config: issuer_config.clone(),
+                        warned_account: AtomicBool::new(false),
+                    }),
                 )
             })
             .collect();
@@ -239,13 +262,14 @@ impl JwtManager {
             return Err(IggyError::Unauthenticated);
         };
         let normalized_iss = normalize_issuer_url(&insecure.claims.iss);
-        let Some(config) = self.trusted_issuers.get(&normalized_iss) else {
+        let Some(issuer) = self.trusted_issuers.get(&normalized_iss) else {
             debug!(
                 issuer = %insecure.claims.iss,
                 "token issuer matches no trusted issuer and failed self-issued verify"
             );
             return Err(IggyError::Unauthenticated);
         };
+        let config = &issuer.config;
 
         // `insecure.header` is parsed from the same header segment `decode_header`
         // reads, so reuse it for `alg` and `kid` instead of parsing twice.
@@ -296,7 +320,7 @@ impl JwtManager {
         Ok(VerifiedToken {
             jti: claims.jti,
             exp: claims.exp,
-            subject: TokenSubject::Username(config.username.clone()),
+            subject: TokenSubject::TrustedIssuer(Arc::clone(issuer)),
         })
     }
 
@@ -319,8 +343,8 @@ impl JwtManager {
                 user_id,
                 created_at,
             } => Ok((user_id, created_at)),
-            TokenSubject::Username(username) => {
-                error!(%username, "refusing to refresh a trusted-issuer token");
+            TokenSubject::TrustedIssuer(issuer) => {
+                debug!(username = %issuer.config.username, "refusing to refresh a trusted-issuer token");
                 Err(IggyError::InvalidAccessToken)
             }
         }
@@ -522,7 +546,7 @@ pub(in crate::http) enum TokenSubject {
     /// A trusted-issuer token acts as the user its issuer config names, looked
     /// up per request, so a later account that takes a deleted user's id does
     /// not inherit the issuer.
-    Username(String),
+    TrustedIssuer(Arc<TrustedIssuer>),
 }
 
 #[derive(Debug)]

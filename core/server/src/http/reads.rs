@@ -53,9 +53,10 @@ use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 /// Every read route reaches this through [`gate_local_read`], which is what
 /// pairs it with the two waits a local read must serve behind. A route that
 /// awaits again after that gate (a cross-shard gather, the snapshot
-/// collection, the partition routing) calls it once more before building its
-/// reply: the account behind the token can be replaced, and its grants can
-/// change, during any await.
+/// collection, or a local partition read) calls it once more before building
+/// its reply: the account behind the token can be replaced, and its grants can
+/// change, during any await. Relayed partition reads are authorized by the
+/// serving node, which verifies the forwarded bearer itself.
 pub(in crate::http) fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
@@ -512,7 +513,9 @@ mod tests {
     };
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
-    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
+    use iggy_binary_protocol::requests::streams::{
+        CreateStreamRequest, DeleteStreamRequest, UpdateStreamRequest,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
     };
@@ -732,16 +735,23 @@ mod tests {
         }
     }
 
-    /// The account can change during either the primary lookup or the data read.
+    /// Account and path changes must not bypass either partition wait's gate.
     #[compio::test]
+    #[allow(clippy::too_many_lines)]
     async fn given_a_partition_read_waiting_on_its_owner_when_the_account_changes_should_reject() {
         for uri in [
-            "/streams/0/topics/0/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
-            "/streams/0/topics/0/consumer-offsets?consumer_id=1&partition_id=0",
+            "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
+            "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
         ] {
-            for (replace, final_wait) in
-                [(true, false), (false, false), (true, true), (false, true)]
-            {
+            for (replace, final_wait, change_path) in [
+                (true, false, None),
+                (false, false, None),
+                (true, true, None),
+                (false, true, None),
+                (false, true, Some(Operation::DeleteStream)),
+                (false, true, Some(Operation::UpdateStream)),
+                (false, true, Some(Operation::UpdateTopic)),
+            ] {
                 let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
                 let state = read_state_on(Some(sender));
                 let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
@@ -818,6 +828,29 @@ mod tests {
                     (reply, primary)
                 };
                 let rejection = change_reader(&state, replace);
+                if let Some(operation) = change_path {
+                    let body = match operation {
+                        Operation::DeleteStream => DeleteStreamRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                        }
+                        .to_bytes(),
+                        Operation::UpdateStream => UpdateStreamRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                            name: WireName::new("renamed").unwrap(),
+                            options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                        Operation::UpdateTopic => UpdateTopicRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                            topic_id: WireIdentifier::numeric(0),
+                            name: WireName::new("renamed").unwrap(),
+                            options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                        _ => unreachable!(),
+                    };
+                    commit_user_request(&state, READER_CREATED_AT + 30, operation, &body);
+                }
                 reply.try_send(body).unwrap();
                 // A read that went on would send to the partition again and
                 // find it gone, instead of waiting for an answer.
@@ -826,7 +859,7 @@ mod tests {
                 assert_eq!(
                     response.await.unwrap().status(),
                     rejection,
-                    "{uri} with the account replaced: {replace}, final wait: {final_wait}"
+                    "{uri} with the account replaced: {replace}, final wait: {final_wait}, path change: {change_path:?}"
                 );
             }
         }

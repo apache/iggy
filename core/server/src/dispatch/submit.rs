@@ -125,18 +125,18 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,
-                verifier,
+                registration,
                 reply,
             } => {
                 let bound =
-                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, verifier)
+                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, registration)
                         .await;
                 let _ = reply.try_send(bound);
             }
             shard::MetadataSubmit::ForwardedRegister {
                 vsr_client_id,
                 user_id,
-                verifier,
+                registration,
                 nonce,
                 origin_replica,
             } => {
@@ -144,7 +144,7 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     &shard,
                     vsr_client_id,
                     user_id,
-                    verifier,
+                    registration,
                     nonce,
                     origin_replica,
                 )

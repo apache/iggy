@@ -372,8 +372,10 @@ TEST_F(E2E_Client, CreateUserPreservesNestedPermissionsInCreateAndGetResponses) 
         TrackStream(second_stream_name);
         first_topic_id  = client.CreateTopic(iggy::Identifier::Numeric(first_stream_id), GetRandomName()).Id();
         second_topic_id = client.CreateTopic(iggy::Identifier::Numeric(first_stream_id), GetRandomName()).Id();
-        third_topic_id  = client.CreateTopic(iggy::Identifier::Numeric(second_stream_id), GetRandomName()).Id();
+        client.CreateTopic(iggy::Identifier::Numeric(second_stream_id), GetRandomName());
+        third_topic_id = client.CreateTopic(iggy::Identifier::Numeric(second_stream_id), GetRandomName()).Id();
     });
+    ASSERT_NE(first_topic_id, third_topic_id);
 
     iggy::GlobalPermissions global;
     global.SetManageServers(true).SetReadUsers(true).SetManageStreams(true).SetReadTopics(true).SetSendMessages(true);

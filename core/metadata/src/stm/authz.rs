@@ -95,6 +95,8 @@ where
     let context = ApplyContext::from(header);
     let reply = mux.update(prepare)?;
     if let Some(deleted) = reply.deleted_resource {
+        // Publish the pruned grants before a later op can reuse the resource ID.
+        // Peer shards may see the deletion first, but cannot see its replacement yet.
         mux.users().remove_grants(deleted, timestamp, context);
     }
     Ok(reply)
@@ -107,16 +109,11 @@ pub(crate) fn reject_stale_session(
     header: &PrepareHeader,
     client_table: &ClientTable,
 ) -> Option<ApplyReply> {
-    if matches!(
-        header.operation,
-        Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
-    ) {
+    if message_bus::is_server_internal_client(header.client) {
         return None;
     }
-    (header.session != 0
-        && (client_table.get_epoch(header.client) != Some(header.session)
-            || client_table.get_user_id(header.client) != Some(header.user_id)))
-    .then(|| ApplyReply::err(IggyError::StaleClient.as_code()))
+    (header.session != 0 && client_table.get_epoch(header.client) != Some(header.session))
+        .then(|| ApplyReply::err(IggyError::StaleClient.as_code()))
 }
 
 /// Generic entry point to `gated_apply` for the WAL-replay path.
@@ -136,9 +133,15 @@ pub trait GatedApply:
 
     /// Partition-set revision used to validate retirement coverage during WAL replay.
     fn namespace_revision(&self) -> u64;
+
+    fn is_active_account(&self, user_id: u32, created_at: u64) -> bool;
 }
 
 impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
+    fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
+        self.users().is_active_account(user_id, created_at)
+    }
+
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         gated_apply(self, prepare)
     }
@@ -520,6 +523,10 @@ fn topic_scoped(
 /// gate. Production always uses the `variadic!(Users, Streams)` machine above.
 #[cfg(test)]
 impl GatedApply for MuxStateMachine<()> {
+    fn is_active_account(&self, _user_id: u32, _created_at: u64) -> bool {
+        true
+    }
+
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
     }

@@ -182,7 +182,11 @@ impl SessionManager {
     /// `None` means the connection is not registered yet, which happens
     /// only on a transport's first frame; the caller installs it from the
     /// bus metadata ([`Self::ensure_connection`]) and asks again.
-    pub(crate) fn touch_connection(&mut self, connection_id: u128) -> Option<ConnectionContext> {
+    pub(crate) fn touch_connection(
+        &mut self,
+        connection_id: u128,
+        include_attachment: bool,
+    ) -> Option<ConnectionContext> {
         let conn = self.connections.get_mut(&connection_id)?;
         if conn
             .consumer_session
@@ -207,6 +211,7 @@ impl SessionManager {
             attachment: conn
                 .consumer_session
                 .as_ref()
+                .filter(|_| include_attachment)
                 .map(|(_, attachment)| attachment.clone()),
             user_id,
             address: Some(conn.address),
@@ -612,7 +617,7 @@ mod tests {
                 session: EPOCH
             }]
         );
-        sessions.touch_connection(1).unwrap();
+        sessions.touch_connection(1, false).unwrap();
         assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 2);
         sessions.remove_connection(2);
         assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 1);
@@ -693,7 +698,7 @@ mod tests {
         bind(&mut sessions, &mut table, 1);
         sessions.record_metadata_watermark(1, 50);
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
-        let context = sessions.touch_connection(1).unwrap();
+        let context = sessions.touch_connection(1, true).unwrap();
         assert_eq!(context.bound, None);
         assert_eq!(context.user_id, None);
         assert_eq!(context.metadata_watermark, 0);

@@ -75,8 +75,24 @@ impl FromRequestParts<HttpState> for Authenticated {
         // `RefCell` borrow or `DashMap` guard across the `.await` (each such
         // critical section is synchronous), so a cooperatively-scheduled sibling
         // task on this thread never observes a borrowed session table.
-        let (key, user_id, user_created_at, expiry) =
+        let (jwt_id, user_id, user_created_at, expiry) =
             SendWrapper::new(resolve_credential(state, bearer)).await?;
+        // External issuers choose their own jti, and their configured username
+        // can resolve to another account later. Scope the session to this account.
+        let key = jwt_id.map_or_else(
+            || {
+                format!(
+                    "{PAT_KEY_PREFIX}{}",
+                    PersonalAccessToken::hash_token(bearer)
+                )
+            },
+            |jwt_id| {
+                format!(
+                    "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
+                    user_created_at.as_micros()
+                )
+            },
+        );
         let session =
             SendWrapper::new(state.resolve_session(key, user_id, user_created_at, expiry)).await?;
         Ok(Self {
@@ -120,7 +136,7 @@ impl FromRequestParts<HttpState> for Identity {
     ) -> Result<Self, Self::Rejection> {
         let bearer = bearer_token(&parts.headers)?;
 
-        // Verify only. The session key and expiry `resolve_credential` also
+        // Verify only. The JWT id and expiry `resolve_credential` also
         // returns feed the write path's session table; a read discards them -
         // its read-your-writes floor is keyed by user id, not by credential
         // (see `MetadataWatermarks`).
@@ -130,7 +146,7 @@ impl FromRequestParts<HttpState> for Identity {
         // ever runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell`
         // borrow or `DashMap` guard across the `.await`, so a sibling task
         // scheduled on this thread meanwhile never observes a borrowed cell.
-        let (_key, user_id, user_created_at, _expiry) =
+        let (_jwt_id, user_id, user_created_at, _expiry) =
             SendWrapper::new(resolve_credential(state, bearer)).await?;
         let path_and_query = parts
             .uri
@@ -169,8 +185,8 @@ pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyErr
         .ok_or(IggyError::AccessTokenMissing)
 }
 
-/// Map a bearer credential to its `(session key, user id, user created_at,
-/// expiry secs)`.
+/// Map a bearer credential to its `(optional JWT id, user id, user created_at,
+/// expiry secs)`. Only `Authenticated` builds a session key from these facts.
 ///
 /// A JWT is the primary credential, keyed by its account and `jti`. A raw PAT
 /// presented as the bearer is the documented fallback, keyed by the same
@@ -189,7 +205,7 @@ pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyErr
 pub(in crate::http) async fn resolve_credential(
     state: &HttpState,
     bearer: &str,
-) -> Result<(String, u32, IggyTimestamp, u64), AuthError> {
+) -> Result<(Option<String>, u32, IggyTimestamp, u64), AuthError> {
     if let Ok(token) = state.jwt.decode(bearer).await {
         let (user_id, user_created_at) = match token.subject {
             TokenSubject::Account {
@@ -199,26 +215,13 @@ pub(in crate::http) async fn resolve_credential(
                 user_id,
                 state.ensure_active_user(user_id, Some(created_at))?,
             ),
-            TokenSubject::Username(username) => state.trusted_issuer_user(&username)?,
+            TokenSubject::TrustedIssuer(issuer) => state.trusted_issuer_user(&issuer)?,
         };
-        // A trusted-issuer token resolves its username on every request, so one
-        // `jti` can name another account after a rename or a delete, and the
-        // issuer picks its own `jti`. The account in the key keeps a cached
-        // session from writing as any account but the one resolved here.
-        let key = format!(
-            "{JWT_KEY_PREFIX}{user_id}:{}:{}",
-            user_created_at.as_micros(),
-            token.jti
-        );
-        return Ok((key, user_id, user_created_at, token.exp));
+        return Ok((Some(token.jti), user_id, user_created_at, token.exp));
     }
 
     let (user_id, user_created_at, expiry) =
         verify_pat_credentials_with_expiry(&state.shard, bearer)
             .map_err(|_| IggyError::Unauthenticated)?;
-    let key = format!(
-        "{PAT_KEY_PREFIX}{}",
-        PersonalAccessToken::hash_token(bearer)
-    );
-    Ok((key, user_id, user_created_at, expiry))
+    Ok((None, user_id, user_created_at, expiry))
 }

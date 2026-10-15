@@ -369,7 +369,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     // unknown connection arrives with a floor of `0`: it was promised nothing,
     // so its reads wait for nothing.
     ConnectionContext {
-        bound: _,
+        bound,
         attachment,
         user_id,
         address: client_address,
@@ -574,7 +574,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             }
         }
         POLL_MESSAGES_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => {
-            let consumer_client = sessions.borrow().consumer_session(transport_client_id);
+            let consumer_client = bound
+                .zip(attachment)
+                .map(|((client_id, _), attachment)| (client_id, attachment))
+                .ok_or(IggyError::Unauthenticated);
             match consumer_client {
                 Ok((consumer_client_id, attachment)) => {
                     handle_poll_messages(
@@ -750,6 +753,17 @@ where
         return Err(IggyError::TransientNotAccepted);
     };
     authorize_attached(attachment, authorize)?;
+    if shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partition_route(namespace)
+        .map(|(current, _)| current)
+        != Some(incarnation)
+    {
+        return Err(IggyError::TransientNotAccepted);
+    }
     Ok(PartitionRouteResponse {
         incarnation,
         metadata_op,

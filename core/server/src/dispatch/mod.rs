@@ -737,12 +737,17 @@ async fn handle_client_request<B, MJ, S, SB>(
     // stale-client eviction still fires.
     // Bound, not matched: a `match` on `borrow_mut()` would hold the guard
     // across the arm that borrows again.
-    let mut touched = sessions.borrow_mut().touch_connection(transport_client_id);
+    let include_attachment = request.header().operation == Operation::NonReplicated;
+    let mut touched = sessions
+        .borrow_mut()
+        .touch_connection(transport_client_id, include_attachment);
     if touched.is_none() {
         // A transport's first frame: the peer address and transport kind live
         // on the bus, so only this path pays that lookup.
         ensure_transport_connection(shard, sessions, transport_client_id);
-        touched = sessions.borrow_mut().touch_connection(transport_client_id);
+        touched = sessions
+            .borrow_mut()
+            .touch_connection(transport_client_id, include_attachment);
     }
     let ConnectionContext {
         bound,
@@ -1138,7 +1143,7 @@ where
             .get(user_id as usize)
             .is_some_and(|user| user.status == UserStatus::Active)
     });
-    if !active_user {
+    if !active_user || !attachment.is_valid() {
         return Err(IggyError::Unauthenticated);
     }
     sessions.borrow_mut().bind_authenticated_connection(
@@ -1170,6 +1175,7 @@ mod tests {
         GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE,
         GET_POLL_ROUTING_CODE, GET_STATS_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
     };
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
     use iggy_binary_protocol::requests::consumer_offsets::{
         GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -1179,6 +1185,10 @@ mod tests {
     use iggy_binary_protocol::requests::system::{
         BindSessionRequest, GetClientRequest, GetClientsRequest, GetStatsRequest,
     };
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+    };
+    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
     };
@@ -1194,6 +1204,8 @@ mod tests {
     use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine;
+    use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+    use metadata::stm::user::CreatePersonalAccessTokenRequest;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::{PartitionLocation, ShardId};
@@ -1206,6 +1218,144 @@ mod tests {
     };
     use std::mem::size_of;
     use std::sync::atomic::AtomicBool;
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_verified_login_when_register_commits_after_user_deletion_should_refuse_id_reuse()
+     {
+        const CLIENT: u128 = 10;
+        const TRANSPORT: u128 = 20;
+        const USER: u32 = 1;
+        const CREATED_AT: u64 = 10;
+        const REPLACED_AT: u64 = 30;
+        const REGISTER_OP: u64 = 40;
+        const SECRET: [u8; 32] = [0x5a; 32];
+        const PASSWORD: &str = "original-password";
+        const TOKEN: &str = "original-personal-access-token";
+        let password_hash = server_common::crypto::hash_password(PASSWORD);
+        for replace_before_register in [false, true] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let metadata = shard.plane.metadata();
+            metadata.mux_stm.users().ensure_root_user("root", "hash");
+            let apply = |op, operation, client, user_id, body: &[u8]| {
+                let prepare = prepare_message(operation, client, 0, body).transmute_header(
+                    |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                        *header = old;
+                        header.op = op;
+                        header.timestamp = op;
+                        header.user_id = user_id;
+                        header.session = 0;
+                    },
+                );
+                metadata::apply_committed_prepare(
+                    &*metadata.mux_stm,
+                    &metadata.client_table,
+                    true,
+                    |_| {},
+                    prepare,
+                )
+            };
+            let create = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: password_hash.clone(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            let created = apply(CREATED_AT, Operation::CreateUser, 0, 0, &create.to_bytes());
+            assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
+            let token_hash = iggy_common::PersonalAccessToken::hash_token(TOKEN);
+            let token = CreatePersonalAccessTokenRequest {
+                user_id: USER,
+                name: WireName::new("original-token").unwrap(),
+                expiry: 0,
+                token_hash: token_hash.as_bytes().try_into().unwrap(),
+            };
+            let created = apply(
+                CREATED_AT + 1,
+                Operation::CreatePersonalAccessToken,
+                0,
+                0,
+                &token.to_bytes(),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
+            let verified =
+                session_ops::verify_login_credentials(&shard, "original", PASSWORD).unwrap();
+            assert_eq!(
+                verified,
+                session_ops::verify_pat_credentials(&shard, TOKEN).unwrap()
+            );
+            assert_eq!(
+                verified,
+                (USER, iggy_common::IggyTimestamp::from(CREATED_AT))
+            );
+            let registration = RegisterRequest {
+                user_created_at: verified.1.as_micros(),
+                bind_verifier: bind_verifier(CLIENT, verified.0, &SECRET),
+            };
+            let deleted = apply(
+                CREATED_AT + 2,
+                Operation::DeleteUser,
+                0,
+                0,
+                &DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes(),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(deleted.body()), Some(0));
+            let replacement = CreateUserRequest {
+                username: WireName::new("replacement").unwrap(),
+                ..create
+            }
+            .to_bytes();
+            if replace_before_register {
+                apply(REPLACED_AT, Operation::CreateUser, 0, 0, &replacement);
+            }
+            let denied = apply(
+                REGISTER_OP,
+                Operation::Register,
+                CLIENT,
+                USER,
+                &registration.to_bytes(),
+            );
+            assert_eq!(
+                iggy_binary_protocol::result_code(denied.body()),
+                Some(IggyError::Unauthenticated.as_code())
+            );
+            assert_eq!(metadata.client_table.borrow().get_user_id(CLIENT), None);
+            if !replace_before_register {
+                apply(REGISTER_OP + 1, Operation::CreateUser, 0, 0, &replacement);
+            }
+            metadata.applied_frontier().advance(REGISTER_OP + 1);
+            let sessions = Rc::new(RefCell::new(SessionManager::new()));
+            sessions.borrow_mut().ensure_connection(
+                TRANSPORT,
+                "127.0.0.1:34567".parse().unwrap(),
+                ClientTransportKind::Tcp,
+            );
+            for session in [0, REGISTER_OP] {
+                let result = complete_session_binding(
+                    &shard,
+                    &sessions,
+                    TRANSPORT,
+                    SessionIdentity {
+                        client_id: CLIENT,
+                        session,
+                        metadata_watermark: REGISTER_OP,
+                    },
+                    BindSecret::new(Box::new(SECRET)),
+                )
+                .await;
+                assert!(
+                    result.is_err(),
+                    "replaced before Register: {replace_before_register}, session: {session}, result: {result:?}"
+                );
+            }
+            assert_eq!(sessions.borrow().get_session(TRANSPORT), None);
+        }
+    }
 
     #[compio::test]
     async fn bind_session_rechecks_the_owner_exists_and_is_active() {
@@ -1432,15 +1582,25 @@ mod tests {
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_the_session_ends_should_refuse_stale_client() {
         for (code, body) in shard_waiting_reads() {
-            assert_read_refused_after_shard_wait(code, &body, true).await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Session).await;
         }
     }
 
     #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_grants_are_revoked_should_refuse_unauthorized() {
         for (code, body) in shard_waiting_reads() {
-            assert_read_refused_after_shard_wait(code, &body, false).await;
+            assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Grants).await;
         }
+    }
+
+    #[compio::test]
+    async fn given_a_route_waiting_on_a_shard_when_the_topic_is_recreated_should_refuse_stale_route()
+     {
+        let (code, body) = shard_waiting_reads()
+            .into_iter()
+            .find(|(code, _)| *code == GET_PARTITION_ROUTE_CODE)
+            .unwrap();
+        assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Topic).await;
     }
 
     /// Every read that asks another shard before it answers: the client reads
@@ -1487,11 +1647,14 @@ mod tests {
         ]
     }
 
-    /// Send `code` from the session of a user that may read the server and
-    /// poll every stream. While the read waits on a shard, end that session or
-    /// revoke the user's grants, then let the shard answer: the read must
-    /// refuse with `StaleClient` or `Unauthorized`.
-    async fn assert_read_refused_after_shard_wait(code: u32, body: &[u8], session_ends: bool) {
+    enum ReadRevocation {
+        Session,
+        Grants,
+        Topic,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_read_refused_after_shard_wait(code: u32, body: &[u8], change: ReadRevocation) {
         let bus = SpyBus::default();
         let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
         let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
@@ -1539,44 +1702,103 @@ mod tests {
         };
         assert!(bus.client_replies.borrow().is_empty());
         let metadata = shard.plane.metadata();
-        if session_ends {
-            assert!(metadata.client_table.borrow_mut().end_session(
-                READER_CLIENT,
-                READER,
-                READER_SESSION,
-                READER_SESSION + 1
-            ));
-        } else {
-            let revoke = UpdatePermissionsRequest {
-                user_id: WireIdentifier::numeric(READER),
-                permissions: None,
-            };
-            let revoked = metadata
-                .mux_stm
-                .update(prepare_message(
-                    Operation::UpdatePermissions,
-                    0,
+        let refusal = match change {
+            ReadRevocation::Session => {
+                assert!(metadata.client_table.borrow_mut().end_session(
+                    READER_CLIENT,
+                    READER,
+                    READER_SESSION,
+                    READER_SESSION + 1
+                ));
+                IggyError::StaleClient
+            }
+            ReadRevocation::Grants => {
+                let revoke = UpdatePermissionsRequest {
+                    user_id: WireIdentifier::numeric(READER),
+                    permissions: None,
+                };
+                let revoked = metadata
+                    .mux_stm
+                    .update(prepare_message(
+                        Operation::UpdatePermissions,
+                        0,
+                        4,
+                        &revoke.to_bytes(),
+                    ))
+                    .unwrap();
+                assert_eq!(revoked.code, 0);
+                IggyError::Unauthorized
+            }
+            ReadRevocation::Topic => {
+                let apply = |op, operation, body: Bytes| {
+                    metadata
+                        .mux_stm
+                        .update(prepare_message(operation, 0, op, &body).transmute_header(
+                            |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                                *header = old;
+                                header.op = op;
+                            },
+                        ))
+                        .unwrap()
+                };
+                let deleted = apply(
                     4,
-                    &revoke.to_bytes(),
-                ))
+                    Operation::DeleteTopic,
+                    DeleteTopicRequest {
+                        stream_id: WireIdentifier::numeric(
+                            namespace.stream_id().try_into().unwrap(),
+                        ),
+                        topic_id: WireIdentifier::numeric(namespace.topic_id().try_into().unwrap()),
+                    }
+                    .to_bytes(),
+                );
+                assert_eq!(deleted.code, 0);
+                let completion = CompleteLifecycleRequest::new(
+                    4,
+                    namespace.stream_id().try_into().unwrap(),
+                    vec![LifecycleCompletion {
+                        topic_id: namespace.topic_id().try_into().unwrap(),
+                        partition_id: namespace.partition_id().try_into().unwrap(),
+                        partition_op: 1,
+                    }],
+                )
                 .unwrap();
-            assert_eq!(revoked.code, 0);
-        }
+                let completed = apply(5, Operation::CompleteLifecycle, completion.to_bytes());
+                assert_eq!(completed.code, 0);
+                let created = apply(
+                    6,
+                    Operation::CreateTopicWithAssignments,
+                    CreateTopicWithAssignmentsRequest {
+                        request: CreateTopicRequest {
+                            stream_id: WireIdentifier::numeric(
+                                namespace.stream_id().try_into().unwrap(),
+                            ),
+                            partitions_count: 1,
+                            name: WireName::new("topic").unwrap(),
+                            options: WireOptions::empty(),
+                        },
+                        derived_options: WireOptions::empty(),
+                        partitions: vec![CreatedPartitionAssignment {
+                            partition_id: namespace.partition_id().try_into().unwrap(),
+                            consensus_group_id: 2,
+                        }],
+                        created_view: 0,
+                    }
+                    .to_bytes(),
+                );
+                assert_eq!(created.code, 0);
+                IggyError::TransientNotAccepted
+            }
+        };
         answer_shard_read(code, frame);
 
         await_replies(&bus, 1).await;
         let replies = bus.client_replies.borrow();
         assert_eq!(replies.len(), 1, "code {code} must answer once");
-        let refusal = if session_ends {
-            IggyError::StaleClient
-        } else {
-            IggyError::Unauthorized
-        };
         assert_eq!(
             reply_status(&replies[0].1),
             refusal.as_code(),
-            "code {code} must refuse once its {} ended",
-            if session_ends { "session" } else { "grants" }
+            "code {code} must refuse a stale read"
         );
     }
 

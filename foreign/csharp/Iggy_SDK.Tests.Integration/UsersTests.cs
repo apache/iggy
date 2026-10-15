@@ -244,6 +244,59 @@ public class UsersTests
         await Should.NotThrowAsync(client.LogoutUserAsync());
     }
 
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Permissions_Should_RejectDanglingGrants_And_PruneDeletedResources(Protocol protocol)
+    {
+        const uint missingResourceId = uint.MaxValue;
+        const int streamNotFound = 1009;
+        const int topicNotFound = 2010;
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var username = $"grants-{Guid.NewGuid():N}"[..20];
+        var stream = await client.CreateStreamAsync($"grants-{Guid.NewGuid():N}");
+        stream.ShouldNotBeNull();
+        var streamId = Identifier.Numeric(stream.Id);
+        var topic = await client.CreateTopicAsync(streamId, "grants-topic", 1);
+        topic.ShouldNotBeNull();
+        var permissions = CreatePermissions(stream.Id, topic.Id);
+        var user = await client.CreateUserAsync(username, "test-password", UserStatus.Active, permissions);
+        user.ShouldNotBeNull();
+        var userId = Identifier.Numeric(user.Id);
+
+        foreach (var (grantStream, grantTopic, code) in new[]
+                 {
+                     (missingResourceId, topic.Id, streamNotFound),
+                     (stream.Id, missingResourceId, topicNotFound)
+                 })
+        {
+            var dangling = CreatePermissions(grantStream, grantTopic);
+            var createError = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+                client.CreateUserAsync($"missing-{Guid.NewGuid():N}"[..20], "test-password", UserStatus.Active, dangling));
+            createError.StatusCode.ShouldBe(code);
+            var updateError = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+                client.UpdatePermissionsAsync(userId, dangling));
+            updateError.StatusCode.ShouldBe(code);
+            var unchanged = await client.GetUserAsync(userId);
+            unchanged.ShouldNotBeNull();
+            unchanged.Permissions.ShouldNotBeNull();
+            unchanged.Permissions.Streams![stream.Id].Topics!.ShouldContainKey(topic.Id);
+        }
+
+        await client.DeleteTopicAsync(streamId, Identifier.Numeric(topic.Id));
+        var afterTopic = await client.GetUserAsync(userId);
+        afterTopic.ShouldNotBeNull();
+        afterTopic.Permissions.ShouldNotBeNull();
+        (afterTopic.Permissions.Streams![stream.Id].Topics?.Count ?? 0).ShouldBe(0);
+        afterTopic.Permissions.Streams[stream.Id].PollMessages.ShouldBeTrue();
+        await client.DeleteStreamAsync(streamId);
+        var afterStream = await client.GetUserAsync(userId);
+        afterStream.ShouldNotBeNull();
+        afterStream.Permissions.ShouldNotBeNull();
+        (afterStream.Permissions.Streams?.Count ?? 0).ShouldBe(0);
+        afterStream.Permissions.Global.PollMessages.ShouldBeTrue();
+        await client.DeleteUserAsync(userId);
+    }
+
     private static Permissions CreatePermissions(uint streamId, uint topicId)
     {
         return new Permissions

@@ -196,13 +196,13 @@ pub(in crate::http) async fn login_user(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotCommitted)?;
-    let user_id = verify_login_credentials(
+    let (user_id, created_at) = verify_login_credentials(
         &state.shard,
         &command.username,
         command.password.expose_secret(),
     )
     .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, None)
+    issue_identity(&state, user_id, Some(created_at))
 }
 
 pub(in crate::http) async fn login_with_personal_access_token(
@@ -214,9 +214,9 @@ pub(in crate::http) async fn login_with_personal_access_token(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotCommitted)?;
-    let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
+    let (user_id, created_at) = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, None)
+    issue_identity(&state, user_id, Some(created_at))
 }
 
 /// `POST /users/refresh-token` body. The route is unauthenticated, so the
@@ -1281,6 +1281,7 @@ pub(in crate::http) async fn delete_segments(
 /// JSON is field-identical to a TCP poll. `auto_commit` rides
 /// [`resolve_poll_request`]'s args and is honored by the owning shard's poll
 /// plan. Another node relays the poll to the primary ([`route_partition`]).
+#[allow(clippy::too_many_lines)]
 pub(in crate::http) async fn poll_messages(
     State(state): State<HttpState>,
     identity: Identity,
@@ -1328,6 +1329,9 @@ pub(in crate::http) async fn poll_messages(
             // as the legacy 404 body.
             Err(_) => return Err(ReadError::NotFound),
         };
+    let rule = |permissioner: &Permissioner, uid| {
+        permissioner.poll_messages(uid, namespace.stream_id(), namespace.topic_id())
+    };
     let metadata = state
         .shard
         .plane
@@ -1364,10 +1368,14 @@ pub(in crate::http) async fn poll_messages(
         PartitionRead::UnboundPollOnPrimary {
             consumer,
             args,
+            user_id: identity.user_id,
+            user_created_at: identity.user_created_at.as_micros(),
             metadata,
         },
     ))
     .await;
+    // The owner may already have auto-committed. At-most-once polls can lose a
+    // batch here, but revoked credentials must never receive it.
     authorize_read(&state, &identity, consistency, rule)?;
     match reply {
         Some(PartitionReadReply::Poll {
@@ -1449,6 +1457,9 @@ pub(in crate::http) async fn get_consumer_offset(
     let (namespace, partition_id, read) = resolve_consumer_offset_request(&state.shard, &wire)
         .map_err(|_| ReadError::NotFound)?
         .ok_or(ReadError::NotFound)?;
+    let rule = |permissioner: &Permissioner, uid| {
+        permissioner.get_consumer_offset(uid, namespace.stream_id(), namespace.topic_id())
+    };
     let context = match request.route() {
         Some(route) => route.context,
         None => state

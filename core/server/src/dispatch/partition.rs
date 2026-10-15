@@ -513,7 +513,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     consumer_client_id: u128,
-    attachment: SessionAttachment,
+    attachment: &SessionAttachment,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -576,7 +576,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
                 transport_client_id,
                 request,
                 resolved,
-                &attachment,
+                attachment,
                 consumer_client_id,
             )
             .await
@@ -701,6 +701,8 @@ where
         },
     };
     let reply = shard.partition_read(namespace, read).await;
+    // Auto-commit is at-most-once: denial here can discard an already committed
+    // batch. Delivery must still stop when the session or grant was revoked.
     let users = shard.plane.metadata().mux_stm.users();
     authorize_attached(Some(attachment), || {
         users.authorize(|permissioner| {
@@ -2245,7 +2247,7 @@ mod tests {
             &poll,
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
-            attachment.clone(),
+            &attachment,
         )
         .await;
 
@@ -2332,7 +2334,7 @@ mod tests {
             &poll,
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
-            attachment.clone(),
+            &attachment,
         )
         .await;
 
@@ -2543,7 +2545,7 @@ mod tests {
             &request,
             Some(DEFAULT_ROOT_USER_ID),
             request.header().client,
-            attachment,
+            &attachment,
         )
         .await;
 
@@ -2636,7 +2638,7 @@ mod tests {
                 &request,
                 Some(DEFAULT_ROOT_USER_ID),
                 VSR_CLIENT_ID,
-                attachment.clone(),
+                &attachment,
             )
             .await;
 
@@ -2725,7 +2727,7 @@ mod tests {
                 &request,
                 Some(DEFAULT_ROOT_USER_ID),
                 VSR_CLIENT_ID,
-                attachment.clone(),
+                &attachment,
             )
             .await;
 

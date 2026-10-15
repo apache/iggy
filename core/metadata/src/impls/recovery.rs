@@ -26,6 +26,7 @@ use consensus::{
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::IggyError;
 use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
@@ -628,12 +629,21 @@ where
                     "committed Register is missing from WAL",
                 ))
             })?;
-            let verifier = prepare.body().try_into().map_err(|_| {
+            let registration = RegisterRequest::decode_from(prepare.body()).map_err(|_| {
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
+            if !mux_stm.is_active_account(header.user_id, registration.user_created_at) {
+                last_applied_op = Some(header.op);
+                continue;
+            }
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table
-                .commit_register(header.client, header.user_id, verifier, reply)
+                .commit_register(
+                    header.client,
+                    header.user_id,
+                    registration.bind_verifier,
+                    reply,
+                )
                 .map_err(RecoveryError::RetryProtection)?;
             on_replayed_session(&mux_stm, header);
             last_applied_op = Some(header.op);
@@ -1011,8 +1021,13 @@ mod tests {
         user_id: u32,
         request: u64,
     ) -> Message<PrepareHeader> {
+        let registration = RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        }
+        .to_bytes();
         let body: &[u8] = if operation == Operation::Register {
-            &[0x5a; 32]
+            &registration
         } else {
             &[]
         };
@@ -1752,7 +1767,13 @@ mod tests {
                 options: WireOptions::empty(),
             }
             .to_bytes();
-            let register = bytes::Bytes::from_static(&[0x5a; 32]);
+            let register = |created_at| {
+                RegisterRequest {
+                    user_created_at: created_at,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes()
+            };
             let replacement = (
                 Operation::CreateUser,
                 account.to_bytes(),
@@ -1773,7 +1794,7 @@ mod tests {
                 (pending_token, replacement)
             };
             let operations = [
-                (Operation::Register, register.clone(), ROOT_CLIENT, 0, 0),
+                (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
                 (
                     Operation::CreateUser,
                     original,
@@ -1781,7 +1802,7 @@ mod tests {
                     0,
                     ROOT_SESSION,
                 ),
-                (Operation::Register, register.clone(), CLIENT, USER, 0),
+                (Operation::Register, register(2), CLIENT, USER, 0),
                 (
                     Operation::DeleteUser,
                     DeleteUserRequest {
@@ -1801,7 +1822,13 @@ mod tests {
                     USER,
                     SESSION,
                 ),
-                (Operation::Register, register, REPLACEMENT_CLIENT, USER, 0),
+                (
+                    Operation::Register,
+                    register(if replace_before_token { 5 } else { 6 }),
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    0,
+                ),
                 (
                     Operation::CreatePersonalAccessToken,
                     token,
@@ -1923,12 +1950,18 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_revoked_user_when_replaying_wal_should_restore_ended_sessions() {
+    async fn given_revoked_user_when_replaying_wal_should_preserve_session_revocation() {
         const CLIENT: u128 = 0x1337;
         const ROOT_CLIENT: u128 = CLIENT + 1;
         const USER: u32 = 1;
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
-        for operation in [Operation::DeleteUser, Operation::UpdateUser] {
+        for (operation, register_first, replace) in [
+            (Operation::DeleteUser, true, false),
+            (Operation::UpdateUser, true, false),
+            (Operation::DeleteUser, false, false),
+            (Operation::UpdateUser, false, false),
+            (Operation::DeleteUser, false, true),
+        ] {
             let directory = tempdir().unwrap();
             let metadata_dir = directory.path().join("metadata");
             std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -1954,35 +1987,54 @@ mod tests {
                 }
                 .to_bytes()
             };
+            let registration = (
+                Operation::Register,
+                RegisterRequest {
+                    user_created_at: 2,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes(),
+                CLIENT,
+                USER,
+            );
+            let mut entries = vec![
+                (
+                    Operation::Register,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    }
+                    .to_bytes(),
+                    ROOT_CLIENT,
+                    0,
+                ),
+                (Operation::CreateUser, create.clone(), ROOT_CLIENT, 0),
+            ];
+            if register_first {
+                entries.push(registration.clone());
+            }
+            entries.push((operation, revocation, ROOT_CLIENT, 0));
+            if replace {
+                entries.push((Operation::CreateUser, create, ROOT_CLIENT, 0));
+            }
+            if !register_first {
+                entries.push(registration);
+            }
+            let last_op = entries.len() as u64;
             let mut parent = 0;
             {
                 let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                     .await
                     .unwrap();
-                for (op, operation, body, client, user_id) in [
-                    (
-                        1,
-                        Operation::Register,
-                        bytes::Bytes::from_static(&[0x5a; 32]),
-                        ROOT_CLIENT,
-                        0,
-                    ),
-                    (2, Operation::CreateUser, create, ROOT_CLIENT, 0),
-                    (
-                        3,
-                        Operation::Register,
-                        bytes::Bytes::from_static(&[0x5a; 32]),
-                        CLIENT,
-                        USER,
-                    ),
-                    (4, operation, revocation, ROOT_CLIENT, 0),
-                ] {
+                for (index, (operation, body, client, user_id)) in entries.into_iter().enumerate() {
+                    let op = index as u64 + 1;
                     let mut prepare = make_prepare(op, body.len());
                     prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
                     let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
                         |old, header: &mut PrepareHeader| {
                             *header = old;
                             header.operation = operation;
+                            header.timestamp = op;
                             header.client = client;
                             header.user_id = user_id;
                             header.session = 1;
@@ -2020,19 +2072,27 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(recovered.last_applied_op, Some(4));
+            assert_eq!(recovered.last_applied_op, Some(last_op));
             assert_eq!(recovered.client_table.get_epoch(CLIENT), None);
             assert_eq!(recovered.client_table.get_epoch(ROOT_CLIENT), Some(1));
-            assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
             let ended: Vec<_> = recovered.client_table.ended_sessions().collect();
-            assert_eq!(
-                ended,
-                vec![iggy_binary_protocol::requests::system::SessionIdentity {
-                    client_id: CLIENT,
-                    session: 3,
-                    metadata_watermark: 4,
-                }]
-            );
+            if register_first {
+                assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
+                assert_eq!(
+                    ended,
+                    vec![iggy_binary_protocol::requests::system::SessionIdentity {
+                        client_id: CLIENT,
+                        session: 3,
+                        metadata_watermark: 4,
+                    }]
+                );
+            } else {
+                assert!(revoked.borrow().is_empty());
+                assert_eq!(
+                    ended,
+                    [] as [iggy_binary_protocol::requests::system::SessionIdentity; 0]
+                );
+            }
         }
     }
 

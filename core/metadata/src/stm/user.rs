@@ -300,6 +300,14 @@ impl UsersInner {
 }
 
 impl Users {
+    pub fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
+        self.read(|users| {
+            users.items.get(user_id as usize).is_some_and(|user| {
+                user.status == UserStatus::Active && user.created_at.as_micros() == created_at
+            })
+        })
+    }
+
     #[must_use]
     pub fn read<F, R>(&self, f: F) -> R
     where
@@ -719,7 +727,6 @@ pub struct RemoveGrantsRequest {
 impl StateHandler for RemoveGrantsRequest {
     type State = UsersInner;
     fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
-        let mut pruned_any = false;
         for (_, user) in &mut state.items {
             let Some(pruned) = user
                 .permissions
@@ -728,11 +735,35 @@ impl StateHandler for RemoveGrantsRequest {
             else {
                 continue;
             };
+            let permissioner = &mut state.permissioner;
+            match self.deleted {
+                DeletedResource::Stream(stream_id) => {
+                    let key = (user.id, stream_id);
+                    permissioner.users_streams_permissions.remove(&key);
+                    permissioner
+                        .users_that_can_poll_messages_from_specific_streams
+                        .remove(&key);
+                    permissioner
+                        .users_that_can_send_messages_to_specific_streams
+                        .remove(&key);
+                }
+                DeletedResource::Topic {
+                    stream_id,
+                    topic_id,
+                } => {
+                    if let Some(stream) = permissioner
+                        .users_streams_permissions
+                        .get_mut(&(user.id, stream_id))
+                        && let Some(topics) = &mut stream.topics
+                    {
+                        topics.remove(&topic_id);
+                        if topics.is_empty() {
+                            stream.topics = None;
+                        }
+                    }
+                }
+            }
             user.permissions = Some(Arc::new(pruned));
-            pruned_any = true;
-        }
-        if pruned_any {
-            state.permissioner = permissioner_of(&state.items);
         }
         ApplyReply::ok(Bytes::new())
     }
