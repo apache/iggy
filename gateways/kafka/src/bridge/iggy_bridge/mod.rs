@@ -280,15 +280,22 @@ impl std::fmt::Debug for IggyBridge {
 ///
 /// Not the lockstep client: a stuck Produce send would hold every new mTLS connection past its
 /// handshake budget, and a burst of handshakes would queue ahead of Produce.
+///
+/// Detached because the caller's `pre_auth_timeout` can be shorter than `REQUEST_TIMEOUT`:
+/// cancelling the lookup there would also cancel the deadline that drops a stuck client, and
+/// every later lookup would queue behind it.
 #[async_trait]
 impl PrincipalResolver for IggyBridge {
     async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
-        let client = &self.lookup_client;
-        let lookup = async {
-            let connected = client.connected(&self.config).await?;
-            Ok(resolve_principal(connected.as_ref(), username).await)
+        let client = self.lookup_client.clone();
+        let config = self.config.clone();
+        let username = username.to_owned();
+        let lookup = async move {
+            let connected = client.connected(&config).await?;
+            Ok(resolve_principal(connected.as_ref(), &username).await)
         };
-        match client.until(Instant::now() + REQUEST_TIMEOUT, lookup).await {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        match self.lookup_client.until_detached(deadline, lookup).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 warn!(%error, "could not reach Iggy to look up the certificate's user");

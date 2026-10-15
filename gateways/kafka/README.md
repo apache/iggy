@@ -312,8 +312,9 @@ pattern matches the whole subject, `DEFAULT` keeps the subject as is. Iggy accep
 3 to 50 characters, but a raw subject is usually longer than that, and is rarely the name the
 operator created, so a deployment that maps identities sets at least one rule. Patterns are a
 Java-compatible subset: `\d \s \w` match ASCII only and `.` stops at Java's line terminators, as on
-a broker, while `(?i)`, the `u` and `U` flags, `\p{..}`, POSIX classes and `\b` are refused at
-startup ([docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) says why). A replacement that
+a broker, while `(?i)`, the `u`, `U`, `m`, `x` and `R` flags, `\p{..}`, POSIX classes, `\b`, `\v`,
+possessive quantifiers and the `--` and `~~` class operations are refused at startup
+([docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) says why). A replacement that
 names a group the pattern does not have is refused at startup. That is stricter than Kafka, which
 writes such a `$N` literally: `RULE:^CN=(.*)$/$2/` maps to `$2` on a broker. The reverse case,
 `/$1\$2/`, makes Kafka throw while the gateway maps `alice` to `alice$2`, which is harmless because

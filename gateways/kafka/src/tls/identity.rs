@@ -29,7 +29,8 @@ use std::str::FromStr;
 
 use regex::{Captures, Regex};
 use regex_syntax::ast::{
-    self, Assertion, AssertionKind, Ast, ClassPerl, ClassPerlKind, ClassSetItem, Flag, Flags, Span,
+    self, Assertion, AssertionKind, Ast, ClassPerl, ClassPerlKind, ClassSetBinaryOp,
+    ClassSetBinaryOpKind, ClassSetItem, Flag, Flags, LiteralKind, Span, SpecialLiteralKind,
     Visitor,
 };
 use thiserror::Error;
@@ -99,6 +100,21 @@ pub enum JavaIncompatibility {
     PosixClass,
     #[error("word boundaries are not supported")]
     WordBoundary,
+    #[error(
+        "the 'm', 'x' and 'R' flags differ between Rust and Java in which line ends and which \
+         whitespace and comments they cover"
+    )]
+    LineOrWhitespaceFlag,
+    #[error("'\\v' is a vertical tab in Rust and any vertical whitespace in Java")]
+    VerticalWhitespace,
+    #[error(
+        "Java reads a quantifier after a quantifier as possessive, Rust as a nested repetition"
+    )]
+    StackedQuantifier,
+    #[error(
+        "Java reads '--' and '~~' inside a class as literal characters, Rust as set operations"
+    )]
+    ClassSetOperation,
 }
 
 /// A replacement that `java.util.regex.Matcher` would throw on when the rule is applied.
@@ -455,6 +471,11 @@ impl JavaRewriter {
                 ast::FlagsItemKind::Flag(Flag::Unicode | Flag::SwapGreed) => {
                     return Err((item.span, JavaIncompatibility::UnicodeFlag));
                 }
+                ast::FlagsItemKind::Flag(
+                    flag @ (Flag::MultiLine | Flag::IgnoreWhitespace | Flag::CRLF),
+                ) if flags.flag_state(flag) == Some(true) => {
+                    return Err((item.span, JavaIncompatibility::LineOrWhitespaceFlag));
+                }
                 _ => {}
             }
         }
@@ -511,6 +532,14 @@ impl Visitor for JavaRewriter {
                 return Err((class.span, JavaIncompatibility::UnicodeClass));
             }
             Ast::Assertion(assertion) => refuse_word_boundary(assertion)?,
+            Ast::Literal(literal)
+                if literal.kind == LiteralKind::Special(SpecialLiteralKind::VerticalTab) =>
+            {
+                return Err((literal.span, JavaIncompatibility::VerticalWhitespace));
+            }
+            Ast::Repetition(repetition) if matches!(*repetition.ast, Ast::Repetition(_)) => {
+                return Err((repetition.op.span, JavaIncompatibility::StackedQuantifier));
+            }
             _ => {}
         }
         Ok(())
@@ -532,9 +561,23 @@ impl Visitor for JavaRewriter {
             ClassSetItem::Ascii(class) => {
                 return Err((class.span, JavaIncompatibility::PosixClass));
             }
+            ClassSetItem::Literal(literal)
+                if literal.kind == LiteralKind::Special(SpecialLiteralKind::VerticalTab) =>
+            {
+                return Err((literal.span, JavaIncompatibility::VerticalWhitespace));
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    fn visit_class_set_binary_op_pre(&mut self, op: &ClassSetBinaryOp) -> Result<(), Self::Err> {
+        match op.kind {
+            ClassSetBinaryOpKind::Difference | ClassSetBinaryOpKind::SymmetricDifference => {
+                Err((op.span, JavaIncompatibility::ClassSetOperation))
+            }
+            ClassSetBinaryOpKind::Intersection => Ok(()),
+        }
     }
 }
 
@@ -1034,9 +1077,25 @@ mod tests {
         }
     }
 
+    /// Asserts each rule list is refused, naming `construct` for `reason`.
+    fn assert_refused(cases: &[(&str, &str, JavaIncompatibility)]) {
+        for &(raw, construct, expected) in cases {
+            match raw.parse::<PrincipalMappingRules>() {
+                Err(MappingRuleError::JavaIncompatible {
+                    construct: found,
+                    reason,
+                    ..
+                }) => {
+                    assert_eq!((found.as_str(), reason), (construct, expected), "{raw}");
+                }
+                other => panic!("'{raw}' must be refused, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn given_a_construct_without_java_semantics_should_refuse_the_rule() {
-        for (raw, construct, expected) in [
+        assert_refused(&[
             (
                 "RULE:(?i)^CN=(\u{17F}vc)$/$1/",
                 "i",
@@ -1082,21 +1141,71 @@ mod tests {
                 r"\B",
                 JavaIncompatibility::WordBoundary,
             ),
-        ] {
-            match raw.parse::<PrincipalMappingRules>() {
-                Err(MappingRuleError::JavaIncompatible {
-                    construct: found,
-                    reason,
-                    ..
-                }) => {
-                    assert_eq!((found.as_str(), reason), (construct, expected), "{raw}");
-                }
-                other => panic!("'{raw}' must be refused, got {other:?}"),
-            }
-        }
+        ]);
         let case_sensitive: PrincipalMappingRules = "RULE:(?-i)^CN=(.*)$/$1/"
             .parse()
             .expect("(?-i) is Java's default");
         assert_eq!(case_sensitive.map("CN=a").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn given_syntax_rust_and_java_read_differently_should_refuse_the_rule() {
+        assert_refused(&[
+            (
+                "RULE:(?m)^CN=(.*)$/$1/",
+                "m",
+                JavaIncompatibility::LineOrWhitespaceFlag,
+            ),
+            (
+                "RULE:(?x)^CN=(.*)$/$1/",
+                "x",
+                JavaIncompatibility::LineOrWhitespaceFlag,
+            ),
+            (
+                "RULE:^CN=(?R:.*)$/CN/",
+                "R",
+                JavaIncompatibility::LineOrWhitespaceFlag,
+            ),
+            (
+                r"RULE:^CN=([^\v,]+)$/$1/",
+                r"\v",
+                JavaIncompatibility::VerticalWhitespace,
+            ),
+            (
+                r"RULE:^CN=(a\v)$/$1/",
+                r"\v",
+                JavaIncompatibility::VerticalWhitespace,
+            ),
+            (
+                "RULE:^CN=(.*+)$/$1/",
+                "+",
+                JavaIncompatibility::StackedQuantifier,
+            ),
+            (
+                "RULE:^CN=(a{2}+)$/$1/",
+                "+",
+                JavaIncompatibility::StackedQuantifier,
+            ),
+            (
+                "RULE:^CN=([a-z--b]+)$/$1/",
+                "a-z--b",
+                JavaIncompatibility::ClassSetOperation,
+            ),
+            (
+                "RULE:^CN=([a-z~~b]+)$/$1/",
+                "a-z~~b",
+                JavaIncompatibility::ClassSetOperation,
+            ),
+        ]);
+        // Turning a flag off keeps Java's default, so it stays admissible.
+        let explicit_defaults: PrincipalMappingRules = "RULE:(?-mx)^CN=([^,]+)$/$1/"
+            .parse()
+            .expect("(?-mx) is Java's default");
+        assert_eq!(explicit_defaults.map("CN=a").as_deref(), Some("a"));
+        // A lazy quantifier and a class intersection mean the same in both.
+        let same_in_both: PrincipalMappingRules = "RULE:^CN=([a-z&&[^q]]+?)$/$1/"
+            .parse()
+            .expect("lazy quantifiers and && match Java");
+        assert_eq!(same_in_both.map("CN=abc").as_deref(), Some("abc"));
     }
 }

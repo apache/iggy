@@ -259,8 +259,10 @@ first frame:
    ASCII only, and `.` outside `(?s)` stops at `\r`, U+0085, U+2028 and U+2029 as well as `\n`, both as
    in Java. Rust would read them over Unicode, so a CA-signed `CN=\u212Aafka` (Kelvin sign) would match
    `\w+` and lowercase to `kafka`. Case-insensitive matching (`(?i)`), the `u` and `U` flags, `\p{..}`
-   and `\P{..}`, POSIX classes such as `[[:alpha:]]`, and word boundaries (`\b`, `\B`) are refused at
-   startup with the construct named: each has no faithful translation. Non-ASCII names still map, so
+   and `\P{..}`, POSIX classes such as `[[:alpha:]]`, word boundaries (`\b`, `\B`), the `m`, `x` and
+   `R` flags, `\v`, a quantifier directly after another (`.*+`, possessive in Java) and the `--` and
+   `~~` class operations are refused at startup with the construct named: each has no faithful
+   translation. Non-ASCII names still map, so
    `CN=Zoë` under `RULE:^CN=([^,]+).*$/$1/` maps to `Zoë` as on a broker.
 3. **Look the name up** through the bridge's own session. The user must exist and be active, or the
    connection is closed after the handshake with the name in the log at `warn`: a certificate the CA signed
