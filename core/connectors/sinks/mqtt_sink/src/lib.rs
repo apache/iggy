@@ -42,7 +42,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use driver::{MqttDriver, MqttProtocol};
-use routing::{TopicMode, prepare_publication, validate_topic};
+use routing::{PreparedPublication, TopicMode, prepare_publication, validate_topic};
 
 sink_connector!(MqttSink);
 
@@ -256,6 +256,36 @@ impl MqttSink {
         self.publish_errors.fetch_add(unfinished, Ordering::Relaxed);
     }
 
+    fn prepare_publications(
+        &self,
+        topic_metadata: &TopicMetadata,
+        messages: Vec<ConsumedMessage>,
+    ) -> Result<Vec<PreparedPublication>, Error> {
+        let mut publications = Vec::with_capacity(messages.len());
+        for message in messages {
+            match prepare_publication(
+                &message,
+                topic_metadata,
+                self.config.topic_mode,
+                self.config.topic.as_deref(),
+                self.config.topic_template.as_deref(),
+                self.config.fallback_topic.as_deref(),
+                self.config.protocol,
+            ) {
+                Ok(publication) => publications.push(publication),
+                Err(error) if is_malformed_record_error(&error) => {
+                    warn!(
+                        "Dropping malformed MQTT record for connector ID: {}, stream: {}, topic: {}, offset: {}: {error}",
+                        self.id, topic_metadata.stream, topic_metadata.topic, message.offset
+                    );
+                    self.publish_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(publications)
+    }
+
     async fn publish_messages(
         &self,
         topic_metadata: &TopicMetadata,
@@ -266,17 +296,9 @@ impl MqttSink {
         // with the publication that caused them.
         let _publish_guard = self.publish_lock.lock().await;
         let qos = self.qos()?;
-        let mut publications = Vec::with_capacity(messages.len());
-        for message in messages {
-            publications.push(prepare_publication(
-                &message,
-                topic_metadata,
-                self.config.topic_mode,
-                self.config.topic.as_deref(),
-                self.config.topic_template.as_deref(),
-                self.config.fallback_topic.as_deref(),
-                self.config.protocol,
-            )?);
+        let publications = self.prepare_publications(topic_metadata, messages)?;
+        if publications.is_empty() {
+            return Ok(0);
         }
         let mut confirmed = vec![false; publications.len()];
         self.in_flight_publications
@@ -329,14 +351,14 @@ impl MqttSink {
                         }
                     }
                     Err(window_error) => {
-                        for local_index in window_error.confirmed {
-                            let index = window_indices[local_index];
+                        for local_index in &window_error.confirmed {
+                            let index = window_indices[*local_index];
                             if !confirmed[index] {
                                 confirmed[index] = true;
                                 self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
-                        failure = Some(window_error.error);
+                        failure = Some(window_error);
                         break;
                     }
                 }
@@ -347,19 +369,25 @@ impl MqttSink {
                 return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64);
             }
 
-            let Some(error) = failure else {
+            let Some(window_error) = failure else {
                 continue;
             };
+            if !window_error.retryable {
+                self.finish_unconfirmed_publications(&confirmed);
+                *self.driver.lock().await = Some(active_driver);
+                return Err(window_error.error);
+            }
             if attempts >= self.max_retries {
                 self.finish_unconfirmed_publications(&confirmed);
-                return Err(error);
+                return Err(window_error.error);
             }
 
             warn!(
-                "Discarding uncertain MQTT connection for connector ID: {} before retry {}/{}: {error}",
+                "Discarding uncertain MQTT connection for connector ID: {} before retry {}/{}: {}",
                 self.id,
                 attempts + 1,
-                self.max_retries
+                self.max_retries,
+                window_error.error
             );
             // The broker can accept a publication before its acknowledgement is
             // lost. Dropping this event loop prevents its late acknowledgements
@@ -396,7 +424,7 @@ impl Sink for MqttSink {
                     driver = Some(connected);
                     break;
                 }
-                Err(error) if attempt < self.max_retries => {
+                Err(Error::Connection(error)) if attempt < self.max_retries => {
                     warn!(
                         "Retrying MQTT connection for connector ID: {} (attempt {attempt}/{}): {error}",
                         self.id, self.max_retries
@@ -503,9 +531,22 @@ fn parse_duration(raw: &str, default: Duration, field: &str, id: u32) -> Duratio
     }
 }
 
+fn is_malformed_record_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::InvalidRecord
+            | Error::InvalidRecordValue(_)
+            | Error::InvalidPayloadType
+            | Error::InvalidJsonPayload
+            | Error::InvalidTextPayload
+            | Error::InvalidProtobufPayload
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_connector_sdk::Payload;
 
     fn test_config() -> MqttSinkConfig {
         MqttSinkConfig {
@@ -587,6 +628,53 @@ mod tests {
         sink.finish_unconfirmed_publications(&[true, false]);
 
         assert_eq!(sink.in_flight_publications.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_malformed_dynamic_record_when_preparing_should_publish_valid_siblings() {
+        let mut config = test_config();
+        config.topic_mode = TopicMode::Dynamic;
+        config.fallback_topic = Some("fallback/{stream}/{topic}".to_string());
+        let sink = MqttSink::new(1, config);
+        let metadata = TopicMetadata {
+            stream: "devices".to_string(),
+            topic: "telemetry".to_string(),
+        };
+        let malformed = br#"{
+            "version": 1,
+            "payload_base64": "not base64"
+        }"#;
+        let mut malformed = malformed.to_vec();
+        let malformed = simd_json::to_owned_value(&mut malformed).expect("JSON must parse");
+        let messages = vec![
+            ConsumedMessage {
+                id: 1,
+                offset: 10,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Raw(b"valid".to_vec()),
+            },
+            ConsumedMessage {
+                id: 2,
+                offset: 11,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Json(malformed),
+            },
+        ];
+
+        let publications = sink
+            .prepare_publications(&metadata, messages)
+            .expect("malformed record must not fail the batch");
+
+        assert_eq!(publications.len(), 1);
+        assert_eq!(publications[0].topic, "fallback/devices/telemetry");
+        assert_eq!(publications[0].payload.as_ref(), b"valid");
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
     }
 

@@ -69,3 +69,7 @@ reports the unfinished publication count and returns an error.
 `mqtt.topic` from raw-message headers, or reads the topic, payload, and MQTT 5
 publish properties from the versioned JSON envelope. Missing dynamic topics use
 `fallback_topic`, which defaults to `{stream}/{topic}`.
+
+Malformed records are logged with their Iggy offset and dropped before MQTT
+publication. Valid records in the same batch are still published. The connector
+does not provide a dead-letter queue for dropped records.

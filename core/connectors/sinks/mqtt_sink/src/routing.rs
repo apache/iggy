@@ -120,7 +120,8 @@ pub fn prepare_publication(
         ),
         TopicMode::Dynamic => prepare_dynamic(message, metadata, fallback, protocol)?,
     };
-    validate_topic(&topic, "resolved topic")?;
+    validate_topic(&topic, "resolved topic")
+        .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
     Ok(PreparedPublication {
         topic,
         payload,
@@ -153,16 +154,24 @@ fn prepare_dynamic(
 
     if let Payload::Json(value) = &message.payload {
         let bytes = simd_json::to_vec(value).map_err(|_| Error::InvalidJsonPayload)?;
-        if let Ok(envelope) = serde_json::from_slice::<MqttEnvelope>(&bytes) {
+        let json_value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidJsonPayload)?;
+        let envelope_marked = json_value.as_object().is_some_and(|object| {
+            object.contains_key("version") || object.contains_key("payload_base64")
+        });
+        if envelope_marked {
+            let envelope = serde_json::from_value::<MqttEnvelope>(json_value).map_err(|error| {
+                Error::InvalidRecordValue(format!("invalid MQTT envelope: {error}"))
+            })?;
             // A recognized envelope must not be silently downgraded to MQTT
             // 3.1.1, because that would discard its publish properties.
             if protocol == MqttProtocol::Mqtt311 {
-                return Err(Error::InvalidConfigValue(
+                return Err(Error::InvalidRecordValue(
                     "MQTT envelopes require protocol = mqtt5".to_string(),
                 ));
             }
             if envelope.version != 1 {
-                return Err(Error::InvalidConfigValue(format!(
+                return Err(Error::InvalidRecordValue(format!(
                     "unsupported MQTT envelope version: {}",
                     envelope.version
                 )));
@@ -173,7 +182,7 @@ fn prepare_dynamic(
                 .unwrap_or_else(|| render_template(fallback, metadata));
             let payload =
                 Bytes::from(STANDARD.decode(envelope.payload_base64).map_err(|error| {
-                    Error::InvalidConfigValue(format!(
+                    Error::InvalidRecordValue(format!(
                         "invalid MQTT envelope payload_base64: {error}"
                     ))
                 })?);
@@ -184,7 +193,7 @@ fn prepare_dynamic(
                         .correlation_data_base64
                         .map(|value| {
                             STANDARD.decode(value).map_err(|error| {
-                                Error::InvalidConfigValue(format!(
+                                Error::InvalidRecordValue(format!(
                                     "invalid MQTT envelope correlation_data_base64: {error}"
                                 ))
                             })
@@ -312,5 +321,74 @@ mod tests {
             publication.properties.unwrap().user_properties[0],
             ("device-type".into(), "sensor".into())
         );
+    }
+
+    #[test]
+    fn dynamic_json_envelope_with_invalid_payload_should_return_record_error() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "payload_base64": "not base64"
+        });
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let error = prepare_publication(
+            &message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
+    }
+
+    #[test]
+    fn dynamic_json_envelope_with_invalid_field_type_should_return_record_error() {
+        let payload = serde_json::json!({
+            "version": "one",
+            "payload_base64": "AQID"
+        });
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let error = prepare_publication(
+            &message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidRecordValue(reason) if reason.contains("invalid MQTT envelope"))
+        );
+    }
+
+    #[test]
+    fn dynamic_json_without_envelope_markers_should_use_fallback_topic() {
+        let payload = serde_json::json!({"topic": "ordinary-json", "value": 1});
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let publication = prepare_publication(
+            &message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            Some("fallback/{stream}/{topic}"),
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.topic, "fallback/devices/telemetry");
+        assert!(publication.properties.is_none());
     }
 }
