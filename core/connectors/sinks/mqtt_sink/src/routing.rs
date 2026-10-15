@@ -16,6 +16,7 @@
 // under the License.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use iggy_common::HeaderKey;
 use iggy_connector_sdk::{ConsumedMessage, Error, Payload, TopicMetadata};
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
@@ -39,7 +40,7 @@ pub enum TopicMode {
 #[derive(Debug)]
 pub struct PreparedPublication {
     pub topic: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub properties: Option<PublishProperties>,
 }
 
@@ -109,12 +110,12 @@ pub fn prepare_publication(
                 .filter(|topic| !topic.trim().is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| render_template(template, metadata)),
-            message.payload.try_to_bytes()?,
+            message.payload.try_to_bytes()?.into(),
             None,
         ),
         TopicMode::Template => (
             render_template(template, metadata),
-            message.payload.try_to_bytes()?,
+            message.payload.try_to_bytes()?.into(),
             None,
         ),
         TopicMode::Dynamic => prepare_dynamic(message, metadata, fallback, protocol)?,
@@ -132,7 +133,7 @@ fn prepare_dynamic(
     metadata: &TopicMetadata,
     fallback: &str,
     protocol: MqttProtocol,
-) -> Result<(String, Vec<u8>, Option<PublishProperties>), Error> {
+) -> Result<(String, Bytes, Option<PublishProperties>), Error> {
     // Raw messages can carry only the source topic header. JSON messages may
     // additionally contain the versioned MQTT 5 envelope used by mqtt_source.
     if let Payload::Raw(_) = &message.payload {
@@ -147,7 +148,7 @@ fn prepare_dynamic(
             .map(|value| value.to_string_value())
             .filter(|topic| !topic.trim().is_empty())
             .unwrap_or_else(|| render_template(fallback, metadata));
-        return Ok((topic, message.payload.try_to_bytes()?, None));
+        return Ok((topic, message.payload.try_to_bytes()?.into(), None));
     }
 
     if let Payload::Json(value) = &message.payload {
@@ -170,9 +171,12 @@ fn prepare_dynamic(
                 .topic
                 .filter(|topic| !topic.trim().is_empty())
                 .unwrap_or_else(|| render_template(fallback, metadata));
-            let payload = STANDARD.decode(envelope.payload_base64).map_err(|error| {
-                Error::InvalidConfigValue(format!("invalid MQTT envelope payload_base64: {error}"))
-            })?;
+            let payload =
+                Bytes::from(STANDARD.decode(envelope.payload_base64).map_err(|error| {
+                    Error::InvalidConfigValue(format!(
+                        "invalid MQTT envelope payload_base64: {error}"
+                    ))
+                })?);
             let properties = envelope
                 .properties
                 .map(|properties| -> Result<PublishProperties, Error> {
@@ -208,7 +212,7 @@ fn prepare_dynamic(
 
     Ok((
         render_template(fallback, metadata),
-        message.payload.try_to_bytes()?,
+        message.payload.try_to_bytes()?.into(),
         None,
     ))
 }
@@ -303,7 +307,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(publication.topic, "devices/test/telemetry");
-        assert_eq!(publication.payload, vec![1, 2, 3]);
+        assert_eq!(publication.payload.as_ref(), [1, 2, 3]);
         assert_eq!(
             publication.properties.unwrap().user_properties[0],
             ("device-type".into(), "sensor".into())

@@ -53,6 +53,11 @@ verbose_logging = false
 `PUBACK` and may duplicate messages during retries. `qos = 2` waits for completion
 of the MQTT QoS 2 exchange.
 
+`max_in_flight` bounds the number of publications sent before the connector
+waits for their acknowledgements. It must not exceed `request_capacity`.
+Acknowledgements are correlated by MQTT packet identifier, so they may arrive
+in any order. The connector retries only publications that were not confirmed.
+
 `topic_mode = "static"` uses `topic`. `topic_mode = "template"` renders
 `topic_template` with `{stream}` and `{topic}`. `topic_mode = "dynamic"` reads
 `mqtt.topic` from raw-message headers, or reads the topic, payload, and MQTT 5
