@@ -229,6 +229,37 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
+    public async Task given_primary_refusal_when_the_budget_expires_in_the_next_route_lookup_should_report_not_accepted()
+    {
+        using var cluster = new PollCluster();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var lookups = 0;
+        cluster.OnPrimaryPoll = request => Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED);
+        cluster.OnCoordinator = request =>
+        {
+            if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE && Interlocked.Increment(ref lookups) == 2)
+            {
+                release.Task.GetAwaiter().GetResult();
+            }
+
+            return null;
+        };
+        using var client = await cluster.ConnectAsync();
+        try
+        {
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
+
+            Assert.Equal(VsrError.TRANSIENT_NOT_ACCEPTED, error.StatusCode);
+            Assert.Equal(2, Volatile.Read(ref lookups));
+            Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
+        }
+        finally
+        {
+            release.SetResult();
+        }
+    }
+
+    [Fact]
     public async Task given_poll_waiting_for_connection_when_metadata_commits_should_revalidate_its_cached_route()
     {
         using var cluster = new PollCluster();
