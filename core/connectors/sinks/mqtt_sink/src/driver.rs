@@ -16,13 +16,14 @@
 // under the License.
 
 use rumqttc::v5::{
-    AsyncClient as Mqtt5Client, Event as Mqtt5Event, EventLoop as Mqtt5EventLoop,
-    Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
-    mqttbytes::v5::{PubAckReason, PubCompReason},
+    AsyncClient as Mqtt5Client, ConnectionError as Mqtt5ConnectionError, Event as Mqtt5Event,
+    EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
+    mqttbytes::v5::{ConnectReturnCode as Mqtt5ConnectReturnCode, PubAckReason, PubCompReason},
 };
 use rumqttc::{
-    AsyncClient as Mqtt311Client, Event as Mqtt311Event, EventLoop as Mqtt311EventLoop,
-    Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options, Outgoing,
+    AsyncClient as Mqtt311Client, ConnectionError as Mqtt311ConnectionError, Event as Mqtt311Event,
+    EventLoop as Mqtt311EventLoop, Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
+    Outgoing,
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
@@ -53,6 +54,7 @@ pub struct MqttDriver {
 pub struct PublishWindowError {
     pub confirmed: Vec<usize>,
     pub error: iggy_connector_sdk::Error,
+    pub retryable: bool,
 }
 
 enum DriverEvent {
@@ -68,6 +70,22 @@ enum DriverEvent {
         reason: PubCompReason,
     },
     Other,
+}
+
+#[derive(Debug)]
+enum PublishWindowFailure {
+    BrokerRejected(String),
+    Protocol(String),
+}
+
+impl PublishWindowFailure {
+    fn error(self) -> iggy_connector_sdk::Error {
+        match self {
+            Self::BrokerRejected(message) | Self::Protocol(message) => {
+                iggy_connector_sdk::Error::Connection(message)
+            }
+        }
+    }
 }
 
 struct PublishWindowState {
@@ -91,11 +109,11 @@ impl PublishWindowState {
         self.confirmed.iter().all(|confirmed| *confirmed)
     }
 
-    fn apply(&mut self, event: DriverEvent) -> Result<(), iggy_connector_sdk::Error> {
+    fn apply(&mut self, event: DriverEvent) -> Result<(), PublishWindowFailure> {
         match event {
             DriverEvent::OutgoingPublish(packet_id) => {
                 let Some(index) = self.submitted.pop_front() else {
-                    return Err(iggy_connector_sdk::Error::Connection(
+                    return Err(PublishWindowFailure::Protocol(
                         "received an unexpected MQTT publish packet".to_string(),
                     ));
                 };
@@ -125,7 +143,7 @@ impl PublishWindowState {
                     ) {
                         self.confirmed[index] = true;
                     } else {
-                        return Err(iggy_connector_sdk::Error::Connection(format!(
+                        return Err(PublishWindowFailure::BrokerRejected(format!(
                             "MQTT 5 PUBACK rejected packet ID {packet_id}: {reason:?}"
                         )));
                     }
@@ -138,7 +156,7 @@ impl PublishWindowState {
                     if reason == PubCompReason::Success {
                         self.confirmed[index] = true;
                     } else {
-                        return Err(iggy_connector_sdk::Error::Connection(format!(
+                        return Err(PublishWindowFailure::BrokerRejected(format!(
                             "MQTT 5 PUBCOMP rejected packet ID {packet_id}: {reason:?}"
                         )));
                     }
@@ -289,6 +307,7 @@ impl MqttDriver {
                 return Err(PublishWindowError {
                     confirmed: state.confirmed_indexes(),
                     error,
+                    retryable: true,
                 });
             }
             state.submitted.push_back(index);
@@ -303,6 +322,7 @@ impl MqttDriver {
                     error: iggy_connector_sdk::Error::Connection(
                         "timed out waiting for MQTT publication acknowledgements".to_string(),
                     ),
+                    retryable: true,
                 });
             }
             let event = match timeout(remaining, self.poll_event()).await {
@@ -311,6 +331,7 @@ impl MqttDriver {
                     return Err(PublishWindowError {
                         confirmed: state.confirmed_indexes(),
                         error,
+                        retryable: true,
                     });
                 }
                 Err(_) => {
@@ -319,6 +340,7 @@ impl MqttDriver {
                         error: iggy_connector_sdk::Error::Connection(
                             "timed out waiting for MQTT publication acknowledgements".to_string(),
                         ),
+                        retryable: true,
                     });
                 }
             };
@@ -326,7 +348,8 @@ impl MqttDriver {
             if let Err(error) = state.apply(event) {
                 return Err(PublishWindowError {
                     confirmed: state.confirmed_indexes(),
-                    error,
+                    error: error.error(),
+                    retryable: false,
                 });
             }
         }
@@ -462,12 +485,12 @@ async fn wait_for_connack(
     timeout(connect_timeout, async {
         loop {
             match event_loop.poll().await {
-                Ok(Mqtt311Event::Incoming(Mqtt311Incoming::ConnAck(_))) => return Ok(()),
+                Ok(Mqtt311Event::Incoming(Mqtt311Incoming::ConnAck(connack))) => {
+                    return mqtt311_connack_result(connack.code, id);
+                }
                 Ok(_) => {}
                 Err(error) => {
-                    return Err(iggy_connector_sdk::Error::Connection(format!(
-                        "MQTT 3.1.1 connection failed for connector ID {id}: {error}"
-                    )));
+                    return Err(mqtt311_connection_error(error, id));
                 }
             }
         }
@@ -488,12 +511,12 @@ async fn wait_for_connack_v5(
     timeout(connect_timeout, async {
         loop {
             match event_loop.poll().await {
-                Ok(Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(_))) => return Ok(()),
+                Ok(Mqtt5Event::Incoming(Mqtt5Incoming::ConnAck(connack))) => {
+                    return mqtt5_connack_result(connack.code, id);
+                }
                 Ok(_) => {}
                 Err(error) => {
-                    return Err(iggy_connector_sdk::Error::Connection(format!(
-                        "MQTT 5 connection failed for connector ID {id}: {error}"
-                    )));
+                    return Err(mqtt5_connection_error(error, id));
                 }
             }
         }
@@ -506,11 +529,106 @@ async fn wait_for_connack_v5(
     })?
 }
 
+fn mqtt311_connection_error(error: Mqtt311ConnectionError, id: u32) -> iggy_connector_sdk::Error {
+    match error {
+        Mqtt311ConnectionError::ConnectionRefused(code) => mqtt311_connack_error(code, id),
+        error => iggy_connector_sdk::Error::Connection(format!(
+            "MQTT 3.1.1 connection failed for connector ID {id}: {error}"
+        )),
+    }
+}
+
+fn mqtt311_connack_result(
+    code: rumqttc::mqttbytes::v4::ConnectReturnCode,
+    id: u32,
+) -> Result<(), iggy_connector_sdk::Error> {
+    if code == rumqttc::mqttbytes::v4::ConnectReturnCode::Success {
+        Ok(())
+    } else {
+        Err(mqtt311_connack_error(code, id))
+    }
+}
+
+fn mqtt311_connack_error(
+    code: rumqttc::mqttbytes::v4::ConnectReturnCode,
+    id: u32,
+) -> iggy_connector_sdk::Error {
+    use rumqttc::mqttbytes::v4::ConnectReturnCode;
+
+    match code {
+        ConnectReturnCode::BadUserNamePassword | ConnectReturnCode::NotAuthorized => {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "MQTT 3.1.1 broker rejected authentication for connector ID {id}: {code:?}"
+            ))
+        }
+        ConnectReturnCode::RefusedProtocolVersion | ConnectReturnCode::BadClientId => {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "MQTT 3.1.1 broker rejected connection configuration for connector ID {id}: {code:?}"
+            ))
+        }
+        ConnectReturnCode::ServiceUnavailable => iggy_connector_sdk::Error::Connection(format!(
+            "MQTT 3.1.1 broker is unavailable for connector ID {id}"
+        )),
+        ConnectReturnCode::Success => {
+            unreachable!("success is handled before mapping connection failures")
+        }
+    }
+}
+
+fn mqtt5_connection_error(error: Mqtt5ConnectionError, id: u32) -> iggy_connector_sdk::Error {
+    match error {
+        Mqtt5ConnectionError::ConnectionRefused(code) => mqtt5_connack_error(code, id),
+        error => iggy_connector_sdk::Error::Connection(format!(
+            "MQTT 5 connection failed for connector ID {id}: {error}"
+        )),
+    }
+}
+
+fn mqtt5_connack_result(
+    code: Mqtt5ConnectReturnCode,
+    id: u32,
+) -> Result<(), iggy_connector_sdk::Error> {
+    if code == Mqtt5ConnectReturnCode::Success {
+        Ok(())
+    } else {
+        Err(mqtt5_connack_error(code, id))
+    }
+}
+
+fn mqtt5_connack_error(code: Mqtt5ConnectReturnCode, id: u32) -> iggy_connector_sdk::Error {
+    use Mqtt5ConnectReturnCode::*;
+
+    match code {
+        BadUserNamePassword | NotAuthorized | Banned | BadAuthenticationMethod => {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "MQTT 5 broker rejected authentication for connector ID {id}: {code:?}"
+            ))
+        }
+        RefusedProtocolVersion | UnsupportedProtocolVersion | ClientIdentifierNotValid => {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "MQTT 5 broker rejected connection configuration for connector ID {id}: {code:?}"
+            ))
+        }
+        ServerUnavailable
+        | ServerBusy
+        | UseAnotherServer
+        | ServerMoved
+        | ConnectionRateExceeded
+        | QuotaExceeded => iggy_connector_sdk::Error::Connection(format!(
+            "MQTT 5 broker temporarily rejected connection for connector ID {id}: {code:?}"
+        )),
+        Success => unreachable!("success is handled before mapping connection failures"),
+        _ => iggy_connector_sdk::Error::InitError(format!(
+            "MQTT 5 broker rejected connection for connector ID {id}: {code:?}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use rumqttc::v5::mqttbytes::v5::{PubAckReason, PubCompReason};
+    use rumqttc::v5::mqttbytes::v5::{ConnectReturnCode, PubAckReason, PubCompReason};
 
-    use super::{DriverEvent, PublishWindowState};
+    use super::{DriverEvent, PublishWindowFailure, PublishWindowState, mqtt5_connack_error};
 
     #[test]
     fn given_out_of_order_qos_one_acknowledgements_when_applied_should_confirm_matching_publications()
@@ -599,7 +717,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            iggy_connector_sdk::Error::Connection(message)
+            PublishWindowFailure::BrokerRejected(message)
                 if message.contains("PUBACK rejected")
         ));
         assert!(!state.is_complete());
@@ -620,9 +738,31 @@ mod tests {
 
         assert!(matches!(
             error,
-            iggy_connector_sdk::Error::Connection(message)
+            PublishWindowFailure::BrokerRejected(message)
                 if message.contains("PUBCOMP rejected")
         ));
         assert!(!state.is_complete());
+    }
+
+    #[test]
+    fn given_mqtt_five_authentication_rejection_should_return_configuration_error() {
+        let error = mqtt5_connack_error(ConnectReturnCode::BadUserNamePassword, 1);
+
+        assert!(matches!(
+            error,
+            iggy_connector_sdk::Error::InvalidConfigValue(message)
+                if message.contains("authentication")
+        ));
+    }
+
+    #[test]
+    fn given_mqtt_five_busy_broker_should_return_connection_error() {
+        let error = mqtt5_connack_error(ConnectReturnCode::ServerBusy, 1);
+
+        assert!(matches!(
+            error,
+            iggy_connector_sdk::Error::Connection(message)
+                if message.contains("temporarily rejected")
+        ));
     }
 }
