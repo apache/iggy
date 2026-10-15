@@ -23,13 +23,6 @@ on:
         description: "JSON with checks (component/task entries) and tests (boolean)"
         type: string
         required: true
-      timeout-minutes:
-        type: number
-        default: 60
-      build-metadata:
-        description: "Embed CI build metadata in the server binaries"
-        type: boolean
-        default: false
     secrets:
       CODECOV_TOKEN:
         required: false
@@ -39,7 +32,7 @@ permissions:
   issues: read # live breaking:storage label lookup
 
 env:
-  IGGY_CI_BUILD: ${{ inputs.build-metadata }}
+  IGGY_CI_BUILD: "false"
 
 jobs:
   checks:
@@ -55,7 +48,7 @@ jobs:
       matrix.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-26.04'
       }}
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -105,8 +98,5 @@ jobs:
     name: tests
     if: ${{ fromJSON(inputs.plan).tests }}
     uses: ./.github/workflows/_rust_tests.yml
-    with:
-      timeout-minutes: ${{ inputs.timeout-minutes }}
-      build-metadata: ${{ inputs.build-metadata }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

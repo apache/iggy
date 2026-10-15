@@ -30,11 +30,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Skip noop
-      if: inputs.component == 'noop'
-      shell: bash
-      run: echo "No changes detected, skipping tests"
-
     - name: Setup Rust for BDD
       if: inputs.task == 'bdd-rust'
       uses: ./.github/actions/utils/setup-rust
@@ -42,11 +37,11 @@ runs:
         coverage: "true"
 
     - name: Download runtime binaries
-      if: startsWith(inputs.component, 'bdd-')
       uses: ./.github/actions/utils/download-runtime
+      with:
+        install-system-dependencies: "false"
 
     - name: Run BDD tests
-      if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
       shell: bash
       run: |
         # Extract SDK name from task (format: bdd-<sdk>).
@@ -69,7 +64,7 @@ runs:
         ./scripts/run-bdd-tests.sh "${COVERAGE_ARGS[@]}" "$SDK_NAME"
 
     - name: Clean up Docker resources (BDD)
-      if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
+      if: always()
       shell: bash
       run: |
         ./scripts/run-bdd-tests.sh clean || true

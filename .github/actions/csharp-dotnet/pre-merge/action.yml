@@ -36,6 +36,8 @@ runs:
     - name: Download runtime binaries
       if: startsWith(inputs.task, 'e2e')
       uses: ./.github/actions/utils/download-runtime
+      with:
+        install-system-dependencies: "false"
 
     - name: Restore dependencies
       run: |

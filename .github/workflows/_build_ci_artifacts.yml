@@ -20,7 +20,7 @@ on:
   workflow_call:
     inputs:
       task:
-        description: "Artifact producer: plan, runtime-build or test-build"
+        description: "Artifact producer: runtime-build or test-build"
         type: string
         required: true
       test-scope:
@@ -44,7 +44,7 @@ env:
 
 jobs:
   build:
-    name: ${{ inputs.task == 'plan' && 'select' || 'build' }}
+    name: build
     runs-on: ubuntu-26.04
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
@@ -66,4 +66,4 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           overwrite: true
-          retention-days: 7
+          retention-days: 30

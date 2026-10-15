@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, plan, runtime-build, test-build, test, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, runtime-build, test-build, test, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -57,7 +57,7 @@ runs:
         coverage: ${{ inputs.task == 'runtime-build' || inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
         # libraries. All compiling tasks keep the existing dependency setup.
-        install-system-dependencies: ${{ inputs.task != 'plan' && inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
@@ -66,14 +66,14 @@ runs:
         # reads only (pre-merge save-cache=false), so it cannot churn `dev`;
         # the warm `~/.cargo` restore is a free win, and its 1.95 target
         # artifacts rebuild regardless since the rustc hash differs.
-        shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
+        shared-key: ${{ inputs.task == 'miri' && 'miri' || inputs.task == 'runtime-build' && 'runtime' || 'dev' }}
         # Shards download the build artifact. Metadata-only tasks need no target cache.
-        read-cache: ${{ (inputs.task == 'plan' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
         save-cache: ${{ inputs.save-cache }}
         # Light legs fit in the runner's ~89 GiB default headroom; skip the
         # ~20-45s reclaim. Disk-heavy legs (coverage build + testcontainers
         # images on test jobs, cross-builds, miri, verify-publish) keep it.
-        free-disk-space: ${{ (inputs.task == 'plan' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space: ${{ (inputs.task == 'runtime-build' || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
         free-disk-space-aggressive: ${{ inputs.free-disk-space-aggressive }}
 
     - name: Install cargo-sort
@@ -103,7 +103,7 @@ runs:
     # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
     - name: Plan affected Rust work
       id: rail
-      if: inputs.task == 'plan' && inputs.test-scope == 'affected'
+      if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
 
@@ -174,13 +174,6 @@ runs:
         rm -f "$HOME"/.local/share/keyrings/*
       shell: bash
 
-    - name: Download Rust build selection
-      if: inputs.task == 'runtime-build' || inputs.task == 'test-build'
-      uses: actions/download-artifact@v8
-      with:
-        name: rust-plan-${{ github.run_id }}
-        path: ${{ runner.temp }}/rust-plan
-
     - name: Download runtime binaries
       if: inputs.task == 'test' || inputs.task == 'test-storage-compat'
       uses: ./.github/actions/utils/download-runtime
@@ -188,7 +181,7 @@ runs:
         restore: "false"
 
     - name: Build coverage artifacts
-      if: inputs.task == 'plan' || inputs.task == 'runtime-build' || inputs.task == 'test-build'
+      if: inputs.task == 'runtime-build' || inputs.task == 'test-build'
       env:
         PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         PLAN_STATUS: ${{ steps.rail.outcome }}
@@ -203,87 +196,70 @@ runs:
         fi
         mkdir -p "$ARTIFACT_DIR"
 
-        if [[ "$ARTIFACT_TASK" == plan ]]; then
-          # Both producers consume one validated selection, including the same fallback.
-          SELECTOR_DIR="$RUNNER_TEMP/cargo-rail-selectors"
-          mkdir -p "$SELECTOR_DIR"
-          TEST_CARGO_ARGS=()
-          TEST_TARGET_ARGS=()
-          TEST_PACKAGES=()
-          RUNTIME_PACKAGES=()
-          if [[ "$TEST_SELECTION" == workspace ]]; then
-            TEST_SCOPE=workspace
-            RUNTIME_SCOPE=workspace
-          elif [[ "$TEST_SELECTION" != affected ]]; then
-            echo "::error::Invalid test scope: $TEST_SELECTION"
-            exit 1
-          elif [[ "$PLAN_STATUS" == success ]] &&
-            TEST_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" cargo.test) &&
-            RUNTIME_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" runtime-artifacts) &&
-            cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-args" &&
-            cargo-rail-action plan target-args "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-target-args" &&
-            cargo-rail-action plan package-names "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-packages" &&
-            cargo-rail-action plan package-names "$PLAN_FILE" runtime-artifacts > "$SELECTOR_DIR/runtime-packages"; then
-            # NUL-delimited selectors preserve package and argument boundaries.
-            mapfile -d '' -t TEST_CARGO_ARGS < "$SELECTOR_DIR/test-args"
-            mapfile -d '' -t TEST_TARGET_ARGS < "$SELECTOR_DIR/test-target-args"
-            mapfile -d '' -t TEST_PACKAGES < "$SELECTOR_DIR/test-packages"
-            mapfile -d '' -t RUNTIME_PACKAGES < "$SELECTOR_DIR/runtime-packages"
-          else
-            TEST_SCOPE=workspace
-            RUNTIME_SCOPE=workspace
-            echo "::warning::Cargo-Rail plan unavailable or invalid; running the full workspace"
-          fi
-
-          printf '%s\n' "$TEST_SCOPE" > "$ARTIFACT_DIR/scope"
-          printf '%s\n' "$RUNTIME_SCOPE" > "$ARTIFACT_DIR/runtime-scope"
-          : > "$ARTIFACT_DIR/test-args"
-          : > "$ARTIFACT_DIR/test-target-args"
-          : > "$ARTIFACT_DIR/test-packages"
-          : > "$ARTIFACT_DIR/runtime-packages"
-          if (( ${#TEST_CARGO_ARGS[@]} )); then
-            printf '%s\0' "${TEST_CARGO_ARGS[@]}" > "$ARTIFACT_DIR/test-args"
-          fi
-          if (( ${#TEST_TARGET_ARGS[@]} )); then
-            printf '%s\0' "${TEST_TARGET_ARGS[@]}" > "$ARTIFACT_DIR/test-target-args"
-          fi
-          if (( ${#TEST_PACKAGES[@]} )); then
-            printf '%s\0' "${TEST_PACKAGES[@]}" > "$ARTIFACT_DIR/test-packages"
-          fi
-          if (( ${#RUNTIME_PACKAGES[@]} )); then
-            printf '%s\0' "${RUNTIME_PACKAGES[@]}" > "$ARTIFACT_DIR/runtime-packages"
-          fi
-          git rev-parse HEAD > "$ARTIFACT_DIR/revision"
+        git rev-parse HEAD > "$ARTIFACT_DIR/revision"
+        if [[ "$ARTIFACT_TASK" == runtime-build ]]; then
+          # Workspace target selection keeps the dependency feature graph stable across SDK PRs.
+          cargo build --locked --bin iggy-server --bin iggy
+          RUNTIME_FILES=(target/debug/iggy-server target/debug/iggy)
+          for binary in "${RUNTIME_FILES[@]}"; do
+            if [[ ! -x "$binary" ]]; then
+              echo "::error::Runtime binary missing or not executable: $binary"
+              exit 1
+            fi
+          done
+          tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" "${RUNTIME_FILES[@]}"
           exit 0
         fi
 
-        PLAN_ARTIFACT_DIR="$RUNNER_TEMP/rust-plan"
-        revision=$(git rev-parse HEAD)
-        if [[ "$(cat "$PLAN_ARTIFACT_DIR/revision")" != "$revision" ]]; then
-          echo "::error::Rust build selection does not match checkout $revision"
+        SELECTOR_DIR="$RUNNER_TEMP/cargo-rail-selectors"
+        mkdir -p "$SELECTOR_DIR"
+        TEST_CARGO_ARGS=()
+        TEST_TARGET_ARGS=()
+        TEST_PACKAGES=()
+        RUNTIME_PACKAGES=()
+        if [[ "$TEST_SELECTION" == workspace ]]; then
+          TEST_SCOPE=workspace
+          RUNTIME_SCOPE=workspace
+        elif [[ "$TEST_SELECTION" != affected ]]; then
+          echo "::error::Invalid test scope: $TEST_SELECTION"
           exit 1
+        elif [[ "$PLAN_STATUS" == success ]] &&
+          TEST_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" cargo.test) &&
+          RUNTIME_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" runtime-artifacts) &&
+          cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-args" &&
+          cargo-rail-action plan target-args "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-target-args" &&
+          cargo-rail-action plan package-names "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-packages" &&
+          cargo-rail-action plan package-names "$PLAN_FILE" runtime-artifacts > "$SELECTOR_DIR/runtime-packages"; then
+          # NUL-delimited selectors preserve package and argument boundaries.
+          mapfile -d '' -t TEST_CARGO_ARGS < "$SELECTOR_DIR/test-args"
+          mapfile -d '' -t TEST_TARGET_ARGS < "$SELECTOR_DIR/test-target-args"
+          mapfile -d '' -t TEST_PACKAGES < "$SELECTOR_DIR/test-packages"
+          mapfile -d '' -t RUNTIME_PACKAGES < "$SELECTOR_DIR/runtime-packages"
+        else
+          TEST_SCOPE=workspace
+          RUNTIME_SCOPE=workspace
+          echo "::warning::Cargo-Rail plan unavailable or invalid; running the full workspace"
         fi
-        TEST_SCOPE=$(cat "$PLAN_ARTIFACT_DIR/scope")
-        RUNTIME_SCOPE=$(cat "$PLAN_ARTIFACT_DIR/runtime-scope")
-        mapfile -d '' -t TEST_CARGO_ARGS < "$PLAN_ARTIFACT_DIR/test-args"
-        mapfile -d '' -t TEST_TARGET_ARGS < "$PLAN_ARTIFACT_DIR/test-target-args"
-        mapfile -d '' -t TEST_PACKAGES < "$PLAN_ARTIFACT_DIR/test-packages"
         printf '%s\n' "$TEST_SCOPE" > "$ARTIFACT_DIR/scope"
-        printf '%s\n' "$revision" > "$ARTIFACT_DIR/revision"
-        if [[ "$ARTIFACT_TASK" == runtime-build ]]; then
-          # SDK-only changes still need the server and CLI, even when Rail skips Rust tests.
-          BUILD_ARGS=()
-          if [[ "$RUNTIME_SCOPE" != workspace ]]; then
-            BUILD_ARGS=(-p server -p iggy-cli)
-            if [[ "$RUNTIME_SCOPE" == packages ]]; then
-              mapfile -d '' -t RUNTIME_PACKAGES < "$PLAN_ARTIFACT_DIR/runtime-packages"
-              for package in "${RUNTIME_PACKAGES[@]}"; do
-                if [[ "$package" != server && "$package" != iggy-cli ]]; then
-                  BUILD_ARGS+=(-p "$package")
-                fi
-              done
+        if [[ "$TEST_SCOPE" == skipped ]]; then
+          echo "::notice::Cargo-Rail reports no affected Rust tests"
+          exit 0
+        fi
+
+        # SDKs need only server/CLI. Keep Rust-only binaries and plugins with their tests.
+        BUILD_ARGS=()
+        if [[ "$RUNTIME_SCOPE" == workspace ]]; then
+          BUILD_ARGS=(--workspace --exclude server --exclude iggy-cli)
+        elif [[ "$RUNTIME_SCOPE" == packages ]]; then
+          for package in "${RUNTIME_PACKAGES[@]}"; do
+            if [[ "$package" != server && "$package" != iggy-cli ]]; then
+              BUILD_ARGS+=(-p "$package")
             fi
-          fi
+          done
+        fi
+
+        : > "$ARTIFACT_DIR/runtime-files"
+        if (( ${#BUILD_ARGS[@]} )); then
           cargo build --locked "${BUILD_ARGS[@]}" --message-format=json-render-diagnostics > "$ARTIFACT_DIR/build.jsonl"
           jq -r 'select(.reason == "compiler-artifact") |
             (select(.target.kind | index("bin")) | .executable // empty),
@@ -292,21 +268,10 @@ runs:
             while IFS= read -r artifact; do
               realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
             done > "$ARTIFACT_DIR/runtime-files"
-          for binary in target/debug/iggy-server target/debug/iggy; do
-            if [[ ! -x "$binary" ]]; then
-              echo "::error::Runtime binary missing or not executable: $binary"
-              exit 1
-            fi
-          done
-          xargs -d '\n' sha256sum < "$ARTIFACT_DIR/runtime-files" > "$ARTIFACT_DIR/SHA256SUMS"
-          tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
-          rm "$ARTIFACT_DIR/build.jsonl" "$ARTIFACT_DIR/runtime-files"
-          exit 0
+          rm "$ARTIFACT_DIR/build.jsonl"
         fi
-        if [[ "$TEST_SCOPE" == "skipped" ]]; then
-          echo "::notice::Cargo-Rail reports no affected Rust tests"
-          exit 0
-        fi
+        tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
+        rm "$ARTIFACT_DIR/runtime-files"
 
         # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
         # wire fixtures. Master always generates them. On PRs, use the selected
@@ -446,6 +411,7 @@ runs:
         # nextest can archive non-test binaries with dev-dependency features.
         # Restore the shared runtime last so every suite executes the same binaries.
         tar --zstd -xf "$ARTIFACT_DIR/nextest.tar.zst"
+        tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
         ./scripts/ci/restore-runtime.sh "$RUNNER_TEMP/rust-runtime"
         cargo nextest run \
           --cargo-metadata target/nextest/cargo-metadata.json \

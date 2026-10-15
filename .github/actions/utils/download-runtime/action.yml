@@ -22,11 +22,15 @@ inputs:
   restore:
     description: Extract and verify the archive after downloading
     default: "true"
+  install-system-dependencies:
+    description: Install libraries for running the binaries on the host
+    default: "true"
 
 runs:
   using: composite
   steps:
     - name: Install runtime libraries
+      if: inputs.install-system-dependencies == 'true'
       shell: bash
       run: |
         missing=()

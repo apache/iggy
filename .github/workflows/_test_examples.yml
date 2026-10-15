@@ -23,9 +23,6 @@ on:
         type: string
         required: true
         description: "Selected component/task entries"
-      fail-fast:
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -35,7 +32,7 @@ jobs:
   run:
     name: ${{ matrix.name || matrix.task }}
     strategy:
-      fail-fast: ${{ inputs.fail-fast }}
+      fail-fast: true
       matrix: ${{ fromJSON(inputs.matrix) }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60

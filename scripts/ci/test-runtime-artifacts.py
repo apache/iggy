@@ -17,7 +17,6 @@
 
 """Exercise runtime archive transfer and CI selection without compiling the workspace."""
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -58,11 +57,6 @@ class RuntimeArtifacts(unittest.TestCase):
 
     def pack(self):
         (self.artifact / "revision").write_text(self.revision + "\n")
-        checksums = "".join(
-            f"{hashlib.sha256((self.producer / name).read_bytes()).hexdigest()}  {name}\n"
-            for name in self.files
-        )
-        (self.artifact / "SHA256SUMS").write_text(checksums)
         result = run("tar", "--zstd", "-cf", str(self.artifact / "runtime.tar.zst"),
                      *self.files, cwd=self.producer)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -94,11 +88,11 @@ class RuntimeArtifacts(unittest.TestCase):
         self.assertIn("does not match checkout", result.stdout)
         self.assertEqual(binary.read_text(), "existing binary")
 
-    def test_corrupted_binary_fails_checksum_validation(self):
-        (self.artifact / "SHA256SUMS").write_text("0" * 64 + "  " + self.files[0] + "\n")
+    def test_corrupted_archive_is_rejected(self):
+        (self.artifact / "runtime.tar.zst").write_bytes(b"invalid archive")
         result = self.restore()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("FAILED", result.stdout)
+        self.assertFalse((self.consumer / self.files[0]).exists())
 
     def test_missing_cli_is_not_accepted_as_a_complete_runtime(self):
         self.files.pop()
@@ -122,7 +116,7 @@ class RuntimeArtifacts(unittest.TestCase):
                          (self.producer / self.files[0]).read_bytes())
 
 
-class RuntimePlan(unittest.TestCase):
+class RuntimeBuildSelection(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -130,25 +124,45 @@ class RuntimePlan(unittest.TestCase):
         action = yaml.safe_load((REPO_ROOT / ".github/actions/rust/pre-merge/action.yml").read_text())
         self.script = next(step["run"] for step in action["runs"]["steps"]
                            if step.get("name") == "Build coverage artifacts")
-        self.env = dict(os.environ, RUNNER_TEMP=str(self.root), ARTIFACT_TASK="plan",
-                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="")
-        self.env["GIT_DIR"] = run("git", "rev-parse", "--absolute-git-dir").stdout.strip()
-
-    def plan(self):
-        return run("bash", "-euo", "pipefail", "-c", self.script, cwd=self.root, env=self.env)
+        self.revision = run("git", "rev-parse", "HEAD").stdout.strip()
+        self.env = dict(os.environ, RUNNER_TEMP=str(self.root), ARTIFACT_TASK="test-build",
+                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="",
+                        GITHUB_WORKSPACE=str(self.root), PATH=f"{self.root}:{os.environ['PATH']}")
+        git = self.root / "git"
+        git.write_text(f"#!/bin/sh\ncase $1 in\n  rev-parse) echo {self.revision} ;;\n  cat-file) echo 'parent fixture' ;;\n  *) exit 1 ;;\nesac\n")
+        git.chmod(0o755)
+        cargo = self.root / "cargo"
+        cargo.write_text("""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+with (Path(os.environ['RUNNER_TEMP']) / 'cargo-calls').open('a') as calls:
+    calls.write(json.dumps(sys.argv[1:]) + '\\n')
+if sys.argv[1:3] == ['nextest', 'archive']:
+    Path(sys.argv[sys.argv.index('--archive-file') + 1]).touch()
+""")
+        cargo.chmod(0o755)
+        generator = self.root / "gateways/kafka/scripts/ci-wire-fixtures.sh"
+        generator.parent.mkdir(parents=True)
+        generator.write_text("#!/bin/sh\nmkdir -p gateways/kafka/tools/kafka-tool/kafka_messages\n")
+        generator.chmod(0o755)
 
     def assert_workspace_fallback(self):
-        result = self.plan()
+        result = run("bash", "-euo", "pipefail", "-c", self.script, cwd=self.root, env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        artifact = self.root / "rust-plan"
+        artifact = self.root / "rust-test-build"
         self.assertEqual((artifact / "scope").read_text(), "workspace\n")
-        self.assertEqual((artifact / "runtime-scope").read_text(), "workspace\n")
-        for name in ("test-args", "test-target-args", "test-packages", "runtime-packages"):
-            self.assertEqual((artifact / name).read_bytes(), b"", name)
-        self.assertEqual((artifact / "revision").read_text().strip(),
-                         run("git", "rev-parse", "HEAD").stdout.strip())
+        self.assertEqual((artifact / "revision").read_text().strip(), self.revision)
+        calls = [json.loads(line) for line in (self.root / "cargo-calls").read_text().splitlines()]
+        self.assertEqual(calls[0], ["build", "--locked", "--workspace", "--exclude", "server",
+                                   "--exclude", "iggy-cli", "--message-format=json-render-diagnostics"])
+        self.assertEqual(calls[1], ["nextest", "archive", "--locked", "--profile", "ci",
+                                   "--archive-file", str(artifact / "nextest.tar.zst")])
+        self.assertTrue((artifact / "runtime.tar.zst").is_file())
+        self.assertEqual((artifact / "kafka-fixtures").read_text(), "true\n")
 
-    def test_planner_failure_selects_workspace_for_both_producers(self):
+    def test_planner_failure_builds_all_test_extras_and_tests(self):
         self.assert_workspace_fallback()
 
     def test_explicit_workspace_selection_does_not_need_a_planner(self):
@@ -167,18 +181,8 @@ case "$2:$4" in
 esac
 """)
         selector.chmod(0o755)
-        self.env.update(PLAN_STATUS="success", PATH=f"{self.root}:{os.environ['PATH']}")
+        self.env["PLAN_STATUS"] = "success"
         self.assert_workspace_fallback()
-
-    def test_both_producers_reject_a_plan_for_another_revision(self):
-        self.assert_workspace_fallback()
-        (self.root / "rust-plan/revision").write_text("0" * 40 + "\n")
-        for task in ("runtime-build", "test-build"):
-            with self.subTest(task=task):
-                self.env["ARTIFACT_TASK"] = task
-                result = self.plan()
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Rust build selection does not match checkout", result.stdout)
 
 
 class RuntimeSelection(unittest.TestCase):
@@ -195,6 +199,20 @@ class RuntimeSelection(unittest.TestCase):
             result = run("node", "-e", "const context = {eventName: 'pull_request'};\n" + script, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+    def test_component_config_change_runs_selection_validation(self):
+        outputs = self.select([".github/config/components.yml"])
+        self.assertIn(("ci-workflows", "validate"),
+                      [(entry["component"], entry["task"])
+                       for entry in json.loads(outputs["other_matrix"])["include"]])
+
+    def test_runtime_restore_change_exercises_real_consumers(self):
+        outputs = self.select(["scripts/ci/restore-runtime.sh"])
+        self.assertEqual(outputs["runtime"], "true")
+        self.assertTrue(json.loads(outputs["rust_plan"])["tests"])
+        self.assertIn(("ci-workflows", "validate"),
+                      [(entry["component"], entry["task"])
+                       for entry in json.loads(outputs["other_matrix"])["include"]])
 
     def test_python_only_change_builds_runtime_without_rust_tests(self):
         outputs = self.select(["foreign/python/src/lib.rs"])

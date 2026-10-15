@@ -53,18 +53,9 @@ jobs:
     name: Detect changes
     uses: ./.github/workflows/_detect.yml
 
-  rust-plan:
-    name: Rust selection
-    needs: detect
-    if: needs.detect.outputs.runtime == 'true'
-    uses: ./.github/workflows/_build_ci_artifacts.yml
-    with:
-      task: plan
-      timeout-minutes: 10
-
   runtime:
     name: Runtime binaries
-    needs: [detect, rust-plan]
+    needs: detect
     if: needs.detect.outputs.runtime == 'true'
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
@@ -72,7 +63,7 @@ jobs:
 
   rust-test-build:
     name: Rust test artifacts
-    needs: [detect, rust-plan]
+    needs: detect
     if: needs.detect.outputs.rust_plan != '' && fromJSON(needs.detect.outputs.rust_plan).tests
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
@@ -210,7 +201,7 @@ jobs:
   finalize_pr:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 5
-    needs: [common, detect, rust-plan, runtime, rust-test-build, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
+    needs: [common, detect, runtime, rust-test-build, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
       - name: Get job execution times
@@ -234,7 +225,7 @@ jobs:
               go: 'Go', java: 'Java', csharp: 'C#', cpp: 'C++', swift: 'Swift',
               bdd: 'BDD', examples: 'Examples', other: 'Other',
               common: 'Common checks', detect: 'Detect changes', runtime: 'Runtime binaries',
-              rust_plan: 'Rust selection', rust_test_build: 'Rust test artifacts',
+              rust_test_build: 'Rust test artifacts',
             };
             for (const [key, group] of Object.entries(groups)) {
               const completed = jobs.filter(job =>
@@ -324,8 +315,6 @@ jobs:
 
           runtime_status=$(format_status "${{ needs.runtime.result }}" "${{ steps.times.outputs.runtime_time }}")
           echo "| Runtime binaries | $runtime_status | ${{ steps.times.outputs.runtime_time }} |" >> "$GITHUB_STEP_SUMMARY"
-          rust_plan_status=$(format_status "${{ needs.rust-plan.result }}" "${{ steps.times.outputs.rust_plan_time }}")
-          echo "| Rust selection | $rust_plan_status | ${{ steps.times.outputs.rust_plan_time }} |" >> "$GITHUB_STEP_SUMMARY"
           rust_test_build_status=$(format_status "${{ needs.rust-test-build.result }}" "${{ steps.times.outputs.rust_test_build_time }}")
           echo "| Rust test artifacts | $rust_test_build_status | ${{ steps.times.outputs.rust_test_build_time }} |" >> "$GITHUB_STEP_SUMMARY"
 
@@ -361,7 +350,6 @@ jobs:
           # Check for failures
           if [[ "${{ needs.common.result }}" == "failure" ]] || \
              [[ "${{ needs.detect.result }}" == "failure" ]] || \
-             [[ "${{ needs.rust-plan.result }}" == "failure" ]] || \
              [[ "${{ needs.runtime.result }}" == "failure" ]] || \
              [[ "${{ needs.rust-test-build.result }}" == "failure" ]] || \
              [[ "${{ needs.test-rust.result }}" == "failure" ]] || \
@@ -381,7 +369,6 @@ jobs:
             exit 1
           elif [[ "${{ needs.common.result }}" == "cancelled" ]] || \
                [[ "${{ needs.detect.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.rust-plan.result }}" == "cancelled" ]] || \
                [[ "${{ needs.runtime.result }}" == "cancelled" ]] || \
                [[ "${{ needs.rust-test-build.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-rust.result }}" == "cancelled" ]] || \

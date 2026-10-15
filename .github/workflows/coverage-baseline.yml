@@ -79,29 +79,19 @@ jobs:
           >> "$GITHUB_OUTPUT"
         shell: bash
 
-  rust-plan:
-    name: Rust selection
+  runtime:
+    name: Runtime binaries
     needs: detect
     if: contains(toJSON(needs.detect.outputs), 'true')
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
-      task: plan
-      test-scope: ${{ needs.detect.outputs.rust == 'true' && 'workspace' || 'affected' }}
-      timeout-minutes: 10
-
-  runtime:
-    name: Runtime binaries
-    needs: [detect, rust-plan]
-    if: contains(toJSON(needs.detect.outputs), 'true')
-    uses: ./.github/workflows/_build_ci_artifacts.yml
-    with:
       task: runtime-build
-      test-scope: ${{ needs.detect.outputs.rust == 'true' && 'workspace' || 'affected' }}
+      save-cache: true
       build-metadata: true
 
   rust-test-build:
     name: Rust test artifacts
-    needs: [detect, rust-plan]
+    needs: detect
     if: needs.detect.outputs.rust == 'true'
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
@@ -116,7 +106,6 @@ jobs:
     if: needs.detect.outputs.rust == 'true'
     permissions:
       contents: read
-      issues: read
     uses: ./.github/workflows/_rust_tests.yml
     with:
       timeout-minutes: 120
@@ -203,6 +192,8 @@ jobs:
 
       - name: Download runtime binaries
         uses: ./.github/actions/utils/download-runtime
+        with:
+          install-system-dependencies: "false"
 
       - name: Build Iggy server Docker image
         id: docker_build
@@ -265,6 +256,7 @@ jobs:
           exit "$result"
 
       - name: Upload to Codecov
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

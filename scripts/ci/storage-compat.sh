@@ -23,11 +23,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 
 # storage-compat.sh -- Prove HEAD still reads a data directory written by master.
 #
-# Builds two iggy-server binaries and hands both to one integration test:
+# Supplies two iggy-server binaries to one integration test:
 #   baseline  built from --baseline-ref, copied aside. Default: on a
 #             pull_request run, the master tip under the checked-out merge ref;
 #             anywhere else, origin/master.
-#   HEAD      built from the working tree, left at target/debug/iggy-server
+#   HEAD      restored from the CI runtime archive, or built locally from HEAD
 # The test boots the baseline, seeds a data directory, swaps the binary to HEAD
 # and restarts against that same directory.
 #
@@ -72,10 +72,10 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [--baseline-ref <ref>] [--rebuild-baseline] [--runtime-artifacts <directory>]"
       echo ""
       echo "Options:"
-      echo "  --baseline-ref <ref>  Ref to build the baseline server from (default: the merge ref's"
-      echo "                        first parent on a pull_request run, origin/master otherwise)"
-      echo "  --runtime-artifacts  Use a revision-checked CI runtime archive for HEAD"
-      echo "  --rebuild-baseline    Rebuild the baseline even when its binary is already on disk"
+      echo "  --baseline-ref <ref>              Ref to build the baseline server from (default: the merge ref's"
+      echo "                                    first parent on a pull_request run, origin/master otherwise)"
+      echo "  --runtime-artifacts <directory>   Use a revision-checked CI runtime archive for HEAD"
+      echo "  --rebuild-baseline                Rebuild the baseline even when its binary is already on disk"
       exit 0
       ;;
     *)
