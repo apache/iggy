@@ -33,9 +33,13 @@ use rumqttc::QoS as MqttQos;
 use secrecy::SecretString;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
 
 use driver::{MqttDriver, MqttProtocol};
 use routing::{TopicMode, prepare_publication, validate_topic};
@@ -46,6 +50,7 @@ const CONNECTOR_NAME: &str = "MQTT sink";
 const DEFAULT_BROKER_URL: &str = "mqtt://127.0.0.1:1883";
 const DEFAULT_KEEP_ALIVE: &str = "30s";
 const DEFAULT_PUBLISH_TIMEOUT: &str = "30s";
+const DEFAULT_SHUTDOWN_TIMEOUT: &str = "30s";
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_MAX_RETRY_DELAY: &str = "30s";
 const DEFAULT_TOPIC: &str = "iggy.messages";
@@ -75,6 +80,7 @@ pub struct MqttSinkConfig {
     pub keep_alive: Option<String>,
     pub request_capacity: Option<usize>,
     pub publish_timeout: Option<String>,
+    pub shutdown_timeout: Option<String>,
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
     pub max_retry_delay: Option<String>,
@@ -100,6 +106,7 @@ pub struct MqttSink {
     config: MqttSinkConfig,
     keep_alive: Duration,
     publish_timeout: Duration,
+    shutdown_timeout: Duration,
     retry_delay: Duration,
     max_retry_delay: Duration,
     max_retries: u32,
@@ -109,6 +116,7 @@ pub struct MqttSink {
     publish_lock: Mutex<()>,
     messages_published: AtomicU64,
     publish_errors: AtomicU64,
+    in_flight_publications: AtomicU64,
 }
 
 impl MqttSink {
@@ -126,6 +134,15 @@ impl MqttSink {
                 .unwrap_or(DEFAULT_PUBLISH_TIMEOUT),
             Duration::from_secs(30),
             "publish_timeout",
+            id,
+        );
+        let shutdown_timeout = parse_duration(
+            config
+                .shutdown_timeout
+                .as_deref()
+                .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT),
+            Duration::from_secs(30),
+            "shutdown_timeout",
             id,
         );
         let retry_delay = parse_duration(
@@ -158,6 +175,7 @@ impl MqttSink {
             config,
             keep_alive,
             publish_timeout,
+            shutdown_timeout,
             retry_delay,
             max_retry_delay: max_retry_delay.max(retry_delay),
             max_retries,
@@ -166,6 +184,7 @@ impl MqttSink {
             publish_lock: Mutex::new(()),
             messages_published: AtomicU64::new(0),
             publish_errors: AtomicU64::new(0),
+            in_flight_publications: AtomicU64::new(0),
         }
     }
 
@@ -217,6 +236,26 @@ impl MqttSink {
             .unwrap_or_else(|| format!("iggy-mqtt-sink-{}", self.id))
     }
 
+    async fn connect_driver(&self) -> Result<MqttDriver, Error> {
+        MqttDriver::connect(
+            self.id,
+            &self.config,
+            self.client_id(),
+            self.keep_alive,
+            self.publish_timeout,
+            self.config.request_capacity.unwrap_or(32),
+            self.max_in_flight,
+        )
+        .await
+    }
+
+    fn finish_unconfirmed_publications(&self, confirmed: &[bool]) {
+        let unfinished = confirmed.iter().filter(|confirmed| !**confirmed).count() as u64;
+        self.in_flight_publications
+            .fetch_sub(unfinished, Ordering::Relaxed);
+        self.publish_errors.fetch_add(unfinished, Ordering::Relaxed);
+    }
+
     async fn publish_messages(
         &self,
         topic_metadata: &TopicMetadata,
@@ -239,16 +278,31 @@ impl MqttSink {
                 self.config.protocol,
             )?);
         }
-        let mut driver = self
-            .driver
-            .lock()
-            .await
-            .take()
-            .ok_or_else(|| Error::InitError("MQTT driver is not initialized".into()))?;
         let mut confirmed = vec![false; publications.len()];
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
+        self.in_flight_publications
+            .fetch_add(publications.len() as u64, Ordering::Relaxed);
+        let mut driver = self.driver.lock().await.take();
+
+        for attempts in 1..=self.max_retries {
+            let mut active_driver = match driver.take() {
+                Some(driver) => driver,
+                None => match self.connect_driver().await {
+                    Ok(reconnected) => reconnected,
+                    Err(error) if attempts == self.max_retries => {
+                        self.finish_unconfirmed_publications(&confirmed);
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Retrying MQTT connection for connector ID: {} (attempt {attempts}/{}): {error}",
+                            self.id, self.max_retries
+                        );
+                        let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                },
+            };
             let pending_indices: Vec<usize> = confirmed
                 .iter()
                 .enumerate()
@@ -261,18 +315,26 @@ impl MqttSink {
                     .iter()
                     .map(|&index| &publications[index])
                     .collect();
-                match driver
+                match active_driver
                     .publish_window(&window, qos, self.config.retain, self.publish_timeout)
                     .await
                 {
                     Ok(window_confirmed) => {
                         for local_index in window_confirmed {
-                            confirmed[window_indices[local_index]] = true;
+                            let index = window_indices[local_index];
+                            if !confirmed[index] {
+                                confirmed[index] = true;
+                                self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     Err(window_error) => {
                         for local_index in window_error.confirmed {
-                            confirmed[window_indices[local_index]] = true;
+                            let index = window_indices[local_index];
+                            if !confirmed[index] {
+                                confirmed[index] = true;
+                                self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
+                            }
                         }
                         failure = Some(window_error.error);
                         break;
@@ -281,7 +343,7 @@ impl MqttSink {
             }
 
             if failure.is_none() {
-                *self.driver.lock().await = Some(driver);
+                *self.driver.lock().await = Some(active_driver);
                 return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64);
             }
 
@@ -289,25 +351,28 @@ impl MqttSink {
                 continue;
             };
             if attempts >= self.max_retries {
-                self.publish_errors.fetch_add(
-                    confirmed.iter().filter(|confirmed| !**confirmed).count() as u64,
-                    Ordering::Relaxed,
-                );
-                *self.driver.lock().await = Some(driver);
+                self.finish_unconfirmed_publications(&confirmed);
                 return Err(error);
             }
 
             warn!(
-                "Retrying MQTT publish window for connector ID: {} (attempt {attempts}/{}): {error}",
-                self.id, self.max_retries
+                "Discarding uncertain MQTT connection for connector ID: {} before retry {}/{}: {error}",
+                self.id,
+                attempts + 1,
+                self.max_retries
             );
-            if let Err(reconnect_error) = driver.reconnect().await {
-                *self.driver.lock().await = Some(driver);
-                return Err(reconnect_error);
-            }
+            // The broker can accept a publication before its acknowledgement is
+            // lost. Dropping this event loop prevents its late acknowledgements
+            // from matching packet identifiers that a replacement connection reuses.
+            drop(active_driver);
             let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
             tokio::time::sleep(delay).await;
         }
+
+        self.finish_unconfirmed_publications(&confirmed);
+        Err(Error::Connection(
+            "MQTT publication retries ended without a terminal error".to_string(),
+        ))
     }
 }
 
@@ -321,23 +386,12 @@ impl Sink for MqttSink {
             ));
         }
         let qos = self.qos()?;
-        let client_id = self.client_id();
         // Connection establishment waits for CONNACK, so a successful open
         // means the broker accepted the session rather than only queueing a
         // local rumqttc request.
         let mut driver = None;
         for attempt in 1..=self.max_retries {
-            match MqttDriver::connect(
-                self.id,
-                &self.config,
-                client_id.clone(),
-                self.keep_alive,
-                self.publish_timeout,
-                self.config.request_capacity.unwrap_or(32),
-                self.max_in_flight,
-            )
-            .await
-            {
+            match self.connect_driver().await {
                 Ok(connected) => {
                     driver = Some(connected);
                     break;
@@ -391,16 +445,49 @@ impl Sink for MqttSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        // Taking the driver out prevents new publication work from borrowing
-        // it while the event loop is being drained and disconnected.
-        if let Some(mut driver) = self.driver.lock().await.take() {
-            driver.disconnect(self.publish_timeout).await?;
+        let shutdown_started = Instant::now();
+        let _publish_guard = timeout(self.shutdown_timeout, self.publish_lock.lock())
+            .await
+            .map_err(|_| {
+                let unfinished = self.in_flight_publications.load(Ordering::Relaxed);
+                error!(
+                    "MQTT shutdown timed out for connector ID: {} with {unfinished} unfinished publications",
+                    self.id
+                );
+                Error::Connection(format!(
+                    "MQTT shutdown timed out with {unfinished} unfinished publications"
+                ))
+            })?;
+        let remaining = self
+            .shutdown_timeout
+            .saturating_sub(shutdown_started.elapsed());
+        let driver = self.driver.lock().await.take();
+        if let Some(mut driver) = driver {
+            if remaining.is_zero() {
+                error!(
+                    "MQTT shutdown timed out for connector ID: {} before disconnecting",
+                    self.id
+                );
+                return Err(Error::Connection(
+                    "MQTT shutdown timed out before disconnecting".to_string(),
+                ));
+            }
+            timeout(remaining, driver.disconnect(remaining))
+                .await
+                .map_err(|_| {
+                    error!(
+                        "MQTT shutdown timed out for connector ID: {} while disconnecting",
+                        self.id
+                    );
+                    Error::Connection("MQTT shutdown timed out while disconnecting".to_string())
+                })??;
         }
         info!(
-            "Closed {CONNECTOR_NAME} connector ID: {} processed {} messages with {} errors",
+            "Closed {CONNECTOR_NAME} connector ID: {} processed {} messages with {} errors and {} unfinished publications",
             self.id,
             self.messages_published.load(Ordering::Relaxed),
-            self.publish_errors.load(Ordering::Relaxed)
+            self.publish_errors.load(Ordering::Relaxed),
+            self.in_flight_publications.load(Ordering::Relaxed)
         );
         Ok(())
     }
@@ -436,6 +523,7 @@ mod tests {
             keep_alive: Some("30s".to_string()),
             request_capacity: Some(32),
             publish_timeout: Some("5s".to_string()),
+            shutdown_timeout: Some("5s".to_string()),
             max_retries: Some(3),
             retry_delay: Some("1s".to_string()),
             max_retry_delay: Some("30s".to_string()),
@@ -492,6 +580,27 @@ mod tests {
     }
 
     #[test]
+    fn given_unconfirmed_publications_when_finishing_should_clear_and_report_them() {
+        let sink = MqttSink::new(1, test_config());
+        sink.in_flight_publications.store(1, Ordering::Relaxed);
+
+        sink.finish_unconfirmed_publications(&[true, false]);
+
+        assert_eq!(sink.in_flight_publications.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_no_active_driver_when_closed_should_release_sink() {
+        let mut sink = MqttSink::new(1, test_config());
+        let runtime = tokio::runtime::Runtime::new().expect("runtime must start");
+
+        runtime
+            .block_on(sink.close())
+            .expect("sink without a driver must close");
+    }
+
+    #[test]
     fn given_minimal_json_when_deserialized_should_apply_defaults() {
         let config: MqttSinkConfig = serde_json::from_str("{}").unwrap();
         let sink = MqttSink::new(1, config);
@@ -499,5 +608,6 @@ mod tests {
         assert_eq!(sink.config.topic.as_deref(), Some(DEFAULT_TOPIC));
         assert_eq!(sink.config.qos, 1);
         assert_eq!(sink.max_in_flight, 1);
+        assert_eq!(sink.shutdown_timeout, Duration::from_secs(30));
     }
 }

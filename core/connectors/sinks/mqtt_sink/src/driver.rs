@@ -412,34 +412,6 @@ impl MqttDriver {
         }
     }
 
-    pub async fn reconnect(&mut self) -> Result<(), iggy_connector_sdk::Error> {
-        // rumqttc reconnects when the existing event loop is polled. Keeping the
-        // event loop and its pending QoS state is important for duplicate-safe retry.
-        match &mut self.connection {
-            MqttConnection::Mqtt311 { event_loop, .. } => {
-                timeout(Duration::from_secs(30), event_loop.poll())
-                    .await
-                    .map_err(|_| {
-                        iggy_connector_sdk::Error::Connection(
-                            "timed out while reconnecting to MQTT broker".to_string(),
-                        )
-                    })?
-                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-            }
-            MqttConnection::Mqtt5 { event_loop, .. } => {
-                timeout(Duration::from_secs(30), event_loop.poll())
-                    .await
-                    .map_err(|_| {
-                        iggy_connector_sdk::Error::Connection(
-                            "timed out while reconnecting to MQTT broker".to_string(),
-                        )
-                    })?
-                    .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string()))?;
-            }
-        }
-        Ok(())
-    }
-
     pub async fn disconnect(
         &mut self,
         disconnect_timeout: Duration,
@@ -582,6 +554,18 @@ mod tests {
         state.apply(DriverEvent::OutgoingPublish(0)).unwrap();
 
         assert!(state.is_complete());
+    }
+
+    #[test]
+    fn given_stale_acknowledgement_when_new_window_reuses_packet_id_should_not_confirm_publication()
+    {
+        let mut state = PublishWindowState::new(1, rumqttc::QoS::AtLeastOnce);
+
+        state.apply(DriverEvent::PubAck(71)).unwrap();
+        state.submitted.push_back(0);
+        state.apply(DriverEvent::OutgoingPublish(71)).unwrap();
+
+        assert!(!state.is_complete());
     }
 
     #[test]
