@@ -201,11 +201,25 @@ actor ClientCore {
                 // request does it.
                 throw failure
             }
+            if !replay {
+                // The request was written and lost, as `RetryOutcome::for_reconnect`
+                // in the Rust SDK records it: no later answer proves it never
+                // committed, so a refused replay is not stamped afresh.
+                outcome.markUncertain()
+            }
             let epoch = failedEpoch
-            let reconnected: Void? = try await withDeadline(deadline) { [self] in
-                // The retried sign-in is the sign-in: the reconnect must not
-                // run another one ahead of it.
-                try await self.reconnect(failedEpoch: epoch, skipAutoLogin: isLogin, cause: error)
+            let reconnected: Void?
+            do {
+                reconnected = try await withDeadline(deadline) { [self] in
+                    // The retried sign-in is the sign-in: the reconnect must not
+                    // run another one ahead of it.
+                    try await self.reconnect(failedEpoch: epoch, skipAutoLogin: isLogin, cause: error)
+                }
+            } catch let reconnectError as IggyError {
+                if !replay {
+                    throw IggyError(.transientNotCommitted, context: "command \(code) may have committed before the reconnect failed: \(reconnectError)")
+                }
+                throw outcome.observe(reconnectError)
             }
             guard reconnected != nil else {
                 throw IggyError(failure.code, context: "the request deadline passed while reconnecting after: \(error)")
@@ -1249,6 +1263,11 @@ actor ClientCore {
 /// proof that re-issuing the request under a new session is safe.
 struct RetryOutcome {
     private(set) var isUncertain = false
+
+    /// Records an attempt that was written and lost with its connection.
+    mutating func markUncertain() {
+        isUncertain = true
+    }
 
     mutating func observe(_ error: IggyError) -> IggyError {
         if error.code == .requestTooOld {

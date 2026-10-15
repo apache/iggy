@@ -541,6 +541,53 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// The first attempt was written before its connection went, so a replay
+    /// the resumed session keeps refusing may still have committed: it is
+    /// reported as unknown, never stamped afresh under a new request id.
+    @Test func aRefusedResumedReplayIsNotStampedAfresh() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let once = Locked(true)
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .deleteStream {
+                return once.exchange(false) ? .close : .status(IggyErrorCode.transientNotAccepted.rawValue)
+            }
+            return .ok([])
+        }
+        let client = makeClient(server, requestTimeout: ClientCore.transientFailoverCheckInterval + .seconds(1))
+        try await client.connect()
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+        let attempts = await server.requests.filter { $0.operation == .deleteStream }.map(\.requestID)
+        #expect(attempts.count > 2)
+        #expect(Set(attempts).count == 1)
+        #expect(await codes(server).filter { $0 == CommandCode.bindSession.rawValue }.count == 1)
+        await client.shutdown()
+    }
+
+    /// A reconnect that fails after the request was written leaves its
+    /// outcome unknown; the reconnect's own error must not hide that.
+    @Test func aFailedReconnectKeepsTheUnknownOutcome() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let registers = Locked(0)
+        await server.respond { request in
+            if request.code == CommandCode.bindSession.rawValue { return .status(IggyErrorCode.unauthenticated.rawValue) }
+            if request.operation == .register {
+                let first = registers.withLock {
+                    $0 += 1; return $0 == 1
+                }
+                return first ? .ok(FakeVSRServer.registerBody()) : .status(IggyErrorCode.invalidCredentials.rawValue)
+            }
+            return request.operation == .deleteStream ? .close : .ok([])
+        }
+        let client = makeClient(server)
+        try await client.connect()
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+        #expect(await server.requests.filter { $0.operation == .deleteStream }.count == 1)
+        await client.shutdown()
+    }
+
     @Test func replicatedRequestIsNotReplayedUnderANewSession() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }

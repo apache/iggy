@@ -20,10 +20,12 @@ import Testing
 @testable import Iggy
 
 /// A signed-in client on the fake server.
-private func connectedClient(_ server: FakeVSRServer, heartbeat: Duration = .seconds(60)) async throws -> IggyClient {
+private func connectedClient(
+    _ server: FakeVSRServer, heartbeat: Duration = .seconds(60), requestTimeout: Duration = .seconds(10)
+) async throws -> IggyClient {
     var configuration = ClientConfiguration(address: server.address, autoLogin: .usernamePassword(username: "iggy", password: "iggy"))
     configuration.reconnection = ReconnectionOptions(maxRetries: nil, interval: .milliseconds(20), reestablishAfter: .zero)
-    configuration.requestTimeout = .seconds(10)
+    configuration.requestTimeout = requestTimeout
     configuration.connectTimeout = .seconds(2)
     configuration.heartbeatInterval = heartbeat
     let client = IggyClient(configuration: configuration, connector: NIOConnector(), logger: testLogger)
@@ -92,6 +94,31 @@ struct MessagingTests {
         let sends = await requests(server, .sendMessages)
         #expect(sends.count == 2)
         #expect(sends.allSatisfy { contains($0.payload, minted) && contains($0.payload, chosen) })
+        await client.shutdown()
+    }
+
+    /// A send lost with its connection may have committed, so a history
+    /// refusal of its resumed replay is an unknown outcome: the send is only
+    /// replayed under its own request id, never sent again under a new
+    /// route.
+    @Test func aResumedSendRefusedForItsHistoryIsNotSentAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let dropped = Locked(false)
+        await server.respond { request in
+            if request.code == CommandCode.sendMessages.rawValue {
+                return dropped.exchange(true) ? .status(IggyErrorCode.historyUnavailable.rawValue) : .close
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await connectedClient(server, requestTimeout: .seconds(1))
+        await expectCode(.transientNotCommitted) {
+            try await client.sendBatch(streamID: 1, topicID: 2, partitioning: .partition(1), messages: ["a"])
+        }
+        let sends = await requests(server, .sendMessages)
+        #expect(sends.count >= 2)
+        #expect(Set(sends.map(\.requestID)).count == 1)
+        #expect(await requests(server, .getPartitionRoute).count == 1)
         await client.shutdown()
     }
 
