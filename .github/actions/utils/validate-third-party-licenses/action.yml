@@ -37,9 +37,10 @@ runs:
       uses: actions/setup-node@v6
       with:
         node-version: ${{ inputs.node-version }}
+        package-manager-cache: false
 
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
       with:
         read-cache: "false"
 

@@ -23,9 +23,9 @@ on:
       third_party_licenses:
         description: "Whether third-party license inputs changed"
         value: ${{ jobs.detect.outputs.third_party_licenses }}
-      rust_matrix:
-        description: "Matrix for Rust components"
-        value: ${{ jobs.detect.outputs.rust_matrix }}
+      rust_plan:
+        description: "Selected Rust checks and tests; empty when Rust is unaffected"
+        value: ${{ jobs.detect.outputs.rust_plan }}
       python_matrix:
         description: "Matrix for Python SDK"
         value: ${{ jobs.detect.outputs.python_matrix }}
@@ -69,7 +69,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
-      rust_matrix: ${{ steps.mk.outputs.rust_matrix }}
+      rust_plan: ${{ steps.mk.outputs.rust_plan }}
       python_matrix: ${{ steps.mk.outputs.python_matrix }}
       php_matrix: ${{ steps.mk.outputs.php_matrix }}
       node_matrix: ${{ steps.mk.outputs.node_matrix }}
@@ -111,7 +111,7 @@ jobs:
               - 'scripts/ci/render-node-licenses.mjs'
               - 'scripts/ci/apt-install.sh'
               - '.github/actions/utils/validate-third-party-licenses/**'
-              - '.github/actions/utils/setup-rust-with-cache/**'
+              - '.github/actions/utils/setup-rust/**'
               - '.github/actions/utils/free-disk-space/**'
               - '.github/workflows/_detect.yml'
               - '.github/workflows/_common.yml'
@@ -290,7 +290,7 @@ jobs:
               const entries = cfg.tasks.map(task => ({ component: name, task }));
               taskedComponents.push({ name, tasks: cfg.tasks, trigger });
 
-              if (name === 'rust') groups.rust.push(...entries);
+              if (name === 'rust' || name.startsWith('rust-')) groups.rust.push(...entries);
               else if (name === 'sdk-python') groups.python.push(...entries);
               else if (name === 'sdk-php') groups.php.push(...entries);
               else if (name === 'sdk-node') groups.node.push(...entries);
@@ -354,7 +354,7 @@ jobs:
               for (const [name, cfg] of Object.entries(components)) {
                 if (!cfg.tasks || cfg.tasks.length === 0) continue;
                 const entries = cfg.tasks.map(task => ({ component: name, task }));
-                if (name === 'rust') groups.rust.push(...entries);
+                if (name === 'rust' || name.startsWith('rust-')) groups.rust.push(...entries);
                 else if (name === 'sdk-python') groups.python.push(...entries);
                 else if (name === 'sdk-php') groups.php.push(...entries);
                 else if (name === 'sdk-node') groups.node.push(...entries);
@@ -426,7 +426,10 @@ jobs:
               require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `${output}\n`);
             };
 
-            setOutput('rust_matrix', JSON.stringify(matrix(groups.rust)));
+            setOutput('rust_plan', groups.rust.length ? JSON.stringify({
+              checks: groups.rust.filter(entry => entry.task !== 'test'),
+              tests: groups.rust.some(entry => entry.task === 'test'),
+            }) : '');
             setOutput('python_matrix', JSON.stringify(matrix(groups.python)));
             setOutput('php_matrix', JSON.stringify(matrix(groups.php)));
             setOutput('node_matrix', JSON.stringify(matrix(groups.node)));
