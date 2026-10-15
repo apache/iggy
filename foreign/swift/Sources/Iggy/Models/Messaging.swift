@@ -95,6 +95,7 @@ public enum Partitioning: Sendable, Hashable {
     private static let balancedCode: UInt8 = 1
     private static let partitionCode: UInt8 = 2
     private static let messagesKeyCode: UInt8 = 3
+    private static let partitionIDSize: UInt8 = 4
 
     /// A messages key outside 1...255 bytes cannot be framed. The client
     /// checks this before it resolves the key to a partition, and `encode`
@@ -114,7 +115,7 @@ public enum Partitioning: Sendable, Hashable {
             writer.write(UInt8(0))
         case .partition(let id):
             writer.write(Self.partitionCode)
-            writer.write(UInt8(4))
+            writer.write(Self.partitionIDSize)
             writer.write(id)
         case .messagesKey(let key):
             writer.write(Self.messagesKeyCode)
@@ -123,10 +124,26 @@ public enum Partitioning: Sendable, Hashable {
         }
     }
 
+    /// `[kind:1][length:1][value]`, held to the lengths the server accepts.
+    static func decode(from reader: inout ByteReader) throws -> Partitioning {
+        let kind = try reader.readUInt8()
+        let length = try reader.readUInt8()
+        switch kind {
+        case balancedCode where length == 0:
+            return .balanced
+        case partitionCode where length == partitionIDSize:
+            return .partition(try reader.readUInt32())
+        case messagesKeyCode where length > 0:
+            return .messagesKey(Array(try reader.readBytes(Int(length))))
+        default:
+            throw WireError.validation("partitioning kind \(kind) cannot carry \(length) bytes")
+        }
+    }
+
     var encodedSize: Int {
         switch self {
         case .balanced: 2
-        case .partition: 6
+        case .partition: 2 + Int(Self.partitionIDSize)
         case .messagesKey(let key): 2 + key.count
         }
     }

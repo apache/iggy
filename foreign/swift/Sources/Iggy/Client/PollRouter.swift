@@ -41,7 +41,7 @@ final class PollRouter: Sendable {
     /// the partition and the consumer.
     struct RouteKey: Hashable, Sendable {
         let code: CommandCode
-        let prefix: [UInt8]
+        let prefix: ArraySlice<UInt8>
     }
 
     private struct Route: Sendable {

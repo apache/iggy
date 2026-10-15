@@ -307,6 +307,18 @@ struct PartitioningTests {
         #expect(try encode(.partition(9)) == [2, 4, 9, 0, 0, 0])
     }
 
+    @Test func decodingReadsWhatEncodingWrites() throws {
+        for partitioning: Partitioning in [.balanced, .partition(9), .messagesKey("user-1")] {
+            var reader = ByteReader(try encode(partitioning)[...])
+            #expect(try Partitioning.decode(from: &reader) == partitioning)
+            #expect(reader.isAtEnd)
+        }
+        for malformed: [UInt8] in [[1, 4, 0, 0, 0, 0], [2, 3, 9, 0, 0], [2, 4, 9], [3, 0], [4, 0]] {
+            var reader = ByteReader(malformed[...])
+            #expect(throws: (any Error).self) { try Partitioning.decode(from: &reader) }
+        }
+    }
+
     /// The poll sentinel is compared against the value the Rust generator
     /// dumped from `core/common`, so the golden lane catches drift.
     @Test func noAssignedPartitionMatchesTheServerConstant() {

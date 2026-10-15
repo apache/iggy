@@ -27,7 +27,10 @@ extension IggyClient {
     /// The server routes explicit partitions only, so `balanced` and
     /// `messagesKey` partitioning are resolved on the client: balanced
     /// round-robins over the topic's partitions, a key is hashed with XXH32.
-    /// A zero message id is replaced with a random one.
+    /// A zero message id is replaced with a random one for this send only;
+    /// `messages` is not changed. A caller that retries a failed send and
+    /// wants each attempt to carry the same ids sets them first, for example
+    /// with ``UInt128Value/random()``.
     ///
     /// The returned confirmations may be empty: the server can commit a batch
     /// it has no offsets to describe.
@@ -129,14 +132,14 @@ extension IggyClient {
     /// A poll on its route. The route key is the poll without its strategy,
     /// count, and auto-commit flag, which do not change where it goes.
     func routedPoll(_ payload: [UInt8], context: PartitionContext?) async throws -> [UInt8] {
-        let key = PollRouter.RouteKey(code: .getPollRouting, prefix: Array(payload.dropLast(RawRequest.pollParametersSize)))
+        let key = PollRouter.RouteKey(code: .getPollRouting, prefix: payload.dropLast(RawRequest.pollParametersSize))
         return try await core.pollRouter.send(.pollMessagesOnPrimary, payload: payload, key: key, routePayload: payload, context: context, coordinator: core)
     }
 
     /// An offset write on its route. `routePayload` is the consumer, stream,
     /// topic, and partition the write names.
     func routedOffsetWrite(_ code: CommandCode, payload: [UInt8], routePayload: [UInt8], context: PartitionContext?) async throws {
-        let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: routePayload)
+        let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: routePayload[...])
         _ = try await core.pollRouter.send(code, payload: payload, key: key, routePayload: routePayload, context: context, coordinator: core)
     }
 
@@ -325,7 +328,7 @@ extension IggyClient {
         case .storeConsumerOffset, .deleteConsumerOffset:
             let prefix = try RawRequest.consumerTargetPrefix(payload)
             let command: CommandCode = code == CommandCode.storeConsumerOffset.rawValue ? .storeConsumerOffset : .deleteConsumerOffset
-            let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: prefix)
+            let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: prefix[...])
             return try await core.pollRouter.send(command, payload: payload, key: key, routePayload: prefix, context: nil, coordinator: core)
         default:
             return nil
@@ -345,23 +348,24 @@ private enum RawRequest {
         let partitionID: UInt32
     }
 
-    /// `[metadata_len:u32][stream][topic][partitioning]...`. Balanced and
-    /// key partitioning are resolved by the typed send from its cache and
+    /// `[metadata_len:u32][stream][topic][partitioning][messages_count:u32]`
+    /// leads the batch, and the fields must fit the declared length. Balanced
+    /// and key partitioning are resolved by the typed send from its cache and
     /// cursor, so a raw send names no partition to route.
     static func sendTarget(_ payload: [UInt8]) throws -> SendTarget {
-        let target = try decode(payload) { reader in
-            _ = try reader.readUInt32()
-            let stream = try Identifier.decode(from: &reader)
-            let topic = try Identifier.decode(from: &reader)
-            let kind = try reader.readUInt8()
-            let value = try reader.readBytes(Int(try reader.readUInt8()))
-            return (stream, topic, kind, value)
+        let (stream, topic, partitioning) = try decode(payload) { reader in
+            var metadata = ByteReader(try reader.readPrefixedBytes())
+            let stream = try Identifier.decode(from: &metadata)
+            let topic = try Identifier.decode(from: &metadata)
+            let partitioning = try Partitioning.decode(from: &metadata)
+            _ = try metadata.readUInt32()
+            return (stream, topic, partitioning)
         }
-        guard target.2 == 2, target.3.count == 4 else {
+        guard case .partition(let partitionID) = partitioning else {
             throw IggyError(
                 .featureUnavailable, context: "a raw send needs an explicit partition id; use sendMessages for balanced or key partitioning")
         }
-        return SendTarget(stream: target.0, topic: target.1, partitionID: UInt32(littleEndianBytes: target.3))
+        return SendTarget(stream: stream, topic: topic, partitionID: partitionID)
     }
 
     /// The consumer, stream, topic, and partition that lead a poll and an

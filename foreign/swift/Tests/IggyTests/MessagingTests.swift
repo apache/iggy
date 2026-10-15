@@ -410,6 +410,15 @@ struct MessagingTests {
         let before = await server.requests.count
         let balanced = try Batch.encodeSend(streamID: 1, topicID: 2, partitioning: .balanced, messages: outgoing)
         await expectCode(.featureUnavailable) { _ = try await client.sendRawRequest(code: CommandCode.sendMessages.rawValue, payload: balanced) }
+        // The count is outside the declared metadata, then the partition id is
+        // three bytes wide: neither is a header the server would accept.
+        var shortMetadata = send
+        shortMetadata[0] -= 4
+        var narrowPartition = send
+        narrowPartition[17] = 3
+        for malformed in [shortMetadata, narrowPartition] {
+            await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.sendMessages.rawValue, payload: malformed) }
+        }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.pollMessages.rawValue, payload: Array(poll.dropLast())) }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.storeConsumerOffset.rawValue, payload: [1, 9]) }
         #expect(await server.requests.count == before)
