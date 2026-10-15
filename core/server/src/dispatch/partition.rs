@@ -576,7 +576,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
                 transport_client_id,
                 request,
                 resolved,
-                attachment,
+                &attachment,
                 consumer_client_id,
             )
             .await
@@ -649,7 +649,7 @@ async fn read_polled_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     (namespace, partition_id, consumer, args): DecodedPollRequest,
-    attachment: SessionAttachment,
+    attachment: &SessionAttachment,
     consumer_client_id: u128,
 ) -> Result<BusMessage, ReadPolledMessagesError>
 where
@@ -696,11 +696,23 @@ where
         consumer,
         args,
         attachment: ConsumerAttachment {
-            session: attachment,
+            session: attachment.clone(),
             metadata,
         },
     };
-    match shard.partition_read(namespace, read).await {
+    let reply = shard.partition_read(namespace, read).await;
+    let users = shard.plane.metadata().mux_stm.users();
+    authorize_attached(Some(attachment), || {
+        users.authorize(|permissioner| {
+            permissioner.poll_messages(
+                attachment.user_id(),
+                namespace.stream_id(),
+                namespace.topic_id(),
+            )
+        })
+    })
+    .map_err(ReadPolledMessagesError::Rejected)?;
+    match reply {
         Some(PartitionReadReply::Poll {
             context,
             fragments,
@@ -2862,7 +2874,7 @@ mod tests {
             TRANSPORT_CLIENT_ID,
             &request,
             poll,
-            attachment,
+            &attachment,
             member,
         )
         .await
@@ -3544,7 +3556,7 @@ mod tests {
             transport_client_id,
             &request,
             resolved_poll,
-            attachment,
+            &attachment,
             transport_client_id,
         )
         .await

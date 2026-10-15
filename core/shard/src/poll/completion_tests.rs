@@ -28,17 +28,20 @@ use consensus::{
     StateTransferStage, VsrConsensus, artifact_kind, build_reply_message_with,
     encode_state_manifest,
 };
+use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
+use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
     AckLevel, ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier,
+    Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName,
+    WireOptions,
 };
-use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy};
+use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy, UserStatus};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::IggyMessageBus;
 use metadata::IggyMetadata;
@@ -121,6 +124,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         MissingLeave,
         Rejoin,
         Delete,
+        RevokePermissions,
     }
     for change in [
         Change::Logout,
@@ -129,6 +133,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         Change::MissingLeave,
         Change::Rejoin,
         Change::Delete,
+        Change::RevokePermissions,
     ] {
         let namespace = IggyNamespace::new(0, 0, 0);
         let bus = Rc::new(IggyMessageBus::new(0));
@@ -250,20 +255,36 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 }
                 .to_bytes(),
             ),
+            Change::RevokePermissions => apply_poll_metadata(
+                &owner,
+                Operation::UpdatePermissions,
+                UpdatePermissionsRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    permissions: None,
+                }
+                .to_bytes(),
+            ),
         }
         for (group, completion, replies, result) in completions {
-            let stale = matches!(change, Change::Logout | Change::Delete)
-                || (matches!(change, Change::Leave) && group.is_some());
+            let stale = matches!(
+                change,
+                Change::Logout | Change::Delete | Change::RevokePermissions
+            ) || (matches!(change, Change::Leave) && group.is_some());
             completion.complete(result);
             assert!(futures::poll!(pump.as_mut()).is_pending());
             let reply = replies
                 .try_recv()
                 .expect("the owner must validate the completion");
             if stale {
+                let expected = if matches!(change, Change::RevokePermissions) {
+                    IggyError::Unauthorized
+                } else {
+                    IggyError::TransientNotAccepted
+                };
                 assert!(
                     matches!(
                         reply,
-                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                        PartitionReadReply::Rejected(ref error) if *error == expected
                     ),
                     "{change:?}, group {group:?}: stale authorization must reject, got {reply:?}"
                 );
@@ -289,6 +310,15 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                     partitions.group_offset_state(&namespace, GROUP).unwrap(),
                     expected,
                     "{change:?}: completion must preserve group progress"
+                );
+            } else {
+                let (stored, _) = partitions
+                    .consumer_offset_read(&namespace, PollingConsumer::Consumer(USER as usize, 0))
+                    .unwrap();
+                assert_eq!(
+                    stored,
+                    (!stale).then_some(0),
+                    "{change:?}: completion must preserve consumer progress"
                 );
             }
         }
@@ -1969,6 +1999,40 @@ fn owner_with_metadata_plane(
         ShardMetrics::for_shard(),
     )
     .expect("valid owner inbox wiring");
+    owner
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .ensure_root_user("root", "hash");
+    for user_id in 1..=BOUND_USER {
+        apply_poll_metadata(
+            &owner,
+            Operation::CreateUser,
+            CreateUserRequest {
+                username: WireName::new(format!("reader-{user_id}")).unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: false,
+                        read_servers: false,
+                        manage_users: false,
+                        read_users: false,
+                        manage_streams: false,
+                        read_streams: false,
+                        manage_topics: false,
+                        read_topics: false,
+                        poll_messages: true,
+                        send_messages: false,
+                    },
+                    streams: Vec::new(),
+                }),
+                options: WireOptions::empty(),
+            }
+            .to_bytes(),
+        );
+    }
     (owner, sender)
 }
 

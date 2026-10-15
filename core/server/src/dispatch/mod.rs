@@ -1445,12 +1445,22 @@ mod tests {
 
     /// Every read that asks another shard before it answers: the client reads
     /// ask every shard, the rest ask the owner of the partition.
-    fn shard_waiting_reads() -> [(u32, Bytes); 7] {
+    fn shard_waiting_reads() -> [(u32, Bytes); 9] {
         let offset = GetConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
             partition_id: Some(0),
+        }
+        .to_bytes();
+        let poll = PollMessagesRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+            strategy: WirePollingStrategy::offset(0),
+            count: 1,
+            auto_commit: false,
         }
         .to_bytes();
         [
@@ -1469,19 +1479,9 @@ mod tests {
                 }
                 .to_bytes(),
             ),
-            (
-                GET_POLL_ROUTING_CODE,
-                PollMessagesRequest {
-                    consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-                    stream_id: WireIdentifier::numeric(0),
-                    topic_id: WireIdentifier::numeric(0),
-                    partition_id: Some(0),
-                    strategy: WirePollingStrategy::offset(0),
-                    count: 1,
-                    auto_commit: false,
-                }
-                .to_bytes(),
-            ),
+            (GET_POLL_ROUTING_CODE, poll.clone()),
+            (POLL_MESSAGES_CODE, poll.clone()),
+            (POLL_MESSAGES_ON_PRIMARY_CODE, poll),
             (GET_CONSUMER_OFFSET_ROUTING_CODE, offset.clone()),
             (GET_CONSUMER_OFFSET_CODE, offset),
         ]
@@ -1509,11 +1509,17 @@ mod tests {
             1,
             body,
         );
-        bytemuck::checked::from_bytes_mut::<RequestHeader>(
+        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
             &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
-        )
-        .reserved[..4]
-            .copy_from_slice(&code.to_le_bytes());
+        );
+        header.reserved[..4].copy_from_slice(&code.to_le_bytes());
+        header.partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
         let server_config = Arc::new(ServerConfig::default());
 
         handle_client_request(
@@ -1651,6 +1657,17 @@ mod tests {
                 })
                 .unwrap(),
             LifecycleFrame::PartitionRead {
+                read: PartitionRead::PollOnPrimary { attachment, .. },
+                reply,
+                ..
+            } => reply
+                .try_send(PartitionReadReply::Poll {
+                    context: attachment.metadata.context(0),
+                    fragments: Vec::new().into(),
+                    current_offset: STORED_OFFSET,
+                })
+                .unwrap(),
+            LifecycleFrame::PartitionRead {
                 read: PartitionRead::ConsumerOffset { .. },
                 reply,
                 ..
@@ -1759,12 +1776,12 @@ mod tests {
             }
             .to_bytes()
         };
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(ROOT_CLIENT, 0, SECRET, register_reply(ROOT_CLIENT, 1))
+            .unwrap();
         if primary {
-            metadata
-                .client_table
-                .borrow_mut()
-                .commit_register(ROOT_CLIENT, 0, SECRET, register_reply(ROOT_CLIENT, 1))
-                .unwrap();
             let consensus = metadata.consensus.as_ref().unwrap();
             consensus.restore_commit_state(SESSION, SESSION);
             consensus.sequencer().set_sequence(SESSION);
@@ -1776,19 +1793,20 @@ mod tests {
             );
             metadata.submit_request_in_process(request).await.unwrap();
         } else {
-            let revocation = prepare_message(operation, 0, 3, &body).transmute_header(
+            let revocation = prepare_message(operation, ROOT_CLIENT, 3, &body).transmute_header(
                 |old, header: &mut iggy_binary_protocol::PrepareHeader| {
                     *header = old;
                     header.op = 3;
                 },
             );
-            metadata::apply_committed_prepare(
+            let reply = metadata::apply_committed_prepare(
                 &*metadata.mux_stm,
                 &metadata.client_table,
                 true,
                 |_| {},
                 consensus::seal_prepare_checksum(revocation),
             );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
         }
         let old_binding = sessions.borrow().get_session(TRANSPORT);
         let restore = if operation == Operation::DeleteUser {

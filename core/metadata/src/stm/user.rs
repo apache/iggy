@@ -546,8 +546,7 @@ impl StateHandler for CreateUserRequest {
         }
 
         state.index.insert(username_arc, id as UserId);
-        // A token create admitted before the delete of the last holder of this
-        // id can commit after it. Its tokens must not resolve to the new holder.
+        // A reused ID must not inherit token-index entries from its previous holder.
         state.remove_personal_access_tokens(id as UserId);
         state
             .personal_access_tokens

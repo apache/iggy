@@ -210,9 +210,16 @@ struct ClientEntry {
 #[derive(Debug, Clone)]
 pub struct SessionAttachment {
     session: Weak<()>,
+    user_id: u32,
 }
 
 impl SessionAttachment {
+    /// Authenticated owner of this session, retained for permission rechecks.
+    #[must_use]
+    pub const fn user_id(&self) -> u32 {
+        self.user_id
+    }
+
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.session.strong_count() != 0
@@ -1470,6 +1477,7 @@ impl ClientTable {
         let attachment = entry.attachment.get_or_insert_with(|| Arc::new(()));
         Some(SessionAttachment {
             session: Arc::downgrade(attachment),
+            user_id,
         })
     }
 

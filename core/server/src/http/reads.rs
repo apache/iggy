@@ -732,16 +732,16 @@ mod tests {
         }
     }
 
-    /// A partition read asks the partition for its primary after the gate,
-    /// and the account behind the token can change during that wait.
+    /// The account can change during either the primary lookup or the data read.
     #[compio::test]
-    async fn given_a_partition_read_waiting_on_its_primary_when_the_account_changes_should_reject()
-    {
+    async fn given_a_partition_read_waiting_on_its_owner_when_the_account_changes_should_reject() {
         for uri in [
             "/streams/0/topics/0/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
             "/streams/0/topics/0/consumer-offsets?consumer_id=1&partition_id=0",
         ] {
-            for replace in [true, false] {
+            for (replace, final_wait) in
+                [(true, false), (false, false), (true, true), (false, true)]
+            {
                 let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
                 let state = read_state_on(Some(sender));
                 let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
@@ -782,13 +782,43 @@ mod tests {
                     panic!("{uri} must ask its partition for the primary");
                 };
 
+                let primary = PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                };
+                let (reply, body) = if final_wait {
+                    reply.try_send(primary).unwrap();
+                    assert!(poll!(response.as_mut()).is_pending());
+                    let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                        read,
+                        reply,
+                        ..
+                    })) = shard_inbox.try_recv()
+                    else {
+                        panic!("{uri} must wait for its partition data");
+                    };
+                    let body = match read {
+                        PartitionRead::UnboundPollOnPrimary { metadata, .. } => {
+                            PartitionReadReply::Poll {
+                                context: metadata.context(0),
+                                fragments: Vec::new().into(),
+                                current_offset: 0,
+                            }
+                        }
+                        PartitionRead::ConsumerOffsetOnPrimary { .. } => {
+                            PartitionReadReply::ConsumerOffset {
+                                stored: Some(0),
+                                current_offset: 0,
+                            }
+                        }
+                        _ => panic!("{uri} sent an unexpected partition read"),
+                    };
+                    (reply, body)
+                } else {
+                    (reply, primary)
+                };
                 let rejection = change_reader(&state, replace);
-                reply
-                    .try_send(PartitionReadReply::Primary {
-                        view: 0,
-                        primary: 0,
-                    })
-                    .unwrap();
+                reply.try_send(body).unwrap();
                 // A read that went on would send to the partition again and
                 // find it gone, instead of waiting for an answer.
                 drop(shard_inbox);
@@ -796,7 +826,7 @@ mod tests {
                 assert_eq!(
                     response.await.unwrap().status(),
                     rejection,
-                    "{uri} with the account replaced: {replace}"
+                    "{uri} with the account replaced: {replace}, final wait: {final_wait}"
                 );
             }
         }

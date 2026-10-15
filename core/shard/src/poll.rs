@@ -418,7 +418,7 @@ where
         if reply.is_disconnected() {
             return;
         }
-        if attachment.is_some_and(|attachment| {
+        if attachment.as_ref().is_some_and(|attachment| {
             !attachment.session.is_valid()
                 || !attachment
                     .metadata
@@ -427,6 +427,23 @@ where
             let _ = reply.try_send(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted,
             ));
+            return;
+        }
+        if let Some(attachment) = &attachment
+            && let Err(error) = self
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .authorize(|permissioner| {
+                    permissioner.poll_messages(
+                        attachment.session.user_id(),
+                        namespace.stream_id(),
+                        namespace.topic_id(),
+                    )
+                })
+        {
+            let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
         }
         let partitions = self.plane.partitions();

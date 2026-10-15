@@ -1368,6 +1368,7 @@ pub(in crate::http) async fn poll_messages(
         },
     ))
     .await;
+    authorize_read(&state, &identity, consistency, rule)?;
     match reply {
         Some(PartitionReadReply::Poll {
             context,
@@ -1482,6 +1483,7 @@ pub(in crate::http) async fn get_consumer_offset(
         _ => return Err(ReadError::Rejected(IggyError::InvalidCommand)),
     };
     let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
+    authorize_read(&state, &identity, consistency, rule)?;
     consumer_offset_reply(partition_id, reply).map(IntoResponse::into_response)
 }
 

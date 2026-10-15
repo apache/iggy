@@ -29,8 +29,9 @@
 //! the same order on every replica, so the primary (`on_ack`), each backup
 //! (`commit_journal`), and WAL replay (`recover`) all recompute the identical
 //! decision. This is why identity must ride the header rather than being
-//! resolved from a local session table: a backup has no session for the
-//! acting client.
+//! resolved from a transport-local session table: a backup has no connection
+//! for the acting client. The commit paths also check the replicated session
+//! table through `reject_stale_session` before this permission gate.
 
 use crate::MuxStateMachine;
 use crate::impls::metadata::StreamsFrontend;
@@ -40,6 +41,7 @@ use crate::stm::result::{ApplyReply, CreateUserResult, UpdatePermissionsResult};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
 use crate::stm::user::Users;
 use crate::stm::{ApplyContext, StateMachine};
+use consensus::ClientTable;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -96,6 +98,25 @@ where
         mux.users().remove_grants(deleted, timestamp, context);
     }
     Ok(reply)
+}
+
+/// An admitted request can commit after its user was deleted or disabled.
+/// Check the replicated session table before resolving the reused user ID.
+/// Partition completions use a synthetic session without a client-table entry.
+pub(crate) fn reject_stale_session(
+    header: &PrepareHeader,
+    client_table: &ClientTable,
+) -> Option<ApplyReply> {
+    if matches!(
+        header.operation,
+        Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
+    ) {
+        return None;
+    }
+    (header.session != 0
+        && (client_table.get_epoch(header.client) != Some(header.session)
+            || client_table.get_user_id(header.client) != Some(header.user_id)))
+    .then(|| ApplyReply::err(IggyError::StaleClient.as_code()))
 }
 
 /// Generic entry point to `gated_apply` for the WAL-replay path.

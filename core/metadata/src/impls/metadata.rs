@@ -17,7 +17,9 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
-use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
+use crate::stm::authz::{
+    PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
+};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
@@ -849,12 +851,14 @@ where
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
     // the reply body, replayed on retry.
-    let apply = gated_apply(mux_stm, prepare).unwrap_or_else(|err| {
-        panic!(
-            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
-            header.op
-        );
-    });
+    let apply = reject_stale_session(&header, &client_table.borrow())
+        .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
+        .unwrap_or_else(|err| {
+            panic!(
+                "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+                header.op
+            );
+        });
     if let Some(user_id) = apply.revoked_user {
         apply_user_revocation(
             mux_stm,
@@ -3976,7 +3980,7 @@ where
 
         // Stamp the acting user id into the replicated header so the in-apply
         // RBAC gate (`crate::stm::authz`) resolves the same identity on every
-        // replica, WAL replay included (no session table there). Every client-op
+        // replica, WAL replay included. Every client-op
         // prepare funnels through here, primary-only by construction, so stamping
         // here -- not in the in-process client path alone -- also covers the
         // wire-plane ingresses (`on_request` and the request-queue drain). The
