@@ -135,8 +135,7 @@ for _ in 1 2 3; do
         fi
 
         if [ "$LOCAL_WRAPPER_JAR_CHECKSUM" != "$REQUIRED_WRAPPER_JAR_CHECKSUM" ]; then
-          echo "bad shasum"
-          rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+            rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
         else
             break
         fi
