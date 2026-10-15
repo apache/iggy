@@ -1150,9 +1150,13 @@ func TestPartitionRoutingNotPrimaryRefreshesWithoutChangingRequestIdentity(t *te
 }
 
 func TestPartitionMutationReplays57OnTheSameLinkAndPreservesUncertainty(t *testing.T) {
+	const watchdogTimeout = 5 * time.Second
 	for _, finalStatus := range []ierror.Code{0, ierror.TransientNotAcceptedCode, ierror.NotPrimaryCode,
 		ierror.HistoryUnavailableCode, ierror.ConsumerGroupPartitionNotOwnedCode, ierror.InvalidCredentialsCode} {
 		t.Run(fmt.Sprint(finalStatus), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), watchdogTimeout)
+			defer cancel()
+			stopAfterReplay := finalStatus == ierror.TransientNotAcceptedCode || finalStatus == ierror.NotPrimaryCode
 			var writes atomic.Uint32
 			fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
 				if read.operation() != vsr.OperationSendMessages {
@@ -1165,17 +1169,37 @@ func TestPartitionMutationReplays57OnTheSameLinkAndPreservesUncertainty(t *testi
 					return statusReplyFrame(vsr.OperationSendMessages, uint32(finalStatus), nil), true
 				}
 				return replyFrame(vsr.OperationSendMessages, zeroConfirmations()), true
-			}, nil)
+			}, func(_ int, read request) ([]byte, bool) {
+				if read.code() != uint32(command.GetPartitionRouteCode) || writes.Load() < 2 {
+					return nil, false
+				}
+				if stopAfterReplay {
+					// This lookup proves the replayed refusal was classified before cancellation.
+					cancel()
+				}
+				// The next mutation must meet the NotPrimary view floor before reaching the retained lane.
+				reply := pollRoutingReply(t, read, 1, max(1, binary.LittleEndian.Uint64(read.header[frameOffsetContext+16:])))
+				binary.LittleEndian.PutUint32(reply[vsr.HeaderSize+16:], 1)
+				return reply, true
+			})
 			stream, topic, _ := groupConsumer(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 180*time.Millisecond)
-			defer cancel()
 			_, err := fixture.client.SendBinaryRequest(ctx, uint32(command.SendMessagesCode), rawSendPayload(t, stream, topic, iggcon.PartitionId(0)))
+			require.NotErrorIs(t, ctx.Err(), context.DeadlineExceeded, "the watchdog must not terminate the replay scenario")
 			if finalStatus == 0 {
 				require.NoError(t, err)
 			} else {
 				require.ErrorIs(t, err, ierror.ErrUncertainOutcome)
+				var uncertain ierror.UncertainOutcome
+				require.ErrorAs(t, err, &uncertain)
+				require.NotZero(t, uncertain.OperationID)
+				nextCtx, nextCancel := context.WithTimeout(context.Background(), watchdogTimeout)
+				defer nextCancel()
+				_, err = fixture.client.SendBinaryRequest(nextCtx, uint32(command.SendMessagesCode), rawSendPayload(t, stream, topic, iggcon.PartitionId(0)))
+				var blocked ierror.LaneBlocked
+				require.ErrorAs(t, err, &blocked)
+				assert.Equal(t, uncertain.OperationID, blocked.OperationID)
 			}
-			assert.GreaterOrEqual(t, writes.Load(), uint32(2))
+			assert.Equal(t, uint32(2), writes.Load())
 			assert.GreaterOrEqual(t, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode), 1)
 			var sent []request
 			for _, read := range fixture.primaries[0].recorded() {
@@ -1183,10 +1207,9 @@ func TestPartitionMutationReplays57OnTheSameLinkAndPreservesUncertainty(t *testi
 					sent = append(sent, read)
 				}
 			}
-			require.GreaterOrEqual(t, len(sent), 2)
-			for _, repeated := range sent[1:] {
-				assert.Equal(t, sent[0].header, repeated.header)
-			}
+			require.Len(t, sent, 2)
+			assert.Equal(t, sent[0].header, sent[1].header)
+			assert.Equal(t, sent[0].payload, sent[1].payload)
 			assert.Equal(t, 1, fixture.primaries[0].connections())
 		})
 	}
