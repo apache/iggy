@@ -97,7 +97,7 @@ public interface CommandCode {
         SEND(101),
         GET_POLL_ROUTING(103),
         POLL_ON_PRIMARY(104),
-        GET_SEND_CONTEXT(105);
+        GET_PARTITION_ROUTE(105);
 
         private final int value;
 

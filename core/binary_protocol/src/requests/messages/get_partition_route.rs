@@ -20,16 +20,17 @@ use bytes::{BufMut, BytesMut};
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
 use crate::{WireError, WireIdentifier};
 
-/// Partition context discovery authorized by send permission, without exposing topic details.
-/// The response is a `PartitionContext` captured before a new send is admitted.
+/// Route lookup for one partition, authorized by send or poll permission on its
+/// topic. The reply includes the partition count, view and primary in a
+/// [`PartitionRouteResponse`](crate::responses::messages::PartitionRouteResponse).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetSendContextRequest {
+pub struct GetPartitionRouteRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
     pub partition_id: u32,
 }
 
-impl WireEncode for GetSendContextRequest {
+impl WireEncode for GetPartitionRouteRequest {
     fn encoded_size(&self) -> usize {
         self.stream_id.encoded_size() + self.topic_id.encoded_size() + size_of::<u32>()
     }
@@ -41,7 +42,7 @@ impl WireEncode for GetSendContextRequest {
     }
 }
 
-impl WireDecode for GetSendContextRequest {
+impl WireDecode for GetPartitionRouteRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let (stream_id, stream_size) = WireIdentifier::decode(buf)?;
         let (topic_id, topic_size) = WireIdentifier::decode(&buf[stream_size..])?;
@@ -63,7 +64,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_send_context_request_when_encoded_should_preserve_named_and_numeric_targets() {
+    fn given_partition_route_request_when_encoded_should_preserve_named_and_numeric_targets() {
         for (stream_id, topic_id) in [
             (WireIdentifier::numeric(3), WireIdentifier::numeric(7)),
             (
@@ -71,17 +72,20 @@ mod tests {
                 WireIdentifier::named("orders").unwrap(),
             ),
         ] {
-            let request = GetSendContextRequest {
+            let request = GetPartitionRouteRequest {
                 stream_id,
                 topic_id,
                 partition_id: 2,
             };
             let bytes = request.to_bytes();
             assert_eq!(bytes.len(), request.encoded_size());
-            assert_eq!(GetSendContextRequest::decode_from(&bytes).unwrap(), request);
+            assert_eq!(
+                GetPartitionRouteRequest::decode_from(&bytes).unwrap(),
+                request
+            );
             for length in 0..bytes.len() {
                 assert!(
-                    GetSendContextRequest::decode_from(&bytes[..length]).is_err(),
+                    GetPartitionRouteRequest::decode_from(&bytes[..length]).is_err(),
                     "accepted a request truncated at {length} bytes"
                 );
             }

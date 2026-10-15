@@ -95,6 +95,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case requestTooOld = 85
     case historyUnavailable = 87
     case lifecycleBusy = 88
+    case notPrimary = 89
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -273,6 +274,9 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case incompatibleProtocolVersion = 14003
     case sessionMismatch = 14004
     case requestIdExhausted = 14005
+    case operationUncertain = 14006
+    case laneBlocked = 14007
+    case operationNotRetained = 14008
 }
 
 extension IggyErrorCode {
@@ -350,6 +354,7 @@ extension IggyErrorCode {
         case .requestTooOld: "request_too_old"
         case .historyUnavailable: "history_unavailable"
         case .lifecycleBusy: "lifecycle_busy"
+        case .notPrimary: "not_primary"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -528,6 +533,9 @@ extension IggyErrorCode {
         case .incompatibleProtocolVersion: "incompatible_protocol_version"
         case .sessionMismatch: "session_mismatch"
         case .requestIdExhausted: "request_id_exhausted"
+        case .operationUncertain: "operation_uncertain"
+        case .laneBlocked: "lane_blocked"
+        case .operationNotRetained: "operation_not_retained"
         }
     }
 }

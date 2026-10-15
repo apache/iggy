@@ -20,6 +20,9 @@ package tcp
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -39,6 +42,15 @@ func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.Cluster
 	if len(metadata.Nodes) == 0 {
 		return nil, fmt.Errorf("%w: empty cluster roster", ierror.ErrTransientNotAccepted)
 	}
+	endpoints := make(map[uint8]string, len(metadata.Nodes))
+	for _, node := range metadata.Nodes {
+		if node.Endpoints.Tcp != 0 {
+			endpoints[node.ReplicaID] = net.JoinHostPort(strings.Trim(node.IP, "[]"), strconv.Itoa(int(node.Endpoints.Tcp)))
+		}
+	}
+	c.polls.mu.Lock()
+	c.polls.endpoints = endpoints
+	c.polls.mu.Unlock()
 	c.clustered.Store(len(metadata.Nodes) > 1)
 	c.topologyKnown.Store(true)
 	return &metadata, nil

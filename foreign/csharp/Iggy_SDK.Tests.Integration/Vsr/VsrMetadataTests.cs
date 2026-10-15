@@ -100,7 +100,8 @@ public class VsrMetadataTests
         fetched.Username.ShouldBe(name);
 
         await client.DeleteUserAsync(Identifier.Numeric(user.Id));
-        (await client.GetUserAsync(Identifier.Numeric(user.Id))).ShouldBeNull();
+        // The freed id goes to the next user any parallel test creates, so only the name proves the delete.
+        (await client.GetUserAsync(Identifier.String(name))).ShouldBeNull();
     }
 
     /// <summary>

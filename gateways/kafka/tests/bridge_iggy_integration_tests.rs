@@ -30,8 +30,8 @@ use secrecy::SecretString;
 use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, TopicMapping,
-    TopicOverride,
+    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
+    ProduceSessionLimits, TopicMapping, TopicOverride,
 };
 
 #[path = "common/certs.rs"]
@@ -427,6 +427,7 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
+        produce_sessions: ProduceSessionLimits::default(),
     };
 
     let result = IggyBridge::connect(config).await;
@@ -452,6 +453,7 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
         tls: IggyTls::default(),
+        produce_sessions: ProduceSessionLimits::default(),
     };
 
     let start = tokio::time::Instant::now();

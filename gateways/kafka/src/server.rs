@@ -928,16 +928,36 @@ async fn route_frame(
     }
 }
 
-/// The frame loop of one accepted connection, plain or TLS.
+/// Serves one accepted connection, plain or TLS, then ends its producer session.
+async fn handle_connection<S>(
+    stream: S,
+    connection: Connection,
+    certificate_name: Option<String>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let connection_state = connection.listener.connection_state();
+    let bridge = connection.state.bridge.clone();
+    let served = serve_frames(stream, connection, certificate_name, &connection_state).await;
+    // A producer without a producer id has its Produce session by connection, so it ends here.
+    if let Some(bridge) = bridge {
+        bridge.end_connection(connection_state.id());
+    }
+    served
+}
+
+/// The frame loop of one accepted connection.
 ///
 /// `certificate_name` is the Iggy username the client certificate mapped to, on an `SSL`
 /// listener that verifies certificates. It is resolved against Iggy before the first frame, and
 /// a name that resolves to no user closes the connection, so a certificate from the trusted CA
 /// never admits a client as an account that does not exist.
-async fn handle_connection<S>(
+async fn serve_frames<S>(
     mut stream: S,
     connection: Connection,
     certificate_name: Option<String>,
+    connection_state: &ConnectionState,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -960,12 +980,11 @@ where
     } else {
         SaslState::Authenticated
     };
-    let connection_state = listener.connection_state();
     let ctx = ConnectionContext {
         config: &config,
         listener: &listener,
         state: &state,
-        connection: &connection_state,
+        connection: connection_state,
         authenticator: shared_auth.authenticator.as_deref(),
         resolver: shared_auth.resolver.as_deref(),
         auth_slots: &shared_auth.slots,
