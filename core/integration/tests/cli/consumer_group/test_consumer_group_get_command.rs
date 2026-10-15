@@ -405,12 +405,10 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagWithStoredOffsetCmd {
     fn verify_command(&self, command_state: Assert) {
         let current_offset = self.messages_count - 1;
         let lag = current_offset as u64 - self.stored_offset;
-        command_state
-            .success()
-            .stdout(contains(format!(
-                "{current_offset}              | {}             | {lag}",
-                self.stored_offset
-            )));
+        command_state.success().stdout(contains(format!(
+            "{current_offset}              | {}             | {lag}",
+            self.stored_offset
+        )));
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {

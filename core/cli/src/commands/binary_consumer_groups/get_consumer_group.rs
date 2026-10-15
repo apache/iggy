@@ -20,8 +20,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
-use iggy_common::{Consumer, ConsumerGroupMember, Identifier, Partition};
-use std::collections::HashMap;
+use iggy_common::{Consumer, Identifier, Partition};
 use tracing::{Level, event};
 
 pub struct GetConsumerGroupCmd {
@@ -38,22 +37,6 @@ impl GetConsumerGroupCmd {
             group_id: consumer_group_id,
         }
     }
-}
-
-fn partition_owner(members: &[ConsumerGroupMember]) -> HashMap<u32, u32> {
-    let mut partition_to_member = HashMap::new();
-    for member in members {
-        for partition_id in &member.partitions {
-            partition_to_member.insert(*partition_id, member.id);
-        }
-    }
-    partition_to_member
-}
-
-fn find_partition(partitions: &[Partition], partition_id: u32) -> Option<&Partition> {
-    partitions
-        .iter()
-        .find(|partition| partition.id == partition_id)
 }
 
 #[async_trait]
@@ -100,7 +83,41 @@ impl CliCommand for GetConsumerGroupCmd {
             })?;
 
         let consumer = Consumer::group(self.group_id.clone());
-        let partition_to_member = partition_owner(&consumer_group.members);
+        let partitions_count = consumer_group.partitions_count as usize;
+        let mut partitions_by_id: Vec<Option<&Partition>> = vec![None; partitions_count];
+        for partition in &topic.partitions {
+            if let Some(slot) = partitions_by_id.get_mut(partition.id as usize) {
+                *slot = Some(partition);
+            }
+        }
+
+        let mut owners: Vec<Option<u32>> = vec![None; partitions_count];
+        let mut members_table = Table::new();
+        let render_members = consumer_group.members_count > 0;
+        if render_members {
+            members_table.load_style(ASCII_NO_BORDERS);
+            members_table.set_header(vec!["Member id", "Partitions count", "Partitions"]);
+        }
+        for member in &consumer_group.members {
+            for partition_id in &member.partitions {
+                if let Some(slot) = owners.get_mut(*partition_id as usize) {
+                    *slot = Some(member.id);
+                }
+            }
+            if render_members {
+                members_table.add_row(vec![
+                    format!("{}", member.id).as_str(),
+                    format!("{}", member.partitions_count).as_str(),
+                    member
+                        .partitions
+                        .iter()
+                        .map(|partition_id| format!("{partition_id}"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                        .as_str(),
+                ]);
+            }
+        }
 
         let mut partitions_table = Table::new();
         partitions_table.load_style(ASCII_NO_BORDERS);
@@ -113,12 +130,16 @@ impl CliCommand for GetConsumerGroupCmd {
         ]);
 
         for partition_id in 0..consumer_group.partitions_count {
-            let partition = find_partition(&topic.partitions, partition_id).with_context(|| {
-                format!(
-                    "Partition with ID: {} in topic with ID: {} was not found",
-                    partition_id, self.topic_id
-                )
-            })?;
+            let partition = partitions_by_id
+                .get(partition_id as usize)
+                .copied()
+                .flatten()
+                .with_context(|| {
+                    format!(
+                        "Partition with ID: {} in topic with ID: {} was not found",
+                        partition_id, self.topic_id
+                    )
+                })?;
 
             let consumer_offset = client
                 .get_consumer_offset(
@@ -135,9 +156,11 @@ impl CliCommand for GetConsumerGroupCmd {
                     )
                 })?;
 
-            let member = partition_to_member
-                .get(&partition_id)
-                .map(|member_id| format!("{}", member_id))
+            let member = owners
+                .get(partition_id as usize)
+                .copied()
+                .flatten()
+                .map(|member_id| format!("{member_id}"))
                 .unwrap_or_else(|| "-".to_string());
 
             let (current_offset, stored_offset, lag) = match consumer_offset {
@@ -182,23 +205,7 @@ impl CliCommand for GetConsumerGroupCmd {
             format!("{}", consumer_group.members_count).as_str(),
         ]);
 
-        if consumer_group.members_count > 0 {
-            let mut members_table = Table::new();
-            members_table.load_style(ASCII_NO_BORDERS);
-            members_table.set_header(vec!["Member id", "Partitions count", "Partitions"]);
-            for member in consumer_group.members {
-                members_table.add_row(vec![
-                    format!("{}", member.id).as_str(),
-                    format!("{}", member.partitions_count).as_str(),
-                    member
-                        .partitions
-                        .iter()
-                        .map(|i| format!("{i}"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                        .as_str(),
-                ]);
-            }
+        if render_members {
             table.add_row(vec!["Members", members_table.to_string().as_str()]);
         }
 
