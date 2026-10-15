@@ -53,7 +53,9 @@ use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
     WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
 };
-use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
+use metadata::stm::user::{
+    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
+};
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
@@ -242,7 +244,7 @@ impl SimClient {
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let registration = iggy_binary_protocol::requests::users::login_register::RegisterRequest {
-            user_created_at: 1,
+            user_created_at: ROOT_USER_CREATED_AT_MICROS,
             bind_verifier: consensus::client_table::bind_verifier(
                 self.client_id,
                 0,

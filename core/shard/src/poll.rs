@@ -447,35 +447,40 @@ where
             return;
         }
         if let Some(attachment) = &attachment {
-            let users = self.plane.metadata().mux_stm.users();
-            let (user_id, metadata, account_valid) = match attachment {
-                PollAttachment::Bound(attachment) => (
-                    attachment.session.user_id(),
-                    &attachment.metadata,
-                    attachment.session.is_valid(),
-                ),
-                PollAttachment::Unbound {
-                    user_id,
-                    user_created_at,
-                    metadata,
-                } => (
-                    *user_id,
-                    metadata,
-                    users.is_active_account(*user_id, *user_created_at),
-                ),
-            };
-            let authorization = if !account_valid {
-                Err(match attachment {
-                    PollAttachment::Bound(_) => IggyError::TransientNotAccepted,
-                    PollAttachment::Unbound { .. } => IggyError::Unauthenticated,
-                })
-            } else if !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace) {
-                Err(IggyError::TransientNotAccepted)
-            } else {
-                users.authorize(|permissioner| {
-                    permissioner.poll_messages(user_id, namespace.stream_id(), namespace.topic_id())
-                })
-            };
+            let authorization = self.plane.metadata().mux_stm.users().read(|users| {
+                let (user_id, metadata, account_valid) = match attachment {
+                    PollAttachment::Bound(attachment) => (
+                        attachment.session.user_id(),
+                        &attachment.metadata,
+                        attachment.session.is_valid(),
+                    ),
+                    PollAttachment::Unbound {
+                        user_id,
+                        user_created_at,
+                        metadata,
+                    } => (
+                        *user_id,
+                        metadata,
+                        users.is_active_account(*user_id, *user_created_at),
+                    ),
+                };
+                if !account_valid {
+                    Err(match attachment {
+                        PollAttachment::Bound(_) => IggyError::TransientNotAccepted,
+                        PollAttachment::Unbound { .. } => IggyError::Unauthenticated,
+                    })
+                } else if !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace) {
+                    Err(IggyError::TransientNotAccepted)
+                } else {
+                    users.authorize(|permissioner| {
+                        permissioner.poll_messages(
+                            user_id,
+                            namespace.stream_id(),
+                            namespace.topic_id(),
+                        )
+                    })
+                }
+            });
             if let Err(error) = authorization {
                 let _ = reply.try_send(PartitionReadReply::Rejected(error));
                 return;

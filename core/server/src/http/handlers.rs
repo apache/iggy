@@ -202,7 +202,7 @@ pub(in crate::http) async fn login_user(
         command.password.expose_secret(),
     )
     .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, Some(created_at))
+    issue_identity(&state, user_id, created_at)
 }
 
 pub(in crate::http) async fn login_with_personal_access_token(
@@ -216,7 +216,7 @@ pub(in crate::http) async fn login_with_personal_access_token(
         .map_err(|_| IggyError::TransientNotCommitted)?;
     let (user_id, created_at) = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, Some(created_at))
+    issue_identity(&state, user_id, created_at)
 }
 
 /// `POST /users/refresh-token` body. The route is unauthenticated, so the
@@ -247,7 +247,7 @@ pub(in crate::http) async fn refresh_token(
     // fetch), so bridge it like every other shard-0 path (see [`logout_user`]).
     let (user_id, user_created_at) =
         SendWrapper::new(state.jwt.decode_for_refresh(&command.token)).await?;
-    issue_identity(&state, user_id, Some(user_created_at))
+    issue_identity(&state, user_id, user_created_at)
 }
 
 /// `DELETE /users/logout`: end the caller's session and answer 204 - the status
@@ -2101,16 +2101,14 @@ pub(in crate::http) async fn delete_pat(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Mint a token bound to the active account at `user_id`. A refresh passes the
-/// `created_at` its token names, so it never re-issues for a newer account that
-/// took a deleted user's id. A login passes `None`, because it just verified
-/// the account's own credentials.
+/// Mint a token only while the account verified by login or named by the
+/// refresh token still occupies its user id.
 fn issue_identity(
     inner: &HttpInner,
     user_id: u32,
-    expected_created_at: Option<IggyTimestamp>,
+    expected_created_at: IggyTimestamp,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    let user_created_at = inner.ensure_active_user(user_id, expected_created_at)?;
+    let user_created_at = inner.ensure_active_user(user_id, Some(expected_created_at))?;
     let generated = inner.jwt.generate(user_id, user_created_at)?;
     Ok(Json(IdentityInfo {
         user_id: generated.user_id,

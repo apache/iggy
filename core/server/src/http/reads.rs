@@ -64,15 +64,17 @@ pub(in crate::http) fn authorize_read(
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<(), ReadError> {
     state
-        .ensure_active_user(identity.user_id, Some(identity.user_created_at))
-        .map_err(ReadError::Rejected)?;
-    state
         .shard
         .plane
         .metadata()
         .mux_stm
         .users()
-        .authorize(|permissioner| rule(permissioner, identity.user_id))
+        .read(|users| {
+            if !users.is_active_account(identity.user_id, identity.user_created_at.as_micros()) {
+                return Err(IggyError::Unauthenticated);
+            }
+            users.authorize(|permissioner| rule(permissioner, identity.user_id))
+        })
         .map_err(ReadError::Rejected)?;
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
         return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));

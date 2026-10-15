@@ -580,6 +580,14 @@ mod tests {
             u32::from(CreateConsumerGroupResult::StreamNotFound),
             stream_not_found
         );
+        assert_eq!(
+            u32::from(CreateUserResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::StreamNotFound),
+            stream_not_found
+        );
 
         // StreamNameAlreadyExists (1012).
         let stream_name_exists = IggyError::StreamNameAlreadyExists(String::new()).as_code();
@@ -610,6 +618,11 @@ mod tests {
         );
         assert_eq!(
             u32::from(CreateConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(u32::from(CreateUserResult::TopicNotFound), topic_not_found);
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::TopicNotFound),
             topic_not_found
         );
 

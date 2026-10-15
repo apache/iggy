@@ -130,13 +130,18 @@ impl JwtManager {
         // `jsonwebtoken` leaves `validate_nbf` off by default, so this is
         // explicit; the claim is always present, so it only ever tightens.
         validation.validate_nbf = true;
-        // Validate every trusted issuer at startup so a broken config fails loud
-        // instead of silently rejecting every A2A token at first use: an empty
-        // issuer, `jwks_url` or `username` can never verify or resolve. A
-        // username that resolves to root is refused per request, by user id.
+        // Reject missing fields at startup instead of failing token verification
+        // at first use. Root mappings are refused per request, by user id.
         for issuer_config in config.trusted_issuers.iter().flatten() {
             if issuer_config.issuer.is_empty() {
                 error!("trusted issuer configured with an empty issuer URL");
+                return Err(IggyError::InvalidConfiguration);
+            }
+            if issuer_config.audience.is_empty() {
+                error!(
+                    issuer = %issuer_config.issuer,
+                    "trusted issuer configured with an empty audience"
+                );
                 return Err(IggyError::InvalidConfiguration);
             }
             if issuer_config.jwks_url.is_empty() {
@@ -681,6 +686,24 @@ mod tests {
             Err(IggyError::InvalidConfiguration) => {}
             Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
             Ok(_) => panic!("build must reject a trusted issuer with an empty issuer"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_trusted_issuer_with_empty_audience() {
+        let jwt = HttpJwtConfig {
+            trusted_issuers: Some(vec![TrustedIssuerConfig {
+                issuer: "https://external.example".to_string(),
+                audience: String::new(),
+                jwks_url: "https://external.example/jwks".to_string(),
+                username: "service".to_string(),
+            }]),
+            ..HttpJwtConfig::default()
+        };
+        match JwtManager::build(&jwt, None) {
+            Err(IggyError::InvalidConfiguration) => {}
+            Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+            Ok(_) => panic!("build must reject a trusted issuer with an empty audience"),
         }
     }
 

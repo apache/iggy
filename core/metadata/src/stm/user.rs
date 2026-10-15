@@ -47,6 +47,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+/// Bootstrap runs independently on each replica, so root needs a fixed timestamp.
+pub const ROOT_USER_CREATED_AT_MICROS: u64 = 1;
+
 // ============================================================================
 // User Entity
 // ============================================================================
@@ -131,6 +134,24 @@ collect_handlers! {
 }
 
 impl UsersInner {
+    #[must_use]
+    pub fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
+        self.items.get(user_id as usize).is_some_and(|user| {
+            user.status == UserStatus::Active && user.created_at.as_micros() == created_at
+        })
+    }
+
+    /// Run a grant check in the same snapshot as other user checks.
+    ///
+    /// # Errors
+    /// Propagates the rule's `IggyError` on denial.
+    pub fn authorize(
+        &self,
+        rule: impl FnOnce(&Permissioner) -> Result<(), IggyError>,
+    ) -> Result<(), IggyError> {
+        rule(&self.permissioner)
+    }
+
     /// Resolve a wire user identifier to its committed slab id, `None` when
     /// the user does not exist.
     #[must_use]
@@ -301,11 +322,7 @@ impl UsersInner {
 
 impl Users {
     pub fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
-        self.read(|users| {
-            users.items.get(user_id as usize).is_some_and(|user| {
-                user.status == UserStatus::Active && user.created_at.as_micros() == created_at
-            })
-        })
+        self.read(|users| users.is_active_account(user_id, created_at))
     }
 
     #[must_use]
@@ -329,7 +346,7 @@ impl Users {
         &self,
         rule: impl FnOnce(&Permissioner) -> Result<(), IggyError>,
     ) -> Result<(), IggyError> {
-        self.read(|inner| rule(&inner.permissioner))
+        self.read(|inner| inner.authorize(rule))
     }
 
     /// Drop every grant on a stream or topic that a committed delete removed.
@@ -404,7 +421,7 @@ impl Users {
                     }),
                     options: WireOptions::empty(),
                 },
-                IggyTimestamp::from(1),
+                IggyTimestamp::from(ROOT_USER_CREATED_AT_MICROS),
                 ApplyContext::default(),
             ))
             .expect("root user bootstrap must run on the metadata writer");
