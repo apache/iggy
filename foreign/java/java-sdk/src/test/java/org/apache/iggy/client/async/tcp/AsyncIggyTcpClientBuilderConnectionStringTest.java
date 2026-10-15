@@ -56,8 +56,9 @@ class AsyncIggyTcpClientBuilderConnectionStringTest {
 
     @Test
     void shouldDisableTlsWhenConnectionStringSetsTlsFalse() {
-        AsyncIggyTcpClientBuilder builder =
-                AsyncIggyTcpClient.builder().enableTls().fromConnectionString("iggy://iggy:iggy@localhost:8090?tls=false");
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder()
+                .enableTls()
+                .fromConnectionString("iggy://iggy:iggy@localhost:8090?tls=false");
 
         assertThat(builder.isTlsEnabled()).isFalse();
     }
