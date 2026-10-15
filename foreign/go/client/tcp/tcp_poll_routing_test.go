@@ -648,8 +648,10 @@ func TestPrimaryPoll_ConfiguredCredentialsFollowSuccessfulSelfUpdates(t *testing
 }
 
 func TestPrimaryPoll_StaleBindingReplacesTheLogicalSessionBeforePolling(t *testing.T) {
-	fixture := newPrimaryPollFixture(t, func(_, connection int, read request) ([]byte, bool) {
-		if connection == 0 && read.code() == uint32(command.BindSessionCode) {
+	var refusedSession atomic.Uint64
+	fixture := newPrimaryPollFixture(t, func(primary, connection int, read request) ([]byte, bool) {
+		if primary == 0 && connection == 0 && read.code() == uint32(command.BindSessionCode) {
+			refusedSession.Store(read.sessionID())
 			return evictionFrame(vsr.EvictionStaleClient, 0, 0), true
 		}
 		return nil, false
@@ -659,8 +661,23 @@ func TestPrimaryPoll_StaleBindingReplacesTheLogicalSessionBeforePolling(t *testi
 	require.NoError(t, err)
 	assert.Equal(t, 2, fixture.primaries[0].connections())
 	assert.GreaterOrEqual(t, fixture.coordinator.connections(), 2)
-	assert.Equal(t, 1, requestCount(fixture.primaries[0].recorded(), command.PollMessagesCode),
+	reads := fixture.primaries[0].recorded()
+	assert.Equal(t, 1, requestCount(reads, command.PollMessagesCode),
 		"attachment failure is retried before any auto-commit poll is admitted")
+	require.NotZero(t, refusedSession.Load())
+	var boundSession uint64
+	for _, read := range reads {
+		switch read.code() {
+		case uint32(command.BindSessionCode):
+			if read.sessionID() != refusedSession.Load() {
+				boundSession = read.sessionID()
+			}
+		case uint32(command.PollMessagesCode):
+			assert.NotEqual(t, refusedSession.Load(), read.sessionID())
+			assert.NotZero(t, boundSession, "replacement session must bind before polling")
+			assert.Equal(t, boundSession, read.sessionID())
+		}
+	}
 }
 
 func TestPrimaryPoll_InvalidBindingDoesNotPollAndRetiresConnection(t *testing.T) {
@@ -685,8 +702,8 @@ func TestPrimaryPoll_InvalidBindingDoesNotPollAndRetiresConnection(t *testing.T)
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
-				if read.code() == uint32(command.BindSessionCode) {
+			fixture := newPrimaryPollFixture(t, func(primary, _ int, read request) ([]byte, bool) {
+				if primary == 0 && read.code() == uint32(command.BindSessionCode) {
 					return test.reply(read), true
 				}
 				return nil, false
