@@ -156,7 +156,16 @@ class TcpConnectionStringTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"tls", "tls=", "tls=yes", "tls=true&", "tls=true=false", "tls=true&tls_ca_file=", "tls=true&tls_ca_file= "})
+    @ValueSource(
+            strings = {
+                "tls",
+                "tls=",
+                "tls=yes",
+                "tls=true&",
+                "tls=true=false",
+                "tls=true&tls_ca_file=",
+                "tls=true&tls_ca_file= "
+            })
     void shouldRejectInvalidOptionValue(String options) {
         assertInvalid("iggy://iggy:iggy@localhost:8090?" + options, "Invalid connection string");
     }
