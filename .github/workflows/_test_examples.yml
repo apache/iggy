@@ -27,6 +27,7 @@ on:
         type: string
         required: true
         description: "Task to run (e.g., 'examples-rust', 'examples-go', 'examples-node')"
+
 permissions:
   contents: read
   security-events: write
@@ -43,27 +44,16 @@ jobs:
         if: inputs.component == 'noop'
         run: echo "No changes detected, skipping tests"
 
-      - name: Setup Rust with cache for examples
+      - name: Setup Rust for examples
         if: startsWith(inputs.component, 'examples-')
-        uses: ./.github/actions/utils/setup-rust-with-cache
+        uses: ./.github/actions/utils/setup-rust
 
-      - name: Setup Node with cache for examples
+      - name: Setup Node for examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
-        uses: ./.github/actions/utils/setup-node-with-cache
+        uses: ./.github/actions/utils/setup-node
         with:
           node-version: "23"
-          cache-dependency-path: examples/node/package-lock.json
           workspace: examples/node
-
-      - name: Setup Python
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.11"
-
-      - name: Setup uv
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Install PHP build dependencies
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
@@ -91,22 +81,15 @@ jobs:
           "${php_bin}" --version
           "${php_config}" --version
 
-      - name: Cache uv
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: actions/cache@v6.1.0
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
-
-      - name: Setup Java with cache for examples
+      - name: Setup Java for examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
-        uses: ./.github/actions/utils/setup-java-with-cache
+        uses: ./.github/actions/utils/setup-java
         with:
           gradle-cache-disabled: "true"
 
       - name: Setup Go for examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
-        uses: ./.github/actions/utils/setup-go-with-cache
+        uses: ./.github/actions/utils/setup-go
         with:
           download-deps: "false"
 
@@ -130,12 +113,11 @@ jobs:
           # against the VSR server.
           SERVER_BIN="iggy-server"
           echo "Building ${SERVER_BIN}..."
-          cargo build --locked --bin "${SERVER_BIN}"
-
+          BUILD_ARGS=(--bin "$SERVER_BIN")
           if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
-            echo "Building additional binaries for Rust examples..."
-            cargo build --locked --bin iggy --examples
+            BUILD_ARGS+=(--bin iggy --examples)
           fi
+          cargo build --locked "${BUILD_ARGS[@]}"
 
           # Verify server binary was built (needed by all examples)
           echo "Verifying server binary:"
@@ -159,6 +141,24 @@ jobs:
               exit 1
             fi
           fi
+
+      # Keep Python's PKG_CONFIG_PATH out of the server build above.
+      - name: Setup Python
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Setup uv
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Cache uv
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
 
       - name: Build PHP extension for examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-php'
@@ -218,9 +218,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            reports/**
-            target/llvm-cov/**
-            coverage.lcov
+          path: reports/**
           if-no-files-found: ignore
           retention-days: 7

@@ -31,16 +31,15 @@ runs:
       with:
         node-version: "23"
         registry-url: "https://registry.npmjs.org"
-        cache: "npm"
-        cache-dependency-path: foreign/node/package-lock.json
+        package-manager-cache: false
 
     - name: Pin npm to 11 to match Dependabot lockfile format
       run: npm install -g npm@11
       shell: bash
 
-    - name: Setup Rust with cache
+    - name: Setup Rust
       if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust-with-cache
+      uses: ./.github/actions/utils/setup-rust
 
     - name: Install netcat
       if: inputs.task == 'e2e'

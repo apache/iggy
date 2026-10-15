@@ -151,6 +151,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "23"
+          package-manager-cache: false
 
       - name: Install markdownlint-cli
         run: npm install -g markdownlint-cli
