@@ -83,7 +83,7 @@ final class RawCommandTest extends TestCase
     {
         $client = new Client('127.0.0.1:1');
         $error = assert_throws(static fn () => $client->$method($operationId));
-        assert_instance_of(PendingOperationException::class, $error);
+        assert_instance_of(PendingOperationException::class, $error, $error->getMessage());
         assert_same($operationId, $error->operation_id);
         assert_same('not_retained', $error->kind);
         assert_same(14008, $error->getCode());
