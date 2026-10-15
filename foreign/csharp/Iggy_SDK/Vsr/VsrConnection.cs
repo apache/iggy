@@ -67,7 +67,7 @@ internal sealed class VsrConnection : IDisposable
     private Exception? _failure;
 
     internal Task Closed => _closed.Task;
-    internal bool IsReady => !_closed.Task.IsCompleted;
+    internal bool IsReady => Failure is null && !_closed.Task.IsCompleted;
     internal Exception? Failure => Volatile.Read(ref _failure);
 
     internal VsrConnection(Stream stream, ConsensusSession session, long maxResponseFrameSize, int requestTimeoutMs,

@@ -467,16 +467,39 @@ public sealed class PrimaryPollingTests
         };
         using var client = await cluster.ConnectAsync(MaxResponseFrameSize);
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        var connection = await (Task<VsrConnection?>)typeof(TcpMessageStream)
+            .GetMethod("FindReadyReplicaAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(client, [(byte)1, TestContext.Current.CancellationToken])!;
+        Assert.NotNull(connection);
+        var lifetime = Assert.IsType<CancellationTokenSource>(typeof(VsrConnection)
+            .GetField("_lifetime", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(connection));
+        var closing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var finishClosing = new ManualResetEventSlim();
+        using var registration = lifetime.Token.Register(() =>
+        {
+            closing.TrySetResult();
+            finishClosing.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        });
 
-        var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.PollMessagesAsync(
-            Stream, Topic, 0, Consumer.New(3), next ? PollingStrategy.Next() : PollingStrategy.Offset(0), 1,
-            !next, TestContext.Current.CancellationToken));
-        Assert.Null(error.OperationId);
-        var invalid = Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException);
-        Assert.False(invalid.FromServer);
-        Assert.False(invalid.Committed);
-        Assert.Equal(VsrError.INVALID_COMMAND, invalid.StatusCode);
-        Assert.Equal(1, polls);
+        try
+        {
+            var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() => client.PollMessagesAsync(
+                Stream, Topic, 0, Consumer.New(3), next ? PollingStrategy.Next() : PollingStrategy.Offset(0), 1,
+                !next, TestContext.Current.CancellationToken));
+            Assert.Null(error.OperationId);
+            var invalid = Assert.IsType<IggyInvalidStatusCodeException>(error.InnerException);
+            Assert.False(invalid.FromServer);
+            Assert.False(invalid.Committed);
+            Assert.Equal(VsrError.INVALID_COMMAND, invalid.StatusCode);
+            Assert.Equal(1, polls);
+            await closing.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.False(connection.Closed.IsCompleted);
+            Assert.False(connection.IsReady);
+        }
+        finally
+        {
+            finishClosing.Set();
+        }
 
         await client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, 0,
             TestContext.Current.CancellationToken);
