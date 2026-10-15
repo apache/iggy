@@ -139,6 +139,7 @@ public sealed class VsrMultiplexingTests
     [Fact]
     public async Task given_a_partial_reply_when_the_frame_deadline_expires_should_fail_only_that_link()
     {
+        const int CompletionTimeoutSeconds = 5;
         using var broken = await LinkPair.ConnectAsync(frameTimeoutMs: 100);
         using var healthy = await LinkPair.ConnectAsync();
         using var canceled = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
@@ -149,8 +150,9 @@ public sealed class VsrMultiplexingTests
         await broken.PartialReplyAsync(firstRequest);
         await canceled.CancelAsync();
         Assert.IsType<OperationCanceledException>((await first).Error);
-        var failure = await second.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        var failure = await second.WaitAsync(TimeSpan.FromSeconds(CompletionTimeoutSeconds), TestContext.Current.CancellationToken);
         Assert.IsType<IOException>(failure.Error);
+        await broken.DropNotified.WaitAsync(TimeSpan.FromSeconds(CompletionTimeoutSeconds), TestContext.Current.CancellationToken);
         Assert.Equal(1, broken.Dropped);
         var next = healthy.SendAsync(token: TestContext.Current.CancellationToken);
         await healthy.ReplyAsync(await healthy.ReadAsync(), [9]);
@@ -238,9 +240,11 @@ public sealed class VsrMultiplexingTests
         private const int RequestTimeoutMs = 5_000;
         private const int MaxResponseFrameSize = 1024 * 1024;
         private readonly NetworkStream _server = server.GetStream();
+        private readonly TaskCompletionSource _dropNotified = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private VsrConnection? _connection;
         private int _dropped;
         internal int Dropped => Volatile.Read(ref _dropped);
+        internal Task DropNotified => _dropNotified.Task;
 
         internal static async Task<LinkPair> ConnectAsync(int frameTimeoutMs = RequestTimeoutMs)
         {
@@ -254,7 +258,11 @@ public sealed class VsrMultiplexingTests
             var pair = new LinkPair(client, server);
             pair._connection = new VsrConnection(client.GetStream(),
                 new ConsensusSession(7, 42, new byte[LoginRegister.BIND_SECRET_BYTES]), MaxResponseFrameSize,
-                frameTimeoutMs, _ => Interlocked.Increment(ref pair._dropped), NullLogger.Instance);
+                frameTimeoutMs, _ =>
+                {
+                    Interlocked.Increment(ref pair._dropped);
+                    pair._dropNotified.TrySetResult();
+                }, NullLogger.Instance);
             return pair;
         }
 
