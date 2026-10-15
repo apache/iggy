@@ -28,5 +28,9 @@ fi
 
 tar --zstd -xf "$artifact_dir/runtime.tar.zst"
 sha256sum --check "$artifact_dir/SHA256SUMS"
-test -x target/debug/iggy-server
-test -x target/debug/iggy
+for binary in target/debug/iggy-server target/debug/iggy; do
+  if [[ ! -x "$binary" ]]; then
+    echo "::error::Runtime binary missing or not executable: $binary"
+    exit 1
+  fi
+done

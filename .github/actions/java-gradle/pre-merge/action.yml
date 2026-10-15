@@ -85,7 +85,6 @@ runs:
       id: iggy
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
         wait-timeout-seconds: "90"
       env:
@@ -162,7 +161,6 @@ runs:
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
         wait-timeout-seconds: "90"
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid

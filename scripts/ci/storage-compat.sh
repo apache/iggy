@@ -97,6 +97,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 mkdir -p "${TARGET_DIR}"
 TARGET_DIR="$(cd "${TARGET_DIR}" && pwd)"
+if [[ -n "$RUNTIME_ARTIFACTS" && "$TARGET_DIR" != "$REPO_ROOT/target" ]]; then
+  echo "Runtime artifacts require CARGO_TARGET_DIR=$REPO_ROOT/target"
+  exit 1
+fi
 export CARGO_TARGET_DIR="${TARGET_DIR}"
 
 cd "${REPO_ROOT}"
@@ -267,10 +271,6 @@ else
 fi
 
 if [[ -n "$RUNTIME_ARTIFACTS" ]]; then
-  if [[ "$TARGET_DIR" != "$REPO_ROOT/target" ]]; then
-    echo "Runtime artifacts require CARGO_TARGET_DIR=$REPO_ROOT/target"
-    exit 1
-  fi
   ./scripts/ci/restore-runtime.sh "$RUNTIME_ARTIFACTS"
 else
   rm -f "${HEAD_SERVER}"

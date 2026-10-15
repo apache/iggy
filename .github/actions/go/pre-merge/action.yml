@@ -128,7 +128,6 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e.pid
@@ -185,7 +184,6 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e-tls.pid
@@ -224,7 +222,6 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-cluster-0.pid
@@ -239,7 +236,6 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
         replica-id: "1"
         tcp_address: 127.0.0.1:8091

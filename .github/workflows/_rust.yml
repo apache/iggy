@@ -23,17 +23,9 @@ on:
         description: "JSON with checks (component/task entries) and tests (boolean)"
         type: string
         required: true
-      test-scope:
-        description: "Test selection: affected or workspace"
-        type: string
-        default: affected
       timeout-minutes:
         type: number
         default: 60
-      save-cache:
-        description: "Save dependencies from the test build for subsequent PRs"
-        type: boolean
-        default: false
       build-metadata:
         description: "Embed CI build metadata in the server binaries"
         type: boolean
@@ -114,9 +106,7 @@ jobs:
     if: ${{ fromJSON(inputs.plan).tests }}
     uses: ./.github/workflows/_rust_tests.yml
     with:
-      test-scope: ${{ inputs.test-scope }}
       timeout-minutes: ${{ inputs.timeout-minutes }}
-      save-cache: ${{ inputs.save-cache }}
       build-metadata: ${{ inputs.build-metadata }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

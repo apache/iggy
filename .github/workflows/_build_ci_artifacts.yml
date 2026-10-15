@@ -15,10 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: _build_runtime
+name: _build_ci_artifacts
 on:
   workflow_call:
     inputs:
+      task:
+        description: "Artifact producer: plan, runtime-build or test-build"
+        type: string
+        required: true
       test-scope:
         type: string
         default: affected
@@ -28,6 +32,9 @@ on:
       build-metadata:
         type: boolean
         default: false
+      timeout-minutes:
+        type: number
+        default: 120
 
 permissions:
   contents: read
@@ -37,25 +44,25 @@ env:
 
 jobs:
   build:
-    name: build
+    name: ${{ inputs.task == 'plan' && 'select' || 'build' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 120
+    timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Build covered runtime binaries
+      - name: Prepare artifacts
         uses: ./.github/actions/rust/pre-merge
         with:
-          task: runtime-build
+          task: ${{ inputs.task }}
           test-scope: ${{ inputs.test-scope }}
           save-cache: ${{ inputs.save-cache }}
           free-disk-space-aggressive: ${{ inputs.test-scope == 'workspace' }}
 
-      - name: Upload runtime binaries
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: rust-runtime-${{ github.run_id }}
-          path: ${{ runner.temp }}/rust-runtime/
+          name: rust-${{ inputs.task == 'runtime-build' && 'runtime' || inputs.task }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/rust-${{ inputs.task == 'runtime-build' && 'runtime' || inputs.task }}/
           compression-level: 0
           if-no-files-found: error
           overwrite: true

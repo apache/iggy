@@ -39,7 +39,7 @@ runs:
       if: inputs.task == 'bdd-rust'
       uses: ./.github/actions/utils/setup-rust
       with:
-        coverage: ${{ inputs.task == 'bdd-rust' }}
+        coverage: "true"
 
     - name: Download runtime binaries
       if: startsWith(inputs.component, 'bdd-')

@@ -19,15 +19,9 @@ name: _rust_tests
 on:
   workflow_call:
     inputs:
-      test-scope:
-        type: string
-        default: affected
       timeout-minutes:
         type: number
         default: 60
-      save-cache:
-        type: boolean
-        default: false
       build-metadata:
         type: boolean
         default: false
@@ -42,34 +36,8 @@ env:
   IGGY_CI_BUILD: ${{ inputs.build-metadata }}
 
 jobs:
-  test-build:
-    name: build-tests
-    runs-on: ubuntu-26.04
-    timeout-minutes: ${{ inputs.timeout-minutes }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      - name: Build coverage test archive
-        uses: ./.github/actions/rust/pre-merge
-        with:
-          task: test-build
-          test-scope: ${{ inputs.test-scope }}
-          save-cache: ${{ inputs.save-cache }}
-          free-disk-space-aggressive: ${{ inputs.test-scope == 'workspace' }}
-
-      - name: Upload test artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: rust-test-build-${{ github.run_id }}
-          path: ${{ runner.temp }}/rust-test-build/
-          compression-level: 0
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 7
-
   tests:
     name: test (${{ matrix.partition }}/${{ strategy.job-total }})
-    needs: test-build
     strategy:
       fail-fast: false
       matrix:

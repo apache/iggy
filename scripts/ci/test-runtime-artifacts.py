@@ -103,12 +103,16 @@ class RuntimeArtifacts(unittest.TestCase):
     def test_missing_cli_is_not_accepted_as_a_complete_runtime(self):
         self.files.pop()
         self.pack()
-        self.assertNotEqual(self.restore().returncode, 0)
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Runtime binary missing or not executable: target/debug/iggy", result.stdout)
 
     def test_nonexecutable_server_is_rejected(self):
         (self.producer / self.files[0]).chmod(0o644)
         self.pack()
-        self.assertNotEqual(self.restore().returncode, 0)
+        result = self.restore()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Runtime binary missing or not executable: target/debug/iggy-server", result.stdout)
 
     def test_rerun_restores_the_original_binary(self):
         self.assertEqual(self.restore().returncode, 0)
@@ -116,6 +120,65 @@ class RuntimeArtifacts(unittest.TestCase):
         self.assertEqual(self.restore().returncode, 0)
         self.assertEqual((self.consumer / self.files[0]).read_bytes(),
                          (self.producer / self.files[0]).read_bytes())
+
+
+class RuntimePlan(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        action = yaml.safe_load((REPO_ROOT / ".github/actions/rust/pre-merge/action.yml").read_text())
+        self.script = next(step["run"] for step in action["runs"]["steps"]
+                           if step.get("name") == "Build coverage artifacts")
+        self.env = dict(os.environ, RUNNER_TEMP=str(self.root), ARTIFACT_TASK="plan",
+                        TEST_SELECTION="affected", PLAN_STATUS="failure", PLAN_FILE="")
+        self.env["GIT_DIR"] = run("git", "rev-parse", "--absolute-git-dir").stdout.strip()
+
+    def plan(self):
+        return run("bash", "-euo", "pipefail", "-c", self.script, cwd=self.root, env=self.env)
+
+    def assert_workspace_fallback(self):
+        result = self.plan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        artifact = self.root / "rust-plan"
+        self.assertEqual((artifact / "scope").read_text(), "workspace\n")
+        self.assertEqual((artifact / "runtime-scope").read_text(), "workspace\n")
+        for name in ("test-args", "test-target-args", "test-packages", "runtime-packages"):
+            self.assertEqual((artifact / name).read_bytes(), b"", name)
+        self.assertEqual((artifact / "revision").read_text().strip(),
+                         run("git", "rev-parse", "HEAD").stdout.strip())
+
+    def test_planner_failure_selects_workspace_for_both_producers(self):
+        self.assert_workspace_fallback()
+
+    def test_explicit_workspace_selection_does_not_need_a_planner(self):
+        self.env["TEST_SELECTION"] = "workspace"
+        self.assert_workspace_fallback()
+
+    def test_selector_failure_discards_partial_package_selection(self):
+        selector = self.root / "cargo-rail-action"
+        selector.write_text("""#!/usr/bin/env bash
+case "$2:$4" in
+  cargo-scope:*) printf 'packages\\n' ;;
+  cargo-args:*) printf '%s\\0' '-p' 'selected-test-package' ;;
+  target-args:*) printf '%s\\0' '--lib' ;;
+  package-names:cargo.test) printf '%s\\0' 'selected-test-package' ;;
+  *) exit 1 ;;
+esac
+""")
+        selector.chmod(0o755)
+        self.env.update(PLAN_STATUS="success", PATH=f"{self.root}:{os.environ['PATH']}")
+        self.assert_workspace_fallback()
+
+    def test_both_producers_reject_a_plan_for_another_revision(self):
+        self.assert_workspace_fallback()
+        (self.root / "rust-plan/revision").write_text("0" * 40 + "\n")
+        for task in ("runtime-build", "test-build"):
+            with self.subTest(task=task):
+                self.env["ARTIFACT_TASK"] = task
+                result = self.plan()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Rust build selection does not match checkout", result.stdout)
 
 
 class RuntimeSelection(unittest.TestCase):

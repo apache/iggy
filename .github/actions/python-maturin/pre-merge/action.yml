@@ -51,7 +51,6 @@ runs:
       id: iggy
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
 
     - name: Setup Python

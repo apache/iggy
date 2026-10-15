@@ -87,7 +87,6 @@ runs:
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
-        mode: bin
         bin: target/debug/iggy-server
 
     - name: Test with coverage
