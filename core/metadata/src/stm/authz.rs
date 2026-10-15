@@ -109,7 +109,10 @@ pub(crate) fn reject_stale_session(
     header: &PrepareHeader,
     client_table: &ClientTable,
 ) -> Option<ApplyReply> {
-    if message_bus::is_server_internal_client(header.client) {
+    if matches!(
+        header.operation,
+        Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
+    ) {
         return None;
     }
     (header.session != 0 && client_table.get_epoch(header.client) != Some(header.session))
@@ -914,6 +917,34 @@ mod tests {
             authorize(&prepare, mux.users(), mux.streams()).is_none(),
             "server-originated revocation must not be gated"
         );
+    }
+
+    #[test]
+    fn given_reserved_client_id_when_session_is_stale_should_reject_client_operations() {
+        let table = ClientTable::new(consensus::CLIENTS_TABLE_MAX);
+        for client in [
+            message_bus::server_internal_client_id(0),
+            message_bus::AUTO_COMMIT_CLIENT_ID,
+        ] {
+            for operation in [
+                Operation::CreatePersonalAccessToken,
+                Operation::TruncatePartition,
+            ] {
+                let header = PrepareHeader {
+                    client,
+                    session: 1,
+                    operation,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    reject_stale_session(&header, &table)
+                        .expect("a reserved ID must not bypass session fencing")
+                        .code,
+                    IggyError::StaleClient.as_code(),
+                    "{operation:?} must check the caller's session"
+                );
+            }
+        }
     }
 
     #[test]

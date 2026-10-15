@@ -653,7 +653,7 @@ pub enum MetadataSubmitError {
     ///   the previous boot's ids while the HTTP id minter restarts at 1, so
     ///   an honest login lands on a recovered entry owned by another user.
     ClientIdOwnedByAnotherUser,
-    /// The account verified at login no longer exists or is inactive.
+    /// The verified account is no longer active or the client ID is reserved.
     Unauthenticated,
     /// The request is at or below the watermark without a retained receipt.
     RequestTooOld,
@@ -2417,6 +2417,9 @@ where
         registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        if message_bus::is_server_internal_client(client_id) {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let consensus = self
             .consensus
             .as_ref()
@@ -5303,6 +5306,40 @@ mod tests {
                 watermark: 0
             })
         );
+    }
+
+    #[compio::test]
+    async fn given_reserved_client_id_when_registering_in_process_should_reject_before_queueing() {
+        const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let metadata = metadata_plane();
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let consensus = metadata.consensus.as_ref().unwrap();
+        for commit_max in [0, 1] {
+            consensus.advance_commit_max(commit_max);
+            for client in [
+                message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                let result = compio::time::timeout(
+                    REGISTRATION_TIMEOUT,
+                    metadata.submit_register_in_process(
+                        client,
+                        0,
+                        RegisterRequest {
+                            user_created_at: 1,
+                            bind_verifier: [0x5a; 32],
+                        },
+                    ),
+                )
+                .await
+                .expect("reserved IDs must be rejected without waiting for consensus");
+                let error = result.expect_err("reserved IDs cannot acquire a session");
+                assert_eq!(error, MetadataSubmitError::Unauthenticated);
+                assert!(!error.is_transient());
+                assert_eq!(metadata.client_table.borrow().get_epoch(client), None);
+                assert!(!consensus.pipeline_has_message_from_client(client));
+            }
+        }
     }
 
     #[test]

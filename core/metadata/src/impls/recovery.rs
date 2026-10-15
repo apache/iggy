@@ -705,6 +705,7 @@ where
         }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
+            && !message_bus::is_auto_commit_client(header.client)
             && !matches!(
                 header.operation,
                 Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
@@ -1724,7 +1725,16 @@ mod tests {
         const TOKEN_HASH: [u8; PAT_TOKEN_HASH_BYTES] = [b'a'; PAT_TOKEN_HASH_BYTES];
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
 
-        for replace_before_token in [false, true] {
+        // Admission rejects reserved IDs, but previously committed sessions must
+        // still replay and fence their pending operations after user deletion.
+        for (client_id, replace_before_token) in [
+            CLIENT,
+            message_bus::server_internal_client_id(0),
+            message_bus::AUTO_COMMIT_CLIENT_ID,
+        ]
+        .into_iter()
+        .flat_map(|client_id| [(client_id, false), (client_id, true)])
+        {
             let directory = tempdir().unwrap();
             let metadata_dir = directory.path().join("metadata");
             std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -1784,7 +1794,7 @@ mod tests {
             let pending_token = (
                 Operation::CreatePersonalAccessToken,
                 token.clone(),
-                CLIENT,
+                client_id,
                 USER,
                 SESSION,
             );
@@ -1802,7 +1812,7 @@ mod tests {
                     0,
                     ROOT_SESSION,
                 ),
-                (Operation::Register, register(2), CLIENT, USER, 0),
+                (Operation::Register, register(2), client_id, USER, 0),
                 (
                     Operation::DeleteUser,
                     DeleteUserRequest {
@@ -1818,7 +1828,7 @@ mod tests {
                 (
                     Operation::CreateStream,
                     stream.clone(),
-                    CLIENT,
+                    client_id,
                     USER,
                     SESSION,
                 ),
@@ -1894,11 +1904,11 @@ mod tests {
                     let reply =
                         apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
                     let status = if operation == Operation::Register {
-                        0
+                        result_code(reply.body()).unwrap_or(0)
                     } else {
                         result_code(reply.body()).unwrap()
                     };
-                    let stale = client == CLIENT && operation != Operation::Register;
+                    let stale = client == client_id && operation != Operation::Register;
                     assert_eq!(
                         status,
                         if stale {
@@ -1906,7 +1916,7 @@ mod tests {
                         } else {
                             0
                         },
-                        "{operation:?} at op {op}, replace before token: {replace_before_token}"
+                        "{operation:?} at op {op}, client {client_id}, replace before token: {replace_before_token}"
                     );
                     if stale {
                         assert_eq!(stm.users().read(|users| users.pat_count_of(USER)), 0);
@@ -1927,7 +1937,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(recovered.client_table.encode(), table.borrow().encode());
-            assert_eq!(recovered.client_table.get_epoch(CLIENT), None);
+            assert_eq!(recovered.client_table.get_epoch(client_id), None);
             assert_eq!(
                 recovered.client_table.get_epoch(REPLACEMENT_CLIENT),
                 Some(REPLACEMENT_SESSION)

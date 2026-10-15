@@ -1109,6 +1109,9 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    if message_bus::is_server_internal_client(identity.client_id) {
+        return Err(IggyError::Unauthenticated);
+    }
     let watermark = identity.metadata_watermark.max(identity.session);
     reads::await_metadata_read_frontier(shard, watermark).await?;
     let (user_id, session, attachment) = if shard.id == 0 {
@@ -1188,7 +1191,10 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
-    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+    use iggy_binary_protocol::requests::users::login_register::{
+        LoginRegisterRequest, RegisterRequest,
+    };
+    use iggy_binary_protocol::requests::users::login_register_with_pat::LoginRegisterWithPatRequest;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
     };
@@ -1358,12 +1364,87 @@ mod tests {
     }
 
     #[compio::test]
-    async fn bind_session_rechecks_the_owner_exists_and_is_active() {
+    async fn given_reserved_client_id_when_logging_in_should_evict_without_registering() {
+        const TRANSPORT: u128 = 94;
+        let version_info = ClientVersionInfo {
+            protocol_version: IGGY_PROTOCOL_VERSION,
+            sdk_name: WireName::new("test-sdk").unwrap(),
+            sdk_version: WireName::new("1.0.0").unwrap(),
+        };
+        let bodies = [
+            LoginRegisterRequest {
+                version_info: version_info.clone(),
+                bind_secret: BindSecret::new(Box::new([0x5a; 32])),
+                username: WireName::new("root").unwrap(),
+                password: "password".into(),
+                client_context: None,
+            }
+            .to_bytes(),
+            LoginRegisterWithPatRequest {
+                version_info,
+                bind_secret: BindSecret::new(Box::new([0x5a; 32])),
+                token: "personal-access-token".into(),
+                client_context: None,
+            }
+            .to_bytes(),
+        ];
+        for replica in [0, 1] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, replica, 3, FIRST_BOOT));
+            let sessions = Rc::new(RefCell::new(SessionManager::new()));
+            for client in [
+                message_bus::server_internal_client_id(0),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                for body in &bodies {
+                    handle_login_register_request(
+                        &shard,
+                        &sessions,
+                        TRANSPORT,
+                        request_message(Operation::Register, client, 0, 0, body),
+                    )
+                    .await;
+                    let replies = bus.client_replies.take();
+                    assert_eq!(replies.len(), 1);
+                    let (transport, frame) = &replies[0];
+                    assert_eq!(*transport, TRANSPORT);
+                    assert_eq!(frame_command(frame), Command::Eviction as u8);
+                    assert_eq!(
+                        eviction_reason_byte(frame),
+                        EvictionReason::MalformedLogin as u8
+                    );
+                    assert!(bus.replica_sends.borrow().is_empty());
+                    assert_eq!(
+                        shard
+                            .plane
+                            .metadata()
+                            .client_table
+                            .borrow()
+                            .get_epoch(client),
+                        None
+                    );
+                    assert_eq!(sessions.borrow().get_session(TRANSPORT), None);
+                }
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn bind_session_rechecks_the_client_id_and_active_account() {
         const CLIENT: u128 = 1;
         const TRANSPORT: u128 = 2;
         const SESSION: u64 = 1;
         const SECRET: [u8; 32] = [0x5a; 32];
-        for status in [None, Some(UserStatus::Inactive), Some(UserStatus::Active)] {
+        for (client_id, status) in [
+            (CLIENT, None),
+            (CLIENT, Some(UserStatus::Inactive)),
+            (CLIENT, Some(UserStatus::Active)),
+            (
+                message_bus::server_internal_client_id(0),
+                Some(UserStatus::Active),
+            ),
+            (message_bus::AUTO_COMMIT_CLIENT_ID, Some(UserStatus::Active)),
+        ] {
             let bus = SpyBus::default();
             let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
             let metadata = shard.plane.metadata();
@@ -1389,10 +1470,10 @@ mod tests {
                 .client_table
                 .borrow_mut()
                 .commit_register(
-                    CLIENT,
+                    client_id,
                     0,
-                    bind_verifier(CLIENT, 0, &SECRET),
-                    register_reply(CLIENT, SESSION),
+                    bind_verifier(client_id, 0, &SECRET),
+                    register_reply(client_id, SESSION),
                 )
                 .unwrap();
             metadata.applied_frontier().advance(SESSION);
@@ -1407,23 +1488,25 @@ mod tests {
                 &sessions,
                 TRANSPORT,
                 SessionIdentity {
-                    client_id: CLIENT,
+                    client_id,
                     session: SESSION,
                     metadata_watermark: SESSION,
                 },
                 BindSecret::new(Box::new(SECRET)),
             )
             .await;
-            if status == Some(UserStatus::Active) {
+            if status == Some(UserStatus::Active)
+                && !message_bus::is_server_internal_client(client_id)
+            {
                 assert_eq!(outcome.unwrap(), (0, SESSION));
                 assert_eq!(
                     sessions.borrow().get_session(TRANSPORT),
-                    Some((CLIENT, SESSION))
+                    Some((client_id, SESSION))
                 );
             } else {
                 assert!(
                     matches!(outcome, Err(IggyError::Unauthenticated)),
-                    "{status:?}: {outcome:?}"
+                    "client {client_id}, {status:?}: {outcome:?}"
                 );
                 assert!(sessions.borrow().get_session(TRANSPORT).is_none());
             }

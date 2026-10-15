@@ -157,9 +157,11 @@ func TestSessionHasActivity_TracksEveryEntryPoint(t *testing.T) {
 	})
 }
 
-func TestNewClientID_NeverReturnsZero(t *testing.T) {
+func TestNewClientID_NonZeroWithTopBitClear(t *testing.T) {
 	for range 64 {
-		assert.False(t, newClientID().IsZero())
+		client := newClientID()
+		assert.False(t, client.IsZero())
+		assert.LessOrEqual(t, client.Hi, uint64(math.MaxInt64))
 	}
 }
 

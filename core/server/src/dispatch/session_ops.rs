@@ -1100,6 +1100,18 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
 
+    if message_bus::is_server_internal_client(vsr_client_id) {
+        send_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::MalformedLogin,
+            "login_rejection",
+        )
+        .await;
+        return;
+    }
+
     // Both login-register shapes share the ClientVersionInfo prefix, so the
     // protocol gate decodes it once and runs before any credential work; the
     // body shapes below parse from past the prefix. Only VSR clients reach

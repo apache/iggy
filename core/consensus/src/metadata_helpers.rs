@@ -257,6 +257,9 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
+    if message_bus::is_server_internal_client(client_id) {
+        return PreflightOutcome::Reject(IggyError::Unauthenticated.as_code());
+    }
     if !is_caught_up_primary(consensus) {
         return PreflightOutcome::NotReady;
     }
@@ -1113,12 +1116,45 @@ mod tests {
     }
 
     #[test]
+    fn given_reserved_client_id_when_registering_should_reject_before_catchup() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
+        consensus.init();
+        let client_table = fresh_client_table();
+        let body = RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        }
+        .to_bytes();
+        for commit_max in [0, 1] {
+            consensus.advance_commit_max(commit_max);
+            for client_id in [
+                message_bus::server_internal_client_id(0),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                assert!(matches!(
+                    register_preflight(
+                        &consensus,
+                        &client_table,
+                        client_id,
+                        ACTING_USER_ID,
+                        &body,
+                        0,
+                        |_| true,
+                    ),
+                    PreflightOutcome::Reject(code) if code == IggyError::Unauthenticated.as_code()
+                ));
+                assert_eq!(client_table.borrow().get_epoch(client_id), None);
+            }
+        }
+    }
+
+    #[test]
     fn register_preflight_new_client_does_not_send_reply() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, ClientSpyBus::new(), LocalPipeline::new());
         consensus.init();
 
         let client_table = fresh_client_table();
-        let client_id: u128 = 0xC0DE;
+        let client_id = message_bus::server_internal_client_id(0) - 1;
 
         let result = register_preflight(
             &consensus,
