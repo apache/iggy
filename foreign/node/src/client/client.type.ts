@@ -74,7 +74,7 @@ export type SendCommandOptions = {
  * Connection lifecycle events of a `Client`, with their listener arguments.
  */
 export type ClientEventMap = {
-  /** A dial to the server starts: the first one, a redial or a redirect */
+  /** A dial to a cluster replica starts, including redials */
   connecting: [],
   /** The dialed socket is ready: TCP connected, or TLS handshake done */
   connected: [],

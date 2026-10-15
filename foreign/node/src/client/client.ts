@@ -35,19 +35,19 @@ export class Client extends CommandAPI {
 
   /** Registers a listener for a connection lifecycle event. */
   on<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
-    this.events.on(event, listener);
+    this.events.on(event === 'error' ? 'connectionError' : event, listener);
     return this;
   }
 
   /** Registers a listener for the next occurrence only. */
   once<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
-    this.events.once(event, listener);
+    this.events.once(event === 'error' ? 'connectionError' : event, listener);
     return this;
   }
 
   /** Removes a listener registered with `on` or `once`. */
   off<E extends keyof ClientEventMap>(event: E, listener: (...args: ClientEventMap[E]) => void): this {
-    this.events.off(event, listener);
+    this.events.off(event === 'error' ? 'connectionError' : event, listener);
     return this;
   }
 
@@ -83,7 +83,7 @@ export class SimpleClient extends CommandAPI {
    */
   async destroy() {
     const client = await this.clientProvider();
-    client.destroy();
+    await client.destroy();
   }
 
 }

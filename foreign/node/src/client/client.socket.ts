@@ -736,6 +736,7 @@ export class CommandResponseStream extends EventEmitter {
     this.lifetime.signal.throwIfAborted();
     const connection = new IggyConnection({ ...this.options, options: { ...this.options.options, ...endpoint } });
     this.connections.add(connection);
+    void connection.socketClosed.then(() => this.connections.delete(connection));
     connection.on('connecting', () => {
       if (!this.lifetime.signal.aborted) this.emit('connecting');
     });
@@ -743,14 +744,10 @@ export class CommandResponseStream extends EventEmitter {
       if (!this.lifetime.signal.aborted) this.emit('connected');
     });
     connection.on('error', (error: Error) => {
-      if (!this.lifetime.signal.aborted && this.listenerCount('error') > 0)
-        this.emit('error', error);
-    });
-    connection.once('disconnected', () => {
-      if (!connection.socket || connection.socket.closed)
-        this.connections.delete(connection);
-      else
-        connection.socket.once('close', () => this.connections.delete(connection));
+      // Keep diagnostic link errors separate from EventEmitter's special
+      // 'error' event: internal events.once waits must survive link recovery.
+      if (!this.lifetime.signal.aborted && this.listenerCount('connectionError') > 0)
+        this.emit('connectionError', error);
     });
     connection.on('eviction', (error) => this.emit('eviction', error));
     return connection;
@@ -993,11 +990,7 @@ export class CommandResponseStream extends EventEmitter {
 
   destroy(): Promise<void> {
     if (this.destroyPromise) return this.destroyPromise;
-    const closed = [...this.connections].map((connection) => {
-      const socket = connection.socket;
-      return !socket || socket.closed ? Promise.resolve() :
-        new Promise<void>((resolve) => socket.once('close', () => resolve()));
-    });
+    const closed = [...this.connections].map((connection) => connection.socketClosed);
     this.destroyPromise = Promise.all(closed).then(() => { this.emit('end'); });
     this.rememberedCredentials = undefined;
     this.lifetime.abort(new Error('client destroyed'));

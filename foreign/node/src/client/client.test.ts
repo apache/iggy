@@ -20,8 +20,8 @@ import { once, type EventEmitter } from 'node:events';
 import { createServer, type AddressInfo, type Server, type Socket } from 'node:net';
 import { setImmediate as nextTick } from 'node:timers/promises';
 import { describe, it } from 'node:test';
-import { Client, SingleClient } from './client.js';
-import { NotConnectedError } from './client.socket.js';
+import { Client, SimpleClient, SingleClient } from './client.js';
+import { CommandResponseStream, NotConnectedError } from './client.socket.js';
 import type { ClientConfig } from './client.type.js';
 import { ResponseFrameDecoder } from './client.frame.js';
 import { ResponseError } from '../wire/error.utils.js';
@@ -109,7 +109,9 @@ describe('Client lifecycle events', () => {
     try {
       await client.system.ping();
       const socket = client['events'].getReadStream() as Socket;
-      client.on('end', () => assert.ok(socket.closed));
+      let closed = false;
+      socket.once('close', () => { closed = true; });
+      client.on('end', () => assert.ok(closed));
       const ended = client.destroy();
       assert.equal(client.destroy(), ended);
       await ended;
@@ -143,6 +145,24 @@ describe('Client lifecycle events', () => {
     }
   });
 
+  it('waits for a socket that was already closing when destroy was called', async () => {
+    const server = await startServer();
+    const client = new Client(clientConfig(server.server));
+    try {
+      await client.system.ping();
+      const socket = client['events'].getReadStream() as Socket;
+      let closed = false;
+      socket.once('close', () => { closed = true; });
+      client.once('end', () => assert.ok(closed));
+      socket.destroy();
+      await client.destroy();
+      assert.ok(closed);
+    } finally {
+      await client.destroy();
+      await server.close();
+    }
+  });
+
   it('does not dial a queued request after destruction', async () => {
     const server = await startServer();
     const client = new Client(clientConfig(server.server));
@@ -162,6 +182,29 @@ describe('Client lifecycle events', () => {
     }
   });
 
+  it('awaits an asynchronous raw client destroy through SimpleClient', async () => {
+    const server = await startServer();
+    const raw = new CommandResponseStream(clientConfig(server.server));
+    const destroy = raw.destroy.bind(raw);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    raw.destroy = async () => { await pending; await destroy(); };
+    const client = new SimpleClient(raw);
+    let finished = false;
+    try {
+      const ended = client.destroy().then(() => { finished = true; });
+      await nextTick();
+      assert.equal(finished, false);
+      release();
+      await ended;
+      assert.equal(finished, true);
+    } finally {
+      release();
+      await destroy();
+      await server.close();
+    }
+  });
+
   it('keeps listeners across replacement links without reattaching them', async () => {
     const server = await startServer();
     const client = new Client(clientConfig(server.server));
@@ -176,7 +219,7 @@ describe('Client lifecycle events', () => {
       client.once('connected', removed);
       client.removeListener('connected', removed);
       const counts = Object.fromEntries(
-        ['connecting', 'connected', 'error', 'end'].map((name) => [name, client['events'].listenerCount(name)])
+        ['connecting', 'connected', 'connectionError', 'end'].map((name) => [name, client['events'].listenerCount(name)])
       );
       for (let replacement = 0; replacement < 3; replacement += 1) {
         const socket = client['events'].getReadStream() as Socket;
@@ -202,7 +245,7 @@ describe('Client lifecycle events', () => {
       await client.system.ping();
       await connected;
       assert.equal(client['events'].listenerCount('connected'), 0);
-      assert.equal(client['events'].listenerCount('error'), 0);
+      assert.equal(client['events'].listenerCount('connectionError'), 0);
     } finally {
       await client.destroy();
       await server.close();
@@ -234,4 +277,3 @@ describe('Client lifecycle events', () => {
     });
   }
 });
-
