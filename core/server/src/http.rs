@@ -361,9 +361,10 @@ const PING_PATH: &str = "/ping";
 /// whose writes all commit through the metadata consensus group - carry the
 /// `forward_to_primary` route layer, so on a follower they are relayed to the
 /// primary instead of failing with a transient 503 (reads under that layer
-/// still serve locally unless `?consistency=linearizable`). The local routes
-/// never need the metadata primary: health, the login/refresh flows (STM read
-/// + JWT mint), node-local reads, and the partition-plane routes.
+/// still serve locally unless `?consistency=linearizable`). The partition
+/// routes go to the primary of their partition instead. The local routes
+/// never need a primary: health, the login/refresh flows (STM read + JWT
+/// mint) and node-local reads.
 ///
 /// `max_request_size` becomes the router-wide `DefaultBodyLimit` (413 past
 /// it), exactly like the legacy server: it bounds the per-request term of the
@@ -399,7 +400,7 @@ fn router(
         .is_some()
         .then(|| state.metrics.request_counter());
     let forwardable = forwardable_routes(state.clone());
-    let partition_writes = partition_write_routes(state.clone());
+    let partitions = partition_routes(state.clone());
     let local = Router::new()
         .route(PING_PATH, get(ping))
         .route("/users/login", post(login_user))
@@ -407,10 +408,6 @@ fn router(
         .route(
             "/personal-access-tokens/login",
             post(login_with_personal_access_token),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
-            get(get_consumer_offset),
         )
         .route("/stats", get(get_stats))
         .route("/options/{scope}", get(describe_options))
@@ -424,7 +421,7 @@ fn router(
     };
     let router = Router::new()
         .merge(forwardable)
-        .merge(partition_writes)
+        .merge(partitions)
         .merge(local)
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_request_size))
@@ -469,17 +466,11 @@ fn router(
     merge_web_ui(router, web_ui).with_state(())
 }
 
-/// Acknowledged partition writes use a bounded HTTP roster fallback. This is
-/// a correctness path for the existing stateless HTTP transport. Direct
-/// partition-primary routing remains the scalable long-term design.
-///
-/// A poll rides the same fallback, because an automatic commit is a partition
-/// write in every sense but the verb: only a replica that can originate the
-/// offset operation may serve one, and the refusal it would otherwise return
-/// is terminal for an HTTP caller, which has no roster of its own to walk.
-/// [`forward::forward_partition_write`] leaves a poll without automatic commit
-/// entirely local, so an ordinary read still pays nothing for this.
-fn partition_write_routes(state: HttpState) -> Router<HttpState> {
+/// Every request of a partition runs on the primary of its partition group,
+/// reads included, as on the binary transports: the node that receives one
+/// chooses the partition and relays the request once when another replica is
+/// the primary ([`forward::route_partition`]).
+fn partition_routes(state: HttpState) -> Router<HttpState> {
     Router::new()
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
@@ -487,13 +478,16 @@ fn partition_write_routes(state: HttpState) -> Router<HttpState> {
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
-            put(store_consumer_offset),
+            put(store_consumer_offset).get(get_consumer_offset),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
             delete(delete_consumer_offset),
         )
-        .route_layer(from_fn_with_state(state, forward::forward_partition_write))
+        .route_layer(from_fn_with_state(
+            state,
+            forward::forward_partition_request,
+        ))
 }
 
 /// The control-plane route table: every write here commits through the

@@ -243,6 +243,10 @@ else
   BASELINE_TARGET_DIR="${WORKTREE_DIR}/target"
   (
     cd "${WORKTREE_DIR}"
+    # The reference revision must not contribute counters to HEAD's coverage report.
+    if [[ "${__CARGO_LLVM_COV_RUSTC_WRAPPER:-}" == 1 ]]; then
+      export RUSTC_WRAPPER="${__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING:-}"
+    fi
     CARGO_TARGET_DIR="${BASELINE_TARGET_DIR}" cargo build --locked -p server --bin iggy-server
   )
 

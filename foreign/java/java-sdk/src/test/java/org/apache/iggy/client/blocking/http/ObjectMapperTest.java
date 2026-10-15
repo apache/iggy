@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.iggy.cluster.ClusterNode;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.partition.PartitionContext;
@@ -35,10 +36,28 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ObjectMapperTest {
 
     private final ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
+
+    @Test
+    void shouldRequireAnExplicitReplicaIdInClusterJson() {
+        String node = """
+                {"name":"node","ip":"127.0.0.1","endpoints":{"tcp":8090,"quic":8080,"http":3000,"websocket":8092},
+                 "role":"leader","status":"healthy"%s}
+                """;
+        for (String missing : new String[] {"", ",\"replica_id\":null"}) {
+            assertThatThrownBy(() -> objectMapper.readValue(node.formatted(missing), ClusterNode.class))
+                    .isInstanceOf(tools.jackson.core.JacksonException.class)
+                    .hasMessageContaining("replica_id");
+        }
+        for (int replica : new int[] {0, 7, 255}) {
+            var decoded = objectMapper.readValue(node.formatted(",\"replica_id\":" + replica), ClusterNode.class);
+            assertThat(decoded.replicaId()).isEqualTo(replica);
+        }
+    }
 
     @Nested
     class Deserialization {

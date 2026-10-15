@@ -58,8 +58,8 @@ runs:
         "${php_config}" --version
         "${php_bin}" "${composer_bin}" --version
 
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
       with:
         shared-key: dev
         save-cache: "false"

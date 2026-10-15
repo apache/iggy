@@ -112,14 +112,13 @@ runs:
           else
             OUT="target/debug/$NAME"
           fi
-          if [[ ! -x "$OUT" ]]; then
-            echo "Building $NAME with cargo ($PROFILE)…"
-            CARGO_ARGS=(build --locked --bin "$NAME")
-            if [[ "$PROFILE" == "release" ]]; then
-              CARGO_ARGS+=(--release)
-            fi
-            cargo "${CARGO_ARGS[@]}"
+          # An existing executable may belong to a different checkout or feature set.
+          echo "Building $NAME with cargo ($PROFILE)..."
+          CARGO_ARGS=(build --locked --bin "$NAME")
+          if [[ "$PROFILE" == "release" ]]; then
+            CARGO_ARGS+=(--release)
           fi
+          cargo "${CARGO_ARGS[@]}"
           BIN_PATH="$OUT"
         else
           BIN_PATH="${{ inputs.bin }}"

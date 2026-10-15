@@ -22,7 +22,6 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.consumergroup.Consumer;
-import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
@@ -67,8 +66,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
     static final int GET_CLUSTER_METADATA_CODE = 12;
     static final int TRANSIENT_NOT_ACCEPTED = 58;
     static final int POLL_CODE = 100;
-    static final int GET_POLL_ROUTING_CODE = 103;
-    static final int POLL_ON_PRIMARY_CODE = 104;
+    static final int GET_PARTITION_ROUTE_CODE = 105;
     static final int BIND_SESSION_CODE = 15;
     static final int GROUP_SYNC_CODE = 606;
 
@@ -104,13 +102,16 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final Duration REFUSAL_HOLD_WINDOW = Duration.ofSeconds(1);
     private static final Duration REFUSAL_HELD_AFTER = TEST_POLL_TIMEOUT.minus(REFUSAL_HOLD_WINDOW);
 
+    private static final java.util.Map<Integer, Integer> REPLICA_IDS = new java.util.concurrent.ConcurrentHashMap<>();
+
     @Test
     void shouldRetainUncertainMutationOutcomeAfterLaterRefusal() throws Exception {
         for (int refusal : new int[] {
             IggyErrorCode.STALE_CLIENT.getCode(),
             IggyErrorCode.UNAUTHENTICATED.getCode(),
             IggyErrorCode.UNAUTHORIZED.getCode(),
-            TRANSIENT_NOT_ACCEPTED
+            TRANSIENT_NOT_ACCEPTED,
+            AsyncTcpConnection.NOT_PRIMARY
         }) {
             InetAddress loopback = InetAddress.getLoopbackAddress();
             try (ServerSocket socket = new ServerSocket(0, 1, loopback)) {
@@ -243,7 +244,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(
                             OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, coordinatorSocket.getLocalPort()));
                 }
@@ -288,7 +289,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                             OPERATION_NON_REPLICATED,
                             clusterMetadata(coordinatorSocket.getLocalPort(), 0, coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     routes.incrementAndGet();
                     return Response.success(OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, 0));
                 }
@@ -303,9 +304,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 client.connect().get(5, TimeUnit.SECONDS);
                 client.login().get(5, TimeUnit.SECONDS);
                 assertThat(client.rosterTargets()).hasSize(1);
-                assertThatThrownBy(() -> poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
-                        .hasRootCauseInstanceOf(IggyClientException.class)
-                        .hasRootCauseMessage("Invalid TCP primary poll routing response");
+                assertServerError(poll(client, Optional.of(0L), true), TRANSIENT_NOT_ACCEPTED);
                 assertThat(routes).hasValue(1);
                 assertThat(legacyPolls).hasValue(0);
             } finally {
@@ -351,7 +350,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                 OPERATION_NON_REPLICATED,
                                 Unpooled.buffer().writeLongLE(1).writeIntLE(1).writeIntLE(0));
                     }
-                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         return Response.success(
                                 OPERATION_NON_REPLICATED,
                                 pollRoute(
@@ -374,7 +373,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                             if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                                 return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                             }
-                            if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                            if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                                 primaryPolls.incrementAndGet();
                                 return Response.success(OPERATION_NON_REPLICATED, emptyPoll(0));
                             }
@@ -397,7 +396,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     metadataUnavailable.set(false);
                     poll(client, Optional.empty(), true).get(5, TimeUnit.SECONDS);
                     assertThat(metadataReads).hasValue(4);
-                    assertThat(client.rosterTargets()).hasSize(clustered ? 2 : 1);
+                    assertThat(client.rosterTargets()).isEmpty();
                     metadataUnavailable.set(true);
                     client.findLeaderElsewhere(client.getConnectionInfo()).get(5, TimeUnit.SECONDS);
                     poll(client, Optional.of(0L), false).get(5, TimeUnit.SECONDS);
@@ -518,7 +517,15 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            clusterMetadata(
+                                    coordinatorSocket.getLocalPort(),
+                                    primarySocket.getLocalPort(),
+                                    coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(
                             OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
                 }
@@ -536,7 +543,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     attachments.incrementAndGet();
                     return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                 }
-                if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     if (attachedConnection.get() != request.connection()) {
                         return Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode());
                     }
@@ -552,8 +559,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 auxiliary.set(data);
                 return data;
             });
-            MessagesTcpClient messages = new MessagesTcpClient(
-                    () -> parent, new ClientRoutingState(), router, () -> CompletableFuture.completedFuture(true));
+            MessagesTcpClient messages = new MessagesTcpClient(() -> parent, new ClientRoutingState(), router);
             try {
                 parent.connect().get(5, TimeUnit.SECONDS);
                 new UsersTcpClient(() -> parent)
@@ -591,7 +597,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 assertThat(attachments).hasValue(2);
                 assertThat(polls).hasValue(2);
             } finally {
-                router.clearSession(parent).get(5, TimeUnit.SECONDS);
+                router.clearSession().get(5, TimeUnit.SECONDS);
                 parent.close().get(5, TimeUnit.SECONDS);
             }
             coordinator.get(5, TimeUnit.SECONDS);
@@ -600,8 +606,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     @Test
-    void shouldPreserveRecoveryPingErrorAndRejectMalformedRoutingReplies() throws Exception {
-        for (int malformedSize : new int[] {-1, 0, 16, 32}) {
+    void shouldPreserveRouteAuthenticationErrorAndRejectMalformedRoutingReplies() throws Exception {
+        for (int malformedSize : new int[] {-1, 0, 24, 26}) {
             InetAddress loopback = InetAddress.getLoopbackAddress();
             try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback);
                     ServerSocket unusedPrimary = new ServerSocket(0, 4, loopback)) {
@@ -618,7 +624,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                         unusedPrimary.getLocalPort(),
                                         coordinatorSocket.getLocalPort()));
                     }
-                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         routes.incrementAndGet();
                         return malformedSize < 0
                                 ? Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode())
@@ -637,11 +643,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                         poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
                                 .satisfies(
                                         error -> assertThat(((IggyServerException) error.getCause()).getRawErrorCode())
-                                                .isEqualTo(IggyErrorCode.INVALID_CREDENTIALS.getCode()));
+                                                .isEqualTo(IggyErrorCode.UNAUTHENTICATED.getCode()));
                     } else {
                         assertThatThrownBy(() ->
                                         poll(client, Optional.of(0L), true).get(5, TimeUnit.SECONDS))
-                                .hasCauseInstanceOf(IggyClientException.class);
+                                .hasCauseInstanceOf(org.apache.iggy.exception.IggyMalformedResponseException.class);
                     }
                     assertThat(routes).hasValue(1);
                 } finally {
@@ -666,7 +672,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     return Response.success(
                             OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     return routes.incrementAndGet() == 1
                             ? Response.error(OPERATION_NON_REPLICATED, TRANSIENT_NOT_ACCEPTED)
                             : Response.success(
@@ -708,7 +714,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 if (request.operation() == OPERATION_REGISTER) {
                     return Response.success(OPERATION_REGISTER, registerBody(1));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     refusals.incrementAndGet();
                     // The deadline has to find a refusal in flight. Instant refusals leave that
                     // to the chance of where the deadline lands between two attempts.
@@ -726,8 +736,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         throw new IllegalStateException("A refused route must not open a primary connection");
                     },
                     TEST_POLL_TIMEOUT);
-            MessagesTcpClient messages = new MessagesTcpClient(
-                    () -> parent, new ClientRoutingState(), router, () -> CompletableFuture.completedFuture(true));
+            MessagesTcpClient messages = new MessagesTcpClient(() -> parent, new ClientRoutingState(), router);
             try {
                 parent.connect().get(5, TimeUnit.SECONDS);
                 new UsersTcpClient(() -> parent)
@@ -750,7 +759,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 assertThat(held).isCompleted();
             } finally {
                 release.complete(null);
-                router.clearSession(parent).get(5, TimeUnit.SECONDS);
+                router.clearSession().get(5, TimeUnit.SECONDS);
                 parent.close().get(5, TimeUnit.SECONDS);
             }
             coordinator.get(5, TimeUnit.SECONDS);
@@ -840,10 +849,11 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                         primarySocket.getLocalPort(),
                                         coordinatorSocket.getLocalPort()));
                     }
-                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         routes.incrementAndGet();
                         return Response.success(
-                                OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, Math.max(1, request.metadataOp()), primarySocket.getLocalPort()));
                     }
                     if (request.operation() == OPERATION_CREATE_STREAM) {
                         return Response.committed(
@@ -862,7 +872,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         }
                         return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                     }
-                    if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                         pollWatermarks.add(attachments.get(attachments.size() - 1));
                         if (!holdAttachment && polls.incrementAndGet() == 1) {
                             awaitRelease(held, release);
@@ -935,7 +945,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                         primarySocket.getLocalPort(),
                                         coordinatorSocket.getLocalPort()));
                     }
-                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         return Response.success(
                                 OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
                     }
@@ -955,7 +965,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         attachments.incrementAndGet();
                         return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                     }
-                    if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                         if (polls.incrementAndGet() == 1) {
                             firstPoll.complete(null);
                             return cancel
@@ -1036,14 +1046,14 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                     .writeIntLE(0)
                                     .writeIntLE(1));
                 }
-                if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     routes.incrementAndGet();
                     return Response.success(
                             OPERATION_NON_REPLICATED,
                             pollRoute(
                                     request,
                                     1,
-                                    1,
+                                    Math.max(1, request.metadataOp()),
                                     partition(request) == 0
                                             ? firstSocket.getLocalPort()
                                             : secondSocket.getLocalPort()));
@@ -1073,7 +1083,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     attachedWatermarks.add(attachment.getLong());
                     return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                 }
-                if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                     (partition(request) == 0 ? firstPolls : secondPolls).incrementAndGet();
                     return Response.success(OPERATION_NON_REPLICATED, emptyPoll(partition(request)));
                 }
@@ -1138,9 +1148,10 @@ class AsyncIggyTcpClientTransientFailoverTest {
                                         primarySocket.getLocalPort(),
                                         coordinatorSocket.getLocalPort()));
                     }
-                    if (request.is(GET_POLL_ROUTING_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                         return Response.success(
-                                OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, primarySocket.getLocalPort()));
+                                OPERATION_NON_REPLICATED,
+                                pollRoute(request, 1, Math.max(1, request.metadataOp()), primarySocket.getLocalPort()));
                     }
                     if (request.operation() == UPDATE_USER_OPERATION
                             || request.operation() == CHANGE_PASSWORD_OPERATION) {
@@ -1161,7 +1172,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     if (request.is(BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
                         return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
                     }
-                    if (request.is(POLL_ON_PRIMARY_CODE, OPERATION_NON_REPLICATED)) {
+                    if (request.is(POLL_CODE, OPERATION_NON_REPLICATED)) {
                         if (polls.incrementAndGet() == 1) {
                             return failure == -1
                                     ? Response.disconnect()
@@ -1234,7 +1245,9 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static int partition(Request request) {
         return ByteBuffer.wrap(request.body())
                 .order(ByteOrder.LITTLE_ENDIAN)
-                .getInt(request.body().length - POLL_PARAMETERS_BYTES - Integer.BYTES);
+                .getInt(request.body().length
+                        - (request.commandCode() == GET_PARTITION_ROUTE_CODE ? 0 : POLL_PARAMETERS_BYTES)
+                        - Integer.BYTES);
     }
 
     static ByteBuf pollRoute(Request request, long session, long watermark, int port) {
@@ -1242,13 +1255,20 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     static ByteBuf pollRoute(Request request, long session, long watermark, int port, long incarnation) {
-        ByteBuf body = Unpooled.buffer()
-                .writeLongLE(request.clientLow())
-                .writeLongLE(request.clientHigh())
-                .writeLongLE(session)
-                .writeLongLE(watermark);
-        writeNode(partitionContext(body, incarnation), "primary", port, false);
-        return body;
+        return Unpooled.buffer()
+                .writeLongLE(incarnation)
+                .writeLongLE(watermark)
+                .writeIntLE(0)
+                .writeIntLE(1)
+                .writeByte(REPLICA_IDS.getOrDefault(port, 0));
+    }
+
+    static ByteBuf partitionRoute(ByteBuf body, long incarnation) {
+        return body.writeLongLE(incarnation)
+                .writeLongLE(0)
+                .writeIntLE(0)
+                .writeIntLE(1)
+                .writeByte(0);
     }
 
     static ByteBuf partitionContext(ByteBuf body, long incarnation) {
@@ -1784,7 +1804,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         ByteBuf body = Unpooled.buffer();
         writeString(body, "test-cluster");
         body.writeIntLE(1);
-        writeNode(body, "node", port, true);
+        writeNode(body, 0, "node", port, true);
         return body;
     }
 
@@ -1792,8 +1812,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
         ByteBuf body = Unpooled.buffer();
         writeString(body, "test-cluster");
         body.writeIntLE(2);
-        writeNode(body, "old-node", oldLeaderPort, oldLeaderPort == leaderPort);
-        writeNode(body, "new-node", newLeaderPort, newLeaderPort == leaderPort);
+        writeNode(body, 0, "old-node", oldLeaderPort, oldLeaderPort == leaderPort);
+        writeNode(body, 1, "new-node", newLeaderPort, newLeaderPort == leaderPort);
         return body;
     }
 
@@ -1801,13 +1821,15 @@ class AsyncIggyTcpClientTransientFailoverTest {
         ByteBuf body = Unpooled.buffer();
         writeString(body, "test-cluster");
         body.writeIntLE(3);
-        writeNode(body, "metadata-leader", firstPort, true);
-        writeNode(body, "follower", secondPort, false);
-        writeNode(body, "partition-primary", thirdPort, false);
+        writeNode(body, 0, "metadata-leader", firstPort, true);
+        writeNode(body, 1, "follower", secondPort, false);
+        writeNode(body, 2, "partition-primary", thirdPort, false);
         return body;
     }
 
-    private static void writeNode(ByteBuf body, String name, int port, boolean leader) {
+    private static void writeNode(ByteBuf body, int replicaId, String name, int port, boolean leader) {
+        REPLICA_IDS.put(port, replicaId);
+        body.writeByte(replicaId);
         writeString(body, name);
         writeString(body, InetAddress.getLoopbackAddress().getHostAddress());
         body.writeShortLE(port);

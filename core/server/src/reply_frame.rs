@@ -222,11 +222,12 @@ pub fn committed_reply_header(reply: &Message<GenericHeader>) -> Option<&ReplyHe
 
 /// The transient variant of a reply-shaped pre-consensus rejection frame
 /// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
-/// for a committed outcome. Either transient means the op did not commit, so
-/// the write path must replay the same request id rather than grade it as a
-/// committed result or advance the session gate. The two codes are kept
-/// distinct because they exhaust differently: `TransientNotAccepted` never
-/// entered the pipeline and is safe to re-issue anywhere, while
+/// for a committed outcome. Every transient means the op did not commit, so
+/// the write path must not grade it as a committed result or advance the
+/// session gate. The codes are kept distinct because they exhaust
+/// differently: `TransientNotAccepted` never entered the pipeline and is safe
+/// to re-issue anywhere, `NotPrimary` never entered it either and names a
+/// normal backup that a local replay cannot change, while
 /// `TransientNotCommitted` may still commit and only a same-session same-id
 /// replay is safe.
 ///
@@ -242,6 +243,7 @@ pub fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
         Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
             Some(IggyError::TransientNotAccepted)
         }
+        Some(code) if code == IggyError::NotPrimary.as_code() => Some(IggyError::NotPrimary),
         _ => None,
     }
 }

@@ -953,31 +953,20 @@ impl Journal for PrepareJournal {
         self.last_op.get()
     }
 
-    /// Remove every entry at or above `from_op`, leaving the snapshot floor where
-    /// it is. Returns how many entries went.
-    ///
-    /// Deliberately not `drain`, which compacts a committed prefix and advances
-    /// `snapshot_op` past its range. Doing that to a suffix would declare everything
-    /// below the head snapshotted, letting `append` evict live entries repair cannot
-    /// put back, when those ops are exactly the ones that must stay refillable.
-    ///
-    /// For the one caller that needs it: a backup whose uncommitted entries disagree
-    /// with the log a view change settled on. They cannot be corrected in place, and
-    /// journal repair skips their ops as already-present, so dropping them is what
-    /// lets the primary's retransmission refill the range.
+    /// Preserve entries outside the repair range and leave removed ops refillable.
     ///
     /// # Errors
     /// I/O error if the rewrite fails. Past the rename the journal is poisoned on any
     /// failure, as in `drain`: serving a pre-truncation offset or appending at a stale
-    /// `write_offset` is worse than a hard stop. `from_op` must be at least 1.
-    async fn truncate_from(&self, from_op: u64) -> io::Result<usize> {
+    /// `write_offset` is worse than a hard stop. Ops are 1-based.
+    async fn remove_range(&self, ops: RangeInclusive<u64>) -> io::Result<usize> {
         if let Some(state) = self.poisoned.get() {
             return Err(Self::poisoned_io_error(state));
         }
-        if from_op == 0 {
+        if *ops.start() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+                "journal removal requires 1-based operations",
             ));
         }
         // Shares the drain guard: both rewrite the same WAL
@@ -997,7 +986,7 @@ impl Journal for PrepareJournal {
             let offsets = self.offsets.borrow();
             for slot in 0..self.slot_count {
                 if let (Some(header), Some(offset)) = (&headers[slot], offsets[slot]) {
-                    if header.op >= from_op {
+                    if ops.contains(&header.op) {
                         removed += 1;
                     } else {
                         live.push((*header, offset));
@@ -1024,7 +1013,7 @@ impl Journal for PrepareJournal {
         }
         for slot in 0..self.slot_count {
             if let Some(header) = &headers[slot]
-                && header.op >= from_op
+                && ops.contains(&header.op)
             {
                 headers[slot] = None;
                 offsets[slot] = None;
@@ -1461,6 +1450,56 @@ mod tests {
         assert_eq!(journal.last_op(), Some(4));
         assert!(journal.header(3).is_some());
         assert!(journal.header(4).is_some());
+    }
+
+    #[compio::test]
+    async fn given_a_repair_gap_when_rewriting_and_reopening_should_preserve_and_refill_both_sides()
+    {
+        const HEAD: u64 = 5;
+        const GAP: u64 = 3;
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let mut parent = 0;
+        let entries: Vec<_> = (1..=HEAD)
+            .map(|op| {
+                let entry = make_identity_sealed_prepare(op, BODY, parent);
+                parent = entry.header().checksum;
+                entry
+            })
+            .collect();
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            for entry in &entries {
+                journal.append(entry.deep_copy()).await.unwrap();
+            }
+            assert_eq!(journal.remove_range(GAP..=GAP).await.unwrap(), 1);
+        }
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            assert_eq!(journal.snapshot_op(), 0);
+            assert_eq!(journal.last_op(), Some(HEAD));
+            assert!(journal.header(GAP as usize).is_none());
+            for entry in entries.iter().filter(|entry| entry.header().op != GAP) {
+                let header = *journal.header(entry.header().op as usize).unwrap();
+                assert_eq!(
+                    journal.entry(&header).await.unwrap().as_slice(),
+                    entry.as_slice()
+                );
+            }
+            journal
+                .append(entries[GAP as usize - 1].deep_copy())
+                .await
+                .unwrap();
+        }
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        for entry in &entries {
+            let header = *journal.header(entry.header().op as usize).unwrap();
+            assert_eq!(
+                journal.entry(&header).await.unwrap().as_slice(),
+                entry.as_slice()
+            );
+        }
     }
 
     #[compio::test]
