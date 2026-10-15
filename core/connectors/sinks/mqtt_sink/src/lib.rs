@@ -40,9 +40,13 @@ use std::{
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use driver::{MqttDriver, MqttProtocol};
-use routing::{PreparedPublication, TopicMode, prepare_publication, validate_topic};
+use routing::{
+    DEFAULT_TOPIC_TEMPLATE, PreparedPublication, TopicMode, prepare_publication, validate_topic,
+    validate_topic_template,
+};
 
 sink_connector!(MqttSink);
 
@@ -98,6 +102,20 @@ fn default_topic() -> Option<String> {
 
 fn default_qos() -> u8 {
     1
+}
+
+fn validate_broker_url(broker_url: &str) -> Result<(), Error> {
+    let url = Url::parse(broker_url)
+        .map_err(|error| Error::InvalidConfigValue(format!("broker_url is invalid: {error}")))?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::InvalidConfigValue(
+            "broker_url must not contain credentials; configure username and password separately"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -200,20 +218,23 @@ impl MqttSink {
     }
 
     fn validate_config(&self) -> Result<(), Error> {
+        validate_broker_url(&self.config.broker_url)?;
         self.qos()?;
         if let Some(topic) = self.config.topic.as_deref() {
             validate_topic(topic, "topic")?;
         }
-        if let Some(fallback_topic) = self.config.fallback_topic.as_deref() {
-            validate_topic(fallback_topic, "fallback_topic")?;
-        }
-        if let Some(topic_template) = self.config.topic_template.as_deref()
-            && topic_template.trim().is_empty()
-        {
-            return Err(Error::InvalidConfigValue(
-                "topic_template must not be empty".to_string(),
-            ));
-        }
+        let topic_template = self
+            .config
+            .topic_template
+            .as_deref()
+            .unwrap_or(DEFAULT_TOPIC_TEMPLATE);
+        validate_topic_template(topic_template, "topic_template")?;
+        let fallback_topic = self
+            .config
+            .fallback_topic
+            .as_deref()
+            .unwrap_or(topic_template);
+        validate_topic_template(fallback_topic, "fallback_topic")?;
         if self.config.request_capacity == Some(0) {
             return Err(Error::InvalidConfigValue(
                 "request_capacity must be greater than zero".to_string(),
@@ -610,6 +631,41 @@ mod tests {
             sink.validate_config(),
             Err(Error::InvalidConfigValue(_))
         ));
+    }
+
+    #[test]
+    fn given_unknown_topic_template_placeholder_when_validating_should_return_configuration_error()
+    {
+        let mut config = test_config();
+        config.topic_template = Some("{stream}/{partition}".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("unsupported placeholder")
+        ));
+    }
+
+    #[test]
+    fn given_broker_url_with_credentials_when_validating_should_return_configuration_error() {
+        let mut config = test_config();
+        config.broker_url = "mqtt://user:password@localhost:1883".to_string();
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("must not contain credentials")
+        ));
+    }
+
+    #[test]
+    fn given_configured_credentials_when_validating_should_accept_broker_url_without_credentials() {
+        let mut config = test_config();
+        config.username = Some("user".to_string());
+        config.password = Some(SecretString::from("password"));
+        let sink = MqttSink::new(1, config);
+
+        assert!(sink.validate_config().is_ok());
     }
 
     #[test]

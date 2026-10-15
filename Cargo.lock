@@ -7733,6 +7733,7 @@ dependencies = [
  "simd-json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
