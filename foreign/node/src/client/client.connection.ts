@@ -585,6 +585,10 @@ export class IggyConnection extends EventEmitter {
   }
 
   async redirect(host: string, port: number) {
+    // A leader move settled while the client was destroyed would otherwise
+    // dial a socket that nothing closes, after 'end'.
+    if (this.ending)
+      throw new Error('connection is closed');
     const redirectedOptions = { ...this.config.options, host, port };
     const redirectedConfig = {
       ...this.config,

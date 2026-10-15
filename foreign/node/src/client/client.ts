@@ -208,7 +208,7 @@ export class SingleClient extends CommandAPI {
    */
   async destroy() {
     const client = await this.clientProvider();
-    client.destroy();
+    await client.destroy();
   }
 }
 
@@ -232,7 +232,7 @@ export class SimpleClient extends CommandAPI {
    */
   async destroy() {
     const client = await this.clientProvider();
-    client.destroy();
+    await client.destroy();
   }
 
 }

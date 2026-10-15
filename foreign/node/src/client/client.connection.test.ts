@@ -173,6 +173,36 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('refuses a redirect after destroy without dialing', async () => {
+    const server = await startServer();
+    const target = await startServer();
+    let dialed = 0;
+    target.on('connection', () => { dialed += 1; });
+    const connection = new IggyConnection(connectionConfig(server));
+    const events: string[] = [];
+    for (const event of ['connecting', 'connect', 'end'])
+      connection.on(event, () => events.push(event));
+    try {
+      await connection.connect();
+      const ended = connection._destroy();
+      await assert.rejects(
+        connection.redirect(
+          '127.0.0.1',
+          (target.address() as AddressInfo).port
+        ),
+        /connection is closed/
+      );
+      await ended;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.equal(dialed, 0);
+      assert.deepEqual(events, ['connecting', 'connect', 'end']);
+    } finally {
+      connection.socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
+  });
+
   it('shares connection attempts, recognizes endpoints, and writes frames',
     async () => {
       const server = await startServer();
