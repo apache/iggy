@@ -44,7 +44,7 @@ use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -67,7 +67,8 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
-    PollMessagesResponseHeader, SendMessagesConfirmationResponse, SendMessagesResponse,
+    PartitionRouteResponse, PollMessagesResponseHeader, PollRoutingResponse,
+    SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
@@ -627,6 +628,15 @@ fn main() {
     );
     add(
         &mut vectors,
+        "request.get_partition_route",
+        &GetPartitionRouteRequest {
+            stream_id: numeric(10),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partition_id: 5,
+        },
+    );
+    add(
+        &mut vectors,
         "request.create_user",
         &CreateUserRequest {
             username: name("admin"),
@@ -931,6 +941,7 @@ fn main() {
         operation: Operation::CreateStream,
         size: (HEADER_SIZE + 12) as u32,
         request: 7,
+        commit: 12,
         status: 0,
         client: client_id,
         ..Default::default()
@@ -1399,6 +1410,44 @@ fn main() {
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
     }
+    add(
+        &mut vectors,
+        "response.partition_route",
+        &PartitionRouteResponse {
+            incarnation: 7,
+            metadata_op: 10,
+            view: 3,
+            partitions_count: 4,
+            primary_replica: 2,
+        },
+    );
+    add(
+        &mut vectors,
+        "response.poll_routing",
+        &PollRoutingResponse {
+            consumer_session: SessionIdentity {
+                client_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+                session: 42,
+                metadata_watermark: 120,
+            },
+            context: PartitionContext {
+                incarnation: 7,
+                owner_generation: 3,
+                metadata_op: 110,
+            },
+            primary: ClusterNodeResponse {
+                replica_id: 2,
+                name: "node-3".to_owned(),
+                ip: "10.0.0.3".to_owned(),
+                tcp_port: 8092,
+                quic_port: 0,
+                http_port: 3002,
+                websocket_port: 0,
+                role: 1,
+                status: 0,
+            },
+        },
+    );
 
     // Domain option blocks.
     let create_options = TopicCreateOptions {
