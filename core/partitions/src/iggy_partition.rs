@@ -29975,6 +29975,32 @@ mod tests {
         assert!(partition.repair.is_some());
     }
 
+    /// As above, with the whole repaired window resident, which would make a
+    /// refusal final. A resident run that reaches the floor drops the floor
+    /// before any capped walk, so the walk cap cannot turn it into a refusal.
+    #[compio::test]
+    async fn given_resident_run_longer_than_one_walk_when_the_window_is_complete_should_keep_repairing()
+     {
+        const FLOOR: u64 = COMMIT_WALK_OPS_MAX as u64 + 6;
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(FLOOR + 2);
+        partition.recovered_durable_offset = Some(3);
+        partition.repair = Some(armed_session(FLOOR + 2, FLOOR));
+        for op in 1..=FLOOR {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        for op in FLOOR + 1..=FLOOR + 2 {
+            partition
+                .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
+                .await;
+        }
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
+        assert!(partition.repair.is_some(), "no state transfer for held ops");
+    }
+
     /// Repair frames arrive out of order. Op 7 connects at offset 4, op 9 does
     /// not, and the window is judged by the lower one whichever lands first.
     #[compio::test]
