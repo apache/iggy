@@ -2,11 +2,11 @@
 
 ## Issue #3421 — in scope (this iteration)
 
-A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy.
+A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs use Iggy.
 
 **Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards
 the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6
-too. CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so
+too. CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs answer `NOT_CONTROLLER` (41), so
 clients do not believe a topic was created, deleted, or that configs were read or changed.
 OffsetCommit and OffsetFetch answer retriable `COORDINATOR_LOAD_IN_PROGRESS`
 (14). Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records
@@ -35,7 +35,7 @@ Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiV
 **Every unsupported-version case closes the connection, for every listed key** - not just above
 the encoder max. `kafka_protocol`'s schema floor for each supported message happens to equal
 `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0, ApiVersions 0,
-CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1, DescribeConfigs 1, AlterConfigs 0, and 0 for the five group coordination keys, DescribeGroups and ListGroups), so there is no version below an API's
+CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1, DescribeConfigs 1, AlterConfigs 0, IncrementalAlterConfigs 0, and 0 for the five group coordination keys, DescribeGroups and ListGroups), so there is no version below an API's
 min that the crate can actually encode a response for either - `unsupported_version_response`
 still tries, but the encode attempt fails and the connection closes rather than sending a
 malformed body.
@@ -68,6 +68,7 @@ it knows the server supports flexible encoding.
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 | 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
+| 44 | IncrementalAlterConfigs | 0 | 1 | 0, 1 | Persists `retention.ms` only, one operation per entry; `APPEND` and `SUBTRACT` are refused. Flexible encoding at v1. See [`CONFIGS.md`](CONFIGS.md) |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
 
@@ -98,6 +99,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 22 | InitProducerId | 0–5 | v2 |
 | 32 | DescribeConfigs | 1–4 | v4 |
 | 33 | AlterConfigs | 0–2 | v2 |
+| 44 | IncrementalAlterConfigs | 0–1 | v1 |
 
 ---
 
@@ -111,7 +113,7 @@ All API keys not listed above close the connection (see Governance model above) 
 | 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
-| 23, 27, 30, 31, 34, 35, 37+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, IncrementalAlterConfigs (44), etc. | Later issues |
+| 23, 27, 30, 31, 34, 35, 37 to 43, 45+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
@@ -174,8 +176,8 @@ nor moved by retention. That is the same core change the ListOffsets `EARLIEST` 
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 19 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs with a bridge |
-| **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), DeleteTopics ([#3546](https://github.com/apache/iggy/issues/3546)), DescribeConfigs and AlterConfigs call it |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 20 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs with a bridge |
+| **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), DeleteTopics ([#3546](https://github.com/apache/iggy/issues/3546)), DescribeConfigs, AlterConfigs and IncrementalAlterConfigs call it |
 
 ---
 

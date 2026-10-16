@@ -1,17 +1,18 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
 
 > **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
-> CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy. With the bridge off (the
-> default), those eight are stubs: Produce, Fetch and ListOffsets answer retriable
-> `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs answer
-> `NOT_CONTROLLER` (41), and Metadata reports every requested topic unknown. **CreateTopics,
-> DeleteTopics and AlterConfigs run as the bridge's own Iggy user**: with the bridge on and
+> CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs use Iggy.
+> With the bridge off (the default), those nine are stubs: Produce, Fetch and ListOffsets answer
+> retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs
+> and IncrementalAlterConfigs answer `NOT_CONTROLLER` (41), and Metadata reports every requested
+> topic unknown. **CreateTopics, DeleteTopics and both alter APIs run as the bridge's own Iggy
+> user**: with the bridge on and
 > `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port can create
 > topics (up to 1000 partitions each), delete topics and their data, or shorten a topic's
 > `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With SASL on,
-> `DeleteTopics` and `AlterConfigs` additionally require the authenticated principal to hold
+> `DeleteTopics`, `AlterConfigs` and `IncrementalAlterConfigs` additionally require the authenticated principal to hold
 > `manage_topics`; without it every resource/name in the request fails
 > `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written or deleted. `CreateTopics` has no such
 > gate yet - SASL on does not protect it. Every client reads and writes as the bridge's Iggy user.
@@ -199,7 +200,7 @@ See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/is
 - [docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md) — group membership, rebalances, and why one gateway per bootstrap endpoint
 - [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md) — how a Kafka client authenticates, and why PLAIN only
 - [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) — how Iggy permissions are described as Kafka ACLs
-- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs and AlterConfigs for topic `retention.ms`
+- [docs/CONFIGS.md](docs/CONFIGS.md) — DescribeConfigs, AlterConfigs and IncrementalAlterConfigs for topic `retention.ms`
 
 ### Delivery guarantees
 
@@ -314,9 +315,9 @@ a topic per call) for `ListOffsets`, probes and polls partitions for Fetch, and 
 group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
 ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
-([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs and AlterConfigs , OffsetCommit and OffsetFetchcall it.
-Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
+([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs, AlterConfigs and IncrementalAlterConfigs, OffsetCommit and OffsetFetch
 ([#3542](https://github.com/apache/iggy/issues/3542)) call it.
+Topic configuration behavior is in [docs/CONFIGS.md](docs/CONFIGS.md).
 Tested by `bridge`'s own unit tests, `tests/bridge_iggy_integration_tests.rs` and the
 `tests/*_real_bridge_tests.rs` suites. All but the unit tests start a real `iggy-server`.
 
@@ -511,7 +512,7 @@ call created it." A *different* `partition_count` against an already-existing to
 two concurrent callers requesting different counts for the same topic must not both see success.
 
 Topics created this way have **no message expiry** - Iggy's own server default, not Kafka's 7-day
-default. `AlterConfigs` can set that expiry afterwards through `retention.ms`
+default. `AlterConfigs` or `IncrementalAlterConfigs` can set that expiry afterwards through `retention.ms`
 ([docs/CONFIGS.md](docs/CONFIGS.md)). Until a client does, messages never expire, so a Kafka app
 that assumes the 7-day default will accumulate data on this bridge.
 
@@ -540,8 +541,9 @@ cut before that threshold is reached - worth knowing rather than discovering lat
   other closes after `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` (600) unused, checked every 30 s.
 - 4 clients sign in at once, 80 a second at most. More wait, up to their request's deadline.
 - `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
-- Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
-  Iggy request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
+- Metadata, CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs
+  share 1 more client, one Iggy request at a time. Fetch polls use 4 more, one per read slot.
+  Topic probes use 1 more.
   Offset calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.

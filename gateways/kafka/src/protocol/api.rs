@@ -41,9 +41,9 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
     alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_configs,
-    describe_groups, dispatch, fetch, find_coordinator, heartbeat, init_producer_id, join_group,
-    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_fetch, produce,
-    respond_or_close, sync_group,
+    describe_groups, dispatch, fetch, find_coordinator, heartbeat, incremental_alter_configs,
+    init_producer_id, join_group, leave_group, list_groups, list_offsets, metadata, offset_commit,
+    offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -72,6 +72,7 @@ pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+pub const API_KEY_INCREMENTAL_ALTER_CONFIGS: i16 = 44;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -299,6 +300,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     delete_topics::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
+    incremental_alter_configs::RANGE,
     init_producer_id::RANGE,
     find_coordinator::RANGE,
     join_group::RANGE,
@@ -320,8 +322,9 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// answers with its stub, so APIs can be wired one at a time.
 ///
 /// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
-/// `DescribeConfigs` and `AlterConfigs` share one lockstep `IggyClient`, so those calls run one
-/// at a time across connections. See the README's "Concurrency ceiling".
+/// `DescribeConfigs`, `AlterConfigs` and `IncrementalAlterConfigs` share one lockstep
+/// `IggyClient`, so those calls run one at a time across connections. See the README's
+/// "Concurrency ceiling".
 pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
@@ -753,6 +756,9 @@ pub fn encode_error_for_key(
             describe_configs::encode_error_response(api_version, error_code)
         }
         API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
+        API_KEY_INCREMENTAL_ALTER_CONFIGS => {
+            incremental_alter_configs::encode_error_response(api_version, error_code)
+        }
         // Carries the live SASL setting, not a hardcoded `false`: answering an illegal-state
         // ApiVersions with a SASL-less key set contradicts the advertisement sent one frame
         // earlier on the same connection.
