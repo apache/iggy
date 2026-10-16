@@ -2934,7 +2934,9 @@ fn split_local_actions(actions: Vec<VsrAction>) -> (Vec<VsrAction>, Vec<VsrActio
     actions.into_iter().partition(|action| {
         matches!(
             action,
-            VsrAction::RebuildPipeline { .. } | VsrAction::CommitJournal
+            VsrAction::RebuildPipeline { .. }
+                | VsrAction::CommitJournal
+                | VsrAction::RetryLocalWrite { .. }
         )
     })
 }
@@ -3963,7 +3965,7 @@ where
         let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
         let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
         // A prepare is never shed on a byte budget. No client to answer, and
-        // recovery is slow: `consensus::retransmit_targets` skips an op that
+        // recovery is slow: `consensus::prepare_timeout_targets` skips an op that
         // already reached quorum, so shedding one gap-stops the backup until
         // `tick_partitions`' driver repairs it, where shedding a request costs
         // one retry. A request is refused the moment admitting it
@@ -10475,11 +10477,7 @@ where
             );
         }
 
-        // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
-        // no-op, so the timer-driven retransmit above cannot recover the
-        // primary's own missing vote. Without this the commit prefix can pin
-        // forever (commit_min stuck below commit_max). See
-        // `IggyMetadata::repair_primary_self_acks`.
+        // Re-emit a lost primary self-ack; see `IggyMetadata::repair_primary_self_acks`.
         metadata.repair_primary_self_acks().await;
 
         // Backstop for commit work stranded by a canceled `on_ack` driver
@@ -12084,9 +12082,9 @@ async fn dispatch_vsr_actions<B, P, J>(
                     |_| true,
                 );
             }
-            // Handled by the caller (shard view change handlers) since it
-            // requires access to the plane's commit_journal method.
-            VsrAction::CommitJournal => {}
+            // Handled by the caller, which owns the plane's journal. Metadata
+            // ignores `RetryLocalWrite` and re-acks via `repair_primary_self_acks`.
+            VsrAction::CommitJournal | VsrAction::RetryLocalWrite { .. } => {}
             VsrAction::SendCommit {
                 view,
                 commit,
@@ -12222,6 +12220,9 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                     |header| partition.register_rebuilt_ack(header),
                 );
             }
+            VsrAction::RetryLocalWrite { op } => {
+                partition.retry_local_write(*op).await;
+            }
             _ => {}
         }
     }
@@ -12277,6 +12278,18 @@ mod persist_gate_tests {
         let (local, wire) = split_local_actions(actions);
         assert!(local.is_empty());
         assert_eq!(wire.len(), 1);
+    }
+
+    #[test]
+    fn given_a_local_write_retry_when_split_should_keep_it_out_of_the_gate() {
+        // A withheld superblock persist must not drop the only action that
+        // recovers the primary's vote.
+        let (local, wire) = split_local_actions(vec![VsrAction::RetryLocalWrite { op: 4 }]);
+        assert!(matches!(
+            local.as_slice(),
+            [VsrAction::RetryLocalWrite { op: 4 }]
+        ));
+        assert!(wire.is_empty());
     }
 }
 
@@ -13899,6 +13912,110 @@ mod partition_ack_durability_tests {
         );
     }
 
+    /// A primary with a consumer-offset WAL under `directory` whose journal
+    /// holds op 1 that the WAL has not taken yet.
+    #[allow(clippy::future_not_send)]
+    async fn primary_with_journaled_offset_prepare(
+        directory: &std::path::Path,
+        durability: Durability,
+    ) -> IggyPartition<IggyMessageBus> {
+        let consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        consensus.mark_superblock_durable(0, 0);
+        let mut partition: IggyPartition<IggyMessageBus> = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+        );
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        partition.set_runtime_options(TopicRuntimeOptions {
+            consumer_offset_durability: durability,
+            ..TopicRuntimeOptions::default()
+        });
+        partition.open_persistence().await.unwrap();
+        let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::StoreConsumerOffset;
+                header.cluster = 1;
+                header.group = 42;
+                header.op = 1;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                header.checksum = header.identity_checksum();
+            },
+        );
+        partition
+            .log
+            .journal()
+            .inner
+            .append(prepare.into_frozen())
+            .await
+            .unwrap();
+        partition.consensus().sequencer().set_sequence(1);
+        partition
+    }
+
+    /// Drive the WAL writer until the loopback carries a self-ack, bounded.
+    #[allow(clippy::future_not_send)]
+    async fn await_self_acks(
+        partition: &mut IggyPartition<IggyMessageBus>,
+    ) -> Vec<Message<GenericHeader>> {
+        let mut acknowledgments = Vec::new();
+        for _ in 0..100 {
+            compio::runtime::time::sleep(Duration::from_millis(10)).await;
+            partition.drive_persistence().await;
+            partition
+                .consensus()
+                .drain_loopback_into(&mut acknowledgments);
+            if !acknowledgments.is_empty() {
+                break;
+            }
+        }
+        acknowledgments
+    }
+
+    #[compio::test]
+    async fn given_a_local_write_retry_when_dispatched_should_resubmit_the_prepare_and_ack_once_durable()
+     {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "iggy-retry-local-write-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        // Boxed: the setup future carries a whole partition, and holding it
+        // inline next to the test's own copy overflows the test thread's stack.
+        let mut partition = Box::pin(primary_with_journaled_offset_prepare(
+            &directory,
+            Durability::Persisted,
+        ))
+        .await;
+        dispatch_partition_journal_actions(
+            partition.consensus(),
+            &partition,
+            &[VsrAction::RetryLocalWrite { op: 1 }],
+        )
+        .await;
+        let mut acknowledgments = await_self_acks(&mut partition).await;
+        assert_eq!(
+            acknowledgments.len(),
+            1,
+            "the retry must re-submit op 1 to the WAL and self-ack it once durable"
+        );
+        let ack: Message<PrepareOkHeader> = acknowledgments
+            .pop()
+            .expect("one self-ack")
+            .try_into_typed()
+            .expect("loopback holds PrepareOks");
+        assert_eq!(ack.header().op, 1);
+        drop(partition);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[compio::test]
     async fn start_view_ack_waits_for_partition_wal_completion() {
         for durability in [Durability::Replicated, Durability::Persisted] {
@@ -13911,40 +14028,12 @@ mod partition_ack_durability_tests {
                 std::process::id()
             ));
             std::fs::create_dir(&directory).unwrap();
-            let consensus =
-                VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
-            consensus.init();
-            consensus.mark_superblock_durable(0, 0);
-            let mut partition: IggyPartition<IggyMessageBus> =
-                IggyPartition::with_in_memory_storage(
-                    Arc::new(PartitionStats::default()),
-                    consensus,
-                    IggyByteSize::from(1024 * 1024),
-                );
-            partition.set_partition_dir(directory.to_string_lossy().into_owned());
-            partition.set_runtime_options(TopicRuntimeOptions {
-                consumer_offset_durability: durability,
-                ..TopicRuntimeOptions::default()
-            });
-            partition.open_persistence().await.unwrap();
-            let prepare = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
-                .transmute_header(|_, header: &mut PrepareHeader| {
-                    header.command = Command::Prepare;
-                    header.operation = Operation::StoreConsumerOffset;
-                    header.cluster = 1;
-                    header.group = 42;
-                    header.op = 1;
-                    header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
-                    header.checksum = header.identity_checksum();
-                });
-            partition
-                .log
-                .journal()
-                .inner
-                .append(prepare.into_frozen())
-                .await
-                .unwrap();
-            partition.consensus().sequencer().set_sequence(1);
+            // Boxed: the setup future carries a whole partition, and holding it
+            // inline next to the test's own copy overflows the test thread's stack.
+            let mut partition = Box::pin(primary_with_journaled_offset_prepare(
+                &directory, durability,
+            ))
+            .await;
             dispatch_partition_journal_actions(
                 partition.consensus(),
                 &partition,
