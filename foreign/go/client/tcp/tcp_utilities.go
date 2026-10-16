@@ -38,6 +38,18 @@ func (c *IggyTcpClient) DescribeOptions(ctx context.Context, scope iggcon.Option
 	return binaryserialization.DeserializeOptionSpecs(buffer)
 }
 
+// Snapshot returns a ZIP archive of the requested server diagnostics.
+func (c *IggyTcpClient) Snapshot(
+	ctx context.Context,
+	compression iggcon.SnapshotCompression,
+	snapshotTypes []iggcon.SystemSnapshotType,
+) ([]byte, error) {
+	return c.do(ctx, &command.Snapshot{
+		Compression:   compression,
+		SnapshotTypes: snapshotTypes,
+	})
+}
+
 func (c *IggyTcpClient) GetStats(ctx context.Context) (*iggcon.Stats, error) {
 	buffer, err := c.do(ctx, &command.GetStats{})
 	if err != nil {
