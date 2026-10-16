@@ -1,0 +1,45 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# JDBC Source Connector for MySQL
+
+type = "source"
+key = "jdbc_mysql"
+enabled = true
+version = 0
+name = "JDBC MySQL Source"
+path = "../../target/debug/libiggy_connector_jdbc_source"
+
+[[streams]]
+stream = "test_stream"
+topic = "test_topic"
+schema = "json"
+
+[plugin_config]
+jdbc_url = ""
+driver_class = ""
+driver_jar_path = ""
+username = ""
+password = ""
+query = "SELECT id, name FROM mysql_cursor_test WHERE id > {last_offset} ORDER BY id"
+poll_interval = "1s"
+batch_size = 2
+mode = "incremental"
+tracking_column = "id"
+initial_offset = "0"
+snake_case_columns = false
+include_metadata = true

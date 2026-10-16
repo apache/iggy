@@ -21,6 +21,7 @@ mod sink;
 mod source;
 
 pub use cdc::{PostgresSourceCdcFixture, PostgresSourceCdcSlowPollFixture};
+pub(crate) use container::PostgresContainer;
 pub use container::{PostgresOps, PostgresSourceOps};
 pub use sink::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresSinkByteaFixture, PostgresSinkFixture,
