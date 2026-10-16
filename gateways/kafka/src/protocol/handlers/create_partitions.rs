@@ -25,7 +25,7 @@
 //!
 //! Iggy's own `create_partitions` takes the number of partitions to add, with no expected current
 //! count, while the Kafka request carries the number to reach. So each topic is read before it is
-//! written, and [`GatewayState::partition_growth`] keeps that read and write together:
+//! written, and `GatewayState::partition_growth` keeps that read and write together:
 //!
 //! - Two `CreatePartitions` on this gateway never both read the same count and both add. The
 //!   lock is held by a task that outlives a cancelled request, so it is not released while the
@@ -36,11 +36,11 @@
 //!   topic that was read (same Iggy id and creation time) and has exactly the requested count.
 //! - A write Iggy did not refuse outright (a timeout, `TransientNotCommitted`, a broken
 //!   connection, anything else whose outcome is unknown) keeps the lock while the count is
-//!   re-read, until [`SETTLE_LIMIT`] after the write started, so the next request sees the write
+//!   re-read, until `SETTLE_LIMIT` after the write started, so the next request sees the write
 //!   if it committed. One still uncommitted after that can commit later, and a retry that read
 //!   the old count would then add again.
 //!
-//! The lock is held at most [`MAX_REQUEST_TIMEOUT`] (30 s) plus [`SETTLE_LIMIT`] (20 s) after the
+//! The lock is held at most `MAX_REQUEST_TIMEOUT` (30 s) plus `SETTLE_LIMIT` (20 s) after the
 //! request that took it arrived: the write never starts past that request's deadline, and
 //! everything after it ends by `SETTLE_LIMIT`. A call that waited on the lock gets a retriable
 //! `REQUEST_TIMED_OUT`, which the Java admin client does not retry by itself: the caller sees a
