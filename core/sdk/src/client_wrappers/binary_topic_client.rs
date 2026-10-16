@@ -29,23 +29,11 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Option<TopicDetails>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::Http(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::Tcp(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::Quic(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::WebSocket(client) => client.get_topic(stream_id, topic_id).await,
-        }
+        self.as_client().get_topic(stream_id, topic_id).await
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_topics(stream_id).await,
-            ClientWrapper::Http(client) => client.get_topics(stream_id).await,
-            ClientWrapper::Tcp(client) => client.get_topics(stream_id).await,
-            ClientWrapper::Quic(client) => client.get_topics(stream_id).await,
-            ClientWrapper::WebSocket(client) => client.get_topics(stream_id).await,
-        }
+        self.as_client().get_topics(stream_id).await
     }
 
     async fn create_topic(
@@ -54,13 +42,9 @@ impl TopicClient for ClientWrapper {
         name: &str,
         options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.create_topic(stream_id, name, options).await,
-            ClientWrapper::Http(client) => client.create_topic(stream_id, name, options).await,
-            ClientWrapper::Tcp(client) => client.create_topic(stream_id, name, options).await,
-            ClientWrapper::Quic(client) => client.create_topic(stream_id, name, options).await,
-            ClientWrapper::WebSocket(client) => client.create_topic(stream_id, name, options).await,
-        }
+        self.as_client()
+            .create_topic(stream_id, name, options)
+            .await
     }
 
     async fn update_topic(
@@ -70,33 +54,9 @@ impl TopicClient for ClientWrapper {
         name: &str,
         options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .update_topic(stream_id, topic_id, name, options)
-                    .await
-            }
-        }
+        self.as_client()
+            .update_topic(stream_id, topic_id, name, options)
+            .await
     }
 
     async fn delete_topic(
@@ -104,12 +64,6 @@ impl TopicClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::Http(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::Tcp(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::Quic(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::WebSocket(client) => client.delete_topic(stream_id, topic_id).await,
-        }
+        self.as_client().delete_topic(stream_id, topic_id).await
     }
 }
