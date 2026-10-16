@@ -24,8 +24,16 @@
 //! offsets in Iggy. The gateway deletes the Iggy group `kafka.cg.<group>` on every Kafka topic,
 //! and Iggy deletes the offsets with it (`IggyBridge::delete_offset_groups`).
 //!
+//! While the deletion runs, the group takes no join and no commit: both get
+//! `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry. The deletion waits for each commit
+//! that passed its check before the deletion began, and answers 14 when one still runs at the
+//! deadline. A member on another gateway is not seen here, so a group whose members all use
+//! another gateway is deleted (`docs/OFFSET_STORAGE.md`).
+//!
 //! With SASL on, a principal without `manage_topics` gets `GROUP_AUTHORIZATION_FAILED` (30) for
-//! every group, and nothing is deleted.
+//! every group, and nothing is deleted. Each group to delete also gets 30, and nothing is deleted,
+//! when the bridge user may not list the Iggy groups of a Kafka topic: a group can hold offsets
+//! there.
 //!
 //! An id repeated in one request is answered once, as in `DescribeGroups`. The response has no
 //! top-level error, so a request that cannot be decoded closes the connection.
@@ -40,10 +48,10 @@ use crate::bridge::{BridgeError, IggyBridge, OffsetCalls};
 use crate::error::Result;
 use crate::group::{GroupRemoval, is_valid_group_id};
 use crate::protocol::api::{
-    API_KEY_DELETE_GROUPS, ApiVersionRange, ConnectionState, ERROR_GROUP_AUTHORIZATION_FAILED,
-    ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_GROUP_ID, ERROR_NON_EMPTY_GROUP, ERROR_NONE,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome,
-    is_supported_version,
+    API_KEY_DELETE_GROUPS, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+    ERROR_GROUP_AUTHORIZATION_FAILED, ERROR_GROUP_ID_NOT_FOUND, ERROR_INVALID_GROUP_ID,
+    ERROR_NON_EMPTY_GROUP, ERROR_NONE, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome, is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_delete_groups_shape;
 use crate::protocol::dedup::dedup_first_seen;
@@ -119,7 +127,9 @@ async fn delete(
         .filter(|group_id| is_valid_group_id(group_id))
         .cloned()
         .collect();
-    let mut removals = state.groups.remove_empty(&valid).await.into_iter();
+    // Until this drops, the groups whose offsets go take no join and no commit.
+    let (removals, deletion) = state.groups.remove_empty(&valid).await;
+    let mut removals = removals.into_iter();
     // Per group: its answer, or whether the coordinator held it when its offsets are to go.
     let plans: Vec<core::result::Result<bool, i16>> = group_ids
         .iter()
@@ -142,11 +152,16 @@ async fn delete(
     let mut deleted = match &state.bridge {
         Some(bridge) if !deletable.is_empty() => {
             let calls = OffsetCalls::new(offset_deadline(state, connection).await);
-            delete_offsets(bridge, &deletable, &calls).await
+            if deletion.commits_ended(calls.deadline()).await {
+                delete_offsets(bridge, &deletable, &calls).await
+            } else {
+                vec![Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS); deletable.len()]
+            }
         }
         _ => Vec::new(),
     }
     .into_iter();
+    drop(deletion);
     plans
         .into_iter()
         .map(|plan| match plan {
@@ -231,6 +246,7 @@ pub fn encode_response(version: i16, results: Vec<DeletableGroupResult>) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::BytesMut;
@@ -238,7 +254,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::group::{GroupCoordinator, GroupCoordinatorConfig, JoinRequest};
+    use crate::group::{CommitRequest, GroupCoordinator, GroupCoordinatorConfig, JoinRequest};
     use crate::protocol::acl::PrincipalPermissions;
     use crate::protocol::api::ERROR_MEMBER_ID_REQUIRED;
 
@@ -375,6 +391,40 @@ mod tests {
             codes(&state, Some(&principal(true, true)), 2, &["waiting"]).await,
             vec![("waiting".to_string(), ERROR_NONE)],
             "a refused request deletes nothing"
+        );
+    }
+
+    /// A commit that passed its check before the deletion began must land whole before it. So
+    /// the deletion waits for it, and answers 14 while it still runs at the deadline.
+    #[tokio::test]
+    async fn given_a_commit_that_runs_past_the_deadline_should_answer_coordinator_load_in_progress()
+    {
+        // A 50 ms offset deadline.
+        let groups = GroupCoordinatorConfig {
+            min_session_timeout: Duration::from_millis(100),
+            ..GroupCoordinatorConfig::default()
+        };
+        let state = GatewayState::new(
+            Some(Arc::new(IggyBridge::offline())),
+            8 * 1024 * 1024,
+            0,
+            GroupCoordinator::new(groups, CancellationToken::new()),
+        );
+        let commit = CommitRequest {
+            group_id: StrBytes::from_static_str("orders-app"),
+            generation_id: -1,
+            member_id: StrBytes::new(),
+            group_instance_id: None,
+        };
+        let _running = state
+            .groups
+            .validate_commit(&commit)
+            .await
+            .expect("a commit outside the group protocol passes");
+
+        assert_eq!(
+            codes(&state, None, 2, &["orders-app"]).await,
+            vec![("orders-app".to_string(), ERROR_COORDINATOR_LOAD_IN_PROGRESS)]
         );
     }
 

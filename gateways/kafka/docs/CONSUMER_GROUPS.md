@@ -72,10 +72,11 @@ consumers left, and the Java admin client takes `consumer` or an empty type as a
 
 The gateway finds these groups with a scan. A scan lists the Kafka topics, then calls
 `get_consumer_groups` once per topic and keeps the Iggy groups named `kafka.cg.<group>`
-([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). It runs on the offset read slots, so it never waits
-behind Produce. One scan answers every request for 10 seconds, because kafka-ui lists groups every
-30 seconds and a scan costs one Iggy call per topic. At most one scan runs at a time, and a request
-that comes while it runs waits for it. A commit through this gateway adds its group at once, so a
+([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). It runs on an Iggy client of its own and makes one
+call at a time. So it never waits behind Produce, and no offset call waits behind it. One scan
+answers every request for 10 seconds, because kafka-ui lists groups every 30 seconds and a scan
+costs one Iggy call per topic. At most one scan runs at a time, and a request that comes while it
+runs waits for it. A commit through this gateway adds its group at once, so a
 new group does not wait for the next scan. A group that another gateway created appears with the
 next scan.
 
@@ -113,6 +114,17 @@ Iggy deletes a group on each partition of the topic, and lists it until every pa
 gateway looks up the group on the topic every 5 to 100 milliseconds. When the group is gone, the
 gateway answers. Then `OffsetFetch` returns -1 for the group, and the admin APIs no longer find it.
 
+While a deletion runs, the group takes no join and no commit. `JoinGroup` and `OffsetCommit` answer
+`COORDINATOR_LOAD_IN_PROGRESS` (14), and clients retry. The deletion waits for each commit that
+passed its check before the deletion began. So a commit lands whole before the deletion or whole
+after it. Also, no member subscribes to a topic between the check of `OffsetDelete` and its
+deletions. If one of those commits still runs at the offset deadline, the deletion answers 14.
+
+A gateway does not see the members on another gateway. Through a gateway where a group has no
+members, `DeleteGroups` deletes the group. `OffsetDelete` there also deletes offsets of the topics
+that those members subscribe to. Point admin tools at the gateway that the group's consumers use
+([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md#more-than-one-gateway)).
+
 `OffsetDelete` reads the topics that the members subscribe to from their metadata for the selected
 protocol, as Kafka does. It reads only the topic list of the consumer protocol's v0 prefix, which
 every later version keeps. If a member's metadata does not decode, or the group has not chosen a
@@ -124,7 +136,11 @@ A call to Iggy that a retry can fix answers `COORDINATOR_LOAD_IN_PROGRESS` (14),
 client retries it. `DeleteGroups` answers it for the group, and `OffsetDelete` for the whole
 request. A second delete of an offset or a group does no harm. A deletion that does not end by the
 offset deadline also answers 14. When Iggy refuses the bridge user, `DeleteGroups` answers
-`GROUP_AUTHORIZATION_FAILED` (30).
+`GROUP_AUTHORIZATION_FAILED` (30). When the bridge user has no permission to list the Iggy groups
+of a Kafka topic, `DeleteGroups` deletes nothing. It answers 30 for each group to delete. The same
+applies to an override topic that the bridge user has no permission to read. `Metadata` leaves such
+a topic out. A group can hold offsets there, so the gateway cannot delete all of them. The log names
+the topics.
 
 A SASL listener names principals, and so does an `SSL` listener that verifies client certificates.
 When a listener names principals, both APIs require the principal to hold the Iggy permission

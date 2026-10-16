@@ -148,14 +148,21 @@ impl Absent {
                 described_group(version, GroupDescription::offsets_only(group_id.clone()))
             }
             Self::Dead | Self::Known(_) => missing_group(version, group_id),
-            Self::Unknown => loading_group(group_id),
+            Self::Unknown => {
+                error_group(version, group_id, ERROR_COORDINATOR_LOAD_IN_PROGRESS, None)
+            }
         }
     }
 }
 
 pub(crate) fn described_group(version: i16, group: GroupDescription) -> DescribedGroup {
     if group.error != ERROR_NONE {
-        return too_large_group(version, &group.group_id);
+        return error_group(
+            version,
+            &group.group_id,
+            ERROR_UNKNOWN_SERVER_ERROR,
+            Some(DESCRIBE_RESPONSE_TOO_LARGE),
+        );
     }
     DescribedGroup::default()
         .with_group_id(GroupId(group.group_id))
@@ -166,29 +173,26 @@ pub(crate) fn described_group(version: i16, group: GroupDescription) -> Describe
 }
 
 /// Empty member list and empty strings, matching Kafka's `DescribeGroupsResponse.groupError`.
-/// The code is not retried by the admin tool, unlike closing the connection.
-fn too_large_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
-    let mut group = DescribedGroup::default()
-        .with_error_code(ERROR_UNKNOWN_SERVER_ERROR)
+/// `message` goes out from v6. A group that does not fit the response gets
+/// `UNKNOWN_SERVER_ERROR`, which the admin tool does not retry, unlike closing the connection.
+/// One that waits for the first scan gets `COORDINATOR_LOAD_IN_PROGRESS`, which it retries.
+fn error_group(
+    version: i16,
+    group_id: &StrBytes,
+    code: i16,
+    message: Option<&'static str>,
+) -> DescribedGroup {
+    let group = DescribedGroup::default()
+        .with_error_code(code)
         .with_group_id(GroupId(group_id.clone()))
         .with_group_state(StrBytes::from_static_str(""))
         .with_protocol_type(StrBytes::from_static_str(""))
         .with_protocol_data(StrBytes::from_static_str(""));
     if version >= FIRST_ERROR_MESSAGE_VERSION {
-        group =
-            group.with_error_message(Some(StrBytes::from_static_str(DESCRIBE_RESPONSE_TOO_LARGE)));
+        group.with_error_message(message.map(StrBytes::from_static_str))
+    } else {
+        group
     }
-    group
-}
-
-/// The same empty shape as [`too_large_group`], with a code the Java admin retries.
-fn loading_group(group_id: &StrBytes) -> DescribedGroup {
-    DescribedGroup::default()
-        .with_error_code(ERROR_COORDINATOR_LOAD_IN_PROGRESS)
-        .with_group_id(GroupId(group_id.clone()))
-        .with_group_state(StrBytes::from_static_str(""))
-        .with_protocol_type(StrBytes::from_static_str(""))
-        .with_protocol_data(StrBytes::from_static_str(""))
 }
 
 fn described_member(member: MemberDescription) -> DescribedGroupMember {

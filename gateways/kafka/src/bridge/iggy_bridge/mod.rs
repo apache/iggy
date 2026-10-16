@@ -145,7 +145,7 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 /// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `CreatePartitions`,
 /// `DescribeConfigs` and `AlterConfigs` share another. Topic probes, certificate user lookups and
 /// `Metadata`'s auto topic creations each use a client of their own, Fetch polls one per read
-/// slot, and offset calls two per offset slot.
+/// slot, offset calls two per offset slot, and the scan for the groups that hold offsets one more.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -168,6 +168,8 @@ pub struct IggyBridge {
     offset_pool: OffsetPool,
     /// The Kafka groups that hold offsets. See `offset_groups`.
     group_index: GroupIndex,
+    /// The client of the scan that finds those groups, so no offset call waits behind it.
+    scan_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -211,6 +213,7 @@ impl IggyBridge {
             auto_create_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
+            scan_client: LazyClient::default(),
         })
     }
 
@@ -292,6 +295,7 @@ impl IggyBridge {
             lookup_client,
             auto_create_client,
             offset_clients,
+            scan_client,
             shared_client,
         ) = tokio::join!(
             self.produce_pool.close(),
@@ -300,6 +304,7 @@ impl IggyBridge {
             self.lookup_client.close(),
             self.auto_create_client.close(),
             self.offset_pool.close(),
+            self.scan_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
@@ -308,6 +313,7 @@ impl IggyBridge {
             .and(lookup_client)
             .and(auto_create_client)
             .and(offset_clients)
+            .and(scan_client)
             .and(shared_client)
     }
 
@@ -395,6 +401,7 @@ impl IggyBridge {
             lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
             group_index: GroupIndex::new(),
+            scan_client: LazyClient::default(),
         }
     }
 }
