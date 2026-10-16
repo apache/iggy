@@ -45,6 +45,8 @@ pub(crate) mod shard_allocator;
 // spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
 pub(crate) mod consumer_group;
 pub(crate) mod dispatch;
+pub use dispatch::host::{SessionGrantMap, empty_session_grants};
+pub(crate) mod external_auth;
 pub(crate) mod namespace;
 pub(crate) mod pat;
 pub(crate) mod reply_frame;

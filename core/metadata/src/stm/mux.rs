@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, RestoreSnapshotInPlace, SnapshotError};
+use crate::stm::snapshot::{
+    FillSnapshot, MetadataSnapshot, RestoreSnapshot, RestoreSnapshotInPlace, SnapshotError,
+};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::Either;
 use iggy_common::variadic;
@@ -213,33 +215,33 @@ where
     }
 }
 
-impl<T, SnapshotData> RestoreSnapshotInPlace<SnapshotData> for MuxStateMachine<T>
+impl<T> RestoreSnapshotInPlace<MetadataSnapshot> for MuxStateMachine<T>
 where
-    T: StateMachine + RestoreSnapshotInPlace<SnapshotData>,
+    T: StateMachine + RestoreSnapshotInPlace<MetadataSnapshot>,
 {
-    fn restore_snapshot_in_place(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+    fn restore_snapshot_in_place(&self, snapshot: &MetadataSnapshot) -> Result<(), SnapshotError> {
         self.inner.restore_snapshot_in_place(snapshot)
     }
 
-    fn check_restorable(&self, snapshot: &SnapshotData) -> Result<(), SnapshotError> {
+    fn check_restorable(&self, snapshot: &MetadataSnapshot) -> Result<(), SnapshotError> {
         self.inner.check_restorable(snapshot)
     }
 }
 
-impl<SnapshotData, T> FillSnapshot<SnapshotData> for MuxStateMachine<T>
+impl<T> FillSnapshot<MetadataSnapshot> for MuxStateMachine<T>
 where
-    T: StateMachine + FillSnapshot<SnapshotData>,
+    T: StateMachine + FillSnapshot<MetadataSnapshot>,
 {
-    fn fill_snapshot(&self, snapshot: &mut SnapshotData) -> Result<(), SnapshotError> {
+    fn fill_snapshot(&self, snapshot: &mut MetadataSnapshot) -> Result<(), SnapshotError> {
         self.inner.fill_snapshot(snapshot)
     }
 }
 
-impl<SnapshotData, T> RestoreSnapshot<SnapshotData> for MuxStateMachine<T>
+impl<T> RestoreSnapshot<MetadataSnapshot> for MuxStateMachine<T>
 where
-    T: StateMachine + RestoreSnapshot<SnapshotData>,
+    T: StateMachine + RestoreSnapshot<MetadataSnapshot>,
 {
-    fn restore_snapshot(snapshot: &SnapshotData) -> Result<Self, SnapshotError> {
+    fn restore_snapshot(snapshot: &MetadataSnapshot) -> Result<Self, SnapshotError> {
         let inner = T::restore_snapshot(snapshot)?;
         Ok(Self::new(inner))
     }

@@ -22,6 +22,7 @@
 //! Parked in either spine it would make one import the other's session module
 //! for a type neither owns.
 
+use crate::session_manager::SessionError;
 use iggy_common::IggyError;
 use metadata::MetadataSubmitError;
 
@@ -34,6 +35,16 @@ pub enum LoginRegisterError {
     InvalidCredentials,
     InvalidToken,
     UserInactive,
+    /// The username matched a local user but the password was wrong (or the
+    /// account is inactive). Surfaced to the client identically to
+    /// `InvalidCredentials` so we don't leak which field failed, but
+    /// excluded from `is_invalid_credentials` so the external auth
+    /// fallback is never attempted for known local users.
+    LocalUserRejected,
+    /// Denied by an external authentication service.
+    ExternalAuthDenied(String),
+    #[allow(dead_code)]
+    Session(SessionError),
     Binding(IggyError),
     /// Recoverable consensus failure. The connection stays `Connected`; the
     /// SDK read-timeout replays.
@@ -41,6 +52,15 @@ pub enum LoginRegisterError {
 }
 
 impl LoginRegisterError {
+    /// `true` when the credential did not match any local user and an
+    /// external auth callout should be attempted as a fallback.
+    /// `LocalUserRejected` (known local user, wrong password) is
+    /// excluded: the fallback is only for users that don't exist locally.
+    #[must_use]
+    pub const fn is_invalid_credentials(&self) -> bool {
+        matches!(self, Self::InvalidCredentials | Self::InvalidToken)
+    }
+
     /// `true` for a terminal failure the client cannot fix by retrying (bad
     /// credentials / token / inactive user / session error); `false` for a
     /// transient consensus failure the SDK replays. The handler fast-fails
@@ -65,9 +85,13 @@ impl LoginRegisterError {
 impl std::fmt::Display for LoginRegisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidCredentials => write!(f, "invalid username or password"),
+            Self::InvalidCredentials | Self::LocalUserRejected => {
+                write!(f, "invalid username or password")
+            }
             Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
+            Self::ExternalAuthDenied(reason) => write!(f, "external auth denied: {reason}"),
+            Self::Session(e) => write!(f, "session error: {e}"),
             Self::Binding(error) => write!(f, "session binding: {error}"),
             Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
         }

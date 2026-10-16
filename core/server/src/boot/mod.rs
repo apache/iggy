@@ -297,6 +297,22 @@ pub fn bootstrap(
     // run this bootstrap; after this line those are no-ops.
     install_default_crypto_provider();
     validate_root_credentials_env(&config)?;
+    crate::external_auth::validate_config(&config.external_auth)?;
+    if config.external_auth.enabled {
+        for issuer in config.http.jwt.trusted_issuers.iter().flatten() {
+            if issuer.user_id == iggy_common::EXTERNAL_AUTH_USER_ID {
+                return Err(
+                    crate::server_error::ServerError::InvalidExternalAuthConfig {
+                        reason: format!(
+                            "trusted issuer '{}' user_id {} collides with iggy_common::EXTERNAL_AUTH_USER_ID",
+                            issuer.issuer, issuer.user_id
+                        ),
+                    },
+                );
+            }
+        }
+    }
+    crate::external_auth::warn_insecure_url(&config.external_auth);
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
@@ -687,6 +703,12 @@ async fn shard_main(
     } else {
         (None, None, None, None, (0, 0), None)
     };
+    // Peer shards (Waiter path) and the post-recovery guard need the
+    // external auth user_id. The Owner path sets it in seed_baseline when
+    // replaying from the WAL; a snapshot restore sets it from the snapshot's
+    // own field (MetadataSnapshot v6+). This post-recovery call covers the
+    // The protocol constant EXTERNAL_AUTH_USER_ID (u32::MAX) is above any
+    // slab-allocated user ID, so no collision check is needed.
     let metadata = ServerMetadata::new(
         metadata_consensus,
         journal_for_metadata,
@@ -729,6 +751,8 @@ async fn shard_main(
     // Heap-pin like `run_shard_thread` pins `shard_main`: the builder future
     // carries the whole shard construction state machine and outgrew clippy's
     // `large_futures` cap; one allocation per shard startup.
+    let external_auth_config = Arc::new(config.external_auth.clone());
+    let session_grants = crate::dispatch::host::empty_session_grants();
     let ShardBuild {
         shard,
         sessions,
@@ -746,6 +770,8 @@ async fn shard_main(
         reply_inbox,
         shard_metrics,
         &roster_cells,
+        Arc::clone(&external_auth_config),
+        Arc::clone(&session_grants),
     ))
     .await?;
 
@@ -1015,6 +1041,7 @@ async fn shard_main(
             accepted_client,
             &connections,
             &shard_metrics_all,
+            external_auth_config,
         )
         .await
         {

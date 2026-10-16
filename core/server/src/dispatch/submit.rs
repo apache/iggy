@@ -108,6 +108,42 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     );
                 }
             }
+            shard::MetadataSubmit::CompleteRevocation {
+                stream_id,
+                topic_id,
+                partition_id,
+                installation,
+                partition_op,
+                reply,
+            } => {
+                let namespace = IggyNamespace::new(
+                    stream_id as usize,
+                    topic_id as usize,
+                    partition_id as usize,
+                );
+                let request = CompleteConsumerGroupRevocationRequest {
+                    stream_id: WireIdentifier::numeric(stream_id),
+                    topic_id: WireIdentifier::numeric(topic_id),
+                    partition_id,
+                    installation,
+                    partition_op,
+                };
+                let key = CompletionKey::Revocation {
+                    namespace,
+                    group_id: installation.group_id,
+                };
+                let commit = if relay_completion(&shard, &relays, key, &request).await {
+                    None
+                } else {
+                    shard
+                        .plane
+                        .metadata()
+                        .submit_complete_revocation_in_process(request, namespace)
+                        .await
+                        .ok()
+                };
+                let _ = reply.try_send(commit);
+            }
             shard::MetadataSubmit::BindSession {
                 vsr_client_id,
                 session,
@@ -128,9 +164,13 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                 verifier,
                 reply,
             } => {
-                let bound =
-                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, verifier)
-                        .await;
+                let bound = submit_register_local_or_forward(
+                    &shard,
+                    vsr_client_id,
+                    user_id,
+                    verifier,
+                )
+                .await;
                 let _ = reply.try_send(bound);
             }
             shard::MetadataSubmit::ForwardedRegister {
@@ -242,42 +282,6 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     Some(Err(_)) => false,
                 };
                 let _ = reply.try_send(report_again);
-            }
-            shard::MetadataSubmit::CompleteRevocation {
-                stream_id,
-                topic_id,
-                partition_id,
-                installation,
-                partition_op,
-                reply,
-            } => {
-                let namespace = IggyNamespace::new(
-                    stream_id as usize,
-                    topic_id as usize,
-                    partition_id as usize,
-                );
-                let request = CompleteConsumerGroupRevocationRequest {
-                    stream_id: WireIdentifier::numeric(stream_id),
-                    topic_id: WireIdentifier::numeric(topic_id),
-                    partition_id,
-                    installation,
-                    partition_op,
-                };
-                let key = CompletionKey::Revocation {
-                    namespace,
-                    group_id: installation.group_id,
-                };
-                let commit = if relay_completion(&shard, &relays, key, &request).await {
-                    None
-                } else {
-                    shard
-                        .plane
-                        .metadata()
-                        .submit_complete_revocation_in_process(request, namespace)
-                        .await
-                        .ok()
-                };
-                let _ = reply.try_send(commit);
             }
             shard::MetadataSubmit::ForwardedCompletion(message) => {
                 propose_relayed_completion(&shard, &message).await;
@@ -1339,7 +1343,14 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
         let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        let host = ServerHost::new(
+            &bus,
+            &shard_handle,
+            Arc::new(server_config),
+            1,
+            Arc::new(configs::external_auth::ExternalAuthConfig::default()),
+            crate::dispatch::host::empty_session_grants(),
+        );
         let (reply, answer) = shard::channel::<bool>(1);
         host.on_metadata_submit(shard::MetadataSubmit::CompleteLifecycle {
             request: lifecycle_batch(pending_delete_intent(&shard)),

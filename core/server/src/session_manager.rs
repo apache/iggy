@@ -26,14 +26,16 @@
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
 use crate::cluster_meta::ClusterRoster;
+use crate::external_auth::SessionPermissions;
 use ahash::AHashMap;
 use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::ConsumerSession;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, Permissions};
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// What the request funnel resolves from one `connections` lookup per frame.
@@ -124,6 +126,13 @@ pub struct Connection {
 /// - Disconnecting one connection leaves the shared session and its peers live.
 pub struct SessionManager {
     connections: AHashMap<u128, Connection>,
+    /// Inline-grant permissions keyed by `vsr_client_id`. Shared across
+    /// all shards on the same node. Set once during ext-auth login;
+    /// all connections sharing a session see the same grant regardless
+    /// of which shard they land on. `Arc<Mutex>` because each shard
+    /// runs on its own thread; the lock is held only for the lookup
+    /// (no await under it).
+    session_grants: Arc<std::sync::Mutex<AHashMap<u128, SessionPermissions>>>,
     /// This shard's copy of the configured cluster roster, served by the
     /// `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
@@ -134,10 +143,24 @@ pub struct SessionManager {
 impl SessionManager {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_grants(Arc::new(std::sync::Mutex::new(AHashMap::new())))
+    }
+
+    /// Create with a shared grant map (so all shards on the same node
+    /// share ext-auth inline-grant state).
+    pub fn with_grants(
+        session_grants: Arc<std::sync::Mutex<AHashMap<u128, SessionPermissions>>>,
+    ) -> Self {
         Self {
             connections: AHashMap::new(),
+            session_grants,
             cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
+    }
+
+    /// An empty shared grants map, for tests and the simulator.
+    pub fn empty_grants() -> Arc<std::sync::Mutex<AHashMap<u128, SessionPermissions>>> {
+        Arc::new(std::sync::Mutex::new(AHashMap::new()))
     }
 
     /// Install this shard's configured cluster roster (once, at bootstrap).
@@ -184,9 +207,20 @@ impl SessionManager {
             .as_ref()
             .is_some_and(|(_, attachment)| !attachment.is_valid())
         {
-            conn.state = ConnectionState::Connected;
-            conn.consumer_session = None;
-            conn.metadata_watermark = 0;
+            // Ext-auth sessions keep their bound state: their authorization
+            // comes from session_grants (keyed by vsr_client_id, not the
+            // attachment). Resetting to Connected would lose the user_id and
+            // client_id that the alt_permissioner lookup depends on.
+            let is_ext_auth = matches!(
+                conn.state,
+                ConnectionState::Bound { user_id, .. }
+                    if user_id == iggy_common::EXTERNAL_AUTH_USER_ID
+            );
+            if !is_ext_auth {
+                conn.state = ConnectionState::Connected;
+                conn.consumer_session = None;
+                conn.metadata_watermark = 0;
+            }
         }
         conn.last_heartbeat = Instant::now();
         let (bound, user_id) = match conn.state {
@@ -241,10 +275,10 @@ impl SessionManager {
 
     /// Remove a transport connection without ending its durable session.
     pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
-        if let Some(conn) = self.connections.remove(&connection_id)
-            && let ConnectionState::Bound {
-                client_id, session, ..
-            } = conn.state
+        let conn = self.connections.remove(&connection_id)?;
+        if let ConnectionState::Bound {
+            client_id, session, ..
+        } = conn.state
         {
             return Some((client_id, session));
         }
@@ -375,6 +409,14 @@ impl SessionManager {
         }
     }
 
+    /// Transport kind (TCP, QUIC, WebSocket) of a connection.
+    #[must_use]
+    pub fn connection_transport(&self, connection_id: u128) -> Option<ClientTransportKind> {
+        self.connections
+            .get(&connection_id)
+            .map(|conn| conn.transport)
+    }
+
     /// Look up the authenticated user id for a connection.
     #[must_use]
     pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {
@@ -390,6 +432,15 @@ impl SessionManager {
             ConnectionState::Bound { user_id, .. } => Some(user_id),
             ConnectionState::Connected => None,
         }
+    }
+
+    /// The transport-level peer address a connection arrived from, recorded by
+    /// [`Self::ensure_connection`] for every transport.
+    #[must_use]
+    pub fn connection_address(&self, connection_id: u128) -> Option<SocketAddr> {
+        self.connections
+            .get(&connection_id)
+            .map(|conn| conn.address)
     }
 
     /// Flatten one connection into a [`ConnectedClientInfo`] for `get_me`.
@@ -444,6 +495,73 @@ impl SessionManager {
             }
         })
     }
+
+    /// Store inline-grant permissions keyed by the VSR `client_id`.
+    /// All connections sharing this session see the same grant,
+    /// across all shards on the same node.
+    pub fn set_session_permissions(&self, vsr_client_id: u128, perms: SessionPermissions) {
+        self.session_grants
+            .lock()
+            .unwrap()
+            .insert(vsr_client_id, perms);
+    }
+
+    /// Remove session-scoped permissions for a VSR `client_id`.
+    /// Used to roll back an inline-grant when `complete_login_register`
+    /// fails.
+    pub fn clear_session_permissions(&self, vsr_client_id: u128) {
+        self.session_grants.lock().unwrap().remove(&vsr_client_id);
+    }
+
+    /// Look up session-scoped permissions by connection ID. Resolves the
+    /// bound VSR `client_id` from the connection, then checks
+    /// `session_grants`. Returns `None` when the session has no grant or
+    /// the grant has expired. Expired grants are removed so they do not
+    /// accumulate.
+    #[must_use]
+    pub fn session_permissions_for_connection(
+        &self,
+        connection_id: u128,
+        now_secs: u64,
+    ) -> Option<std::sync::Arc<Permissions>> {
+        let conn = self.connections.get(&connection_id)?;
+        let vsr_client_id = match conn.state {
+            ConnectionState::Bound { client_id, .. } => client_id,
+            ConnectionState::Connected => return None,
+        };
+        let mut grants = self.session_grants.lock().unwrap();
+        let expired = grants
+            .get(&vsr_client_id)
+            .is_some_and(|sp| sp.expires_at <= now_secs);
+        if expired {
+            grants.remove(&vsr_client_id);
+            return None;
+        }
+        let result = grants
+            .get(&vsr_client_id)
+            .map(|sp| std::sync::Arc::clone(&sp.permissions));
+        drop(grants);
+        result
+    }
+
+    /// Whether a grant exists for this VSR `client_id` (regardless of
+    /// which connection it's on). Used by `complete_session_binding` to
+    /// reject `BindSession` on nodes that never ran the ext-auth callout.
+    pub fn has_session_permissions_for_client(&self, vsr_client_id: u128) -> bool {
+        self.session_grants
+            .lock()
+            .unwrap()
+            .contains_key(&vsr_client_id)
+    }
+
+    pub fn has_session_permissions(&self, connection_id: u128) -> bool {
+        let conn = self.connections.get(&connection_id);
+        let vsr_client_id = conn.and_then(|c| match c.state {
+            ConnectionState::Bound { client_id, .. } => Some(client_id),
+            ConnectionState::Connected => None,
+        });
+        vsr_client_id.is_some_and(|id| self.session_grants.lock().unwrap().contains_key(&id))
+    }
 }
 
 impl Default for SessionManager {
@@ -451,6 +569,35 @@ impl Default for SessionManager {
         Self::new()
     }
 }
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum SessionError {
+    ConnectionNotFound(u128),
+    InvalidTransition {
+        connection_id: u128,
+        from: &'static str,
+        to: &'static str,
+    },
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionNotFound(id) => write!(f, "connection {id} not found"),
+            Self::InvalidTransition {
+                connection_id,
+                from,
+                to,
+            } => write!(
+                f,
+                "connection {connection_id}: invalid transition {from} -> {to}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
 
 /// Flatten a connection + its id into a [`ConnectedClientInfo`].
 fn record_from(connection_id: u128, conn: &Connection) -> ConnectedClientInfo {
