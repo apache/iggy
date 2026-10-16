@@ -25,6 +25,7 @@
 //! directory sync makes creation, replacement, or deletion durable. Offset callers
 //! own that directory sync.
 
+use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
@@ -52,6 +53,10 @@ const CHECKSUM_SIZE: usize = core::mem::size_of::<u64>();
 /// The offset is a consumer cursor reloaded unchanged on every restart, so a
 /// flipped bit silently rewinds the consumer into redelivery or skips it forward.
 pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
+
+/// Disk space an offset file's first record allocates: one block on ext4 and
+/// xfs defaults. The next disk usage sample corrects other block sizes.
+const OFFSET_FILE_BLOCK_BYTES: u64 = 4096;
 
 /// Sibling name an atomic offset replacement writes before its rename lands.
 const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
@@ -360,17 +365,39 @@ pub async fn persist_offset_retained(
         file
     } else {
         create_parent_dir(path).await?;
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
+        open_offset_file(path)
             .await
             .note_descriptor_exhaustion(|| format!("opening {path}"))
             .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?
     };
     let result = file.write_all_at(encode_offset_record(offset), 0).await.0;
     Ok((result, file))
+}
+
+/// Opens the offset file at `path` for writing, creating it when absent. Only a
+/// file this call creates is charged: its first record allocates a block, while
+/// an existing file already owns one.
+async fn open_offset_file(path: &str) -> io::Result<compio::fs::File> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+    {
+        Ok(file) => {
+            DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES);
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn write_in_place<S: DurableStorage, const N: usize>(
@@ -460,6 +487,9 @@ async fn write_replacement<S: DurableStorage, const N: usize>(
         .open(Path::new(&temporary), OpenMode::CreateWriteOnly)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
+    // The replacement is a fresh inode, so its record allocates a block. The
+    // rename frees the previous file's block, which the next sample sees.
+    storage.charge_allocation(OFFSET_FILE_BLOCK_BYTES);
     if file.write(0, record.to_vec()).await.is_err() {
         let _ = storage.remove_file(Path::new(&temporary)).await;
         return Err(IggyError::CannotWriteToFile);
