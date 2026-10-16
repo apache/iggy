@@ -206,4 +206,12 @@ struct ConcurrencyTests {
         #expect(outcome.observe(IggyError(.disconnected)).code == .disconnected)
         #expect(outcome.observe(IggyError(.streamNameAlreadyExists)).code == .streamNameAlreadyExists)
     }
+
+    /// The server took a later request of the session first, so an earlier
+    /// attempt of this one may have committed.
+    @Test func retryOutcomeReportsARequestTooOldAsUnknown() {
+        var outcome = RetryOutcome()
+        #expect(outcome.observe(IggyError(.requestTooOld)).code == .transientNotCommitted)
+        #expect(outcome.isUncertain)
+    }
 }
