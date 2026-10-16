@@ -118,6 +118,91 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('announces the constructor dial to listeners attached after it',
+    async () => {
+      const server = await startServer();
+      const connection = new IggyConnection(connectionConfig(server));
+      const events: string[] = [];
+      connection.on('connecting', () => events.push('connecting'));
+      connection.on('connect', () => events.push('connect'));
+      try {
+        await connection.connect();
+        assert.deepEqual(events, ['connecting', 'connect']);
+      } finally {
+        await closeConnection(connection, server);
+      }
+    }
+  );
+
+  it('emits end once, after disconnected, and announces no dial after destroy',
+    async () => {
+      const server = await startServer();
+      const connection = new IggyConnection(connectionConfig(server));
+      const events: string[] = [];
+      for (const event of ['connecting', 'connect', 'disconnected', 'end'])
+        connection.on(event, () => events.push(event));
+      try {
+        const ended = connection._destroy();
+        assert.equal(connection._destroy(), ended);
+        await ended;
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        assert.deepEqual(events, ['disconnected', 'end']);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  );
+
+  it('emits end after disconnected when destroyed while the socket closes',
+    async () => {
+      const server = await startServer();
+      const connection = new IggyConnection(connectionConfig(server));
+      const events: string[] = [];
+      for (const event of ['disconnected', 'end'])
+        connection.on(event, () => events.push(event));
+      try {
+        await connection.connect();
+        // abort() starts the close; Node reports the socket as closed before
+        // its 'close' event fires.
+        connection.abort();
+        await connection._destroy();
+        assert.deepEqual(events, ['disconnected', 'end']);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  );
+
+  it('refuses a redirect after destroy without dialing', async () => {
+    const server = await startServer();
+    const target = await startServer();
+    let dialed = 0;
+    target.on('connection', () => { dialed += 1; });
+    const connection = new IggyConnection(connectionConfig(server));
+    const events: string[] = [];
+    for (const event of ['connecting', 'connect', 'end'])
+      connection.on(event, () => events.push(event));
+    try {
+      await connection.connect();
+      const ended = connection._destroy();
+      await assert.rejects(
+        connection.redirect(
+          '127.0.0.1',
+          (target.address() as AddressInfo).port
+        ),
+        /connection is closed/
+      );
+      await ended;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.equal(dialed, 0);
+      assert.deepEqual(events, ['connecting', 'connect', 'end']);
+    } finally {
+      connection.socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
+  });
+
   it('shares connection attempts, recognizes endpoints, and writes frames',
     async () => {
       const server = await startServer();

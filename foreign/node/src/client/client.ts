@@ -16,8 +16,16 @@
 // under the License.
 
 import { createPool, type Pool } from 'generic-pool';
-import type { RawClient, ClientConfig, ClientConfigOrString } from "./client.type.js"
-import { getRawClient } from '../client/client.socket.js';
+import type {
+  RawClient,
+  ClientConfig,
+  ClientConfigOrString,
+  ClientEventMap
+} from "./client.type.js"
+import {
+  CommandResponseStream,
+  getRawClient
+} from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
 import { normalizeClientConfig } from './client.config.js';
@@ -28,15 +36,16 @@ import { normalizeClientConfig } from './client.config.js';
  * Automatically acquires and releases clients from the pool.
  *
  * @param config - Client configuration including pool size options
- * @returns Client provider and its connection pool
+ * @returns Client provider, its connection pool and the pooled connection
  */
 const createPooledClientProvider = (config: ClientConfig) => {
   // Constructed eagerly rather than inside the factory: generic-pool never
   // rejects waiting acquires when a create fails, and keeps re-dispatching
   // the doomed factory, which hangs every command. Normalization already
   // pins this pool to exactly one pooled connection, so there is nothing
-  // lazy to preserve.
-  const client = getRawClient(config);
+  // lazy to preserve. Built directly rather than through getRawClient, whose
+  // RawClient type has no way to remove a listener.
+  const client = new CommandResponseStream(config);
   const minPoolSize = config.poolSize?.min || 1;
   const maxPoolSize = config.poolSize?.max || 4;
   const pool = createPool({
@@ -59,7 +68,7 @@ const createPooledClientProvider = (config: ClientConfig) => {
     });
     return pooled;
   }
-  return { clientProvider, pool };
+  return { clientProvider, pool, client };
 };
 
 
@@ -72,6 +81,8 @@ export class Client extends CommandAPI {
   _config: ClientConfig
   /** Connection pool instance */
   _pool: Pool<RawClient>
+  /** The pooled connection, which emits the lifecycle events */
+  private readonly events: CommandResponseStream
 
   /**
    * Creates a new pooled client.
@@ -80,15 +91,77 @@ export class Client extends CommandAPI {
   */
   constructor(config: ClientConfigOrString) {
     const normalizedConfig = normalizeClientConfig(config);
-    const { clientProvider, pool } =
+    const { clientProvider, pool, client } =
       createPooledClientProvider(normalizedConfig);
     super(clientProvider);
     this._config = normalizedConfig;
     this._pool = pool;
+    this.events = client;
+  }
+
+  /**
+   * Registers a listener for a connection lifecycle event.
+   *
+   * @param event - Event name
+   * @param listener - Called with the event's arguments
+   * @returns This client
+   */
+  on<E extends keyof ClientEventMap>(
+    event: E,
+    listener: (...args: ClientEventMap[E]) => void
+  ): this {
+    this.events.on(event, listener);
+    return this;
+  }
+
+  /**
+   * Registers a listener that runs on the next occurrence of an event only.
+   *
+   * @param event - Event name
+   * @param listener - Called with the event's arguments
+   * @returns This client
+   */
+  once<E extends keyof ClientEventMap>(
+    event: E,
+    listener: (...args: ClientEventMap[E]) => void
+  ): this {
+    this.events.once(event, listener);
+    return this;
+  }
+
+  /**
+   * Removes a listener registered with `on` or `once`.
+   *
+   * @param event - Event name
+   * @param listener - The listener to remove
+   * @returns This client
+   */
+  off<E extends keyof ClientEventMap>(
+    event: E,
+    listener: (...args: ClientEventMap[E]) => void
+  ): this {
+    this.events.off(event, listener);
+    return this;
+  }
+
+  /**
+   * Alias of `off`. At run time, `events.once()` and `events.on()` from
+   * `node:events` remove their listeners through this name.
+   *
+   * @param event - Event name
+   * @param listener - The listener to remove
+   * @returns This client
+   */
+  removeListener<E extends keyof ClientEventMap>(
+    event: E,
+    listener: (...args: ClientEventMap[E]) => void
+  ): this {
+    return this.off(event, listener);
   }
 
   /**
    * Destroys the client and drains all connections from the pool.
+   * Resolves after the 'end' event.
    */
   async destroy() {
     debug('destroying client pool. pool size is', this._pool.size);
@@ -135,7 +208,7 @@ export class SingleClient extends CommandAPI {
    */
   async destroy() {
     const client = await this.clientProvider();
-    client.destroy();
+    await client.destroy();
   }
 }
 
@@ -159,7 +232,7 @@ export class SimpleClient extends CommandAPI {
    */
   async destroy() {
     const client = await this.clientProvider();
-    client.destroy();
+    await client.destroy();
   }
 
 }

@@ -164,6 +164,16 @@ export class IggyConnection extends EventEmitter {
   private connectPromise?: Promise<this>;
   /** Shared promise for callers waiting on automatic reconnection */
   private reconnectPromise?: Promise<this>;
+  /**
+   * Settles once 'end' is emitted. Shared so that a repeated destroy cannot
+   * announce the end twice.
+   */
+  private endPromise?: Promise<void>;
+  /**
+   * Sockets whose 'close' already fired. Node sets `socket.closed` inside
+   * destroy(), before 'close', so that flag cannot tell the two apart.
+   */
+  private readonly closedSockets = new WeakSet<Socket>();
   /** Endpoint the client was configured with, kept across leader redirects */
   private readonly seedOptions: ClientConfig['options'];
   /**
@@ -244,6 +254,7 @@ export class IggyConnection extends EventEmitter {
     });
 
     socket.once('close', (hadError?: boolean) => {
+      this.closedSockets.add(socket);
       if (this.socket !== socket)
         return;
       debug('socket/close event', hadError);
@@ -254,6 +265,15 @@ export class IggyConnection extends EventEmitter {
       this.emit('disconnected', hadError);
       if (!this.ending)
         void this.reconnect().catch(() => undefined);
+    });
+
+    // Every dial gets a socket of its own, so one announcement per installed
+    // socket is one per attempt. Deferred because the constructor dials
+    // before a caller can attach a listener. The tick still runs ahead of
+    // the socket's I/O events, so the attempt is announced before its outcome.
+    process.nextTick(() => {
+      if (this.socket === socket && !this.ending)
+        this.emit('connecting');
     });
     return socket;
   }
@@ -565,6 +585,10 @@ export class IggyConnection extends EventEmitter {
   }
 
   async redirect(host: string, port: number) {
+    // A leader move settled while the client was destroyed would otherwise
+    // dial a socket that nothing closes, after 'end'.
+    if (this.ending)
+      throw new Error('connection is closed');
     const redirectedOptions = { ...this.config.options, host, port };
     const redirectedConfig = {
       ...this.config,
@@ -609,11 +633,28 @@ export class IggyConnection extends EventEmitter {
 
   /**
    * Destroys the connection and marks it as ending.
+   *
+   * @returns Promise that settles once 'end' is emitted
    */
-  _destroy() {
+  _destroy(): Promise<void> {
     this.ending = true;
     this._endResponseWait();
-    this.socket.destroy();
+    const socket = this.socket;
+    // Emitted after the socket's own 'close', so the 'disconnected' that the
+    // close raises cannot trail the end.
+    this.endPromise ??= new Promise<void>((resolve) => {
+      // Settled first: a throwing 'end' listener must not leave destroy hanging.
+      const end = () => {
+        resolve();
+        this.emit('end');
+      };
+      if (this.closedSockets.has(socket))
+        process.nextTick(end);
+      else
+        socket.once('close', end);
+    });
+    socket.destroy();
+    return this.endPromise;
   }
 
   /**

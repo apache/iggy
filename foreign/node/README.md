@@ -128,6 +128,34 @@ const client = new Client({
 const stats = await client.system.getStats();
 ```
 
+### Connection events
+
+`Client` reports its connection lifecycle through Node.js-style `on`, `once`,
+`off` and `removeListener` methods. Each method returns the client, so calls
+can be chained. `SingleClient` and `SimpleClient` do not report these events.
+
+```ts
+client
+  .on("connecting", () => console.log("dialing the server"))
+  .once("connected", () => console.log("connected"))
+  .on("error", (error) => console.error("connection error", error))
+  .on("end", () => console.log("client destroyed"));
+```
+
+- `connecting` fires once for each dial: the first one, each redial after
+  the connection is lost, and each dial to another cluster node that the
+  client moves to. The extra connections that polls open to partition
+  owners in a cluster do not report events. The first dial starts in the
+  constructor and is announced on the next tick, so attach listeners right
+  after `new Client(...)`, before any `await`, to receive it.
+- `connected` fires when that dial is ready: TCP connected, or the TLS
+  handshake done. It fires before the client logs in.
+- `error` receives each error the connection reports, for example a refused
+  dial. A command that the error fails still rejects with it. Without an
+  `error` listener, the client does not throw.
+- `end` fires once, after `destroy()` closes the connection, and no event
+  follows it. `await client.destroy()` resolves after `end`.
+
 ### Connection strings
 
 Every client constructor (except `SimpleClient` see note) also accepts a
