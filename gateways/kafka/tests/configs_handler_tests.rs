@@ -49,10 +49,8 @@ const ALTER_VERSION: i16 = 2;
 
 fn state_without_bridge() -> GatewayState {
     GatewayState::new(
-        BrokerAdvertise::default(),
         None,
         8 * 1024 * 1024,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )

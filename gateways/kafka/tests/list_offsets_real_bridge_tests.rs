@@ -35,8 +35,7 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-    GatewayState,
+    ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::list_offsets;
 
@@ -197,10 +196,8 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
         .await
         .expect("seed bridge should connect to a ready server");
     let state = GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     );
@@ -486,10 +483,8 @@ async fn a_stalled_lookup_leaves_the_later_partitions_of_the_request_their_answe
         .await
         .expect("bridge should connect through the relay");
     let state = GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     );

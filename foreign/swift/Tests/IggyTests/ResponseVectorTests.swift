@@ -195,13 +195,29 @@ struct ResponseVectorTests {
         #expect(stats.totalDiskSpace == 512_110_190_592)
     }
 
+    @Test func routes() async throws {
+        #expect(try Responses.partitionRoute(body("response.partition_route")) == PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10))
+        // A route of any other length comes from a mismatched build.
+        await expectCode(.invalidCommand) { _ = try Responses.partitionRoute(body("response.partition_route") + [0]) }
+
+        let poll = try Responses.pollRoute(body("response.poll_routing"))
+        #expect(poll.consumerSession.clientID == UInt128Value(low: 0x090a_0b0c_0d0e_0f10, high: 0x0102_0304_0506_0708))
+        #expect(poll.consumerSession.session == 42)
+        #expect(poll.consumerSession.metadataWatermark == 120)
+        #expect(poll.context == PartitionContext(incarnation: 7, ownerGeneration: 3, metadataOp: 110))
+        #expect(poll.primary.replicaID == 2)
+        #expect(poll.primary.tcpAddress == "10.0.0.3:8092")
+    }
+
     @Test func clusterMetadata() throws {
         let metadata = try Responses.clusterMetadata(body("response.cluster_metadata"))
         #expect(metadata.name == "prod-cluster")
         #expect(metadata.nodes.count == 2)
+        #expect(metadata.nodes[0].replicaID == 0)
         #expect(metadata.nodes[0].role == .leader)
         #expect(metadata.nodes[0].status == .healthy)
         #expect(metadata.nodes[0].tcpAddress == "10.0.0.1:8090")
+        #expect(metadata.nodes[1].replicaID == 1)
         #expect(metadata.nodes[1].role == .follower)
         #expect(metadata.nodes[1].status == .unreachable)
         #expect(metadata.nodes[1].tcpAddress == "[fd00::2]:8091")

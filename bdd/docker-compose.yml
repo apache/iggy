@@ -21,6 +21,8 @@ services:
     build:
       context: ..
       dockerfile: bdd/rust/Dockerfile
+      args:
+        BDD_RUST_FEATURES: ${BDD_RUST_FEATURES:-bdd}
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy

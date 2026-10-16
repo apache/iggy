@@ -73,7 +73,6 @@ pub struct ConsumerGroupOwnershipTransition {
     pub stream_id: u32,
     pub topic_id: u32,
     pub partition_id: u32,
-    pub source: Option<ConsumerGroupOwner>,
     pub installation: InstallConsumerGroupOwnerRequest,
     pub created_at: u64,
     pub skip_drain: bool,
@@ -132,7 +131,7 @@ pub struct ConsumerGroup {
     pub id: u64,
     /// Bumped on every `rebalance_members`. The client caches the generation it
     /// synced at; the coordinator fences stale polls and the heartbeat re-syncs
-    /// when it advances.
+    /// when it advances. Owner generations are metadata ops, not this counter.
     pub generation: u64,
     pub name: Arc<str>,
     pub members: IdSlab<ConsumerGroupMember>,
@@ -182,7 +181,7 @@ impl ConsumerGroup {
             let desired = ConsumerGroupOwner {
                 client_id,
                 session,
-                generation: self.generation,
+                generation: metadata_op,
             };
             let assignment =
                 self.assignments
@@ -200,8 +199,14 @@ impl ConsumerGroup {
             let same_member = |owner: ConsumerGroupOwner| {
                 owner.client_id == client_id && owner.session == session
             };
-            if let Some(pending) = assignment.pending {
+            let owner_left = assignment
+                .owner
+                .is_none_or(|owner| !members.contains(&(owner.client_id, owner.session)));
+            if let Some(pending) = assignment.pending.as_mut() {
                 if same_member(pending.owner) {
+                    // Only a member owner can still commit, so the drain
+                    // wait follows the current membership.
+                    pending.skip_drain = owner_left;
                     continue;
                 }
             } else if assignment.owner.is_some_and(same_member)
@@ -209,14 +214,14 @@ impl ConsumerGroup {
             {
                 continue;
             }
-            let skip_drain = assignment
-                .owner
-                .is_none_or(|owner| !members.contains(&(owner.client_id, owner.session)));
+            // The installed owner drains the same work for any successor, so a
+            // new target keeps the deadline of the first handoff.
+            let created_at = assignment.pending.map_or(now, |pending| pending.created_at);
             assignment.pending = Some(PendingOwnership {
                 owner: desired,
                 metadata_op,
-                created_at: now,
-                skip_drain,
+                created_at,
+                skip_drain: owner_left,
             });
         }
         self.rebuild_member_assignments();
@@ -295,7 +300,6 @@ impl ConsumerGroup {
                     stream_id: stream_id as u32,
                     topic_id: topic_id as u32,
                     partition_id: partition_id as u32,
-                    source: assignment.owner,
                     installation: InstallConsumerGroupOwnerRequest {
                         incarnation: assignment.incarnation,
                         group_id: self.id,
@@ -492,8 +496,9 @@ impl WireDecode for LeaveConsumerGroupRequest {
     }
 }
 
-/// Owner retirement sends every live group id of a topic in one catalog, and
-/// decode refuses a catalog above `CONSUMER_GROUP_OWNERS_MAX`.
+/// Owner retirement sends the live group ids of a topic plus the kept ids of a
+/// partition in one catalog, and decode refuses a catalog above
+/// `CONSUMER_GROUP_OWNERS_MAX`. This guard bounds only the live ids.
 const fn admits_consumer_group(live_groups: usize) -> bool {
     live_groups < CONSUMER_GROUP_OWNERS_MAX as usize
 }
@@ -611,8 +616,8 @@ impl StateHandler for DeleteConsumerGroupRequest {
             return ApplyReply::err(DeleteConsumerGroupResult::ConsumerGroupNotFound);
         };
         topic.consumer_group_index.remove(&group.name);
-        // Finalization runs under the intent's op, and the lifecycle completion
-        // then records the op that actually removed the group.
+        // A finalized deletion applies at its completion op. A sibling group
+        // created after the intent can hold a later op than the intent.
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
         // Bump the partition-shaping revision so the reconciler's fast-skip
         // doesn't pass over the delete: it reclaims the group's leftover
@@ -1221,6 +1226,261 @@ mod tests {
     }
 
     #[test]
+    fn given_installed_owner_leaves_when_successor_is_kept_should_skip_its_drain() {
+        const OWNER: (u128, u64) = (7, 11);
+        const SUCCESSOR: (u128, u64) = (8, 13);
+        let member = |id, (client_id, session)| {
+            let mut member = ConsumerGroupMember::new(id, client_id);
+            member.session = Some(session);
+            member
+        };
+        let partitions: Vec<_> = (0..2)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        group.members.insert(member(0, OWNER));
+        group.rebalance_members(&partitions, 12, 100);
+        for partition_id in 0..2 {
+            let assignment = &group.assignments[&partition_id];
+            let pending = assignment.pending.unwrap();
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: group.id,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            assert!(group.complete_revocation(partition_id, &installation, 1));
+        }
+        group.members.insert(member(1, SUCCESSOR));
+        group.rebalance_members(&partitions, 14, 200);
+        let decided = group.assignments[&1].pending.unwrap();
+        assert!(!decided.skip_drain);
+
+        group.members.remove(0);
+        group.rebalance_members(&partitions, 16, 400);
+        assert_eq!(
+            group.assignments[&1].pending,
+            Some(PendingOwnership {
+                skip_drain: true,
+                ..decided
+            }),
+            "a departed owner cannot commit, so its successor must not wait for a drain"
+        );
+        let mut transitions = BTreeMap::new();
+        group.index_pending_revocations(0, 0, &mut transitions);
+        assert!(transitions[&(0, 0, group.id, 1)].skip_drain);
+
+        let handoff = group.assignments[&0].pending.unwrap();
+        assert!(handoff.skip_drain);
+        group.members.insert(member(0, OWNER));
+        group.rebalance_members(&partitions, 18, 600);
+        assert_eq!(
+            group.assignments[&0].pending,
+            Some(PendingOwnership {
+                skip_drain: false,
+                ..handoff
+            }),
+            "a rejoined owner can commit again, so the handoff waits for its drain"
+        );
+    }
+
+    #[test]
+    fn given_pending_owner_when_its_target_changes_should_keep_the_drain_deadline() {
+        const OWNER: (u128, u64) = (7, 11);
+        const SECOND: (u128, u64) = (8, 13);
+        const THIRD: (u128, u64) = (9, 15);
+        const FIRST_HANDOFF_AT: u64 = 300;
+        let member = |id, (client_id, session)| {
+            let mut member = ConsumerGroupMember::new(id, client_id);
+            member.session = Some(session);
+            member
+        };
+        let partitions: Vec<_> = (0..3)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        group.members.insert(member(0, OWNER));
+        group.rebalance_members(&partitions, 12, 100);
+        for partition_id in 0..3 {
+            let assignment = &group.assignments[&partition_id];
+            let pending = assignment.pending.unwrap();
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: group.id,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            assert!(group.complete_revocation(partition_id, &installation, 1));
+        }
+        group.members.insert(member(1, SECOND));
+        group.rebalance_members(&partitions, 14, 200);
+        group.members.insert(member(2, THIRD));
+        group.rebalance_members(&partitions, 15, FIRST_HANDOFF_AT);
+        let first = group.assignments[&1].pending.unwrap();
+        assert_eq!(
+            (first.owner.client_id, first.created_at),
+            (THIRD.0, FIRST_HANDOFF_AT)
+        );
+
+        group.members.remove(2);
+        group.rebalance_members(&partitions, 16, 400);
+        assert_eq!(
+            group.assignments[&1].pending,
+            Some(PendingOwnership {
+                owner: ConsumerGroupOwner {
+                    client_id: OWNER.0,
+                    session: OWNER.1,
+                    generation: 16,
+                },
+                metadata_op: 16,
+                created_at: FIRST_HANDOFF_AT,
+                skip_drain: false,
+            }),
+            "a new target must not restart the drain deadline of the installed owner"
+        );
+        let mut transitions = BTreeMap::new();
+        group.index_pending_revocations(0, 0, &mut transitions);
+        assert_eq!(
+            transitions[&(0, 0, group.id, 1)].created_at,
+            FIRST_HANDOFF_AT
+        );
+    }
+
+    #[test]
+    fn given_membership_change_when_rebalancing_should_mint_the_deciding_op_as_owner_generation() {
+        const FIRST_OP: u64 = 12;
+        const SECOND_OP: u64 = 31;
+        let partitions: Vec<_> = (0..2)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        let mut first = ConsumerGroupMember::new(0, 7);
+        first.session = Some(11);
+        group.members.insert(first);
+        group.rebalance_members(&partitions, FIRST_OP, 100);
+        let mut second = ConsumerGroupMember::new(1, 8);
+        second.session = Some(13);
+        group.members.insert(second);
+        group.rebalance_members(&partitions, SECOND_OP, 200);
+
+        let decisions: Vec<_> = group
+            .assignments
+            .values()
+            .map(|assignment| {
+                let pending = assignment.pending.unwrap();
+                assert_eq!(pending.owner.generation, pending.metadata_op);
+                (pending.owner.client_id, pending.owner.generation)
+            })
+            .collect();
+        assert_eq!(decisions, [(7, FIRST_OP), (8, SECOND_OP)]);
+        assert_eq!(
+            group.generation, 2,
+            "the synced counter keeps its own sequence"
+        );
+    }
+
+    /// A user revocation ends several sessions in one op, so a group can
+    /// rebalance twice under that op.
+    #[test]
+    fn given_two_rebalances_in_one_op_when_indexing_should_leave_one_decision_per_partition() {
+        const FIRST_OP: u64 = 10;
+        const REVOCATION_OP: u64 = 20;
+        const SURVIVOR: u128 = 3;
+        let partitions: Vec<_> = (0..3)
+            .map(|id| Partition::new(id, id as u64 + 1, IggyTimestamp::from(1), 1, 0))
+            .collect();
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        for id in 0..3 {
+            let mut member = ConsumerGroupMember::new(id, id as u128 + 1);
+            member.session = Some(1);
+            group.members.insert(member);
+        }
+        group.rebalance_members(&partitions, FIRST_OP, 100);
+        for key in [0, 1] {
+            group.members.remove(key);
+            group.rebalance_members(&partitions, REVOCATION_OP, 200);
+        }
+
+        let mut transitions = BTreeMap::new();
+        group.index_pending_revocations(0, 0, &mut transitions);
+        let decisions: Vec<_> = transitions
+            .values()
+            .map(|transition| {
+                let installation = transition.installation;
+                assert_eq!(installation.owner.client_id, SURVIVOR);
+                assert_eq!(installation.owner.generation, installation.metadata_op);
+                (transition.partition_id, installation.metadata_op)
+            })
+            .collect();
+        assert_eq!(
+            decisions,
+            [(0, REVOCATION_OP), (1, REVOCATION_OP), (2, FIRST_OP)]
+        );
+    }
+
+    #[test]
+    fn given_two_revoked_sessions_when_removed_together_should_match_sequential_removals() {
+        const REVOKED: [u128; 2] = [1, 2];
+        const SURVIVOR: u128 = 3;
+        const ABSENT: u128 = 99;
+        const REVOCATION_OP: u64 = 50;
+        let timestamp = IggyTimestamp::from(1_000);
+        let mut state = streams_with_topic();
+        assert_eq!(create_partitions(&mut state, 2).code, 0);
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        for client_id in [REVOKED[0], REVOKED[1], SURVIVOR] {
+            assert_eq!(join(&mut state, 0, 0, 0, client_id).code, 0);
+        }
+        complete_pending_revocations(&mut state);
+        let observe = |streams: &Streams| {
+            (
+                rmp_serde::to_vec(&streams.to_snapshot()).unwrap(),
+                streams.consumer_group_pending_revocations(),
+            )
+        };
+        let sequential = Streams::from(state.clone());
+        let batched = Streams::from(state);
+        for streams in [&sequential, &batched] {
+            // A left-right absorbs its first command in place, so the
+            // removals below go through the op log of both copies.
+            streams.remove_consumer_group_member(ABSENT, timestamp, REVOCATION_OP - 1);
+        }
+
+        sequential.remove_consumer_group_member(REVOKED[0], timestamp, REVOCATION_OP);
+        assert!(
+            sequential
+                .consumer_group_pending_revocations()
+                .iter()
+                .any(|transition| transition.installation.owner.client_id == REVOKED[1]),
+            "the first removal alone decides an owner that the second one replaces"
+        );
+        sequential.remove_consumer_group_member(REVOKED[1], timestamp, REVOCATION_OP);
+        batched.remove_consumer_group_members(&REVOKED, timestamp, REVOCATION_OP);
+
+        let decisions: Vec<_> = batched
+            .consumer_group_pending_revocations()
+            .iter()
+            .map(|transition| {
+                (
+                    transition.partition_id,
+                    transition.installation.owner.client_id,
+                    transition.installation.metadata_op,
+                )
+            })
+            .collect();
+        assert_eq!(
+            decisions,
+            [(0, SURVIVOR, REVOCATION_OP), (2, SURVIVOR, REVOCATION_OP)]
+        );
+        assert_eq!(observe(&batched), observe(&sequential));
+        for streams in [&sequential, &batched] {
+            // The next publish exposes the copy that replayed the removals.
+            streams.remove_consumer_group_member(ABSENT, timestamp, REVOCATION_OP + 1);
+        }
+        assert_eq!(observe(&batched), observe(&sequential));
+    }
+
+    #[test]
     fn given_session_refresh_when_rebalancing_should_index_revocations_like_full_rebuild() {
         const CLIENT: u128 = 7;
         const OTHER: u128 = 8;
@@ -1324,6 +1584,49 @@ mod tests {
             };
             assert_eq!(reply.code, 0);
             assert!(state.consumer_group_members.is_empty());
+        }
+    }
+
+    #[test]
+    fn given_recreated_group_when_same_session_rejoins_should_mint_generations_above_the_deleted_group()
+     {
+        const CLIENT: u128 = 7;
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, CLIENT).code, 0);
+        let deleted_owners = complete_pending_revocations(&mut state);
+        assert_eq!(deleted_owners.len(), 1, "the topic has one partition");
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &DeleteConsumerGroupRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    group_id: WireIdentifier::numeric(0),
+                },
+                &mut state,
+                IggyTimestamp::now(),
+            )
+            .code,
+            0
+        );
+        // Bounds every generation the deleted group minted, its fences included.
+        let deleted_through = state.apply_context.metadata_op;
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 1, CLIENT).code, 0);
+
+        let recreated: Vec<_> = state
+            .pending_revocations
+            .values()
+            .map(|transition| transition.installation.owner)
+            .collect();
+        assert_eq!(recreated.len(), deleted_owners.len());
+        for (deleted, recreated) in deleted_owners.iter().zip(&recreated) {
+            assert_eq!(
+                (recreated.client_id, recreated.session),
+                (deleted.client_id, deleted.session)
+            );
+            assert!(recreated.generation > deleted_through);
+            assert_ne!(recreated, deleted, "a deleted group's owner must not match");
         }
     }
 
@@ -1606,9 +1909,11 @@ mod tests {
         )
     }
 
-    fn complete_pending_revocations(state: &mut StreamsInner) {
+    /// Installs every pending owner, one op each, and returns the installed owners.
+    fn complete_pending_revocations(state: &mut StreamsInner) -> Vec<ConsumerGroupOwner> {
         let transitions: Vec<_> = state.pending_revocations.values().copied().collect();
-        for transition in transitions {
+        for transition in &transitions {
+            state.apply_context.metadata_op += 1;
             let completion = CompleteConsumerGroupRevocationRequest {
                 stream_id: WireIdentifier::numeric(transition.stream_id),
                 topic_id: WireIdentifier::numeric(transition.topic_id),
@@ -1622,6 +1927,10 @@ mod tests {
             );
         }
         assert!(state.pending_revocations.is_empty());
+        transitions
+            .iter()
+            .map(|transition| transition.installation.owner)
+            .collect()
     }
 
     #[test]
@@ -1638,8 +1947,9 @@ mod tests {
     }
 
     /// A full topic costs hundreds of megabytes to materialise, so this pins
-    /// the guard to the catalog bound instead: the largest admitted topic must
-    /// still fit one retirement catalog.
+    /// the guard to the catalog bound instead: the live ids of the largest
+    /// admitted topic must still fit one retirement catalog. A partition adds
+    /// its kept ids to them, which this bound does not cover.
     #[test]
     fn given_the_owner_catalog_bound_when_creating_one_more_group_should_reject() {
         let largest = CONSUMER_GROUP_OWNERS_MAX as usize;

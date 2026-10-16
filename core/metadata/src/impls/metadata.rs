@@ -899,17 +899,22 @@ fn apply_user_revocation<M: StreamsFrontend>(
     }
     // A transferred table may already contain this end marker while the
     // streams snapshot still needs the matching membership release.
-    let table = client_table.borrow();
-    for identity in table.ended_sessions().filter(|identity| {
-        identity.metadata_watermark == header.op
-            && table.get_user_id(identity.client_id) == Some(user_id)
-    }) {
-        mux_stm.streams().remove_consumer_group_member(
-            identity.client_id,
-            iggy_common::IggyTimestamp::from(header.timestamp),
-            header.op,
-        );
-    }
+    let client_ids: Vec<u128> = {
+        let table = client_table.borrow();
+        table
+            .ended_sessions()
+            .filter(|identity| {
+                identity.metadata_watermark == header.op
+                    && table.get_user_id(identity.client_id) == Some(user_id)
+            })
+            .map(|identity| identity.client_id)
+            .collect()
+    };
+    mux_stm.streams().remove_consumer_group_members(
+        &client_ids,
+        iggy_common::IggyTimestamp::from(header.timestamp),
+        header.op,
+    );
 }
 
 /// Late-bound callback invoked after every committed op on shard 0's metadata
@@ -2852,9 +2857,11 @@ where
     }
 
     /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
-    /// metadata consensus group (shard 0). The partition reconciler calls this
-    /// to complete a cooperative revocation once the source has drained the
-    /// partition (or it timed out).
+    /// metadata consensus group (shard 0). A partition reconciler, on this node
+    /// or on a relaying backup, asks for this to complete a cooperative
+    /// revocation once the source has drained the partition (or it timed out).
+    /// `namespace` is the partition that `request` completes, and keys its
+    /// internal client.
     ///
     /// Unlike a client op there is no session: a reserved internal client id
     /// (never coordinator-minted) carries it, `request_preflight` is skipped
@@ -2874,27 +2881,12 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn submit_complete_revocation_in_process(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
-        installation: iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest,
-        partition_op: u64,
+        request: CompleteConsumerGroupRevocationRequest,
+        namespace: server_common::sharding::IggyNamespace,
     ) -> Result<u64, MetadataSubmitError> {
-        let request = CompleteConsumerGroupRevocationRequest {
-            stream_id: WireIdentifier::numeric(stream_id),
-            topic_id: WireIdentifier::numeric(topic_id),
-            partition_id,
-            installation,
-            partition_op,
-        };
         self.submit_partition_completion(
             Operation::CompleteConsumerGroupRevocation,
-            server_common::sharding::IggyNamespace::new(
-                stream_id as usize,
-                topic_id as usize,
-                partition_id as usize,
-            )
-            .inner(),
+            namespace.inner(),
             &request.to_bytes(),
         )
         .await
@@ -2937,7 +2929,7 @@ where
     ) -> Result<Message<ReplyHeader>, MetadataSubmitError> {
         // One internal client per key serializes the completions of that key.
         const INTERNAL_REQUEST_ID: u64 = u64::MAX;
-        let internal_client_id = (u128::from(u64::MAX) << 64) | u128::from(internal_client);
+        let internal_client_id = message_bus::server_internal_client_id(internal_client);
         let consensus = self
             .consensus
             .as_ref()
@@ -3107,20 +3099,22 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-        // Not-primary is transient: the same request replayed against the
-        // current primary commits fine. Reply with the explicit transient
-        // frame (relayed to the socket by the home shard) so the client
-        // replays immediately rather than waiting out its read-timeout.
-        // `TransientNotAccepted` specifically: the request never entered the
-        // pipeline here, so the client may re-issue it ANYWHERE -- including
-        // under a fresh session after failing over to the current leader --
-        // without double-apply risk. (`TransientNotCommitted` conversely means
-        // the outcome is unknown and only a same-session replay is safe.)
+        // Reply before admission so the client can retry without a read timeout.
+        // This refusal covers only this attempt; earlier copies may still commit.
+        // Retrying with their session and request id preserves deduplication.
         //
         // No catch-up gate: a non-register op admitted mid-commit-window
         // simply pipelines behind the in-flight batch (the wire path has
         // always done this); the register-specific invariant is guarded in
         // `submit_register_in_process` / `register_preflight`.
+        if consensus.is_normal_backup() {
+            return Ok(build_result_rejection_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::NotPrimary.as_code(),
+            )
+            .into_generic());
+        }
         if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
@@ -3168,9 +3162,8 @@ where
         // Prepare queue full: backpressure, not failure. Absorb into the
         // request queue with this caller's reply subscriber; the commit
         // path promotes it as slots free up and the await below resolves
-        // with the committed reply. Only a full request queue is terminal
-        // (`TransientNotAccepted`, re-issuable anywhere: the request never
-        // entered a queue).
+        // with the committed reply. A full request queue refuses this attempt
+        // before admission, without settling the outcome of earlier copies.
         if consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(message);
             if consensus.push_queued_request(entry).is_err() {
@@ -3501,7 +3494,7 @@ where
             // a send to the reserved id only fails with a false error.
             if !had_in_process_subscriber
                 && prepare_header.client != RESERVED_CLIENT_ID
-                && !message_bus::is_auto_commit_client(prepare_header.client)
+                && !message_bus::is_server_internal_client(prepare_header.client)
             {
                 wire_replies.push((event, reply));
             }
@@ -4231,6 +4224,9 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn commit_journal(&self) {
         let consensus = self.consensus.as_ref().unwrap();
+        if consensus.view_log_unproven() {
+            return;
+        }
         let journal = self.journal.as_ref().unwrap();
 
         let mut applied = 0usize;
@@ -4755,6 +4751,7 @@ mod tests {
     use crate::stm::StateHandler;
     use crate::stm::authz::GatedApply;
     use crate::stm::consumer_group::JoinConsumerGroupRequest;
+    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{Users, UsersInner};
     use consensus::LocalPipeline;
@@ -4775,6 +4772,9 @@ mod tests {
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn given_cancelled_snapshot_writer_when_replaced_should_keep_the_new_snapshot() {
@@ -5527,8 +5527,7 @@ mod tests {
     /// delete without its in-process sender. Committing it must not send a
     /// reply to the reserved client id, which no connection owns.
     #[compio::test]
-    async fn given_repipelined_server_originated_delete_when_committed_should_send_no_client_reply()
-    {
+    async fn given_repipelined_server_operations_when_committed_should_send_no_client_reply() {
         const USER: u32 = 7;
         const TOKEN: &str = "expired";
 
@@ -5590,6 +5589,40 @@ mod tests {
         assert!(
             consensus.message_bus().client_sends.borrow().is_empty(),
             "no connection owns the reserved client id, so nothing may be sent to it"
+        );
+
+        let body = CompleteLifecycleRequest::new(
+            1,
+            1,
+            vec![LifecycleCompletion {
+                topic_id: 1,
+                partition_id: 0,
+                partition_op: 1,
+            }],
+        )
+        .unwrap()
+        .to_bytes();
+        let header = RoutedRequestHeader {
+            client: message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+            ..header
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &header, Operation::CompleteLifecycle, &body),
+            consensus.retry_capacity(&md.client_table.borrow()),
+        );
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .unwrap()
+            .try_into_typed::<PrepareOkHeader>()
+            .unwrap();
+        md.on_ack(ack).await;
+        assert_eq!(consensus.commit_min(), 2, "the completion must commit");
+        assert!(
+            consensus.message_bus().client_sends.borrow().is_empty(),
+            "a completion without its in-process sender must never send a wire reply"
         );
     }
 
@@ -5727,6 +5760,64 @@ mod tests {
             Some(IggyError::PartitionsLimitReached.as_code()),
             "a new create past the cap must be denied"
         );
+    }
+
+    /// A normal backup names the primary of its view as the place to retry,
+    /// and a backup in transfer cannot. Neither admits the mutation.
+    #[compio::test]
+    async fn given_backup_when_mutation_is_submitted_should_refuse_by_role() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = TOPIC_MANAGER;
+        const BACKUP_REPLICA: u8 = 1;
+        const REPLICA_COUNT: u8 = 3;
+        for (transferring, expected) in [
+            (false, IggyError::NotPrimary),
+            (true, IggyError::TransientNotAccepted),
+        ] {
+            let consensus = VsrConsensus::new(
+                1,
+                BACKUP_REPLICA,
+                REPLICA_COUNT,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            if transferring {
+                consensus.begin_state_transfer_await();
+            }
+            let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+                Some(consensus),
+                None,
+                None,
+                None,
+                TestMux::new((
+                    users_with_topic_manager(),
+                    (stream_with_one_partition().into(), ()),
+                )),
+                None,
+            );
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, 1))
+                .unwrap();
+
+            let reply = metadata
+                .submit_request_in_process(create_topic_request(CLIENT, USER))
+                .await
+                .expect("a refusal is a reply, not a submit error");
+            assert_eq!(
+                iggy_binary_protocol::result_code(&reply.as_slice()[size_of::<ReplyHeader>()..]),
+                Some(expected.as_code()),
+                "transferring {transferring}"
+            );
+            assert_eq!(
+                metadata.consensus.as_ref().unwrap().pipeline_len(),
+                0,
+                "a backup must not prepare the mutation"
+            );
+        }
     }
 
     #[test]
@@ -7416,6 +7507,92 @@ mod tests {
         }
     }
 
+    /// All owner decisions of one revocation share its op as generation, and a
+    /// reconciler on another shard installs what it reads. A reader that holds
+    /// a guard across the revocation stalls any second publish, so a racing
+    /// reader would then see one removal alone.
+    #[compio::test]
+    async fn given_two_sessions_of_one_user_when_revoked_should_publish_both_removals_at_once() {
+        const FIRST: u128 = 1;
+        const SECOND: u128 = 2;
+        const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+        let (_directory, metadata) = metadata_with_group_member(FIRST).await;
+        join_group_member(&metadata, SECOND).await;
+        let header = PrepareHeader {
+            op: metadata.consensus.as_ref().unwrap().commit_min() + 1,
+            operation: Operation::DeleteUser,
+            ..Default::default()
+        };
+        let factory = metadata.mux_stm.streams().factory();
+        // One guard for both members: two reads could straddle a publish.
+        let memberships = |streams: &Streams| {
+            streams.read(|inner| {
+                [FIRST, SECOND].map(|client_id| {
+                    inner
+                        .items
+                        .iter()
+                        .flat_map(|(_, stream)| stream.topics.iter())
+                        .flat_map(|(_, topic)| topic.consumer_groups.values())
+                        .filter(|group| {
+                            group
+                                .members
+                                .iter()
+                                .any(|(_, member)| member.client_id == client_id)
+                        })
+                        .count()
+                })
+            })
+        };
+        let (held_sender, held_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+
+        let seen = thread::scope(|scope| {
+            let holder_factory = factory.clone();
+            let holder = scope.spawn(move || {
+                Streams::from_factory(holder_factory)
+                    .read(|_| {
+                        held_sender.send(()).unwrap();
+                        release_receiver.recv()
+                    })
+                    .unwrap();
+            });
+            held_receiver.recv().unwrap();
+            let observer = scope.spawn(move || {
+                let streams = Streams::from_factory(factory);
+                let deadline = Instant::now() + PUBLISH_TIMEOUT;
+                let seen = loop {
+                    let seen = memberships(&streams);
+                    if seen != [1, 1] {
+                        break seen;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the revocation never reached readers"
+                    );
+                    thread::yield_now();
+                };
+                release_sender.send(()).unwrap();
+                seen
+            });
+            apply_user_revocation(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                GROUP_MEMBER_USER,
+                &header,
+            );
+            let seen = observer.join().unwrap();
+            holder.join().unwrap();
+            seen
+        });
+
+        assert_eq!(
+            seen,
+            [0, 0],
+            "a reader saw one member removal of the revocation without the other"
+        );
+    }
+
     #[test]
     fn given_rejected_or_older_user_deletion_when_applying_should_preserve_newer_sessions() {
         const CLIENT: u128 = 1;
@@ -7488,6 +7665,9 @@ mod tests {
         }
     }
 
+    /// The user of every session that [`join_group_member`] registers.
+    const GROUP_MEMBER_USER: u32 = 7;
+
     #[allow(clippy::future_not_send)]
     async fn metadata_with_group_member(
         client_id: u128,
@@ -7495,7 +7675,6 @@ mod tests {
         tempfile::TempDir,
         IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
     ) {
-        const USER: u32 = 7;
         let mut inner = StreamsInner::new();
         let timestamp = IggyTimestamp::now();
         let _ = StateHandler::apply(
@@ -7541,11 +7720,22 @@ mod tests {
                 .unwrap(),
         );
         metadata.mux_stm = Rc::new(TestMux::new((Users::default(), (inner.into(), ()))));
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        join_group_member(&metadata, client_id).await;
+        (dir, metadata)
+    }
+
+    /// Registers `client_id` as a session of `GROUP_MEMBER_USER` and commits
+    /// its join to the group of [`metadata_with_group_member`].
+    #[allow(clippy::future_not_send)]
+    async fn join_group_member(
+        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+        client_id: u128,
+    ) {
         metadata
-            .submit_register_in_process(client_id, USER, [0x5a; 32])
+            .submit_register_in_process(client_id, GROUP_MEMBER_USER, [0x5a; 32])
             .await
             .unwrap();
-        metadata.mux_stm.users().ensure_root_user("root", "hash");
         let consensus = metadata.consensus.as_ref().unwrap();
         let join = consensus::seal_prepare_capacity(
             build_prepare_message(
@@ -7584,7 +7774,6 @@ mod tests {
                 .len(),
             1
         );
-        (dir, metadata)
     }
 
     /// Register is the one op that still honors the catch-up gate (its

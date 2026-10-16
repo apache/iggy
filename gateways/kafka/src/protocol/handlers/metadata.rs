@@ -27,9 +27,9 @@ use kafka_protocol::protocol::{Encodable, StrBytes};
 use crate::bridge::IggyBridge;
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{
-    API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ERROR_NONE, ERROR_REQUEST_TIMED_OUT,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome, REQUEST_DEADLINE,
-    is_supported_version, supported_max_version,
+    API_KEY_METADATA, ApiVersionRange, BrokerAdvertise, ConnectionState, ERROR_NONE,
+    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, HandleOutcome,
+    REQUEST_DEADLINE, is_supported_version, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_metadata_shape;
 use crate::protocol::dedup::dedup_first_seen;
@@ -47,7 +47,12 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// threshold - tune with a real benchmark if it proves too high or too low in practice.
 const BLOCKING_ENCODE_PARTITION_THRESHOLD: u32 = 20_000;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_METADATA, api_version) {
         // Clamping the response to the supported max leaves a body the client parses at its own
         // (unsupported) version, so UNSUPPORTED_VERSION never survives. Clients that skip
@@ -63,7 +68,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     let Some(bridge) = &state.bridge else {
         return match decode_topics(api_version, body, state.max_frame_size) {
             Ok(topics) => respond_or_close(
-                encode_response(api_version, &topics, &state.broker, ERROR_NONE),
+                encode_response(api_version, &topics, &connection.broker, ERROR_NONE),
                 "Metadata",
             ),
             Err(error) => {
@@ -161,7 +166,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         // this shard for the duration. `spawn_blocking` moves that cost off the shard's own task
         // so ordinary requests keep their latency regardless of how large one all-topics response
         // gets.
-        let broker = state.broker.clone();
+        let broker = connection.broker.clone();
         tokio::task::spawn_blocking(move || encode_real_response(api_version, &results, &broker))
             .await
             .unwrap_or_else(|join_error| {
@@ -169,7 +174,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
                 Err(KafkaProtocolError::Malformed(join_error.to_string()))
             })
     } else {
-        encode_real_response(api_version, &results, &state.broker)
+        encode_real_response(api_version, &results, &connection.broker)
     };
     respond_or_close(encoded, "Metadata")
 }

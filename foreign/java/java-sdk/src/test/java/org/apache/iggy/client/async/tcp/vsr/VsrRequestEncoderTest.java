@@ -84,7 +84,7 @@ class VsrRequestEncoderTest {
     }
 
     @Test
-    void shouldKeepPreAuthClusterMetadataSessionlessWithoutAdvancingRequestId() {
+    void shouldKeepPreAuthClusterMetadataSessionlessWithAUniqueRequestId() {
         ByteBuf frame = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(frame.getUnsignedByte(VsrHeaders.REQUEST_OPERATION_OFFSET))
@@ -92,7 +92,7 @@ class VsrRequestEncoderTest {
             assertThat(frame.getIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET)).isEqualTo(GET_CLUSTER_METADATA_CODE);
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isZero();
-            assertThat(session.currentRequestId()).isEqualTo(1);
+            assertThat(session.currentRequestId()).isEqualTo(2);
         } finally {
             frame.release();
         }
@@ -218,13 +218,42 @@ class VsrRequestEncoderTest {
     @Test
     void shouldKeepUnsignedSharedEpochInEncodedRequest() {
         byte[] secret = session.bindSecret();
-        session.bindShared(new ConsensusSession(), 1, 2, Long.MIN_VALUE, secret);
+        ConsensusSession parent = new ConsensusSession();
+        parent.bind(Long.MIN_VALUE);
+        session.bindShared(parent, 1, 2, Long.MIN_VALUE, secret);
         ByteBuf frame = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(Long.MIN_VALUE);
             assertThat(session.bindSecret(1, 2, Long.MIN_VALUE)).isEqualTo(secret);
         } finally {
             frame.release();
+        }
+    }
+
+    @Test
+    void shouldShareOneCounterAcrossCoordinatorReadsBindsAndPrimaryWrites() {
+        session.bind(7);
+        ConsensusSession shared = new ConsensusSession();
+        shared.bindShared(session, session.clientIdLow(), session.clientIdHigh(), 7, session.bindSecret());
+        VsrRequestEncoder primary = new VsrRequestEncoder(shared);
+        ByteBuf read = encoder.encode(alloc, GET_CLUSTER_METADATA_CODE, Unpooled.EMPTY_BUFFER);
+        ByteBuf bind = primary.encode(alloc, 20, Unpooled.EMPTY_BUFFER);
+        ByteBuf payload = sendMessagesPayload(2, 3, 4);
+        ByteBuf write = primary.encode(alloc, SEND_MESSAGES_CODE, payload);
+        ByteBuf nextRead = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
+        try {
+            assertThat(read.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(1);
+            assertThat(bind.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(2);
+            assertThat(write.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(3);
+            assertThat(nextRead.getLongLE(VsrHeaders.REQUEST_ID_OFFSET)).isEqualTo(4);
+            assertThat(write.getLongLE(VsrHeaders.REQUEST_CLIENT_OFFSET)).isEqualTo(session.clientIdLow());
+            assertThat(write.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(7);
+        } finally {
+            read.release();
+            bind.release();
+            write.release();
+            nextRead.release();
+            payload.release();
         }
     }
 

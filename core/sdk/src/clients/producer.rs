@@ -1147,18 +1147,22 @@ mod tests {
                 if request.operation == Operation::NonReplicated {
                     assert_eq!(
                         u32::from_le_bytes(request.reserved),
-                        iggy_binary_protocol::codes::GET_SEND_CONTEXT_CODE
+                        iggy_binary_protocol::codes::GET_PARTITION_ROUTE_CODE
                     );
                     let response =
-                        iggy_binary_protocol::primitives::partition_history::PartitionContext {
+                        iggy_binary_protocol::responses::messages::PartitionRouteResponse {
                             incarnation: 7,
-                            owner_generation: 0,
                             metadata_op: 11,
+                            view: 0,
+                            partitions_count: 1,
+                            primary_replica: 0,
                         };
                     let body = iggy_binary_protocol::WireEncode::to_bytes(&response);
                     let reply = ReplyHeader {
                         command: Command::Reply,
                         operation: request.operation,
+                        client: request.client,
+                        request: request.request,
                         size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
                         ..Default::default()
                     };

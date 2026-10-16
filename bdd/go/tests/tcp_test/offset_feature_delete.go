@@ -159,7 +159,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 				randomU32Identifier(),
 				randomU32Identifier(),
 				&partitionId)
-			itShouldReturnSpecificError(err, ierror.ErrResourceNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 	})
 
