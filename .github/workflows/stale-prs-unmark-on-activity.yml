@@ -15,8 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Removes the S-stale label on PR comments and review submissions, via
-# the workflow_run handoff from pr-triage-collect.yml.
+# Removes the S-stale label on PR comments, review submissions, and
+# contributor push / reopen / ready_for_review, via the workflow_run handoff
+# from pr-triage-collect.yml. Companion to stale-prs.yml, which runs with
+# remove-stale-when-updated:false so the stale bot does not unmark its own
+# label on the next cron run.
 #
 # Why workflow_run instead of issue_comment / pull_request_review here:
 # those events deliver a read-only GITHUB_TOKEN on cross-fork PRs
@@ -26,14 +29,22 @@
 # token; this workflow runs against base ref via workflow_run, where the
 # GITHUB_TOKEN has write perms, and removes the label.
 #
-# Push-driven unmark stays in stale-prs-unmark.yml because
-# pull_request_target.synchronize gets a write token directly.
+# Push-driven unmark used to live in stale-prs-unmark.yml on
+# pull_request_target, which ASF Infra bars on workflows that hold a token
+# and disables for ASF repositories from November 2026
+# (https://infra.apache.org/github-actions-policy.html). It now arrives here
+# as a pull_request event through the same collector. pull_request workflows
+# do not run while a PR has a merge conflict, so pr-triage-reconcile.yml
+# clears S-stale on a schedule for pushes the collector never saw.
 #
 # SECURITY: no actions/checkout, no exec of PR contents. The artifact is
-# not trusted for identity: on the pull_request_review path collect runs the
-# PR head's own copy, so a fork can forge the payload. Only a numeric id is
-# read from it, the PR number is resolved from the API, and the commit the
-# collect run fired on must belong to that PR.
+# not trusted for identity: on the pull_request_review and pull_request
+# paths collect runs the PR head's own copy, so a fork can forge the
+# payload. Only a numeric id is read from it and the PR number is resolved
+# from the API. On the pull_request path the claimed PR's head must be the
+# repository and branch GitHub recorded for the collect run; on the
+# pull_request_review path the review must belong to the claimed PR and be
+# as new as the run.
 
 name: Unmark Stale PRs on Activity
 
@@ -50,8 +61,9 @@ permissions:
   actions: read
 
 concurrency:
-  # workflow_run cannot key on PR number until after artifact parse, so it
-  # falls back to the upstream run id. Same constraint as pr-triage-apply.
+  # Keyed on the upstream run id, so same-PR runs do not serialise.
+  # pr-triage-apply.yml re-keys per PR in a second job; this workflow is a
+  # single idempotent label removal and does not need to.
   group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
@@ -73,20 +85,34 @@ jobs:
         id: resolve
         env:
           UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_CREATED: ${{ github.event.workflow_run.created_at }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # collect runs the PR head's own copy on the pull_request_review
-          # path, so a fork can upload any payload. Take only a numeric id from
-          # the artifact and resolve the PR number from the API, so a forged
-          # value can neither reach a process env var nor point this at another
-          # PR. UPSTREAM_EVENT is set by GitHub from the collect run, not from
-          # the artifact, and issue_comment workflows only run from the default
-          # branch, so a fork's run always arrives as pull_request_review and
-          # takes the checked path.
+          # collect runs the PR head's own copy on the pull_request_review and
+          # pull_request paths, so a fork can upload any payload. Take only a
+          # numeric id from the artifact and resolve the PR number from the
+          # API, so a forged value can neither reach a process env var nor
+          # point this at another PR. UPSTREAM_EVENT is set by GitHub from the
+          # collect run, not from the artifact, and issue_comment workflows
+          # only run from the default branch, so a fork's run always arrives
+          # as pull_request_review or pull_request and takes a checked path.
+          #
+          # HEAD_REPO and HEAD_BRANCH are also set by GitHub. On a
+          # pull_request run they are the fork and branch the run fired on,
+          # and requiring them to be the claimed PR's head confines a forged
+          # payload to the fork's own PR. That identity survives a
+          # force-push, unlike the commit the run fired on, and does not
+          # depend on the commits endpoint, which stops at 250 commits. On a
+          # pull_request_review run GitHub records the base repository as
+          # head_repository and the branch name is the fork's to choose, so
+          # the review path instead requires the review to be on the claimed
+          # PR and as new as the run: the worst a forged run can then do is
+          # clear S-stale on a PR whose fresh review already cleared it.
           payload=( payload/*.json payload/event.json )
           f=""
           for candidate in "${payload[@]}"; do
@@ -128,6 +154,19 @@ jobs:
             if [[ "$code" == 404 ]]; then return 44; fi
             return 1
           }
+          # .head.repo is null once a fork is deleted, which fails the
+          # comparison, as it should.
+          require_head() {
+            local cpr="$1" p head_repo head_ref
+            p="$(gh_api "repos/${REPO}/pulls/${cpr}")"
+            head_repo="$(jq -r '.head.repo.full_name // ""' <<<"$p")"
+            head_ref="$(jq -r '.head.ref // ""' <<<"$p")"
+            if [[ -z "$HEAD_REPO" || -z "$HEAD_BRANCH" \
+                  || "$head_repo" != "$HEAD_REPO" || "$head_ref" != "$HEAD_BRANCH" ]]; then
+              echo "collect ran on ${HEAD_REPO}:${HEAD_BRANCH}, which is not the head of PR ${cpr} (${head_repo}:${head_ref})" >&2
+              exit 1
+            fi
+          }
           case "$UPSTREAM_EVENT" in
             issue_comment)
               cid="$(jq -r '.comment.id // ""' "$f")"
@@ -141,17 +180,39 @@ jobs:
               require_num "$rid" review_id
               require_num "$cpr" pr_number
               # A review id that does not belong to the claimed PR 404s here.
-              gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}" >/dev/null
-              # HEAD_SHA is set by GitHub, not the fork. A forged run fires on
-              # the fork's own commit, which is in no other PR's commit list,
-              # so a real review cannot be replayed onto another PR. The
-              # review's commit_id is not compared: GitHub moves it when the
-              # branch is updated.
-              shas="$(gh_api --paginate "repos/${REPO}/pulls/${cpr}/commits" --jq '.[].sha')"
-              if ! grep -qxF "$HEAD_SHA" <<<"$shas"; then
-                echo "collect ran on ${HEAD_SHA}, which is not a commit of PR ${cpr}" >&2
+              r="$(gh_api "repos/${REPO}/pulls/${cpr}/reviews/${rid}")"
+              # RUN_CREATED is set by GitHub, and a real run is created
+              # seconds after its review is submitted, so an old review
+              # cannot be replayed. Same window as pr-triage-apply.yml.
+              sub="$(jq -r '.submitted_at // ""' <<<"$r")"
+              if [[ -z "$sub" ]]; then
+                echo "review ${rid} has no submitted_at" >&2
                 exit 1
               fi
+              age=$(( $(date -u -d "$RUN_CREATED" +%s) - $(date -u -d "$sub" +%s) ))
+              if (( age < -60 || age > 300 )); then
+                echo "review ${rid} was submitted at ${sub} and the collect run created at ${RUN_CREATED}, outside the allowed window" >&2
+                exit 1
+              fi
+              pr="$cpr"
+              ;;
+            pull_request)
+              # The action comes from the artifact, which a fork can forge. It
+              # only decides whether to look further, and the worst a forged
+              # one can do is clear S-stale on the fork's own PR, which a push
+              # does anyway.
+              action="$(jq -r '.action // ""' "$f")"
+              case "$action" in
+                synchronize|reopened|ready_for_review) ;;
+                *)
+                  echo "pull_request action '${action}' does not unmark, skipping"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+              cpr="$(jq -r '.pull_request.number // ""' "$f")"
+              require_num "$cpr" pr_number
+              require_head "$cpr"
               pr="$cpr"
               ;;
             *)
@@ -166,6 +227,7 @@ jobs:
           echo "pr_number=$pr" >> "$GITHUB_OUTPUT"
 
       - name: Remove stale label if present
+        if: steps.resolve.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.resolve.outputs.pr_number }}
