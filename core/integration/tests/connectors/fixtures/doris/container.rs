@@ -82,8 +82,8 @@ const DEFAULT_BE_REGISTRATION_ATTEMPTS: usize = 180;
 const DEFAULT_BE_REGISTRATION_INTERVAL_MS: u64 = 2000;
 
 // 90 seconds (180 × 500ms) — bulk tests with 1000 rows can take ~30 s on a
-// fresh container, and a Doris instance under memory pressure (e.g. when it
-// is the 3rd or 4th container to spin up serially) takes longer.
+// fresh container, and a Doris instance under memory pressure (e.g. while
+// other tests load the same shared container in parallel) takes longer.
 pub const DEFAULT_POLL_ATTEMPTS: usize = 180;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 
@@ -184,7 +184,7 @@ fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
         .unwrap_or(0);
     if v < REQUIRED_VM_MAX_MAP_COUNT {
         return Err(TestBinaryError::FixtureSetup {
-            fixture_type: "SharedDoris".to_string(),
+            fixture_type: "DorisContainer".to_string(),
             message: format!(
                 "Doris 4.0.3 BE refuses to start unless vm.max_map_count >= \
                  {REQUIRED_VM_MAX_MAP_COUNT} (current: {v}). \
@@ -206,6 +206,9 @@ fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
 /// rather than about how long Doris takes to boot.
 const CONTAINER_START_ATTEMPTS: u32 = 30;
 const CONTAINER_START_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Bounds the creating test's FE health wait. Attaching skips testcontainers'
+/// wait. Same headroom over the 60s default as the Elasticsearch fixture.
+const CONTAINER_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Creates the shared Doris container, or attaches to it if another test won
 /// the race.
@@ -244,6 +247,7 @@ async fn start_shared_container(
                     .with_port(FE_HTTP_PORT.tcp())
                     .with_expected_status_code(200u16),
             ))
+            .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
             .with_env_var("SKIP_CHECK_ULIMIT", "true")
             .with_cmd(["-c", entrypoint_cmd])
             .with_mapped_port(0, FE_HTTP_PORT.tcp())
