@@ -114,7 +114,7 @@ The collation decides uniqueness too. The default `utf8mb4_0900_ai_ci` is case- 
 
 The connector cannot tell a safe column from an unsafe one without reading the data, so it warns at startup for every `CHAR`, `VARCHAR` or `TEXT` tracking column, naming the table, the column and its type. Temporal columns are compared as text too but are not warned about: their rendering is fixed-width, so their text order is their chronological order whatever the collation is.
 
-The warning is only raised for a column the connector can find in `information_schema`. A `custom_query` projecting a computed or aliased tracking column has no such row, so its comparison order is settled from the first result set at poll time and no startup warning is possible.
+The warning is only raised for a column the connector can find in `information_schema`. A `custom_query` projecting a computed or aliased tracking column has no such row, so its comparison order is settled from the first result set at poll time and no startup warning is possible. Such a column cannot be combined with `delete_after_read` or `processed_column` (see [Delete After Read / Mark as Processed](#delete-after-read--mark-as-processed)).
 
 ## Output Modes
 
@@ -423,6 +423,13 @@ read from it, and is disabled until restart if the check fails, with nothing
 published or deleted. A composite index does not count. `primary_key_column`
 defaults to `tracking_column`, so set it explicitly when the tracking column is
 not unique.
+
+Mark/delete only touches rows up to the batch's highest tracking value, so a row
+that reuses a delivered key (for example via `REPLACE INTO`) is never deleted or
+marked before it is read. For this, `tracking_column` must be a real column of
+the table: a computed or aliased tracking column is rejected when either option
+is set. Do not alias a different expression to a column's own name (such as
+`created_at AS seq`), since the connector cannot detect it.
 
 When `processed_column` is set, the connector adds a `WHERE is_processed = FALSE` filter to **the query it builds itself**, so only unprocessed rows are fetched. It cannot do that for a `custom_query`, which it substitutes as text without parsing: there, marking rows is all it does, and the query has to exclude them itself.
 

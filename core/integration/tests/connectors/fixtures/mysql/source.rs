@@ -661,6 +661,253 @@ impl TestFixture for MySqlSourceNonUniqueKeyDeleteFixture {
     }
 }
 
+/// MySQL source fixture that deletes by a natural key while tracking an auto-increment.
+///
+/// `sku` is the primary key and `seq` the tracking column, so a `REPLACE` keeps the
+/// key but gives the row a new tracking value. A trigger can block deletes, which
+/// keeps a delivered batch's cleanup pending in the saved state across a restart.
+/// `QUEUE_QUERY` swaps the built query for a `custom_query` with no `$offset`, where
+/// deleting the rows is the only thing that moves the poll forward.
+pub struct MySqlSourceReusedKeyFixture<const QUEUE_QUERY: bool> {
+    container: MySqlContainer,
+}
+
+pub type MySqlSourceReusedKeyDeleteFixture = MySqlSourceReusedKeyFixture<false>;
+pub type MySqlSourceReusedKeyQueueFixture = MySqlSourceReusedKeyFixture<true>;
+
+impl<const QUEUE_QUERY: bool> MySqlOps for MySqlSourceReusedKeyFixture<QUEUE_QUERY> {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl<const QUEUE_QUERY: bool> MySqlSourceOps for MySqlSourceReusedKeyFixture<QUEUE_QUERY> {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl<const QUEUE_QUERY: bool> MySqlSourceReusedKeyFixture<QUEUE_QUERY> {
+    const TABLE: &'static str = "test_reused_key_delete";
+    const TRIGGER: &'static str = "test_reused_key_block_delete";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                sku VARCHAR(32) NOT NULL PRIMARY KEY,
+                seq BIGINT NOT NULL AUTO_INCREMENT UNIQUE,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    /// One statement, so a poll cannot catch only some of the rows.
+    pub async fn replace_rows(&self, pool: &Pool<MySql>, rows: &[(&str, &str)]) {
+        let values = vec!["(?, ?)"; rows.len()].join(", ");
+        let query = format!("REPLACE INTO `{}` (sku, name) VALUES {values}", Self::TABLE);
+        let mut statement = sqlx::query(sqlx::AssertSqlSafe(query));
+        for (sku, name) in rows {
+            statement = statement.bind(*sku).bind(*name);
+        }
+        statement
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to replace rows: {e}"));
+    }
+
+    pub async fn has_row(&self, pool: &Pool<MySql>, sku: &str) -> bool {
+        let query = format!("SELECT COUNT(*) FROM `{}` WHERE sku = ?", Self::TABLE);
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
+            .bind(sku)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
+        count.0 > 0
+    }
+
+    // CREATE TRIGGER is not allowed through PREPARE, so these go over the text protocol.
+    pub async fn block_deletes(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TRIGGER `{}` BEFORE DELETE ON `{}` FOR EACH ROW \
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'delete blocked by test'",
+            Self::TRIGGER,
+            Self::TABLE
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create trigger: {e}"));
+    }
+
+    pub async fn allow_deletes(&self, pool: &Pool<MySql>) {
+        let query = format!("DROP TRIGGER `{}`", Self::TRIGGER);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to drop trigger: {e}"));
+    }
+}
+
+#[async_trait]
+impl<const QUEUE_QUERY: bool> TestFixture for MySqlSourceReusedKeyFixture<QUEUE_QUERY> {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "seq".to_string());
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "sku".to_string());
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
+        if QUEUE_QUERY {
+            envs.insert(
+                ENV_SOURCE_CUSTOM_QUERY.to_string(),
+                "SELECT * FROM $table ORDER BY seq LIMIT $limit".to_string(),
+            );
+        }
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose `custom_query` computes the tracking column while
+/// `delete_after_read` is set.
+///
+/// The cleanup bounds the rows it deletes by the tracking column, which a computed
+/// column cannot back. `TABLE_AT_STARTUP` decides which check sees it: `open()` when
+/// the table already exists, or the first poll that stages a cleanup when it does not.
+pub struct MySqlSourceComputedTrackingDeleteFixture<const TABLE_AT_STARTUP: bool> {
+    container: MySqlContainer,
+}
+
+pub type MySqlSourceComputedTrackingDeleteAtStartupFixture =
+    MySqlSourceComputedTrackingDeleteFixture<true>;
+pub type MySqlSourceComputedTrackingDeleteAtPollFixture =
+    MySqlSourceComputedTrackingDeleteFixture<false>;
+
+impl<const TABLE_AT_STARTUP: bool> MySqlOps
+    for MySqlSourceComputedTrackingDeleteFixture<TABLE_AT_STARTUP>
+{
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl<const TABLE_AT_STARTUP: bool> MySqlSourceOps
+    for MySqlSourceComputedTrackingDeleteFixture<TABLE_AT_STARTUP>
+{
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl<const TABLE_AT_STARTUP: bool> MySqlSourceComputedTrackingDeleteFixture<TABLE_AT_STARTUP> {
+    const TABLE: &'static str = "test_computed_tracking_delete";
+
+    pub async fn create_table(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!("INSERT INTO `{}` (name) VALUES (?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl<const TABLE_AT_STARTUP: bool> TestFixture
+    for MySqlSourceComputedTrackingDeleteFixture<TABLE_AT_STARTUP>
+{
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        if TABLE_AT_STARTUP {
+            let pool = container.create_pool().await?;
+            Self::create_table(&pool)
+                .await
+                .map_err(|e| TestBinaryError::FixtureSetup {
+                    fixture_type: "MySqlSourceComputedTrackingDeleteFixture".to_string(),
+                    message: format!("Failed to create table: {e}"),
+                })?;
+            pool.close().await;
+        }
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "cursor_key".to_string(),
+        );
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT *, id * 10 AS cursor_key FROM $table ORDER BY cursor_key LIMIT $limit"
+                .to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture with `processed_column` marking.
 pub struct MySqlSourceMarkFixture {
     container: MySqlContainer,

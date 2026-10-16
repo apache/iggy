@@ -19,17 +19,20 @@ use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT}
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingFixture, MySqlSourceDecimalTrackingFixture,
-    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
-    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
-    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceComputedTrackingDeleteAtPollFixture,
+    MySqlSourceComputedTrackingDeleteAtStartupFixture, MySqlSourceComputedTrackingFixture,
+    MySqlSourceDecimalTrackingFixture, MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture,
+    MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture,
+    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
-    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
-    MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
+    MySqlSourceRawFixture, MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
+    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
+    MySqlSourceTinyintTrackingFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, IggyTimestamp, PollingStrategy};
-use integration::harness::seeds;
+use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -501,6 +504,256 @@ async fn delete_after_read_source_removes_rows_after_producing(
     );
 
     pool.close().await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn delete_after_read_replay_spares_row_that_reused_a_delivered_key(
+    harness: &mut TestHarness,
+    fixture: MySqlSourceReusedKeyDeleteFixture,
+) {
+    replay_spares_row_that_reused_a_delivered_key(harness, &fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn queue_custom_query_replay_spares_row_that_reused_a_delivered_key(
+    harness: &mut TestHarness,
+    fixture: MySqlSourceReusedKeyQueueFixture,
+) {
+    replay_spares_row_that_reused_a_delivered_key(harness, &fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn computed_tracking_column_with_delete_after_read_fails_startup(
+    harness: &TestHarness,
+    fixture: MySqlSourceComputedTrackingDeleteAtStartupFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let received = count_published_messages(harness, "computed_startup_consumer").await;
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    assert_eq!(received, 0, "Expected no messages, got {received}");
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Expected every row to remain in MySQL, found {remaining}"
+    );
+    // open() errors reach the runtime only as a status code, so the reason is not
+    // logged. The fixture's query passes every other startup check.
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime should be running")
+        .collect_logs();
+    assert!(
+        format!("{stdout}{stderr}").contains("Plugin initialization failed"),
+        "Expected the connector to refuse to start"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn computed_tracking_column_with_delete_after_read_disables_a_late_table(
+    harness: &TestHarness,
+    fixture: MySqlSourceComputedTrackingDeleteAtPollFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    MySqlSourceComputedTrackingDeleteAtPollFixture::create_table(&pool)
+        .await
+        .expect("Failed to create table");
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let received = count_published_messages(harness, "computed_poll_consumer").await;
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    assert_eq!(received, 0, "Expected no messages, got {received}");
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Expected every row to remain in MySQL, found {remaining}"
+    );
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime should be running")
+        .collect_logs();
+    let logs = format!("{stdout}{stderr}");
+    assert!(
+        logs.contains("tracking_column 'cursor_key' is not a column of table"),
+        "Expected the first staged cleanup to reject the computed tracking column"
+    );
+    assert!(
+        logs.contains("Table disabled until restart"),
+        "Expected the table to be disabled, since the query cannot correct itself"
+    );
+}
+
+/// Polls for the whole attempt budget, so a connector that should publish nothing
+/// gets every chance to publish something.
+async fn count_published_messages(harness: &TestHarness, consumer: &str) -> usize {
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer = Consumer::new(consumer.try_into().unwrap());
+    let client = harness.root_client().await.unwrap();
+    let mut received = 0usize;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    received
+}
+
+async fn replay_spares_row_that_reused_a_delivered_key<const QUEUE_QUERY: bool>(
+    harness: &mut TestHarness,
+    fixture: &MySqlSourceReusedKeyFixture<QUEUE_QUERY>,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+    // The batch is delivered but its delete fails, so the saved state keeps the
+    // cleanup and the restart below replays it, as after a crash mid-cleanup.
+    fixture.block_deletes(&pool).await;
+    fixture
+        .replace_rows(
+            &pool,
+            &[
+                ("a", "a-original"),
+                ("b", "b-original"),
+                ("c", "c-original"),
+            ],
+        )
+        .await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer = Consumer::new("reused_key_consumer".try_into().unwrap());
+    let client = harness.root_client().await.unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(json) = serde_json::from_slice(&msg.payload) {
+                    received.push(json);
+                }
+            }
+            if received.len() >= 3 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert_eq!(
+        received.len(),
+        3,
+        "Expected the 3 original rows to be published"
+    );
+
+    let mut cleanup_failed = false;
+    for _ in 0..POLL_ATTEMPTS {
+        let (stdout, stderr) = harness
+            .connectors_runtime()
+            .expect("connectors runtime should be running")
+            .collect_logs();
+        if format!("{stdout}{stderr}").contains("Failed to mark or delete") {
+            cleanup_failed = true;
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert!(
+        cleanup_failed,
+        "Expected the blocked delete to leave the cleanup pending"
+    );
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors");
+
+    // `b` keeps its key but gets a new `seq`, so it is a row the connector has not read.
+    fixture.allow_deletes(&pool).await;
+    fixture.replace_rows(&pool, &[("b", "b-replacement")]).await;
+
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors");
+
+    let mut replacement_published = false;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+            && polled.messages.iter().any(|msg| {
+                serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                    .is_ok_and(|json| json["name"] == "b-replacement")
+            })
+        {
+            replacement_published = true;
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let originals_deleted =
+        !fixture.has_row(&pool, "a").await && !fixture.has_row(&pool, "c").await;
+    pool.close().await;
+
+    assert!(
+        originals_deleted,
+        "Expected the restored cleanup to delete the delivered rows 'a' and 'c'"
+    );
+    assert!(
+        replacement_published,
+        "The replayed cleanup deleted the replacement row for key 'b' before it was read"
+    );
 }
 
 #[iggy_harness(

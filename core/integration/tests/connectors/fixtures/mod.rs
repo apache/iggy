@@ -86,13 +86,16 @@ pub use mongodb::{
 };
 pub use mysql::{
     MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingFixture, MySqlSourceDecimalTrackingFixture,
-    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
-    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
-    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceComputedTrackingDeleteAtPollFixture,
+    MySqlSourceComputedTrackingDeleteAtStartupFixture, MySqlSourceComputedTrackingFixture,
+    MySqlSourceDecimalTrackingFixture, MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture,
+    MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture,
+    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
-    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
-    MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
+    MySqlSourceRawFixture, MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
+    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
+    MySqlSourceTinyintTrackingFixture,
 };
 pub use postgres::{
     POSTGRES_LARGE_BATCH_SIZE, PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture,

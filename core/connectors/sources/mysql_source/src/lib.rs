@@ -441,6 +441,16 @@ struct PendingOperation {
     table: String,
     ids: Vec<PkValue>,
     target: CleanupTarget,
+    #[serde(default)]
+    tracking_bound: Option<TrackingBound>,
+}
+
+/// The highest tracking value of the batch. Cleanup only touches rows at or below
+/// it, and a monotonic tracking column puts any replacement row above it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TrackingBound {
+    column: String,
+    offset: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +485,7 @@ struct PolledBatch {
 enum CleanupKeyCheck {
     Unique,
     NotUnique,
+    TrackingColumnMissing,
     TableMissing,
 }
 
@@ -893,6 +904,12 @@ impl MySqlSource {
                         "tracking_column '{tracking_column}' not found on table '{table}'"
                     )));
                 }
+                if self.cleanup_target().is_some() {
+                    return Err(Error::InitError(missing_bound_column_message(
+                        table,
+                        tracking_column,
+                    )));
+                }
 
                 warn!(
                     "tracking_column '{tracking_column}' is not a column of table '{table}'; \
@@ -1041,9 +1058,10 @@ impl MySqlSource {
             return Ok(());
         };
         let pool = self.get_pool()?;
+        let tracking_column = self.tracking_column();
         let mut verified = HashSet::with_capacity(self.config.tables.len());
         for table in &self.config.tables {
-            let check = cleanup_key_check(pool, table, &target.key_column)
+            let check = cleanup_key_check(pool, table, &target.key_column, tracking_column)
                 .await
                 .map_err(|e| {
                     Error::InitError(format!(
@@ -1061,6 +1079,12 @@ impl MySqlSource {
                         &target.key_column,
                     )));
                 }
+                CleanupKeyCheck::TrackingColumnMissing => {
+                    return Err(Error::InitError(missing_bound_column_message(
+                        table,
+                        tracking_column,
+                    )));
+                }
                 CleanupKeyCheck::TableMissing => {}
             }
         }
@@ -1068,16 +1092,17 @@ impl MySqlSource {
         Ok(())
     }
 
-    async fn cleanup_key_is_unique(
+    /// Why the table cannot be marked or deleted from safely, or `None` when it can.
+    async fn unusable_cleanup_reason(
         &self,
         pool: &Pool<MySql>,
         table: &str,
         key_column: &str,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<String>, Error> {
         if self.verified_cleanup_keys.lock().await.contains(table) {
-            return Ok(true);
+            return Ok(None);
         }
-        let check = cleanup_key_check(pool, table, key_column)
+        let check = cleanup_key_check(pool, table, key_column, self.tracking_column())
             .await
             .map_err(|e| {
                 Error::Connection(format!(
@@ -1090,9 +1115,13 @@ impl MySqlSource {
                     .lock()
                     .await
                     .insert(table.to_string());
-                Ok(true)
+                Ok(None)
             }
-            CleanupKeyCheck::NotUnique => Ok(false),
+            CleanupKeyCheck::NotUnique => Ok(Some(not_unique_key_message(table, key_column))),
+            CleanupKeyCheck::TrackingColumnMissing => Ok(Some(missing_bound_column_message(
+                table,
+                self.tracking_column(),
+            ))),
             CleanupKeyCheck::TableMissing => Err(Error::Connection(format!(
                 "table '{table}' disappeared before its primary_key_column could be checked"
             ))),
@@ -1384,7 +1413,12 @@ impl MySqlSource {
         pool: &Pool<MySql>,
         operation: &PendingOperation,
     ) -> Result<(), Error> {
-        let PendingOperation { table, ids, target } = operation;
+        let PendingOperation {
+            table,
+            ids,
+            target,
+            tracking_bound,
+        } = operation;
         if ids.is_empty() {
             return Ok(());
         }
@@ -1392,6 +1426,16 @@ impl MySqlSource {
         let quoted_table = quote_qualified_identifier(table)?;
         let quoted_pk = quote_identifier(&target.key_column)?;
         let placeholders = vec!["?"; ids.len()].join(", ");
+        // Rendered like the polling query's `>` filter, so `<=` is its exact complement
+        // under the same type coercion and collation.
+        let bound_clause = match tracking_bound {
+            Some(bound) => format!(
+                " AND {} <= {}",
+                quote_identifier(&bound.column)?,
+                format_offset_value(&bound.offset, self.tracking_kind(table).await)
+            ),
+            None => String::new(),
+        };
 
         let query = match &target.action {
             CleanupAction::Delete => {
@@ -1400,7 +1444,9 @@ impl MySqlSource {
                 } else {
                     debug!("Deleting {} processed rows from '{table}'", ids.len());
                 }
-                format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({placeholders})")
+                format!(
+                    "DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({placeholders}){bound_clause}"
+                )
             }
             CleanupAction::MarkProcessed { column } => {
                 let quoted_processed = quote_identifier(column)?;
@@ -1410,7 +1456,7 @@ impl MySqlSource {
                     debug!("Marking {} rows as processed in '{table}'", ids.len());
                 }
                 format!(
-                    "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({placeholders})"
+                    "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({placeholders}){bound_clause}"
                 )
             }
         };
@@ -1595,6 +1641,7 @@ impl MySqlSource {
         // the runtime has sent the batch and saved this candidate state, and a Nack
         // throws the candidate away so the same rows are read again.
         let cleanup_target = self.cleanup_target();
+        let tracking_column = self.tracking_column();
         let mut candidate_state = self.state.lock().await.clone();
         let mut operations = Vec::new();
         let mut messages = Vec::new();
@@ -1615,29 +1662,30 @@ impl MySqlSource {
                     continue;
                 }
 
-                match self
-                    .cleanup_key_is_unique(pool, &batch.table, &target.key_column)
+                let unusable = match self
+                    .unusable_cleanup_reason(pool, &batch.table, &target.key_column)
                     .await
                 {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        error!(
-                            "{}. Table disabled until restart.",
-                            not_unique_key_message(&batch.table, &target.key_column)
-                        );
-                        self.poisoned_tables.lock().await.insert(batch.table);
-                        continue;
-                    }
+                    Ok(reason) => reason,
                     Err(error) => {
                         error!("Table '{}' skipped this cycle: {error}", batch.table);
                         continue;
                     }
+                };
+                if let Some(reason) = unusable {
+                    error!("{reason}. Table disabled until restart.");
+                    self.poisoned_tables.lock().await.insert(batch.table);
+                    continue;
                 }
 
                 operations.push(PendingOperation {
                     table: batch.table.clone(),
                     ids: std::mem::take(&mut batch.processed_ids),
                     target: target.clone(),
+                    tracking_bound: batch.max_offset.clone().map(|offset| TrackingBound {
+                        column: tracking_column.to_string(),
+                        offset,
+                    }),
                 });
             }
 
@@ -2244,6 +2292,7 @@ async fn cleanup_key_check(
     pool: &Pool<MySql>,
     table: &str,
     key_column: &str,
+    tracking_column: &str,
 ) -> Result<CleanupKeyCheck, sqlx::Error> {
     let (schema, table_name) = table.split_once('.').unwrap_or(("", table));
     // COUNT(*) comes back as BIGINT, so both columns decode as i64. Read by position:
@@ -2258,7 +2307,10 @@ async fn cleanup_key_check(
                 AND non_unique = 0 \
               GROUP BY index_name \
               HAVING COUNT(*) = 1 AND MAX(column_name) = ? \
-            ) AS single_column_unique)",
+            ) AS single_column_unique), \
+           (SELECT COUNT(*) FROM information_schema.columns \
+            WHERE table_schema = IF(? = '', DATABASE(), ?) AND table_name = ? \
+              AND column_name = ?)",
     )
     .bind(schema)
     .bind(schema)
@@ -2267,13 +2319,19 @@ async fn cleanup_key_check(
     .bind(schema)
     .bind(table_name)
     .bind(key_column)
+    .bind(schema)
+    .bind(schema)
+    .bind(table_name)
+    .bind(tracking_column)
     .fetch_one(pool)
     .await?;
     let tables: i64 = row.try_get(0)?;
     let unique_indexes: i64 = row.try_get(1)?;
-    Ok(match (tables, unique_indexes) {
-        (0, _) => CleanupKeyCheck::TableMissing,
-        (_, 0) => CleanupKeyCheck::NotUnique,
+    let tracking_columns: i64 = row.try_get(2)?;
+    Ok(match (tables, unique_indexes, tracking_columns) {
+        (0, _, _) => CleanupKeyCheck::TableMissing,
+        (_, 0, _) => CleanupKeyCheck::NotUnique,
+        (_, _, 0) => CleanupKeyCheck::TrackingColumnMissing,
         _ => CleanupKeyCheck::Unique,
     })
 }
@@ -2283,6 +2341,14 @@ fn not_unique_key_message(table: &str, key_column: &str) -> String {
         "primary_key_column '{key_column}' on table '{table}' is not backed by a single-column \
          PRIMARY KEY or UNIQUE index, so marking or deleting by it can hit rows that were never \
          read; set primary_key_column to a unique column (it defaults to tracking_column)"
+    )
+}
+
+fn missing_bound_column_message(table: &str, tracking_column: &str) -> String {
+    format!(
+        "tracking_column '{tracking_column}' is not a column of table '{table}', but \
+         delete_after_read and processed_column bound the rows they touch by it; track a \
+         column of the table, or drop the computed tracking column"
     )
 }
 
@@ -2618,6 +2684,7 @@ mod tests {
                 key_column: "id".to_string(),
                 action: CleanupAction::Delete,
             },
+            tracking_bound: None,
         }
     }
 
@@ -2702,6 +2769,68 @@ mod tests {
         assert!(pending.acknowledged);
         assert!(!pending.retiring);
         assert_eq!(pending.state.pending_operations, state.pending_operations);
+    }
+
+    #[test]
+    fn given_restored_operation_with_tracking_bound_should_keep_the_bound() {
+        let mut operation = delete_operation("users", vec![PkValue::Text("42".to_string())]);
+        operation.tracking_bound = Some(TrackingBound {
+            column: "seq".to_string(),
+            offset: "42".to_string(),
+        });
+        let state = candidate_state("42", vec![operation]);
+        let connector_state =
+            ConnectorState::serialize(&state, "test", 1).expect("Failed to serialize state");
+
+        let source = MySqlSource::new(1, test_config(), Some(connector_state));
+
+        let pending = source.pending_batch.try_lock().unwrap().clone();
+        let pending = pending.expect("restored operations should be pending");
+        assert_eq!(pending.state.pending_operations, state.pending_operations);
+    }
+
+    #[test]
+    fn given_operation_saved_before_tracking_bound_should_restore_without_it() {
+        // The shape the previous release persisted. A missing bound must not discard
+        // the cleanup, or the delivered rows would never be marked or deleted.
+        #[derive(Serialize)]
+        struct UnboundOperation {
+            table: String,
+            ids: Vec<PkValue>,
+            target: CleanupTarget,
+        }
+        #[derive(Serialize)]
+        struct UnboundState {
+            tracking_offsets: HashMap<String, String>,
+            processed_rows: u64,
+            pending_operations: Vec<UnboundOperation>,
+        }
+        let saved = UnboundState {
+            tracking_offsets: HashMap::from([("users".to_string(), "42".to_string())]),
+            processed_rows: 1,
+            pending_operations: vec![UnboundOperation {
+                table: "users".to_string(),
+                ids: vec![PkValue::Text("42".to_string())],
+                target: CleanupTarget {
+                    key_column: "id".to_string(),
+                    action: CleanupAction::Delete,
+                },
+            }],
+        };
+        let connector_state =
+            ConnectorState::serialize(&saved, "test", 1).expect("Failed to serialize state");
+
+        let source = MySqlSource::new(1, test_config(), Some(connector_state));
+
+        let pending = source.pending_batch.try_lock().unwrap().clone();
+        let pending = pending.expect("restored operations should be pending");
+        assert_eq!(
+            pending.state.pending_operations,
+            vec![delete_operation(
+                "users",
+                vec![PkValue::Text("42".to_string())]
+            )]
+        );
     }
 
     #[test]
