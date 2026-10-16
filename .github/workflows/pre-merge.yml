@@ -59,12 +59,13 @@ jobs:
     if: needs.detect.outputs.runtime == 'true'
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
-      task: runtime-build
+      task: runtime
+      timeout-minutes: 60
 
   rust-test-build:
     name: Rust test artifacts
     needs: detect
-    if: needs.detect.outputs.rust_plan != '' && fromJSON(needs.detect.outputs.rust_plan).tests
+    if: needs.detect.outputs.rust_runtime_plan != '' && fromJSON(needs.detect.outputs.rust_runtime_plan).tests
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
       task: test-build
@@ -73,11 +74,19 @@ jobs:
   # Rust components
   test-rust:
     name: Rust
-    needs: [detect, runtime, rust-test-build]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && contains(fromJSON('["success","skipped"]'), needs.rust-test-build.result) && needs.detect.outputs.rust_plan != '' }}
+    needs: detect
+    if: needs.detect.outputs.rust_plan != ''
     uses: ./.github/workflows/_rust.yml
     with:
       plan: ${{ needs.detect.outputs.rust_plan }}
+
+  test-rust-runtime:
+    name: Rust tests
+    needs: [detect, runtime, rust-test-build]
+    if: ${{ !cancelled() && !failure() && needs.detect.outputs.rust_runtime_plan != '' }}
+    uses: ./.github/workflows/_rust.yml
+    with:
+      plan: ${{ needs.detect.outputs.rust_runtime_plan }}
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -85,7 +94,7 @@ jobs:
   test-python:
     name: Python
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.python_matrix }}
@@ -96,7 +105,7 @@ jobs:
   test-php:
     name: PHP
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.php_matrix }}
@@ -108,7 +117,7 @@ jobs:
   test-node:
     name: Node
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.node_matrix }}
@@ -119,7 +128,7 @@ jobs:
   test-go:
     name: Go
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.go_matrix }}
@@ -130,7 +139,7 @@ jobs:
   test-java:
     name: Java
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.java_matrix }}
@@ -141,7 +150,7 @@ jobs:
   test-csharp:
     name: C#
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.csharp_matrix }}
@@ -152,7 +161,7 @@ jobs:
   test-cpp:
     name: C++
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.cpp_matrix }}
@@ -162,8 +171,8 @@ jobs:
   # Swift SDK
   test-swift:
     name: Swift
-    needs: detect
-    if: ${{ fromJson(needs.detect.outputs.swift_matrix).include[0].component != 'noop' }}
+    needs: [detect, runtime]
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.swift_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test.yml
     with:
       matrix: ${{ needs.detect.outputs.swift_matrix }}
@@ -181,7 +190,7 @@ jobs:
   test-bdd:
     name: BDD
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test_bdd.yml
     with:
       matrix: ${{ needs.detect.outputs.bdd_matrix }}
@@ -192,7 +201,7 @@ jobs:
   test-examples:
     name: Examples
     needs: [detect, runtime]
-    if: ${{ !cancelled() && needs.detect.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.runtime.result) && fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
+    if: ${{ !cancelled() && !failure() && fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
     uses: ./.github/workflows/_test_examples.yml
     with:
       matrix: ${{ needs.detect.outputs.examples_matrix }}
@@ -201,7 +210,7 @@ jobs:
   finalize_pr:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 5
-    needs: [common, detect, runtime, rust-test-build, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
+    needs: [common, detect, runtime, rust-test-build, test-rust, test-rust-runtime, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
       - name: Get job execution times
@@ -221,7 +230,7 @@ jobs:
               return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
             };
             const groups = {
-              rust: 'Rust', python: 'Python', php: 'PHP', node: 'Node',
+              rust: 'Rust', rust_tests: 'Rust tests', python: 'Python', php: 'PHP', node: 'Node',
               go: 'Go', java: 'Java', csharp: 'C#', cpp: 'C++', swift: 'Swift',
               bdd: 'BDD', examples: 'Examples', other: 'Other',
               common: 'Common checks', detect: 'Detect changes', runtime: 'Runtime binaries',
@@ -320,6 +329,7 @@ jobs:
 
           # Language/component tests
           rust_status=$(format_status "${{ needs.test-rust.result }}" "${{ steps.times.outputs.rust_time }}")
+          rust_tests_status=$(format_status "${{ needs.test-rust-runtime.result }}" "${{ steps.times.outputs.rust_tests_time }}")
           python_status=$(format_status "${{ needs.test-python.result }}" "${{ steps.times.outputs.python_time }}")
           php_status=$(format_status "${{ needs.test-php.result }}" "${{ steps.times.outputs.php_time }}")
           node_status=$(format_status "${{ needs.test-node.result }}" "${{ steps.times.outputs.node_time }}")
@@ -333,6 +343,7 @@ jobs:
           other_status=$(format_status "${{ needs.test-other.result }}" "${{ steps.times.outputs.other_time }}")
 
           echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🦀 Rust tests | $rust_tests_status | ${{ steps.times.outputs.rust_tests_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🐍 Python | $python_status | ${{ steps.times.outputs.python_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🐘 PHP | $php_status | ${{ steps.times.outputs.php_time }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| 🟢 Node | $node_status | ${{ steps.times.outputs.node_time }} |" >> "$GITHUB_STEP_SUMMARY"
@@ -348,41 +359,11 @@ jobs:
           echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> "$GITHUB_STEP_SUMMARY"
 
           # Check for failures
-          if [[ "${{ needs.common.result }}" == "failure" ]] || \
-             [[ "${{ needs.detect.result }}" == "failure" ]] || \
-             [[ "${{ needs.runtime.result }}" == "failure" ]] || \
-             [[ "${{ needs.rust-test-build.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-rust.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-python.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-php.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-node.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-go.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-java.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-csharp.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-cpp.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-swift.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-bdd.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-examples.result }}" == "failure" ]] || \
-             [[ "${{ needs.test-other.result }}" == "failure" ]]; then
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "❌ **CI Failed** - Please check the logs for details." >> "$GITHUB_STEP_SUMMARY"
             exit 1
-          elif [[ "${{ needs.common.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.detect.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.runtime.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.rust-test-build.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-rust.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-python.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-php.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-node.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-go.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-java.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-csharp.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-cpp.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-swift.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-bdd.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-examples.result }}" == "cancelled" ]] || \
-               [[ "${{ needs.test-other.result }}" == "cancelled" ]]; then
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> "$GITHUB_STEP_SUMMARY"
             exit 1

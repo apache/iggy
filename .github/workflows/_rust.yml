@@ -31,12 +31,9 @@ permissions:
   contents: read
   issues: read # live breaking:storage label lookup
 
-env:
-  IGGY_CI_BUILD: "false"
-
 jobs:
   checks:
-    name: ${{ matrix.task }}
+    name: ${{ matrix.component == 'rust' && matrix.task || format('{0}/{1}', matrix.component, matrix.task) }}
     if: ${{ fromJSON(inputs.plan).checks[0] != null }}
     strategy:
       fail-fast: true

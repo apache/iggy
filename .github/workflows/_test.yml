@@ -51,10 +51,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
-      - name: Skip noop
-        if: matrix.component == 'noop'
-        run: echo "No changes detected, skipping tests"
-
       # Python SDK
       - name: Set up Docker Buildx for Python
         if: matrix.component == 'sdk-python' && matrix.task == 'test'

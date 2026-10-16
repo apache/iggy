@@ -28,6 +28,8 @@ runs:
   steps:
     - name: Setup Rust
       uses: ./.github/actions/utils/setup-rust
+      with:
+        free-disk-space: ${{ inputs.task != 'test' }}
 
     - name: Download runtime binaries
       if: inputs.task == 'test'

@@ -29,6 +29,8 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESTORE = REPO_ROOT / "scripts/ci/restore-runtime.sh"
+SERVER_START = "./.github/actions/utils/server-start"
+DOWNLOAD_RUNTIME = "./.github/actions/utils/download-runtime"
 
 
 def run(*args, cwd=REPO_ROOT, env=None):
@@ -209,7 +211,7 @@ class RuntimeSelection(unittest.TestCase):
     def test_runtime_restore_change_exercises_real_consumers(self):
         outputs = self.select(["scripts/ci/restore-runtime.sh"])
         self.assertEqual(outputs["runtime"], "true")
-        self.assertTrue(json.loads(outputs["rust_plan"])["tests"])
+        self.assertTrue(json.loads(outputs["rust_runtime_plan"])["tests"])
         self.assertIn(("ci-workflows", "validate"),
                       [(entry["component"], entry["task"])
                        for entry in json.loads(outputs["other_matrix"])["include"]])
@@ -218,18 +220,36 @@ class RuntimeSelection(unittest.TestCase):
         outputs = self.select(["foreign/python/src/lib.rs"])
         self.assertEqual(outputs["runtime"], "true")
         self.assertEqual(outputs["rust_plan"], "")
+        self.assertEqual(outputs["rust_runtime_plan"], "")
         self.assertEqual(json.loads(outputs["python_matrix"])["include"][0]["component"], "sdk-python")
 
     def test_server_change_selects_runtime_and_rust_tests(self):
         outputs = self.select(["core/server/src/main.rs"])
         self.assertEqual(outputs["runtime"], "true")
-        self.assertTrue(json.loads(outputs["rust_plan"])["tests"])
+        runtime_plan = json.loads(outputs["rust_runtime_plan"])
+        self.assertTrue(runtime_plan["tests"])
+        self.assertEqual([entry["task"] for entry in runtime_plan["checks"]], ["test-storage-compat"])
+        plan = json.loads(outputs["rust_plan"])
+        self.assertFalse(plan["tests"])
+        self.assertFalse({"test", "test-storage-compat"} & {entry["task"] for entry in plan["checks"]})
 
-    def test_swift_only_change_does_not_build_server(self):
-        self.assertEqual(self.select(["foreign/swift/Sources/Iggy/IggyClient.swift"])["runtime"], "false")
+    def test_swift_only_change_builds_server_for_e2e(self):
+        self.assertEqual(self.select(["foreign/swift/Sources/Iggy/IggyClient.swift"])["runtime"], "true")
 
     def test_unrelated_documentation_does_not_build_server(self):
         self.assertEqual(self.select(["docs/unrelated.md"])["runtime"], "false")
+
+
+class RuntimeConsumers(unittest.TestCase):
+    def test_every_server_start_follows_a_runtime_download(self):
+        for path in sorted((REPO_ROOT / ".github").rglob("*.yml")):
+            document = yaml.safe_load(path.read_text())
+            step_lists = [document.get("runs", {}).get("steps", [])]
+            step_lists += [job.get("steps", []) for job in document.get("jobs", {}).values()]
+            for steps in step_lists:
+                uses = [step.get("uses") for step in steps]
+                if SERVER_START in uses:
+                    self.assertIn(DOWNLOAD_RUNTIME, uses[:uses.index(SERVER_START)], path.relative_to(REPO_ROOT))
 
 
 if __name__ == "__main__":

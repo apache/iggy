@@ -22,18 +22,12 @@ on:
       timeout-minutes:
         type: number
         default: 60
-      build-metadata:
-        type: boolean
-        default: false
     secrets:
       CODECOV_TOKEN:
         required: false
 
 permissions:
   contents: read
-
-env:
-  IGGY_CI_BUILD: ${{ inputs.build-metadata }}
 
 jobs:
   tests:

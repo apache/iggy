@@ -35,6 +35,9 @@ runs:
       uses: ./.github/actions/utils/setup-rust
       with:
         coverage: "true"
+        # The suite compiles in Docker. The host only runs the coverage report.
+        free-disk-space: "false"
+        read-cache: "false"
 
     - name: Download runtime binaries
       uses: ./.github/actions/utils/download-runtime

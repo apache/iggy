@@ -20,7 +20,7 @@ on:
   workflow_call:
     inputs:
       task:
-        description: "Artifact producer: runtime-build or test-build"
+        description: "Artifact producer: runtime or test-build"
         type: string
         required: true
       test-scope:
@@ -61,8 +61,8 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: rust-${{ inputs.task == 'runtime-build' && 'runtime' || inputs.task }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/rust-${{ inputs.task == 'runtime-build' && 'runtime' || inputs.task }}/
+          name: rust-${{ inputs.task }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/rust-${{ inputs.task }}/
           compression-level: 0
           if-no-files-found: error
           overwrite: true

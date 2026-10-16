@@ -16,7 +16,11 @@
 # under the License.
 
 name: download-runtime
-description: Restore coverage-instrumented runtime binaries for this workflow revision
+description: >-
+  Restore coverage-instrumented runtime binaries for this workflow revision.
+  In .github/workflows/_detect.yml, needsRuntime must select the caller's
+  task, and in .github/workflows/pre-merge.yml the caller's job must need
+  runtime.
 
 inputs:
   restore:

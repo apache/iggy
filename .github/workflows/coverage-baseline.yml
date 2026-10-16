@@ -85,7 +85,7 @@ jobs:
     if: contains(toJSON(needs.detect.outputs), 'true')
     uses: ./.github/workflows/_build_ci_artifacts.yml
     with:
-      task: runtime-build
+      task: runtime
       save-cache: true
       build-metadata: true
 
@@ -109,7 +109,6 @@ jobs:
     uses: ./.github/workflows/_rust_tests.yml
     with:
       timeout-minutes: 120
-      build-metadata: true
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
