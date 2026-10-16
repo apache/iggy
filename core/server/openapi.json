@@ -1,0 +1,5378 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Apache Iggy HTTP API",
+    "version": "0.9.0",
+    "description": "REST API of the Apache Iggy server. Most routes need a bearer credential: either an access token from a login or refresh route, or a raw personal access token. Names and numeric IDs are both accepted wherever a path takes a stream, topic, consumer group, user or consumer. In a cluster, a follower forwards control plane writes to the primary. The web UI routes under `/ui` are not described here.",
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Default address in the shipped `config.toml`."
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "System",
+      "description": "Health, statistics, options, snapshots and metrics."
+    },
+    {
+      "name": "Cluster",
+      "description": "Cluster topology."
+    },
+    {
+      "name": "Clients",
+      "description": "Connected clients."
+    },
+    {
+      "name": "Users",
+      "description": "Users, login and logout."
+    },
+    {
+      "name": "Personal access tokens",
+      "description": "Long-lived tokens for programmatic access."
+    },
+    {
+      "name": "Streams",
+      "description": "Streams, the top level containers for topics."
+    },
+    {
+      "name": "Topics",
+      "description": "Topics within a stream."
+    },
+    {
+      "name": "Partitions",
+      "description": "Adding and removing a topic's partitions."
+    },
+    {
+      "name": "Segments",
+      "description": "Deleting a partition's oldest segments."
+    },
+    {
+      "name": "Consumer groups",
+      "description": "Consumer groups within a topic."
+    },
+    {
+      "name": "Consumer offsets",
+      "description": "Offsets stored for regular consumers."
+    },
+    {
+      "name": "Messages",
+      "description": "Sending and polling messages."
+    }
+  ],
+  "paths": {
+    "/ping": {
+      "get": {
+        "operationId": "ping",
+        "summary": "Health check",
+        "tags": [
+          "System"
+        ],
+        "description": "Unauthenticated. The `Iggy-View` and `Iggy-Applied-Op` headers are never set on this route.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The server is up. The body is the text `pong`.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "const": "pong"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "operationId": "get_stats",
+        "summary": "Get server statistics",
+        "tags": [
+          "System"
+        ],
+        "description": "Requires the `read_servers` or `manage_servers` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server and storage statistics.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/options/{scope}": {
+      "get": {
+        "operationId": "describe_options",
+        "summary": "Describe the option catalogue for a resource",
+        "tags": [
+          "System"
+        ],
+        "description": "Any authenticated user may call this route.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OptionsScope"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every option key the scope accepts.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OptionSpec"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/snapshot": {
+      "post": {
+        "operationId": "get_snapshot",
+        "summary": "Download a diagnostic snapshot",
+        "tags": [
+          "System"
+        ],
+        "description": "Requires the `read_servers` or `manage_servers` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetSnapshot"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A ZIP archive sent as an attachment named `iggy_snapshot_<YYYYMMDD_HHMMSS>.zip`.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              },
+              "Content-Disposition": {
+                "$ref": "#/components/headers/ContentDisposition"
+              }
+            },
+            "content": {
+              "application/zip": {
+                "schema": {
+                  "type": "string",
+                  "contentMediaType": "application/zip"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "get_metrics",
+        "summary": "Scrape Prometheus metrics",
+        "tags": [
+          "System"
+        ],
+        "description": "Registered only when `http.metrics.enabled` is true, at the path set by `http.metrics.endpoint`. `/metrics` is the default in the shipped `config.toml`. Any authenticated user may scrape.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Metrics in the Prometheus text exposition format.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          }
+        }
+      }
+    },
+    "/cluster/metadata": {
+      "get": {
+        "operationId": "get_cluster_metadata",
+        "summary": "Get cluster metadata",
+        "tags": [
+          "Cluster"
+        ],
+        "description": "Any authenticated user may call this route. Node addresses are chosen for the caller's network when the cluster config has matching address selectors.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The cluster name and its nodes.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterMetadata"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          }
+        }
+      }
+    },
+    "/clients": {
+      "get": {
+        "operationId": "get_clients",
+        "summary": "List connected clients",
+        "tags": [
+          "Clients"
+        ],
+        "description": "Requires the `read_servers` or `manage_servers` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every connected client across all shards.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientInfo"
+                  }
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/clients/{client_id}": {
+      "get": {
+        "operationId": "get_client",
+        "summary": "Get a connected client",
+        "tags": [
+          "Clients"
+        ],
+        "description": "Requires the `read_servers` or `manage_servers` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ClientId"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The client and its consumer group memberships.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInfoDetails"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/users/login": {
+      "post": {
+        "operationId": "login_user",
+        "summary": "Log in with a username and password",
+        "tags": [
+          "Users"
+        ],
+        "description": "Unauthenticated. Wrong credentials and an inactive user are answered with 400. Answers 503 if the node has not finished replaying its log after a restart.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginUser"
+              }
+            }
+          }
+        },
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "An access token for the user.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/users/refresh-token": {
+      "post": {
+        "operationId": "refresh_token",
+        "summary": "Refresh an access token",
+        "tags": [
+          "Users"
+        ],
+        "description": "Unauthenticated. The current access token is sent in the body. The presented token is not revoked and stays valid until it expires. Tokens from trusted external issuers cannot be refreshed.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshToken"
+              }
+            }
+          }
+        },
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "A new access token for the same user.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          }
+        }
+      }
+    },
+    "/users/logout": {
+      "delete": {
+        "operationId": "logout_user",
+        "summary": "Log out",
+        "tags": [
+          "Users"
+        ],
+        "description": "Ends the server-side session for the presented credential. The bearer token itself is not revoked and stays valid until it expires.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The session was ended.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/users": {
+      "get": {
+        "operationId": "get_users",
+        "summary": "List users",
+        "tags": [
+          "Users"
+        ],
+        "description": "Requires the `read_users` or `manage_users` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every user.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserInfo"
+                  }
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_user",
+        "summary": "Create a user",
+        "tags": [
+          "Users"
+        ],
+        "description": "Requires the `manage_users` permission.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUser"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The created user.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInfoDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/users/{user_id}": {
+      "get": {
+        "operationId": "get_user",
+        "summary": "Get a user",
+        "tags": [
+          "Users"
+        ],
+        "description": "Reading your own user (by `me`, your ID or your username) needs no permission. Reading another user requires `read_users` or `manage_users`.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserIdOrMe"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The user and its permissions.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInfoDetails"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "update_user",
+        "summary": "Update a user",
+        "tags": [
+          "Users"
+        ],
+        "description": "Changes the username, the status, or both. Requires the `manage_users` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUser"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The user was updated.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_user",
+        "summary": "Delete a user",
+        "tags": [
+          "Users"
+        ],
+        "description": "Requires the `manage_users` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The user was deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/users/{user_id}/password": {
+      "put": {
+        "operationId": "change_password",
+        "summary": "Change a user's password",
+        "tags": [
+          "Users"
+        ],
+        "description": "A wrong current password is answered with 400.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePassword"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The password was changed.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/users/{user_id}/permissions": {
+      "put": {
+        "operationId": "update_permissions",
+        "summary": "Replace a user's permissions",
+        "tags": [
+          "Users"
+        ],
+        "description": "Requires the `manage_users` permission.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePermissions"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The permissions were replaced.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/personal-access-tokens/login": {
+      "post": {
+        "operationId": "login_with_personal_access_token",
+        "summary": "Log in with a personal access token",
+        "tags": [
+          "Personal access tokens"
+        ],
+        "description": "Unauthenticated. An unknown or expired token is answered with 401.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginWithPersonalAccessToken"
+              }
+            }
+          }
+        },
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "An access token for the token's owner.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/personal-access-tokens": {
+      "get": {
+        "operationId": "get_pats",
+        "summary": "List your personal access tokens",
+        "tags": [
+          "Personal access tokens"
+        ],
+        "description": "Lists only the caller's own tokens.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller's tokens. The secrets are never returned.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PersonalAccessTokenInfo"
+                  }
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_pat",
+        "summary": "Create a personal access token",
+        "tags": [
+          "Personal access tokens"
+        ],
+        "description": "Creates a token for the caller.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePersonalAccessToken"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The raw token. It is returned only once.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawPersonalAccessToken"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/personal-access-tokens/{name}": {
+      "delete": {
+        "operationId": "delete_pat",
+        "summary": "Delete a personal access token",
+        "tags": [
+          "Personal access tokens"
+        ],
+        "description": "Deletes one of the caller's own tokens.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PatName"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The token was deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams": {
+      "get": {
+        "operationId": "get_streams",
+        "summary": "List streams",
+        "tags": [
+          "Streams"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every stream.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Stream"
+                  }
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_stream",
+        "summary": "Create a stream",
+        "tags": [
+          "Streams"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStream"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The created stream. The server assigns its ID.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}": {
+      "get": {
+        "operationId": "get_stream",
+        "summary": "Get a stream",
+        "tags": [
+          "Streams"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stream and its topics.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamDetails"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "update_stream",
+        "summary": "Update a stream",
+        "tags": [
+          "Streams"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateStream"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The stream was updated.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_stream",
+        "summary": "Delete a stream",
+        "tags": [
+          "Streams"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The stream was deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/purge": {
+      "delete": {
+        "operationId": "purge_stream",
+        "summary": "Purge a stream's messages",
+        "tags": [
+          "Streams"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The stream's messages were removed.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics": {
+      "get": {
+        "operationId": "get_topics",
+        "summary": "List a stream's topics",
+        "tags": [
+          "Topics"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every topic in the stream.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Topic"
+                  }
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_topic",
+        "summary": "Create a topic",
+        "tags": [
+          "Topics"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTopic"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The created topic. The server assigns its ID.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}": {
+      "get": {
+        "operationId": "get_topic",
+        "summary": "Get a topic",
+        "tags": [
+          "Topics"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The topic and its partitions.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicDetails"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "put": {
+        "operationId": "update_topic",
+        "summary": "Update a topic",
+        "tags": [
+          "Topics"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTopic"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The topic was updated.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_topic",
+        "summary": "Delete a topic",
+        "tags": [
+          "Topics"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The topic was deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/purge": {
+      "delete": {
+        "operationId": "purge_topic",
+        "summary": "Purge a topic's messages",
+        "tags": [
+          "Topics"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The topic's messages were removed.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/partitions": {
+      "post": {
+        "operationId": "create_partitions",
+        "summary": "Add partitions to a topic",
+        "tags": [
+          "Partitions"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePartitions"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The partitions were added. The response has no body.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_partitions",
+        "summary": "Remove partitions from a topic",
+        "tags": [
+          "Partitions"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "name": "partitions_count",
+            "in": "query",
+            "required": true,
+            "description": "Number of partitions to remove, from 1 to 1000.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 1,
+              "maximum": 1000
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The partitions were removed.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}": {
+      "delete": {
+        "operationId": "delete_segments",
+        "summary": "Delete a partition's oldest segments",
+        "tags": [
+          "Segments"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/PartitionId"
+          },
+          {
+            "name": "segments_count",
+            "in": "query",
+            "required": true,
+            "description": "Number of the oldest sealed segments to delete.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The segments were deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/consumer-groups": {
+      "get": {
+        "operationId": "get_cgs",
+        "summary": "List a topic's consumer groups",
+        "tags": [
+          "Consumer groups"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every consumer group in the topic.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConsumerGroup"
+                  }
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_cg",
+        "summary": "Create a consumer group",
+        "tags": [
+          "Consumer groups"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConsumerGroup"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The created consumer group. The server assigns its ID.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsumerGroupDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}": {
+      "get": {
+        "operationId": "get_cg",
+        "summary": "Get a consumer group",
+        "tags": [
+          "Consumer groups"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/GroupId"
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The consumer group and its members.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsumerGroupDetails"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "delete_cg",
+        "summary": "Delete a consumer group",
+        "tags": [
+          "Consumer groups"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/GroupId"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The consumer group was deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/consumer-offsets": {
+      "get": {
+        "operationId": "get_consumer_offset",
+        "summary": "Get a consumer's stored offset",
+        "tags": [
+          "Consumer offsets"
+        ],
+        "description": "Answers 404 when no offset has been stored for the consumer.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "name": "consumer_id",
+            "in": "query",
+            "required": false,
+            "description": "Consumer ID or name. Defaults to 1. HTTP always uses a regular consumer, never a consumer group.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "partition_id",
+            "in": "query",
+            "required": false,
+            "description": "Partition ID. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored and current offsets.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsumerOffsetInfo"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "put": {
+        "operationId": "store_consumer_offset",
+        "summary": "Store a consumer's offset",
+        "tags": [
+          "Consumer offsets"
+        ],
+        "description": "Waits for the partition's quorum commit before answering.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreConsumerOffset"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The offset was committed.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}": {
+      "delete": {
+        "operationId": "delete_consumer_offset",
+        "summary": "Delete a consumer's stored offset",
+        "tags": [
+          "Consumer offsets"
+        ],
+        "description": "Answers 404 when no offset has been stored for the consumer.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "$ref": "#/components/parameters/ConsumerId"
+          },
+          {
+            "name": "partition_id",
+            "in": "query",
+            "required": false,
+            "description": "Partition ID.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The offset was deleted.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    },
+    "/streams/{stream_id}/topics/{topic_id}/messages": {
+      "get": {
+        "operationId": "poll_messages",
+        "summary": "Poll messages",
+        "tags": [
+          "Messages"
+        ],
+        "description": "Requires the `poll_messages` permission for the topic. A poll that the server fences as a stale consumer group assignment is answered with 200 and an empty batch.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "name": "consumer_id",
+            "in": "query",
+            "required": false,
+            "description": "Consumer ID or name. Defaults to 1. HTTP always uses a regular consumer, never a consumer group.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "partition_id",
+            "in": "query",
+            "required": false,
+            "description": "Partition ID. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "Where to start polling. Defaults to `offset`. The single letters `o`, `t`, `f`, `l` and `n` are also accepted.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "offset",
+                "timestamp",
+                "first",
+                "last",
+                "next"
+              ],
+              "default": "offset"
+            }
+          },
+          {
+            "name": "value",
+            "in": "query",
+            "required": false,
+            "description": "Offset, or timestamp in microseconds, for the `offset` and `timestamp` kinds. Defaults to 0.",
+            "schema": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "count",
+            "in": "query",
+            "required": false,
+            "description": "Maximum number of messages to return. Defaults to 10.",
+            "schema": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 10
+            }
+          },
+          {
+            "name": "auto_commit",
+            "in": "query",
+            "required": false,
+            "description": "Store the consumer offset after polling. The offset may advance before the response arrives, and a successful response does not confirm the commit.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Consistency"
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The polled messages.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolledMessages"
+                }
+              }
+            }
+          },
+          "307": {
+            "$ref": "#/components/responses/TemporaryRedirect"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      },
+      "post": {
+        "operationId": "send_messages",
+        "summary": "Send messages",
+        "tags": [
+          "Messages"
+        ],
+        "description": "Requires the `send_messages` permission for the topic.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/StreamId"
+          },
+          {
+            "$ref": "#/components/parameters/TopicId"
+          },
+          {
+            "name": "ack",
+            "in": "query",
+            "required": false,
+            "description": "`replicated` waits for the quorum commit and answers 201. `none` answers 202 as soon as the batch is dispatched.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "replicated",
+                "none"
+              ],
+              "default": "replicated"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessages"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "The batch was committed. The body lists where it landed.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              },
+              "Iggy-Durability": {
+                "$ref": "#/components/headers/IggyDurabilityCommitted"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendMessagesConfirmations"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The batch was accepted for dispatch. Commit was not awaited. The response has no body.",
+            "headers": {
+              "Iggy-View": {
+                "$ref": "#/components/headers/IggyView"
+              },
+              "Iggy-Applied-Op": {
+                "$ref": "#/components/headers/IggyAppliedOp"
+              },
+              "Iggy-Durability": {
+                "$ref": "#/components/headers/IggyDurabilityNone"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/SessionConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/UnprocessableEntity"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "502": {
+            "$ref": "#/components/responses/BadGateway"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "$ref": "#/components/responses/GatewayTimeout"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "`Authorization: Bearer <token>`. The token is an access token from `POST /users/login`, `POST /personal-access-tokens/login` or `POST /users/refresh-token`, or a raw personal access token. The server tries it as a JWT first and then as a personal access token. Tokens from configured trusted external issuers are also accepted."
+      }
+    },
+    "parameters": {
+      "StreamId": {
+        "name": "stream_id",
+        "in": "path",
+        "required": true,
+        "description": "Stream ID or name.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "TopicId": {
+        "name": "topic_id",
+        "in": "path",
+        "required": true,
+        "description": "Topic ID or name.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "GroupId": {
+        "name": "group_id",
+        "in": "path",
+        "required": true,
+        "description": "Consumer group ID or name.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "UserId": {
+        "name": "user_id",
+        "in": "path",
+        "required": true,
+        "description": "User ID or username.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "UserIdOrMe": {
+        "name": "user_id",
+        "in": "path",
+        "required": true,
+        "description": "User ID or username, or `me` for the caller. A user named `me` can still be read by ID.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "ConsumerId": {
+        "name": "consumer_id",
+        "in": "path",
+        "required": true,
+        "description": "Consumer ID or name. HTTP always uses a regular consumer, never a consumer group.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        }
+      },
+      "PartitionId": {
+        "name": "partition_id",
+        "in": "path",
+        "required": true,
+        "description": "Partition ID.",
+        "schema": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "ClientId": {
+        "name": "client_id",
+        "in": "path",
+        "required": true,
+        "description": "Client ID as listed by `GET /clients`.",
+        "schema": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "PatName": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "Name of the personal access token.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "OptionsScope": {
+        "name": "scope",
+        "in": "path",
+        "required": true,
+        "description": "Resource whose options to describe.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "topic",
+            "stream",
+            "user"
+          ]
+        }
+      },
+      "Consistency": {
+        "name": "consistency",
+        "in": "query",
+        "required": false,
+        "description": "`serializable` reads from this node's local state, which may lag the primary. `linearizable` reads from the primary: a follower redirects with 307 when it can resolve the primary's address, and answers 503 otherwise. Unknown values are rejected with 400.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "serializable",
+            "linearizable"
+          ],
+          "default": "serializable"
+        }
+      }
+    },
+    "headers": {
+      "IggyView": {
+        "description": "Current consensus view number. Set on success and redirect responses when the node runs consensus. Never set on errors or on `/ping`.",
+        "schema": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "IggyAppliedOp": {
+        "description": "Metadata operation number the serving node has applied. Set on success and redirect responses. Never set on errors or on `/ping`.",
+        "schema": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "IggyDurabilityCommitted": {
+        "description": "Durability the commit achieved under the topic's message policy.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "replicated",
+            "persisted"
+          ]
+        }
+      },
+      "IggyDurabilityNone": {
+        "description": "Always `none`: the batch was dispatched but its commit was not awaited.",
+        "schema": {
+          "type": "string",
+          "const": "none"
+        }
+      },
+      "RetryAfter": {
+        "description": "Seconds to wait before retrying.",
+        "schema": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "Location": {
+        "description": "URL of the same request on the primary.",
+        "schema": {
+          "type": "string",
+          "format": "uri"
+        }
+      },
+      "ContentDisposition": {
+        "description": "Marks the response as a file download.",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "TemporaryRedirect": {
+        "description": "Only for `consistency=linearizable` on a follower. Repeat the request against the primary at `Location`.",
+        "headers": {
+          "Location": {
+            "$ref": "#/components/headers/Location"
+          },
+          "Iggy-View": {
+            "$ref": "#/components/headers/IggyView"
+          },
+          "Iggy-Applied-Op": {
+            "$ref": "#/components/headers/IggyAppliedOp"
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "The request was rejected: an invalid identifier, a failed validation, or a business error such as a duplicate name. A path or query string that cannot be parsed, or malformed JSON, is answered with a plain text body instead.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          },
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Unauthenticated": {
+        "description": "The bearer credential is missing, invalid or expired.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The caller lacks the permission this route needs.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "The resource does not exist.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "SessionConflict": {
+        "description": "The server session ID minted for this credential is owned by another user. Retrying will not help.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "The body is larger than `http.max_request_size`. The body is plain text, or JSON with code `payload_too_large` when the node was forwarding the request. The connection is closed on HTTP/1.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          },
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "The request has no `Content-Type: application/json` header.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UnprocessableEntity": {
+        "description": "The JSON body does not match the expected shape.",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "This session already has too many writes in flight. Wait for them to finish, then retry.",
+        "headers": {
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "BadGateway": {
+        "description": "The node forwarded the request to the primary and the forward failed after sending. The outcome is unknown.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "A temporary condition, such as no caught-up primary, a node still recovering, or a busy node. Safe to retry after `Retry-After`.",
+        "headers": {
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfter"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "GatewayTimeout": {
+        "description": "No reply arrived in time. For writes the outcome is unknown and the write may still commit.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Identifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 255,
+        "description": "A numeric ID or a name, 1 to 255 bytes long. A value that parses as an unsigned 32-bit integer is used as a numeric ID. Anything else is used as a name, so a resource whose name is all digits can only be addressed by its ID."
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Error body returned by every route.",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Iggy error code, or the HTTP status code for errors raised by the HTTP layer itself."
+          },
+          "code": {
+            "type": "string",
+            "description": "Error name in snake case, for example `stream_id_not_found` or `not_found`."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human readable message."
+          },
+          "field": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Request field the error relates to, when known."
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "reason",
+          "field"
+        ]
+      },
+      "Timestamp": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "description": "Microseconds since the Unix epoch."
+      },
+      "ByteSize": {
+        "type": "string",
+        "description": "Byte size as a string with a unit, for example `0 B`, `1 KiB` or `1.234 KB`."
+      },
+      "Expiry": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "description": "Expiry in microseconds. 0 means the server default and 18446744073709551615 (the largest unsigned 64-bit value) means never expire."
+      },
+      "MaxTopicSize": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "description": "Maximum topic size in bytes. 0 means the server default and 18446744073709551615 (the largest unsigned 64-bit value) means unlimited."
+      },
+      "CompressionAlgorithm": {
+        "type": "string",
+        "enum": [
+          "none",
+          "gzip"
+        ],
+        "description": "Compression algorithm. Input is matched without regard to case."
+      },
+      "UserStatus": {
+        "type": "string",
+        "enum": [
+          "active",
+          "inactive"
+        ]
+      },
+      "OptionValue": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "string",
+            "description": "Value in the same string form a create request takes."
+          },
+          "explicit": {
+            "type": "boolean",
+            "description": "True when the value was set by a client rather than defaulted."
+          }
+        },
+        "required": [
+          "value",
+          "explicit"
+        ]
+      },
+      "OptionSpec": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Option key."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "raw",
+              "string",
+              "bool",
+              "int8",
+              "int16",
+              "int32",
+              "int64",
+              "int128",
+              "uint8",
+              "uint16",
+              "uint32",
+              "uint64",
+              "uint128",
+              "float32",
+              "float64"
+            ],
+            "description": "Value type the server stores the option as."
+          },
+          "default_value": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            },
+            "description": "Default value as raw bytes in the encoding of `kind`. Empty when the key has no default."
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "kind",
+          "default_value",
+          "description"
+        ]
+      },
+      "IdentityInfo": {
+        "type": "object",
+        "properties": {
+          "user_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "access_token": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TokenInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Always set by the login and refresh routes."
+          }
+        },
+        "required": [
+          "user_id",
+          "access_token"
+        ]
+      },
+      "TokenInfo": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Access token (JWT) to send as a bearer token."
+          },
+          "expiry": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Expiry time in seconds since the Unix epoch."
+          }
+        },
+        "required": [
+          "token",
+          "expiry"
+        ]
+      },
+      "LoginUser": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "format": "password"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client version. Accepted but not used by the HTTP login."
+          },
+          "context": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client context. Accepted but not used by the HTTP login."
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ]
+      },
+      "RefreshToken": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "A current, unexpired access token issued by this server."
+          }
+        },
+        "required": [
+          "token"
+        ]
+      },
+      "LoginWithPersonalAccessToken": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "format": "password",
+            "description": "Raw personal access token."
+          }
+        },
+        "required": [
+          "token"
+        ]
+      },
+      "RawPersonalAccessToken": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Raw token. Store it securely: it cannot be retrieved again."
+          }
+        },
+        "required": [
+          "token"
+        ]
+      },
+      "PersonalAccessTokenInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "expiry_at": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Expiry time, or null if the token never expires."
+          }
+        },
+        "required": [
+          "name",
+          "expiry_at"
+        ]
+      },
+      "CreatePersonalAccessToken": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique token name, 3 to 30 bytes."
+          },
+          "expiry": {
+            "$ref": "#/components/schemas/Expiry"
+          }
+        },
+        "required": [
+          "name",
+          "expiry"
+        ]
+      },
+      "GlobalPermissions": {
+        "type": "object",
+        "description": "Permissions that apply to every stream.",
+        "properties": {
+          "manage_servers": {
+            "type": "boolean"
+          },
+          "read_servers": {
+            "type": "boolean"
+          },
+          "manage_users": {
+            "type": "boolean"
+          },
+          "read_users": {
+            "type": "boolean"
+          },
+          "manage_streams": {
+            "type": "boolean"
+          },
+          "read_streams": {
+            "type": "boolean"
+          },
+          "manage_topics": {
+            "type": "boolean"
+          },
+          "read_topics": {
+            "type": "boolean"
+          },
+          "poll_messages": {
+            "type": "boolean"
+          },
+          "send_messages": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "manage_servers",
+          "read_servers",
+          "manage_users",
+          "read_users",
+          "manage_streams",
+          "read_streams",
+          "manage_topics",
+          "read_topics",
+          "poll_messages",
+          "send_messages"
+        ]
+      },
+      "StreamPermissions": {
+        "type": "object",
+        "description": "Permissions for one stream and its topics.",
+        "properties": {
+          "manage_stream": {
+            "type": "boolean"
+          },
+          "read_stream": {
+            "type": "boolean"
+          },
+          "manage_topics": {
+            "type": "boolean"
+          },
+          "read_topics": {
+            "type": "boolean"
+          },
+          "poll_messages": {
+            "type": "boolean"
+          },
+          "send_messages": {
+            "type": "boolean"
+          },
+          "topics": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Per-topic permissions keyed by numeric topic ID.",
+            "propertyNames": {
+              "pattern": "^[0-9]+$"
+            },
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TopicPermissions"
+            }
+          }
+        },
+        "required": [
+          "manage_stream",
+          "read_stream",
+          "manage_topics",
+          "read_topics",
+          "poll_messages",
+          "send_messages",
+          "topics"
+        ]
+      },
+      "TopicPermissions": {
+        "type": "object",
+        "description": "Permissions for one topic.",
+        "properties": {
+          "manage_topic": {
+            "type": "boolean"
+          },
+          "read_topic": {
+            "type": "boolean"
+          },
+          "poll_messages": {
+            "type": "boolean"
+          },
+          "send_messages": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "manage_topic",
+          "read_topic",
+          "poll_messages",
+          "send_messages"
+        ]
+      },
+      "Permissions": {
+        "type": "object",
+        "properties": {
+          "global": {
+            "$ref": "#/components/schemas/GlobalPermissions"
+          },
+          "streams": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Per-stream permissions keyed by numeric stream ID.",
+            "propertyNames": {
+              "pattern": "^[0-9]+$"
+            },
+            "additionalProperties": {
+              "$ref": "#/components/schemas/StreamPermissions"
+            }
+          }
+        },
+        "required": [
+          "global",
+          "streams"
+        ]
+      },
+      "UserInfo": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "status": {
+            "$ref": "#/components/schemas/UserStatus"
+          },
+          "username": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object",
+            "description": "Resource options keyed by option name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionValue"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "status",
+          "username",
+          "options"
+        ]
+      },
+      "UserInfoDetails": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "status": {
+            "$ref": "#/components/schemas/UserStatus"
+          },
+          "username": {
+            "type": "string"
+          },
+          "permissions": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Permissions"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "options": {
+            "type": "object",
+            "description": "Resource options keyed by option name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionValue"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "status",
+          "username",
+          "permissions",
+          "options"
+        ]
+      },
+      "CreateUser": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "Unique username, 3 to 50 bytes."
+          },
+          "password": {
+            "type": "string",
+            "format": "password",
+            "description": "Password, 3 to 100 bytes."
+          },
+          "status": {
+            "$ref": "#/components/schemas/UserStatus"
+          },
+          "permissions": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Permissions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Permissions. Omit or send null for none."
+          }
+        },
+        "required": [
+          "username",
+          "password",
+          "status"
+        ]
+      },
+      "UpdateUser": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New username, 3 to 50 bytes. Omit to keep the current one."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UserStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New status. Omit to keep the current one."
+          },
+          "options": {
+            "type": "object",
+            "description": "User options to change. No user option can be changed yet, so any key is rejected.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          }
+        },
+        "required": []
+      },
+      "ChangePassword": {
+        "type": "object",
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "format": "password",
+            "description": "Current password, 3 to 100 bytes."
+          },
+          "new_password": {
+            "type": "string",
+            "format": "password",
+            "description": "New password, 3 to 100 bytes."
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ]
+      },
+      "UpdatePermissions": {
+        "type": "object",
+        "properties": {
+          "permissions": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Permissions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New permissions. Omit or send null to remove all permissions."
+          }
+        },
+        "required": []
+      },
+      "Stream": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "topics_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "options": {
+            "type": "object",
+            "description": "Resource options keyed by option name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionValue"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "name",
+          "size",
+          "messages_count",
+          "topics_count",
+          "options"
+        ]
+      },
+      "StreamDetails": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "topics_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "topics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Topic"
+            }
+          },
+          "options": {
+            "type": "object",
+            "description": "Resource options keyed by option name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionValue"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "name",
+          "size",
+          "messages_count",
+          "topics_count",
+          "topics",
+          "options"
+        ]
+      },
+      "CreateStream": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique stream name, up to 255 bytes."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "UpdateStream": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "New stream name, up to 255 bytes."
+          },
+          "options": {
+            "type": "object",
+            "description": "Stream options to change. No stream option can be changed yet, so any key is rejected.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "Topic": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "message_expiry": {
+            "$ref": "#/components/schemas/Expiry"
+          },
+          "compression_algorithm": {
+            "$ref": "#/components/schemas/CompressionAlgorithm"
+          },
+          "max_topic_size": {
+            "$ref": "#/components/schemas/MaxTopicSize"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "options": {
+            "type": "object",
+            "description": "Resource options keyed by option name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionValue"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "name",
+          "size",
+          "message_expiry",
+          "compression_algorithm",
+          "max_topic_size",
+          "messages_count",
+          "partitions_count",
+          "options"
+        ]
+      },
+      "TopicDetails": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "message_expiry": {
+            "$ref": "#/components/schemas/Expiry"
+          },
+          "compression_algorithm": {
+            "$ref": "#/components/schemas/CompressionAlgorithm"
+          },
+          "max_topic_size": {
+            "$ref": "#/components/schemas/MaxTopicSize"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Partition"
+            }
+          },
+          "options": {
+            "type": "object",
+            "description": "Resource options keyed by option name.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OptionValue"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "name",
+          "size",
+          "message_expiry",
+          "compression_algorithm",
+          "max_topic_size",
+          "messages_count",
+          "partitions_count",
+          "partitions",
+          "options"
+        ]
+      },
+      "Partition": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "segments_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "current_offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "size": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "segments_count",
+          "current_offset",
+          "size",
+          "messages_count"
+        ]
+      },
+      "CreateTopic": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique topic name, 1 to 255 bytes."
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "maximum": 1000,
+            "description": "Number of partitions, up to 1000."
+          },
+          "compression_algorithm": {
+            "$ref": "#/components/schemas/CompressionAlgorithm"
+          },
+          "message_expiry": {
+            "$ref": "#/components/schemas/Expiry"
+          },
+          "max_topic_size": {
+            "$ref": "#/components/schemas/MaxTopicSize"
+          },
+          "options": {
+            "type": "object",
+            "description": "Further topic options as strings, parsed with the same rules as the server config. Accepted keys: `compression_algorithm`, `message_expiry`, `max_topic_size`, `segment_size`, `durability`, `consumer_offset_durability`, `messages_required_to_save`, `size_of_messages_required_to_save` and `preallocate_segments`. Unknown keys are rejected. `GET /options/topic` describes each key.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          }
+        },
+        "required": [
+          "name",
+          "partitions_count",
+          "compression_algorithm",
+          "message_expiry",
+          "max_topic_size"
+        ]
+      },
+      "UpdateTopic": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Topic name, up to 255 bytes."
+          },
+          "compression_algorithm": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CompressionAlgorithm"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omit to keep the current value."
+          },
+          "message_expiry": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Expiry"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omit to keep the current value."
+          },
+          "max_topic_size": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MaxTopicSize"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omit to keep the current value."
+          },
+          "options": {
+            "type": "object",
+            "description": "Topic options to change. Only `compression_algorithm`, `message_expiry` and `max_topic_size` are accepted. Keys that are not sent keep their current values.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "CreatePartitions": {
+        "type": "object",
+        "properties": {
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 1,
+            "maximum": 1000,
+            "description": "Number of partitions to add, from 1 to 1000."
+          }
+        },
+        "required": [
+          "partitions_count"
+        ]
+      },
+      "ConsumerGroup": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "members_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "partitions_count",
+          "members_count"
+        ]
+      },
+      "ConsumerGroupDetails": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "members_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsumerGroupMember"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "partitions_count",
+          "members_count",
+          "members"
+        ]
+      },
+      "ConsumerGroupMember": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          }
+        },
+        "required": [
+          "id",
+          "partitions_count",
+          "partitions"
+        ]
+      },
+      "CreateConsumerGroup": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique consumer group name."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      },
+      "ConsumerId": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        ],
+        "description": "Consumer ID as a number, or an ID or name as a string. Defaults to 1."
+      },
+      "ConsumerOffsetInfo": {
+        "type": "object",
+        "properties": {
+          "partition_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "current_offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Current offset of the partition."
+          },
+          "stored_offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Offset stored for the consumer."
+          }
+        },
+        "required": [
+          "partition_id",
+          "current_offset",
+          "stored_offset"
+        ]
+      },
+      "StoreConsumerOffset": {
+        "type": "object",
+        "properties": {
+          "consumer_id": {
+            "$ref": "#/components/schemas/ConsumerId"
+          },
+          "partition_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Partition ID."
+          },
+          "offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Offset to store."
+          }
+        },
+        "required": [
+          "offset"
+        ]
+      },
+      "Stats": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "cpu_usage": {
+            "type": "number",
+            "format": "float"
+          },
+          "total_cpu_usage": {
+            "type": "number",
+            "format": "float"
+          },
+          "memory_usage": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "total_memory": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "available_memory": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "run_time": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Process run time in microseconds."
+          },
+          "start_time": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "read_bytes": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "written_bytes": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "messages_size_bytes": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "streams_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "topics_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "partitions_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "segments_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "messages_count": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "clients_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "consumer_groups_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "os_name": {
+            "type": "string"
+          },
+          "os_version": {
+            "type": "string"
+          },
+          "kernel_version": {
+            "type": "string"
+          },
+          "iggy_server_version": {
+            "type": "string"
+          },
+          "iggy_server_semver": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "description": "Version as major * 1000000 + minor * 1000 + patch."
+          },
+          "cache_metrics": {
+            "type": "object",
+            "description": "Cache metrics keyed by `<stream_id>-<topic_id>-<partition_id>`.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/CacheMetrics"
+            }
+          },
+          "threads_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "free_disk_space": {
+            "$ref": "#/components/schemas/ByteSize"
+          },
+          "total_disk_space": {
+            "$ref": "#/components/schemas/ByteSize"
+          }
+        },
+        "required": [
+          "process_id",
+          "cpu_usage",
+          "total_cpu_usage",
+          "memory_usage",
+          "total_memory",
+          "available_memory",
+          "run_time",
+          "start_time",
+          "read_bytes",
+          "written_bytes",
+          "messages_size_bytes",
+          "streams_count",
+          "topics_count",
+          "partitions_count",
+          "segments_count",
+          "messages_count",
+          "clients_count",
+          "consumer_groups_count",
+          "hostname",
+          "os_name",
+          "os_version",
+          "kernel_version",
+          "iggy_server_version",
+          "iggy_server_semver",
+          "cache_metrics",
+          "threads_count",
+          "free_disk_space",
+          "total_disk_space"
+        ]
+      },
+      "CacheMetrics": {
+        "type": "object",
+        "properties": {
+          "hits": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "misses": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "hit_ratio": {
+            "type": "number",
+            "format": "float"
+          }
+        },
+        "required": [
+          "hits",
+          "misses",
+          "hit_ratio"
+        ]
+      },
+      "GetSnapshot": {
+        "type": "object",
+        "properties": {
+          "compression": {
+            "type": "string",
+            "enum": [
+              "Stored",
+              "Deflated",
+              "Bzip2",
+              "Zstd",
+              "Lzma",
+              "Xz"
+            ],
+            "description": "Archive compression."
+          },
+          "snapshot_types": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "FilesystemOverview",
+                "ProcessList",
+                "ResourceUsage",
+                "Test",
+                "ServerLogs",
+                "ServerConfig",
+                "All"
+              ]
+            },
+            "description": "What to include in the archive."
+          }
+        },
+        "required": [
+          "compression",
+          "snapshot_types"
+        ]
+      },
+      "ClusterMetadata": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClusterNode"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "nodes"
+        ]
+      },
+      "ClusterNode": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "ip": {
+            "type": "string",
+            "description": "Address for the caller to connect to."
+          },
+          "endpoints": {
+            "$ref": "#/components/schemas/TransportEndpoints"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "leader",
+              "follower"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "starting",
+              "stopping",
+              "unreachable",
+              "maintenance",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "ip",
+          "endpoints",
+          "role",
+          "status"
+        ]
+      },
+      "TransportEndpoints": {
+        "type": "object",
+        "description": "Port numbers per transport.",
+        "properties": {
+          "tcp": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "quic": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "http": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "websocket": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
+        },
+        "required": [
+          "tcp",
+          "quic",
+          "http",
+          "websocket"
+        ]
+      },
+      "ClientInfo": {
+        "type": "object",
+        "properties": {
+          "client_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "user_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          },
+          "address": {
+            "type": "string"
+          },
+          "transport": {
+            "type": "string"
+          },
+          "consumer_groups_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "client_id",
+          "user_id",
+          "address",
+          "transport",
+          "consumer_groups_count"
+        ]
+      },
+      "ClientInfoDetails": {
+        "type": "object",
+        "properties": {
+          "client_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "user_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0
+          },
+          "address": {
+            "type": "string"
+          },
+          "transport": {
+            "type": "string"
+          },
+          "consumer_groups_count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "consumer_groups": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsumerGroupInfo"
+            }
+          }
+        },
+        "required": [
+          "client_id",
+          "user_id",
+          "address",
+          "transport",
+          "consumer_groups_count",
+          "consumer_groups"
+        ]
+      },
+      "ConsumerGroupInfo": {
+        "type": "object",
+        "properties": {
+          "stream_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "topic_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "group_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "stream_id",
+          "topic_id",
+          "group_id"
+        ]
+      },
+      "Partitioning": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "balanced",
+              "partition_id",
+              "messages_key"
+            ],
+            "description": "`balanced` picks a partition by round robin. `partition_id` uses the partition in `value`. `messages_key` hashes `value` to pick a partition."
+          },
+          "value": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Base64 bytes, at most 255 before encoding. For `partition_id`, the partition ID as 4 little-endian bytes. For `messages_key`, the key. May be empty only for `balanced`."
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ]
+      },
+      "HeaderField": {
+        "type": "object",
+        "description": "A typed header key or value.",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "raw",
+              "string",
+              "bool",
+              "int8",
+              "int16",
+              "int32",
+              "int64",
+              "int128",
+              "uint8",
+              "uint16",
+              "uint32",
+              "uint64",
+              "uint128",
+              "float32",
+              "float64"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Base64 of the value bytes. Numbers are little-endian."
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ]
+      },
+      "HeaderEntry": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "$ref": "#/components/schemas/HeaderField"
+          },
+          "value": {
+            "$ref": "#/components/schemas/HeaderField"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ]
+      },
+      "UserHeaders": {
+        "oneOf": [
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HeaderEntry"
+            }
+          },
+          {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Raw header bytes that could not be decoded as entries, such as client-side encrypted headers."
+          }
+        ]
+      },
+      "SendMessage": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0,
+                "description": "Numeric ID."
+              },
+              {
+                "type": "string",
+                "description": "Decimal 128-bit ID, or 32 hex digits with optional dashes (UUID form)."
+              }
+            ],
+            "description": "Message ID. Defaults to 0."
+          },
+          "payload": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Base64 message payload."
+          },
+          "user_headers": {
+            "oneOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/HeaderEntry"
+                }
+              },
+              {
+                "type": "string",
+                "contentEncoding": "base64",
+                "description": "Raw header bytes, for example client-side encrypted headers."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional user headers."
+          }
+        },
+        "required": [
+          "payload"
+        ]
+      },
+      "SendMessages": {
+        "type": "object",
+        "description": "Only `partitioning` and `messages` are accepted. Other fields are rejected.",
+        "properties": {
+          "partitioning": {
+            "$ref": "#/components/schemas/Partitioning"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SendMessage"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "partitioning",
+          "messages"
+        ]
+      },
+      "SendMessagesConfirmations": {
+        "type": "object",
+        "properties": {
+          "confirmations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SendMessagesConfirmation"
+            },
+            "description": "One entry per partition the batch landed in. Empty when the commit reported no offsets."
+          }
+        },
+        "required": [
+          "confirmations"
+        ]
+      },
+      "SendMessagesConfirmation": {
+        "type": "object",
+        "properties": {
+          "stream_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "topic_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "partition_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "base_offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Offset of the first message of the batch in the partition."
+          }
+        },
+        "required": [
+          "stream_id",
+          "topic_id",
+          "partition_id",
+          "base_offset"
+        ]
+      },
+      "PolledMessages": {
+        "type": "object",
+        "properties": {
+          "partition_id": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Partition the messages came from. An empty batch may carry a sentinel value instead."
+          },
+          "current_offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Current offset of the partition."
+          },
+          "count": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Number of messages returned."
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            }
+          }
+        },
+        "required": [
+          "partition_id",
+          "current_offset",
+          "count",
+          "messages"
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "header": {
+            "$ref": "#/components/schemas/MessageHeader"
+          },
+          "payload": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Base64 message payload."
+          },
+          "user_headers": {
+            "$ref": "#/components/schemas/UserHeaders",
+            "description": "User headers. An empty array when the message has none."
+          }
+        },
+        "required": [
+          "header",
+          "payload",
+          "user_headers"
+        ]
+      },
+      "MessageHeader": {
+        "type": "object",
+        "properties": {
+          "checksum": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "id": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Message ID, an unsigned 128-bit integer written as a JSON number."
+          },
+          "offset": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "timestamp": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Server timestamp in microseconds."
+          },
+          "origin_timestamp": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Client timestamp in microseconds."
+          },
+          "user_headers_length": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "payload_length": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "reserved": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "checksum",
+          "id",
+          "offset",
+          "timestamp",
+          "origin_timestamp",
+          "user_headers_length",
+          "payload_length",
+          "reserved"
+        ]
+      }
+    }
+  }
+}
