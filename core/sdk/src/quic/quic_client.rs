@@ -109,6 +109,10 @@ pub struct QuicClient {
     /// connection that drops without a `disconnect()` call leaves it clear, so
     /// that loss still heals.
     disconnected_by_caller: AtomicBool,
+    /// Serializes the caller intent: `Client::connect` holds it while it
+    /// clears `disconnected_by_caller`, and `Client::disconnect` holds it from
+    /// the moment it sets the flag until its teardown ends.
+    caller_intent: Mutex<()>,
     /// Set when `shutdown()` finishes its cleanup. The state turns `Shutdown`
     /// before that cleanup and stays there, so it cannot tell a finished
     /// shutdown from a cancelled one: a cancelled `shutdown()` leaves the
@@ -133,18 +137,26 @@ impl Default for QuicClient {
 #[async_trait]
 impl Client for QuicClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        // A sweep that started before the last disconnect ends at its next
-        // read of the flag. Joined, it would go on with the session that the
-        // disconnect reset, and hand its failure to this connect. Once
-        // another connect cleared the flag, its sweep is the one to join.
-        self.connect_coordinator
-            .wait_until_inactive(|| self.caller_disconnected())
-            .await;
-        self.disconnected_by_caller.store(false, Ordering::SeqCst);
+        {
+            // Held so that the flag cannot be cleared in the middle of a
+            // disconnect.
+            let _intent = self.caller_intent.lock().await;
+            // A sweep that started before the last disconnect ends at its next
+            // read of the flag. Joined, it would go on with the session that the
+            // disconnect reset, and hand its failure to this connect. Once
+            // another connect cleared the flag, its sweep is the one to join.
+            self.connect_coordinator
+                .wait_until_inactive(|| self.caller_disconnected())
+                .await;
+            self.disconnected_by_caller.store(false, Ordering::SeqCst);
+        }
         QuicClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // Held until the teardown ends: a connect cannot clear the flag, and
+        // so start a sweep, while this disconnect resets the session.
+        let _intent = self.caller_intent.lock().await;
         self.disconnected_by_caller.store(true, Ordering::SeqCst);
         self.forget_session_credentials().await;
         // A sweep in flight stops at its next check. Woken from its pause
@@ -690,6 +702,7 @@ impl QuicClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             disconnected_by_caller: AtomicBool::new(false),
+            caller_intent: Mutex::new(()),
             shutdown_complete: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
@@ -2620,5 +2633,70 @@ mod tests {
             "got {result:?}"
         );
         assert_eq!(client.get_state().await, ClientState::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_connect_during_a_disconnect_dials_only_after_the_disconnect_returns() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = quinn::ServerConfig::with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = Arc::new(
+            QuicClient::create(Arc::new(QuicClientConfig {
+                server_address: endpoint.local_addr().unwrap().to_string(),
+                reconnection: QuicClientReconnectionConfig {
+                    reestablish_after: IggyDuration::from_str("60s").unwrap(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .unwrap(),
+        );
+        // A connection a moment ago: the sweep waits out `reestablish_after`.
+        client
+            .connected_at
+            .lock()
+            .await
+            .replace(IggyTimestamp::now());
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { QuicClient::connect(&client).await }
+        });
+        while client.get_state().await != ClientState::Connecting {
+            sleep(Duration::from_millis(10)).await;
+        }
+        // Held by the test: the teardown of the disconnect waits for it.
+        let link = client.link.lock().await;
+        let disconnect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::disconnect(&*client).await }
+        });
+        sleep(Duration::from_millis(50)).await;
+        // Without that pause, the connect below dials at once.
+        client.connected_at.lock().await.take();
+        let connect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::connect(&*client).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), endpoint.accept())
+                .await
+                .is_err(),
+            "a connect must not dial while the disconnect tears down"
+        );
+        drop(link);
+        disconnect.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), endpoint.accept())
+            .await
+            .expect("the connect dials once the disconnect returned")
+            .expect("an incoming connection");
+        connect.abort();
+        assert!(matches!(sweep.await.unwrap(), Err(IggyError::NotConnected)));
     }
 }

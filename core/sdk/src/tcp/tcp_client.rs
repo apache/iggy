@@ -114,6 +114,10 @@ pub struct TcpClient {
     /// connection that drops without a `disconnect()` call leaves it clear, so
     /// that loss still heals.
     disconnected_by_caller: AtomicBool,
+    /// Serializes the caller intent: `Client::connect` holds it while it
+    /// clears `disconnected_by_caller`, and `Client::disconnect` holds it from
+    /// the moment it sets the flag until its teardown ends.
+    caller_intent: Mutex<()>,
     /// Set when `shutdown()` finishes its cleanup. The state turns `Shutdown`
     /// before that cleanup and stays there, so it cannot tell a finished
     /// shutdown from a cancelled one: a cancelled `shutdown()` leaves the
@@ -156,18 +160,26 @@ impl Default for TcpClient {
 #[async_trait]
 impl Client for TcpClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        // A sweep that started before the last disconnect ends at its next
-        // read of the flag. Joined, it would go on with the session that the
-        // disconnect reset, and hand its failure to this connect. Once
-        // another connect cleared the flag, its sweep is the one to join.
-        self.connect_coordinator
-            .wait_until_inactive(|| self.caller_disconnected())
-            .await;
-        self.disconnected_by_caller.store(false, Ordering::SeqCst);
+        {
+            // Held so that the flag cannot be cleared in the middle of a
+            // disconnect.
+            let _intent = self.caller_intent.lock().await;
+            // A sweep that started before the last disconnect ends at its next
+            // read of the flag. Joined, it would go on with the session that the
+            // disconnect reset, and hand its failure to this connect. Once
+            // another connect cleared the flag, its sweep is the one to join.
+            self.connect_coordinator
+                .wait_until_inactive(|| self.caller_disconnected())
+                .await;
+            self.disconnected_by_caller.store(false, Ordering::SeqCst);
+        }
         TcpClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // Held until the teardown ends: a connect cannot clear the flag, and
+        // so start a sweep, while this disconnect resets the session.
+        let _intent = self.caller_intent.lock().await;
         self.disconnected_by_caller.store(true, Ordering::SeqCst);
         // An explicit disconnect is caller intent, like a logout: the session
         // it ends must not be resurrected by the next reconnect, so the
@@ -553,6 +565,7 @@ impl TcpClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             disconnected_by_caller: AtomicBool::new(false),
+            caller_intent: Mutex::new(()),
             shutdown_complete: AtomicBool::new(false),
             session_owner,
             skip_auto_login_once: Mutex::new(false),
@@ -4115,5 +4128,39 @@ mod tests {
             "got {result:?}"
         );
         assert_eq!(client.get_state().await, ClientState::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_connect_during_a_disconnect_dials_only_after_the_disconnect_returns() {
+        let (client, sweep) = sweep_in_a_retry_pause().await;
+        let address = client.current_server_address.lock().await.clone();
+        // The endpoint comes back, so the connect below can dial it.
+        let listener = TcpListener::bind(&address).await.expect("bind again");
+        // Held by the test: the teardown of the disconnect waits for it.
+        let link = client.link.lock().await;
+        let disconnect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::disconnect(&*client).await }
+        });
+        sleep(Duration::from_millis(50)).await;
+        let connect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::connect(&*client).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a connect must not dial while the disconnect tears down"
+        );
+        drop(link);
+        disconnect.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("the connect dials once the disconnect returned")
+            .expect("accept");
+        connect.abort();
+        assert!(matches!(sweep.await.unwrap(), Err(IggyError::NotConnected)));
     }
 }

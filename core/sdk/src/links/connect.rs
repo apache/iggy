@@ -228,8 +228,10 @@ impl ConnectCoordinator {
     pub(crate) async fn pause(&self, duration: Duration) {
         let interrupted = self.interrupted.notified();
         tokio::pin!(interrupted);
-        // Registered before the count is read: an interrupt between the two
-        // still wakes this pause.
+        // `notify_waiters` wakes only the futures registered at that moment,
+        // and a `Notified` registers when it is first polled or enabled.
+        // Enabled before the count is read, this pause sees every interrupt:
+        // one before the read changes the count, one after it wakes the pause.
         interrupted.as_mut().enable();
         if self.interrupts.load(Ordering::SeqCst)
             != self.interrupts_at_owner_start.load(Ordering::SeqCst)
