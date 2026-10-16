@@ -32,6 +32,7 @@ use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 
 mod fetch;
+mod group_index;
 mod group_offsets;
 mod offsets;
 mod produce;
@@ -39,6 +40,8 @@ mod topics;
 
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
+use group_index::GroupIndex;
+pub use group_index::OffsetGroups;
 use group_offsets::OffsetPool;
 pub use group_offsets::{OFFSET_GROUP_PREFIX, OffsetCalls};
 use produce::ProducePool;
@@ -133,7 +136,7 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 /// Each producer sends on a client of its own, one request at a time. Producers past the session
 /// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
 /// `AlterConfigs` share another. Topic probes use a client of their own, Fetch polls one per read
-/// slot, and offset calls two per offset slot.
+/// slot, offset calls two per offset slot, and the scan for the groups that hold offsets one more.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -150,6 +153,10 @@ pub struct IggyBridge {
     probe_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
+    /// The Kafka groups that hold offsets. See `offset_groups`.
+    group_index: GroupIndex,
+    /// The client of the scan that finds those groups, so no offset call waits behind it.
+    scan_client: LazyClient,
 }
 
 /// The Iggy stream and topic one Kafka topic maps to. Resolve once per topic, use many times.
@@ -190,6 +197,8 @@ impl IggyBridge {
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
+            scan_client: LazyClient::default(),
         })
     }
 
@@ -245,17 +254,26 @@ impl IggyBridge {
     /// one fails, and the error is the first one.
     pub async fn close(&self) -> Result<(), BridgeError> {
         // At once, so a client that is slow to close does not use up the time of the others.
-        let (produce_clients, fetch_clients, probe_client, offset_clients, shared_client) = tokio::join!(
+        let (
+            produce_clients,
+            fetch_clients,
+            probe_client,
+            offset_clients,
+            scan_client,
+            shared_client,
+        ) = tokio::join!(
             self.produce_pool.close(),
             self.fetch_pool.close(),
             self.probe_client.close(),
             self.offset_pool.close(),
+            self.scan_client.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
             .and(fetch_clients)
             .and(probe_client)
             .and(offset_clients)
+            .and(scan_client)
             .and(shared_client)
     }
 }
@@ -289,6 +307,8 @@ impl IggyBridge {
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
+            group_index: GroupIndex::new(),
+            scan_client: LazyClient::default(),
         }
     }
 }

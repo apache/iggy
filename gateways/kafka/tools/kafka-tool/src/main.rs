@@ -30,6 +30,9 @@ use kafka_protocol::messages::join_group_request::*;
 use kafka_protocol::messages::leave_group_request::MemberIdentity;
 use kafka_protocol::messages::list_offsets_request::*;
 use kafka_protocol::messages::offset_commit_request::*;
+use kafka_protocol::messages::offset_delete_request::{
+    OffsetDeleteRequestPartition, OffsetDeleteRequestTopic,
+};
 use kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestGroup;
 use kafka_protocol::messages::produce_request::*;
 use kafka_protocol::messages::txn_offset_commit_request::*;
@@ -572,6 +575,24 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .with_auth_bytes(Bytes::from_static(b"\x00iggy\x00secret"))
                 .encode(&mut buf, version)
                 .context("SaslAuthenticate")?;
+        }
+        42 => {
+            DeleteGroupsRequest::default()
+                .with_groups_names(vec![GroupId::from(StrBytes::from_static_str("test-group"))])
+                .encode(&mut buf, version)
+                .context("DeleteGroups")?;
+        }
+        47 => {
+            let topic = OffsetDeleteRequestTopic::default()
+                .with_name(TopicName::from(StrBytes::from_static_str("test-topic")))
+                .with_partitions(vec![
+                    OffsetDeleteRequestPartition::default().with_partition_index(0),
+                ]);
+            OffsetDeleteRequest::default()
+                .with_group_id(GroupId::from(StrBytes::from_static_str("test-group")))
+                .with_topics(vec![topic])
+                .encode(&mut buf, version)
+                .context("OffsetDelete")?;
         }
         other => {
             warn!("api_key={other}: no explicit builder — empty payload (framing test)");

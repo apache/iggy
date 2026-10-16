@@ -18,28 +18,35 @@
 //! `DescribeGroups` (API key 15).
 //!
 //! Reports the members, assignment and state of groups this coordinator holds. A named group
-//! that is not here is `Dead`: v6 also carries `GROUP_ID_NOT_FOUND`, and earlier versions do
-//! not, matching Kafka 4.0's `describeGroups`. A v6 client treats error 0 as a real group.
+//! that is not here is `Empty` when it holds offsets in Iggy, as Kafka keeps a group whose
+//! consumers left. Otherwise it is `Dead`: v6 also carries `GROUP_ID_NOT_FOUND`, and earlier
+//! versions do not, matching Kafka 4.0's `describeGroups`. A v6 client treats error 0 as a real
+//! group. When no scan has found the groups that hold offsets yet (`IggyBridge::offset_groups`),
+//! a group that is not here gets `COORDINATOR_LOAD_IN_PROGRESS` (14), which clients retry.
 //!
 //! `include_authorized_operations` is not answered. The field stays at the omitted sentinel
 //! (`i32::MIN`): there is no group ACL bitfield to report, and any other value fails the
 //! encoder below v3.
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use kafka_protocol::messages::describe_groups_response::{DescribedGroup, DescribedGroupMember};
 use kafka_protocol::messages::{DescribeGroupsRequest, DescribeGroupsResponse, GroupId};
 use kafka_protocol::protocol::StrBytes;
 
+use crate::bridge::OffsetGroups;
 use crate::error::Result;
 use crate::group::{DESCRIBE_RESPONSE_TOO_LARGE, GroupDescription, MemberDescription};
 use crate::protocol::api::{
-    API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ERROR_GROUP_ID_NOT_FOUND, ERROR_NONE,
-    ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome, is_supported_version,
+    API_KEY_DESCRIBE_GROUPS, ApiVersionRange, ConnectionState, ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+    ERROR_GROUP_ID_NOT_FOUND, ERROR_NONE, ERROR_UNKNOWN_SERVER_ERROR, GatewayState, HandleOutcome,
+    is_supported_version,
 };
 use crate::protocol::bounds_guard::validate_describe_groups_shape;
 use crate::protocol::dedup::dedup_first_seen;
 use crate::protocol::handlers::{
-    decode_guarded, encode_message, respond_or_close, unsupported_version_response,
+    decode_guarded, encode_message, offset_deadline, respond_or_close, unsupported_version_response,
 };
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -54,7 +61,12 @@ const DEAD: &str = "Dead";
 /// `GROUP_ID_NOT_FOUND` for a missing group.
 const FIRST_ERROR_MESSAGE_VERSION: i16 = 6;
 
-pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
+pub async fn handle(
+    state: &GatewayState,
+    connection: &ConnectionState,
+    api_version: i16,
+    body: Bytes,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_DESCRIBE_GROUPS, api_version) {
         // No top-level error field to carry a code on, so this answers with an empty group
         // list rather than a dedicated error response. Versions outside 0-6 fail in the
@@ -90,12 +102,17 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         .groups
         .describe_groups(&group_ids, api_version, state.max_frame_size)
         .await;
+    let absent = if described.iter().any(Option::is_none) {
+        Absent::look_up(state, connection).await
+    } else {
+        Absent::Dead
+    };
     let groups = group_ids
         .iter()
         .zip(described)
         .map(|(group_id, group)| {
             group.map_or_else(
-                || missing_group(api_version, group_id),
+                || absent.answer(api_version, group_id),
                 |group| described_group(api_version, group),
             )
         })
@@ -103,9 +120,49 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     respond_or_close(encode_response(api_version, groups), "DescribeGroups")
 }
 
+/// How one request answers a group that is not on this coordinator.
+enum Absent {
+    /// Without a bridge no group holds offsets, so each one is `Dead`.
+    Dead,
+    /// `Empty` for a group that holds offsets, `Dead` for any other.
+    Known(Arc<OffsetGroups>),
+    /// No scan has found the groups that hold offsets yet.
+    Unknown,
+}
+
+impl Absent {
+    async fn look_up(state: &GatewayState, connection: &ConnectionState) -> Self {
+        let Some(bridge) = &state.bridge else {
+            return Self::Dead;
+        };
+        let deadline = offset_deadline(state, connection).await;
+        bridge
+            .offset_groups(deadline)
+            .await
+            .map_or(Self::Unknown, Self::Known)
+    }
+
+    fn answer(&self, version: i16, group_id: &StrBytes) -> DescribedGroup {
+        match self {
+            Self::Known(offset_groups) if offset_groups.contains(group_id.as_str()) => {
+                described_group(version, GroupDescription::offsets_only(group_id.clone()))
+            }
+            Self::Dead | Self::Known(_) => missing_group(version, group_id),
+            Self::Unknown => {
+                error_group(version, group_id, ERROR_COORDINATOR_LOAD_IN_PROGRESS, None)
+            }
+        }
+    }
+}
+
 pub(crate) fn described_group(version: i16, group: GroupDescription) -> DescribedGroup {
     if group.error != ERROR_NONE {
-        return too_large_group(version, &group.group_id);
+        return error_group(
+            version,
+            &group.group_id,
+            ERROR_UNKNOWN_SERVER_ERROR,
+            Some(DESCRIBE_RESPONSE_TOO_LARGE),
+        );
     }
     DescribedGroup::default()
         .with_group_id(GroupId(group.group_id))
@@ -116,19 +173,26 @@ pub(crate) fn described_group(version: i16, group: GroupDescription) -> Describe
 }
 
 /// Empty member list and empty strings, matching Kafka's `DescribeGroupsResponse.groupError`.
-/// The code is not retried by the admin tool, unlike closing the connection.
-fn too_large_group(version: i16, group_id: &StrBytes) -> DescribedGroup {
-    let mut group = DescribedGroup::default()
-        .with_error_code(ERROR_UNKNOWN_SERVER_ERROR)
+/// `message` goes out from v6. A group that does not fit the response gets
+/// `UNKNOWN_SERVER_ERROR`, which the admin tool does not retry, unlike closing the connection.
+/// One that waits for the first scan gets `COORDINATOR_LOAD_IN_PROGRESS`, which it retries.
+fn error_group(
+    version: i16,
+    group_id: &StrBytes,
+    code: i16,
+    message: Option<&'static str>,
+) -> DescribedGroup {
+    let group = DescribedGroup::default()
+        .with_error_code(code)
         .with_group_id(GroupId(group_id.clone()))
         .with_group_state(StrBytes::from_static_str(""))
         .with_protocol_type(StrBytes::from_static_str(""))
         .with_protocol_data(StrBytes::from_static_str(""));
     if version >= FIRST_ERROR_MESSAGE_VERSION {
-        group =
-            group.with_error_message(Some(StrBytes::from_static_str(DESCRIBE_RESPONSE_TOO_LARGE)));
+        group.with_error_message(message.map(StrBytes::from_static_str))
+    } else {
+        group
     }
-    group
 }
 
 fn described_member(member: MemberDescription) -> DescribedGroupMember {

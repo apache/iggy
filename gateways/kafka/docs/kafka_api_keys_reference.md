@@ -90,10 +90,11 @@ Key new minimums:
 | 14 | **SyncGroup** | 1 | 5 | v4 | 🟠 Required Stub |
 | 15 | **DescribeGroups** | 0 | 6 | v5 | Implemented |
 | 16 | **ListGroups** | 1 | 5 | v3 | Implemented |
-| 42 | **DeleteGroups** | 1 | 2 | v2 | 🟡 Optional Stub |
+| 42 | **DeleteGroups** | 1 | 2 | v2 | Implemented |
 
-> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups.
-> See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
+> DescribeGroups and ListGroups are implemented. They read this coordinator's in-memory groups, and
+> report a group that only holds offsets in Iggy as `Empty`. DeleteGroups, and OffsetDelete (47)
+> below, delete those offsets. See [`CONSUMER_GROUPS.md`](CONSUMER_GROUPS.md).
 
 ---
 
@@ -183,7 +184,7 @@ Key new minimums:
 | 43 | **ElectLeaders** | 0 | 2 | v2 | 🟡 Optional Stub |
 | 45 | **AlterPartitionReassignments** | 0 | 0 | v0 | 🟡 Optional Stub |
 | 46 | **ListPartitionReassignments** | 0 | 0 | v0 | 🟡 Optional Stub |
-| 47 | **OffsetDelete** | 0 | 0 | never | 🟡 Optional Stub |
+| 47 | **OffsetDelete** | 0 | 0 | never | Implemented |
 | 57 | **UpdateFeatures** | 0 | 1 | v1 | 🟡 Optional Stub |
 
 ---
