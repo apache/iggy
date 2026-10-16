@@ -875,7 +875,7 @@ async fn shard_main(
         let hb_shard = Rc::clone(&shard);
         let hb_sessions = Rc::clone(&sessions);
         let hb_interval = config.heartbeat.interval.get_duration();
-        let hb_max_age = config.heartbeat.staleness_window();
+        let hb_max_age = config.heartbeat.session_timeout();
         let hb_handle = compio::runtime::spawn(async move {
             crate::dispatch::session_ops::run_heartbeat_verifier(
                 hb_shard,
@@ -1043,7 +1043,7 @@ async fn shard_main(
         let (stop_tx, stop_rx) = channel(1);
         let cleaner_shard = Rc::clone(&shard);
         let interval = config.consumer_group.heartbeat_interval.get_duration();
-        let timeout = config.heartbeat.staleness_window();
+        let timeout = config.heartbeat.session_timeout();
         let system_path = config.get_system_path();
         let handle = compio::runtime::spawn(async move {
             crate::consumer_group::liveness::run(

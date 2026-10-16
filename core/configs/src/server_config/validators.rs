@@ -359,11 +359,11 @@ impl Validatable<ConfigurationError> for ServerConfig {
         // These knobs sit on shared section structs, so the rejects live
         // here rather than in those types' own `Validatable` impls. `0` /
         // `disabled` / `unlimited` all parse to the same zero duration.
-        let staleness_window = self.heartbeat.staleness_window();
+        let session_timeout = self.heartbeat.session_timeout();
         let heartbeat_interval = self.consumer_group.heartbeat_interval.get_duration();
         if heartbeat_interval.is_zero() {
             eprintln!(
-                "{COMPONENT} consumer_group.heartbeat_interval ({heartbeat_interval:?}) must be nonzero; the session timeout, 1.2 x heartbeat.interval, is {staleness_window:?}"
+                "{COMPONENT} consumer_group.heartbeat_interval ({heartbeat_interval:?}) must be nonzero; the session timeout, 1.2 x heartbeat.interval, is {session_timeout:?}"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -373,16 +373,16 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .saturating_add(CONSUMER_SESSION_REPORT_TIMEOUT)
             .saturating_mul(CONSUMER_SESSION_MISSED_REPORT_TOLERANCE + 1)
             .saturating_add(heartbeat_interval);
-        if staleness_window <= minimum_timeout {
+        if session_timeout <= minimum_timeout {
             eprintln!(
-                "{COMPONENT} 1.2 x heartbeat.interval ({staleness_window:?}) must exceed {minimum_timeout:?}, covering three consumer_group.heartbeat_interval periods and two gather/send deadlines, allowing one missed report"
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed {minimum_timeout:?}, covering three consumer_group.heartbeat_interval periods and two gather/send deadlines, allowing one missed report. Raise heartbeat.interval, which sets the session timeout also with heartbeat.enabled = false, or lower consumer_group.heartbeat_interval"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
         let cluster_timeout = self.cluster.heartbeat_timeout.get_duration();
-        if self.cluster.enabled && staleness_window <= cluster_timeout {
+        if self.cluster.enabled && session_timeout <= cluster_timeout {
             eprintln!(
-                "{COMPONENT} 1.2 x heartbeat.interval ({staleness_window:?}) must exceed cluster.heartbeat_timeout ({cluster_timeout:?})"
+                "{COMPONENT} the session timeout, 1.2 x heartbeat.interval ({session_timeout:?}), must exceed cluster.heartbeat_timeout ({cluster_timeout:?}). Raise heartbeat.interval"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -1120,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn given_heartbeat_window_above_missed_report_budget_when_validating_should_pass() {
+    fn given_session_timeout_above_missed_report_budget_when_validating_should_pass() {
         let config = config_with_override(
             "[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"6417ms\"\n",
         );
@@ -1140,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn given_heartbeat_window_within_cluster_liveness_window_when_validating_should_reject() {
+    fn given_session_timeout_within_cluster_liveness_window_when_validating_should_reject() {
         for interval in ["12500ms", "15s"] {
             let config = config_with_override(&format!(
                 "[cluster]\nenabled = true\nheartbeat_timeout = \"18s\"\n[consumer_group]\nheartbeat_interval = \"500ms\"\n[heartbeat]\ninterval = \"{interval}\"\n"

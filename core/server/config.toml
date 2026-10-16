@@ -326,14 +326,20 @@ enabled = true
 # Interval for expected client heartbeats. 1.2 x interval is the session
 # timeout: the metadata primary ends a session that no server reported for
 # that long, whether or not heartbeat checks are enabled. That covers a closed
-# connection, a crashed client and a lost node. With checks on, it also covers
-# a silent connection, which loses its session after about 2.4 x interval.
+# connection and a lost node. With checks on, it also covers a silent
+# connection, which loses its session after about 2.4 x interval. With checks
+# off, a client host that dies without closing its socket keeps its session:
+# TCP and WebSocket set no keepalive, and only QUIC closes such a connection,
+# after quic.max_idle_timeout. An idle HTTP session expires after about
+# 2.4 x interval either way.
 # The consumer groups of an ended session rebalance, and its client must log
 # in again. Each new primary grants a fresh timeout. Incomplete client lists
 # defer expiry across the cluster until a full timeout has passed without an
 # incomplete report. 1.2 x interval must exceed cluster.heartbeat_timeout when
 # clustering is enabled, and three consumer_group.heartbeat_interval periods
 # plus two gather (3s) and send (100ms) deadlines, allowing one missed report.
+# So interval must exceed (3 x consumer_group.heartbeat_interval + 6.2s) / 1.2:
+# about 17.67s at the default 5s, and always more than 5.16s.
 # The SDKs ping automatically every 5 s, but only from a connected high-level
 # client: the Rust and Java pingers start in connect(), so a session that logs
 # in without it never pings. Use the same settings on all nodes.

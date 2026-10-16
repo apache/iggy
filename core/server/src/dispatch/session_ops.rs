@@ -364,8 +364,8 @@ const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
 }
 
 /// Per-shard heartbeat verifier: every `interval`, evict group-member
-/// connections that sent nothing for `max_age`, the heartbeat staleness
-/// window. Mirrors the legacy `verify_heartbeats` periodic task. Eviction
+/// connections that sent nothing for `max_age`, the session timeout.
+/// Mirrors the legacy `verify_heartbeats` periodic task. Eviction
 /// removes the connection binding and sends `Eviction(StaleClient)`. The
 /// shared logical session and its group membership remain until committed
 /// lease expiry or explicit logout.

@@ -85,21 +85,20 @@ pub struct HeartbeatConfig {
 }
 
 impl HeartbeatConfig {
-    // A client is stale once it misses 1.2 intervals. Integer 6/5 rather
-    // than `mul_f64`, which panics on an absurd interval.
-    const STALENESS_NUMERATOR: u32 = 6;
-    const STALENESS_DENOMINATOR: u32 = 5;
+    // Integer 6/5 rather than `mul_f64`, which panics on an absurd interval.
+    const SESSION_TIMEOUT_NUMERATOR: u32 = 6;
+    const SESSION_TIMEOUT_DENOMINATOR: u32 = 5;
 
     /// The session timeout, 1.2 x `interval`. With heartbeat checks on, a
     /// connection silent this long stops renewing its session. With or without
     /// checks, the metadata primary ends a session that no server renewed for
     /// this long.
     #[must_use]
-    pub fn staleness_window(&self) -> Duration {
+    pub fn session_timeout(&self) -> Duration {
         self.interval
             .get_duration()
-            .saturating_mul(Self::STALENESS_NUMERATOR)
-            / Self::STALENESS_DENOMINATOR
+            .saturating_mul(Self::SESSION_TIMEOUT_NUMERATOR)
+            / Self::SESSION_TIMEOUT_DENOMINATOR
     }
 }
 

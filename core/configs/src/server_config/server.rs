@@ -153,11 +153,13 @@ const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
         path: "extra",
         replacement: RelocatedTarget::Removed,
     },
-    // 1.2 x heartbeat.interval is the session timeout now. Refusing the old
-    // key keeps an operator's timeout from changing without notice.
+    // Refusing the old key keeps an operator's timeout from changing without
+    // notice.
     RelocatedKey {
         path: "consumer_group.session_timeout",
-        replacement: RelocatedTarget::Removed,
+        replacement: RelocatedTarget::Superseded(
+            "the session timeout is now 1.2 x heartbeat.interval",
+        ),
     },
 ];
 

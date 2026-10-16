@@ -32,6 +32,11 @@ use tokio::time::sleep;
 /// suite.
 const STALE_EVICTION_TIMEOUT: Duration = Duration::from_secs(30);
 const STALE_EVICTION_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a live member must keep its membership across a backup restart.
+/// More than twice the 8.4s session timeout at the specs' 7s heartbeat
+/// interval, so the wait outlasts the expiry of a lease that the restart
+/// stopped renewing.
+const MEMBERSHIP_HOLD_PERIOD: Duration = Duration::from_secs(20);
 
 const STREAM_NAME: &str = "stale-test-stream";
 const TOPIC_NAME: &str = "stale-test-topic";
@@ -142,7 +147,7 @@ async fn given_live_member_when_backup_restarts_should_preserve_membership(
 
     harness.kill_node(2).unwrap();
     harness.restart_node(2).unwrap();
-    sleep(STALE_EVICTION_TIMEOUT).await;
+    sleep(MEMBERSHIP_HOLD_PERIOD).await;
 
     let observer = harness.root_client_for_node(0).await.unwrap();
     let after = observer
@@ -446,28 +451,15 @@ async fn should_handle_stale_client_with_manual_reconnection(
     // waiting for. That is also why the assertion below gets only a couple of
     // attempts -- each one refreshes liveness, so retrying harder makes
     // eviction less likely, not more.
-    let deadline = tokio::time::Instant::now() + STALE_EVICTION_TIMEOUT;
-    loop {
-        let group = setup_client
-            .get_consumer_group(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
-            )
-            .await
-            .unwrap()
-            .expect("consumer group exists");
-        if group.members_count == 0 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?}, \
-             group still reports {} member(s)",
-            group.members_count
-        );
-        sleep(STALE_EVICTION_RETRY_INTERVAL).await;
-    }
+    integration::harness::wait_for_consumer_group_assignment(
+        &setup_client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        0,
+        STALE_EVICTION_TIMEOUT,
+    )
+    .await;
 
     let mut got_error = false;
     for _ in 0..3 {
@@ -582,7 +574,15 @@ async fn should_handle_stale_client_with_auto_reconnection(
                 // Stay silent until the verifier evicts the connection and
                 // the server ends the session, so the consumer must
                 // reconnect, log in again and rejoin its group.
-                sleep(STALE_EVICTION_TIMEOUT).await;
+                integration::harness::wait_for_consumer_group_assignment(
+                    &setup_client,
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+                    0,
+                    STALE_EVICTION_TIMEOUT,
+                )
+                .await;
             }
         }
     }
