@@ -166,18 +166,6 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
-    /// The reply to `GetPollRouting` and `GetConsumerOffsetRouting`: the
-    /// session of `request` and a primary at `primary`.
-    static func pollRouteBody(for request: Request, context: PartitionContext, primary: String, watermark: UInt64 = 0) -> [UInt8] {
-        var writer = ByteWriter()
-        writer.write(request.clientID)
-        writer.write(request.session)
-        writer.write(watermark)
-        context.encode(into: &writer)
-        writeNode(primary, replicaID: 0, leader: true, into: &writer)
-        return writer.bytes
-    }
-
     /// A poll reply without messages.
     static func polledBody(partitionID: UInt32, context: PartitionContext = .empty) -> [UInt8] {
         var writer = ByteWriter()
@@ -296,9 +284,7 @@ final class FakeVSRServer: @unchecked Sendable {
             return .ok(registerBody(session: request.session))
         case .getPartitionRoute:
             return .ok(partitionRouteBody(routeContext))
-        case .getPollRouting, .getConsumerOffsetRouting:
-            return .ok(pollRouteBody(for: request, context: routeContext, primary: address))
-        case .pollMessagesOnPrimary:
+        case .pollMessages:
             return .ok(polledBody(partitionID: 0, context: routeContext))
         default:
             return .ok([])
