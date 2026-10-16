@@ -37,6 +37,15 @@ final class Locked<Value>: @unchecked Sendable {
         defer { lock.unlock() }
         return try body(&value)
     }
+
+    /// Stores `newValue` and returns the value it replaced.
+    func exchange(_ newValue: Value) -> Value {
+        withLock { value in
+            let previous = value
+            value = newValue
+            return previous
+        }
+    }
 }
 
 /// Polls `condition` until it holds or `timeout` passes.
@@ -60,5 +69,17 @@ func expectCode(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_source
         #expect(error.code == code, "expected \(code), got \(error)", sourceLocation: sourceLocation)
     } catch {
         Issue.record("expected \(code), got \(error)", sourceLocation: sourceLocation)
+    }
+}
+
+extension IggyClient {
+    /// ``sendMessages(streamID:topicID:partitioning:messages:)`` for a batch
+    /// the test does not read back, so the call can take a literal.
+    @discardableResult
+    func sendBatch(
+        streamID: Identifier, topicID: Identifier, partitioning: Partitioning = .balanced, messages: [IggyMessage]
+    ) async throws -> SendMessagesResponse {
+        var batch = messages
+        return try await sendMessages(streamID: streamID, topicID: topicID, partitioning: partitioning, messages: &batch)
     }
 }

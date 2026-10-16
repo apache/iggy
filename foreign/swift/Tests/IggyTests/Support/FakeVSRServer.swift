@@ -35,6 +35,7 @@ final class FakeVSRServer: @unchecked Sendable {
         let session: UInt64
         let clientID: UInt128Value
         let checksum: UInt64
+        let context: PartitionContext
         let payload: [UInt8]
     }
 
@@ -43,6 +44,8 @@ final class FakeVSRServer: @unchecked Sendable {
         /// Status zero with this body; result-framed operations get the
         /// empty result section prepended.
         case ok([UInt8])
+        /// `ok` from a metadata operation that committed at `commit`.
+        case committed([UInt8], commit: UInt64)
         /// A pre-commit denial: the status in the header, no body.
         case status(UInt32)
         /// A committed rejection carried in the result section.
@@ -134,25 +137,91 @@ final class FakeVSRServer: @unchecked Sendable {
         try! writer.writeLongString("fake-cluster")
         writer.write(UInt32(addresses.count))
         for (index, address) in addresses.enumerated() {
-            let endpoint = try! Endpoint(parsing: address)
-            writer.write(UInt8(index))
-            try! writer.writeLongString("node-\(index)")
-            try! writer.writeLongString(endpoint.host)
-            writer.write(UInt16(endpoint.port))
-            writer.write(UInt16(0))
-            writer.write(UInt16(0))
-            writer.write(UInt16(0))
-            writer.write(index == leaderIndex ? ClusterNodeRole.leader.rawValue : ClusterNodeRole.follower.rawValue)
-            writer.write(ClusterNodeStatus.healthy.rawValue)
+            writeNode(address, replicaID: UInt8(index), leader: index == leaderIndex, into: &writer)
         }
         return writer.bytes
     }
 
-    static func encodeReply(request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8]) -> [UInt8] {
+    static func writeNode(_ address: String, replicaID: UInt8, leader: Bool, into writer: inout ByteWriter) {
+        let endpoint = try! Endpoint(parsing: address)
+        writer.write(replicaID)
+        try! writer.writeLongString("node-\(replicaID)")
+        try! writer.writeLongString(endpoint.host)
+        writer.write(UInt16(endpoint.port))
+        writer.write(UInt16(0))
+        writer.write(UInt16(0))
+        writer.write(UInt16(0))
+        writer.write(leader ? ClusterNodeRole.leader.rawValue : ClusterNodeRole.follower.rawValue)
+        writer.write(ClusterNodeStatus.healthy.rawValue)
+    }
+
+    /// The reply to `GetPartitionRoute`.
+    static func partitionRouteBody(_ context: PartitionContext, partitionsCount: UInt32 = 3, primaryReplica: UInt8 = 0) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(context.incarnation)
+        writer.write(context.metadataOp)
+        writer.write(UInt32(1))
+        writer.write(partitionsCount)
+        writer.write(primaryReplica)
+        return writer.bytes
+    }
+
+    /// The reply to `GetPollRouting` and `GetConsumerOffsetRouting`: the
+    /// session of `request` and a primary at `primary`.
+    static func pollRouteBody(for request: Request, context: PartitionContext, primary: String, watermark: UInt64 = 0) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(request.clientID)
+        writer.write(request.session)
+        writer.write(watermark)
+        context.encode(into: &writer)
+        writeNode(primary, replicaID: 0, leader: true, into: &writer)
+        return writer.bytes
+    }
+
+    /// A poll reply without messages.
+    static func polledBody(partitionID: UInt32, context: PartitionContext = .empty) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(partitionID)
+        writer.write(UInt64(0))
+        writer.write(UInt32(0))
+        context.encode(into: &writer)
+        return writer.bytes
+    }
+
+    /// The reply to `SyncConsumerGroup` for a member.
+    static func assignmentBody(generation: UInt64, partitions: [UInt32]) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(generation)
+        writer.write(UInt32(partitions.count))
+        for partition in partitions {
+            writer.write(partition)
+        }
+        return writer.bytes
+    }
+
+    /// A topic with three partitions, 0 to 2, under `contexts`.
+    static func topicBody(contexts: [PartitionContext]) -> [UInt8] {
+        precondition(contexts.count == 3, "the golden topic header names three partitions")
+        var writer = ByteWriter()
+        writer.write(GoldenFixture.shared.bytes("response.topic_header"))
+        for (id, context) in contexts.enumerated() {
+            writer.write(UInt32(id))
+            writer.write(UInt64(0))
+            writer.write(UInt32(1))
+            writer.write(UInt64(0))
+            writer.write(UInt64(0))
+            writer.write(UInt64(0))
+            context.encode(into: &writer)
+        }
+        return writer.bytes
+    }
+
+    static func encodeReply(request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8], commit: UInt64 = 0) -> [UInt8] {
         var frame = [UInt8](repeating: 0, count: VSRFrame.headerSize)
         frame.withUnsafeMutableBytes { buffer in
             buffer.storeBytes(of: UInt32(VSRFrame.headerSize + body.count).littleEndian, toByteOffset: VSRFrame.ReplyOffset.size, as: UInt32.self)
             buffer[VSRFrame.ReplyOffset.command] = VSRFrame.Command.reply.rawValue
+            buffer.storeBytes(of: commit.littleEndian, toByteOffset: VSRFrame.ReplyOffset.commit, as: UInt64.self)
             buffer.storeBytes(of: request.requestID.littleEndian, toByteOffset: VSRFrame.ReplyOffset.request, as: UInt64.self)
             buffer[VSRFrame.ReplyOffset.operation] = operation.rawValue
             buffer.storeBytes(of: status.littleEndian, toByteOffset: VSRFrame.ReplyOffset.status, as: UInt32.self)
@@ -190,17 +259,47 @@ final class FakeVSRServer: @unchecked Sendable {
             connection: connection, operation: operation, code: code, requestID: u64(VSRFrame.RequestOffset.request),
             session: u64(VSRFrame.RequestOffset.session),
             clientID: UInt128Value(low: u64(VSRFrame.RequestOffset.client), high: u64(VSRFrame.RequestOffset.client + 8)),
-            checksum: u64(VSRFrame.RequestOffset.requestChecksum), payload: frame.body)
+            checksum: u64(VSRFrame.RequestOffset.requestChecksum),
+            context: PartitionContext(
+                incarnation: u64(VSRFrame.RequestOffset.partitionIncarnation), ownerGeneration: u64(VSRFrame.RequestOffset.ownerGeneration),
+                metadataOp: u64(VSRFrame.RequestOffset.minimumMetadataOp)),
+            payload: frame.body)
+    }
+
+    /// The partition context the default script routes every partition to.
+    static let routeContext = PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10)
+
+    /// The answer to a register and to a resume: the session is bound, as on
+    /// a node that holds it. Nil for any other request.
+    static func sessionReply(_ request: Request) -> Reply? {
+        if request.operation == .register {
+            return .ok(registerBody())
+        }
+        if request.code == CommandCode.bindSession.rawValue {
+            return .ok(registerBody(session: request.session))
+        }
+        return nil
     }
 
     /// Answers every request successfully with an empty body, a bound
-    /// session for a register, and a single-node roster for the metadata read.
+    /// session for a register and a bind, a single-node roster for the
+    /// metadata read, routes to this server under ``routeContext``, and an
+    /// empty poll.
     static func defaultReply(_ request: Request, address: String) -> Reply {
-        switch request.operation {
-        case .register:
+        if request.operation == .register {
             return .ok(registerBody())
-        case .nonReplicated where request.code == CommandCode.getClusterMetadata.rawValue:
+        }
+        switch request.code.flatMap(CommandCode.init(rawValue:)) {
+        case .getClusterMetadata:
             return .ok(rosterBody([address]))
+        case .bindSession:
+            return .ok(registerBody(session: request.session))
+        case .getPartitionRoute:
+            return .ok(partitionRouteBody(routeContext))
+        case .getPollRouting, .getConsumerOffsetRouting:
+            return .ok(pollRouteBody(for: request, context: routeContext, primary: address))
+        case .pollMessagesOnPrimary:
+            return .ok(polledBody(partitionID: 0, context: routeContext))
         default:
             return .ok([])
         }
@@ -290,6 +389,8 @@ final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
             switch reply {
             case .ok(let body):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
+            case .committed(let body, let commit):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), commit: commit))
             case .status(let status):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: status, body: []))
             case .committedRejection(let code):
@@ -303,7 +404,7 @@ final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
             case .wrongRequestID(let requestID):
                 let wrong = FakeVSRServer.Request(
                     connection: request.connection, operation: operation, code: request.code, requestID: requestID, session: request.session,
-                    clientID: request.clientID, checksum: request.checksum, payload: request.payload)
+                    clientID: request.clientID, checksum: request.checksum, context: request.context, payload: request.payload)
                 write(FakeVSRServer.encodeReply(request: wrong, operation: operation, status: 0, body: framedBody([])))
             case .close:
                 channel.close(promise: nil)
