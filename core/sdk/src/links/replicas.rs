@@ -25,7 +25,8 @@
 //! `NotConnected`.
 
 use super::connect::{
-    ConnectCoordinator, is_same_address, is_same_spelling, node_address, transport_port,
+    ConnectCoordinator, accepts_state, is_same_address, is_same_spelling, node_address,
+    transport_port,
 };
 use super::{
     Dialer, Link, OPERATION_TIMEOUT, backoff, event_channel, exchange, lost_link,
@@ -34,7 +35,7 @@ use super::{
 use crate::SDK_VERSION;
 use crate::session_owner::{SessionEpoch, SessionOwner};
 use async_broadcast::{Receiver, Sender};
-use futures::future::join_all;
+use futures::{FutureExt, future::join_all};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::codes::{BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, PING_CODE};
 use iggy_binary_protocol::requests::system::{
@@ -52,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 use tracing::{info, warn};
 
 /// Dials that run at once, for one client.
@@ -60,6 +61,9 @@ const MAX_CONCURRENT_DIALS: usize = 4;
 
 /// The longest pause before a slot or a sweep tries again.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+const TEST_JITTER_DRAW: f64 = 0.5;
 
 /// The reconnection configuration, the same for every transport.
 #[derive(Debug, Clone, Copy)]
@@ -71,7 +75,7 @@ pub(crate) struct ReconnectPolicy {
     pub(super) max_retries: Option<u32>,
     /// The base of the backoff.
     pub(super) interval: Duration,
-    /// A link that stayed up this long redials at once after a loss.
+    /// A link that stayed up this long resets its backoff after a loss.
     pub(super) reestablish_after: Duration,
 }
 
@@ -81,7 +85,11 @@ impl ReconnectPolicy {
     }
 
     fn pause(&self, retry: u32) -> Duration {
-        backoff(retry, self.interval, RECONNECT_BACKOFF_MAX, rand::random())
+        #[cfg(not(test))]
+        let draw = rand::random();
+        #[cfg(test)]
+        let draw = TEST_JITTER_DRAW;
+        backoff(retry, self.interval, RECONNECT_BACKOFF_MAX, draw)
     }
 }
 
@@ -142,6 +150,7 @@ struct LinksShared {
 #[derive(Debug)]
 struct Table {
     state: ClientState,
+    shutdown_complete: bool,
     /// One slot per replica of the last roster. A replica id is a `u8`, so
     /// the table holds at most 256 slots.
     slots: BTreeMap<u8, Slot>,
@@ -216,6 +225,7 @@ impl ReplicaLinks {
         let (events, subscribers) = event_channel();
         let table = Table {
             state: ClientState::Disconnected,
+            shutdown_complete: false,
             slots: BTreeMap::new(),
             bootstrap: None,
             metadata_primary: None,
@@ -238,13 +248,58 @@ impl ReplicaLinks {
 
     /// Sweeps the known endpoints until one of them signs in. Concurrent
     /// callers share one result. On a connected client, every slot without a
-    /// link dials again at once.
+    /// link restarts with its initial reconnect jitter.
     pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         let shared = &self.shared;
         shared
             .coordinator
-            .run(|abandoned, _| shared.sweep(abandoned))
+            .run(|abandoned| shared.sweep(abandoned, true))
             .await
+    }
+
+    /// Reuses the sweep and its coordinator, but leaves a new session for the
+    /// caller's explicit credentials. An existing session resumes for logout.
+    pub(crate) async fn prepare_sign_in(&self) -> Result<(), IggyError> {
+        let shared = &self.shared;
+        let fence = shared.session.fence();
+        let mut retry = false;
+        loop {
+            let mut owner = false;
+            let result = shared
+                .coordinator
+                .run(|abandoned| {
+                    owner = true;
+                    async move {
+                        if retry && shared.session.fence() != fence {
+                            return Err(IggyError::NotConnected);
+                        }
+                        shared.sweep(abandoned || retry, false).await
+                    }
+                })
+                .await;
+            // A concurrent Connect owns its credentials and result. Its
+            // rejection cannot reject different explicit credentials.
+            if !owner
+                && result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error,
+                        IggyError::InvalidCredentials
+                            | IggyError::InvalidUsername
+                            | IggyError::InvalidPassword
+                            | IggyError::InvalidPersonalAccessToken
+                            | IggyError::PersonalAccessTokenExpired(..)
+                            | IggyError::UserInactive
+                            | IggyError::Unauthenticated
+                            | IggyError::InvalidFormat
+                    )
+                })
+                && shared.session.fence() == fence
+            {
+                retry = true;
+                continue;
+            }
+            return result;
+        }
     }
 
     /// Aborts every task and closes every link, which fails each pending
@@ -257,7 +312,7 @@ impl ReplicaLinks {
     pub(crate) async fn shutdown(&self) {
         let links = {
             let mut table = self.shared.table();
-            if table.state == ClientState::Shutdown {
+            if table.shutdown_complete {
                 return;
             }
             table.state = ClientState::Shutdown;
@@ -265,12 +320,17 @@ impl ReplicaLinks {
         };
         join_all(links.into_iter().map(Link::shutdown)).await;
         self.shared.dialer.shutdown().await;
-        self.shared.publish(DiagnosticEvent::Shutdown);
+        let mut table = self.shared.table();
+        if !table.shutdown_complete {
+            table.shutdown_complete = true;
+            drop(table);
+            self.shared.publish(DiagnosticEvent::Shutdown);
+        }
     }
 
     /// Pings every link that serves the session, all at once. A failed ping
     /// only logs, because a link that lost its connection redials on its own.
-    pub(crate) async fn keepalive(&self) -> Result<(), IggyError> {
+    pub(crate) async fn keepalive(&self) -> Result<bool, IggyError> {
         let links: Vec<Arc<Link>> = {
             let epoch = self.shared.session.epoch();
             let table = self.shared.table();
@@ -293,12 +353,14 @@ impl ReplicaLinks {
                 deadline,
             )
         });
+        let mut succeeded = false;
         for result in join_all(pings).await {
-            if let Err(error) = result {
-                warn!("A keepalive ping failed: {error}");
+            match result {
+                Ok(_) => succeeded = true,
+                Err(error) => warn!("A keepalive ping failed: {error}"),
             }
         }
-        Ok(())
+        Ok(succeeded)
     }
 
     /// The link for `target`. A request never dials, so a target without a
@@ -309,11 +371,7 @@ impl ReplicaLinks {
         let slot = |id: u8| table.slots.get(&id).and_then(|slot| slot.link.as_ref());
         let ready = match target {
             Target::Replica(id) => slot(id),
-            Target::MetadataPrimary => table
-                .metadata_primary
-                .and_then(slot)
-                .filter(|ready| serves(ready, epoch))
-                .or(table.bootstrap.as_ref().map(|bootstrap| &bootstrap.link)),
+            Target::MetadataPrimary => table.primary_link(epoch),
         };
         ready
             .filter(|ready| serves(ready, epoch))
@@ -350,7 +408,12 @@ impl ReplicaLinks {
 
     /// Reads the roster on `link` and rebuilds the slots from it.
     pub(crate) async fn refresh_roster(&self, link: &Arc<Link>) -> Result<(), IggyError> {
-        self.shared.refresh_roster(link).await
+        timeout_at(
+            iggy_common::binary_operation_deadline(),
+            self.shared.refresh_roster(link),
+        )
+        .await
+        .map_err(|_| IggyError::TransientNotAccepted)?
     }
 
     pub(crate) fn subscribe(&self) -> Receiver<DiagnosticEvent> {
@@ -358,6 +421,10 @@ impl ReplicaLinks {
     }
 
     pub(crate) fn publish(&self, event: DiagnosticEvent) {
+        let table = self.shared.table();
+        if event == DiagnosticEvent::SignedIn && table.state != ClientState::Authenticated {
+            return;
+        }
         self.shared.publish(event);
     }
 
@@ -365,10 +432,10 @@ impl ReplicaLinks {
         self.shared.table().state
     }
 
-    /// Sets the state, except after a shutdown, which is final.
+    /// Late sign-in replies cannot undo an explicit disconnect or shutdown.
     pub(crate) fn set_state(&self, state: ClientState) {
         let mut table = self.shared.table();
-        if table.state != ClientState::Shutdown {
+        if accepts_state(table.state, state, true) {
             table.state = state;
         }
     }
@@ -403,7 +470,9 @@ impl LinksShared {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The channel runs in overflow mode, so a publish never waits.
+    /// The channel runs in overflow mode, so a publish never waits. A first
+    /// install and a last close publish under the table lock, so their events
+    /// keep the order of the table changes.
     fn publish(&self, event: DiagnosticEvent) {
         let _ = self.events.try_broadcast(event);
     }
@@ -426,20 +495,33 @@ impl LinksShared {
         }
     }
 
-    async fn sweep(self: &Arc<Self>, abandoned: bool) -> Result<(), IggyError> {
+    async fn sweep(
+        self: &Arc<Self>,
+        abandoned: bool,
+        automatic_sign_in: bool,
+    ) -> Result<(), IggyError> {
         if abandoned {
             // The last sweep lost its caller halfway.
             self.disconnect();
         }
         let (candidates, stopped) = {
+            let epoch = self.session.epoch();
             let mut table = self.table();
             match table.state {
                 ClientState::Shutdown => return Err(IggyError::ClientShutdown),
                 ClientState::Connected
                 | ClientState::Authenticating
                 | ClientState::Authenticated => {
-                    self.restart_down_slots(&mut table);
-                    return Ok(());
+                    if epoch.bound
+                        || table
+                            .primary_link(epoch)
+                            .is_some_and(|ready| ready.link.closed().now_or_never().is_none())
+                    {
+                        self.restart_down_slots(&mut table);
+                        return Ok(());
+                    }
+                    // Unbound slot tasks wait for a session, so only a
+                    // bootstrap sweep can carry the next sign-in.
                 }
                 ClientState::Disconnected | ClientState::Connecting => {}
             }
@@ -453,7 +535,7 @@ impl LinksShared {
             let mut config_fault = None;
             let mut sign_in_failure = None;
             for endpoint in &candidates {
-                match self.try_endpoint(endpoint).await {
+                match self.try_endpoint(endpoint, automatic_sign_in).await {
                     Ok(()) => return Ok(()),
                     Err(Attempt::EndpointFailed) => {}
                     Err(Attempt::ConfigFault(error)) => config_fault = Some(error),
@@ -473,6 +555,7 @@ impl LinksShared {
                 self.fail_sweep();
                 return Err(error);
             }
+            sweeping(self.table().state)?;
             let pause = self.policy.pause(pass);
             info!("No endpoint signed in. Pass {pass} starts in {pause:?}.");
             sleep(pause).await;
@@ -494,7 +577,11 @@ impl LinksShared {
         candidates
     }
 
-    async fn try_endpoint(self: &Arc<Self>, endpoint: &str) -> Result<(), Attempt> {
+    async fn try_endpoint(
+        self: &Arc<Self>,
+        endpoint: &str,
+        automatic_sign_in: bool,
+    ) -> Result<(), Attempt> {
         sweeping(self.table().state).map_err(Attempt::Failed)?;
         info!("Connecting to {endpoint}...");
         let dialed = match self.dial_permits.acquire().await {
@@ -513,7 +600,7 @@ impl LinksShared {
         self.publish(DiagnosticEvent::Connected);
         info!("Connected to {endpoint}.");
 
-        if let Err(failure) = self.resume_or_sign_in(&link).await {
+        if let Err(failure) = self.resume_or_sign_in(&link, automatic_sign_in).await {
             if failure.link_lost {
                 warn!(
                     "The sign-in on {endpoint} did not complete: {}",
@@ -531,6 +618,19 @@ impl LinksShared {
             && let Err(error) = self.refresh_roster(&link).await
         {
             warn!("Failed to read the roster from {endpoint}: {error}");
+            self.lose_bootstrap(&link);
+            if lost_link(&error)
+                || matches!(
+                    error,
+                    IggyError::TransientNotCommitted
+                        | IggyError::TransientNotAccepted
+                        | IggyError::NotPrimary
+                )
+            {
+                return Err(Attempt::SignInLost(error));
+            }
+            self.fail_sweep();
+            return Err(Attempt::Failed(error));
         }
         self.watch_bootstrap(&link);
         Ok(())
@@ -600,14 +700,17 @@ impl LinksShared {
         table.bootstrap = None;
         let last = table.ready_count() == 0;
         table.settle();
-        drop(table);
         if last {
             self.publish(DiagnosticEvent::Disconnected);
         }
     }
 
     /// Resumes a bound session on the bootstrap link, else signs in there.
-    async fn resume_or_sign_in(&self, link: &Arc<Link>) -> Result<(), SignInFailure> {
+    async fn resume_or_sign_in(
+        &self,
+        link: &Arc<Link>,
+        automatic_sign_in: bool,
+    ) -> Result<(), SignInFailure> {
         let epoch = self.session.epoch();
         if epoch.bound {
             match self.bind_session(link).await {
@@ -633,7 +736,11 @@ impl LinksShared {
                 }
             }
         }
-        self.sign_in(link).await
+        if automatic_sign_in {
+            self.sign_in(link).await
+        } else {
+            Ok(())
+        }
     }
 
     /// Signs in on `link` with the known credentials, if any. A failure that
@@ -857,8 +964,7 @@ impl LinksShared {
         tokio::spawn(Arc::clone(self).run_slot(id, endpoint, adopted)).abort_handle()
     }
 
-    /// Starts every slot without a link again, at once and without its
-    /// backoff.
+    /// Restarts each slot without a link using its initial reconnect jitter.
     fn restart_down_slots(self: &Arc<Self>, table: &mut Table) {
         for (id, slot) in table
             .slots
@@ -872,8 +978,8 @@ impl LinksShared {
         }
     }
 
-    /// Keeps one link to replica `id` up. Each retry waits its backoff, and a
-    /// link that stayed up for `reestablish_after` redials at once.
+    /// Every background dial waits its jitter, including the first attempt
+    /// after a stable link resets the backoff.
     async fn run_slot(self: Arc<Self>, id: u8, endpoint: String, mut adopted: Option<Arc<Link>>) {
         let mut signs_in_at = None;
         let mut retry = 0_u32;
@@ -881,12 +987,10 @@ impl LinksShared {
             let link = match adopted.take() {
                 Some(link) => link,
                 None => {
-                    if retry > 0 {
-                        if !self.policy.allows(retry) {
-                            break;
-                        }
-                        sleep(self.policy.pause(retry)).await;
+                    if retry > 0 && !self.policy.allows(retry) {
+                        break;
                     }
+                    sleep(self.policy.pause(retry)).await;
                     match self.open(id, &endpoint, &mut signs_in_at).await {
                         Some(link) => link,
                         None => {
@@ -988,11 +1092,16 @@ impl LinksShared {
         } else {
             None
         };
-        drop(table);
-        drop(retired);
         if first {
             self.publish(DiagnosticEvent::Connected);
+            // After every link closed, a link that binds the session again
+            // resumes it, as a sweep does.
+            if bound_fence.is_some() && table.state == ClientState::Authenticated {
+                self.publish(DiagnosticEvent::SignedIn);
+            }
         }
+        drop(table);
+        drop(retired);
         info!("The link to replica {id} is ready.");
         Some(link)
     }
@@ -1010,12 +1119,11 @@ impl LinksShared {
             return;
         }
         slot.link = None;
-        let last = table.ready_count() == 0;
-        drop(table);
-        warn!("The link to replica {id} closed.");
-        if last {
+        if table.ready_count() == 0 {
             self.publish(DiagnosticEvent::Disconnected);
         }
+        drop(table);
+        warn!("The link to replica {id} closed.");
     }
 
     fn slot_stopped(&self, id: u8) {
@@ -1072,6 +1180,14 @@ impl LinksShared {
 }
 
 impl Table {
+    fn primary_link(&self, epoch: SessionEpoch) -> Option<&ReadyLink> {
+        self.metadata_primary
+            .and_then(|id| self.slots.get(&id))
+            .and_then(|slot| slot.link.as_ref())
+            .filter(|ready| serves(ready, epoch))
+            .or(self.bootstrap.as_ref().map(|bootstrap| &bootstrap.link))
+    }
+
     fn links(&self) -> impl Iterator<Item = &ReadyLink> {
         self.slots
             .values()
@@ -1183,8 +1299,8 @@ mod tests {
     use super::*;
     use crate::links::dial::DIAL_TIMEOUT;
     use crate::links::fake_cluster::{
-        FakeCluster, PORT, REESTABLISH_AFTER, TEST_BUDGET, UNANSWERED_CODE, connected, endpoint,
-        eventually, ip, links, node, policy,
+        Answer, FakeCluster, INTERVAL, PORT, REESTABLISH_AFTER, TEST_BUDGET, UNANSWERED_CODE,
+        connected, endpoint, eventually, ip, links, node, policy,
     };
     use bytes::Bytes;
     use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
@@ -1241,6 +1357,23 @@ mod tests {
         assert_eq!(refreshed.unwrap_err(), IggyError::InvalidFormat);
         assert_eq!(slot_endpoints(&links), [(0, endpoint(0)), (1, endpoint(1))]);
         assert_eq!(links.ready_replicas(), [0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refused_initial_roster_when_connecting_should_install_managed_slots() {
+        let cluster = FakeCluster::new(1);
+        cluster.script(
+            &endpoint(0),
+            GET_CLUSTER_METADATA_CODE,
+            [Answer::Refuse(IggyError::TransientNotAccepted)],
+        );
+        let links = links(&cluster, &endpoint(0), policy());
+
+        links.connect().await.unwrap();
+
+        assert_eq!(links.ready_replicas(), [0]);
+        assert!(slot_task_runs(&links, 0));
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1306,7 +1439,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_a_link_up_longer_than_reestablish_after_when_it_drops_should_redial_at_once() {
+    async fn given_a_stable_link_when_it_drops_should_jitter_its_first_redial() {
         let cluster = FakeCluster::new(2);
         let links = connected(&cluster, 2).await;
         sleep(REESTABLISH_AFTER).await;
@@ -1318,7 +1451,19 @@ mod tests {
         })
         .await;
 
-        assert_eq!(cluster.dials_to(&endpoint(1))[1], dropped_at);
+        let delay = backoff(0, INTERVAL, RECONNECT_BACKOFF_MAX, TEST_JITTER_DRAW);
+        assert_eq!(cluster.dials_to(&endpoint(1))[1], dropped_at + delay);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_new_client_when_connecting_should_dial_the_bootstrap_without_backoff() {
+        let cluster = FakeCluster::new(1);
+        let links = links(&cluster, &endpoint(0), policy());
+        let started = Instant::now();
+
+        links.connect().await.unwrap();
+
+        assert_eq!(cluster.dials_to(&endpoint(0)), [started]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1331,7 +1476,7 @@ mod tests {
         let links = links(&cluster, &endpoint(0), disabled);
         links.connect().await.unwrap();
         eventually("both slots are ready", || links.ready_replicas().len() == 2).await;
-        // A link this old would redial at once, without the switch.
+        // A stable link resets its retry count, but still honors the switch.
         sleep(REESTABLISH_AFTER).await;
 
         cluster.drop_connections(&endpoint(1));
@@ -1368,7 +1513,7 @@ mod tests {
         let cluster = FakeCluster::new(3);
         let links = connected(&cluster, 3).await;
 
-        links.keepalive().await.unwrap();
+        assert!(links.keepalive().await.unwrap());
 
         for id in 0..3 {
             let pings = cluster
@@ -1378,6 +1523,22 @@ mod tests {
                 .count();
             assert_eq!(pings, 1, "replica {id}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_failed_pings_when_keepalive_ticks_should_report_no_success_and_keep_links() {
+        let cluster = FakeCluster::new(2);
+        let links = connected(&cluster, 2).await;
+        for id in 0..2 {
+            cluster.script(&endpoint(id), PING_CODE, [Answer::Silence]);
+        }
+
+        assert!(!links.keepalive().await.unwrap());
+        assert_eq!(links.ready_replicas().len(), 2);
+        assert!(links.keepalive().await.unwrap());
+
+        links.disconnect();
+        assert!(!links.keepalive().await.unwrap());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1394,6 +1555,40 @@ mod tests {
         .await;
 
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_every_link_lost_when_a_slot_binds_the_session_again_should_publish_signed_in() {
+        let cluster = FakeCluster::new(3);
+        let links = connected(&cluster, 3).await;
+        let fence = links.shared.session.fence();
+        let mut events = links.subscribe();
+        while events.try_recv().is_ok() {}
+
+        // Refused dials keep every slot down until the last link closed.
+        cluster.down.lock().unwrap().extend((0..3).map(endpoint));
+        for id in 0..3 {
+            cluster.drop_connections(&endpoint(id));
+        }
+        eventually("every link is down", || links.ready_replicas().is_empty()).await;
+        assert_eq!(links.state(), ClientState::Authenticated);
+        cluster.down.lock().unwrap().clear();
+        eventually("every slot is ready again", || {
+            links.ready_replicas().len() == 3
+        })
+        .await;
+
+        let published: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            published,
+            [
+                DiagnosticEvent::Disconnected,
+                DiagnosticEvent::Connected,
+                DiagnosticEvent::SignedIn
+            ]
+        );
+        assert_eq!(links.shared.session.fence(), fence);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1453,6 +1648,72 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_disconnect_when_late_sign_in_steps_run_should_keep_the_client_disconnected() {
+        let cluster = FakeCluster::new(2);
+        let links = connected(&cluster, 2).await;
+        let mut events = links.subscribe();
+        while events.try_recv().is_ok() {}
+        links.disconnect();
+        links.set_state(ClientState::Authenticated);
+        links.publish(DiagnosticEvent::SignedIn);
+        assert_eq!(links.state(), ClientState::Disconnected);
+        assert_eq!(events.try_recv().unwrap(), DiagnosticEvent::Disconnected);
+        assert!(events.try_recv().is_err());
+        links.connect().await.unwrap();
+        assert_eq!(links.state(), ClientState::Authenticated);
+        links.shutdown().await;
+        links.set_state(ClientState::Connected);
+        assert_eq!(links.state(), ClientState::Shutdown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_reconnect_sweep_when_shutdown_should_stop_before_the_next_dial() {
+        let cluster = FakeCluster::new(1);
+        cluster.down.lock().unwrap().insert(endpoint(0));
+        let links = links(&cluster, &endpoint(0), policy());
+
+        let (result, ()) = tokio::join!(links.connect(), async {
+            eventually("the first dial fails", || {
+                cluster.dials_to(&endpoint(0)).len() == 1
+            })
+            .await;
+            links.shutdown().await;
+            cluster.down.lock().unwrap().clear();
+        });
+
+        assert_eq!(result.unwrap_err(), IggyError::ClientShutdown);
+        assert_eq!(links.state(), ClientState::Shutdown);
+        assert_eq!(cluster.dials_to(&endpoint(0)).len(), 1);
+        assert!(links.ready_replicas().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_shutdown_during_the_last_dial_when_it_fails_should_skip_retry_backoff() {
+        let cluster = FakeCluster::new(1);
+        cluster.silent.lock().unwrap().insert(endpoint(0));
+        let links = links(
+            &cluster,
+            &endpoint(0),
+            ReconnectPolicy {
+                interval: RECONNECT_BACKOFF_MAX,
+                ..policy()
+            },
+        );
+        let started = Instant::now();
+
+        let (result, ()) = tokio::join!(links.connect(), async {
+            eventually("the dial starts", || {
+                !cluster.dials_to(&endpoint(0)).is_empty()
+            })
+            .await;
+            links.shutdown().await;
+        });
+
+        assert_eq!(result.unwrap_err(), IggyError::ClientShutdown);
+        assert_eq!(started.elapsed(), DIAL_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_connection_info_when_slots_change_should_name_the_metadata_primary() {
         let cluster = FakeCluster::new(2);
         let links = links(&cluster, BALANCER, policy());
@@ -1479,8 +1740,10 @@ mod tests {
         let cluster = FakeCluster::new(3);
         let links = connected(&cluster, 3).await;
         let fence = links.shared.session.fence();
-        // Every slot then redials at once, and all binds find the session gone.
+        // Each slot waits its initial jitter, then its bind finds the session gone.
         sleep(REESTABLISH_AFTER).await;
+        let mut events = links.subscribe();
+        while events.try_recv().is_ok() {}
 
         *cluster.session.lock().unwrap() = None;
         for id in 0..3 {
@@ -1494,6 +1757,15 @@ mod tests {
         assert_eq!(links.shared.session.fence(), fence + 1);
         assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
         assert_eq!(links.state(), ClientState::Authenticated);
+        let published: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            published,
+            [
+                DiagnosticEvent::Disconnected,
+                DiagnosticEvent::Connected,
+                DiagnosticEvent::SignedIn
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]

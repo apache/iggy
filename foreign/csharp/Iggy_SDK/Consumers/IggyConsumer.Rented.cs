@@ -124,12 +124,20 @@ public partial class IggyConsumer
                 await WaitBeforePollingAsync(ct);
             }
 
-            rental = await _client.PollMessagesRentedAsync(_config.StreamId, _config.TopicId,
-                _config.PartitionId, _config.Consumer, partitionId =>
-                {
-                    polledPartition = partitionId;
-                    return PollingStrategyFor(partitionId);
-                }, _config.BatchSize, _config.AutoCommit, ct);
+            var selectedPartition = _config.PartitionId;
+            PollingStrategy? selectedStrategy = null;
+            rental = await WithLaneRecoveryAsync(token =>
+            {
+                var retryStrategy = selectedStrategy;
+                return _client.PollMessagesRentedAsync(_config.StreamId, _config.TopicId,
+                    selectedPartition, _config.Consumer, partitionId =>
+                    {
+                        polledPartition = partitionId;
+                        selectedPartition = partitionId;
+                        selectedStrategy = retryStrategy ?? PollingStrategyFor(partitionId);
+                        return selectedStrategy.Value;
+                    }, _config.BatchSize, _config.AutoCommit, token);
+            }, ct);
 
             if (rental.Messages.Count == 0)
             {
@@ -208,7 +216,8 @@ public partial class IggyConsumer
             LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
             throw;
         }
-        catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
+        catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException
+            or VsrLaneBlockedException))
         {
             ForgetRefusedPollingStrategy(ex, polledPartition);
             LogFailedToPollMessages(ex);

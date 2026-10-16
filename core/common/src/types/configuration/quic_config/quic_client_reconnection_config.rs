@@ -22,8 +22,9 @@ use std::str::FromStr;
 pub struct QuicClientReconnectionConfig {
     pub enabled: bool,
     pub max_retries: Option<u32>,
-    /// Delay between connection attempts.
+    /// Full-jitter exponential backoff base, capped at 10 seconds.
     pub interval: NonZeroIggyDuration,
+    /// Stable connection duration that resets the retry count and backoff.
     pub reestablish_after: IggyDuration,
 }
 

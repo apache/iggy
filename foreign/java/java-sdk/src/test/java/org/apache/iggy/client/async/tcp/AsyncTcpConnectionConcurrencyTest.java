@@ -21,12 +21,19 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -65,6 +72,71 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int LOGOUT_CODE = 39;
     private static final int SEND_MESSAGES_CODE = 101;
     private static final int TRANSIENT_NOT_COMMITTED = 57;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReleaseRetainedFramesOnlyWhenClosingTheirSessionOwner(boolean followsSession) throws Exception {
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(2));
+                    Request register = readRequest(socket.getInputStream());
+                    writeResponse(socket.getOutputStream(), register, registerBody());
+                    assertThat(readRequest(socket.getInputStream()).operation()).isEqualTo(OPERATION_SEND_MESSAGES);
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 50);
+            if (followsSession) {
+                connection.followSession(new ConsensusSession());
+            }
+            ConsensusSession owner = connection.sessionOwner();
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var state = new AsyncTcpConnection.TransientFailoverState();
+                var request = connection.send(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(),
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        state);
+                assertThatThrownBy(() -> request.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN));
+                server.get(5, TimeUnit.SECONDS);
+
+                ConsensusSession.Ticket ticket = state.ticket();
+                ByteBuf alias = ticket.frame();
+                ByteBuf allocation = alias;
+                while (allocation.unwrap() != null) {
+                    allocation = allocation.unwrap();
+                }
+                alias.release();
+                ticket.finishWrite();
+                assertThat(allocation.refCnt()).isPositive();
+
+                connection.close().get(5, TimeUnit.SECONDS);
+                if (followsSession) {
+                    assertThat(owner.resume(ticket.operationId())).isSameAs(ticket);
+                    assertThat(allocation.refCnt()).isPositive();
+                    owner.abandon(ticket.operationId());
+                }
+                assertThat(allocation.refCnt()).isZero();
+                assertThatThrownBy(() -> owner.resume(ticket.operationId()))
+                        .isInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error).getErrorCode())
+                                .isEqualTo(IggyErrorCode.OPERATION_NOT_RETAINED));
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+                owner.reset();
+            }
+        }
+    }
 
     @Test
     void shouldFlushRequestFromReplyCallbackWithoutFurtherInboundTraffic() throws Exception {
@@ -177,9 +249,25 @@ class AsyncTcpConnectionConcurrencyTest {
                         .get(5, TimeUnit.SECONDS)
                         .release();
 
-                CompletableFuture<ByteBuf> first = connection.send(SEND_MESSAGES_CODE, sendMessagesPayload());
+                var firstState = new AsyncTcpConnection.TransientFailoverState(
+                        new PartitionContext(BigInteger.valueOf(7), BigInteger.ZERO, BigInteger.ONE));
+                firstState.setLane(new ConsensusSession.LaneKey(7, 3));
+                var secondState = new AsyncTcpConnection.TransientFailoverState(
+                        new PartitionContext(BigInteger.valueOf(8), BigInteger.ZERO, BigInteger.ONE));
+                secondState.setLane(new ConsensusSession.LaneKey(8, 4));
+                CompletableFuture<ByteBuf> first = connection.sendRouted(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(3),
+                        0,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        firstState);
                 firstRequestRead.get(5, TimeUnit.SECONDS);
-                CompletableFuture<ByteBuf> second = connection.send(SEND_MESSAGES_CODE, sendMessagesPayload());
+                CompletableFuture<ByteBuf> second = connection.sendRouted(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(4),
+                        0,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        secondState);
 
                 assertResponse(first, "first");
                 assertResponse(second, "second");
@@ -385,7 +473,8 @@ class AsyncTcpConnectionConcurrencyTest {
         return new Request(
                 Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
                 fields.getLong(REQUEST_ID_OFFSET),
-                fields.getInt(REQUEST_CODE_OFFSET));
+                fields.getInt(REQUEST_CODE_OFFSET),
+                header);
     }
 
     private static void writeResponse(OutputStream output, Request request, byte[] payload) throws IOException {
@@ -401,6 +490,14 @@ class AsyncTcpConnectionConcurrencyTest {
         fields.putInt(REPLY_STATUS_OFFSET, status);
         header[COMMAND_OFFSET] = COMMAND_REPLY;
         header[REPLY_OPERATION_OFFSET] = (byte) request.operation();
+        if (status == 0 && request.operation() != OPERATION_NON_REPLICATED) {
+            header[220] = 1;
+            System.arraycopy(request.header(), 144, header, 128, 16);
+            System.arraycopy(request.header(), 128, header, 160, 16);
+            System.arraycopy(request.header(), 200, header, 224, Long.BYTES);
+            fields.putLong(176, 1);
+            fields.putLong(184, 1);
+        }
         output.write(header);
         output.write(payload);
         output.flush();
@@ -435,13 +532,17 @@ class AsyncTcpConnectionConcurrencyTest {
     }
 
     private static ByteBuf sendMessagesPayload() {
+        return sendMessagesPayload(3);
+    }
+
+    private static ByteBuf sendMessagesPayload(int partition) {
         ByteBuf payload = Unpooled.buffer();
         payload.writeIntLE(22);
         writeNumericIdentifier(payload, 1);
         writeNumericIdentifier(payload, 2);
         payload.writeByte(2);
         payload.writeByte(4);
-        payload.writeIntLE(3);
+        payload.writeIntLE(partition);
         payload.writeIntLE(0);
         return payload;
     }
@@ -463,5 +564,5 @@ class AsyncTcpConnectionConcurrencyTest {
         }
     }
 
-    private record Request(int operation, long requestId, int commandCode) {}
+    private record Request(int operation, long requestId, int commandCode, byte[] header) {}
 }

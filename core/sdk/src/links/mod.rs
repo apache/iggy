@@ -30,22 +30,14 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
 pub(crate) mod connect;
+mod dial;
 #[cfg(test)]
 pub(crate) mod fake_cluster;
-// Unused until the clients send through the driver.
-#[allow(dead_code)]
-mod dial;
 pub(crate) mod mux;
 pub(crate) mod quic;
-// Unused until the clients send through the driver.
-#[allow(dead_code)]
 mod replicas;
 
-// Unused until the clients send through the driver.
-#[allow(unused_imports)]
 pub(crate) use dial::Dialer;
-// Unused until the clients send through the driver.
-#[allow(unused_imports)]
 pub(crate) use replicas::{ReconnectPolicy, ReplicaLinks, Target};
 
 #[cfg(test)]
@@ -54,7 +46,7 @@ pub(crate) use crate::diagnostic_events::diagnostic_event_channel as event_chann
 
 /// The longest that one request waits, from its first attempt to its last
 /// reply.
-pub(crate) const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const OPERATION_TIMEOUT: Duration = iggy_common::BINARY_OPERATION_TIMEOUT;
 
 /// The pauses between the attempts of one request grow from the base to the
 /// cap, see [`backoff`].
@@ -196,21 +188,13 @@ pub(crate) mod test_support {
     use bytes::Bytes;
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_binary_protocol::consensus::{
-        Command, HEADER_SIZE, Operation, RESULT_COUNT_LEN, ReplyHeader, RequestHeader,
+        Command, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
     };
-    use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-    use iggy_binary_protocol::{IGGY_PROTOCOL_VERSION, WireEncode, WireName};
-    use iggy_common::{Client, ClientState, Credentials, IggyError, VsrSessionControl};
+    use iggy_common::IggyError;
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::Arc;
-    use tokio::task::JoinHandle;
 
     pub(crate) const CLIENT: u128 = 7;
-    /// Enough turns of a current-thread test runtime for a spawned
-    /// `disconnect()` to reach the link that an exchange in flight holds.
-    pub(crate) const DISCONNECT_YIELDS: usize = 32;
-    pub(crate) const SIGNED_IN_USER_ID: u32 = 7;
     pub(crate) const LOCALHOST: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
     /// The buffer of each direction of an in-memory stream.
     pub(crate) const DUPLEX_CAPACITY: usize = 64 * 1024;
@@ -256,93 +240,6 @@ pub(crate) mod test_support {
 
     pub(crate) fn read_request_header(header: &[u8; HEADER_SIZE]) -> RequestHeader {
         bytemuck::checked::try_pod_read_unaligned(header).unwrap()
-    }
-
-    /// The reply to a login or to a session bind, for the user
-    /// [`SIGNED_IN_USER_ID`] and the session `session`.
-    pub(crate) fn sign_in_reply(session: u64) -> Bytes {
-        LoginRegisterResponse {
-            user_id: SIGNED_IN_USER_ID,
-            session,
-            server_protocol_version: IGGY_PROTOCOL_VERSION,
-            server_version: WireName::new("test").unwrap(),
-        }
-        .to_bytes()
-    }
-
-    /// The reply to a Register: a result section with no rejection, then
-    /// [`sign_in_reply`].
-    pub(crate) fn register_reply(session: u64) -> Vec<u8> {
-        let mut body = vec![0; RESULT_COUNT_LEN];
-        body.extend_from_slice(&sign_in_reply(session));
-        body
-    }
-
-    /// Disconnects `client`, then takes the steps that a sign-in takes after
-    /// its reply binds the session, and returns the state they leave.
-    pub(crate) async fn sign_in_steps_after_a_disconnect<C>(client: &C) -> ClientState
-    where
-        C: Client + VsrSessionControl,
-    {
-        Client::disconnect(client).await.unwrap();
-        client.set_state(ClientState::Authenticated).await;
-        client
-            .remember_session_credentials(
-                Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
-                SIGNED_IN_USER_ID,
-            )
-            .await;
-        client.get_state().await
-    }
-
-    /// Starts an explicit `disconnect()` of `client`, and returns once the
-    /// disconnect has raised the caller flag and waits for the link that an
-    /// exchange in flight holds. So the reply to that exchange arrives after
-    /// the caller disconnected.
-    pub(crate) async fn spawn_disconnect_behind_the_link<C: Client + 'static>(
-        client: &Arc<C>,
-        caller_disconnected: impl Fn(&C) -> bool,
-    ) -> JoinHandle<Result<(), IggyError>> {
-        let disconnect = tokio::spawn({
-            let client = Arc::clone(client);
-            async move { Client::disconnect(&*client).await }
-        });
-        wait_behind_the_link(client, caller_disconnected, &disconnect).await;
-        disconnect
-    }
-
-    /// [`spawn_disconnect_behind_the_link`], with a `connect()` right after
-    /// the disconnect returns, as a caller restarts a client.
-    pub(crate) async fn spawn_restart_behind_the_link<C: Client + 'static>(
-        client: &Arc<C>,
-        caller_disconnected: impl Fn(&C) -> bool,
-    ) -> JoinHandle<Result<(), IggyError>> {
-        let restart = tokio::spawn({
-            let client = Arc::clone(client);
-            async move {
-                Client::disconnect(&*client).await?;
-                Client::connect(&*client).await
-            }
-        });
-        wait_behind_the_link(client, caller_disconnected, &restart).await;
-        restart
-    }
-
-    async fn wait_behind_the_link<C>(
-        client: &Arc<C>,
-        caller_disconnected: impl Fn(&C) -> bool,
-        disconnecting: &JoinHandle<Result<(), IggyError>>,
-    ) {
-        while !caller_disconnected(client) {
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..DISCONNECT_YIELDS {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !disconnecting.is_finished(),
-            "the disconnect must wait for the exchange that holds the link"
-        );
     }
 
     /// A QUIC server on a free local port, and the certificate it presents.

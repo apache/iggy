@@ -19,10 +19,10 @@ use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
 use iggy::prelude::{
-    DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
+    Client, DirectConfig, HeaderKey, HeaderValue, Identifier, IggyClient, IggyDuration, IggyError,
     IggyMessage, IggyProducer, StreamClient, TopicClient, TopicCreateOptions,
 };
-use iggy_common::{Durability, TopicRuntimeOptions};
+use iggy_common::{BINARY_OPERATION_TIMEOUT, Durability, TopicRuntimeOptions};
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
@@ -60,6 +60,7 @@ use prometheus_client::metrics::counter::Counter;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 const MAX_FAILED_TAIL_RETRIES: u32 = 3;
 const SOURCE_TOPIC_MESSAGES_REQUIRED_TO_SAVE: u32 = 1;
@@ -692,9 +693,12 @@ pub(crate) async fn source_forwarding_loop(
         let send_result = if state_unavailable {
             Err(IggyError::Error)
         } else if processing_errors == 0 {
-            send_with_failed_tail_retries(processed.messages, plugin_id, |messages| {
-                producer.send(messages)
-            })
+            send_with_failed_tail_retries(
+                processed.messages,
+                plugin_id,
+                &context.iggy_clients.producer,
+                |messages| producer.send(messages),
+            )
             .await
         } else {
             Err(IggyError::Error)
@@ -1090,6 +1094,7 @@ fn process_messages(
 async fn send_with_failed_tail_retries<F, Fut, T>(
     mut messages: Vec<IggyMessage>,
     plugin_id: u32,
+    client: &IggyClient,
     mut send: F,
 ) -> Result<(), IggyError>
 where
@@ -1108,11 +1113,21 @@ where
                 topic_name,
             }) => {
                 warn!(
+                    cause_code = cause.as_code(),
                     "Source connector with ID: {plugin_id} send failed after {} chunks committed; {} messages remain",
                     committed.len(),
                     failed.len()
                 );
-                if retry >= MAX_FAILED_TAIL_RETRIES || failed.is_empty() {
+                // Exhausted SDK reconnect tasks need an explicit connect. A possibly
+                // submitted binary chunk returns OperationUncertain instead.
+                if retry >= MAX_FAILED_TAIL_RETRIES
+                    || failed.is_empty()
+                    || (matches!(*cause, IggyError::NotConnected | IggyError::Disconnected)
+                        && !matches!(
+                            timeout(BINARY_OPERATION_TIMEOUT, client.connect()).await,
+                            Ok(Ok(()))
+                        ))
+                {
                     return Err(IggyError::ProducerSendFailed {
                         cause,
                         failed,
@@ -1955,6 +1970,7 @@ mod tests {
             let result = send_with_failed_tail_retries(
                 vec![test_message(1), test_message(2), test_message(3)],
                 31,
+                &IggyClient::default(),
                 |messages| {
                     attempts.push(
                         messages
@@ -1983,10 +1999,15 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
 
-            let result = send_with_failed_tail_retries(vec![test_message(1)], 37, |_| {
-                attempts += 1;
-                ready(responses.pop_front().expect("send response should exist"))
-            })
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1)],
+                37,
+                &IggyClient::default(),
+                |_| {
+                    attempts += 1;
+                    ready(responses.pop_front().expect("send response should exist"))
+                },
+            )
             .await;
 
             assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
@@ -2009,16 +2030,72 @@ mod tests {
             }));
             let mut attempts = 0;
 
-            let result =
-                send_with_failed_tail_retries(vec![test_message(1), test_message(2)], 41, |_| {
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2)],
+                41,
+                &IggyClient::default(),
+                |_| {
                     attempts += 1;
                     ready(response.take().expect("send response should exist"))
-                })
-                .await;
+                },
+            )
+            .await;
 
             assert!(matches!(result, Err(IggyError::ProducerSendFailed { .. })));
             assert_eq!(attempts, 1);
             assert_eq!(retained.len(), 1);
+        });
+    }
+
+    #[test]
+    fn given_unsent_tail_when_reconnect_fails_should_preserve_the_original_failure() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for failure_cause in [IggyError::NotConnected, IggyError::Disconnected] {
+                let client = IggyClient::default();
+                client.shutdown().await.expect("client should shut down");
+                let mut failure = failed_send(vec![test_message(2), test_message(3)]);
+                let IggyError::ProducerSendFailed { cause, .. } = &mut failure else {
+                    panic!("expected producer failure");
+                };
+                **cause = failure_cause.clone();
+                let mut responses = VecDeque::from([Err(failure), Ok(())]);
+                let mut attempts = 0;
+
+                let result = send_with_failed_tail_retries(
+                    vec![test_message(1), test_message(2), test_message(3)],
+                    43,
+                    &client,
+                    |_| {
+                        attempts += 1;
+                        ready(responses.pop_front().expect("send response should exist"))
+                    },
+                )
+                .await;
+
+                let Err(IggyError::ProducerSendFailed {
+                    cause,
+                    failed,
+                    committed,
+                    stream_name,
+                    topic_name,
+                }) = result
+                else {
+                    panic!("reconnect failure must preserve the producer failure");
+                };
+                assert_eq!(*cause, failure_cause);
+                assert_eq!(
+                    failed
+                        .iter()
+                        .map(|message| message.payload[0])
+                        .collect::<Vec<_>>(),
+                    [2, 3]
+                );
+                assert!(committed.is_empty());
+                assert_eq!(stream_name, "test-stream");
+                assert_eq!(topic_name, "test-topic");
+                assert_eq!(attempts, 1, "reconnect failure must not resubmit the tail");
+            }
         });
     }
 }

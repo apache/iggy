@@ -19,23 +19,28 @@ use crate::session::ConsensusSession;
 use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
-use iggy_common::{AutoLogin, Credentials, IdKind, Identifier, IggyError};
+use iggy_common::{
+    AutoLogin, ConsumerGroupClientState, Credentials, IdKind, Identifier, IggyError,
+    PendingOperationsConfig,
+};
 use lanes::Lanes;
+use pending::PendingOperations;
 use secrecy::SecretString;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::watch;
 
 mod lanes;
+mod pending;
 
 pub(crate) use lanes::{LaneKey, LaneTicket, RetainedOperation};
 
 /// The session state that every link of one client shares: the consensus
 /// session, its epoch, the lanes, the metadata watermark and the sign-in.
 ///
-/// Only [`Self::reset`] holds two of these locks, `session` and then `lanes`.
-/// The epoch is read and written under either of them, never the other way
-/// round. No lock is held across an await.
+/// Lock order is session, lanes, then pending-operation usage. The epoch is
+/// read and written under session or lanes, never the other way round.
+/// No lock is held across an await.
 #[derive(Debug)]
 pub(crate) struct SessionOwner {
     session: Mutex<ConsensusSession>,
@@ -44,6 +49,8 @@ pub(crate) struct SessionOwner {
     /// belongs to a replaced session.
     epoch: watch::Sender<SessionEpoch>,
     lanes: Mutex<Lanes>,
+    pending: Arc<PendingOperations>,
+    consumer_group_state: Arc<ConsumerGroupClientState>,
     /// The highest metadata commit a reply showed. A reset keeps it.
     metadata_watermark: AtomicU64,
     sign_in: Mutex<SignIn>,
@@ -79,15 +86,29 @@ struct RememberedSignIn {
 }
 
 impl SessionOwner {
+    #[cfg(test)]
     pub(crate) fn new(auto_login: AutoLogin) -> Self {
+        Self::with_pending_operations(auto_login, PendingOperationsConfig::default())
+    }
+
+    pub(crate) fn with_pending_operations(
+        auto_login: AutoLogin,
+        pending_operations: PendingOperationsConfig,
+    ) -> Self {
         Self {
             session: Mutex::new(ConsensusSession::new()),
             epoch: watch::Sender::new(SessionEpoch::default()),
             lanes: Mutex::default(),
+            pending: Arc::new(PendingOperations::new(pending_operations)),
+            consumer_group_state: Arc::default(),
             metadata_watermark: AtomicU64::new(0),
             sign_in: Mutex::default(),
             auto_login,
         }
+    }
+
+    pub(crate) fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
+        Arc::clone(&self.consumer_group_state)
     }
 
     /// The caller must not replace the session through the guard, because
@@ -295,12 +316,6 @@ impl SessionOwner {
         }
     }
 
-    /// The session of a poisoned lock, for tests that poison it.
-    #[cfg(test)]
-    pub(crate) fn session_ignoring_poison(&self) -> MutexGuard<'_, ConsensusSession> {
-        self.session.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn sign_in(&self) -> MutexGuard<'_, SignIn> {
         self.sign_in.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -316,6 +331,8 @@ impl SessionOwner {
             epoch.fence += 1;
             epoch.bound = false;
         });
+        self.pending.reset(self.fence());
+        self.consumer_group_state.clear_session_scoped();
         lanes::drop_retained(&mut lanes);
     }
 }
@@ -348,6 +365,24 @@ mod tests {
     const BOUND_SESSION: u64 = 3;
     const NEXT_SESSION: u64 = 4;
     const METADATA_COMMIT: u64 = 11;
+
+    #[test]
+    fn given_shared_group_assignments_when_any_link_resets_should_invalidate_the_session_cache() {
+        let owner = SessionOwner::new(AutoLogin::Disabled);
+        let first_link = owner.consumer_group_state();
+        let second_link = owner.consumer_group_state();
+        assert!(Arc::ptr_eq(&first_link, &second_link));
+        for explicit in [true, false] {
+            first_link.set_assignment("stream|topic|group".to_owned(), 1, vec![0]);
+            assert!(second_link.has_assignment("stream|topic|group"));
+            if explicit {
+                owner.reset().unwrap();
+            } else {
+                owner.reset_if_fence(owner.fence()).unwrap();
+            }
+            assert!(!second_link.has_assignment("stream|topic|group"));
+        }
+    }
 
     #[test]
     fn given_a_reset_when_the_session_is_replaced_should_raise_the_fence_and_keep_the_watermark_and_sign_in()

@@ -142,8 +142,7 @@ public class LeaderRedirectionSteps
             var result = await client.LoginUserAsync(TestEnvironment.RootUsername, TestEnvironment.RootPassword);
             result.ShouldNotBeNull("Failed to login as root");
 
-            // RedirectAsync runs inside LoginUserAsync; if address changed, redirection happened.
-            if (client.GetCurrentAddress() != initialAddress)
+            if (!await HaveSameEndpointAsync(client.GetCurrentAddress(), initialAddress))
             {
                 _context.RedirectionOccurred = true;
             }
@@ -221,10 +220,10 @@ public class LeaderRedirectionSteps
         var clientA = GetClient("A");
         var clientB = GetClient("B");
 
-        // A client that never redirected still holds the address it was given (possibly a
-        // hostname), while a redirected one holds the roster address the cluster published.
-        // Both may name the same node, so they are compared once resolved.
-        await AssertSameEndpointAsync(clientA.GetCurrentAddress(), clientB.GetCurrentAddress());
+        var addressA = clientA.GetCurrentAddress();
+        var addressB = clientB.GetCurrentAddress();
+        (await HaveSameEndpointAsync(addressA, addressB))
+            .ShouldBeTrue($"Both clients should be connected to the same server, got {addressA} and {addressB}");
 
         await clientA.PingAsync();
         await clientB.PingAsync();
@@ -241,7 +240,7 @@ public class LeaderRedirectionSteps
 
     // ---------- Helpers ----------
 
-    private static async Task AssertSameEndpointAsync(string left, string right)
+    private static async Task<bool> HaveSameEndpointAsync(string left, string right)
     {
         static (string Host, int Port) Split(string address)
         {
@@ -251,12 +250,14 @@ public class LeaderRedirectionSteps
 
         var (leftHost, leftPort) = Split(left);
         var (rightHost, rightPort) = Split(right);
-        leftPort.ShouldBe(rightPort, $"Both clients should use the same port, got {left} and {right}");
+        if (leftPort != rightPort)
+        {
+            return false;
+        }
 
         var leftIps = await Dns.GetHostAddressesAsync(leftHost);
         var rightIps = await Dns.GetHostAddressesAsync(rightHost);
-        leftIps.Intersect(rightIps).ShouldNotBeEmpty(
-            $"Both clients should be connected to the same server, got {left} and {right}");
+        return leftIps.Intersect(rightIps).Any();
     }
 
     private string ResolveAddressForRole(string role) => role.ToLowerInvariant() switch

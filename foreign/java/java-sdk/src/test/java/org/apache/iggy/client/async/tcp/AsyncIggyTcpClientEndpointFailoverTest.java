@@ -22,21 +22,20 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.ConnectionInfo;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
 
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
@@ -45,9 +44,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The node a client signed in on dies; its next request has to complete on a
@@ -57,21 +58,111 @@ import static org.assertj.core.api.Assertions.assertThat;
  * kept separate so a death mid-connection cannot disturb that suite's server.
  */
 class AsyncIggyTcpClientEndpointFailoverTest {
-    private static final int HEADER_SIZE = 256;
-    private static final int SIZE_OFFSET = 48;
-    private static final int COMMAND_OFFSET = 60;
-    private static final int REQUEST_ID_OFFSET = 168;
-    private static final int REQUEST_OPERATION_OFFSET = 176;
-    private static final int REQUEST_CODE_OFFSET = 196;
-    private static final int REPLY_REQUEST_ID_OFFSET = 200;
-    private static final int REPLY_OPERATION_OFFSET = 208;
-    private static final int REPLY_STATUS_OFFSET = 216;
-
-    private static final int COMMAND_REPLY = 8;
     private static final int OPERATION_REGISTER = 1;
     private static final int OPERATION_NON_REPLICATED = 2;
     private static final int GET_CLUSTER_METADATA_CODE = 12;
     private static final int PING_CODE = 1;
+    private static final int EVICTION_STALE_CLIENT = 13;
+
+    @Test
+    void shouldCloseAnUnmanagedBootstrapAfterRetargeting() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket bootstrap = new ServerSocket(0, 4, loopback);
+                ServerSocket target = new ServerSocket(0, 4, loopback)) {
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(bootstrap.getLocalPort())
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                try (Socket previous = bootstrap.accept()) {
+                    previous.setSoTimeout(1000);
+                    client.retarget(new ConnectionInfo(loopback.getHostAddress(), target.getLocalPort()))
+                            .get(5, TimeUnit.SECONDS);
+                    assertThat(previous.getInputStream().read()).isEqualTo(-1);
+                }
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void shouldKeepTheLatestLoginAfterReplicaPromotionAndSessionExpiration() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger leaderPort = new AtomicInteger(primaryPort);
+            AtomicInteger primaryRegistrations = new AtomicInteger();
+            AtomicBoolean expireNextRequest = new AtomicBoolean();
+            List<String> survivorLogins = new CopyOnWriteArrayList<>();
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, leaderPort.get()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(primaryRegistrations.incrementAndGet()));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return expireNextRequest.compareAndSet(true, false)
+                            ? Response.eviction(EVICTION_STALE_CLIENT)
+                            : Response.success(
+                                    OPERATION_NON_REPLICATED,
+                                    clusterMetadata(primaryPort, survivorPort, leaderPort.get()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    survivorLogins.add(request.bodyAsText());
+                    return Response.success(OPERATION_REGISTER, registerBody(primaryRegistrations.get() + 1));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .heartbeatInterval(Duration.ofMinutes(1))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("alice", "alice-password").get(5, TimeUnit.SECONDS);
+                client.retarget(new ConnectionInfo(loopback.getHostAddress(), survivorPort))
+                        .get(5, TimeUnit.SECONDS);
+                client.retarget(new ConnectionInfo(loopback.getHostAddress(), primaryPort))
+                        .get(5, TimeUnit.SECONDS);
+
+                client.users().login("bob", "bob-password").get(5, TimeUnit.SECONDS);
+                leaderPort.set(survivorPort);
+                client.retarget(new ConnectionInfo(loopback.getHostAddress(), survivorPort))
+                        .get(5, TimeUnit.SECONDS);
+                assertThat(survivorLogins).isEmpty();
+
+                survivor.rejectBindings = true;
+                expireNextRequest.set(true);
+                assertThatThrownBy(() -> client.system().getClusterMetadata().get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class)
+                        .satisfies(error -> assertThat(((IggyServerException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.STALE_CLIENT));
+                client.system().getClusterMetadata().get(5, TimeUnit.SECONDS);
+
+                assertThat(survivorLogins)
+                        .singleElement()
+                        .asString()
+                        .contains("bob", "bob-password")
+                        .doesNotContain("alice");
+                assertThat(client.getConnectionInfo().port()).isEqualTo(survivorPort);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                primary.close();
+                survivor.close();
+            }
+        }
+    }
 
     @Test
     void shouldResumeOnASurvivorAfterTheSignedInNodeDies() throws Exception {
@@ -146,16 +237,12 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 assertThat(client.getConnectionInfo().port())
                         .as("the client moved off the dead endpoint")
                         .isEqualTo(survivorPort);
-                assertThat(survivorRegistrations)
-                        .as("the login was replayed on the survivor")
-                        .hasValueGreaterThanOrEqualTo(1);
+                assertThat(survivorRegistrations).hasValue(0);
+                assertThat(survivor.bindings).hasValueGreaterThanOrEqualTo(1);
                 assertThat(survivorPings)
                         .as("the request landed on the survivor")
                         .hasValueGreaterThanOrEqualTo(1);
-                assertThat(survivorLogins.get(survivorLogins.size() - 1))
-                        .as("the redial replayed the configured user instead of the last sign-in")
-                        .contains("handrun")
-                        .doesNotContain("configured");
+                assertThat(survivorLogins).isEmpty();
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
                 survivor.close();
@@ -292,6 +379,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         private final ServerSocket server;
         private final List<Socket> accepted = new CopyOnWriteArrayList<>();
         private volatile boolean killed;
+        private volatile boolean rejectBindings;
+        private final AtomicInteger bindings = new AtomicInteger();
 
         private MockNode(ServerSocket server) {
             this.server = server;
@@ -324,8 +413,20 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 InputStream input = socket.getInputStream();
                 OutputStream output = socket.getOutputStream();
                 Request request;
-                while (!killed && (request = readRequest(input)) != null) {
-                    writeResponse(output, request, handler.handle(request));
+                while (!killed && (request = AsyncIggyTcpClientTransientFailoverTest.readRequest(input, 0)) != null) {
+                    Response response;
+                    if (request.is(
+                            AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
+                        bindings.incrementAndGet();
+                        response = rejectBindings
+                                ? Response.error(OPERATION_NON_REPLICATED, IggyErrorCode.UNAUTHENTICATED.getCode())
+                                : Response.success(
+                                        OPERATION_NON_REPLICATED,
+                                        AsyncIggyTcpClientTransientFailoverTest.bindBody(request));
+                    } else {
+                        response = handler.handle(request);
+                    }
+                    AsyncIggyTcpClientTransientFailoverTest.writeResponse(output, request, response);
                 }
             } catch (IOException closed) {
                 // A killed node and a client that went away look the same here.
@@ -342,60 +443,6 @@ class AsyncIggyTcpClientEndpointFailoverTest {
 
         void close() throws IOException {
             kill();
-        }
-    }
-
-    private static Request readRequest(InputStream input) throws IOException {
-        byte[] header = input.readNBytes(HEADER_SIZE);
-        if (header.length == 0) {
-            return null;
-        }
-        if (header.length != HEADER_SIZE) {
-            throw new EOFException("Truncated VSR request header");
-        }
-        ByteBuffer fields = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-        int size = fields.getInt(SIZE_OFFSET);
-        byte[] body = input.readNBytes(size - HEADER_SIZE);
-        if (body.length != size - HEADER_SIZE) {
-            throw new EOFException("Truncated VSR request body");
-        }
-        return new Request(
-                Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
-                fields.getInt(REQUEST_CODE_OFFSET),
-                fields.getLong(REQUEST_ID_OFFSET),
-                body);
-    }
-
-    private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
-        byte[] body = new byte[response.body().readableBytes()];
-        response.body().readBytes(body);
-        response.body().release();
-        byte[] header = new byte[HEADER_SIZE];
-        ByteBuffer fields = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-        fields.putInt(SIZE_OFFSET, HEADER_SIZE + body.length);
-        header[COMMAND_OFFSET] = (byte) COMMAND_REPLY;
-        fields.putLong(REPLY_REQUEST_ID_OFFSET, request.requestId());
-        header[REPLY_OPERATION_OFFSET] = (byte) response.operation();
-        fields.putInt(REPLY_STATUS_OFFSET, 0);
-        output.write(header);
-        output.write(body);
-        output.flush();
-    }
-
-    private record Request(int operation, int commandCode, long requestId, byte[] body) {
-        boolean is(int expectedCode, int expectedOperation) {
-            return commandCode == expectedCode && operation == expectedOperation;
-        }
-
-        /** The request body as text, for asserting which user a login names. */
-        String bodyAsText() {
-            return new String(body, StandardCharsets.UTF_8);
-        }
-    }
-
-    private record Response(int operation, ByteBuf body) {
-        static Response success(int operation, ByteBuf body) {
-            return new Response(operation, body);
         }
     }
 
@@ -460,9 +507,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                         .as("zero retries skipped the one rotation the known endpoints are for")
                         .isTrue();
                 assertThat(client.getConnectionInfo().port()).isEqualTo(survivorPort);
-                assertThat(survivorRegistrations)
-                        .as("the sign-in was replayed on the survivor")
-                        .hasValueGreaterThanOrEqualTo(1);
+                assertThat(survivorRegistrations).hasValue(0);
+                assertThat(survivor.bindings).hasValueGreaterThanOrEqualTo(1);
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
                 survivor.close();

@@ -16,6 +16,7 @@
 // under the License.
 
 import { MAX_U32 } from '../constant.js';
+import { HEADER_SIZE } from '../wire/vsr/header.js';
 import {
   nanosecondsToMilliseconds,
   parseIggyDurationNanoseconds
@@ -114,7 +115,8 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
         tls: false,
         reconnect: { ...CONNECTION_STRING_RECONNECT }
       };
-  const { tls, reconnect, heartbeatInterval, ...transportOptions } = options;
+  const { tls, reconnect, heartbeatInterval, maxPendingOperations,
+    maxPendingOperationBytes, ...transportOptions } = options;
 
   const config: ClientConfig = {
     transport: tls ? 'TLS' : 'TCP',
@@ -132,6 +134,10 @@ export const parseConnectionString = (connectionString: string): ClientConfig =>
   };
   if (heartbeatInterval !== undefined)
     config.heartbeatInterval = heartbeatInterval;
+  if (maxPendingOperations !== undefined)
+    config.maxPendingOperations = maxPendingOperations;
+  if (maxPendingOperationBytes !== undefined)
+    config.maxPendingOperationBytes = maxPendingOperationBytes;
 
   return config;
 };
@@ -143,7 +149,9 @@ type ParsedConnectionOptions = {
   /** Path stored for connect-time reading, match Rust SDK. */
   caFile?: string,
   reconnect: ReconnectOption,
-  heartbeatInterval?: number
+  heartbeatInterval?: number,
+  maxPendingOperations?: number,
+  maxPendingOperationBytes?: number
 };
 
 const parseConnectionOptions = (
@@ -206,6 +214,15 @@ const parseConnectionOptions = (
       case 'heartbeat_interval':
         parsed.heartbeatInterval = parseDuration(value);
         break;
+      case 'max_pending_operations':
+      case 'max_pending_operation_bytes': {
+        const limit = parseNumber(name, value);
+        const minimum = name === 'max_pending_operations' ? 1 : HEADER_SIZE;
+        if (!Number.isSafeInteger(limit) || limit < minimum)
+          throw new TypeError(`option "${name}" must be a safe integer of at least ${minimum}`);
+        parsed[name === 'max_pending_operations' ? 'maxPendingOperations' : 'maxPendingOperationBytes'] = limit;
+        break;
+      }
       default:
         throw new TypeError(`unknown option "${name}"`);
     }

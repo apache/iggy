@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use iggy::prelude::{
-    Identifier, IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient,
+    Identifier, IggyError, IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient,
 };
 use secrecy::SecretString;
 use serial_test::serial;
@@ -434,15 +434,14 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
     assert!(matches!(result, Err(BridgeError::Iggy(_))));
 }
 
-/// Regression test for the missing dial timeout: `TcpClient::establish_bounded` only applies its
-/// own `FAILOVER_DIAL_TIMEOUT` when at least two failover candidates are configured, which a
-/// bridge (always exactly one address) never has, so the underlying `TcpStream::connect` had no
-/// deadline at all against an address that drops packets instead of refusing them. 192.0.2.1 is
-/// RFC 5737 TEST-NET-1 - reserved for documentation, routed nowhere, so the connect attempt hangs
-/// on the kernel's own SYN-retry timeout (confirmed against this exact address before writing this
-/// test: over the sandbox's real network stack, a bare `connect()` past 3s had not yet failed).
-/// Before `REQUEST_TIMEOUT`, this test would have hung for minutes; now it must fail within a
-/// bounded window.
+/// Regression test for the missing dial timeout: the SDK once bounded a dial only when at least
+/// two failover candidates were configured, which a bridge (always exactly one address) never
+/// has, so the underlying `TcpStream::connect` had no deadline at all against an address that
+/// drops packets instead of refusing them. 192.0.2.1 is RFC 5737 TEST-NET-1 - reserved for
+/// documentation, routed nowhere, so the connect attempt hangs on the kernel's own SYN-retry
+/// timeout (confirmed against this exact address before writing this test: over the sandbox's
+/// real network stack, a bare `connect()` past 3s had not yet failed). Before `REQUEST_TIMEOUT`,
+/// this test would have hung for minutes; now it must fail within a bounded window.
 #[tokio::test]
 async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
     let config = IggyBridgeConfig {
@@ -468,10 +467,19 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         "connect took {:?}, longer than REQUEST_TIMEOUT (15s) should allow",
         start.elapsed()
     );
-    // BridgeError::Timeout, not BridgeError::Iggy: with_request_timeout's own elapsed branch
-    // maps here (see that function's doc for why an unknown outcome must not borrow
+    // Either bound can end the attempt first. The SDK cuts every dial at its own timeout and
+    // returns CannotEstablishConnection after its last reconnect pass, which is safe because no
+    // link ever came up. Otherwise with_request_timeout's own elapsed branch maps to
+    // BridgeError::Timeout (see that function's doc for why an unknown outcome must not borrow
     // CannotEstablishConnection's known-safe code).
-    assert!(matches!(result, Err(BridgeError::Timeout)));
+    assert!(
+        matches!(
+            result,
+            Err(BridgeError::Timeout | BridgeError::Iggy(IggyError::CannotEstablishConnection))
+        ),
+        "unexpected connect result: {:?}",
+        result.as_ref().err()
+    );
 }
 
 /// Regression test: `IggyClient::disconnect` (what `close` used to call) never touches

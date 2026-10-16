@@ -430,19 +430,29 @@ enum Responses {
 
     static let partitionRouteSize = 25
 
-    /// The context a request routed by a `GetPartitionRoute` reply carries:
-    /// `[incarnation:8][metadata_op:8][view:4][partitions_count:4][primary_replica:1]`.
+    /// One replica's route to a partition, the reply to `GetPartitionRoute`.
+    struct PartitionRoute: Equatable {
+        /// The context a request routed by the reply carries.
+        let context: PartitionContext
+        /// The configured replica id of the partition primary, as
+        /// `GetClusterMetadata` reports it, never a roster position.
+        let primaryReplica: UInt8
+    }
+
+    /// Decodes `[incarnation:8][metadata_op:8][view:4][partitions_count:4][primary_replica:1]`.
     /// A route names no consumer, so the context carries owner 0, as
-    /// `PartitionRouteResponse::context` in the Rust protocol crate. The view
-    /// and the primary pick a replica for a client that dials each one; this
-    /// one sends over its connection. A reply of any other length comes from
-    /// a mismatched build.
-    static func partitionRoute(_ body: ArraySlice<UInt8>) throws -> PartitionContext {
+    /// `PartitionRouteResponse::context` in the Rust protocol crate. A reply
+    /// of any other length comes from a mismatched build.
+    static func partitionRoute(_ body: ArraySlice<UInt8>) throws -> PartitionRoute {
         guard body.count == partitionRouteSize else {
             throw IggyError(.invalidCommand, context: "partition route is \(body.count) bytes, expected \(partitionRouteSize)")
         }
         return try decode(body) { reader in
-            PartitionContext(incarnation: try reader.readUInt64(), ownerGeneration: 0, metadataOp: try reader.readUInt64())
+            let context = PartitionContext(incarnation: try reader.readUInt64(), ownerGeneration: 0, metadataOp: try reader.readUInt64())
+            // The view and the partition count, which a client that asks only
+            // the coordinator for routes does not use.
+            try reader.skip(2 * MemoryLayout<UInt32>.size)
+            return PartitionRoute(context: context, primaryReplica: try reader.readUInt8())
         }
     }
 
@@ -451,22 +461,7 @@ enum Responses {
     struct SessionIdentity: Equatable {
         let clientID: UInt128Value
         let session: UInt64
-        var metadataWatermark: UInt64
-    }
-
-    /// Where a poll or an offset write goes: the reply to `GetPollRouting`
-    /// and `GetConsumerOffsetRouting`.
-    struct PollRoute: Equatable {
-        var consumerSession: SessionIdentity
-        let context: PartitionContext
-        let primary: ClusterNode
-    }
-
-    static func pollRoute(_ body: ArraySlice<UInt8>) throws -> PollRoute {
-        try decode(body) { reader in
-            let session = SessionIdentity(clientID: try reader.readUInt128(), session: try reader.readUInt64(), metadataWatermark: try reader.readUInt64())
-            return PollRoute(consumerSession: session, context: try PartitionContext.decode(from: &reader), primary: try clusterNode(from: &reader))
-        }
+        let metadataWatermark: UInt64
     }
 
     // MARK: Messages

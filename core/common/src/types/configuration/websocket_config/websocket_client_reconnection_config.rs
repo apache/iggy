@@ -24,17 +24,17 @@ use std::str::FromStr;
 /// It consists of the following fields:
 /// - `enabled`: whether to enable reconnection.
 /// - `max_retries`: the maximum number of retries. If None, will retry infinitely.
-/// - `interval`: the interval between retries.
-/// - `reestablish_after`: the time to wait before attempting to reestablish connection.
+/// - `interval`: the full-jitter exponential backoff base, capped at 10 seconds.
+/// - `reestablish_after`: the stable connection duration that resets the retry count and backoff.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WebSocketClientReconnectionConfig {
     /// Whether to enable reconnection.
     pub enabled: bool,
     /// The maximum number of retries. If None, will retry infinitely.
     pub max_retries: Option<u32>,
-    /// The interval between retries.
+    /// Full-jitter exponential backoff base, capped at 10 seconds.
     pub interval: NonZeroIggyDuration,
-    /// The time to wait before attempting to reestablish connection.
+    /// Stable connection duration that resets the retry count and backoff.
     pub reestablish_after: IggyDuration,
 }
 

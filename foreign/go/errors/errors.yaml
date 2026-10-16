@@ -1338,3 +1338,21 @@
 - name: RequestIdExhausted
   code: 14005
   format: "vsr request id exhausted"
+- name: UncertainOutcome
+  code: 14006
+  format: "operation %d has an uncertain outcome"
+  fields:
+    - name: OperationID
+      type: uint64
+- name: LaneBlocked
+  code: 14007
+  format: "lane blocked by operation %d"
+  fields:
+    - name: OperationID
+      type: uint64
+- name: OperationNotRetained
+  code: 14008
+  format: "operation %d is not retained"
+  fields:
+    - name: OperationID
+      type: uint64

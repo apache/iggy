@@ -78,15 +78,12 @@ struct ClientTransportTests {
         try await client.ping()
         let requests = await server.requests
         #expect(requests.map(\.operation) == [.register, .nonReplicated, .nonReplicated, .deleteStream, .deleteStream, .nonReplicated])
-        // The register runs unbound with request id 0; the roster read that
-        // follows is non-replicated and never advances the watermark, which
-        // the replicated creates then consume as 1 and 2.
+        #expect(requests.map(\.requestID) == Array(0...5))
         #expect(requests[0].session == 0 && requests[0].requestID == 0 && requests[0].checksum != 0)
         #expect(requests[1].code == CommandCode.getClusterMetadata.rawValue)
-        #expect(requests[2].code == CommandCode.ping.rawValue && requests[2].session == 1 && requests[2].requestID == 1)
-        #expect(requests[3].requestID == 1 && requests[3].session == 1 && requests[3].checksum == XXH3.hash64(requests[3].payload))
-        #expect(requests[4].requestID == 2)
-        #expect(requests[5].requestID == 3 && requests[5].checksum == 0)
+        #expect(requests[2].code == CommandCode.ping.rawValue && requests[2].session == 1)
+        #expect(requests[3].session == 1 && requests[3].checksum == XXH3.hash64(requests[3].payload))
+        #expect(requests[5].checksum == 0)
         #expect(requests.allSatisfy { $0.clientID == requests[0].clientID })
         #expect(await client.serverAddress == server.address)
         #expect(await client.clientAddress?.hasPrefix("127.0.0.1:") == true)
@@ -1002,8 +999,9 @@ struct ClientTransportTests {
             }
             try await group.waitForAll()
         }
-        let creates = await server.requests.filter { $0.operation == .deleteStream }.map(\.requestID)
-        #expect(creates.sorted() == Array(1...10))
+        let requests = await server.requests
+        #expect(requests.filter { $0.operation == .deleteStream }.count == 10)
+        #expect(requests.map(\.requestID) == Array(0...21))
         #expect(await server.connectionCount == 1)
         await client.shutdown()
     }

@@ -16,6 +16,8 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::driver::{operation_deadline, with_deadline};
+use crate::links::OPERATION_TIMEOUT;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
@@ -42,11 +44,18 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout_at};
 use tracing::{debug, error, info, trace, warn};
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>> + Send>>;
+
+#[derive(Clone, Copy)]
+enum OffsetMutation {
+    Store { partition_id: u32, offset: u64 },
+    StorePosition(ConsumerPosition),
+    Delete { partition_id: Option<u32> },
+}
 
 /// The auto-commit configuration for storing the offset on the server.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -195,20 +204,11 @@ impl IggyConsumerState {
             offset,
             context: PartitionContext::default(),
         };
-        if !self.allow_replay && self.stored_offset_covers(position) {
-            return Ok(());
-        }
-        self.client
-            .read()
-            .await
-            .store_consumer_offset(
-                &self.consumer,
-                &self.stream_id,
-                &self.topic_id,
-                Some(partition_id),
-                offset,
-            )
-            .await?;
+        self.mutate_offset(OffsetMutation::Store {
+            partition_id,
+            offset,
+        })
+        .await?;
         self.last_stored_offsets.insert(partition_id, position);
         Ok(())
     }
@@ -220,14 +220,13 @@ impl IggyConsumerState {
         if partition_id.is_none() && !self.is_consumer_group {
             partition_id = Some(self.partition_id());
         }
-        let client = self.client.read().await;
-        client
-            .delete_consumer_offset(
-                &self.consumer,
-                &self.stream_id,
-                &self.topic_id,
-                partition_id,
-            )
+        // Cancellation can hide a committed delete, so a later store must reach the server.
+        if let Some(partition_id) = partition_id {
+            self.last_stored_offsets.remove(&partition_id);
+        } else {
+            self.last_stored_offsets.clear();
+        }
+        self.mutate_offset(OffsetMutation::Delete { partition_id })
             .await
     }
 
@@ -245,32 +244,89 @@ impl IggyConsumerState {
         if !allow_replay && self.stored_offset_covers(position) {
             return Ok(());
         }
-        self.client
-            .read()
-            .await
-            .store_consumer_position(&self.consumer, &self.stream_id, &self.topic_id, position)
+        self.mutate_offset(OffsetMutation::StorePosition(position))
             .await?;
         self.last_stored_offsets
             .insert(position.partition_id, position);
         Ok(())
     }
 
-    /// Whether the offset last stored for the partition is at or ahead of `position`. A store made
-    /// before anything was consumed from the partition has no captured context, so it is compared
-    /// with stores of every context rather than only within one incarnation and owner. Such a
-    /// comparison never covers offset 0. Every record covers it, so a record from an earlier
-    /// incarnation of a recreated partition otherwise skips the first offset of the new one.
+    async fn mutate_offset(&self, mutation: OffsetMutation) -> Result<(), IggyError> {
+        with_deadline(Instant::now() + OPERATION_TIMEOUT, async {
+            let deadline = operation_deadline();
+            let client = timeout_at(deadline, self.client.read())
+                .await
+                .map_err(|_| IggyError::TransientNotAccepted)?;
+            match self.send_offset_mutation(&client, mutation).await {
+                Err(IggyError::LaneBlocked(op)) => {
+                    if matches!(
+                        client.resolve_operation(op, deadline.into_std()).await,
+                        Err(IggyError::OperationUncertain(_))
+                    ) {
+                        return Err(IggyError::LaneBlocked(op));
+                    }
+                    // The blocker has its own outcome. Re-entering the lane either
+                    // admits this new mutation or reports that it remains blocked.
+                    self.send_offset_mutation(&client, mutation).await
+                }
+                result => result,
+            }
+        })
+        .await
+    }
+
+    async fn send_offset_mutation(
+        &self,
+        client: &ClientWrapper,
+        mutation: OffsetMutation,
+    ) -> Result<(), IggyError> {
+        match mutation {
+            OffsetMutation::Store {
+                partition_id,
+                offset,
+            } => {
+                client
+                    .store_consumer_offset(
+                        &self.consumer,
+                        &self.stream_id,
+                        &self.topic_id,
+                        Some(partition_id),
+                        offset,
+                    )
+                    .await
+            }
+            OffsetMutation::StorePosition(position) => {
+                client
+                    .store_consumer_position(
+                        &self.consumer,
+                        &self.stream_id,
+                        &self.topic_id,
+                        position,
+                    )
+                    .await
+            }
+            OffsetMutation::Delete { partition_id } => {
+                client
+                    .delete_consumer_offset(
+                        &self.consumer,
+                        &self.stream_id,
+                        &self.topic_id,
+                        partition_id,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// An uncaptured scalar store cannot prove coverage in any partition history.
     fn stored_offset_covers(&self, position: ConsumerPosition) -> bool {
-        let uncaptured = PartitionContext::default();
         self.last_stored_offsets
             .get(&position.partition_id)
             .is_some_and(|stored| {
-                let comparable = if stored.context == uncaptured || position.context == uncaptured {
-                    position.offset > 0
-                } else {
-                    same_incarnation_and_owner(stored.context, position.context)
-                };
-                comparable && position.offset <= stored.offset
+                stored.context.incarnation != 0
+                    && position.context.incarnation != 0
+                    && same_incarnation_and_owner(stored.context, position.context)
+                    && position.offset <= stored.offset
             })
     }
 
@@ -879,9 +935,8 @@ impl IggyConsumer {
     ///
     /// An offset that is not ahead of the last one stored in the same captured context is
     /// skipped and `Ok(())` is returned without a request, unless the consumer was built with
-    /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay). When either of the two
-    /// has no captured context, see below, they are compared regardless of context, and offset
-    /// `0` is never skipped.
+    /// [`allow_replay`](crate::prelude::IggyConsumerBuilder::allow_replay). A store without a
+    /// captured context is always sent and cannot suppress a later captured position.
     ///
     /// The offset is committed under the context of the latest message consumed from that
     /// partition, or without a captured context when nothing was consumed from it. An offset taken
@@ -895,11 +950,14 @@ impl IggyConsumer {
     /// [`delete_offset()`](Self::delete_offset) after [`shutdown()`](Self::shutdown) and build a new
     /// consumer. A new consumer built with [`PollingStrategy::offset()`] re-reads from any point.
     ///
+    /// On binary transports, a retained operation blocking this partition is resolved before
+    /// the requested store. Recovery and the new store share one operation deadline.
+    ///
     /// # Errors
     ///
-    /// Returns any error the server raised while storing the offset, for example
-    /// [`IggyError::Disconnected`] or a permission error. The offset is then not stored and the
-    /// call can be retried.
+    /// [`IggyError::OperationUncertain`] means this store may have committed and remains retained.
+    /// [`IggyError::LaneBlocked`] means the earlier operation is still unresolved and this store
+    /// was not sent. Other failures include connection, permission, history and ownership errors.
     pub async fn store_offset(
         &self,
         offset: u64,
@@ -913,7 +971,7 @@ impl IggyConsumer {
     /// refused without updating replacement progress.
     ///
     /// # Errors
-    /// Returns the server's storage, permission, history or ownership error.
+    /// Uses the recovery and error contract of [`Self::store_offset`].
     pub async fn store_position(&self, position: ConsumerPosition) -> Result<(), IggyError> {
         self.state.store_position(position).await
     }
@@ -931,14 +989,16 @@ impl IggyConsumer {
     /// [`PollingStrategy::next()`] starts at the first message.
     ///
     /// `None` as `partition_id` means [`partition_id()`](Self::partition_id) for a standalone
-    /// consumer. A consumer group passes `None` through to the server. This consumer's own records
-    /// are untouched, so its auto-commit or [`shutdown()`](Self::shutdown) can store the offset
-    /// again. When starting over, call it after [`shutdown()`](Self::shutdown).
+    /// consumer. A binary consumer group requires an explicit partition. Starting a delete
+    /// clears this consumer's stored-offset record, while retaining its consumed position, so
+    /// auto-commit or [`shutdown()`](Self::shutdown) can store that position again. When starting
+    /// over, call it after [`shutdown()`](Self::shutdown).
     ///
     /// # Errors
     ///
     /// Returns [`IggyError::ConsumerOffsetNotFound`] when nothing is stored for that partition, or
-    /// any other error the server raised, for example [`IggyError::Disconnected`].
+    /// any other error the server raised. Uses the recovery and uncertainty contract of
+    /// [`Self::store_offset`].
     pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
         self.state.delete_offset(partition_id).await
     }
@@ -1000,9 +1060,9 @@ impl IggyConsumer {
     ///   stays idle under [`AutoCommit::Disabled`].
     ///
     /// Both skip an offset that is not ahead of this consumer's own record of what it stored
-    /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)) in the same captured context,
-    /// or by a [`store_offset()`](Self::store_offset) made before anything was consumed from that
-    /// partition, which never covers offset `0`. Under auto-commit-on-poll (the default) that record trails the server by one
+    /// ([`get_last_stored_offset()`](Self::get_last_stored_offset)) in the same captured context.
+    /// An earlier scalar store without a captured context cannot suppress these commits.
+    /// Under auto-commit-on-poll (the default) that record trails the server by one
     /// batch, so every tick re-sends the reading position and the server, which takes an explicit
     /// store as is, moves its offset back to it until the next poll.
     ///
@@ -1795,9 +1855,10 @@ impl IggyConsumer {
     ///   forcing it to abort.
     /// - commit the reading position of every partition where it is ahead of this consumer's own
     ///   record of what it stored, unless [`auto_commit()`] is [`AutoCommit::Disabled`]. Under
-    ///   auto-commit-on-poll (the default) the poll already committed the whole batch, so this
-    ///   store moves the server offset back to the last message handed over, and the next run
-    ///   resumes right after it instead of after the last batch fetched.
+    ///   auto-commit-on-poll (the default), the poll admitted progress for the whole batch. This
+    ///   store requests the last message handed over, so the next run resumes after it when the
+    ///   store succeeds. On binary transports, final stores and any blocker recovery share one
+    ///   operation deadline. HTTP retains its configured request timeout.
     /// - leave the consumer group, if this consumer is a group member. This lets the server give its partitions to
     ///   the remaining members immediately instead of waiting for the connection to time out.
     /// - stop the task watching the connection lifecycle.
@@ -1854,15 +1915,18 @@ impl IggyConsumer {
         if self.auto_commit != AutoCommit::Disabled {
             // Replay governs reading only: this flush must never move a stored offset back.
             let allow_replay = false;
-            for position in self.state.last_consumed_positions() {
-                if let Err(error) = self
-                    .state
-                    .store_consumer_position(position, allow_replay)
-                    .await
-                {
-                    warn!(?position, %error, "Final consumer checkpoint was not acknowledged");
+            with_deadline(Instant::now() + OPERATION_TIMEOUT, async {
+                for position in self.state.last_consumed_positions() {
+                    if let Err(error) = self
+                        .state
+                        .store_consumer_position(position, allow_replay)
+                        .await
+                    {
+                        warn!(?position, %error, "Final consumer checkpoint was not acknowledged");
+                    }
                 }
-            }
+            })
+            .await;
         }
 
         if self.is_consumer_group && self.joined_consumer_group.load(ORDERING) {
@@ -1922,31 +1986,23 @@ mod tests {
     use super::*;
     use crate::client_wrappers::client_wrapper::ClientWrapper;
     use crate::clients::consumer_builder::IggyConsumerBuilder;
+    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint, eventually};
     use crate::tcp::tcp_client::TcpClient;
     use iggy_binary_protocol::codes::{
-        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_POLL_ROUTING_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
+        DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
     };
-    use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
+    use iggy_binary_protocol::requests::consumer_offsets::{
+        DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
+    };
     use iggy_binary_protocol::requests::messages::PollMessagesRequest;
-    use iggy_binary_protocol::requests::system::SessionIdentity;
     use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-    use iggy_binary_protocol::responses::messages::PollRoutingResponse;
-    use iggy_binary_protocol::responses::system::get_cluster_metadata::{
-        ClusterMetadataResponse, ClusterNodeResponse,
-    };
-    use iggy_binary_protocol::{
-        Command, HEADER_SIZE, Operation, ReplyHeader, RequestHeader, STATUS_OK, WireDecode,
-        WireEncode,
-    };
+    use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+    use iggy_binary_protocol::{WireDecode, WireEncode};
+    use iggy_common::Aes256GcmEncryptor;
     use iggy_common::locking::IggyRwLockFn;
-    use iggy_common::{
-        Aes256GcmEncryptor, BinaryTransport, ClientState, TcpClientConfig, VsrSessionControl,
-    };
     use std::str::FromStr;
     use std::task::Waker;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
     use tokio::time::timeout;
     use tracing::field::Field;
     use tracing::span::{Attributes, Id, Record};
@@ -2102,114 +2158,79 @@ mod tests {
         assert!(consumer.next_offsets.is_empty());
     }
 
-    /// The requests a server from [`connect_to_test_server`] served.
-    #[derive(Debug, Default)]
-    struct Served {
-        polled_partitions: Vec<u32>,
-        stored_offsets: Vec<u64>,
+    struct Served(Arc<FakeCluster>);
+
+    impl Served {
+        fn stored_offsets(&self) -> Vec<u64> {
+            self.0
+                .received(STORE_CONSUMER_OFFSET_CODE)
+                .iter()
+                .map(|request| {
+                    StoreConsumerOffsetRequest::decode_from(&request.body)
+                        .unwrap()
+                        .offset
+                })
+                .collect()
+        }
+
+        fn deleted_partitions(&self) -> Vec<u32> {
+            self.0
+                .received(DELETE_CONSUMER_OFFSET_CODE)
+                .iter()
+                .map(|request| {
+                    DeleteConsumerOffsetRequest::decode_from(&request.body)
+                        .unwrap()
+                        .partition_id
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn polled_partitions(&self) -> Vec<u32> {
+            self.0
+                .received(POLL_MESSAGES_CODE)
+                .iter()
+                .map(|request| {
+                    PollMessagesRequest::decode_from(&request.body)
+                        .unwrap()
+                        .partition_id
+                        .unwrap()
+                })
+                .collect()
+        }
     }
 
-    /// Connects a signed-in client to a single-node server whose group assigns `partitions`. The
-    /// server refuses every poll with `poll_refusal` and accepts every offset store.
     async fn connect_to_test_server(
         partitions: Vec<u32>,
         poll_refusal: IggyError,
-    ) -> (TcpClient, Arc<std::sync::Mutex<Served>>) {
-        /// A result section without entries, which accepts a replicated request.
-        const ACCEPTED: [u8; size_of::<u32>()] = STATUS_OK.to_le_bytes();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let node = ClusterNodeResponse {
-            replica_id: 0,
-            name: "node".to_owned(),
-            ip: address.ip().to_string(),
-            tcp_port: address.port(),
-            quic_port: 0,
-            http_port: 0,
-            websocket_port: 0,
-            role: 1,
-            status: 1,
-        };
-        let served = Arc::new(std::sync::Mutex::new(Served::default()));
-        let server_served = Arc::clone(&served);
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut header = [0; HEADER_SIZE];
-            while stream.read_exact(&mut header).await.is_ok() {
-                let request: RequestHeader =
-                    bytemuck::checked::try_pod_read_unaligned(&header).unwrap();
-                let mut body = vec![0; request.size as usize - HEADER_SIZE];
-                stream.read_exact(&mut body).await.unwrap();
-                let mut status = STATUS_OK;
-                let reply = match (request.operation, u32::from_le_bytes(request.reserved)) {
-                    (Operation::StoreConsumerOffset, _) => {
-                        let store = StoreConsumerOffsetRequest::decode_from(&body).unwrap();
-                        server_served
-                            .lock()
-                            .unwrap()
-                            .stored_offsets
-                            .push(store.offset);
-                        Bytes::from_static(&ACCEPTED)
-                    }
-                    (_, GET_CLUSTER_METADATA_CODE) => ClusterMetadataResponse {
-                        name: "cluster".to_owned(),
-                        nodes: vec![node.clone()],
-                    }
-                    .to_bytes(),
-                    (_, SYNC_CONSUMER_GROUP_CODE) => SyncConsumerGroupResponse {
-                        generation: 1,
-                        partitions: partitions.clone(),
-                    }
-                    .to_bytes(),
-                    (_, GET_POLL_ROUTING_CODE | GET_CONSUMER_OFFSET_ROUTING_CODE) => {
-                        PollRoutingResponse {
-                            consumer_session: SessionIdentity {
-                                client_id: 1,
-                                session: 1,
-                                metadata_watermark: 0,
-                            },
-                            context: PartitionContext::default(),
-                            primary: node.clone(),
-                        }
-                        .to_bytes()
-                    }
-                    (_, POLL_MESSAGES_ON_PRIMARY_CODE) => {
-                        let poll = PollMessagesRequest::decode_from(&body).unwrap();
-                        server_served
-                            .lock()
-                            .unwrap()
-                            .polled_partitions
-                            .push(poll.partition_id.unwrap());
-                        status = poll_refusal.as_code();
-                        Bytes::new()
-                    }
-                    (operation, code) => panic!("unexpected {operation:?} request, code: {code}"),
-                };
-                let reply_header = ReplyHeader {
-                    command: Command::Reply,
-                    operation: request.operation,
-                    client: request.client,
-                    request: request.request,
-                    size: u32::try_from(HEADER_SIZE + reply.len()).unwrap(),
-                    status,
-                    ..Default::default()
-                };
-                stream
-                    .write_all(bytemuck::bytes_of(&reply_header))
-                    .await
-                    .unwrap();
-                stream.write_all(&reply).await.unwrap();
-            }
+    ) -> (TcpClient, Served) {
+        let cluster = FakeCluster::new(1);
+        *cluster.route.lock().unwrap() = Some(PartitionRouteResponse {
+            incarnation: 1,
+            metadata_op: 1,
+            view: 0,
+            partitions_count: partitions.iter().copied().max().unwrap_or_default() + 1,
+            primary_replica: 0,
         });
-        let client = TcpClient::create(Arc::new(TcpClientConfig {
-            server_address: address.to_string(),
-            ..Default::default()
-        }))
-        .unwrap();
-        Client::connect(&client).await.unwrap();
-        client.bind_vsr_session(1).await.unwrap();
-        client.set_state(ClientState::Authenticated).await;
-        (client, served)
+        cluster.script(
+            &endpoint(0),
+            SYNC_CONSUMER_GROUP_CODE,
+            [Answer::Body(
+                SyncConsumerGroupResponse {
+                    generation: 1,
+                    partitions,
+                }
+                .to_bytes()
+                .to_vec(),
+            )],
+        );
+        cluster.script(
+            &endpoint(0),
+            POLL_MESSAGES_CODE,
+            [Answer::Refuse(poll_refusal)],
+        );
+        let links = connected(&cluster, 1).await;
+        (TcpClient::from_links(links), Served(cluster))
     }
 
     #[tokio::test]
@@ -2240,10 +2261,7 @@ mod tests {
                 matches!(&polled, Some(Err(error)) if *error == refusal),
                 "{refusal}"
             );
-            assert_eq!(
-                served.lock().unwrap().polled_partitions,
-                [REFUSED_PARTITION]
-            );
+            assert_eq!(served.polled_partitions(), [REFUSED_PARTITION]);
             assert_eq!(next_offset(&consumer, REFUSED_PARTITION), None, "{refusal}");
             assert_eq!(
                 next_offset(&consumer, RETAINED_PARTITION),
@@ -2259,6 +2277,7 @@ mod tests {
             partition_id: 1,
             offset,
             context: PartitionContext {
+                incarnation: 1,
                 metadata_op,
                 ..PartitionContext::default()
             },
@@ -2291,7 +2310,7 @@ mod tests {
 
         consumer.shutdown().await.unwrap();
 
-        assert!(served.lock().unwrap().stored_offsets.is_empty());
+        assert!(served.stored_offsets().is_empty());
         assert_eq!(consumer.get_last_stored_offset(1), Some(stored.offset));
     }
 
@@ -2306,7 +2325,7 @@ mod tests {
 
         consumer.store_offset(OFFSET, Some(1)).await.unwrap();
 
-        assert_eq!(served.lock().unwrap().stored_offsets, [OFFSET]);
+        assert_eq!(served.stored_offsets(), [OFFSET]);
         assert_eq!(consumer.get_last_stored_offset(1), Some(OFFSET));
     }
 
@@ -2330,7 +2349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_offset_without_a_consumed_position_should_skip_a_lower_offset() {
+    async fn store_offset_without_a_consumed_position_should_send_every_offset() {
         let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
         let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
             .partition(Some(1))
@@ -2340,8 +2359,8 @@ mod tests {
         consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
         consumer.store_offset(LOWER_OFFSET, Some(1)).await.unwrap();
 
-        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
-        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, LOWER_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
     }
 
     #[tokio::test]
@@ -2356,15 +2375,12 @@ mod tests {
         consumer.store_offset(STORED_OFFSET, Some(1)).await.unwrap();
         consumer.store_offset(LOWER_OFFSET, Some(1)).await.unwrap();
 
-        assert_eq!(
-            served.lock().unwrap().stored_offsets,
-            [STORED_OFFSET, LOWER_OFFSET]
-        );
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, LOWER_OFFSET]);
         assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
     }
 
     #[tokio::test]
-    async fn store_position_should_skip_an_offset_behind_one_stored_without_a_consumed_position() {
+    async fn store_position_should_send_after_an_uncaptured_scalar_store() {
         let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
         let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
             .partition(Some(1))
@@ -2377,8 +2393,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
-        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, LOWER_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
     }
 
     /// A recreated partition starts again at 0, and the offset stored without a consumed position
@@ -2397,12 +2413,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET, 0]);
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, 0]);
         assert_eq!(consumer.get_last_stored_offset(1), Some(0));
     }
 
     #[tokio::test]
-    async fn store_offset_without_a_consumed_position_should_not_move_a_stored_position_back() {
+    async fn store_offset_without_a_consumed_position_should_not_compare_a_captured_store() {
         let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
         let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
             .partition(Some(1))
@@ -2415,12 +2431,12 @@ mod tests {
             .unwrap();
         consumer.store_offset(LOWER_OFFSET, Some(1)).await.unwrap();
 
-        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
-        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, LOWER_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
     }
 
     #[tokio::test]
-    async fn shutdown_should_not_move_back_an_offset_stored_without_a_consumed_position() {
+    async fn shutdown_should_store_the_captured_position_after_an_uncaptured_scalar_store() {
         let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
         let mut consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
             .partition(Some(1))
@@ -2433,8 +2449,313 @@ mod tests {
 
         consumer.shutdown().await.unwrap();
 
-        assert_eq!(served.lock().unwrap().stored_offsets, [STORED_OFFSET]);
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, LOWER_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
+    }
+
+    #[tokio::test]
+    async fn given_a_deleted_offset_when_storing_the_same_position_should_send_again() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        let position = captured_position_at(STORED_OFFSET);
+        consumer.store_position(position).await.unwrap();
+
+        consumer
+            .delete_offset(Some(position.partition_id))
+            .await
+            .unwrap();
+
+        assert_eq!(consumer.get_last_stored_offset(position.partition_id), None);
+        consumer.store_position(position).await.unwrap();
+        assert_eq!(served.deleted_partitions(), [position.partition_id]);
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, STORED_OFFSET]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_unconfirmed_delete_when_storing_the_same_position_should_resolve_and_store() {
+        for cancel in [false, true] {
+            let (client, served) =
+                connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+            let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+                .partition(Some(1))
+                .auto_commit(AutoCommit::Disabled)
+                .build();
+            let position = captured_position_at(STORED_OFFSET);
+            consumer.store_position(position).await.unwrap();
+            served.0.script(
+                &endpoint(0),
+                DELETE_CONSUMER_OFFSET_CODE,
+                [Answer::Silence, Answer::Commit(2)],
+            );
+
+            if cancel {
+                assert!(
+                    tokio::time::timeout(POLL_RETRY_INTERVAL, consumer.delete_offset(Some(1)))
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(matches!(
+                    consumer.delete_offset(Some(1)).await,
+                    Err(IggyError::OperationUncertain(_))
+                ));
+            }
+            assert_eq!(served.0.count(DELETE_CONSUMER_OFFSET_CODE), 1);
+            consumer.store_position(position).await.unwrap();
+
+            let deletes = served.0.received(DELETE_CONSUMER_OFFSET_CODE);
+            assert_eq!(deletes.len(), 2);
+            assert_eq!(deletes[0].header.request, deletes[1].header.request);
+            assert_eq!(served.stored_offsets(), [STORED_OFFSET, STORED_OFFSET]);
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_rejected_delete_when_storing_the_same_position_should_refresh_coverage() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        let position = captured_position_at(STORED_OFFSET);
+        consumer.store_position(position).await.unwrap();
+        served.0.script(
+            &endpoint(0),
+            DELETE_CONSUMER_OFFSET_CODE,
+            [Answer::CommitRejected(2, IggyError::InvalidCommand)],
+        );
+
+        assert_eq!(
+            consumer.delete_offset(Some(1)).await,
+            Err(IggyError::InvalidCommand)
+        );
+        consumer.store_position(position).await.unwrap();
+
         assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+        assert_eq!(served.stored_offsets(), [STORED_OFFSET, STORED_OFFSET]);
+    }
+
+    #[tokio::test]
+    async fn given_a_stored_position_when_its_owner_or_incarnation_changes_should_store_the_lower_offset()
+     {
+        for context in [
+            PartitionContext {
+                owner_generation: 2,
+                ..captured_position_at(LOWER_OFFSET).context
+            },
+            PartitionContext {
+                incarnation: 2,
+                ..captured_position_at(LOWER_OFFSET).context
+            },
+        ] {
+            let (client, served) =
+                connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+            let consumer = builder_on(client, Consumer::group(Identifier::numeric(1).unwrap()))
+                .partition(Some(1))
+                .auto_commit(AutoCommit::Disabled)
+                .build();
+            consumer
+                .store_position(captured_position_at(STORED_OFFSET))
+                .await
+                .unwrap();
+
+            consumer
+                .store_position(ConsumerPosition {
+                    context,
+                    ..captured_position_at(LOWER_OFFSET)
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(served.stored_offsets(), [STORED_OFFSET, LOWER_OFFSET]);
+            let stores = served.0.received(STORE_CONSUMER_OFFSET_CODE);
+            assert_eq!(stores[1].header.partition_incarnation, context.incarnation);
+            assert_eq!(stores[1].header.owner_generation, context.owner_generation);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_store_when_the_blocker_is_rejected_should_store_the_new_position() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        served.0.script(
+            &endpoint(0),
+            STORE_CONSUMER_OFFSET_CODE,
+            [
+                Answer::Silence,
+                Answer::CommitRejected(1, IggyError::HistoryUnavailable),
+                Answer::Commit(2),
+            ],
+        );
+        let first = consumer
+            .store_position(captured_position_at(LOWER_OFFSET))
+            .await;
+        let old = served.0.received(STORE_CONSUMER_OFFSET_CODE)[0]
+            .header
+            .request;
+        assert_eq!(first, Err(IggyError::OperationUncertain(old)));
+
+        consumer
+            .store_position(captured_position_at(STORED_OFFSET))
+            .await
+            .unwrap();
+
+        let stores = served.0.received(STORE_CONSUMER_OFFSET_CODE);
+        assert_eq!(
+            served.stored_offsets(),
+            [LOWER_OFFSET, LOWER_OFFSET, STORED_OFFSET]
+        );
+        assert_eq!(stores[0].header.request, stores[1].header.request);
+        assert_eq!(stores[0].body, stores[1].body);
+        assert_ne!(stores[1].header.request, stores[2].header.request);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(STORED_OFFSET));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_store_when_deleting_should_resolve_before_sending_the_delete() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        served.0.script(
+            &endpoint(0),
+            STORE_CONSUMER_OFFSET_CODE,
+            [Answer::Silence, Answer::Commit(1)],
+        );
+        assert!(matches!(
+            consumer
+                .store_position(captured_position_at(LOWER_OFFSET))
+                .await,
+            Err(IggyError::OperationUncertain(_))
+        ));
+
+        consumer.delete_offset(Some(1)).await.unwrap();
+
+        let mutations: Vec<_> = served
+            .0
+            .codes(&endpoint(0))
+            .into_iter()
+            .filter(|code| {
+                matches!(
+                    *code,
+                    STORE_CONSUMER_OFFSET_CODE | DELETE_CONSUMER_OFFSET_CODE
+                )
+            })
+            .collect();
+        assert_eq!(
+            mutations,
+            [
+                STORE_CONSUMER_OFFSET_CODE,
+                STORE_CONSUMER_OFFSET_CODE,
+                DELETE_CONSUMER_OFFSET_CODE
+            ]
+        );
+        assert_eq!(served.deleted_partitions(), [1]);
+        assert_eq!(consumer.get_last_stored_offset(1), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_still_uncertain_store_when_storing_again_should_leave_the_new_position_unsent()
+    {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .partition(Some(1))
+            .auto_commit(AutoCommit::Disabled)
+            .build();
+        served.0.script(
+            &endpoint(0),
+            STORE_CONSUMER_OFFSET_CODE,
+            [Answer::Silence, Answer::Silence],
+        );
+        assert!(matches!(
+            consumer
+                .store_position(captured_position_at(LOWER_OFFSET))
+                .await,
+            Err(IggyError::OperationUncertain(_))
+        ));
+        let old = served.0.received(STORE_CONSUMER_OFFSET_CODE)[0]
+            .header
+            .request;
+        let started = Instant::now();
+
+        let result = consumer
+            .store_position(captured_position_at(STORED_OFFSET))
+            .await;
+
+        assert_eq!(result, Err(IggyError::LaneBlocked(old)));
+        assert!(started.elapsed() <= OPERATION_TIMEOUT);
+        assert_eq!(served.stored_offsets(), [LOWER_OFFSET, LOWER_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_multiple_final_positions_when_shutdown_times_out_should_share_one_deadline() {
+        let (client, served) =
+            connect_to_test_server(vec![1, 2], IggyError::HistoryUnavailable).await;
+        let mut consumer =
+            builder_on(client, Consumer::new(Identifier::numeric(1).unwrap())).build();
+        for partition_id in [1, 2] {
+            consumer.state.last_consumed_offsets.insert(
+                partition_id,
+                ConsumerPosition {
+                    partition_id,
+                    ..captured_position_at(LOWER_OFFSET)
+                },
+            );
+        }
+        served.0.script(
+            &endpoint(0),
+            STORE_CONSUMER_OFFSET_CODE,
+            [Answer::Silence, Answer::Silence],
+        );
+        let started = Instant::now();
+
+        consumer.shutdown().await.unwrap();
+
+        assert!(started.elapsed() <= OPERATION_TIMEOUT);
+        assert_eq!(served.stored_offsets(), [LOWER_OFFSET]);
+        assert_eq!(consumer.get_last_stored_offset(1), None);
+        assert_eq!(consumer.get_last_stored_offset(2), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_inflight_background_store_when_shutdown_aborts_it_should_resolve_and_flush() {
+        let (client, served) = connect_to_test_server(vec![1], IggyError::HistoryUnavailable).await;
+        let mut consumer = builder_on(client, Consumer::new(Identifier::numeric(1).unwrap()))
+            .offset_drain_timeout(IggyDuration::new(POLL_RETRY_INTERVAL))
+            .build();
+        consumer
+            .state
+            .last_consumed_offsets
+            .insert(1, captured_position_at(LOWER_OFFSET));
+        served.0.script(
+            &endpoint(0),
+            STORE_CONSUMER_OFFSET_CODE,
+            [Answer::Silence, Answer::Commit(1), Answer::Commit(2)],
+        );
+        consumer.background_commit_task =
+            Some(consumer.store_offsets_in_background(
+                NonZeroIggyDuration::new(POLL_RETRY_INTERVAL).unwrap(),
+            ));
+        eventually("background store reached the primary", || {
+            served.0.count(STORE_CONSUMER_OFFSET_CODE) == 1
+        })
+        .await;
+
+        consumer.shutdown().await.unwrap();
+
+        let stores = served.0.received(STORE_CONSUMER_OFFSET_CODE);
+        assert_eq!(stores.len(), 3);
+        assert_eq!(stores[0].header.request, stores[1].header.request);
+        assert_ne!(stores[1].header.request, stores[2].header.request);
+        assert_eq!(consumer.get_last_stored_offset(1), Some(LOWER_OFFSET));
     }
 
     /// Records the error events emitted on the test thread. The current-thread runtime of
