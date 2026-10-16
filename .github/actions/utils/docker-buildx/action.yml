@@ -222,11 +222,7 @@ runs:
         os="${{ runner.os }}"
         arch="${{ runner.arch }}"
         img="${{ steps.config.outputs.image }}"
-        # A flavor selects a different Dockerfile stage, so two flavors of one
-        # component build different graphs. They run concurrently on the same
-        # arch and both export mode=max, so an unsuffixed ref would be
-        # last-writer-wins and cache-from could restore the other flavor's
-        # graph. Empty for single-flavor components, whose refs are unchanged.
+        # Each flavor gets its own cache name suffix because two flavors building at the same time would otherwise overwrite each other's cache, and a later build could load the cache of the wrong flavor.
         flavor="${{ inputs.flavor_suffix }}"
 
         # Include architecture in cache scope to prevent collisions between
