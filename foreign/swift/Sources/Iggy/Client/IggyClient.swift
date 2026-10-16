@@ -22,7 +22,9 @@ import Logging
 /// The client speaks the consensus wire protocol, the only protocol the
 /// server accepts. One client owns one connection and is safe to share
 /// between tasks: requests are serialized on the connection, so a single
-/// client feeds many producers and consumers.
+/// client feeds many producers and consumers. In a cluster, polls and
+/// offset writes go to each partition's primary over a second connection
+/// bound to the same session.
 ///
 /// ```swift
 /// let client = IggyClient(address: "localhost:8090", autoLogin: .usernamePassword(username: "iggy", password: "iggy"))
@@ -116,6 +118,7 @@ public final class IggyClient: Sendable {
 
     /// Pings in every state but shutdown, as the Rust SDK does: a ping on a
     /// client whose connection dropped is what reconnects it between calls.
+    /// After a ping that went through, the joined consumer groups are synced.
     private func heartbeat() async {
         guard await core.state != .shutdown else {
             return
@@ -124,7 +127,9 @@ public final class IggyClient: Sendable {
             try await ping()
         } catch {
             logger.debug("Heartbeat ping failed: \(error)")
+            return
         }
+        await refreshConsumerGroupAssignments()
     }
 
     // MARK: Authentication
@@ -165,11 +170,27 @@ public final class IggyClient: Sendable {
 
     /// Sends a command code with an already-encoded payload and returns the
     /// raw reply body. For commands without a typed method; the caller owns
-    /// the wire format. Session-control codes are rejected because they must
-    /// go through ``login(username:password:)`` and ``logout()``.
+    /// the wire format. Session-control codes, `BindSession` among them, are
+    /// rejected because they must go through ``login(username:password:)``
+    /// and ``logout()``.
+    ///
+    /// Partition requests carry the partition context their typed call
+    /// sends: `SendMessages` with an explicit partition id, `PollMessages`,
+    /// `StoreConsumerOffset`, and `DeleteConsumerOffset` take the route of
+    /// ``sendMessages(streamID:topicID:partitioning:messages:)``,
+    /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:)``,
+    /// and the offset calls. A raw send with balanced or key partitioning
+    /// fails with ``IggyErrorCode/featureUnavailable``, and a partition
+    /// payload that does not decode fails with ``IggyErrorCode/invalidCommand``,
+    /// before anything is sent. The routing codes `GetPollRouting`,
+    /// `PollMessagesOnPrimary`, and `GetConsumerOffsetRouting` are sent once
+    /// on the current connection, with no reconnect or replay.
     public func sendRawRequest(code: UInt32, payload: [UInt8]) async throws -> [UInt8] {
         guard !CommandCode.isSessionControl(code) else {
             throw IggyError(.invalidCommand, context: "code \(code) controls the session; use login and logout")
+        }
+        if let routed = try await sendRawPartitionRequest(code: code, payload: payload) {
+            return routed
         }
         return try await core.exchange(code: code, payload: payload)
     }

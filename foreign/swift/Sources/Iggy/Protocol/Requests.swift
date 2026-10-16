@@ -159,6 +159,14 @@ enum Requests {
         return writer.bytes
     }
 
+    static func partitionRoute(streamID: Identifier, topicID: Identifier, partitionID: UInt32) throws -> [UInt8] {
+        var writer = ByteWriter()
+        try streamID.encode(into: &writer)
+        try topicID.encode(into: &writer)
+        writer.write(partitionID)
+        return writer.bytes
+    }
+
     // MARK: Users
 
     /// Byte length of a bind secret carried by login and bind-session requests.

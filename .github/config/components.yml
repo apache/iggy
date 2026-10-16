@@ -343,7 +343,7 @@ components:
       - "foreign/swift/**"
       - "bdd/swift/**"
       - "examples/swift/**"
-    tasks: ["lint", "test", "build", "build-macos", "golden"]
+    tasks: ["lint", "test", "build", "build-macos", "golden", "e2e"]
 
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:

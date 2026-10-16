@@ -113,6 +113,7 @@ struct RequestVectorTests {
         #expect(
             try Requests.pollMessages(consumer: .group(3), streamID: 1, topicID: 1, partitionID: nil, strategy: .first, count: 10, autoCommit: false)
                 == golden.bytes("request.poll_messages.group"))
+        #expect(try Requests.partitionRoute(streamID: 10, topicID: "orders", partitionID: 5) == golden.bytes("request.get_partition_route"))
 
         let headers: UserHeaders = ["trace-id": "abc", "attempt": .uint32(3)]
         let messages = [
@@ -264,6 +265,7 @@ struct VSRHeaderVectorTests {
         #expect(VSRFrame.peekCommand(ok) == .reply)
         #expect(VSRFrame.readSize(ok) == UInt32(VSRFrame.headerSize + 12))
         #expect(VSRFrame.readReplyRequestID(ok) == 7)
+        #expect(VSRFrame.readReplyCommit(ok) == 12)
         #expect(VSRFrame.readReplyStatus(ok) == 0)
         #expect(VSRFrame.readReplyOperation(ok) == .createStream)
 
