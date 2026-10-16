@@ -232,8 +232,6 @@ Limits:
 - One gateway per bootstrap endpoint. Group membership is gateway memory
   ([docs/CONSUMER_GROUPS.md](docs/CONSUMER_GROUPS.md)).
 - Classic protocol only. A consumer with `group.protocol=consumer` (KIP-848) fails.
-- `group.instance.id` is accepted but not honoured. A static member that restarts causes two
-  rebalances.
 - No DescribeGroups or ListGroups yet ([#3548](https://github.com/apache/iggy/issues/3548)), so
   `kafka-consumer-groups.sh` cannot list or describe a group.
 - No DeleteGroups or OffsetDelete, and offsets never expire. An operator deletes a group's offsets
