@@ -51,8 +51,9 @@ pub enum ViewWindowVerdict {
 /// Walk `(floor, through]` top-down from `anchor_parent`, the checksum the view's
 /// entry at `through` must carry.
 ///
-/// An unsealed checksum on either side counts as a link, as in the shard's
-/// `header_is_view_entry`: a pre-seal WAL entry carries no identity to compare.
+/// An unsealed entry breaks the chain: it names no identity to compare, and its
+/// zero `parent` would link every op below it, as [`PrepareHeader::anchors_chain`]
+/// refuses for the anchor.
 #[must_use]
 pub fn view_window_verdict(
     floor: u64,
@@ -65,10 +66,7 @@ pub fn view_window_verdict(
         let Some(local) = header_at(op) else {
             return ViewWindowVerdict::Hole { op };
         };
-        let linked = local.checksum == expected
-            || local.checksum == CHECKSUM_UNSEALED
-            || expected == CHECKSUM_UNSEALED;
-        if !linked {
+        if local.checksum == CHECKSUM_UNSEALED || local.checksum != expected {
             return ViewWindowVerdict::Break { op };
         }
         expected = local.parent;
@@ -143,6 +141,19 @@ mod tests {
             ViewWindowVerdict::Hole { op: FLOOR + 2 },
             "a hole is missing data, not evidence against the entry below it"
         );
+    }
+
+    #[test]
+    fn given_an_unsealed_entry_in_the_window_when_proving_should_report_a_break() {
+        let mut log = view_log();
+        // Unsealed, with the zero parent an unsealed producer leaves: accepting it
+        // would link every op below it unchecked.
+        let mut unsealed = log[&(FLOOR + 2)];
+        unsealed.checksum = 0;
+        unsealed.parent = 0;
+        log.insert(FLOOR + 2, unsealed);
+        log.insert(FLOOR + 1, sealed(FLOOR + 1, 0, 99));
+        assert_eq!(verdict(&log), ViewWindowVerdict::Break { op: FLOOR + 2 });
     }
 
     #[test]
