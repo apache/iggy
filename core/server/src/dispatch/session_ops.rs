@@ -42,17 +42,17 @@ use crate::reply_frame::{
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;
-use consensus::client_table::{BIND_SECRET_BYTES, bind_verifier};
+use consensus::client_table::bind_verifier;
 use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::requests::system::SessionIdentity;
-use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::requests::users::login_register::{BindSecret, RegisterRequest};
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::{
     ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
     ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, HEADER_SIZE, ProtocolVersion, RoutedRequestHeader, WireDecode,
-    is_protocol_compatible,
+    WireEncode, is_protocol_compatible,
 };
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
@@ -92,7 +92,7 @@ pub fn verify_login_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
     password: &str,
-) -> Result<u32, LoginRegisterError>
+) -> Result<(u32, IggyTimestamp), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -126,14 +126,14 @@ where
         {
             return Err(LoginRegisterError::InvalidCredentials);
         }
-        Ok(user.id)
+        Ok((user.id, user.created_at))
     })
 }
 
 pub fn verify_pat_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<u32, LoginRegisterError>
+) -> Result<(u32, IggyTimestamp), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -141,17 +141,20 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    verify_pat_credentials_with_expiry(shard, token).map(|(user_id, _)| user_id)
+    verify_pat_credentials_with_expiry(shard, token)
+        .map(|(user_id, created_at, _)| (user_id, created_at))
 }
 
-/// Like [`verify_pat_credentials`] but also surfaces the token's expiry (unix
-/// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
-/// per-token VSR session table on this expiry for lazy eviction; the wire and
-/// login paths only need the user id and go through [`verify_pat_credentials`].
+/// Like [`verify_pat_credentials`] but also surfaces the owner's `created_at`,
+/// from the same read so it names the token's owner, and the token's expiry
+/// (unix seconds, `u64::MAX` when the PAT never expires). The HTTP extractor
+/// keys a per-token VSR session table on this expiry for lazy eviction; the
+/// wire and login paths need the account identity and go through
+/// [`verify_pat_credentials`].
 pub fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<(u32, u64), LoginRegisterError>
+) -> Result<(u32, IggyTimestamp, u64), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -195,7 +198,7 @@ where
         let expiry = pat
             .expiry_at
             .map_or(u64::MAX, |expiry_at| expiry_at.to_secs());
-        Ok((user.id, expiry))
+        Ok((user.id, user.created_at, expiry))
     })
 }
 
@@ -206,7 +209,7 @@ async fn complete_login_register<B, MJ, S, SB>(
     transport_client_id: u128,
     vsr_client_id: u128,
     request_header: &RoutedRequestHeader,
-    user_id: u32,
+    (user_id, user_created_at): (u32, IggyTimestamp),
     client_version: &ClientVersionInfo,
     secret: &BindSecret,
 ) -> Result<(), LoginRegisterError>
@@ -227,8 +230,12 @@ where
     // optimistic Authenticated transition, so a transient submit failure
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
-    let verifier = bind_verifier(vsr_client_id, user_id, secret.expose_secret());
-    let session = match submit_register_on_owner(shard, vsr_client_id, user_id, verifier).await {
+    let registration = RegisterRequest {
+        user_created_at: user_created_at.as_micros(),
+        bind_verifier: bind_verifier(vsr_client_id, user_id, secret.expose_secret()),
+    };
+    let session = match submit_register_on_owner(shard, vsr_client_id, user_id, registration).await
+    {
         // The wire reply carries only the fence epoch; the SDK numbers its
         // own requests, so the bind watermark is not surfaced (see the
         // BoundSession doc for who does consume it).
@@ -461,7 +468,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
-    verifier: [u8; BIND_SECRET_BYTES],
+    registration: RegisterRequest,
     nonce: u128,
     origin_replica: u8,
 ) where
@@ -484,7 +491,7 @@ pub(in crate::dispatch) async fn answer_forwarded_register<B, MJ, S, SB>(
     let bound = shard
         .plane
         .metadata()
-        .submit_register_in_process(vsr_client_id, user_id, verifier)
+        .submit_register_in_process(vsr_client_id, user_id, registration)
         .await;
     // `view` predates the await above, which parks with no deadline, so the
     // sealed value can be stale by send time. The origin routes the result by
@@ -555,7 +562,7 @@ pub(in crate::dispatch) async fn submit_register_local_or_forward<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
-    verifier: [u8; BIND_SECRET_BYTES],
+    registration: RegisterRequest,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -580,7 +587,7 @@ where
         return shard
             .plane
             .metadata()
-            .submit_register_in_process(vsr_client_id, user_id, verifier)
+            .submit_register_in_process(vsr_client_id, user_id, registration)
             .await;
     }
 
@@ -594,7 +601,7 @@ where
         vsr_client_id,
         nonce,
         user_id,
-        verifier,
+        registration,
     );
     if let Err(error) = shard
         .bus
@@ -639,6 +646,7 @@ const fn forward_register_result(
         ForwardRegisterOutcome::ClientIdOwnedByAnotherUser => {
             Err(MetadataSubmitError::ClientIdOwnedByAnotherUser)
         }
+        ForwardRegisterOutcome::Unauthenticated => Err(MetadataSubmitError::Unauthenticated),
     }
 }
 
@@ -659,9 +667,11 @@ const fn forward_register_outcome(
         Err(MetadataSubmitError::ClientIdOwnedByAnotherUser) => {
             (zero, ForwardRegisterOutcome::ClientIdOwnedByAnotherUser)
         }
-        // `MetadataSubmitError` is `#[non_exhaustive]`. Every variant but the
-        // ownership refusal is transient by contract, and `Canceled` is the
-        // transient answer that claims nothing beyond "retry".
+        Err(MetadataSubmitError::Unauthenticated) => {
+            (zero, ForwardRegisterOutcome::Unauthenticated)
+        }
+        // `MetadataSubmitError` is `#[non_exhaustive]`. The remaining errors
+        // are transient; `Canceled` claims nothing beyond "retry".
         Err(_) => (zero, ForwardRegisterOutcome::Canceled),
     }
 }
@@ -674,10 +684,11 @@ fn build_forward_register_message(
     client: u128,
     nonce: u128,
     user_id: u32,
-    verifier: [u8; BIND_SECRET_BYTES],
+    registration: RegisterRequest,
 ) -> Message<ForwardRegisterHeader> {
-    let mut message = Message::<ForwardRegisterHeader>::new(HEADER_SIZE + BIND_SECRET_BYTES);
-    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&verifier);
+    let body = registration.to_bytes();
+    let mut message = Message::<ForwardRegisterHeader>::new(HEADER_SIZE + body.len());
+    message.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
     message.transmute_header(|_, header: &mut ForwardRegisterHeader| {
         header.command = Command::ForwardRegister;
         header.cluster = cluster;
@@ -686,8 +697,8 @@ fn build_forward_register_message(
         header.client = client;
         header.nonce = nonce;
         header.user_id = user_id;
-        header.size = (HEADER_SIZE + BIND_SECRET_BYTES) as u32;
-        header.checksum_body = u128::from(iggy_common::calculate_checksum(&verifier));
+        header.size = (HEADER_SIZE + body.len()) as u32;
+        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
         header.seal();
     })
 }
@@ -927,7 +938,7 @@ pub async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
-    verifier: [u8; BIND_SECRET_BYTES],
+    registration: RegisterRequest,
 ) -> Result<BoundSession, MetadataSubmitError>
 where
     B: ShellBus,
@@ -937,13 +948,13 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return submit_register_local_or_forward(shard, vsr_client_id, user_id, verifier).await;
+        return submit_register_local_or_forward(shard, vsr_client_id, user_id, registration).await;
     }
     let (reply, rx) = shard::channel::<Result<BoundSession, MetadataSubmitError>>(1);
     shard.forward_metadata_submit(shard::MetadataSubmit::Register {
         vsr_client_id,
         user_id,
-        verifier,
+        registration,
         reply,
     });
     // The owner's outcome, verbatim in both directions. `Canceled` is only for a
@@ -1088,6 +1099,18 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     let body = request_body(&request);
     let vsr_client_id = request.header().client;
 
+    if message_bus::is_server_internal_client(vsr_client_id) {
+        send_eviction(
+            shard,
+            transport_client_id,
+            vsr_client_id,
+            EvictionReason::MalformedLogin,
+            "login_rejection",
+        )
+        .await;
+        return;
+    }
+
     // Both login-register shapes share the ClientVersionInfo prefix, so the
     // protocol gate decodes it once and runs before any credential work; the
     // body shapes below parse from past the prefix. Only VSR clients reach
@@ -1139,14 +1162,14 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             wire_request.username.as_str(),
             wire_request.password.expose_secret(),
         ) {
-            Ok(user_id) => {
+            Ok(account) => {
                 if let Err(error) = complete_login_register(
                     shard,
                     sessions,
                     transport_client_id,
                     vsr_client_id,
                     request.header(),
-                    user_id,
+                    account,
                     &wire_request.version_info,
                     &wire_request.bind_secret,
                 )
@@ -1178,14 +1201,14 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         LoginRegisterWithPatRequest::decode_after_prefix(version_info, body_tail)
     {
         match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
-            Ok(user_id) => {
+            Ok(account) => {
                 if let Err(error) = complete_login_register(
                     shard,
                     sessions,
                     transport_client_id,
                     vsr_client_id,
                     request.header(),
-                    user_id,
+                    account,
                     &wire_request.version_info,
                     &wire_request.bind_secret,
                 )
@@ -1535,7 +1558,16 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, USER, [0x5a; 32]).await
+                submit_register_local_or_forward(
+                    &shard,
+                    CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
             })
         };
         await_forward(&bus).await;
@@ -1647,7 +1679,16 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]).await
+                submit_register_local_or_forward(
+                    &shard,
+                    0xCAFE,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
             })
         };
         await_forward(&bus).await;
@@ -1676,7 +1717,16 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, FIRST_BOOT));
 
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]).await;
+        let outcome = submit_register_local_or_forward(
+            &shard,
+            0xCAFE,
+            7,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        )
+        .await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         assert!(
             outcome.unwrap_err().is_transient(),
@@ -1775,7 +1825,16 @@ mod tests {
         let login = {
             let shard = Rc::clone(&shard);
             compio::runtime::spawn(async move {
-                submit_register_local_or_forward(&shard, CLIENT, 7, [0x5a; 32]).await
+                submit_register_local_or_forward(
+                    &shard,
+                    CLIENT,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
+                .await
             })
         };
         await_forward(&bus).await;
@@ -1822,7 +1881,15 @@ mod tests {
         // matters is that nothing left over the interconnect.
         let _ = compio::time::timeout(
             Duration::from_millis(50),
-            submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]),
+            submit_register_local_or_forward(
+                &shard,
+                0xCAFE,
+                7,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            ),
         )
         .await;
         assert!(
@@ -1838,7 +1905,16 @@ mod tests {
         let bus = SpyBus::default();
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 1, 3, incarnation));
-        let outcome = submit_register_local_or_forward(&shard, 0xCAFE, 7, [0x5a; 32]).await;
+        let outcome = submit_register_local_or_forward(
+            &shard,
+            0xCAFE,
+            7,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        )
+        .await;
         assert_eq!(outcome, Err(MetadataSubmitError::ForwardTimedOut));
         bus.sole_replica_send::<ForwardRegisterHeader>().1.nonce
     }

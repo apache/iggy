@@ -19,6 +19,7 @@ use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
     USAGE_PREFIX,
 };
+use crate::cli::user::common::create_grant_targets;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, Permissions, StreamPermissions, TopicPermissions, UserId, UserStatus};
@@ -105,6 +106,7 @@ impl TestUserGetCmd {
 impl IggyCmdTestCase for TestUserGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         if self.create_user {
+            create_grant_targets(client, self.get_permissions().as_ref()).await;
             let create_user = client
                 .create_user(
                     &self.username,

@@ -156,9 +156,9 @@ use_base64_secret = false
 
 # Trusted issuers for A2A (Application-to-Application) authentication. Opt-in:
 # with none configured the listener accepts only self-issued HMAC tokens.
-# `issuer`, `audience` and `jwks_url` are required per entry; `user_id` is
-# optional but defaults to 0 (root), which is rejected - set it to the non-zero
-# iggy user every token from that issuer is remapped onto.
+# `issuer`, `audience`, `jwks_url` and `username` are required per entry. Every
+# token from an issuer acts as the iggy user named `username`, looked up on each
+# request. A token is refused while that user is missing, inactive or root.
 #
 # Operational note: enabling an issuer opens an outbound JWKS fetch that is
 # reachable before a token's signature is verified - a token naming this issuer
@@ -171,7 +171,7 @@ use_base64_secret = false
 # issuer = "test-issuer"
 # jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
 # audience = "iggy.apache.org"
-# user_id = 1
+# username = "a2a-service"
 
 # Metrics configuration for HTTP.
 [http.metrics]

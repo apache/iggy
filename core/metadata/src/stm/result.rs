@@ -37,6 +37,17 @@ use iggy_binary_protocol::consensus::{
 /// via `binary_protocol`. Re-exported so server-side callers keep one import.
 pub use iggy_binary_protocol::consensus::result_code;
 
+/// A stream or topic removed by a committed delete, named by slab id.
+///
+/// Grants name streams and topics by slab id, and the slab gives a freed id to
+/// the next create. So the grants on a deleted id must go in the same apply, or
+/// they reach the stream or topic that reuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedResource {
+    Stream(usize),
+    Topic { stream_id: usize, topic_id: usize },
+}
+
 /// Outcome of applying one committed metadata op.
 ///
 /// `code == 0` is success, `body` the typed reply payload. Nonzero `code` is a
@@ -50,6 +61,8 @@ pub struct ApplyReply {
     /// Local apply effect, recomputed from the committed operation on every replay.
     /// It is not part of the client reply or persisted receipt.
     pub(crate) revoked_user: Option<u32>,
+    /// Local apply effect, like `revoked_user`: the grants on this resource must go.
+    pub(crate) deleted_resource: Option<DeletedResource>,
 }
 
 impl ApplyReply {
@@ -60,6 +73,7 @@ impl ApplyReply {
             code: 0,
             body,
             revoked_user: None,
+            deleted_resource: None,
         }
     }
 
@@ -71,6 +85,7 @@ impl ApplyReply {
             code: code.into(),
             body: Bytes::new(),
             revoked_user: None,
+            deleted_resource: None,
         }
     }
 
@@ -216,6 +231,8 @@ result_enum!(TruncatePartitionResult {
 result_enum!(CreateUserResult {
     InvalidUsername = 43,
     UserAlreadyExists = 46,
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
     InvalidOptionValue = 4042,
 });
 result_enum!(UpdateUserResult {
@@ -235,6 +252,8 @@ result_enum!(ChangePasswordResult {
 result_enum!(UpdatePermissionsResult {
     UserNotFound = 20,
     CannotChangePermissions = 49,
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
 });
 
 // Personal access tokens.
@@ -561,6 +580,14 @@ mod tests {
             u32::from(CreateConsumerGroupResult::StreamNotFound),
             stream_not_found
         );
+        assert_eq!(
+            u32::from(CreateUserResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::StreamNotFound),
+            stream_not_found
+        );
 
         // StreamNameAlreadyExists (1012).
         let stream_name_exists = IggyError::StreamNameAlreadyExists(String::new()).as_code();
@@ -591,6 +618,11 @@ mod tests {
         );
         assert_eq!(
             u32::from(CreateConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(u32::from(CreateUserResult::TopicNotFound), topic_not_found);
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::TopicNotFound),
             topic_not_found
         );
 

@@ -17,7 +17,7 @@
 
 use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
-use crate::stm::authz::GatedApply;
+use crate::stm::authz::{GatedApply, reject_stale_session};
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use consensus::{
     ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
@@ -26,6 +26,7 @@ use consensus::{
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::IggyError;
 use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
@@ -628,12 +629,21 @@ where
                     "committed Register is missing from WAL",
                 ))
             })?;
-            let verifier = prepare.body().try_into().map_err(|_| {
+            let registration = RegisterRequest::decode_from(prepare.body()).map_err(|_| {
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
+            if !mux_stm.is_active_account(header.user_id, registration.user_created_at) {
+                last_applied_op = Some(header.op);
+                continue;
+            }
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table
-                .commit_register(header.client, header.user_id, verifier, reply)
+                .commit_register(
+                    header.client,
+                    header.user_id,
+                    registration.bind_verifier,
+                    reply,
+                )
                 .map_err(RecoveryError::RetryProtection)?;
             on_replayed_session(&mux_stm, header);
             last_applied_op = Some(header.op);
@@ -679,7 +689,8 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        let reply = mux_stm.gated_update(entry)?;
+        let reply = reject_stale_session(header, &client_table)
+            .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
         if let Some(user_id) = reply.revoked_user {
             for identity in client_table.end_user_sessions(user_id, header.op) {
                 on_replayed_session(
@@ -694,6 +705,7 @@ where
         }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
+            && !message_bus::is_auto_commit_client(header.client)
             && !matches!(
                 header.operation,
                 Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
@@ -856,19 +868,23 @@ fn verify_checkpoint_pairing(
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::impls::metadata::{StreamsFrontend, checkpoint_checksum};
+    use crate::impls::metadata::{StreamsFrontend, apply_committed_prepare, checkpoint_checksum};
+    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::snapshot::{SNAPSHOT_FORMAT_VERSION, Snapshotable};
     use crate::stm::stream::{Streams, StreamsSnapshot};
-    use crate::stm::user::Users;
+    use crate::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES, Users};
     use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command, Operation};
+    use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
     };
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions, result_code};
     use iggy_common::UserStatus;
     use journal::Journal;
     use server_common::iobuf::Owned;
+    use std::cell::RefCell;
     use tempfile::tempdir;
 
     use crate::MuxStateMachine;
@@ -1006,8 +1022,13 @@ mod tests {
         user_id: u32,
         request: u64,
     ) -> Message<PrepareHeader> {
+        let registration = RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        }
+        .to_bytes();
         let body: &[u8] = if operation == Operation::Register {
-            &[0x5a; 32]
+            &registration
         } else {
             &[]
         };
@@ -1692,12 +1713,265 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_revoked_user_when_replaying_wal_should_restore_ended_sessions() {
+    #[allow(clippy::too_many_lines)]
+    async fn given_reused_user_id_when_pending_operations_commit_should_reject_the_old_session() {
+        const CLIENT: u128 = 1;
+        const ROOT_CLIENT: u128 = 2;
+        const REPLACEMENT_CLIENT: u128 = 3;
+        const USER: u32 = 1;
+        const ROOT_SESSION: u64 = 1;
+        const SESSION: u64 = 3;
+        const REPLACEMENT_SESSION: u64 = 8;
+        const TOKEN_HASH: [u8; PAT_TOKEN_HASH_BYTES] = [b'a'; PAT_TOKEN_HASH_BYTES];
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+
+        // Admission rejects reserved IDs, but previously committed sessions must
+        // still replay and fence their pending operations after user deletion.
+        for (client_id, replace_before_token) in [
+            CLIENT,
+            message_bus::server_internal_client_id(0),
+            message_bus::AUTO_COMMIT_CLIENT_ID,
+        ]
+        .into_iter()
+        .flat_map(|client_id| [(client_id, false), (client_id, true)])
+        {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let stm = UserStm::default();
+            stm.users().ensure_root_user("root", "hash");
+            let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+            let mut account = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            let original = account.to_bytes();
+            account.username = WireName::new("replacement").unwrap();
+            account.permissions = Some(WirePermissions {
+                global: WireGlobalPermissions {
+                    manage_servers: false,
+                    read_servers: false,
+                    manage_users: false,
+                    read_users: false,
+                    manage_streams: true,
+                    read_streams: false,
+                    manage_topics: false,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                },
+                streams: Vec::new(),
+            });
+            let token = CreatePersonalAccessTokenRequest {
+                user_id: USER,
+                name: WireName::new("token").unwrap(),
+                expiry: 0,
+                token_hash: TOKEN_HASH,
+            }
+            .to_bytes();
+            let stream = CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            let register = |created_at| {
+                RegisterRequest {
+                    user_created_at: created_at,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes()
+            };
+            let replacement = (
+                Operation::CreateUser,
+                account.to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            );
+            let pending_token = (
+                Operation::CreatePersonalAccessToken,
+                token.clone(),
+                client_id,
+                USER,
+                SESSION,
+            );
+            let (first, second) = if replace_before_token {
+                (replacement, pending_token)
+            } else {
+                (pending_token, replacement)
+            };
+            let operations = [
+                (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
+                (
+                    Operation::CreateUser,
+                    original,
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+                (Operation::Register, register(2), client_id, USER, 0),
+                (
+                    Operation::DeleteUser,
+                    DeleteUserRequest {
+                        user_id: WireIdentifier::numeric(USER),
+                    }
+                    .to_bytes(),
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+                first,
+                second,
+                (
+                    Operation::CreateStream,
+                    stream.clone(),
+                    client_id,
+                    USER,
+                    SESSION,
+                ),
+                (
+                    Operation::Register,
+                    register(if replace_before_token { 5 } else { 6 }),
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    0,
+                ),
+                (
+                    Operation::CreatePersonalAccessToken,
+                    token,
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    REPLACEMENT_SESSION,
+                ),
+                (
+                    Operation::CreateStream,
+                    stream,
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    REPLACEMENT_SESSION,
+                ),
+                (
+                    Operation::CompleteLifecycle,
+                    CompleteLifecycleRequest::new(
+                        ROOT_SESSION,
+                        0,
+                        vec![LifecycleCompletion {
+                            topic_id: 0,
+                            partition_id: 0,
+                            partition_op: 1,
+                        }],
+                    )
+                    .unwrap()
+                    .to_bytes(),
+                    message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                    0,
+                    1,
+                ),
+            ];
+            let mut parent = 0;
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                for (index, (operation, body, client, user_id, session)) in
+                    operations.into_iter().enumerate()
+                {
+                    let op = u64::try_from(index).unwrap() + 1;
+                    let mut prepare = make_prepare(op, body.len());
+                    prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                    let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.operation = operation;
+                            header.client = client;
+                            header.user_id = user_id;
+                            header.session = session;
+                            header.request = if operation == Operation::Register {
+                                0
+                            } else {
+                                op
+                            };
+                            header.timestamp = op;
+                            header.parent = parent;
+                            header.checksum_body =
+                                u128::from(iggy_common::calculate_checksum(&body));
+                        },
+                    ));
+                    parent = prepare.header().checksum;
+                    let reply =
+                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                    let status = if operation == Operation::Register {
+                        result_code(reply.body()).unwrap_or(0)
+                    } else {
+                        result_code(reply.body()).unwrap()
+                    };
+                    let stale = client == client_id && operation != Operation::Register;
+                    assert_eq!(
+                        status,
+                        if stale {
+                            IggyError::StaleClient.as_code()
+                        } else {
+                            0
+                        },
+                        "{operation:?} at op {op}, client {client_id}, replace before token: {replace_before_token}"
+                    );
+                    if stale {
+                        assert_eq!(stm.users().read(|users| users.pat_count_of(USER)), 0);
+                        assert!(stm.streams().read(|streams| streams.items.is_empty()));
+                    }
+                    journal.append(prepare).await.unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let recovered = recover::<UserStm>(
+                directory.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |stm| stm.users().ensure_root_user("root", "hash"),
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.client_table.encode(), table.borrow().encode());
+            assert_eq!(recovered.client_table.get_epoch(client_id), None);
+            assert_eq!(
+                recovered.client_table.get_epoch(REPLACEMENT_CLIENT),
+                Some(REPLACEMENT_SESSION)
+            );
+            assert_eq!(
+                recovered.mux_stm.users().read(|users| {
+                    let replacement = users.user_by_name("replacement").unwrap();
+                    (replacement.id, users.pat_count_of(USER))
+                }),
+                (USER, 1)
+            );
+            assert_eq!(
+                recovered
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams.items.len()),
+                1
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_revoked_user_when_replaying_wal_should_preserve_session_revocation() {
         const CLIENT: u128 = 0x1337;
         const ROOT_CLIENT: u128 = CLIENT + 1;
         const USER: u32 = 1;
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
-        for operation in [Operation::DeleteUser, Operation::UpdateUser] {
+        for (operation, register_first, replace) in [
+            (Operation::DeleteUser, true, false),
+            (Operation::UpdateUser, true, false),
+            (Operation::DeleteUser, false, false),
+            (Operation::UpdateUser, false, false),
+            (Operation::DeleteUser, false, true),
+        ] {
             let directory = tempdir().unwrap();
             let metadata_dir = directory.path().join("metadata");
             std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -1723,35 +1997,54 @@ mod tests {
                 }
                 .to_bytes()
             };
+            let registration = (
+                Operation::Register,
+                RegisterRequest {
+                    user_created_at: 2,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes(),
+                CLIENT,
+                USER,
+            );
+            let mut entries = vec![
+                (
+                    Operation::Register,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    }
+                    .to_bytes(),
+                    ROOT_CLIENT,
+                    0,
+                ),
+                (Operation::CreateUser, create.clone(), ROOT_CLIENT, 0),
+            ];
+            if register_first {
+                entries.push(registration.clone());
+            }
+            entries.push((operation, revocation, ROOT_CLIENT, 0));
+            if replace {
+                entries.push((Operation::CreateUser, create, ROOT_CLIENT, 0));
+            }
+            if !register_first {
+                entries.push(registration);
+            }
+            let last_op = entries.len() as u64;
             let mut parent = 0;
             {
                 let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                     .await
                     .unwrap();
-                for (op, operation, body, client, user_id) in [
-                    (
-                        1,
-                        Operation::Register,
-                        bytes::Bytes::from_static(&[0x5a; 32]),
-                        ROOT_CLIENT,
-                        0,
-                    ),
-                    (2, Operation::CreateUser, create, ROOT_CLIENT, 0),
-                    (
-                        3,
-                        Operation::Register,
-                        bytes::Bytes::from_static(&[0x5a; 32]),
-                        CLIENT,
-                        USER,
-                    ),
-                    (4, operation, revocation, ROOT_CLIENT, 0),
-                ] {
+                for (index, (operation, body, client, user_id)) in entries.into_iter().enumerate() {
+                    let op = index as u64 + 1;
                     let mut prepare = make_prepare(op, body.len());
                     prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
                     let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
                         |old, header: &mut PrepareHeader| {
                             *header = old;
                             header.operation = operation;
+                            header.timestamp = op;
                             header.client = client;
                             header.user_id = user_id;
                             header.session = 1;
@@ -1789,19 +2082,27 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(recovered.last_applied_op, Some(4));
+            assert_eq!(recovered.last_applied_op, Some(last_op));
             assert_eq!(recovered.client_table.get_epoch(CLIENT), None);
             assert_eq!(recovered.client_table.get_epoch(ROOT_CLIENT), Some(1));
-            assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
             let ended: Vec<_> = recovered.client_table.ended_sessions().collect();
-            assert_eq!(
-                ended,
-                vec![iggy_binary_protocol::requests::system::SessionIdentity {
-                    client_id: CLIENT,
-                    session: 3,
-                    metadata_watermark: 4,
-                }]
-            );
+            if register_first {
+                assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
+                assert_eq!(
+                    ended,
+                    vec![iggy_binary_protocol::requests::system::SessionIdentity {
+                        client_id: CLIENT,
+                        session: 3,
+                        metadata_watermark: 4,
+                    }]
+                );
+            } else {
+                assert!(revoked.borrow().is_empty());
+                assert_eq!(
+                    ended,
+                    [] as [iggy_binary_protocol::requests::system::SessionIdentity; 0]
+                );
+            }
         }
     }
 

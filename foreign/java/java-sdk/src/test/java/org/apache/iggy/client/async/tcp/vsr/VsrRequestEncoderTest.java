@@ -45,6 +45,16 @@ class VsrRequestEncoderTest {
     private final ByteBufAllocator alloc = ByteBufAllocator.DEFAULT;
 
     @Test
+    void shouldKeepGeneratedClientIdsOutsideServerRangeAfterReset() {
+        int samples = 64;
+        for (int sample = 0; sample < samples; sample++) {
+            assertThat(session.clientIdHigh()).isNotNegative();
+            assertThat(session.clientIdLow() | session.clientIdHigh()).isNotZero();
+            session.reset();
+        }
+    }
+
+    @Test
     void shouldBuildRegisterFrameForLogin() {
         ByteBuf payload = loginUserPayload();
         ByteBuf frame = encoder.encode(alloc, LOGIN_USER_CODE, payload);
