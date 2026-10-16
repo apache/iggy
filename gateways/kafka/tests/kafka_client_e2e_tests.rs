@@ -31,9 +31,10 @@
 //! kcat and the Java consumer read them back through Fetch. The group tests run Java consumers in
 //! one group across a gateway restart and a member leaving.
 //!
-//! Prerequisites are Docker and an already-built `iggy-server`. Missing either skips, the way the
-//! wire-fixture suites do, unless `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure
-//! so a broken CI step cannot leave these silently green.
+//! Prerequisites are Docker, an already-built `iggy-server`, and a host JDK (`javac`) for the
+//! `offsetsForTimes` probe. Missing any skips, the way the wire-fixture suites do, unless
+//! `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure so a broken CI step cannot
+//! leave these silently green.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
@@ -44,6 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use iggy::prelude::IggyTimestamp;
 use secrecy::SecretString;
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -1409,6 +1411,212 @@ fn records_by_partition(output: &[String]) -> BTreeMap<i64, Vec<i64>> {
         }
     }
     read
+}
+
+/// Milliseconds since the epoch, the unit Kafka timestamps use.
+fn now_millis() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch");
+    i64::try_from(elapsed.as_millis()).expect("now fits an i64")
+}
+
+/// `millis` as the `YYYY-MM-DDTHH:mm:SS.sssZ` that `--to-datetime` reads. The zone is explicit,
+/// so the client container's own zone does not matter.
+fn utc_datetime(millis: i64) -> String {
+    let micros = u64::try_from(millis).expect("a time after the epoch") * 1000;
+    IggyTimestamp::from(micros).to_utc_string("%Y-%m-%dT%H:%M:%S%.3fZ")
+}
+
+/// Runs `command` under the same GNU `timeout` bound as [`run_client`].
+fn output_bounded(command: &[&str], what: &str) -> std::process::Output {
+    Command::new("timeout")
+        .args(["--kill-after=10s", CLIENT_RUN_TIMEOUT])
+        .args(command)
+        .output()
+        .unwrap_or_else(|error| panic!("run {what}: {error}"))
+}
+
+/// Compiles `tests/java/OffsetsForTimesProbe.java` against the `kafka-clients` jar of the client
+/// image, into a directory the client container mounts. `None`, after reporting why, when there
+/// is no JDK.
+fn compile_offsets_for_times_probe() -> Option<tempfile::TempDir> {
+    let javac = Command::new("javac")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !javac {
+        skip("javac is unavailable, so the consumer offsetsForTimes probe cannot be built");
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("create probe dir");
+    let jar = dir.path().join("kafka-clients.jar");
+    let (_, kafka_version) = KAFKA_IMAGE
+        .rsplit_once(':')
+        .expect("the client image is pinned to a version tag");
+    let image_jar = format!("/opt/kafka/libs/kafka-clients-{kafka_version}.jar");
+    let extracted = output_bounded(
+        &[
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--entrypoint",
+            "cat",
+            KAFKA_IMAGE,
+            &image_jar,
+        ],
+        "kafka-clients extraction",
+    );
+    assert!(
+        extracted.status.success(),
+        "extracting {image_jar} failed: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    std::fs::write(&jar, extracted.stdout).expect("write kafka-clients jar");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/OffsetsForTimesProbe.java");
+    let (jar, out, source) = (
+        jar.to_str().expect("jar path is utf-8"),
+        dir.path().to_str().expect("probe dir is utf-8"),
+        source.to_str().expect("probe source path is utf-8"),
+    );
+    let compiled = output_bounded(
+        &["javac", "--release", "17", "-cp", jar, "-d", out, source],
+        "javac",
+    );
+    assert!(
+        compiled.status.success(),
+        "javac failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    Some(dir)
+}
+
+/// #4516 acceptance: Java's lookups by time resolve against what the gateway stored. Three
+/// records, then a time, then a fourth record a second later, so every lookup has one right
+/// answer whichever clock the client and Iggy stamp with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_records_on_both_sides_of_a_time_when_java_looks_up_by_time_should_find_the_later_one()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let between = now_millis();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+
+    let get_offsets = |time: &str| {
+        run_client(
+            KAFKA_IMAGE,
+            &[
+                "/opt/kafka/bin/kafka-get-offsets.sh",
+                "--bootstrap-server",
+                &gateway.to_string(),
+                "--topic",
+                TOPIC,
+                "--time",
+                time,
+            ],
+            &[],
+        )
+        .expect_ran(&format!("kafka-get-offsets --time {time}"))
+    };
+    let at = get_offsets(&between.to_string());
+    assert!(
+        at.lines().any(|line| line.trim() == format!("{TOPIC}:0:3")),
+        "a lookup by time must find the record after the time, got: {at}"
+    );
+    let start = get_offsets("0");
+    assert!(
+        start
+            .lines()
+            .any(|line| line.trim() == format!("{TOPIC}:0:0")),
+        "time 0 finds where the partition starts, as AKHQ asks, got: {start}"
+    );
+    let max = get_offsets("-3");
+    assert!(
+        max.lines()
+            .any(|line| line.trim() == format!("{TOPIC}:0:3")),
+        "max-timestamp names the last record, got: {max}"
+    );
+    let future = now_millis() + 3_600_000;
+    let after = get_offsets(&future.to_string());
+    assert!(
+        !after
+            .lines()
+            .any(|line| line.starts_with(&format!("{TOPIC}:0:"))),
+        "a time past every record has no offset, which the tool prints as nothing, got: {after}"
+    );
+
+    let reset = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--group",
+            "e2e-reset-by-time",
+            "--topic",
+            TOPIC,
+            "--reset-offsets",
+            "--to-datetime",
+            &utc_datetime(between),
+            "--execute",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --reset-offsets --to-datetime");
+    // The tool prints its header and rows without a line break between them, so the row is
+    // matched as a run of fields anywhere in the output.
+    let fields: Vec<&str> = reset.split_whitespace().collect();
+    let moved = fields
+        .windows(4)
+        .any(|row| row == ["e2e-reset-by-time", TOPIC, "0", "3"]);
+    assert!(
+        moved,
+        "the group must move to the first record after the time, got: {reset}"
+    );
+
+    // The consumer's own `offsetsForTimes`, which plain consumers and Kafka Streams seek by time
+    // with, not the Admin call the tools above use. Same request on the wire, different client
+    // code.
+    let Some(probe) = compile_offsets_for_times_probe() else {
+        return;
+    };
+    let probe_dir = probe.path().to_str().expect("probe path is utf-8");
+    let consumer = run_client(
+        KAFKA_IMAGE,
+        &[
+            "java",
+            "-cp",
+            "/opt/kafka/libs/*:/probe",
+            "OffsetsForTimesProbe",
+            &gateway.to_string(),
+            TOPIC,
+            "0",
+            &between.to_string(),
+            "0",
+            &future.to_string(),
+        ],
+        &[(probe_dir, "/probe")],
+    )
+    .expect_ran("java consumer offsetsForTimes");
+    for expected in [
+        format!("time={between} offset=3"),
+        "time=0 offset=0".to_string(),
+        format!("time={future} offset=null"),
+    ] {
+        assert!(
+            consumer.lines().any(|line| line.trim() == expected),
+            "offsetsForTimes must answer `{expected}`, got: {consumer}"
+        );
+    }
 }
 
 /// The TLS-side stack: a bridged gateway with an `SSL` and a `SASL_SSL` listener, client
