@@ -20,7 +20,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
-use iggy_common::Identifier;
+use iggy_common::{Consumer, Identifier, Partition};
 use tracing::{Level, event};
 
 pub struct GetConsumerGroupCmd {
@@ -65,6 +65,139 @@ impl CliCommand for GetConsumerGroupCmd {
         }
 
         let consumer_group = consumer_group.unwrap();
+
+        let topic = client
+            .get_topic(&self.stream_id, &self.topic_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "Problem getting topic with ID: {} in stream with ID: {}",
+                    self.topic_id, self.stream_id
+                )
+            })?
+            .with_context(|| {
+                format!(
+                    "Topic with ID: {} in stream with ID: {} was not found",
+                    self.topic_id, self.stream_id
+                )
+            })?;
+
+        let consumer = Consumer::group(self.group_id.clone());
+        if consumer_group.partitions_count > iggy_common::MAX_PARTITIONS_COUNT {
+            anyhow::bail!(
+                "Consumer group with ID: {} reports partitions count {} above the limit {}",
+                self.group_id,
+                consumer_group.partitions_count,
+                iggy_common::MAX_PARTITIONS_COUNT
+            );
+        }
+        // Size the indexes from the topic partition list. `partitions_count` is a
+        // wire field, and a huge value must not allocate before the missing-id check.
+        let index_len = topic.partitions.len();
+        let mut partitions_by_id: Vec<Option<&Partition>> = vec![None; index_len];
+        for partition in &topic.partitions {
+            if let Some(slot) = partitions_by_id.get_mut(partition.id as usize) {
+                *slot = Some(partition);
+            }
+        }
+
+        let mut owners: Vec<Option<u32>> = vec![None; index_len];
+        let mut members_table = Table::new();
+        let render_members = consumer_group.members_count > 0;
+        if render_members {
+            members_table.load_style(ASCII_NO_BORDERS);
+            members_table.set_header(vec!["Member id", "Partitions count", "Partitions"]);
+        }
+        for member in &consumer_group.members {
+            for partition_id in &member.partitions {
+                if let Some(slot) = owners.get_mut(*partition_id as usize) {
+                    *slot = Some(member.id);
+                }
+            }
+            if render_members {
+                members_table.add_row(vec![
+                    format!("{}", member.id).as_str(),
+                    format!("{}", member.partitions_count).as_str(),
+                    member
+                        .partitions
+                        .iter()
+                        .map(|partition_id| format!("{partition_id}"))
+                        .collect::<Vec<String>>()
+                        .join(", ")
+                        .as_str(),
+                ]);
+            }
+        }
+
+        let mut partitions_table = Table::new();
+        partitions_table.load_style(ASCII_NO_BORDERS);
+        partitions_table.set_header(vec![
+            "Partition",
+            "Member",
+            "Current offset",
+            "Stored offset",
+            "Lag",
+        ]);
+
+        for partition_id in 0..consumer_group.partitions_count {
+            let partition = partitions_by_id
+                .get(partition_id as usize)
+                .copied()
+                .flatten()
+                .with_context(|| {
+                    format!(
+                        "Partition with ID: {} in topic with ID: {} was not found",
+                        partition_id, self.topic_id
+                    )
+                })?;
+
+            let consumer_offset = client
+                .get_consumer_offset(
+                    &consumer,
+                    &self.stream_id,
+                    &self.topic_id,
+                    Some(partition_id),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Problem getting consumer offset for consumer group with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {}",
+                        self.group_id, self.stream_id, self.topic_id, partition_id
+                    )
+                })?;
+
+            let member = owners
+                .get(partition_id as usize)
+                .copied()
+                .flatten()
+                .map(|member_id| format!("{member_id}"))
+                .unwrap_or_else(|| "-".to_string());
+
+            let (current_offset, stored_offset, lag) = match consumer_offset {
+                Some(offset_info) => {
+                    let lag = offset_info.current_offset - offset_info.stored_offset;
+                    (
+                        format!("{}", offset_info.current_offset),
+                        format!("{}", offset_info.stored_offset),
+                        format!("{}", lag),
+                    )
+                }
+                None => (
+                    format!("{}", partition.current_offset),
+                    "-".to_string(),
+                    format!("{}", partition.messages_count),
+                ),
+            };
+
+            partitions_table.add_row(vec![
+                format!("{}", partition_id),
+                member,
+                current_offset,
+                stored_offset,
+                lag,
+            ]);
+        }
+
         let mut table = Table::new();
 
         table.set_header(vec!["Property", "Value"]);
@@ -82,25 +215,11 @@ impl CliCommand for GetConsumerGroupCmd {
             format!("{}", consumer_group.members_count).as_str(),
         ]);
 
-        if consumer_group.members_count > 0 {
-            let mut members_table = Table::new();
-            members_table.load_style(ASCII_NO_BORDERS);
-            members_table.set_header(vec!["Member id", "Partitions count", "Partitions"]);
-            for member in consumer_group.members {
-                members_table.add_row(vec![
-                    format!("{}", member.id).as_str(),
-                    format!("{}", member.partitions_count).as_str(),
-                    member
-                        .partitions
-                        .iter()
-                        .map(|i| format!("{i}"))
-                        .collect::<Vec<String>>()
-                        .join(", ")
-                        .as_str(),
-                ]);
-            }
+        if render_members {
             table.add_row(vec!["Members", members_table.to_string().as_str()]);
         }
+
+        table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");
 
