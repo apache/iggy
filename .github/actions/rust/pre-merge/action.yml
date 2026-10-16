@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, test-build, test, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, docker-connectors-fat, test-build, test, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -57,7 +57,7 @@ runs:
         coverage: ${{ inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
         # libraries. All compiling tasks keep the existing dependency setup.
-        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' && inputs.task != 'docker-connectors-fat' }}
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
@@ -67,8 +67,9 @@ runs:
         # the warm `~/.cargo` restore is a free win, and its 1.95 target
         # artifacts rebuild regardless since the rustc hash differs.
         shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
-        # Shards download the build artifact. Metadata-only tasks need no target cache.
-        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
+        # Shards download the build artifact. fmt/sort/machete/docker-connectors-fat
+        # never build into target/, so the multi-GB cache restore is pure overhead.
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'docker-connectors-fat' || inputs.task == 'test') && 'false' || 'true' }}
         save-cache: ${{ inputs.save-cache }}
         # Light legs fit in the runner's ~89 GiB default headroom; skip the
         # ~20-45s reclaim. Disk-heavy legs (coverage build + testcontainers
@@ -166,6 +167,18 @@ runs:
         CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
       run: ./scripts/verify-crates-publish.sh
       shell: bash
+
+    - name: Build connectors image (fat, amd64)
+      if: inputs.task == 'docker-connectors-fat'
+      uses: ./.github/actions/utils/docker-buildx
+      with:
+        task: build
+        component: rust-connectors
+        target: runtime-fat
+        flavor: fat
+        platform: linux/amd64
+        libc: glibc
+        dry_run: "true"
 
     - name: Install dependencies for Rust tests
       if: (inputs.task == 'test' || inputs.task == 'test-storage-compat') && runner.os == 'Linux'

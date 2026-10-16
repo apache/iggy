@@ -15,24 +15,159 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Delta Lake sink example: iggy-server -> iggy-connect (Delta sink) -> floci (S3 emulator).
+#
+#   docker compose up -d --build
+#   cargo run --example sink-data-producer --release    (from the repository root)
+#   docker compose run --rm tools s3 ls s3://delta-warehouse/users --recursive
+#   docker compose run --rm delta-tools python show.py
+#   docker compose down -v                               (stop and reset all data)
+#
+# The default apache/iggy-connect:edge image bundles the Delta sink plugin. To
+# test an unreleased change, set IGGY_CONNECT_IMAGE to a locally built image
+# (see the connectors README for the build command).
+
 services:
-  quickwit:
-    image: quickwit/quickwit:edge
-    container_name: quickwit
+  iggy-server:
+    image: ${IGGY_SERVER_IMAGE:-apache/iggy:edge}
+    container_name: iggy-server
+    command: ["--with-default-root-credentials"]
     restart: unless-stopped
-    volumes:
-      - quickwit:/quickwit/qwdata
-    ports:
-      - 7280:7280
-      - 7281:7281
-    command: run
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+      - label:disable
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     environment:
-      - QW_ENABLE_OTLP_ENDPOINT=true
-      - QW_ENABLE_JAEGER_ENDPOINT=true
-      - QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER=true
-      - QW_ENABLE_INGEST_V2=true
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:7281
-      - RUST_LOG=info,quickwit_actors=error,indexing_split_store=error,tantivy=error,quickwit_serve=warn,quickwit_indexing=warn,quickwit=warn
+      # The published image listens on loopback only, so bind all interfaces.
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_LOGGING_LEVEL=debug
+      - IGGY_NODE_ADVERTISED_ADDRESS=localhost
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+    networks:
+      - iggy-network
+    ports:
+      - 3000:3000
+      - 8090:8090
+    volumes:
+      - iggy-server:/app/local_data
+
+  # The connectors runtime does not wait for missing streams or topics, so
+  # they are created before it starts.
+  iggy-init:
+    image: ${IGGY_SERVER_IMAGE:-apache/iggy:edge}
+    container_name: iggy-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        iggy_cli() { iggy --tcp-server-address iggy-server:8090 -u iggy -p iggy "$$@"; }
+        # The CLI exits 0 from `get` for a missing resource, so `get || create`
+        # never creates. Create instead and tolerate only "already exists".
+        create_if_missing() {
+          if ! output="$$(iggy_cli "$$@" 2>&1)"; then
+            case "$$output" in
+              *"already exists"*) ;;
+              *) echo "$$output" >&2; return 1 ;;
+            esac
+          fi
+        }
+        create_if_missing stream create example_stream
+        create_if_missing topic create example_stream users 1 none
+        echo "stream example_stream and topic users are ready"
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    networks:
+      - iggy-network
+
+  floci:
+    image: floci/floci:2.1.0
+    container_name: floci
+    restart: unless-stopped
+    environment:
+      # Keep the bucket and the Delta table across `docker compose down`, in step
+      # with the iggy-server volume. Without it the sink resumes from its stored
+      # offset and writes into an empty table.
+      - FLOCI_STORAGE_MODE=persistent
+      - FLOCI_STORAGE_PERSISTENT_PATH=/app/data
+    networks:
+      - iggy-network
+    ports:
+      - 4566:4566
+    volumes:
+      - floci:/app/data
+
+  # Creates the bucket and the Delta table (the sink requires an existing
+  # table). Also used on demand to inspect the table.
+  delta-tools:
+    build: ./delta-tools
+    container_name: delta-tools
+    restart: "no"
+    command: python init.py
+    environment:
+      - S3_ENDPOINT_URL=http://floci:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - S3_BUCKET=delta-warehouse
+      - DELTA_TABLE_PATH=users
+    depends_on:
+      floci:
+        condition: service_started
+    networks:
+      - iggy-network
+
+  iggy-connect:
+    image: ${IGGY_CONNECT_IMAGE:-apache/iggy-connect:edge}
+    container_name: iggy-connect
+    restart: unless-stopped
+    environment:
+      - IGGY_CONNECTORS_CONFIG_PATH=/config/config.toml
+      - IGGY_LOGGING_LEVEL=debug
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      iggy-server:
+        condition: service_started
+      floci:
+        condition: service_started
+      iggy-init:
+        condition: service_completed_successfully
+      delta-tools:
+        condition: service_completed_successfully
+    networks:
+      - iggy-network
+    ports:
+      - 3001:3001
+
+  tools:
+    image: amazon/aws-cli
+    profiles: ["tools"]
+    entrypoint: ["aws"]
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ENDPOINT_URL=http://floci:4566
+    networks:
+      - iggy-network
 
 volumes:
-  quickwit:
+  iggy-server:
+  floci:
+
+networks:
+  iggy-network:
+    name: iggy-network

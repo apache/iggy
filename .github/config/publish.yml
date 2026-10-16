@@ -86,6 +86,18 @@ components:
     platforms: ["linux/amd64", "linux/arm64"]
     version_file: "core/connectors/runtime/Cargo.toml"
     version_regex: '(?m)^\s*version\s*=\s*"([^"]+)"'
+    # Two published flavors from one Dockerfile. The fat flavor (empty suffix,
+    # runtime-fat stage) bundles every connector plugin and is the default;
+    # -slim (runtime stage) ships the runtime binary only. Each flavor keeps
+    # its own per-arch digest set and manifest tags. Components without a
+    # flavors list build their single default stage.
+    flavors:
+      - name: fat
+        suffix: ""
+        stage: runtime-fat
+      - name: slim
+        suffix: "-slim"
+        stage: runtime
 
   web-ui:
     tag_pattern: "^web-ui-([0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$"

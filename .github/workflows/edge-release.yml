@@ -65,6 +65,24 @@ jobs:
           name: rust-artifacts-all
           path: ./artifacts
 
+      - name: Render bundled connector plugin list
+        id: plugins
+        shell: bash
+        run: |
+          # Read from the shipped tarball so the notes list what was built
+          # and this job needs no Rust toolchain.
+          tarball=artifacts/iggy-connectors-x86_64-unknown-linux-gnu-edge.tar.gz
+          list="$(tar tzf "$tarball" | sed -n 's#^\./lib\(.*\)\.so$#- `\1`#p' | sort)"
+          if [[ -z "$list" ]]; then
+            echo "::error::no connector plugins found in $tarball" >&2
+            exit 1
+          fi
+          {
+            echo "list<<PLUGINS_EOF"
+            echo "$list"
+            echo "PLUGINS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Delete existing edge release and tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -95,17 +113,7 @@ jobs:
             - `iggy-connectors` - The connectors runtime
 
             ## Connector plugins included (.so)
-            - `iggy_connector_elasticsearch_sink`
-            - `iggy_connector_elasticsearch_source`
-            - `iggy_connector_iceberg_sink`
-            - `iggy_connector_postgres_sink`
-            - `iggy_connector_postgres_source`
-            - `iggy_connector_quickwit_sink`
-            - `iggy_connector_random_source`
-            - `iggy_connector_s3_sink`
-            - `iggy_connector_stdout_sink`
-            - `iggy_connector_surrealdb_sink`
-            - `iggy_connector_rabbitmq_sink`
+            ${{ steps.plugins.outputs.list }}
 
             ## Downloads
 

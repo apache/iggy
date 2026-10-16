@@ -2,7 +2,7 @@
 
 The highly performant and modular runtime for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. Create your own Rust plugins by simply implementing either the `Source` or `Sink` trait and build custom pipelines for the data processing.
 
-The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect:edge`.
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available via `docker pull apache/iggy-connect`. It ships in two flavors: a default image with every connector plugin bundled, and a `-slim` runtime-only image (see [Docker image](#docker-image)).
 
 ## Features
 
@@ -18,47 +18,96 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 - **Observability**: Prometheus metrics with per-stage latency histograms, plus an opt-in per-batch tracing benchmark target.
 - **Structured logging**: Selectable text or JSON log format via `[logging]` configuration.
 
+## Docker image
+
+Published to Docker Hub as [`apache/iggy-connect`](https://hub.docker.com/r/apache/iggy-connect) in two flavors:
+
+| Tag | Contents |
+| --- | --- |
+| `edge`, `x.y.z`, `latest` | Runtime plus every bundled connector plugin (default) |
+| `edge-slim`, `x.y.z-slim`, `latest-slim` | Runtime binary only |
+
+The default (fat) image bakes every connector plugin into `/usr/local/lib`, which is on the runtime's [plugin search path](#plugin-path-resolution). A connector config can therefore load a bundled plugin by library file name alone, with no directory and no extension:
+
+```toml
+# a connector definition in your config_dir
+type = "sink"
+key = "stdout"
+name = "Stdout sink"
+path = "libiggy_connector_stdout_sink"
+```
+
+Run the runtime with a config mounted in, pointing `IGGY_CONNECTORS_CONFIG_PATH` at it:
+
+```bash
+docker run --rm \
+  -v "$PWD/my_config:/config" \
+  -e IGGY_CONNECTORS_CONFIG_PATH=/config/config.toml \
+  apache/iggy-connect
+```
+
+The mounted `config.toml` must set `[connectors].config_dir` to the connector definitions inside the container, and each definition's `path` must resolve there; bundled plugins resolve by file name as shown above.
+
+Choose a `-slim` tag when you supply your own plugins and want a smaller image with a narrower dependency surface, and mount the plugin `.so` files into one of the search-path directories (for example `/usr/local/lib`).
+
+Source connectors save their checkpoints under `[state].path`, which is `local_state` by default. In the image this resolves to `/app/local_state`. If you run sources, mount a volume there. Otherwise the checkpoints are lost when the container is replaced.
+
 ## Quick Start
 
-Run these commands from the root of the same Iggy source checkout used for the server and plugins. This guide targets server 0.9.0, including its edge builds.
+This example runs the Iggy server, the connectors runtime with the Delta Lake sink and [floci](https://github.com/floci-io/floci), a local S3 emulator, then produces random user records and shows them in a Delta table. You need Docker with Compose, and a Rust toolchain for the producer.
 
-1. Build the server, CLI, runtime and quick-start plugins:
-
-    ```bash
-    cargo build --release -p server -p iggy-cli -p iggy-connectors \
-      -p iggy_connector_random_source -p iggy_connector_stdout_sink \
-      -p iggy_connector_quickwit_sink
-    ```
-
-    For a debug build, omit `--release` and replace `target/release` with `target/debug` in both the commands and plugin paths. Make sure that the plugins specified in `core/connectors/runtime/example_config/connectors/` directory under `path` are available. The configuration must be provided in `toml` format.
-    The example directory also enables connectors for ClickHouse, Delta Lake, Apache Doris, Apache Iceberg, and InfluxDB. Without their backing services (or their compiled plugins) these are reported with the `Error` status, but they don't block the remaining connectors. Set `enabled = false` in their files to skip them entirely.
-
-2. Run `docker compose -f examples/rust/src/sink-data-producer/docker-compose.yml up -d`, which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
-
-3. In the terminal that will run the connectors, set the runtime configuration path:
+1. Start the stack from the example directory:
 
     ```bash
-    export IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/example_config/config.toml
+    cd examples/rust/src/sink-data-producer
+    docker compose up -d --build
     ```
 
-4. Start the Iggy server in a separate terminal with credentials matching the sample connector configuration:
+    One-shot services create the `example_stream` stream with the `users` topic, and the `delta-warehouse` bucket with the Delta table `s3://delta-warehouse/users`. The runtime starts after they finish.
+
+2. Check that everything is up:
 
     ```bash
-    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server --release
+    docker compose ps
+    curl localhost:3001/health
+    curl localhost:3001/sinks
     ```
 
-    With the server running, create the example streams and topics using the CLI from this checkout. An existing server must have these credentials, or you must adjust the commands and connector configuration to match it.
+    The `iggy-init` and `delta-tools` services exit after their work is done, the other services keep running. The `/sinks` response lists the `delta` sink, its status should be `running`.
+
+3. From the repository root, run the producer. It sends 100 batches of random records to the `users` topic:
 
     ```bash
-    target/release/iggy --username iggy --password iggy stream create example_stream
-    target/release/iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d --durability persisted
-    target/release/iggy --username iggy --password iggy stream create qw
-    target/release/iggy --username iggy --password iggy topic create qw records 1 none 1d
+    cargo run --example sink-data-producer --release
     ```
 
-5. Execute `cargo run --example sink-data-producer --release`, which sends 100 batches of messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
+4. See the results. The first command lists the Delta data and log files in the bucket, the second prints the table version, the row count and the newest rows:
 
-6. Start the connector runtime `cargo run --bin iggy-connectors --release` in the terminal configured in step 3. The Quickwit sink indexes the produced records in the `events` index. At the same time, you should see the new messages being added to the `example_stream` stream and `example_topic` topic by the Random source connector - you can [start the Iggy Web UI](https://iggy.apache.org/docs/web_ui/start) to browse the data. The messages will have applied the basic fields transformations.
+    ```bash
+    cd examples/rust/src/sink-data-producer
+    docker compose run --rm tools s3 ls s3://delta-warehouse/users --recursive
+    docker compose run --rm delta-tools python show.py
+    ```
+
+5. Stop the stack and remove all its data:
+
+    ```bash
+    docker compose down -v
+    ```
+
+The default `apache/iggy-connect:edge` image bundles the Delta sink plugin. To test an unreleased change to the image or the plugins, build the default image locally from the repository root and point the example at it:
+
+```bash
+docker buildx build -f core/connectors/runtime/Dockerfile --target runtime-fat \
+  --platform linux/amd64 --build-arg LIBC=glibc --build-arg IGGY_CI_BUILD=true \
+  -t iggy-connect:fat-local --load .
+cd examples/rust/src/sink-data-producer
+IGGY_CONNECT_IMAGE=iggy-connect:fat-local docker compose up -d --build
+```
+
+IMPORTANT: make sure you have pulled the code from the latest master to ensure connectors and server protocol compatibility. The incompatibility causes obscure errors coming from the connectors' client due to frequent changes done to the protocol at the moment. Run `docker compose pull` before `docker compose up` so that the `edge` images match your checkout.
+
+The configuration used by the example lives in `examples/rust/src/sink-data-producer/config/`.
 
 ## Runtime
 
@@ -101,10 +150,15 @@ Each sink should have its own, custom configuration, which is passed along with 
 
 ### Available Sinks
 
+- **ClickHouse Sink** - inserts messages into ClickHouse tables as JSONEachRow, RowBinary or raw string data
+- **Delta Sink** - appends messages to Delta Lake tables on local disk, S3, Azure Blob Storage or Google Cloud Storage
 - **Doris Sink** - loads JSON messages into Apache Doris tables via the Stream Load HTTP API
 - **Elasticsearch Sink** - sends messages to Elasticsearch indices
+- **HTTP Sink** - delivers messages to any HTTP endpoint such as webhooks and REST APIs
 - **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
+- **InfluxDB Sink** - writes messages to InfluxDB V2 and V3 as line-protocol points
 - **Meilisearch Sink** - indexes messages in Meilisearch
+- **MongoDB Sink** - stores messages as documents in a MongoDB collection
 - **PostgreSQL Sink** - stores messages in PostgreSQL database tables
 - **Quickwit Sink** - indexes messages in Quickwit search engine
 - **RabbitMQ Sink** - publishes messages to RabbitMQ exchanges via AMQP 0.9.1
@@ -122,6 +176,8 @@ Please refer to the **[Source documentation](https://github.com/apache/iggy/tree
 ### Available Sources
 
 - **Elasticsearch Source** - polls documents from Elasticsearch indices
+- **HTTP Source** - receives webhook POST requests over an embedded HTTP server and produces their bodies as messages
+- **InfluxDB Source** - polls InfluxDB V2 (Flux) and V3 (SQL) with a persisted timestamp cursor
 - **PostgreSQL Source** - reads rows from PostgreSQL tables with multiple consumption strategies (delete after read, mark as processed, timestamp tracking)
 - **Random Source** - generates random test messages (useful for testing/development)
 

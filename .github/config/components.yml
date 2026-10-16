@@ -242,6 +242,22 @@ components:
     paths:
       - "core/connectors/**"
 
+  # Smoke-test build of the full (fat) connectors image. Runs on all connector
+  # changes and not other related ones so that the problem is always targeted
+  # at developers changing connectors the most.
+  rust-connectors-image:
+    paths:
+      - "core/connectors/**"
+      - "scripts/ci/connector-plugins.sh"
+      - "scripts/ci/third-party-licenses.sh"
+      - "about.hbs"
+      - "about.toml"
+      - ".dockerignore"
+      - ".github/actions/utils/docker-buildx/**"
+      - ".github/actions/rust/pre-merge/action.yml"
+    tasks:
+      - "docker-connectors-fat"
+
   # MCP AI component
   rust-mcp:
     depends_on:
