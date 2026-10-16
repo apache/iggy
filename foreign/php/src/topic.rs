@@ -42,12 +42,12 @@ impl TopicDetails {
         self.inner.name.to_string()
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn messages_count(&self) -> u64 {
         self.inner.messages_count
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }

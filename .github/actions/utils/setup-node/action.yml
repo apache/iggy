@@ -15,24 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# NOTE: this action sets up the Node.js toolchain + npm cache for dependencies,
-#       it is a convenience wrapper, so that we can use it in all workflows.
-
-name: setup-node-with-cache
-description: Setup Node.js toolchain and comprehensive caching (npm cache for dependencies)
+name: setup-node
+description: Setup Node.js toolchain and install dependencies
 inputs:
   node-version:
     description: "Node.js version to use"
     required: false
     default: "23"
-  enabled:
-    description: "Whether to enable caching"
-    required: false
-    default: "true"
-  cache-dependency-path:
-    description: "Path to lock file for npm caching"
-    required: false
-    default: "package-lock.json"
   workspace:
     description: "Workspace directory"
     required: false
@@ -44,25 +33,13 @@ runs:
       uses: actions/setup-node@v6
       with:
         node-version: ${{ inputs.node-version }}
-        cache: "npm"
-        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+        package-manager-cache: false
 
     - name: Pin npm to 11 to match Dependabot lockfile format
       run: npm install -g npm@11
       shell: bash
 
-    - name: Setup npm cache
-      if: inputs.enabled == 'true'
-      uses: actions/cache@v5
-      with:
-        path: ~/.npm
-        key: npm-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}
-        restore-keys: |
-          npm-${{ runner.os }}-
-
-
     - name: Install dependencies
-      if: inputs.enabled == 'true'
       run: |
         echo "📦 Installing Node.js dependencies..."
         if [ "${{ inputs.workspace }}" != "." ]; then

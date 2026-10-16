@@ -16,10 +16,10 @@
 # under the License.
 
 # NOTE: Go builds are fast, so caching is disabled by default.
-# The read-cache/save-cache inputs exist for parity with setup-rust-with-cache
+# The read-cache/save-cache inputs exist for parity with setup-rust
 # but both default to "false". Enable only if Go build times become a bottleneck.
 
-name: setup-go-with-cache
+name: setup-go
 description: Setup Go toolchain and optional caching (go mod cache + golangci-lint cache)
 inputs:
   go-version:

@@ -20,22 +20,41 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, test-1, test-2, test-3, test-storage-compat, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, doctest, verify-publish, test-build, test, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
     required: false
     default: ""
+  test-scope:
+    description: "Test selection: affected or workspace"
+    required: false
+    default: affected
+  partition:
+    description: "One-based nextest partition index for the test task"
+    required: false
+  partitions:
+    description: "Total nextest partitions for the test task"
+    required: false
+  save-cache:
+    description: "Save build dependencies for subsequent PRs"
+    required: false
+    default: "false"
+  free-disk-space-aggressive:
+    description: "Use deep disk cleanup for full workspace coverage builds"
+    required: false
+    default: "false"
 
 runs:
   using: "composite"
   steps:
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
       with:
         # Only test jobs execute nextest. Avoid downloading it in lint, metadata,
         # and cross-build jobs.
-        install-nextest: ${{ startsWith(inputs.task, 'test-') }}
+        install-nextest: ${{ inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
+        coverage: ${{ inputs.task == 'test-build' || inputs.task == 'test' }}
         # These tasks do not compile workspace crates and need no native
         # libraries. All compiling tasks keep the existing dependency setup.
         install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
@@ -48,14 +67,14 @@ runs:
         # the warm `~/.cargo` restore is a free win, and its 1.95 target
         # artifacts rebuild regardless since the rustc hash differs.
         shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
-        # fmt/sort/machete never build into target/, so the multi-GB cache
-        # restore is pure overhead. Compiling legs (check/clippy/doctest/test-*)
-        # keep it; a cold cache there recompiles the whole dep tree.
-        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete') && 'false' || 'true' }}
+        # Shards download the build artifact. Metadata-only tasks need no target cache.
+        read-cache: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'machete' || inputs.task == 'test') && 'false' || 'true' }}
+        save-cache: ${{ inputs.save-cache }}
         # Light legs fit in the runner's ~89 GiB default headroom; skip the
         # ~20-45s reclaim. Disk-heavy legs (coverage build + testcontainers
-        # images on test-*, cross-builds, miri, verify-publish) keep it.
+        # images on test jobs, cross-builds, miri, verify-publish) keep it.
         free-disk-space: ${{ (inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'doctest') && 'false' || 'true' }}
+        free-disk-space-aggressive: ${{ inputs.free-disk-space-aggressive }}
 
     - name: Install cargo-sort
       if: inputs.task == 'sort'
@@ -84,7 +103,7 @@ runs:
     # Cargo-Rail release it is qualified with (0.30.1 for v10.1.1).
     - name: Plan affected Rust work
       id: rail
-      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
+      if: inputs.task == 'test-build' && inputs.test-scope == 'affected'
       continue-on-error: true
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
 
@@ -149,45 +168,22 @@ runs:
       shell: bash
 
     - name: Install dependencies for Rust tests
-      if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
+      if: (inputs.task == 'test' || inputs.task == 'test-storage-compat') && runner.os == 'Linux'
       run: |
         ./scripts/ci/apt-install.sh musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f "$HOME"/.local/share/keyrings/*
       shell: bash
 
-    - name: Install cargo-llvm-cov
-      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-llvm-cov
-
-    - name: Build and test with coverage
-      # test-storage-compat drives its own nextest invocation from
-      # scripts/ci/storage-compat.sh. Without this exclusion it would also run
-      # here without partition arguments, i.e. a fourth *unpartitioned* copy
-      # of the whole suite on top of test-1/2/3.
-      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
+    - name: Build coverage test archive
+      if: inputs.task == 'test-build'
       env:
         PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         PLAN_STATUS: ${{ steps.rail.outcome }}
-        TASK: ${{ inputs.task }}
+        TEST_SELECTION: ${{ inputs.test-scope }}
       run: |
         set -euo pipefail
-
-        # Parse partition index from task name (test-1 -> hash:1/3, test-2 -> hash:2/3, ...).
-        # TEST_PARTITIONS must match the number of test-N tasks in
-        # .github/config/components.yml. Cluster bootstrap makes each test
-        # CPU-heavy, so partitions stay small.
-        # The regex is numeric-only on purpose: non-numeric test-* tasks
-        # (test-storage-compat) opt out of partitioning rather than producing
-        # an out-of-range hash:N/3.
-        TEST_PARTITIONS=3
-        PARTITION_ARGS=()
-        if [[ "$TASK" =~ ^test-([0-9]+)$ ]]; then
-          PARTITION_INDEX="${BASH_REMATCH[1]}"
-          PARTITION_ARGS=(--partition "hash:${PARTITION_INDEX}/${TEST_PARTITIONS}")
-          echo "::notice::Running test partition ${PARTITION_INDEX}/${TEST_PARTITIONS}"
-        fi
+        ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
+        mkdir -p "$ARTIFACT_DIR"
 
         # Read only validated selectors. Argument and package selectors are
         # NUL-delimited, hence `mapfile -d ''`. Any planner or selector failure
@@ -195,12 +191,18 @@ runs:
         # target-args emits `--test` pairs only when every selected target of
         # every selected package is an integration test, so it never drops a
         # package or its unit tests from a mixed selection.
-        SELECTOR_DIR="${RUNNER_TEMP:?RUNNER_TEMP is required}/cargo-rail-selectors-${TASK}"
+        SELECTOR_DIR="${RUNNER_TEMP:?RUNNER_TEMP is required}/cargo-rail-selectors"
         mkdir -p "$SELECTOR_DIR"
         TEST_CARGO_ARGS=()
         TEST_TARGET_ARGS=()
         TEST_PACKAGES=()
-        if [[ "$PLAN_STATUS" == "success" ]] &&
+        if [[ "$TEST_SELECTION" == "workspace" ]]; then
+          TEST_SCOPE=workspace
+          RUNTIME_SCOPE=workspace
+        elif [[ "$TEST_SELECTION" != "affected" ]]; then
+          echo "::error::Invalid test scope: $TEST_SELECTION"
+          exit 1
+        elif [[ "$PLAN_STATUS" == "success" ]] &&
           TEST_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" cargo.test) &&
           RUNTIME_SCOPE=$(cargo-rail-action plan cargo-scope "$PLAN_FILE" runtime-artifacts) &&
           cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test > "$SELECTOR_DIR/test-args" &&
@@ -216,61 +218,44 @@ runs:
           echo "::warning::Cargo-Rail plan unavailable or invalid; running the full workspace"
         fi
 
+        printf '%s\n' "$TEST_SCOPE" > "$ARTIFACT_DIR/scope"
+        git rev-parse HEAD > "$ARTIFACT_DIR/revision"
         if [[ "$TEST_SCOPE" == "skipped" ]]; then
           echo "::notice::Cargo-Rail reports no affected Rust tests"
           exit 0
         fi
 
-        # Runtime prerequisites (spawned binaries, dlopened connector plugins)
-        # are built alongside the tested packages. A package in both lists is
-        # built once.
+        # Only spawned binaries and dlopened plugins need a separate dev build.
+        # nextest archive compiles the selected tests with their dev-dependency features.
         BUILD_ARGS=()
-        if [[ "$TEST_SCOPE" == "packages" && "$RUNTIME_SCOPE" != "workspace" ]]; then
-          mapfile -d '' -t BUILD_PACKAGES < <(sort -zu "$SELECTOR_DIR/test-packages" "$SELECTOR_DIR/runtime-packages")
-          for package in "${BUILD_PACKAGES[@]}"; do
+        if [[ "$RUNTIME_SCOPE" == "packages" ]]; then
+          mapfile -d '' -t RUNTIME_PACKAGES < "$SELECTOR_DIR/runtime-packages"
+          for package in "${RUNTIME_PACKAGES[@]}"; do
             BUILD_ARGS+=(-p "$package")
           done
-          BUILD_SUMMARY="${#BUILD_PACKAGES[@]} packages"
-        else
-          BUILD_SUMMARY="full workspace"
         fi
-        if [[ "$TEST_SCOPE" == "packages" ]]; then
-          TEST_SUMMARY="${#TEST_PACKAGES[@]} packages"
-        else
-          TEST_SUMMARY="full workspace"
+        : > "$ARTIFACT_DIR/build.jsonl"
+        : > "$ARTIFACT_DIR/runtime-files"
+        if [[ "$RUNTIME_SCOPE" != "skipped" ]]; then
+          cargo build --locked "${BUILD_ARGS[@]}" --message-format=json-render-diagnostics > "$ARTIFACT_DIR/build.jsonl"
+          jq -r 'select(.reason == "compiler-artifact") |
+            (select(.target.kind | index("bin")) | .executable // empty),
+            (select(.target.crate_types | index("cdylib")) | .filenames[] | select(endswith(".so")))' \
+            "$ARTIFACT_DIR/build.jsonl" | sort -u | \
+            while IFS= read -r artifact; do
+              realpath --relative-to="$GITHUB_WORKSPACE" "$artifact"
+            done > "$ARTIFACT_DIR/runtime-files"
         fi
-        echo "::notice::Cargo-Rail: testing ${TEST_SUMMARY}, building ${BUILD_SUMMARY}"
-
-        source <(cargo llvm-cov show-env --export-prefix)
-
-        # Doris 4.0.3's start_be.sh hard-`exit 1`s unless vm.max_map_count >= 2000000.
-        # This kernel param can only be set on the host (no container can raise it),
-        # so we raise it here. Everything else about booting Doris — image, heap/mem
-        # caps, port mappings, BE-alive wait — lives in the testcontainers fixture
-        # at core/integration/tests/connectors/fixtures/doris/container.rs, so
-        # `cargo test` and CI follow exactly the same path.
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
-          sudo sysctl -w vm.max_map_count=2000000 || true
-        fi
-
-        bins_start=$(date +%s)
-        cargo build --locked "${BUILD_ARGS[@]}"
-        bins_end=$(date +%s)
-        bins_duration=$((bins_end - bins_start))
-        echo "::notice::Binaries and libraries built in ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
-
-        compile_start=$(date +%s)
-        cargo test --locked --no-run "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}"
-        compile_end=$(date +%s)
-        compile_duration=$((compile_end - compile_start))
-        echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
+        tar --zstd -cf "$ARTIFACT_DIR/runtime.tar.zst" -T "$ARTIFACT_DIR/runtime-files"
+        rm "$ARTIFACT_DIR/build.jsonl" "$ARTIFACT_DIR/runtime-files"
 
         # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
-        # wire fixtures. Generate when iggy-gateway-kafka is in the Cargo-Rail test scope, or (on
-        # a full-workspace run) when gateways/** changed vs the PR base — avoid building
-        # kafka-message-gen / kafka-protocol when the gateway was not touched.
+        # wire fixtures. Master always generates them. On PRs, use the selected
+        # packages or the gateway diff to avoid building fixture tools unnecessarily.
         NEEDS_KAFKA_FIXTURES=false
-        if [[ "$TEST_SCOPE" == "packages" ]]; then
+        if [[ "$TEST_SELECTION" == "workspace" ]]; then
+          NEEDS_KAFKA_FIXTURES=true
+        elif [[ "$TEST_SCOPE" == "packages" ]]; then
           for package in "${TEST_PACKAGES[@]}"; do
             if [[ "$package" == "iggy-gateway-kafka" ]]; then
               NEEDS_KAFKA_FIXTURES=true
@@ -313,9 +298,47 @@ runs:
             echo "::warning::git diff against the PR base failed (base: ${BASE_SHA:-none, HEAD is not a merge commit}; ${DIFF_OUTPUT:-}); generating Kafka fixtures unconditionally as a fail-safe"
           fi
         fi
+        printf '%s\n' "$NEEDS_KAFKA_FIXTURES" > "$ARTIFACT_DIR/kafka-fixtures"
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
           ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
-          trap './gateways/kafka/scripts/ci-wire-fixtures.sh cleanup' EXIT
+          tar --zstd -cf "$ARTIFACT_DIR/kafka-fixtures.tar.zst" gateways/kafka/tools/kafka-tool/kafka_messages
+        fi
+
+        cargo nextest archive --locked --profile ci \
+          "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}" \
+          --archive-file "$ARTIFACT_DIR/nextest.tar.zst"
+      shell: bash
+
+    - name: Run coverage test partition
+      if: inputs.task == 'test'
+      env:
+        # Keep these out of TEST_* and IGGY_*. They reach every test process,
+        # where config env tests panic on unknown TEST_* names and debug
+        # servers refuse to boot on unknown IGGY_* names.
+        PARTITION_INDEX: ${{ inputs.partition }}
+        PARTITION_COUNT: ${{ inputs.partitions }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$PARTITION_INDEX" =~ ^[1-9][0-9]*$ || ! "$PARTITION_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+          (( PARTITION_INDEX > PARTITION_COUNT )); then
+          echo "::error::Invalid test partition: $PARTITION_INDEX/$PARTITION_COUNT"
+          exit 1
+        fi
+        ARTIFACT_DIR="$RUNNER_TEMP/rust-test-build"
+        artifact_revision=$(cat "$ARTIFACT_DIR/revision")
+        checkout_revision=$(git rev-parse HEAD)
+        if [[ "$artifact_revision" != "$checkout_revision" ]]; then
+          echo "::error::Coverage archive revision $artifact_revision does not match checkout $checkout_revision"
+          exit 1
+        fi
+        TEST_SCOPE=$(cat "$ARTIFACT_DIR/scope")
+        if [[ "$TEST_SCOPE" == "skipped" ]]; then
+          echo "::notice::Cargo-Rail reports no affected Rust tests"
+          exit 0
+        fi
+        tar --zstd -xf "$ARTIFACT_DIR/runtime.tar.zst"
+        if [[ "$(cat "$ARTIFACT_DIR/kafka-fixtures")" == true ]]; then
+          tar --zstd -xf "$ARTIFACT_DIR/kafka-fixtures.tar.zst"
           # Fixtures are expected to exist from here on; a missing one now means
           # generation silently failed, not a legitimate local-dev skip.
           export KAFKA_FIXTURES_REQUIRED=1
@@ -349,52 +372,23 @@ runs:
         # Previously this ran before `cargo build`, leaving a 7+ minute idle
         # window that triggered org.freedesktop.Secret.Error.IsLocked ~10% of runs.
         if [[ "$RUNNER_OS" == "Linux" ]]; then
-          eval $(dbus-launch --sh-syntax)
+          eval "$(dbus-launch --sh-syntax)"
           export DBUS_SESSION_BUS_ADDRESS
-          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+          eval "$(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)"
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
         fi
 
-        test_start=$(date +%s)
-        if command -v cargo-nextest &> /dev/null; then
-          if [[ "$TEST_SCOPE" == "packages" ]]; then
-            # Every test target in the `bdd` crate is `required-features =
-            # ["bdd"]`, so the `cargo test --no-run` above builds no binaries
-            # for it. A PR touching only that crate then produces a valid
-            # package scope that matches zero tests, and nextest's default
-            # `--no-tests=fail` turns that into exit 4 on a green PR.
-            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci \
-              "${PARTITION_ARGS[@]}" "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}"
-          else
-            cargo nextest run --locked --no-fail-fast --profile ci "${PARTITION_ARGS[@]}"
-          fi
-        else
-          if [[ ${#PARTITION_ARGS[@]} -gt 0 ]]; then
-            echo "::error::cargo-nextest not found, falling back to cargo test without partitioning (all tests will run on every partition)"
-          fi
-          cargo test --locked --no-fail-fast "${TEST_CARGO_ARGS[@]}" "${TEST_TARGET_ARGS[@]}"
+        # Doris requires this host setting before its testcontainers fixture starts.
+        sudo sysctl -w vm.max_map_count=2000000 || true
+        NO_TESTS=fail
+        if [[ "$TEST_SCOPE" == "packages" ]]; then
+          # BDD targets require features, so a BDD-only scope can contain no runnable tests.
+          NO_TESTS=warn
         fi
-        test_end=$(date +%s)
-        test_duration=$((test_end - test_start))
-        echo "::notice::Tests executed in ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
-
-        build_duration=$((bins_duration + compile_duration))
-        total_duration=$((build_duration + test_duration))
-        echo ""
-        echo "========================================="
-        echo "Cargo-Rail scope (test):       ${TEST_SUMMARY}"
-        echo "Cargo-Rail scope (build):      ${BUILD_SUMMARY}"
-        echo "All targets build:             ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
-        echo "Tests compile:                 ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
-        echo "Tests execute:                 ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
-        echo "-----------------------------------------"
-        echo "Total build:                   ${build_duration}s ($(date -ud @${build_duration} +'%M:%S'))"
-        echo "Total time:                    ${total_duration}s ($(date -ud @${total_duration} +'%M:%S'))"
-        echo "========================================="
-
-        cargo llvm-cov report --codecov --output-path codecov.json
-        echo "Coverage report generated: codecov.json"
-        ls -la codecov.json
+        cargo nextest run --archive-file "$ARTIFACT_DIR/nextest.tar.zst" \
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --workspace-remap "$GITHUB_WORKSPACE" \
+          --no-fail-fast --no-tests="$NO_TESTS" --profile ci \
+          --partition "hash:${PARTITION_INDEX}/${PARTITION_COUNT}"
       shell: bash
 
     # On-disk format backwards compatibility. The script builds an iggy-server
@@ -478,7 +472,19 @@ runs:
       run: |
         target/debug/iggy-server --fresh > server-boot.log 2>&1 &
         SERVER_PID=$!
-        trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+        stop_server() {
+          local stop_timeout=30
+          kill "$SERVER_PID" 2>/dev/null || true
+          for ((elapsed = 0; elapsed < stop_timeout; elapsed++)); do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          kill -KILL "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" || true
+        }
+        trap stop_server EXIT
 
         for _ in $(seq 1 30); do
           if ! kill -0 "$SERVER_PID" 2>/dev/null; then
