@@ -470,7 +470,9 @@ impl LinksShared {
         self.table.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The channel runs in overflow mode, so a publish never waits.
+    /// The channel runs in overflow mode, so a publish never waits. A first
+    /// install and a last close publish under the table lock, so their events
+    /// keep the order of the table changes.
     fn publish(&self, event: DiagnosticEvent) {
         let _ = self.events.try_broadcast(event);
     }
@@ -698,7 +700,6 @@ impl LinksShared {
         table.bootstrap = None;
         let last = table.ready_count() == 0;
         table.settle();
-        drop(table);
         if last {
             self.publish(DiagnosticEvent::Disconnected);
         }
@@ -1091,11 +1092,16 @@ impl LinksShared {
         } else {
             None
         };
-        drop(table);
-        drop(retired);
         if first {
             self.publish(DiagnosticEvent::Connected);
+            // After every link closed, a link that binds the session again
+            // resumes it, as a sweep does.
+            if bound_fence.is_some() && table.state == ClientState::Authenticated {
+                self.publish(DiagnosticEvent::SignedIn);
+            }
         }
+        drop(table);
+        drop(retired);
         info!("The link to replica {id} is ready.");
         Some(link)
     }
@@ -1113,12 +1119,11 @@ impl LinksShared {
             return;
         }
         slot.link = None;
-        let last = table.ready_count() == 0;
-        drop(table);
-        warn!("The link to replica {id} closed.");
-        if last {
+        if table.ready_count() == 0 {
             self.publish(DiagnosticEvent::Disconnected);
         }
+        drop(table);
+        warn!("The link to replica {id} closed.");
     }
 
     fn slot_stopped(&self, id: u8) {
@@ -1553,6 +1558,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_every_link_lost_when_a_slot_binds_the_session_again_should_publish_signed_in() {
+        let cluster = FakeCluster::new(3);
+        let links = connected(&cluster, 3).await;
+        let fence = links.shared.session.fence();
+        let mut events = links.subscribe();
+        while events.try_recv().is_ok() {}
+
+        // Refused dials keep every slot down until the last link closed.
+        cluster.down.lock().unwrap().extend((0..3).map(endpoint));
+        for id in 0..3 {
+            cluster.drop_connections(&endpoint(id));
+        }
+        eventually("every link is down", || links.ready_replicas().is_empty()).await;
+        assert_eq!(links.state(), ClientState::Authenticated);
+        cluster.down.lock().unwrap().clear();
+        eventually("every slot is ready again", || {
+            links.ready_replicas().len() == 3
+        })
+        .await;
+
+        let published: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            published,
+            [
+                DiagnosticEvent::Disconnected,
+                DiagnosticEvent::Connected,
+                DiagnosticEvent::SignedIn
+            ]
+        );
+        assert_eq!(links.shared.session.fence(), fence);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_session_reset_when_links_are_ready_should_close_all_but_the_sign_in_link() {
         let cluster = FakeCluster::new(3);
         let links = connected(&cluster, 3).await;
@@ -1703,6 +1742,8 @@ mod tests {
         let fence = links.shared.session.fence();
         // Each slot waits its initial jitter, then its bind finds the session gone.
         sleep(REESTABLISH_AFTER).await;
+        let mut events = links.subscribe();
+        while events.try_recv().is_ok() {}
 
         *cluster.session.lock().unwrap() = None;
         for id in 0..3 {
@@ -1716,6 +1757,15 @@ mod tests {
         assert_eq!(links.shared.session.fence(), fence + 1);
         assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
         assert_eq!(links.state(), ClientState::Authenticated);
+        let published: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            published,
+            [
+                DiagnosticEvent::Disconnected,
+                DiagnosticEvent::Connected,
+                DiagnosticEvent::SignedIn
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
