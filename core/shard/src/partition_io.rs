@@ -2476,6 +2476,7 @@ mod tests {
                     floor: None,
                     peer: 1,
                     idle_ticks: 0,
+                    floor_pulled_from: 0,
                 });
                 let reply =
                     Message::<RepairRangeReplyHeader>::new(size_of::<RepairRangeReplyHeader>())
@@ -2548,6 +2549,7 @@ mod tests {
             floor: None,
             peer: 0,
             idle_ticks: 0,
+            floor_pulled_from: 0,
         });
         assert_eq!(
             partition.complete_repair(partitions.config()).await,
@@ -3192,6 +3194,7 @@ mod tests {
                 fetch_to_op: commit_max,
                 floor: None,
                 peer: 0,
+                floor_pulled_from: 0,
                 idle_ticks: 0,
             });
             owner.plane.partitions().insert(namespace, partition);
@@ -5227,6 +5230,7 @@ mod tests {
             floor: None,
             peer,
             idle_ticks: 0,
+            floor_pulled_from: 0,
         });
         partition
     }
