@@ -34,7 +34,7 @@ use iggy::prelude::{AutoLogin, Client, Credentials, IggyClient, IggyClientBuilde
 use secrecy::SecretString;
 
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, ProduceSessionLimits, TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits, TopicMapping,
 };
 
 /// Desired slot count - the actual count `port_band()` computes may be smaller if the machine's
@@ -262,6 +262,26 @@ impl TestServer {
     /// its assertions, orphaning a process that still holds its `PortGuard` slot, which then
     /// fails the next test that draws that slot to bind.
     pub async fn spawn_with_password(data_dir: &std::path::Path, password: &str) -> Self {
+        Self::spawn_configured(data_dir, password, None).await
+    }
+
+    /// Spawns `iggy-server` whose TCP listener speaks only TLS, with the given PEM pair.
+    ///
+    /// The bridge under test then has to dial it over TLS, which is the one way to prove the
+    /// bridge's own `IggyTls` reaches the socket rather than only the credential check's.
+    pub async fn spawn_with_tls(
+        data_dir: &std::path::Path,
+        cert_file: &std::path::Path,
+        key_file: &std::path::Path,
+    ) -> Self {
+        Self::spawn_configured(data_dir, "iggy", Some((cert_file, key_file))).await
+    }
+
+    async fn spawn_configured(
+        data_dir: &std::path::Path,
+        password: &str,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> Self {
         let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
 
@@ -303,6 +323,15 @@ impl TestServer {
             // attempt fails with "invalid credentials" no matter what this test passes.
             .env("IGGY_ROOT_USERNAME", "iggy")
             .env("IGGY_ROOT_PASSWORD", password);
+        if let Some((cert_file, key_file)) = tls {
+            // `self_signed` is off explicitly: left on, the server would still load an existing
+            // pair, but the test should fail loudly on a missing file rather than mint one.
+            command
+                .env("IGGY_TCP_TLS_ENABLED", "true")
+                .env("IGGY_TCP_TLS_SELF_SIGNED", "false")
+                .env("IGGY_TCP_TLS_CERT_FILE", cert_file)
+                .env("IGGY_TCP_TLS_KEY_FILE", key_file);
+        }
         let child = command.spawn().expect("spawn iggy-server");
 
         let mut server = Self {
@@ -346,6 +375,7 @@ impl TestServer {
             topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
                 .expect("valid mapping for this test's fixture data"),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            tls: IggyTls::default(),
             produce_sessions: ProduceSessionLimits::default(),
         }
     }

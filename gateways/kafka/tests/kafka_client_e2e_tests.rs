@@ -51,15 +51,21 @@ use tokio::task::JoinHandle;
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
 use iggy_gateway_kafka::bridge::{
-    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, ProduceSessionLimits, TopicMapping,
+    DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, ProduceSessionLimits,
+    TopicMapping,
 };
-use iggy_gateway_kafka::server::bind_listener;
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
+#[path = "common/certs.rs"]
+mod certs;
 #[path = "common/server.rs"]
 mod server;
 
-use server::spawn_test_server_with_authenticator;
+use certs::{Issued, TestPki};
+use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
+use server::{spawn_gateway as spawn_listeners, spawn_test_server_with_authenticator};
 
 const KCAT_IMAGE: &str = "edenhill/kcat:1.7.1";
 const KAFKA_IMAGE: &str = "apache/kafka:3.9.0";
@@ -287,7 +293,10 @@ fn free_port() -> u16 {
 /// Starts the gateway with SASL on, verifying credentials against `iggy_address`.
 async fn spawn_gateway(iggy_address: &str) -> SocketAddr {
     let config = GatewayConfig {
-        sasl_enabled: true,
+        listeners: vec![ListenerConfig::new(
+            SecurityProtocol::SaslPlaintext,
+            "127.0.0.1:0",
+        )],
         ..GatewayConfig::default()
     };
     let authenticator = Arc::new(IggyAuthenticator::new(iggy_address.to_string()));
@@ -334,6 +343,7 @@ async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> B
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("the default mapping is valid"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
     };
     let bridge = IggyBridge::connect(config)
@@ -347,14 +357,14 @@ async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> B
     }
     let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    let config = GatewayConfig {
-        bind_addr: addr.to_string(),
-        ..GatewayConfig::default()
-    };
-    let gateway = KafkaGateway::new(config).with_bridge(Some(Arc::new(bridge)));
+    let listener = BoundListener::new(
+        ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+        listener,
+    );
+    let gateway = KafkaGateway::new(GatewayConfig::default()).with_bridge(Some(Arc::new(bridge)));
     let (shutdown, receiver) = broadcast::channel(1);
     let task = tokio::spawn(async move {
-        let _ = gateway.run(listener, receiver).await;
+        let _ = gateway.run(vec![listener], receiver).await;
     });
     BridgedGateway {
         addr,
@@ -1399,4 +1409,343 @@ fn records_by_partition(output: &[String]) -> BTreeMap<i64, Vec<i64>> {
         }
     }
     read
+}
+
+/// The TLS-side stack: a bridged gateway with an `SSL` and a `SASL_SSL` listener, client
+/// certificates requested and mapped to Iggy users by common name, and the material every
+/// client needs on disk.
+struct TlsStack {
+    _server: TestServer,
+    ssl: SocketAddr,
+    sasl_ssl: SocketAddr,
+    _certs_dir: tempfile::TempDir,
+    ca_file: PathBuf,
+    /// A certificate whose common name is `TLS_USER`, an Iggy user the stack creates.
+    user_cert: Issued,
+    /// A certificate the CA signed for a name no Iggy user has.
+    stranger_cert: Issued,
+}
+
+/// The Iggy user a client certificate maps to. Created with a topic read so `DescribeAcls`
+/// renders a binding that names it.
+const TLS_USER: &str = "cert-alice";
+
+/// Brings up the TLS stack, or reports why it could not.
+async fn tls_stack() -> Option<TlsStack> {
+    let server = ready_server()?;
+    let token = root_token(&server.http_address);
+    create_user(
+        &server.http_address,
+        &token,
+        TLS_USER,
+        r#"{"global":{"manage_servers":false,"read_servers":false,"manage_users":false,
+           "read_users":false,"manage_streams":false,"read_streams":false,"manage_topics":false,
+           "read_topics":true,"poll_messages":false,"send_messages":false},"streams":null}"#,
+    );
+
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let (cert_file, key_file) = pki.server_cert("gateway").write(certs_dir.path(), "server");
+    let ca_file = pki.write_ca(certs_dir.path());
+    let user_cert = pki.client_cert(TLS_USER, "Iggy");
+    let stranger_cert = pki.client_cert("nobody", "Iggy");
+
+    let bridge = IggyBridge::connect(IggyBridgeConfig {
+        address: server.address.clone(),
+        username: ROOT_USER.to_string(),
+        password: SecretString::from(ROOT_PASSWORD.to_string()),
+        topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
+            .expect("the default mapping is valid"),
+        max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        produce_sessions: ProduceSessionLimits::default(),
+        tls: IggyTls::default(),
+    })
+    .await
+    .expect("the bridge connects to a ready server");
+    bridge
+        .ensure_stream_and_topic(TOPIC, 1)
+        .await
+        .expect("create the topic");
+    let authenticator = Arc::new(IggyAuthenticator::new(server.address.clone()));
+    let config = GatewayConfig {
+        listeners: vec![
+            ListenerConfig::new(SecurityProtocol::Ssl, "127.0.0.1:0"),
+            ListenerConfig::new(SecurityProtocol::SaslSsl, "127.0.0.1:0"),
+        ],
+        tls: Some(
+            TlsConfig::new(cert_file, key_file)
+                .with_client_auth(ClientAuth::Requested, &ca_file)
+                .with_principal_mapping("RULE:^CN=([^,]+).*$/$1/".parse().expect("valid rule")),
+        ),
+        ..GatewayConfig::default()
+    };
+    let (addrs, shutdown) = spawn_listeners(
+        move |config| {
+            KafkaGateway::new(config)
+                .with_bridge(Some(Arc::new(bridge)))
+                .with_authenticator(authenticator)
+        },
+        config,
+    );
+    // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
+    std::mem::forget(shutdown);
+    Some(TlsStack {
+        _server: server,
+        ssl: addrs[0],
+        sasl_ssl: addrs[1],
+        _certs_dir: certs_dir,
+        ca_file,
+        user_cert,
+        stranger_cert,
+    })
+}
+
+impl TlsStack {
+    /// kcat against `addr` with `extra` librdkafka properties, trusting the stack's CA.
+    fn kcat_tls(&self, addr: SocketAddr, extra: &[&str], client: Option<&Issued>) -> ClientRun {
+        let dir = tempfile::tempdir().expect("client certs dir");
+        let mut args = vec![
+            "-b".to_string(),
+            addr.to_string(),
+            "-X".to_string(),
+            "ssl.ca.location=/tmp/certs/ca.pem".to_string(),
+        ];
+        let mut mounts = vec![(self.ca_file.display().to_string(), "/tmp/certs/ca.pem")];
+        let (cert_file, key_file) = client.map_or_else(
+            || (PathBuf::new(), PathBuf::new()),
+            |issued| issued.write(dir.path(), "client"),
+        );
+        if client.is_some() {
+            args.extend([
+                "-X".to_string(),
+                "ssl.certificate.location=/tmp/certs/client.pem".to_string(),
+                "-X".to_string(),
+                "ssl.key.location=/tmp/certs/client.key".to_string(),
+            ]);
+            mounts.push((cert_file.display().to_string(), "/tmp/certs/client.pem"));
+            mounts.push((key_file.display().to_string(), "/tmp/certs/client.key"));
+        }
+        for property in extra {
+            args.extend(["-X".to_string(), (*property).to_string()]);
+        }
+        args.push("-L".to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mounts: Vec<(&str, &str)> = mounts
+            .iter()
+            .map(|(host, guest)| (host.as_str(), *guest))
+            .collect();
+        run_client(KCAT_IMAGE, &args, &mounts)
+    }
+
+    /// Writes a Java client config for TLS with `extra` properties, plus the CA and, when
+    /// given, a PEM keystore. Returns the mounts the container needs.
+    fn java_tls_config(
+        &self,
+        extra: &str,
+        client: Option<&Issued>,
+    ) -> (tempfile::TempDir, Vec<(String, &'static str)>) {
+        let dir = tempfile::tempdir().expect("create config dir");
+        let mut mounts = vec![(self.ca_file.display().to_string(), "/tmp/certs/ca.pem")];
+        let mut properties = format!(
+            "ssl.truststore.type=PEM\n\
+             ssl.truststore.location=/tmp/certs/ca.pem\n\
+             request.timeout.ms={JAVA_CLIENT_TIMEOUT_MS}\n\
+             default.api.timeout.ms={JAVA_CLIENT_TIMEOUT_MS}\n\
+             {extra}\n"
+        );
+        if let Some(issued) = client {
+            let bundle = issued.write_bundle(dir.path(), "client");
+            mounts.push((bundle.display().to_string(), "/tmp/certs/client.pem"));
+            properties.push_str(
+                "ssl.keystore.type=PEM\n\
+                 ssl.keystore.location=/tmp/certs/client.pem\n",
+            );
+        }
+        let path = dir.path().join("client.properties");
+        std::fs::write(&path, properties).expect("write client config");
+        mounts.push((path.display().to_string(), "/tmp/client.properties"));
+        (dir, mounts)
+    }
+
+    fn java(
+        &self,
+        tool: &str,
+        addr: SocketAddr,
+        extra: &str,
+        client: Option<&Issued>,
+    ) -> ClientRun {
+        let (_dir, mounts) = self.java_tls_config(extra, client);
+        let mounts: Vec<(&str, &str)> = mounts
+            .iter()
+            .map(|(host, guest)| (host.as_str(), *guest))
+            .collect();
+        let bootstrap = addr.to_string();
+        let mut args = vec![
+            tool,
+            "--bootstrap-server",
+            &bootstrap,
+            "--command-config",
+            "/tmp/client.properties",
+        ];
+        if tool.ends_with("kafka-acls.sh") {
+            args.push("--list");
+        }
+        run_client(KAFKA_IMAGE, &args, &mounts)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_an_ssl_listener_when_librdkafka_connects_with_ssl_should_serve_metadata() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let output = stack
+        .kcat_tls(stack.ssl, &["security.protocol=SSL"], None)
+        .expect_ran("kcat over SSL");
+    assert!(
+        output.contains("Metadata for all topics"),
+        "librdkafka must handshake against the gateway certificate and be served, got: {output}"
+    );
+    assert!(
+        output.contains(&format!("127.0.0.1:{}", stack.ssl.port())),
+        "the broker advertised must be the SSL listener the client used, got: {output}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_sasl_ssl_listener_when_librdkafka_authenticates_should_serve_metadata() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let sasl = |password: &str| {
+        stack.kcat_tls(
+            stack.sasl_ssl,
+            &[
+                "security.protocol=SASL_SSL",
+                "sasl.mechanisms=PLAIN",
+                &format!("sasl.username={ROOT_USER}"),
+                &format!("sasl.password={password}"),
+            ],
+            None,
+        )
+    };
+    let output = sasl(ROOT_PASSWORD).expect_ran("kcat over SASL_SSL");
+    assert!(
+        output.contains("Metadata for all topics"),
+        "librdkafka must authenticate inside TLS and be served, got: {output}"
+    );
+    assert!(
+        output.contains(&format!("127.0.0.1:{}", stack.sasl_ssl.port())),
+        "the broker advertised must be the SASL_SSL listener the client used, got: {output}"
+    );
+
+    // kcat exits non-zero here by design, so only its output is asserted.
+    let rejected = sasl("definitely-not-the-password").text();
+    assert!(
+        rejected.contains("Authentication failed"),
+        "a rejected credential must reach the client as an auth failure, got: {rejected}"
+    );
+    assert!(
+        !rejected.contains("Metadata for all topics"),
+        "nothing may be served to a rejected client"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_client_certificate_when_librdkafka_connects_should_be_admitted_as_its_user() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let output = stack
+        .kcat_tls(
+            stack.ssl,
+            &["security.protocol=SSL"],
+            Some(&stack.user_cert),
+        )
+        .expect_ran("kcat with a client certificate");
+    assert!(
+        output.contains("Metadata for all topics"),
+        "a certificate naming an Iggy user must be admitted, got: {output}"
+    );
+
+    let stranger = stack.kcat_tls(
+        stack.ssl,
+        &["security.protocol=SSL"],
+        Some(&stack.stranger_cert),
+    );
+    assert!(
+        !stranger.text.contains("Metadata for all topics"),
+        "a certificate naming no Iggy user must not be served, got: {}",
+        stranger.text
+    );
+    assert!(
+        !stranger.succeeded,
+        "kcat must fail when the gateway closes on it, got: {}",
+        stranger.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_the_java_client_with_ssl_and_sasl_ssl_should_connect_through_both_listeners() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let ssl = stack
+        .java(
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            stack.ssl,
+            "security.protocol=SSL",
+            None,
+        )
+        .expect_ran("java client over SSL");
+    assert!(
+        ssl.contains(&format!("127.0.0.1:{}", stack.ssl.port())),
+        "the Java client reads Metadata and then dials the advertised SSL listener, got: {ssl}"
+    );
+    assert!(
+        ssl.contains("SaslHandshake(17): UNSUPPORTED"),
+        "an SSL listener advertises no SASL keys, got: {ssl}"
+    );
+
+    let sasl_ssl = stack
+        .java(
+            "/opt/kafka/bin/kafka-broker-api-versions.sh",
+            stack.sasl_ssl,
+            &format!(
+                "security.protocol=SASL_SSL\n\
+                 sasl.mechanism=PLAIN\n\
+                 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule \
+                 required username=\"{ROOT_USER}\" password=\"{ROOT_PASSWORD}\";"
+            ),
+            None,
+        )
+        .expect_ran("java client over SASL_SSL");
+    assert!(
+        sasl_ssl.contains("SaslHandshake(17): 0 to 1")
+            && sasl_ssl.contains("SaslAuthenticate(36): 0 to 2"),
+        "the Java client must authenticate inside TLS and read the advertisement, got: {sasl_ssl}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_the_java_client_with_a_client_certificate_should_be_described_as_its_user() {
+    let Some(stack) = tls_stack().await else {
+        return;
+    };
+    let listing = stack
+        .java(
+            "/opt/kafka/bin/kafka-acls.sh",
+            stack.ssl,
+            "security.protocol=SSL",
+            Some(&stack.user_cert),
+        )
+        .expect_ran("java kafka-acls over mTLS");
+    assert!(
+        listing.contains(&format!("principal=User:{TLS_USER}")),
+        "the certificate's common name is the principal described, got: {listing}"
+    );
+    assert!(
+        grants(&listing, "TOPIC", "READ"),
+        "the mapped user's read_topics grant renders, got: {listing}"
+    );
 }
