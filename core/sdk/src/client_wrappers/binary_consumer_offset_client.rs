@@ -29,33 +29,9 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         position: ConsumerPosition,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .store_consumer_position(consumer, stream_id, topic_id, position)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .store_consumer_position(consumer, stream_id, topic_id, position)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .store_consumer_position(consumer, stream_id, topic_id, position)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .store_consumer_position(consumer, stream_id, topic_id, position)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .store_consumer_position(consumer, stream_id, topic_id, position)
-                    .await
-            }
-        }
+        self.as_client()
+            .store_consumer_position(consumer, stream_id, topic_id, position)
+            .await
     }
 
     async fn store_consumer_offset(
@@ -66,33 +42,9 @@ impl ConsumerOffsetClient for ClientWrapper {
         partition_id: Option<u32>,
         offset: u64,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
-                    .await
-            }
-        }
+        self.as_client()
+            .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
+            .await
     }
 
     async fn get_consumer_offset(
@@ -102,33 +54,9 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-        }
+        self.as_client()
+            .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
+            .await
     }
 
     async fn delete_consumer_offset(
@@ -138,32 +66,8 @@ impl ConsumerOffsetClient for ClientWrapper {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
-                    .await
-            }
-        }
+        self.as_client()
+            .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
+            .await
     }
 }

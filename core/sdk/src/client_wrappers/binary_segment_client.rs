@@ -29,32 +29,8 @@ impl SegmentClient for ClientWrapper {
         partition_id: u32,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-            ClientWrapper::WebSocket(client) => {
-                client
-                    .delete_segments(stream_id, topic_id, partition_id, segments_count)
-                    .await
-            }
-        }
+        self.as_client()
+            .delete_segments(stream_id, topic_id, partition_id, segments_count)
+            .await
     }
 }
