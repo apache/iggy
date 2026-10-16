@@ -65,6 +65,7 @@ components:
   ci-infrastructure:
     paths:
       - ".github/**"
+      - "scripts/ci/restore-runtime.sh"
 
   # Core library components that others depend on
   rust-sdk:
@@ -564,6 +565,9 @@ components:
   # CI/CD workflow monitoring (informational, no tasks)
   ci-workflows:
     paths:
+      - ".github/config/components.yml"
+      - "scripts/ci/restore-runtime.sh"
+      - "scripts/ci/test-runtime-artifacts.py"
       - ".github/workflows/**/*.yml"
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"
