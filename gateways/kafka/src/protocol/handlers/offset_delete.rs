@@ -30,6 +30,12 @@
 //! `COORDINATOR_LOAD_IN_PROGRESS` (14) for the whole group, which the Java admin client retries.
 //! Deleting an offset twice does no harm. v1 is not in a Kafka release, so only v0 is advertised.
 //!
+//! While the deletion runs, the group takes no join and no commit: both get 14, which clients
+//! retry. So no member subscribes to a topic between the check and the deletions, and a commit
+//! lands whole before or after them. The deletions wait for each commit that passed its check
+//! before them, and the group gets 14 when one still runs at the deadline. A member on another
+//! gateway is not seen here, so its topics count as unsubscribed (`docs/OFFSET_STORAGE.md`).
+//!
 //! With SASL on, a principal without `manage_topics` gets `GROUP_AUTHORIZATION_FAILED` (30), and
 //! nothing is deleted.
 
@@ -43,7 +49,7 @@ use kafka_protocol::messages::offset_delete_response::{
 use kafka_protocol::messages::{OffsetDeleteRequest, OffsetDeleteResponse};
 
 use crate::auth::AuthenticatedPrincipal;
-use crate::bridge::{BridgeError, IggyBridge, OffsetCalls};
+use crate::bridge::{BridgeError, IggyBridge, OffsetCalls, TopicTarget};
 use crate::error::Result;
 use crate::group::{OffsetDeletion, Subscribed, is_valid_group_id};
 use crate::protocol::api::{
@@ -117,17 +123,18 @@ async fn delete_offsets(
     if !is_valid_group_id(group) {
         return Err(ERROR_INVALID_GROUP_ID);
     }
-    let deletion = state.groups.offset_deletion(group).await;
+    // Until this drops, the group takes no join and no commit.
+    let (deletable, deletion) = state.groups.offset_deletion(group).await;
     let Some(bridge) = &state.bridge else {
         // No group holds offsets, and no topic exists.
-        return match deletion {
+        return match deletable {
             OffsetDeletion::Absent => Err(ERROR_GROUP_ID_NOT_FOUND),
             OffsetDeletion::Refused => Err(ERROR_NON_EMPTY_GROUP),
             OffsetDeletion::Allowed(_) => Ok(same_code(request, ERROR_UNKNOWN_TOPIC_OR_PARTITION)),
         };
     };
     let calls = OffsetCalls::new(offset_deadline(state, connection).await);
-    let subscribed = match deletion {
+    let subscribed = match deletable {
         OffsetDeletion::Refused => return Err(ERROR_NON_EMPTY_GROUP),
         OffsetDeletion::Allowed(subscribed) => subscribed,
         // No members here, so the group exists only while it holds offsets.
@@ -137,17 +144,20 @@ async fn delete_offsets(
             Some(_) => return Err(ERROR_GROUP_ID_NOT_FOUND),
         },
     };
-    let partitions = partition_counts(bridge, request, &calls).await?;
-    delete_unsubscribed(bridge, request, &partitions, &subscribed, &calls).await
+    let topics = requested_topics(bridge, request, &calls).await?;
+    if !deletion.commits_ended(calls.deadline()).await {
+        return Err(ERROR_COORDINATOR_LOAD_IN_PROGRESS);
+    }
+    delete_unsubscribed(bridge, request, &topics, &subscribed, &calls).await
 }
 
-/// The partition count of each requested topic, or the code for each of its partitions. A lookup
-/// that a retry can fix fails the group.
-async fn partition_counts<'a>(
+/// The Iggy topic and the partition count of each requested topic, or the code for each of its
+/// partitions. A lookup that a retry can fix fails the group.
+async fn requested_topics<'a>(
     bridge: &IggyBridge,
     request: &'a OffsetDeleteRequest,
     calls: &OffsetCalls,
-) -> core::result::Result<HashMap<&'a str, core::result::Result<u32, i16>>, i16> {
+) -> core::result::Result<HashMap<&'a str, core::result::Result<(TopicTarget, u32), i16>>, i16> {
     let mut names: Vec<&str> = request
         .topics
         .iter()
@@ -163,8 +173,8 @@ async fn partition_counts<'a>(
     .await;
     let mut found = HashMap::with_capacity(names.len());
     for (name, count) in names.into_iter().zip(counts) {
-        let count = match count {
-            Ok(Some(count)) => Ok(count),
+        let topic = match count {
+            Ok(Some(topic)) => Ok(topic),
             // Kafka answers a topic that it does not know with 3, whatever its name.
             Ok(None) | Err(BridgeError::InvalidKafkaTopicName { .. }) => {
                 Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION)
@@ -176,7 +186,7 @@ async fn partition_counts<'a>(
                 code => Err(code),
             },
         };
-        found.insert(name, count);
+        found.insert(name, topic);
     }
     Ok(found)
 }
@@ -186,31 +196,26 @@ async fn partition_counts<'a>(
 async fn delete_unsubscribed(
     bridge: &IggyBridge,
     request: &OffsetDeleteRequest,
-    partitions: &HashMap<&str, core::result::Result<u32, i16>>,
+    requested: &HashMap<&str, core::result::Result<(TopicTarget, u32), i16>>,
     subscribed: &Subscribed,
     calls: &OffsetCalls,
 ) -> core::result::Result<Vec<OffsetDeleteResponseTopic>, i16> {
     let group = request.group_id.0.as_str();
-    let targets: Vec<_> = request
-        .topics
-        .iter()
-        .map(|topic| bridge.topic_target(topic.name.0.as_str()))
-        .collect();
     let mut topics = same_code(request, ERROR_NONE);
     let mut deletions = Vec::new();
     // Where each deletion's code goes: (topic, partition) in `topics`.
     let mut positions = Vec::new();
-    for (topic_at, (topic, target)) in request.topics.iter().zip(&targets).enumerate() {
+    for (topic_at, topic) in request.topics.iter().enumerate() {
         let name = topic.name.0.as_str();
-        let count = partitions
-            .get(name)
-            .copied()
-            .unwrap_or(Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION));
+        let found = match requested.get(name) {
+            Some(Ok(found)) => Ok(found),
+            Some(Err(code)) => Err(*code),
+            None => Err(ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+        };
         for (partition_at, partition) in topic.partitions.iter().enumerate() {
-            let index = u32::try_from(partition.partition_index).ok();
-            let code = match (count, index, target) {
-                (Err(code), _, _) => code,
-                (Ok(count), Some(index), Ok(target)) if index < count => {
+            let code = match (found, u32::try_from(partition.partition_index)) {
+                (Err(code), _) => code,
+                (Ok((target, count)), Ok(index)) if index < *count => {
                     if subscribed.contains(name) {
                         ERROR_GROUP_SUBSCRIBED_TO_TOPIC
                     } else {
@@ -219,8 +224,7 @@ async fn delete_unsubscribed(
                         continue;
                     }
                 }
-                (Ok(_), _, Err(error)) => error.to_offset_error_code(),
-                (Ok(_), _, Ok(_)) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+                (Ok(_), _) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             };
             topics[topic_at].partitions[partition_at].error_code = code;
         }

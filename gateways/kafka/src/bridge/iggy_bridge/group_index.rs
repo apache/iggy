@@ -18,7 +18,7 @@
 //! The Kafka groups that hold offsets in Iggy, for the group admin APIs. Finding them costs one
 //! Iggy call per topic, so one scan answers every request for a while.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,10 +70,10 @@ struct Published {
     ended: u64,
     /// The groups of the last scan that found them.
     groups: Option<Arc<OffsetGroups>>,
-    /// The groups this gateway stored offsets for (`true`) or deleted (`false`) while a scan
-    /// runs, in order. `None` while none runs. The scan can list a topic before such a change,
-    /// so the changes go on top of what it finds.
-    changes: Option<Vec<(String, bool)>>,
+    /// The last change of each group while a scan runs: this gateway stored offsets for it
+    /// (`true`) or deleted them (`false`). `None` while none runs. The scan can list a topic
+    /// before such a change, so the changes go on top of what it finds.
+    changes: Option<HashMap<String, bool>>,
 }
 
 impl GroupIndex {
@@ -127,7 +127,11 @@ impl GroupIndex {
     fn change(&self, group: &str, holds: bool) {
         self.published.send_if_modified(|current| {
             if let Some(changes) = current.changes.as_mut() {
-                changes.push((group.to_owned(), holds));
+                if let Some(held) = changes.get_mut(group) {
+                    *held = holds;
+                } else {
+                    changes.insert(group.to_owned(), holds);
+                }
             }
             let Some(groups) = current.groups.as_mut() else {
                 return false;
@@ -152,7 +156,7 @@ impl GroupIndex {
         };
         let published = Arc::clone(&self.published);
         published.send_if_modified(|current| {
-            current.changes = Some(Vec::new());
+            current.changes = Some(HashMap::new());
             false
         });
         let started = Instant::now();
@@ -362,13 +366,15 @@ mod tests {
         let (release, released) = oneshot::channel::<()>();
         let stale = move || async move {
             let _ = released.await;
-            Ok(found(&["deleted", "kept"]))
+            Ok(found(&["deleted", "kept", "flipped"]))
         };
 
         let (groups, ()) = tokio::join!(index.groups(later(), stale), async {
             tokio::task::yield_now().await;
             index.forget("deleted");
             index.note("stored");
+            index.note("flipped");
+            index.forget("flipped");
             release.send(()).expect("the scan waits for its release");
         });
 

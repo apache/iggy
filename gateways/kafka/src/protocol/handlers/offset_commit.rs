@@ -71,17 +71,19 @@ pub async fn handle(
         }
     };
 
-    let error = state
+    let validated = state
         .groups
         .validate_commit(&CommitRequest::from(&request))
         .await;
-    let topics = match (&state.bridge, error) {
-        (Some(bridge), ERROR_NONE) => {
+    let topics = match (&state.bridge, validated) {
+        // The commit stays counted until its Iggy calls end, so a deletion of the group's offsets
+        // waits for it.
+        (Some(bridge), Ok(_commit)) => {
             let calls = OffsetCalls::new(offset_deadline(state, connection).await);
             commit_all(bridge, &request, &calls).await
         }
-        (None, ERROR_NONE) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
-        (_, error) => same_code(&request, error),
+        (None, Ok(_)) => same_code(&request, ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+        (_, Err(error)) => same_code(&request, error),
     };
     respond_or_close(encode_response(api_version, topics), "OffsetCommit")
 }

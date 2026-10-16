@@ -114,6 +114,9 @@ Offsets are shared, since the key depends only on the Kafka group id. Membership
 - A commit that a gateway gave up on can still land after a newer commit made through another
   gateway. It then puts back the older offset, or deletes the key. Iggy cannot refuse the older
   write yet.
+- `DeleteGroups` and `OffsetDelete` see only the members on their own gateway. Through a gateway
+  with no members in a group, they delete offsets of a group that is live on another gateway. That
+  includes offsets of the topics that its members subscribe to.
 
 ## Server side
 

@@ -26,8 +26,10 @@
 //! Membership is process memory, not Iggy state. Two gateway instances fronting one Iggy cluster
 //! therefore coordinate two independent groups under one name; see `docs/CONSUMER_GROUPS.md`.
 
+mod offset_work;
 mod state;
 
+pub use offset_work::{RunningCommit, RunningDeletion};
 pub use state::{MAX_GROUP_ID_BYTES, is_valid_group_id};
 
 use std::collections::{HashMap, HashSet};
@@ -42,8 +44,11 @@ use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::group::offset_work::OffsetWork;
 use crate::group::state::{GroupState, Step};
-use crate::protocol::api::{ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID};
+use crate::protocol::api::{
+    ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_NONE, ERROR_NOT_COORDINATOR, ERROR_UNKNOWN_MEMBER_ID,
+};
 
 /// `DescribeGroups` / `ListGroups` state string for a group with no joined members.
 pub const GROUP_STATE_EMPTY: &str = "Empty";
@@ -521,6 +526,9 @@ impl From<&HeartbeatRequest> for GroupMember {
 pub struct GroupCoordinator {
     config: GroupCoordinatorConfig,
     groups: Mutex<HashMap<StrBytes, GroupState>>,
+    /// The commits and the offset deletions that run for each group. Changed under `groups`, so
+    /// a check of a group and its deletion's start are one step.
+    offset_work: OffsetWork,
     /// Resolves parked waiters on shutdown drain instead of holding it open for a full rebalance
     /// timeout.
     shutdown: CancellationToken,
@@ -532,11 +540,16 @@ impl GroupCoordinator {
         Self {
             config,
             groups: Mutex::new(HashMap::new()),
+            offset_work: OffsetWork::new(),
             shutdown,
         }
     }
 
     /// Joins `request`'s member, parking until the group's join barrier completes.
+    ///
+    /// While a deletion of the group's offsets runs, answers `COORDINATOR_LOAD_IN_PROGRESS`,
+    /// which clients retry. A member that joined then could subscribe to a topic whose offsets
+    /// the deletion removes, and commit offsets that it wipes.
     pub async fn join(&self, request: &JoinRequest) -> JoinResult {
         let mut parked: Option<StrBytes> = None;
         loop {
@@ -544,6 +557,12 @@ impl GroupCoordinator {
                 let mut groups = self.groups.lock().await;
                 let now = Instant::now();
                 let step = match parked.as_ref() {
+                    None if self.offset_work.deleting(&request.group_id) => {
+                        Step::Respond(JoinResult::error(
+                            ERROR_COORDINATOR_LOAD_IN_PROGRESS,
+                            request.member_id.clone(),
+                        ))
+                    }
                     None => state::join_step(&mut groups, &self.config, request, now),
                     Some(member_id) => {
                         state::join_resume_step(&mut groups, &request.group_id, member_id, now)
@@ -648,28 +667,58 @@ impl GroupCoordinator {
         )
     }
 
-    /// Whether `request` may commit offsets for its group. A member's commit also refreshes its
-    /// session. Never parks.
-    pub async fn validate_commit(&self, request: &CommitRequest) -> i16 {
+    /// The commit of `request`, counted until it drops, when `request` may commit offsets for its
+    /// group. A member's commit also refreshes its session. Never parks.
+    ///
+    /// # Errors
+    ///
+    /// The Kafka code that refuses the commit. `COORDINATOR_LOAD_IN_PROGRESS` while a deletion of
+    /// the group's offsets runs, which clients retry.
+    pub async fn validate_commit(&self, request: &CommitRequest) -> Result<RunningCommit<'_>, i16> {
         let mut groups = self.groups.lock().await;
-        state::commit_step(&mut groups, request, Instant::now())
+        match state::commit_step(&mut groups, request, Instant::now()) {
+            ERROR_NONE => self
+                .offset_work
+                .begin_commit(&request.group_id)
+                .ok_or(ERROR_COORDINATOR_LOAD_IN_PROGRESS),
+            error => Err(error),
+        }
     }
 
     /// Removes each group of `group_ids` that has no joined members, as `DeleteGroups` does. One
-    /// answer per id, in order. Never parks.
-    pub async fn remove_empty(&self, group_ids: &[StrBytes]) -> Vec<GroupRemoval> {
+    /// answer per id, in order. The deletion of the offsets of each group that is not
+    /// [`GroupRemoval::Live`] runs until the returned value drops. Never parks.
+    pub async fn remove_empty(
+        &self,
+        group_ids: &[StrBytes],
+    ) -> (Vec<GroupRemoval>, RunningDeletion<'_>) {
         let mut groups = self.groups.lock().await;
         let now = Instant::now();
-        group_ids
+        let removals: Vec<GroupRemoval> = group_ids
             .iter()
             .map(|group_id| state::remove_empty(&mut groups, group_id, now))
-            .collect()
+            .collect();
+        let deleted = group_ids
+            .iter()
+            .zip(&removals)
+            .filter(|(_, removal)| **removal != GroupRemoval::Live)
+            .map(|(group_id, _)| group_id);
+        let deletion = self.offset_work.begin_deletion(deleted);
+        drop(groups);
+        (removals, deletion)
     }
 
-    /// What `OffsetDelete` may do with the offsets of `group_id`. Never parks.
-    pub async fn offset_deletion(&self, group_id: &StrBytes) -> OffsetDeletion {
+    /// What `OffsetDelete` may do with the offsets of `group_id`. The deletion runs until the
+    /// returned value drops. Never parks.
+    pub async fn offset_deletion(
+        &self,
+        group_id: &StrBytes,
+    ) -> (OffsetDeletion, RunningDeletion<'_>) {
         let mut groups = self.groups.lock().await;
-        state::offset_deletion(&mut groups, group_id, Instant::now())
+        let allowed = state::offset_deletion(&mut groups, group_id, Instant::now());
+        let deletion = self.offset_work.begin_deletion([group_id]);
+        drop(groups);
+        (allowed, deletion)
     }
 
     /// How long an `OffsetCommit` or `OffsetFetch` may hold its connection. A heartbeat there
@@ -840,6 +889,130 @@ mod tests {
             })
             .collect();
         assert_eq!(identities, vec![("m-1", None), ("", Some("i-2"))]);
+    }
+
+    /// No initial rebalance delay, so a first join completes at once.
+    fn coordinator() -> GroupCoordinator {
+        let config = GroupCoordinatorConfig {
+            initial_rebalance_delay: Duration::ZERO,
+            ..GroupCoordinatorConfig::default()
+        };
+        GroupCoordinator::new(config, CancellationToken::new())
+    }
+
+    fn id(group: &str) -> StrBytes {
+        StrBytes::from_string(group.to_owned())
+    }
+
+    fn join_request(group: &str) -> JoinRequest {
+        JoinRequest {
+            group_id: id(group),
+            session_timeout: Duration::from_secs(10),
+            rebalance_timeout: Duration::from_secs(10),
+            member_id: StrBytes::new(),
+            group_instance_id: None,
+            protocol_type: StrBytes::from_static_str(CONSUMER_PROTOCOL_TYPE),
+            protocols: vec![(StrBytes::from_static_str("range"), Bytes::new())],
+            require_known_member_id: false,
+        }
+    }
+
+    /// A commit made outside the group protocol, as admin tools send.
+    fn standalone_commit(group: &str) -> CommitRequest {
+        CommitRequest {
+            group_id: id(group),
+            generation_id: -1,
+            member_id: StrBytes::new(),
+            group_instance_id: None,
+        }
+    }
+
+    /// Kafka's coordinator refuses a join or a commit of a group that `DeleteGroups` marked
+    /// `Dead`. A member that joined during the deletion would see its commits wiped.
+    #[tokio::test]
+    async fn given_a_deletion_that_runs_should_refuse_joins_and_commits_of_its_groups() {
+        let coordinator = coordinator();
+        let (removals, deletion) = coordinator.remove_empty(&[id("orders")]).await;
+        assert_eq!(removals, [GroupRemoval::Absent]);
+
+        assert_eq!(
+            coordinator.join(&join_request("orders")).await.error,
+            ERROR_COORDINATOR_LOAD_IN_PROGRESS
+        );
+        assert_eq!(
+            coordinator
+                .validate_commit(&standalone_commit("orders"))
+                .await
+                .err(),
+            Some(ERROR_COORDINATOR_LOAD_IN_PROGRESS)
+        );
+        assert!(
+            coordinator
+                .validate_commit(&standalone_commit("payments"))
+                .await
+                .is_ok(),
+            "another group commits"
+        );
+
+        drop(deletion);
+        assert!(
+            coordinator
+                .validate_commit(&standalone_commit("orders"))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            coordinator.join(&join_request("orders")).await.error,
+            ERROR_NONE
+        );
+    }
+
+    /// A group with members is not deleted, so its members go on committing.
+    #[tokio::test]
+    async fn given_a_live_group_when_deleting_should_not_refuse_its_commits() {
+        let coordinator = coordinator();
+        let joined = coordinator.join(&join_request("orders")).await;
+        assert_eq!(joined.error, ERROR_NONE);
+        let synced = coordinator
+            .sync(SyncRequest {
+                group_id: id("orders"),
+                generation_id: joined.generation_id,
+                member_id: joined.member_id.clone(),
+                protocol_type: None,
+                protocol_name: None,
+                assignments: vec![(joined.member_id.clone(), Bytes::new())],
+            })
+            .await;
+        assert_eq!(synced.error, ERROR_NONE, "the group is stable");
+
+        let (removals, _deletion) = coordinator.remove_empty(&[id("orders")]).await;
+        assert_eq!(removals, [GroupRemoval::Live]);
+
+        let commit = CommitRequest {
+            generation_id: joined.generation_id,
+            member_id: joined.member_id,
+            ..standalone_commit("orders")
+        };
+        assert!(coordinator.validate_commit(&commit).await.is_ok());
+    }
+
+    /// A member that joined during `OffsetDelete` could subscribe to a topic whose offsets go.
+    #[tokio::test]
+    async fn given_an_offset_deletion_that_runs_should_refuse_joins_of_the_group() {
+        let coordinator = coordinator();
+        let (deletable, deletion) = coordinator.offset_deletion(&id("orders")).await;
+        assert_eq!(deletable, OffsetDeletion::Absent);
+
+        assert_eq!(
+            coordinator.join(&join_request("orders")).await.error,
+            ERROR_COORDINATOR_LOAD_IN_PROGRESS
+        );
+
+        drop(deletion);
+        assert_eq!(
+            coordinator.join(&join_request("orders")).await.error,
+            ERROR_NONE
+        );
     }
 
     #[test]

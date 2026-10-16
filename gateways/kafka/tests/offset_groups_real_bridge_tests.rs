@@ -27,20 +27,25 @@ mod iggy_server;
 #[path = "common/wire.rs"]
 mod wire;
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iggy::prelude::{ConsumerGroupClient, Identifier};
+use iggy::prelude::{
+    ConsumerGroupClient, Identifier, Permissions, StreamClient, StreamPermissions, UserClient,
+    UserStatus,
+};
+use secrecy::SecretString;
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
-use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, TopicMapping, TopicOverride};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_DELETE_GROUPS, API_KEY_DESCRIBE_GROUPS, API_KEY_JOIN_GROUP, API_KEY_LEAVE_GROUP,
     API_KEY_LIST_GROUPS, API_KEY_OFFSET_COMMIT, API_KEY_OFFSET_DELETE, API_KEY_OFFSET_FETCH,
-    BrokerAdvertise, ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_GROUP_ID_NOT_FOUND,
-    ERROR_GROUP_SUBSCRIBED_TO_TOPIC, ERROR_NON_EMPTY_GROUP, ERROR_NONE,
+    BrokerAdvertise, ERROR_COORDINATOR_LOAD_IN_PROGRESS, ERROR_GROUP_AUTHORIZATION_FAILED,
+    ERROR_GROUP_ID_NOT_FOUND, ERROR_GROUP_SUBSCRIBED_TO_TOPIC, ERROR_NON_EMPTY_GROUP, ERROR_NONE,
     ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
 };
 
@@ -82,7 +87,11 @@ struct Described {
 }
 
 async fn connected_state(server: &TestServer) -> GatewayState {
-    let bridge = IggyBridge::connect(server.test_config())
+    state_with(server.test_config()).await
+}
+
+async fn state_with(config: IggyBridgeConfig) -> GatewayState {
+    let bridge = IggyBridge::connect(config)
         .await
         .expect("bridge should connect to a ready server");
     // A new group's first join completes at once, so a test can hold a live member.
@@ -709,4 +718,94 @@ async fn given_members_kafka_cannot_read_delete_offsets_should_keep_every_offset
         delete_offsets(&state, "connect-cluster", &[("orders", &[0])]).await,
         (ERROR_NON_EMPTY_GROUP, vec![])
     );
+}
+
+/// The bridge user may not read an override topic, so `Metadata` leaves it out. A group can hold
+/// offsets there from before the bridge user lost access. The gateway cannot delete them, so it
+/// deletes nothing and does not answer success.
+#[tokio::test]
+#[serial]
+async fn given_an_override_topic_the_bridge_user_may_not_read_delete_should_refuse_and_keep_every_offset()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    seed_topic(&server, "orders").await;
+    let mapping = || {
+        let audit = TopicOverride {
+            stream: "hidden".to_string(),
+            topic: "audit".to_string(),
+        };
+        TopicMapping::new(
+            "kafka".to_string(),
+            HashMap::from([("audit".to_string(), audit)]),
+        )
+        .expect("a valid mapping")
+    };
+    let root = IggyBridgeConfig {
+        topic_mapping: mapping(),
+        ..server.test_config()
+    };
+    IggyBridge::connect(root)
+        .await
+        .expect("root bridge should connect")
+        .ensure_stream_and_topic("audit", 1)
+        .await
+        .expect("create hidden/audit");
+    let raw = iggy_server::raw_client(&server).await;
+    let iggy_id = |name: &str| Identifier::named(name).expect("valid Iggy name");
+    raw.create_consumer_group(&iggy_id("hidden"), &iggy_id("audit"), "kafka.cg.orders-app")
+        .await
+        .expect("an Iggy group with offsets on hidden/audit");
+    let kafka_stream = raw
+        .get_stream(&iggy_id("kafka"))
+        .await
+        .expect("get the stream")
+        .expect("the stream exists")
+        .id;
+    let read_kafka = StreamPermissions {
+        read_stream: true,
+        ..StreamPermissions::default()
+    };
+    raw.create_user(
+        "kafka-bridge",
+        "kafka-bridge-secret",
+        UserStatus::Active,
+        Some(Permissions {
+            streams: Some(BTreeMap::from([(
+                usize::try_from(kafka_stream).expect("a small stream id"),
+                read_kafka,
+            )])),
+            ..Permissions::default()
+        }),
+    )
+    .await
+    .expect("create a bridge user that may read only the stream kafka");
+    let state = state_with(IggyBridgeConfig {
+        username: "kafka-bridge".to_string(),
+        password: SecretString::from("kafka-bridge-secret"),
+        topic_mapping: mapping(),
+        ..server.test_config()
+    })
+    .await;
+    commit(&state, GROUP, "orders", 4).await;
+
+    assert_eq!(
+        delete_groups(&state, &[GROUP]).await,
+        vec![(GROUP.to_string(), ERROR_GROUP_AUTHORIZATION_FAILED)]
+    );
+
+    assert_eq!(
+        committed(&state, GROUP, "orders").await,
+        4,
+        "nothing is deleted"
+    );
+    let hidden = raw
+        .get_consumer_group(
+            &iggy_id("hidden"),
+            &iggy_id("audit"),
+            &iggy_id("kafka.cg.orders-app"),
+        )
+        .await
+        .expect("get the Iggy group");
+    assert!(hidden.is_some(), "the offsets on hidden/audit stay");
 }
