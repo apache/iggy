@@ -42,17 +42,23 @@ namespace Apache.Iggy.Tests.VsrTests;
 /// </summary>
 public sealed class EndpointFailoverTests
 {
+    // An unmasked TRANSIENT_NOT_ACCEPTED replays the same id for the 2s failover check anyway, so only more
+    // refusals than fit in it (50 x 50ms) tell masking apart. The other codes are not replayed unmasked.
     [Theory]
-    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED)]
-    [InlineData(VsrError.UNAUTHORIZED)]
-    [InlineData(VsrError.UNAUTHENTICATED)]
-    [InlineData(VsrError.STALE_CLIENT)]
-    [InlineData(VsrError.NOT_PRIMARY)]
-    [InlineData(VsrError.LIFECYCLE_BUSY)]
-    [InlineData(VsrError.FEATURE_UNAVAILABLE)]
-    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite(int refusal)
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, false, 50)]
+    [InlineData(VsrError.UNAUTHORIZED, false, 3)]
+    [InlineData(VsrError.UNAUTHENTICATED, false, 3)]
+    [InlineData(VsrError.STALE_CLIENT, false, 3)]
+    [InlineData(VsrError.NOT_PRIMARY, false, 3)]
+    [InlineData(VsrError.LIFECYCLE_BUSY, false, 3)]
+    [InlineData(VsrError.FEATURE_UNAVAILABLE, false, 3)]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, true, 50)]
+    [InlineData(VsrError.NOT_PRIMARY, true, 3)]
+    [InlineData(VsrError.UNAUTHENTICATED, true, 3)]
+    [InlineData(VsrError.HISTORY_UNAVAILABLE, true, 3)]
+    public async Task LaterRefusalsKeepTheIdentityOfAnUncertainMetadataWrite(int refusal, bool resultSection,
+        int refusalCount)
     {
-        const int RefusalCount = 50;
         using var node = new MockNode();
         var attempts = new ConcurrentQueue<MockRequest>();
         node.Serve(request =>
@@ -63,27 +69,23 @@ public sealed class EndpointFailoverTests
                 var status = attempts.Count switch
                 {
                     1 => VsrError.TRANSIENT_NOT_COMMITTED,
-                    <= RefusalCount => refusal,
+                    _ when attempts.Count <= refusalCount => refusal,
                     _ => 0
                 };
-                return Reply(request.Operation, status == 0 ? new byte[4] : [], (uint)status);
+                return status == 0 ? Reply(request.Operation, new byte[4])
+                    : resultSection ? Reply(request.Operation, VsrTestPayloads.Rejection(status))
+                    : Reply(request.Operation, [], (uint)status);
             }
             return request.Code == GET_CLUSTER_METADATA_CODE
                 ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
                 : Answer(request);
         });
-        using var client = new TcpMessageStream(new IggyClientConfigurator
-        {
-            BaseAddress = $"127.0.0.1:{node.Port}",
-            Protocol = Protocol.Tcp,
-            HeartbeatInterval = TimeSpan.FromHours(1)
-        }, NullLoggerFactory.Instance);
-        await client.ConnectAsync(TestContext.Current.CancellationToken);
-        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        using var client = await SignedInClientAsync(node);
+
         await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
             TestContext.Current.CancellationToken);
 
-        Assert.Equal(RefusalCount + 1, attempts.Count);
+        Assert.Equal(refusalCount + 1, attempts.Count);
         var original = attempts.First();
         Assert.All(attempts, replay =>
         {
@@ -92,6 +94,124 @@ public sealed class EndpointFailoverTests
             Assert.Equal(original.RequestId, replay.RequestId);
             Assert.Equal(original.Body, replay.Body);
         });
+    }
+
+    [Theory]
+    [InlineData(VsrError.REQUEST_TOO_OLD)]
+    [InlineData(VsrError.INVALID_COMMAND)]
+    public async Task FinalRejectionOfAReplayReportsAnUncertainMetadataWriteAsUnknownAtOnce(int rejection)
+    {
+        using var node = new MockNode();
+        var attempts = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePartitions)
+            {
+                attempts.Enqueue(request);
+                return Reply(request.Operation, VsrTestPayloads.Rejection(attempts.Count == 1
+                    ? VsrError.TRANSIENT_NOT_COMMITTED
+                    : rejection));
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = await SignedInClientAsync(node);
+
+        await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+                TestContext.Current.CancellationToken));
+
+        var sent = attempts.ToArray();
+        Assert.Equal(2, sent.Length);
+        Assert.Equal(sent[0].RequestId, sent[1].RequestId);
+    }
+
+    [Fact]
+    public async Task CommittedRejectionOfAReplaySettlesAnUncertainMetadataWrite()
+    {
+        const int rejectionCode = VsrError.TOPIC_ID_NOT_FOUND;
+        using var node = new MockNode();
+        var attempts = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePartitions)
+            {
+                return Interlocked.Increment(ref attempts) == 1
+                    ? Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.TRANSIENT_NOT_COMMITTED))
+                    : Reply(request.Operation, VsrTestPayloads.Rejection(rejectionCode));
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = await SignedInClientAsync(node);
+
+        var rejection = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+                TestContext.Current.CancellationToken));
+
+        Assert.Equal(rejectionCode, rejection.StatusCode);
+        Assert.Equal(2, Volatile.Read(ref attempts));
+    }
+
+    [Fact]
+    public async Task RefusedTokenReplaySettlesAnUncertainTokenCreation()
+    {
+        using var node = new MockNode();
+        var attempts = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePersonalAccessToken)
+            {
+                return Interlocked.Increment(ref attempts) == 1
+                    ? Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.TRANSIENT_NOT_COMMITTED))
+                    : Reply(request.Operation,
+                        VsrTestPayloads.Rejection(VsrError.PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS));
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = await SignedInClientAsync(node);
+
+        var rejection = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            client.CreatePersonalAccessTokenAsync("token", token: TestContext.Current.CancellationToken));
+
+        Assert.Equal(VsrError.PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS, rejection.StatusCode);
+        Assert.Equal(2, Volatile.Read(ref attempts));
+    }
+
+    [Fact]
+    public async Task CommittedLifecycleBusyOfAReplayResendsAnUncertainMetadataWriteUnderANewId()
+    {
+        using var node = new MockNode();
+        var attempts = new ConcurrentQueue<MockRequest>();
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.CreatePartitions)
+            {
+                attempts.Enqueue(request);
+                return attempts.Count switch
+                {
+                    1 => Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.TRANSIENT_NOT_COMMITTED)),
+                    2 => Reply(request.Operation, VsrTestPayloads.Rejection(VsrError.LIFECYCLE_BUSY)),
+                    _ => Reply(request.Operation, new byte[4])
+                };
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
+                : Answer(request);
+        });
+        using var client = await SignedInClientAsync(node);
+
+        await client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+            TestContext.Current.CancellationToken);
+
+        var sent = attempts.ToArray();
+        Assert.Equal(3, sent.Length);
+        Assert.Equal(sent[0].RequestId, sent[1].RequestId);
+        Assert.NotEqual(sent[0].RequestId, sent[2].RequestId);
     }
 
     [Theory]
@@ -351,6 +471,67 @@ public sealed class EndpointFailoverTests
         Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
         Assert.True(partitionPrimary.Connections >= 1,
             "the arbitrary metadata redirect cap stopped the bounded roster walk");
+    }
+
+    [Fact]
+    public async Task ReturnsToANodeThatRefusedEarlierOnceTheWalkFindsNoOtherPrimary()
+    {
+        const uint commandCode = 60_042;
+        using var leader = new MockNode();
+        using var follower = new MockNode();
+        var roster = new[] { leader.Port, follower.Port };
+        var followerRefusals = 0;
+        var leaderAnswers = 0;
+
+        // The leader refuses until the walk has been to the follower, as a primary does until it has
+        // materialised the partition.
+        leader.Serve(request =>
+        {
+            if (request.Code == GET_CLUSTER_METADATA_CODE)
+            {
+                return Reply(OPERATION_NON_REPLICATED, RosterMetadata(leader.Port, roster));
+            }
+
+            if (request.Code != (int)commandCode)
+            {
+                return Answer(request);
+            }
+
+            if (Volatile.Read(ref followerRefusals) == 0)
+            {
+                return Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED);
+            }
+
+            Interlocked.Increment(ref leaderAnswers);
+            return Answer(request);
+        });
+        follower.Serve(request =>
+        {
+            if (request.Code != (int)commandCode)
+            {
+                return Answer(request);
+            }
+
+            Interlocked.Increment(ref followerRefusals);
+            return Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED);
+        });
+
+        using var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{leader.Port}",
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.FromMilliseconds(20)
+            }
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+
+        Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
+        Assert.Equal(1, Volatile.Read(ref leaderAnswers));
     }
 
     /// <summary>
@@ -669,6 +850,19 @@ public sealed class EndpointFailoverTests
         frame[COMMAND_OFFSET] = COMMAND_EVICTION;
         frame[EVICTION_REASON_OFFSET] = reason;
         return frame;
+    }
+
+    private static async Task<TcpMessageStream> SignedInClientAsync(MockNode node)
+    {
+        var client = new TcpMessageStream(new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromHours(1)
+        }, NullLoggerFactory.Instance);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        return client;
     }
 
     [Fact]

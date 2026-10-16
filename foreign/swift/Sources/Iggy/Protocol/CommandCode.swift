@@ -135,6 +135,19 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         }
     }
 
+    /// Codes that drive the session handshake and therefore cannot be sent
+    /// through the raw request path. `BindSession` would rebind the
+    /// connection outside the client's bookkeeping of its session.
+    static func isSessionControl(_ code: UInt32) -> Bool {
+        switch CommandCode(rawValue: code) {
+        case .loginUser, .logoutUser, .loginRegister, .loginWithPersonalAccessToken,
+            .loginRegisterWithPersonalAccessToken, .bindSession:
+            true
+        default:
+            false
+        }
+    }
+
     /// Codes that carry the sign-in handshake.
     static func isRegister(_ code: UInt32) -> Bool {
         code == CommandCode.loginRegister.rawValue

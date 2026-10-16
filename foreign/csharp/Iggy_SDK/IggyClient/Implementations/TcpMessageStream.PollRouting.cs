@@ -176,6 +176,7 @@ public sealed partial class TcpMessageStream
         var refreshHistory = code == CommandCodes.SEND_MESSAGES_CODE && context is null;
         var refusedPrimary = false;
         var lifecycleInterval = LifecycleRetryIntervalMs;
+        IggyInvalidStatusCodeException? refusal = null;
         try
         {
             while (true)
@@ -190,6 +191,7 @@ public sealed partial class TcpMessageStream
                     }
                     generation ??= route.Generation;
                     frame ??= _consensusSession.Resolve(VsrOperations.ForCode(code));
+                    refusal = null;
                     if (Volatile.Read(ref _clusterNodeCount) <= 1)
                     {
                         var attempt = await SendVsrAttemptAsync(code, payload, Environment.TickCount64, deadline,
@@ -213,6 +215,7 @@ public sealed partial class TcpMessageStream
                     VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY)
                 {
                     RemovePartitionRoute(target.Key);
+                    refusal = error;
                     if ((generation is not null && generation != _consensusSession.Generation)
                         || Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
                     {
@@ -234,12 +237,16 @@ public sealed partial class TcpMessageStream
                     refreshHistory = false;
                     captured = null;
                     frame = null;
+                    refusal = error;
                 }
+                // The partition plane does not commit LIFECYCLE_BUSY today. A routed request still handles it, so a
+                // server that starts committing it needs no client change.
                 catch (IggyInvalidStatusCodeException error) when (error.FromServer
                     && error.StatusCode == VsrError.LIFECYCLE_BUSY
                     && error.CommandCode == code
                     && Environment.TickCount64 + lifecycleInterval < deadline)
                 {
+                    refusal = error;
                     await Task.Delay(lifecycleInterval, cancellation.Token);
                     lifecycleInterval = Math.Min(lifecycleInterval * 2, LifecycleRetryMaxIntervalMs);
                     frame = null;
@@ -249,7 +256,26 @@ public sealed partial class TcpMessageStream
         catch (OperationCanceledException error) when (!token.IsCancellationRequested)
         {
             RemovePartitionRoute(target.Key);
+            // The budget can expire in the backoff or in a read-only control request that follows it, before the
+            // send call for the request starts again, so the last refusal still decides the outcome. An expiry
+            // inside that send call reports an unknown outcome even before the write, which is conservative.
+            if (refusal is not null)
+            {
+                ExceptionDispatchInfo.Throw(refusal);
+            }
+
             throw new VsrRequestOutcomeUnknownException(error);
+        }
+        // The read timer of a route lookup fires at the same deadline as the budget and turns into a timeout
+        // IOException when it wins, and a redial can fail the same way. A kept refusal means no send started
+        // since, so it still decides the outcome.
+        catch (Exception error) when (error is IOException or SocketException
+            && refusal is not null
+            && Environment.TickCount64 + PollRoutingRetryIntervalMs >= deadline)
+        {
+            RemovePartitionRoute(target.Key);
+            ExceptionDispatchInfo.Throw(refusal);
+            throw;
         }
     }
 

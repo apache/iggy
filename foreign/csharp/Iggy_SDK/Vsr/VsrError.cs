@@ -36,6 +36,7 @@ internal static class VsrError
     internal const int INVALID_CREDENTIALS = 42;
     internal const int INVALID_USERNAME = 43;
     internal const int INVALID_PASSWORD = 44;
+    internal const int PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS = 51;
     internal const int INVALID_PERSONAL_ACCESS_TOKEN = 53;
     internal const int TRANSIENT_NOT_COMMITTED = 57;
     internal const int TRANSIENT_NOT_ACCEPTED = 58;
@@ -59,11 +60,18 @@ internal static class VsrError
     }
 
     /// <summary>
-    ///     A verdict the server reported, on the reply status word, in the committed result section or in an
-    ///     eviction frame. Only these may drive retry and failover.
+    ///     A verdict the server reported, on the reply status word or in an eviction frame. Retry and failover act
+    ///     on server verdicts, these and <see cref="FromResultSection" /> ones, plus the TRANSIENT_NOT_ACCEPTED the
+    ///     routed poll path raises itself when a primary does not admit it.
     /// </summary>
     internal static IggyInvalidStatusCodeException FromServer(int code, string message)
     {
         return new IggyInvalidStatusCodeException(code, message, true);
+    }
+
+    /// <summary>A verdict the server reported in the result section of a reply.</summary>
+    internal static IggyInvalidStatusCodeException FromResultSection(int code, string message)
+    {
+        return new IggyInvalidStatusCodeException(code, message, true) { FromResultSection = true };
     }
 }

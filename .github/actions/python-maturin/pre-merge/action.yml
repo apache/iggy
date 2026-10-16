@@ -26,13 +26,36 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
+
+    # setup-python changes PKG_CONFIG_PATH and invalidates cached native server dependencies.
+    - name: Build server Docker image for TLS tests
+      if: inputs.task == 'test'
+      run: |
+        # test_tls.py spawns the server in a container; build it from the
+        # same binaries the plain-TCP tests run against.
+        cargo build --locked --bin iggy-server --bin iggy
+        docker build \
+          -f core/server/Dockerfile \
+          --target runtime-prebuilt \
+          --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+          --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+          -t iggy-server:local .
+      shell: bash
+
+    - name: Start Iggy server
+      if: inputs.task == 'test'
+      id: iggy
+      uses: ./.github/actions/utils/server-start
+      with:
+        mode: bin
+        bin: target/debug/iggy-server
+
     - name: Setup Python
       uses: actions/setup-python@v6
       with:
         python-version: "3.11"
-
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Install cargo-llvm-cov
       if: inputs.task == 'test'
@@ -146,27 +169,6 @@ runs:
         echo "Building Python wheel with coverage instrumentation..."
         uv run --no-sync maturin develop
       shell: bash
-
-    - name: Build server Docker image for TLS tests
-      if: inputs.task == 'test'
-      run: |
-        # test_tls.py spawns the server in a container; build it from the
-        # same binaries the plain-TCP tests run against.
-        cargo build --locked --bin iggy-server --bin iggy
-        docker build \
-          -f core/server/Dockerfile \
-          --target runtime-prebuilt \
-          --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
-          --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
-          -t iggy-server:local .
-      shell: bash
-
-    - name: Start Iggy server
-      if: inputs.task == 'test'
-      id: iggy
-      uses: ./.github/actions/utils/server-start
-      with:
-        cargo-bin: iggy-server
 
     - name: Run Python integration tests
       if: inputs.task == 'test'
