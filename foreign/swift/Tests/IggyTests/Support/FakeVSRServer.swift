@@ -199,6 +199,17 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
+    /// A send reply confirming one request at `baseOffset`.
+    static func confirmationBody(partitionID: UInt32, baseOffset: UInt64) -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(UInt32(1))
+        writer.write(UInt32(1))
+        writer.write(UInt32(2))
+        writer.write(partitionID)
+        writer.write(baseOffset)
+        return writer.bytes
+    }
+
     /// A topic with three partitions, 0 to 2, under `contexts`.
     static func topicBody(contexts: [PartitionContext]) -> [UInt8] {
         precondition(contexts.count == 3, "the golden topic header names three partitions")

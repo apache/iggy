@@ -14,8 +14,8 @@ The SDK is built up in stages. The client is a TCP connection with optional TLS 
 speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
 reconnects, and follows the cluster leader. It manages streams, topics, partitions,
 segments, users, personal access tokens, and consumer groups, sends and polls messages,
-and stores consumer offsets. The producer and consumer, examples, and BDD scenarios
-follow in later changes.
+stores consumer offsets, and produces with a batching producer. The consumer, examples,
+and BDD scenarios follow in later changes.
 
 ## Requirements
 
@@ -148,6 +148,34 @@ signs in under a new one and the caller must call `joinConsumerGroup` again: the
 group poll fails with `consumerGroupMemberNotFound` until it does. In a cluster, polls
 and offset writes go to the partition's primary over a second connection bound to the
 same session.
+
+### Producer
+
+`IggyProducer` appends to one topic. `initialize()` creates the stream and topic when
+they are named and missing, then a send either writes from the calling task (`direct`,
+the default) or queues the batch for a background worker (`background`):
+
+```swift
+let producer = client.producer(stream: "orders", topic: "created")
+try await producer.initialize()
+let response = try await producer.send(["placed", "paid"])
+
+let background = client.producer(
+    stream: "orders", topic: "created",
+    configuration: ProducerConfiguration(mode: .background(BackgroundSendOptions(lingerTime: .milliseconds(5)))))
+try await background.initialize()
+try await background.send(["queued"])
+await background.shutdown()
+```
+
+A direct send splits a batch into requests of `batchLength` messages and returns their
+confirmations; a failure throws `ProducerSendError` with the confirmations so far and
+the unconfirmed tail. A background send returns once queued and reports write failures
+to `errorHandler`; `shutdown()` writes what is still buffered. The producer retries
+only a request the server refused to admit or that found no connection, since a retry
+is a new request: anything that may have committed, such as `transientNotCommitted`,
+is left to the caller. With the default ordered sharding, sends to one topic keep their
+order.
 
 ### Errors
 
