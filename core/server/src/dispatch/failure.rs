@@ -463,6 +463,8 @@ mod tests {
     use std::mem::size_of;
     use std::sync::Arc;
 
+    use configs::external_auth::ExternalAuthConfig;
+
     const TRANSPORT: u128 = 42;
     const VSR_CLIENT: u128 = 7;
     const SESSION: u64 = 3;
@@ -647,6 +649,7 @@ mod tests {
             &sessions,
             &server_config,
             MAX_TOKENS_PER_USER,
+            &Arc::new(ExternalAuthConfig::default()),
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             frame,
@@ -889,11 +892,13 @@ mod tests {
         });
         let request_header = *request.header();
 
+        let external_auth = Arc::new(configs::external_auth::ExternalAuthConfig::default());
         handle_client_request(
             &shard,
             &sessions,
             &server_config,
             MAX_TOKENS_PER_USER,
+            &external_auth,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             request.into_generic(),

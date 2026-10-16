@@ -168,3 +168,10 @@ pub use utils::versioning::SemanticVersion;
 
 pub const MAX_NAME_LENGTH: usize = 255;
 pub const MAX_PARTITIONS_COUNT: u32 = 1000;
+
+/// Protocol-level user ID for external-auth inline-grant sessions.
+///
+/// Every node in the cluster uses this value in the replicated apply gate,
+/// so it must be a compile-time constant rather than a per-node config knob.
+/// `u32::MAX` is guaranteed above any slab-allocated user ID.
+pub const EXTERNAL_AUTH_USER_ID: u32 = u32::MAX;

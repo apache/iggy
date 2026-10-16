@@ -471,6 +471,9 @@ async fn partition_write(
             );
             PartitionWriteError::Unavailable
         })?;
+    let alt_permissioner = state
+        .resolve_session_perms(session)
+        .map(|perms| crate::dispatch::authz::build_inline_permissioner(session.user_id, &perms));
     let attachment = session.attachment.borrow().clone();
     let outcome =
         compio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
@@ -482,6 +485,7 @@ async fn partition_write(
                 session.client_id,
                 Some(session.user_id),
                 Some((session.client_id, attachment)),
+                alt_permissioner.as_ref(),
                 Some(namespace),
                 None,
             )

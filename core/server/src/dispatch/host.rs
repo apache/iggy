@@ -42,6 +42,7 @@ use crate::dispatch::{
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShardHandle};
 use ahash::AHashMap;
+use configs::external_auth::ExternalAuthConfig;
 use configs::server::ServerConfig;
 use iggy_binary_protocol::{GenericHeader, PrepareHeader};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
@@ -53,6 +54,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Shared map of ext-auth inline-grant permissions, keyed by VSR client ID.
+/// All shards on one node share one instance via `Arc<Mutex<...>>`.
+pub type SessionGrantMap =
+    Arc<std::sync::Mutex<AHashMap<u128, crate::external_auth::SessionPermissions>>>;
+
+/// An empty shared grants map, for tests and the simulator.
+#[must_use]
+pub fn empty_session_grants() -> SessionGrantMap {
+    Arc::new(std::sync::Mutex::new(AHashMap::new()))
+}
 
 /// The shard host the server runs; see the module docs.
 ///
@@ -74,6 +86,7 @@ where
     completion_relays: Rc<RefCell<CompletionRelays>>,
     server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
 }
@@ -95,9 +108,13 @@ where
         shard_handle: &ShellShardHandle<B, MJ, S, SB>,
         server_config: Arc<ServerConfig>,
         max_tokens_per_user: u32,
+        external_auth: Arc<ExternalAuthConfig>,
+        session_grants: Arc<
+            std::sync::Mutex<ahash::AHashMap<u128, crate::external_auth::SessionPermissions>>,
+        >,
     ) -> Self {
         let shard_handle = Rc::clone(shard_handle);
-        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let sessions = Rc::new(RefCell::new(SessionManager::with_grants(session_grants)));
         let queues: ClientRequestQueues = Rc::new(RefCell::new(AHashMap::new()));
         let queues_for_disconnect = Rc::clone(&queues);
         let sessions_for_disconnect = Rc::clone(&sessions);
@@ -127,6 +144,7 @@ where
             ))),
             server_config,
             max_tokens_per_user,
+            external_auth,
             queues,
             active: Rc::new(RefCell::new(AHashMap::new())),
         }
@@ -168,6 +186,7 @@ where
             &self.sessions,
             &self.server_config,
             self.max_tokens_per_user,
+            &self.external_auth,
             &self.queues,
             &self.active,
             client_id,

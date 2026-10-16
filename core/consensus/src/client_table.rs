@@ -1933,7 +1933,6 @@ mod tests {
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
     const TEST_USER_ID: u32 = 7;
-
     #[allow(clippy::cast_possible_truncation)]
     fn make_register_reply(client: u128, commit: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
@@ -2077,6 +2076,24 @@ mod tests {
             }
         ));
     }
+    // A capacity lowered below a live entry's slot cannot be honoured without dropping
+    // a recovered session, so the table keeps room for it.
+    #[test]
+    fn from_snapshot_keeps_a_slot_above_the_configured_capacity() {
+        let mut table = ClientTable::new(8);
+        table
+            .commit_register(1, TEST_USER_ID, [0x5a; 32], make_register_reply(1, 10))
+            .unwrap();
+        let mut snapshot = table.to_snapshot();
+        snapshot.slots[0].0 = 5;
+
+        let restored = ClientTable::from_snapshot(snapshot).unwrap();
+        assert_eq!(
+            restored.get_epoch(1),
+            Some(10),
+            "an entry above the configured capacity must survive, not be dropped"
+        );
+    }
 
     #[test]
     fn from_snapshot_preserves_committed_capacity_and_slot_identity() {
@@ -2130,7 +2147,6 @@ mod tests {
             Err(ClientTableDecodeError::SlotOutOfRange { .. })
         ));
     }
-
     #[test]
     fn from_snapshot_rejects_duplicate_client_ids() {
         let mut table = ClientTable::new(2);
@@ -2298,7 +2314,6 @@ mod tests {
         assert_eq!(table.get_user_id(1), Some(TEST_USER_ID));
         assert_eq!(table.count(), 1);
     }
-
     // Each entry keeps the user id it registered with; lookups are per-client.
     #[test]
     fn register_stores_user_id() {
@@ -2329,7 +2344,6 @@ mod tests {
             RequestStatus::NoSession
         ));
     }
-
     // Epochs are only handed out by register replies; a newer-than-minted
     // epoch is a client bug, distinct from the zombie case.
     #[test]
@@ -2623,9 +2637,6 @@ mod tests {
             other => panic!("expected Duplicate, got {other:?}"),
         }
     }
-
-    // Eviction tests
-
     // Capacity resize (boot-only)
 
     // --- ClientTableMode::PartitionSlice: watermark-only dedup ---
@@ -2802,7 +2813,7 @@ mod tests {
                     CLIENT,
                     TEST_USER_ID + 1,
                     verifier,
-                    make_register_reply(CLIENT, 21)
+                    make_register_reply(CLIENT, 21),
                 )
                 .is_err()
         );
@@ -2812,7 +2823,7 @@ mod tests {
                     CLIENT,
                     TEST_USER_ID,
                     [0x6a; BIND_SECRET_BYTES],
-                    make_register_reply(CLIENT, 22)
+                    make_register_reply(CLIENT, 22),
                 )
                 .is_err()
         );
@@ -2822,7 +2833,7 @@ mod tests {
                     CLIENT + 1,
                     TEST_USER_ID,
                     verifier,
-                    make_register_reply(CLIENT + 1, 23)
+                    make_register_reply(CLIENT + 1, 23),
                 )
                 .is_err()
         );
@@ -2922,7 +2933,7 @@ mod tests {
                     CLIENT + 1,
                     TEST_USER_ID,
                     verifier,
-                    make_register_reply(CLIENT + 1, END + 1)
+                    make_register_reply(CLIENT + 1, END + 1),
                 )
                 .is_err()
         );
@@ -3248,7 +3259,7 @@ mod tests {
             .commit_register(200, TEST_USER_ID, [0x5a; 32], make_register_reply(200, 20))
             .unwrap();
         assert!(matches!(
-            table.commit_register(300, TEST_USER_ID, [0x5a; 32], make_register_reply(300, 30)),
+            table.commit_register(300, TEST_USER_ID, [0x5a; 32], make_register_reply(300, 30),),
             Err(ClientTableWireError::TooManyEntries { max: 2, .. })
         ));
         assert_eq!(table.count(), 2);
@@ -3264,7 +3275,6 @@ mod tests {
         let (mut table, _session) = table_with_client();
         table.set_capacity(2);
     }
-
     // Edge cases
 
     // commit_reply for unregistered/evicted client must not panic;
@@ -3331,7 +3341,7 @@ mod tests {
         table
             .commit_register(2, TEST_USER_ID, [0x5a; 32], make_register_reply(2, 20))
             .unwrap();
-        // Retrying login must not replace either epoch.
+        // Rebind client 2 only.
         table
             .commit_register(2, TEST_USER_ID, [0x5a; 32], make_register_reply(2, 30))
             .unwrap();
@@ -3436,7 +3446,6 @@ mod tests {
             other => panic!("expected Duplicate, got {other:?}"),
         }
     }
-
     #[test]
     fn decode_rejects_corruption() {
         let mut table = ClientTable::new(4);
@@ -3517,7 +3526,6 @@ mod tests {
             Err(ClientTableWireError::DuplicateClientId { client_id: 7, .. })
         ));
     }
-
     // The received count is the only bound between a peer-supplied u32 and the
     // eager slot allocation, so it must stop at the same ceiling
     // `from_snapshot` enforces.

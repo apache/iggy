@@ -3458,7 +3458,12 @@ where
         let Some(body) = control_suffix_body_verified(message, header.checksum_body) else {
             return;
         };
-        let Ok(verifier) = body.try_into() else {
+        let Some(verifier) = body
+            .get(..consensus::client_table::BIND_SECRET_BYTES)
+            .and_then(|slice| {
+                <[u8; consensus::client_table::BIND_SECRET_BYTES]>::try_from(slice).ok()
+            })
+        else {
             return;
         };
         debug_assert_eq!(

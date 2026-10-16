@@ -19,6 +19,7 @@
 // the server's ported trusted-issuer path verify them.
 mod a2a_jwt;
 mod cg;
+mod external_auth;
 // Raw TCP framing (connect, hand-crafted frames, root register) for the
 // server suites that send what the SDK cannot.
 pub(crate) mod raw_tcp;

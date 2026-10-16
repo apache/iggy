@@ -78,6 +78,10 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
+    session_grants: Arc<
+        std::sync::Mutex<ahash::AHashMap<u128, crate::external_auth::SessionPermissions>>,
+    >,
 ) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let retired_key: iggy_common::HeaderKey =
@@ -256,6 +260,8 @@ pub(in crate::boot) async fn build_shard_for_thread(
         &shard_handle,
         Arc::new(config.clone()),
         config.personal_access_token.max_tokens_per_user,
+        external_auth,
+        session_grants,
     ));
     let sessions = Rc::clone(host.sessions());
     let consumer_group_liveness = Rc::clone(host.consumer_group_liveness());

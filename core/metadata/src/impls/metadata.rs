@@ -2421,7 +2421,26 @@ where
         if consensus.pipeline_has_message_from_client(client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
+
         let request = build_register_request_message(consensus, client_id, user_id, bind_verifier);
+        // Wire path runs `RoutedRequestHeader::validate` at network boundary;
+        // in-process skips it. debug_assert pins drift.
+        debug_assert!(
+            {
+                use iggy_binary_protocol::ConsensusHeader;
+                request.header().validate().is_ok()
+            },
+            "build_register_request_message produced a header that fails validate()"
+        );
+
+        // Not caught up (admitting a register while a committed op is still
+        // unapplied risks a double-register fence bump) or prepare queue full:
+        // absorb into the request queue instead of bouncing with a transient
+        // error. The queued entry carries this caller's reply subscriber; the
+        // commit path promotes it (`drain_request_queue_into_prepares`, which
+        // re-runs `register_preflight` and so applies the ownership gate) as
+        // soon as the in-flight batch drains, and the await below resolves
+        // exactly like the direct dispatch would.
         if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
             if consensus.push_queued_request(entry).is_err() {
@@ -4197,7 +4216,7 @@ where
             "replicate: prepare must be durable in local journal before chain-forward"
         );
         if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
-            tracing::warn!(op = header.op, error = ?e, "chain replication failed");
+            tracing::debug!(op = header.op, error = ?e, "chain replication failed");
         }
     }
 
@@ -4363,6 +4382,8 @@ where
 ///
 /// Buffer is `size_of::<RoutedRequestHeader>()`; `prepare_request` transmutes into
 /// `PrepareHeader` (also 256 bytes), no realloc.
+/// Decode inline-grant permissions from a Register prepare body. Empty body
+/// (the pre-ext-auth format) returns `None`.
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
@@ -4390,12 +4411,7 @@ where
         client: client_id,
         session: 0,
         request: 0,
-        // Replicated on the prepare so every replica resolves session -> user.
         user_id,
-        // Route through the metadata consensus group. The chain-forwarded
-        // prepare is re-routed on each peer by namespace; a `0` here would
-        // hash to a non-zero shard with no metadata consensus and be
-        // silently dropped (see `shard::router::route_typed`).
         group: server_common::sharding::METADATA_GROUP,
         ..RoutedRequestHeader::default()
     };
@@ -7301,7 +7317,7 @@ mod tests {
                         capacity as u128 + 1,
                         USER,
                         [0x5a; 32],
-                        register_reply(capacity as u128 + 1, capacity as u64 + 2)
+                        register_reply(capacity as u128 + 1, capacity as u64 + 2),
                     )
                     .is_err()
             );

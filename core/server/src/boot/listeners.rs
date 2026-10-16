@@ -67,6 +67,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
     accepted_clients: LocalClientAcceptFns,
     connections: &Rc<ConnectionCap>,
     shard_metrics_all: &[ShardMetrics],
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
 ) -> Result<(), ServerError> {
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds on its own. Config first, so a bad `[http.*]`
@@ -159,6 +160,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
             roster,
             connections,
             shard_metrics_all,
+            external_auth,
         )?;
     }
 

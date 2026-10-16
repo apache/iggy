@@ -59,6 +59,7 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 12: pending consumer group owner generations equal their metadata
 /// operation, replacing independently incremented generations.
+///
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 12;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.

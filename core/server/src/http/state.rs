@@ -27,11 +27,12 @@ use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
+use configs::external_auth::ExternalAuthConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
-use message_bus::InstanceToken;
+use message_bus::{InstanceToken, MessageBus};
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
 use send_wrapper::SendWrapper;
@@ -217,6 +218,10 @@ pub(in crate::http) struct HttpInner {
     /// clients out of the shared VSR client table. Read by `resolve_session`
     /// when admitting a fresh session.
     pub(in crate::http) max_http_sessions: usize,
+    /// Cap on pending external auth inline-grant entries. Separate from
+    /// `max_http_sessions` (which bounds VSR session slots): a grant is
+    /// inserted at login and may outlive its session.
+    pub(in crate::http) max_session_grants: usize,
     /// Configured `[personal_access_token] max_tokens_per_user`, enforced
     /// pre-consensus by the PAT rewrite inside the write submit (the cap is
     /// config-derived, so it must never branch inside the replicated apply).
@@ -235,6 +240,14 @@ pub(in crate::http) struct HttpInner {
     /// Behind `Rc` because the write path records from a detached task that
     /// outlives its handler by design (see `submit_committed`).
     pub(in crate::http) metadata_watermarks: Rc<MetadataWatermarks>,
+    /// External authentication callout config. Shared across all handlers.
+    pub(in crate::http) external_auth: Arc<ExternalAuthConfig>,
+    /// Pending inline-grant permissions keyed by session key (`jwt:{jti}`).
+    /// Populated at login when an inline grant is issued; consumed by the
+    /// session resolution path to attach the grant to the `HttpSession`.
+    pub(in crate::http) session_grants: RefCell<
+        HashMap<crate::http::extractor::SessionKey, crate::external_auth::SessionPermissions>,
+    >,
 }
 
 impl HttpInner {
@@ -340,16 +353,33 @@ impl HttpInner {
                     // The guard reserves local capacity across Register and
                     // releases it on failure or cancellation, waking waiters.
                     let fresh = self.register_session(key.clone(), user_id, expiry).await?;
-                    self.sessions
+                    // Resample after the await: the pre-await stamp is stale for
+                    // the expiry sweep and cap check below.
+                    let now = IggyTimestamp::now().to_secs();
+                    let (admitted, torn) = {
+                        let mut table = self.sessions.borrow_mut();
+                        let torn = sweep_expired(&mut table, now);
+                        if table.len() >= self.max_http_sessions {
+                            (None, torn)
+                        } else {
+                            table.insert(key.clone(), Rc::clone(&fresh));
+                            (Some(fresh), torn)
+                        }
+                    };
+                    self.session_grants
                         .borrow_mut()
-                        .insert(key.clone(), Rc::clone(&fresh));
-                    return Ok(fresh);
+                        .retain(|_, grant| grant.expires_at > now);
+                    self.teardown_reply_targets(torn);
+                    return admitted.ok_or(AuthError::SessionUnavailable);
                 }
             }
         }
     }
 
     pub(in crate::http) fn ensure_active_user(&self, user_id: u32) -> Result<(), AuthError> {
+        if self.external_auth.enabled && user_id == iggy_common::EXTERNAL_AUTH_USER_ID {
+            return Ok(());
+        }
         let active = self.shard.plane.metadata().mux_stm.users().read(|users| {
             users
                 .items
@@ -454,6 +484,8 @@ impl HttpInner {
         // A canceled submit used to strand consensus state mid-await; now the
         // detached task always drives it to completion and a disconnect only
         // drops the receiver half (same discipline as `submit_committed`).
+        let _grant_perms = crate::http::extractor::SessionKey::from_table_key(&key)
+            .and_then(|sk| self.session_grant_permissions(&sk));
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
@@ -539,6 +571,58 @@ impl HttpInner {
             in_flight_writes: Cell::new(0),
         }))
     }
+    /// Insert an inline-grant permission, sweeping any expired entries first
+    /// so the map stays bounded by the number of live (non-expired) grants.
+    pub(in crate::http) fn insert_session_grant(
+        &self,
+        key: crate::http::extractor::SessionKey,
+        grant: crate::external_auth::SessionPermissions,
+    ) -> bool {
+        let now_secs = IggyTimestamp::from(self.shard.bus.realtime_micros()).to_secs();
+        let mut grants = self.session_grants.borrow_mut();
+        grants.retain(|_, g| g.expires_at > now_secs);
+        if grants.len() >= self.max_session_grants {
+            warn!(
+                live_grants = grants.len(),
+                cap = self.max_session_grants,
+                "external auth grant table full; rejecting inline grant"
+            );
+            return false;
+        }
+        grants.insert(key, grant);
+        true
+    }
+
+    /// Look up session-scoped permissions for an external auth inline grant.
+    /// Returns `None` when the session has no grant or it has expired.
+    /// Expired grants are eagerly removed so they don't linger until the
+    /// next sweep.
+    pub(in crate::http) fn session_grant_permissions(
+        &self,
+        session_key: &crate::http::extractor::SessionKey,
+    ) -> Option<std::sync::Arc<iggy_common::Permissions>> {
+        let now_secs = IggyTimestamp::from(self.shard.bus.realtime_micros()).to_secs();
+        let mut grants = self.session_grants.borrow_mut();
+        let sp = grants.get(session_key)?;
+        if sp.expires_at <= now_secs {
+            grants.remove(session_key);
+            return None;
+        }
+        Some(std::sync::Arc::clone(&sp.permissions))
+    }
+
+    /// Resolve session-scoped permissions for an external auth session.
+    /// Returns `None` for regular users or when no grant is stored.
+    pub(in crate::http) fn resolve_session_perms(
+        &self,
+        session: &crate::http::session::HttpSession,
+    ) -> Option<std::sync::Arc<iggy_common::Permissions>> {
+        if !self.external_auth.enabled || session.user_id != iggy_common::EXTERNAL_AUTH_USER_ID {
+            return None;
+        }
+        let sk = crate::http::extractor::SessionKey::from_table_key(&session.key)?;
+        self.session_grant_permissions(&sk)
+    }
 
     /// Drop the session table entry for `session`, but only if it is still the
     /// current occupant of its key (pointer-fenced, so a later re-registration
@@ -549,6 +633,10 @@ impl HttpInner {
     /// request re-register cleanly through the barrier.
     pub(in crate::http) fn forget_session(&self, session: &Rc<HttpSession>) {
         let torn = forget_if_same(&mut self.sessions.borrow_mut(), session);
+        // The grant is NOT removed here: the bearer token is still valid and
+        // the holder will re-register a session on its next request. Dropping
+        // the grant would 403 every request until the token expires. Expiry
+        // reclaims the grant in insert_session_grant and resolve_session.
         self.teardown_reply_targets(torn.into_iter().collect());
     }
 

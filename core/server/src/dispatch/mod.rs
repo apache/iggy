@@ -32,7 +32,7 @@
 //! HTTP spine keeps its own equivalent gates (see `crate::http`) because its
 //! error contract (404-before-403) is pinned client-visible behavior.
 
-mod authz;
+pub mod authz;
 mod failure;
 pub mod host;
 pub mod login_error;
@@ -57,8 +57,9 @@ use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use crate::wire::verify_request_checksum;
+use crate::wire::{request_body, verify_request_checksum};
 use ahash::{AHashMap, AHashSet};
+use configs::external_auth::ExternalAuthConfig;
 use configs::server::ServerConfig;
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
@@ -151,6 +152,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
     max_tokens_per_user: u32,
+    external_auth: &Arc<ExternalAuthConfig>,
     queues: &ClientRequestQueues,
     active: &ActiveClientRequests,
     client_id: u128,
@@ -186,6 +188,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
     let server_config = Arc::clone(server_config);
+    let external_auth = Arc::clone(external_auth);
     let queues = Rc::clone(queues);
     let active = Rc::clone(active);
     bus.spawn(async move {
@@ -201,6 +204,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             sessions,
             server_config,
             max_tokens_per_user,
+            external_auth,
             queues,
             &drain,
             client_id,
@@ -423,12 +427,13 @@ impl Drop for InFlight {
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     server_config: Arc<ServerConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
     queues: ClientRequestQueues,
     drain: &Rc<ClientDrain>,
     client_id: u128,
@@ -465,6 +470,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
                 &sessions,
                 &server_config,
                 max_tokens_per_user,
+                &external_auth,
                 drain,
                 client_id,
                 queued.message,
@@ -690,6 +696,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     server_config: &Arc<ServerConfig>,
     max_tokens_per_user: u32,
+    external_auth: &Arc<ExternalAuthConfig>,
     drain: &Rc<ClientDrain>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
@@ -826,6 +833,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                     shard,
                     sessions,
                     server_config,
+                    external_auth,
                     transport_client_id,
                     request,
                     context,
@@ -840,12 +848,14 @@ async fn handle_client_request<B, MJ, S, SB>(
             let task_shard = Rc::clone(shard);
             let task_sessions = Rc::clone(sessions);
             let task_config = Arc::clone(server_config);
+            let task_external_auth = Arc::clone(external_auth);
             shard.bus.spawn(async move {
                 let _in_flight = in_flight;
                 handle_non_replicated_request(
                     &task_shard,
                     &task_sessions,
                     &task_config,
+                    &task_external_auth,
                     transport_client_id,
                     request,
                     context,
@@ -855,7 +865,14 @@ async fn handle_client_request<B, MJ, S, SB>(
         }
         RequestClass::LoginRegister => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
-            handle_login_register_request(shard, sessions, transport_client_id, request).await;
+            handle_login_register_request(
+                shard,
+                sessions,
+                transport_client_id,
+                request,
+                external_auth,
+            )
+            .await;
         }
         RequestClass::Logout => {
             let _in_flight = drain.admit(Admission::MetadataLane).await;
@@ -931,6 +948,34 @@ async fn handle_client_request<B, MJ, S, SB>(
             // The acting user comes from the prologue's lookup. A bound
             // transport always has one, but the gate below fails closed on
             // `None` rather than trust that.
+            // Rebuilt per frame: the grant can expire between frames, and
+            // `session_permissions_for_connection` checks expiry on each call.
+            let is_ext_auth = user_id == Some(iggy_common::EXTERNAL_AUTH_USER_ID);
+            let alt_permissioner = if is_ext_auth {
+                let now_secs =
+                    iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+                sessions
+                    .borrow_mut()
+                    .session_permissions_for_connection(transport_client_id, now_secs)
+                    .map(|perms| {
+                        authz::build_inline_permissioner(iggy_common::EXTERNAL_AUTH_USER_ID, &perms)
+                    })
+            } else {
+                None
+            };
+            // An ext-auth session without a live grant must not fall through
+            // to the STM permissioner (which could match a colliding local
+            // user). Deny everything except PING and logout.
+            if is_ext_auth && alt_permissioner.is_none() {
+                send_deny_reply(
+                    shard,
+                    transport_client_id,
+                    request.header(),
+                    IggyError::Unauthorized.as_code(),
+                )
+                .await;
+                return;
+            }
             dispatch_partition_request(
                 shard,
                 request,
@@ -939,6 +984,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 transport_client_id,
                 user_id,
                 consumer_session,
+                alt_permissioner.as_ref(),
                 None,
                 progress,
             )
@@ -963,6 +1009,45 @@ async fn handle_client_request<B, MJ, S, SB>(
                         new_header.session = bound_session;
                     }
                 });
+            // Ext-auth sessions without a live grant must not reach consensus.
+            if user_id == Some(iggy_common::EXTERNAL_AUTH_USER_ID) {
+                let now_secs =
+                    iggy_common::IggyTimestamp::from(shard.bus.realtime_micros()).to_secs();
+                let alt_meta_perms = sessions
+                    .borrow_mut()
+                    .session_permissions_for_connection(transport_client_id, now_secs);
+                if alt_meta_perms.is_none() {
+                    send_deny_reply(
+                        shard,
+                        transport_client_id,
+                        request.header(),
+                        IggyError::Unauthorized.as_code(),
+                    )
+                    .await;
+                    return;
+                }
+                // CG join/leave needs stream+topic level check; the STM
+                // allow-list has no session-scoped permissions.
+                if matches!(
+                    request.header().operation,
+                    Operation::JoinConsumerGroup | Operation::LeaveConsumerGroup
+                ) {
+                    let alt_cg_permissioner = alt_meta_perms.map(|perms| {
+                        authz::build_inline_permissioner(iggy_common::EXTERNAL_AUTH_USER_ID, &perms)
+                    });
+                    if let Some(deny_code) = authz::authorize_consumer_group_op(
+                        shard,
+                        request.header().operation,
+                        request_body(&request),
+                        iggy_common::EXTERNAL_AUTH_USER_ID,
+                        alt_cg_permissioner.as_ref(),
+                    ) {
+                        send_deny_reply(shard, transport_client_id, request.header(), deny_code)
+                            .await;
+                        return;
+                    }
+                }
+            }
             let (request, raw_pat_token) = match tcp_chain(
                 shard,
                 sessions,
@@ -1130,14 +1215,33 @@ where
             Either::Right(_) => return Err(IggyError::TransientNotAccepted),
         }
     };
-    let active_user = shard.plane.metadata().mux_stm.users().read(|users| {
-        users
-            .items
-            .get(user_id as usize)
-            .is_some_and(|user| user.status == UserStatus::Active)
-    });
-    if !active_user {
-        return Err(IggyError::Unauthenticated);
+    // Inline-grant sessions use a synthetic reserved user_id that is not in
+    // the users slab; their permissions come from SessionPermissions. Skip
+    // the active-user gate for them.
+    let is_ext_auth_inline = user_id == iggy_common::EXTERNAL_AUTH_USER_ID;
+    if is_ext_auth_inline {
+        // Ext-auth sessions must have a grant in this node's session_grants.
+        // The login path sets the grant before calling complete_login_register,
+        // so it will be present. A BindSession on a node that never ran the
+        // ext-auth callout will not have it — deny with a retriable error so
+        // the SDK falls back to a full re-login, which triggers the callout
+        // on this node.
+        let has_grant = sessions
+            .borrow()
+            .has_session_permissions_for_client(identity.client_id);
+        if !has_grant {
+            return Err(IggyError::Unauthenticated);
+        }
+    } else {
+        let active_user = shard.plane.metadata().mux_stm.users().read(|users| {
+            users
+                .items
+                .get(user_id as usize)
+                .is_some_and(|user| user.status == UserStatus::Active)
+        });
+        if !active_user {
+            return Err(IggyError::Unauthenticated);
+        }
     }
     sessions.borrow_mut().bind_authenticated_connection(
         transport_client_id,
@@ -1284,12 +1388,14 @@ mod tests {
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         bind_root_session(&shard, &sessions).await;
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
             &server_config,
             1,
+            &external_auth,
             &Rc::new(ClientDrain::new(&server_config)),
             ROOT_TRANSPORT,
             held_get_me(1, UNAPPLIED_OP),
@@ -1821,6 +1927,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
@@ -1849,6 +1956,7 @@ mod tests {
                 &sessions,
                 &server_config,
                 1,
+                &external_auth,
                 &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 metadata_read(),
@@ -2104,6 +2212,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         for code in [LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE] {
             handle_client_request(
@@ -2111,6 +2220,7 @@ mod tests {
                 &sessions,
                 &server_config,
                 1,
+                &external_auth,
                 &Rc::new(ClientDrain::new(&server_config)),
                 TRANSPORT,
                 non_replicated_request(TRANSPORT, code),
@@ -2147,12 +2257,14 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
             &server_config,
             1,
+            &external_auth,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
@@ -2184,12 +2296,14 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         handle_client_request(
             &shard,
             &sessions,
             &server_config,
             1,
+            &external_auth,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             non_replicated_request(TRANSPORT, PING_CODE),
@@ -2219,6 +2333,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
         {
@@ -2235,6 +2350,7 @@ mod tests {
             &sessions,
             &server_config,
             1,
+            &external_auth,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             message.into_generic(),
@@ -2302,7 +2418,14 @@ mod tests {
         commit_root_session(&shard);
         let shard_handle = unset_shard_handle();
         *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        let host = ServerHost::new(
+            &bus,
+            &shard_handle,
+            Arc::new(server_config),
+            1,
+            Arc::new(ExternalAuthConfig::default()),
+            host::empty_session_grants(),
+        );
         (bus, shard, host)
     }
 
@@ -2317,6 +2440,8 @@ mod tests {
             &unset_shard_handle(),
             Arc::new(ServerConfig::default()),
             1,
+            Arc::new(ExternalAuthConfig::default()),
+            host::empty_session_grants(),
         );
         assert_eq!(
             bus.connection_lost_hooks.get(),
@@ -2335,7 +2460,14 @@ mod tests {
         const TRANSPORT: u128 = 98;
         let bus = SpyBus::default();
         let shard_handle = unset_shard_handle();
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
+        let host = ServerHost::new(
+            &bus,
+            &shard_handle,
+            Arc::new(ServerConfig::default()),
+            1,
+            Arc::new(ExternalAuthConfig::default()),
+            host::empty_session_grants(),
+        );
 
         host.on_client_request(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
         run_spawned_tasks().await;
@@ -2418,7 +2550,14 @@ mod tests {
                 .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
             commit_root_session(&shard);
             let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-            let host = ServerHost::new(&bus, &shard_handle, Arc::new(ServerConfig::default()), 1);
+            let host = ServerHost::new(
+                &bus,
+                &shard_handle,
+                Arc::new(ServerConfig::default()),
+                1,
+                Arc::new(ExternalAuthConfig::default()),
+                host::empty_session_grants(),
+            );
             bind_root_session(&shard, host.sessions()).await;
             let body = PollMessagesRequest {
                 consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
@@ -2560,6 +2699,7 @@ mod tests {
             Rc::clone(host.sessions()),
             config,
             1,
+            Arc::new(ExternalAuthConfig::default()),
             Rc::clone(&queues),
             &drain,
             ROOT_TRANSPORT,
@@ -2677,6 +2817,7 @@ mod tests {
             Rc::clone(host.sessions()),
             config,
             1,
+            Arc::new(ExternalAuthConfig::default()),
             queues,
             &drain,
             ROOT_TRANSPORT,
@@ -2820,6 +2961,7 @@ mod tests {
         let server_config = Arc::new(server_config);
         let queues: ClientRequestQueues = Rc::default();
         let active: ActiveClientRequests = Rc::default();
+        let external_auth = Arc::new(ExternalAuthConfig::default());
         let enqueue = |message| {
             enqueue_client_request(
                 &bus,
@@ -2827,6 +2969,7 @@ mod tests {
                 &sessions,
                 &server_config,
                 1,
+                &external_auth,
                 &queues,
                 &active,
                 ROOT_TRANSPORT,
@@ -3106,12 +3249,14 @@ mod tests {
             )
             .unwrap();
         let server_config = Arc::new(ServerConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         handle_client_request(
             &Rc::new(shard),
             &sessions,
             &server_config,
             1,
+            &external_auth,
             &Rc::new(ClientDrain::new(&server_config)),
             HOME_TRANSPORT,
             request.into_generic(),
@@ -3125,6 +3270,7 @@ mod tests {
     /// inbox there drops the forward, so no verdict comes back. A silent drop
     /// left the client waiting for its whole read timeout.
     #[compio::test]
+    #[allow(clippy::large_futures)]
     async fn given_full_owner_inbox_when_metadata_write_is_forwarded_should_deny_transient_not_committed()
      {
         let bus = SpyBus::default();
@@ -3156,6 +3302,7 @@ mod tests {
     /// whose body does not decode must be denied there, before the home
     /// shard forwards it to the metadata owner.
     #[compio::test]
+    #[allow(clippy::large_futures)]
     async fn given_malformed_join_when_dispatching_should_deny_invalid_command_before_consensus() {
         // Shorter than any join encoding, so the decoder fails on length.
         const TRUNCATED_BODY: &[u8] = &[0x01];
