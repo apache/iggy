@@ -26,6 +26,7 @@ use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
 use kafka_protocol::messages::{BrokerId, CreateTopicsRequest, CreateTopicsResponse};
 use kafka_protocol::protocol::StrBytes;
 
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::bridge::{BridgeError, IggyBridge, TopicCreationOutcome};
@@ -57,13 +58,15 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
 /// bridge config - there is no such config surface today.
 const DEFAULT_PARTITION_COUNT: u32 = 1;
 
-/// Iggy's own server-side per-topic partition cap (`rewrite.rs`'s `IggyError::TooManyPartitions`).
+/// Iggy's own server-side cap on the partitions one create or add names (`rewrite.rs`'s
+/// `IggyError::TooManyPartitions`), so a topic's count here and the partitions `CreatePartitions`
+/// adds in one call.
 ///
 /// Not exported by `iggy::prelude`, so mirrored here as a named constant rather than a bare
 /// literal repeated at every call site. Enforcing it locally means `validate_only` answers the
 /// same rejection the real path would eventually get from the bridge, instead of reporting
 /// `NONE` for a partition count the real path can never actually create.
-const MAX_PARTITIONS_COUNT: u32 = 1000;
+pub(crate) const MAX_PARTITIONS_COUNT: u32 = 1000;
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     let Some(bridge) = &state.bridge else {
@@ -136,6 +139,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     let deadline = Instant::now() + clamp_request_timeout(req.timeout_ms);
     let results = create_all_topics(
         bridge,
+        &state.partition_growth,
         &req.topics,
         &duplicate_names,
         req.validate_only,
@@ -165,6 +169,7 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
 /// call itself, the same pattern `list_offsets.rs` uses, not rely on `timeout_at` to skip it.
 async fn create_all_topics(
     bridge: &IggyBridge,
+    partition_growth: &Mutex<()>,
     topics: &[CreatableTopic],
     duplicate_names: &HashSet<&str>,
     validate_only: bool,
@@ -199,7 +204,7 @@ async fn create_all_topics(
             continue;
         }
 
-        let create = create_one_topic(bridge, topic, validate_only);
+        let create = create_one_topic(bridge, partition_growth, topic, validate_only);
         let result = match tokio::time::timeout_at(deadline, create).await {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -241,6 +246,7 @@ async fn create_all_topics(
 /// one caller does.
 async fn create_one_topic(
     bridge: &IggyBridge,
+    partition_growth: &Mutex<()>,
     topic: &CreatableTopic,
     validate_only: bool,
 ) -> CreatableTopicResult {
@@ -279,6 +285,9 @@ async fn create_one_topic(
         };
     }
 
+    // `CreatePartitions` reads a topic and then adds to it by name. Holding its lock here keeps
+    // a topic created under that name from appearing between its read and its write.
+    let _growth = partition_growth.lock().await;
     match bridge
         .create_kafka_topic(kafka_topic, partition_count)
         .await
@@ -467,8 +476,9 @@ fn assignment_indices_are_consecutive_from_zero(
 /// The only legal replica list for any partition this gateway assigns: this gateway advertises
 /// exactly one broker (node id 1, `metadata.rs`'s `BrokerId(1)`), so `[1]` is the sole valid
 /// shape - length 1 rules out both empty and a duplicated id, and the value itself rules out a
-/// broker Metadata never advertised.
-const SINGLE_BROKER_ID: i32 = 1;
+/// broker Metadata never advertised. `CreatePartitions` holds a manual assignment to the same
+/// list.
+pub(crate) const SINGLE_BROKER_ID: i32 = 1;
 
 fn assignment_replicas_are_valid(assignments: &[CreatableReplicaAssignment]) -> bool {
     assignments

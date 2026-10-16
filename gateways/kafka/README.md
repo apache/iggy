@@ -1,21 +1,24 @@
 # Kafka gateway (`iggy-gateway-kafka`)
 
-Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
+Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/3421): a TCP listener on the Kafka wire port that decodes requests and validates scoped API keys and versions. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs use Iggy. InitProducerId and consumer group coordination work with or without one.
 
 > **Stub warning:** with `IGGY_KAFKA_BRIDGE_ENABLED=true`, Produce, Fetch, ListOffsets, Metadata,
-> CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy. With the bridge off (the
-> default), those eight are stubs: Produce, Fetch and ListOffsets answer retriable
-> `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs answer
-> `NOT_CONTROLLER` (41), and Metadata reports every requested topic unknown. **CreateTopics,
-> DeleteTopics and AlterConfigs run as the bridge's own Iggy user**: with the bridge on and
-> `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port can create
-> topics (up to 1000 partitions each), delete topics and their data, or shorten a topic's
-> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With SASL on,
-> `DeleteTopics` and `AlterConfigs` additionally require the authenticated principal to hold
-> `manage_topics`; without it every resource/name in the request fails
-> `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written or deleted. `CreateTopics` has no such
-> gate yet - SASL on does not protect it. Every client reads and writes as the bridge's Iggy user.
-> See [docs/SCOPE.md](docs/SCOPE.md).
+> CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs use Iggy. With
+> the bridge off (the default), those nine are stubs: Produce, Fetch and ListOffsets answer
+> retriable `NOT_LEADER_OR_FOLLOWER` (6), CreateTopics, DeleteTopics, CreatePartitions,
+> DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), and Metadata reports every
+> requested topic unknown. **CreateTopics, DeleteTopics, CreatePartitions and AlterConfigs run as
+> the bridge's own Iggy user**: with the bridge on and `IGGY_KAFKA_SASL_ENABLED` off (the
+> default), any client that can reach this port can create topics (up to 1000 partitions each),
+> grow them by up to 1000 partitions per topic per request (100 topics per request), delete
+> topics and their data, or shorten a
+> topic's `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With
+> SASL on, `DeleteTopics`, `CreatePartitions` and `AlterConfigs` additionally require the
+> authenticated principal to hold `manage_topics`; without it every resource/name in the request
+> fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written or deleted. `CreateTopics` has no
+> such gate yet - SASL on does not protect it. Every client reads and writes as the bridge's Iggy
+> user. Iggy's `metadata.partitions_max` defaults to 0 (unlimited), so set it before exposing the
+> gateway. See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
 >
@@ -540,9 +543,17 @@ cut before that threshold is reached - worth knowing rather than discovering lat
   other closes after `IGGY_KAFKA_PRODUCE_SESSION_IDLE_SECS` (600) unused, checked every 30 s.
 - 4 clients sign in at once, 80 a second at most. More wait, up to their request's deadline.
 - `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
-- Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
-  Iggy request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
+- Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs share
+  1 more client, one Iggy request at a time. Fetch polls use 4 more, one per read slot. Topic
+  probes use 1 more.
   Offset calls use 8 more: a commit client and a read client per offset slot.
+- CreateTopics, DeleteTopics and CreatePartitions writes also take one gateway-wide lock, so a
+  CreatePartitions can read a topic's count and add to it with nothing in between. A
+  CreatePartitions whose write outcome is unknown keeps the lock while it re-reads the topic, for
+  at most 50 s after its request arrived: the 30 s request ceiling plus 20 s from the write. Admin
+  calls behind it wait up to their own deadline, then answer retriable `REQUEST_TIMED_OUT` (7).
+  The Java admin client does not retry that code by itself: `kafka-topics.sh` and
+  `Admin.createPartitions` report a `TimeoutException`, and the caller must retry.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
 - Order: set `max.in.flight.requests.per.connection=1`, or `retries=0`. Otherwise a retried batch
@@ -610,9 +621,12 @@ against one partition. Passing it returns `TooManyConsumerOffsets` (3024), which
 client as `UNKNOWN_SERVER_ERROR` because Kafka has no code for the condition. The gateway logs
 the real Iggy error, so the server log is where an operator diagnoses it.
 
-A `CreateTopics` that would take the node past `metadata.partitions_max` returns
-`PartitionsLimitReached` (2022), which reaches the client as `POLICY_VIOLATION` (44). The cap
-counts committed partitions only, so creates that run at the same time can go past it.
+A `CreateTopics` or `CreatePartitions` that would take the node past `metadata.partitions_max`
+returns `PartitionsLimitReached` (2022), which reaches the client as `POLICY_VIOLATION` (44). The
+cap counts committed partitions only, so creates that run at the same time can go past it. A
+`CreatePartitions` on a topic created with a fixed partition count (`PartitionResizeDisabled`,
+2023) reaches the client as `POLICY_VIOLATION` too, `validate_only` included. Topics the gateway
+creates are resizable.
 
 The other three decide when a Kafka record goes into the envelope instead of being stored
 natively. See [docs/OFFSET_STORAGE.md](docs/OFFSET_STORAGE.md) and

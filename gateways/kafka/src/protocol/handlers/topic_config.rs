@@ -54,8 +54,8 @@ pub const ONLY_TOPIC_RESOURCES: &str = "only topic resources are supported";
 
 pub const RETENTION_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active segment does not expire. -1 means sealed segments never expire.";
 
-/// Distinct topic names one `CreateTopics`, `DescribeConfigs`, or `AlterConfigs` request
-/// may address through the bridge.
+/// Distinct topic names one `CreateTopics`, `CreatePartitions`, `DescribeConfigs`, or
+/// `AlterConfigs` request may address through the bridge.
 ///
 /// `bounds_guard`'s element ceiling is a pre-decode limit. `CreateTopics` can spend several
 /// lockstep Iggy calls per name on the shared client (`ensure_stream`, `create_topic`, and a
@@ -208,9 +208,10 @@ pub fn topic_cap_message(api_name: &str) -> String {
 
 /// Names in `names` that occur more than once.
 ///
-/// Real Kafka refuses every occurrence of a duplicate resource name with `INVALID_REQUEST`
-/// (42) rather than silently picking a winner. Shared by `CreateTopics`, `DescribeConfigs`
-/// and `AlterConfigs`, which all make the same choice for a repeated topic name in one batch.
+/// Real Kafka refuses a duplicate resource name with `INVALID_REQUEST` (42) rather than
+/// silently picking a winner. Shared by `CreateTopics`, `CreatePartitions`, `DescribeConfigs`
+/// and `AlterConfigs`. `CreatePartitions` answers once per repeated name, as Kafka's
+/// `ControllerApis.createPartitions` does, the others once per occurrence.
 #[must_use]
 pub fn find_duplicate_names<'a>(names: impl IntoIterator<Item = &'a str>) -> HashSet<&'a str> {
     let mut seen = HashSet::new();

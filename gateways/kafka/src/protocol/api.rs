@@ -24,7 +24,7 @@ use kafka_protocol::error::ResponseError;
 use kafka_protocol::messages::{
     DescribeAclsRequest, SaslAuthenticateRequest, SaslHandshakeRequest,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
@@ -40,10 +40,10 @@ use crate::protocol::bounds_guard::{
 };
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_configs,
-    describe_groups, dispatch, fetch, find_coordinator, heartbeat, init_producer_id, join_group,
-    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_fetch, produce,
-    respond_or_close, sync_group,
+    alter_configs, api_versions, create_partitions, create_topics, decode_guarded, delete_topics,
+    describe_configs, describe_groups, dispatch, fetch, find_coordinator, heartbeat,
+    init_producer_id, join_group, leave_group, list_groups, list_offsets, metadata, offset_commit,
+    offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -72,6 +72,7 @@ pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+pub const API_KEY_CREATE_PARTITIONS: i16 = 37;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -297,6 +298,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     api_versions::RANGE,
     create_topics::RANGE,
     delete_topics::RANGE,
+    create_partitions::RANGE,
     describe_configs::RANGE,
     alter_configs::RANGE,
     init_producer_id::RANGE,
@@ -320,8 +322,8 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
 /// answers with its stub, so APIs can be wired one at a time.
 ///
 /// Produce sends on one Iggy client per producer. Metadata, `CreateTopics`, `DeleteTopics`,
-/// `DescribeConfigs` and `AlterConfigs` share one lockstep `IggyClient`, so those calls run one
-/// at a time across connections. See the README's "Concurrency ceiling".
+/// `CreatePartitions`, `DescribeConfigs` and `AlterConfigs` share one lockstep `IggyClient`, so
+/// those calls run one at a time across connections. See the README's "Concurrency ceiling".
 pub struct GatewayState {
     pub broker: BrokerAdvertise,
     pub bridge: Option<Arc<IggyBridge>>,
@@ -346,6 +348,12 @@ pub struct GatewayState {
     pub(crate) loading: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// Held by `CreatePartitions` from reading a topic's partition count until its write is
+    /// settled, and by `CreateTopics` and `DeleteTopics` around their writes. Iggy adds a number
+    /// of partitions, Kafka asks for a count to reach, and two requests that read the same count
+    /// would otherwise both add and overshoot it. Per process: other gateways and direct Iggy
+    /// clients are not behind it.
+    pub(crate) partition_growth: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -383,7 +391,16 @@ impl GatewayState {
             groups,
             loading: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            partition_growth: Arc::default(),
         }
+    }
+
+    /// Holds back the writes of `CreateTopics`, `DeleteTopics` and `CreatePartitions` on this
+    /// gateway until the guard drops, the way a `CreatePartitions` settling an unknown outcome
+    /// does. For tests that check those handlers wait for it.
+    #[doc(hidden)]
+    pub async fn hold_topic_changes(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.partition_growth).lock_owned().await
     }
 
     /// State with no bridge, so every handler takes its stub path.
