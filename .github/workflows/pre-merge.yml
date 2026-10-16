@@ -213,8 +213,11 @@ jobs:
     needs: [common, detect, runtime, rust-test-build, test-rust, test-rust-runtime, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}
     steps:
+      # The durations only fill the summary table. A GitHub API error here
+      # must not skip "Check status", which decides the required check.
       - name: Get job execution times
         id: times
+        continue-on-error: true
         uses: actions/github-script@v9
         with:
           script: |

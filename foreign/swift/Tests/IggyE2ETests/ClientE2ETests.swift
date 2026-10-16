@@ -317,8 +317,8 @@ struct UserE2ETests {
             let identity = try await other.login(username: username, password: "secret-1")
             #expect(identity.userID == created.id)
             _ = try await other.getStreams()
-            await #expect(throws: IggyError(.unauthorized)) {
-                try await other.createStream(name: E2EEnvironment.uniqueName("swift-forbidden"))
+            await expectReplicatedIggyError(.unauthorized) {
+                _ = try await other.createStream(name: E2EEnvironment.uniqueName("swift-forbidden"))
             }
 
             try await client.changePassword(userID, currentPassword: "secret-1", newPassword: "secret-2")

@@ -25,11 +25,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-/// Bounds the wait for the heartbeat verifier to evict a client that stopped
-/// pinging. Generous relative to the 2.4s threshold it covers, because the
-/// eviction pass competes with the rest of the suite.
-const STALE_EVICTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bounds the wait for a client that stopped sending to lose its group
+/// membership. At the specs' 7s heartbeat interval, the server stops renewing
+/// a silent session after 8.4s and ends it about 8.4s later. Generous relative
+/// to that, because the report and expiry passes compete with the rest of the
+/// suite.
+const STALE_EVICTION_TIMEOUT: Duration = Duration::from_secs(30);
 const STALE_EVICTION_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+/// How long a live member must keep its membership across a backup restart.
+/// More than twice the 8.4s session timeout at the specs' 7s heartbeat
+/// interval, so the wait outlasts the expiry of a lease that the restart
+/// stopped renewing.
+const MEMBERSHIP_HOLD_PERIOD: Duration = Duration::from_secs(20);
 
 const STREAM_NAME: &str = "stale-test-stream";
 const TOPIC_NAME: &str = "stale-test-topic";
@@ -46,9 +53,8 @@ enum Restart {
 
 #[iggy_harness(cluster_nodes = 1, server(
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_client_disconnect_when_member_is_replaced_should_resume_consumption(
     harness: &mut integration::harness::TestHarness,
@@ -58,9 +64,8 @@ async fn given_client_disconnect_when_member_is_replaced_should_resume_consumpti
 
 #[iggy_harness(cluster_nodes = 1, server(
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_server_shutdown_when_member_is_replaced_should_resume_consumption(
     harness: &mut integration::harness::TestHarness,
@@ -70,9 +75,8 @@ async fn given_server_shutdown_when_member_is_replaced_should_resume_consumption
 
 #[iggy_harness(cluster_nodes = 1, server(
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_server_crash_when_member_is_replaced_should_resume_consumption(
     harness: &mut integration::harness::TestHarness,
@@ -82,8 +86,8 @@ async fn given_server_crash_when_member_is_replaced_should_resume_consumption(
 
 #[iggy_harness(cluster_nodes = 1, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_heartbeat_disabled_when_member_is_replaced_after_crash_should_resume_consumption(
     harness: &mut integration::harness::TestHarness,
@@ -93,8 +97,8 @@ async fn given_heartbeat_disabled_when_member_is_replaced_after_crash_should_res
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_cluster_node_restart_when_member_is_replaced_should_resume_consumption(
     harness: &mut integration::harness::TestHarness,
@@ -104,8 +108,8 @@ async fn given_cluster_node_restart_when_member_is_replaced_should_resume_consum
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_cluster_restart_when_member_is_replaced_should_resume_consumption(
     harness: &mut integration::harness::TestHarness,
@@ -115,8 +119,8 @@ async fn given_cluster_restart_when_member_is_replaced_should_resume_consumption
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn given_live_member_when_backup_restarts_should_preserve_membership(
     harness: &mut integration::harness::TestHarness,
@@ -143,7 +147,7 @@ async fn given_live_member_when_backup_restarts_should_preserve_membership(
 
     harness.kill_node(2).unwrap();
     harness.restart_node(2).unwrap();
-    sleep(STALE_EVICTION_TIMEOUT).await;
+    sleep(MEMBERSHIP_HOLD_PERIOD).await;
 
     let observer = harness.root_client_for_node(0).await.unwrap();
     let after = observer
@@ -393,9 +397,8 @@ async fn setup_resources(client: &IggyClient, durability: Durability) {
 /// Tests that a stale client receives clean errors and can manually reconnect.
 #[iggy_harness(server(
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_handle_stale_client_with_manual_reconnection(
     harness: &integration::harness::TestHarness,
@@ -442,34 +445,21 @@ async fn should_handle_stale_client_with_manual_reconnection(
     }
     assert_eq!(messages_polled, 5);
 
-    // Wait for the heartbeat verifier (2s interval, 2.4s threshold) to evict
-    // the stale client, observed through `setup_client` rather than by polling
-    // `stale_client` itself: a poll counts as activity and would keep resetting
-    // the staleness the test is waiting for. That is also why the assertion
-    // below gets only a couple of attempts -- each one refreshes liveness, so
-    // retrying harder makes eviction less likely, not more.
-    let deadline = tokio::time::Instant::now() + STALE_EVICTION_TIMEOUT;
-    loop {
-        let group = setup_client
-            .get_consumer_group(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-                &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
-            )
-            .await
-            .unwrap()
-            .expect("consumer group exists");
-        if group.members_count == 0 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "stale client was not evicted within {STALE_EVICTION_TIMEOUT:?}, \
-             group still reports {} member(s)",
-            group.members_count
-        );
-        sleep(STALE_EVICTION_RETRY_INTERVAL).await;
-    }
+    // Wait for the server to end the stale client's session, observed through
+    // `setup_client` rather than by polling `stale_client` itself: a poll
+    // counts as activity and would keep resetting the staleness the test is
+    // waiting for. That is also why the assertion below gets only a couple of
+    // attempts -- each one refreshes liveness, so retrying harder makes
+    // eviction less likely, not more.
+    integration::harness::wait_for_consumer_group_assignment(
+        &setup_client,
+        &Identifier::named(STREAM_NAME).unwrap(),
+        &Identifier::named(TOPIC_NAME).unwrap(),
+        &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+        0,
+        STALE_EVICTION_TIMEOUT,
+    )
+    .await;
 
     let mut got_error = false;
     for _ in 0..3 {
@@ -539,9 +529,8 @@ async fn should_handle_stale_client_with_manual_reconnection(
 /// Tests that IggyConsumer automatically recovers after stale disconnect.
 #[iggy_harness(server(
     heartbeat.enabled = true,
-    heartbeat.interval = "2s",
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
 ))]
 async fn should_handle_stale_client_with_auto_reconnection(
     harness: &integration::harness::TestHarness,
@@ -570,7 +559,7 @@ async fn should_handle_stale_client_with_auto_reconnection(
 
     let mut messages_consumed = 0u32;
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(15);
+    let timeout = STALE_EVICTION_TIMEOUT + Duration::from_secs(15);
 
     while messages_consumed < TOTAL_MESSAGES && start.elapsed() < timeout {
         let poll_result: Option<Result<ReceivedMessage, IggyError>> =
@@ -582,8 +571,18 @@ async fn should_handle_stale_client_with_auto_reconnection(
         if let Some(Ok(_)) = poll_result {
             messages_consumed += 1;
             if messages_consumed == 5 {
-                // Sleep longer than heartbeat threshold (2s * 1.2 = 2.4s) to trigger staleness
-                sleep(Duration::from_millis(4000)).await;
+                // Stay silent until the verifier evicts the connection and
+                // the server ends the session, so the consumer must
+                // reconnect, log in again and rejoin its group.
+                integration::harness::wait_for_consumer_group_assignment(
+                    &setup_client,
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                    &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
+                    0,
+                    STALE_EVICTION_TIMEOUT,
+                )
+                .await;
             }
         }
     }
