@@ -861,6 +861,86 @@ impl TestFixture for MySqlSourceTextTrackingFixture {
     }
 }
 
+/// MySQL source fixture tracking a `DECIMAL(65,30)` column, wider than rust_decimal's
+/// 28 places. A cursor rounded up past an unread value strands that row forever.
+pub struct MySqlSourceDecimalTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceDecimalTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceDecimalTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceDecimalTrackingFixture {
+    const TABLE: &'static str = "test_decimal_tracking";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                amount DECIMAL(65,30) NOT NULL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, amount: &str) {
+        let query = format!("INSERT INTO `{}` (amount, name) VALUES (?, ?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(amount)
+            .bind(format!("row_{amount}"))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceDecimalTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "amount".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture whose `custom_query` orders rows descending by a computed
 /// column that does not exist on the table.
 ///

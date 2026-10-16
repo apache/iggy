@@ -27,6 +27,7 @@ use iggy_connector_sdk::{
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sqlx::mysql::{MySqlDatabaseError, MySqlRow};
+use sqlx::types::BigDecimal;
 use sqlx::{Column, MySql, Pool, Row, TypeInfo, mysql::MySqlPoolOptions};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
@@ -2013,9 +2014,9 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
                 .unwrap_or(serde_json::Value::Null))
         }
         "DECIMAL" => {
-            let value: Option<rust_decimal::Decimal> = row.try_get(column_index).map_err(to_err)?;
+            let value: Option<BigDecimal> = row.try_get(column_index).map_err(to_err)?;
             Ok(value
-                .map(|d| serde_json::Value::String(d.to_string()))
+                .map(|d| serde_json::Value::String(d.to_plain_string()))
                 .unwrap_or(serde_json::Value::Null))
         }
         "BIT" => {
@@ -3034,6 +3035,34 @@ mod tests {
             )
             .expect("Failed to build query");
         assert!(string.contains("`updated_at` > '2024-01-01'"));
+    }
+
+    #[test]
+    fn given_decimal_beyond_rust_decimal_range_should_keep_every_digit_in_the_cursor() {
+        let source = MySqlSource::new(1, test_config(), None);
+        for raw in [
+            "1.000000000000000000000000000060",
+            "0.000000100000000000000000000000",
+            "12345678901234567890.12345678901234567890",
+        ] {
+            let decimal = BigDecimal::from_str(raw).expect("valid decimal");
+            let rendered = decimal.to_plain_string();
+            assert_eq!(rendered, raw);
+
+            let query = source
+                .build_polling_query(
+                    "prices",
+                    "amount",
+                    &Some(rendered),
+                    100,
+                    OffsetKind::Numeric,
+                )
+                .expect("Failed to build query");
+            assert!(
+                query.contains(&format!("`amount` > {raw}")),
+                "cursor literal lost digits or switched notation: {query}"
+            );
+        }
     }
 
     #[test]

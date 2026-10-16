@@ -21,11 +21,11 @@ mod source;
 pub use container::{MySqlOps, MySqlSourceOps};
 pub use source::{
     MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
-    MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
-    MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
-    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
-    MySqlSourceNullTrackingFixture, MySqlSourceRawFixture, MySqlSourceTextTrackingFixture,
-    MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
-    MySqlSourceTinyintTrackingFixture,
+    MySqlSourceComputedTrackingFixture, MySqlSourceDecimalTrackingFixture,
+    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
+    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
+    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceRawFixture,
+    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };

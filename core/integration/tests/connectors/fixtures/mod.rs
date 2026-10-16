@@ -86,12 +86,12 @@ pub use mongodb::{
 };
 pub use mysql::{
     MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
-    MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
-    MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
-    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
-    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
-    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceComputedTrackingFixture, MySqlSourceDecimalTrackingFixture,
+    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
+    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
+    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
+    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
     MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };
 pub use postgres::{

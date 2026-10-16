@@ -19,12 +19,12 @@ use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT}
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
-    MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
-    MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
-    MySqlSourceNoMetadataFixture, MySqlSourceNonUniqueKeyDeleteFixture,
-    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
-    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceComputedTrackingFixture, MySqlSourceDecimalTrackingFixture,
+    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
+    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
+    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
+    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
     MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };
 use iggy_common::MessageClient;
@@ -1695,5 +1695,82 @@ async fn non_unique_primary_key_column_publishes_and_deletes_nothing(
     assert_eq!(
         remaining, TEST_MESSAGE_COUNT as i64,
         "Expected every row to survive, {remaining} of {TEST_MESSAGE_COUNT} remain"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn decimal_tracking_column_publishes_exact_values_and_strands_no_row(
+    harness: &TestHarness,
+    fixture: MySqlSourceDecimalTrackingFixture,
+) {
+    // rust_decimal rounds `...060` up to `...0001` at 28 places. That rounded cursor
+    // sits above `...080`, so the late row would never be read. The small value pins
+    // plain notation: `1E-7` in a payload or cursor is the regression.
+    const SEEDED: [&str; 2] = [
+        "0.000000100000000000000000000000",
+        "1.000000000000000000000000000060",
+    ];
+    const LATE: &str = "1.000000000000000000000000000080";
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for amount in SEEDED {
+        fixture.insert_row(&pool, amount).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "decimal_tracking_consumer".try_into().unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut inserted_late = false;
+    let mut late_seen = false;
+
+    for _ in 0..(POLL_ATTEMPTS * 2) {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                50,
+                true,
+            )
+            .await
+        {
+            for message in polled.messages {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&message.payload)
+                    && let Some(amount) = json.get("amount").and_then(|amount| amount.as_str())
+                {
+                    seen.push(amount.to_string());
+                }
+            }
+        }
+
+        if !inserted_late && SEEDED.iter().all(|amount| seen.iter().any(|s| s == amount)) {
+            fixture.insert_row(&pool, LATE).await;
+            inserted_late = true;
+        }
+        if inserted_late && seen.iter().any(|amount| amount == LATE) {
+            late_seen = true;
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    pool.close().await;
+    assert!(
+        inserted_late,
+        "Expected every seeded amount published digit for digit, got {seen:?}"
+    );
+    assert!(
+        late_seen,
+        "Row '{LATE}' was never published: the cursor was rounded past it. Saw {seen:?}"
     );
 }
