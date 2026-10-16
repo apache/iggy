@@ -61,7 +61,7 @@ tracking_column = "ID"
 initial_offset = "0"
 
 # Source mode: "incremental" or "bulk"
-# Works with ALL JDBC databases universally
+# This Oracle configuration is a guide and is not currently integration-tested.
 mode = "incremental"
 
 # Convert column names to snake_case (e.g., OrderDate -> order_date)

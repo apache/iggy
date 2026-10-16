@@ -16,8 +16,8 @@
 # under the License.
 
 # Example JDBC Source Connector Configuration - BULK MODE
-# Bulk mode works with ALL JDBC databases without any special requirements
-# No tracking column needed - just executes your query and fetches results
+# Bulk mode uses standard JDBC query APIs and does not require a tracking column.
+# PostgreSQL and MySQL have integration coverage; validate other JDBC drivers.
 
 type = "source"
 key = "jdbc_bulk_example"
@@ -28,8 +28,8 @@ path = "target/release/libiggy_connector_jdbc_source"
 plugin_config_format = "toml"
 
 [plugin_config]
-# This example uses PostgreSQL, but bulk mode works identically with:
-# MySQL, Oracle, SQL Server, H2, Derby, DB2, etc.
+# This example uses PostgreSQL. Other drivers use the same connector shape, but
+# their query syntax, result types, and timeout behavior must be validated.
 jdbc_url = "jdbc:postgresql://localhost:5432/warehouse"
 
 # Database credentials can be in URL or separate
@@ -69,7 +69,7 @@ mode = "bulk"
 # - Works with any SELECT query
 # - Supports complex queries (JOINs, aggregations, window functions)
 # - Perfect for periodic snapshots
-# - Universal compatibility with all databases
+# - Uses database-independent JDBC result-set APIs
 
 snake_case_columns = true
 include_metadata = false

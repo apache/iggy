@@ -792,7 +792,8 @@ impl JdbcSource {
             let state = lock_mutex(&self.state, "state")?;
             self.build_query(&state)
         }?;
-        // Logged at debug: the built query embeds the substituted offset value.
+        // Logged at debug without the bound offset value; incremental queries
+        // retain `?` placeholders and bind the cursor on the statement.
         debug!(
             "{CONNECTOR_NAME} connector [{}] executing query: {}",
             self.id, query.sql
@@ -1023,6 +1024,7 @@ impl JdbcSource {
         let mut columns = Vec::with_capacity(raw_columns.len());
         let mut output_names = std::collections::HashSet::new();
         let mut tracking_matches = 0usize;
+        let mut tracking_sql_type = None;
         for (source_name, sql_type) in raw_columns {
             let output_name = if self.config.snake_case_columns {
                 to_snake_case(&source_name)
@@ -1043,6 +1045,7 @@ impl JdbcSource {
                 });
             if is_tracking {
                 tracking_matches += 1;
+                tracking_sql_type = Some(sql_type);
             }
             columns.push(ColumnMetadata {
                 output_name,
@@ -1054,7 +1057,18 @@ impl JdbcSource {
         if self.config.mode == Mode::Incremental {
             let tracking_column = self.config.tracking_column.as_deref().unwrap_or("");
             match tracking_matches {
-                1 => {}
+                1 => {
+                    let Some(sql_type) = tracking_sql_type else {
+                        return Err(Error::InvalidState);
+                    };
+                    if !is_canonical_tracking_type(sql_type) {
+                        return Err(Error::InvalidConfigValue(format!(
+                            "tracking column '{tracking_column}' uses JDBC type {sql_type}, which \
+                             has no cross-database canonical cursor representation; use an integer, \
+                             finite floating-point, NUMERIC/DECIMAL, DATE, TIME, or TIMESTAMP column"
+                        )));
+                    }
+                }
                 0 => {
                     return Err(Error::InvalidConfigValue(format!(
                         "tracking column '{tracking_column}' is not present in the query result; include it exactly once in the SELECT list"
@@ -1518,7 +1532,14 @@ fn extract_offset_value(
     sql_type: i32,
 ) -> Result<Option<String>, Error> {
     match row_data.get(col_name) {
-        Some(serde_json::Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(serde_json::Value::Number(number)) => {
+            if matches!(sql_type, Types::FLOAT | Types::REAL | Types::DOUBLE)
+                && number.as_f64().is_some_and(|value| value == 0.0)
+            {
+                return Ok(Some("0".to_string()));
+            }
+            Ok(Some(number.to_string()))
+        }
         Some(serde_json::Value::String(value)) if !value.is_empty() => {
             if matches!(sql_type, Types::NUMERIC | Types::DECIMAL) {
                 let canonical = BigDecimal::from_str(value).map_err(|error| {
@@ -1533,6 +1554,24 @@ fn extract_offset_value(
         }
         _ => Ok(None),
     }
+}
+
+fn is_canonical_tracking_type(sql_type: i32) -> bool {
+    matches!(
+        sql_type,
+        Types::TINYINT
+            | Types::SMALLINT
+            | Types::INTEGER
+            | Types::BIGINT
+            | Types::FLOAT
+            | Types::REAL
+            | Types::DOUBLE
+            | Types::NUMERIC
+            | Types::DECIMAL
+            | Types::DATE
+            | Types::TIME
+            | Types::TIMESTAMP
+    )
 }
 
 impl JdbcSource {
@@ -1765,10 +1804,10 @@ impl Source for JdbcSource {
     ///
     /// `Ack` means the runtime both sent the batch and durably persisted its
     /// checkpoint, so the staged cursor becomes the committed one. `Nack` means
-    /// neither happened, so the staged cursor is dropped and the next poll rebuilds
-    /// the same query from the committed offset. That re-reads the batch (delivery
-    /// stays at-least-once) instead of skipping it, which is what advancing the
-    /// cursor at fetch time would have done.
+    /// the runtime could not confirm both operations; the send may already have
+    /// succeeded even when checkpoint persistence failed. Dropping the staged
+    /// cursor makes the next poll re-read the batch, preserving at-least-once
+    /// delivery at the cost of possible duplicates.
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
         let candidate = lock_mutex(&self.pending_state, "pending_state")?.take();
         let Some(candidate) = candidate else {
@@ -2412,6 +2451,9 @@ mod java {
             pub const DOUBLE: i32 = 8;
             pub const NUMERIC: i32 = 2;
             pub const DECIMAL: i32 = 3;
+            pub const DATE: i32 = 91;
+            pub const TIME: i32 = 92;
+            pub const TIMESTAMP: i32 = 93;
             pub const BINARY: i32 = -2;
             pub const VARBINARY: i32 = -3;
             pub const LONGVARBINARY: i32 = -4;
@@ -2692,6 +2734,20 @@ mod tests {
             .prepare_column_metadata(vec![("name".to_string(), 12)])
             .expect_err("missing tracking label must be rejected");
         assert!(matches!(err, Error::InvalidConfigValue(msg) if msg.contains("not present")));
+    }
+
+    #[test]
+    fn given_text_tracking_column_should_be_rejected() {
+        let mut config = base_config();
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("cursor_value".to_string());
+        let source = JdbcSource::new(1, config, None);
+        let error = source
+            .prepare_column_metadata(vec![("cursor_value".to_string(), 12)])
+            .expect_err("text cursors do not have a cross-database canonical representation");
+        assert!(
+            matches!(error, Error::InvalidConfigValue(message) if message.contains("canonical cursor representation"))
+        );
     }
 
     #[test]
@@ -3428,6 +3484,7 @@ mod tests {
     #[test]
     fn given_shipped_examples_should_parse_each_plugin_config() {
         let examples = [
+            ("default", include_str!("../config.toml")),
             (
                 "bulk",
                 include_str!("../../../runtime/example_config/connectors/jdbc_bulk_mode.toml"),
@@ -3449,18 +3506,38 @@ mod tests {
                 include_str!("../../../runtime/example_config/connectors/jdbc_sqlserver.toml"),
             ),
         ];
+        let validation_jar = write_temp_jar("jdbc_shipped_config_validation.jar");
 
         for (name, example) in examples {
             let document: toml::Value = toml::from_str(example).unwrap_or_else(|error| {
                 panic!("shipped {name} example must be valid TOML: {error}")
             });
+            for required_field in ["type", "key", "enabled", "version", "name", "path"] {
+                assert!(
+                    document.get(required_field).is_some(),
+                    "shipped {name} example must contain {required_field}"
+                );
+            }
+            let streams = document
+                .get("streams")
+                .and_then(toml::Value::as_array)
+                .filter(|streams| !streams.is_empty())
+                .unwrap_or_else(|| panic!("shipped {name} example must contain a stream"));
+            assert!(
+                streams.iter().all(|stream| stream.get("schema").is_some()),
+                "every stream in shipped {name} example must contain schema"
+            );
             let plugin_config = document
                 .get("plugin_config")
                 .cloned()
                 .unwrap_or_else(|| panic!("shipped {name} example must contain plugin_config"));
-            let config: JdbcSourceConfig = plugin_config.try_into().unwrap_or_else(|error| {
+            let mut config: JdbcSourceConfig = plugin_config.try_into().unwrap_or_else(|error| {
                 panic!("shipped {name} plugin_config must deserialize: {error}")
             });
+            config.driver_jar_path.clone_from(&validation_jar);
+            JdbcSource::new(1, config.clone(), None)
+                .validate_config()
+                .unwrap_or_else(|error| panic!("shipped {name} config must validate: {error}"));
 
             if name == "h2" {
                 assert_eq!(config.mode, Mode::Incremental);
@@ -3543,14 +3620,14 @@ mod tests {
     }
 
     #[test]
-    fn given_string_cursor_should_extract_unchanged() {
+    fn given_timestamp_cursor_should_extract_unchanged() {
         let mut row = serde_json::Map::new();
         row.insert(
             "updated_at".to_string(),
             serde_json::json!("2024-06-15 12:00:00"),
         );
         assert_eq!(
-            extract_offset_value(&row, "updated_at", -999).unwrap(),
+            extract_offset_value(&row, "updated_at", Types::TIMESTAMP).unwrap(),
             Some("2024-06-15 12:00:00".to_string())
         );
     }
@@ -3563,6 +3640,18 @@ mod tests {
             extract_offset_value(&row, "version", Types::DOUBLE).unwrap(),
             Some("3.5".to_string())
         );
+    }
+
+    #[test]
+    fn given_signed_zero_float_cursors_should_have_one_canonical_form() {
+        for value in [-0.0, 0.0] {
+            let mut row = serde_json::Map::new();
+            row.insert("version".to_string(), serde_json::json!(value));
+            assert_eq!(
+                extract_offset_value(&row, "version", Types::DOUBLE).unwrap(),
+                Some("0".to_string())
+            );
+        }
     }
 
     #[test]
@@ -3784,8 +3873,8 @@ mod tests {
         block_on(source.on_batch_result(SourceBatchResult::Nack)).expect("NACK should apply");
 
         let state = source.state.lock().expect("state lock");
-        // The undelivered batch must not advance the cursor, and the staged value
-        // must be discarded rather than lingering for a later batch to commit.
+        // A NACKed batch must not advance the cursor, even though its messages may
+        // already have been sent, and its staged value must not linger.
         assert_eq!(state.last_offset, Some("10".to_string()));
         assert_eq!(state.processed_rows, 0);
         assert!(source.pending_state.lock().expect("pending lock").is_none());

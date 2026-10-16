@@ -221,7 +221,7 @@ schema = "json"
 | `query` | string | Yes | - | SQL query to execute. Incremental mode requires `{last_offset}`; `{tracking_column}` is also supported |
 | `poll_interval` | string (duration) | No | 5s | Positive polling interval as a humantime string (e.g., "30s", "5m", "1h"); zero is rejected |
 | `batch_size` | u32 | No | 1000 | Maximum rows to fetch per poll |
-| `tracking_column` | string | Incremental | - | Column to track for incremental reads (required in incremental mode; the query must also `ORDER BY` it) |
+| `tracking_column` | string | Incremental | - | Canonically represented numeric, date, time, or timestamp column to track for incremental reads (required in incremental mode; the query must also `ORDER BY` it) |
 | `initial_offset` | string | No | - | Starting offset value for first poll |
 | `mode` | string | No | "incremental" | Sync mode: "incremental" or "bulk" |
 | `connection_timeout_ms` | u64 | No | 5000 | Timeout (ms) for the per-poll `isValid` liveness check; converted to seconds and capped at 5s |
@@ -239,8 +239,9 @@ The `query` parameter supports placeholders for dynamic queries:
 - `{last_offset}`: Replaced with a JDBC `PreparedStatement` parameter and bound using the parameter's reported SQL type; drivers that do not expose parameter types use `setString`
 - `{tracking_column}`: Replaced with the configured `tracking_column` (validated as a plain SQL identifier)
 
-Incremental mode is validated at `open()` and enforces the following (the
-connector refuses to start otherwise):
+Static incremental configuration is validated at `open()`. Requirements that
+depend on JDBC result metadata, including the tracking column's SQL type and
+result-label count, fail the poll before any messages or state are emitted:
 
 - **`tracking_column` is required.** Without it the offset can never advance and
   every poll re-reads the same rows.
@@ -250,6 +251,13 @@ connector refuses to start otherwise):
 - **Exactly one result column must match `tracking_column`.** The connector
   rejects a missing match and duplicate matching labels. Use explicit, unique
   aliases when a query joins tables that expose the same column name.
+- **The tracking column must have a canonical JDBC representation.** Supported
+  cursor types are integer, finite floating-point, `NUMERIC`/`DECIMAL`, `DATE`,
+  `TIME`, and `TIMESTAMP`. Text and other collation-sensitive types are rejected
+  when result metadata is read: two text values can compare equal in the
+  database while differing as Rust strings, which would make a strict `>` resume
+  skip rows at a batch boundary. Decimal scale and signed floating-point zero are
+  normalized before boundary comparison.
 - **The query must order by the tracking column, ascending, as the first
   `ORDER BY` term.** Row limiting uses `setMaxRows`, so an unordered (or
   otherwise-ordered) query returns an arbitrary subset; advancing the offset to
@@ -290,11 +298,8 @@ The tracking column must also be:
   commit order.
 - **Monotonic under the database's own ordering.** Because the cursor is the last
   ordered row and is fed back as a bound parameter in `WHERE {tracking_column} >
-  ?`, the column
-  must increase monotonically under the same ordering the database applies to that
-  `>` (including its collation, for text). Prefer an auto-increment ID or a
-  timestamp; a case-insensitively-collated text key can order differently than its
-  bytes and skip or re-read rows.
+  ?`, the column must increase monotonically under the same ordering the database
+  applies to that comparison. Prefer an auto-increment ID or a timestamp.
 - **`NOT NULL`.** A NULL tracking value cannot be watermarked, so the connector
   errors the poll if it reads one and keeps erroring (making no progress) until
   the query is fixed. Exclude NULLs in the query, e.g. `AND {tracking_column} IS
@@ -365,7 +370,7 @@ JDBC SQL types are automatically mapped to JSON:
 | FLOAT, REAL | number | Float |
 | DOUBLE | number | Double |
 | NUMERIC, DECIMAL | string | Emitted as a string to preserve arbitrary precision (e.g. money) |
-| CHAR, VARCHAR, TEXT | string | - |
+| CHAR, VARCHAR, TEXT | string | Cannot be used as an incremental tracking column because database collation equality is not portable |
 | DATE, TIME, TIMESTAMP | string | Driver string form |
 | BINARY, VARBINARY, LONGVARBINARY | string | Base64 encoded |
 | NULL | null | - |
@@ -392,8 +397,8 @@ JDBC SQL types are automatically mapped to JSON:
   is a planned follow-up.)
 - **Incremental boundaries fail closed on tied tracking values.** The connector
   fetches one probe row beyond `batch_size`. If the probe and last in-batch row
-  share a tracking value, no messages are emitted and no cursor is staged. Raise
-  `batch_size` above the tie group or use a unique tracking column.
+  share a canonical tracking value, no messages are emitted and no cursor is
+  staged. Raise `batch_size` above the tie group or use a unique tracking column.
 - **Fetched-batch delivery is at-least-once.** The offset advanced by a poll is
   only *staged*; it is committed after the runtime reports that the batch was
   both sent and its checkpoint durably persisted (`SourceBatchResult::Ack`). If
@@ -590,8 +595,9 @@ jdbc_url = "jdbc:h2:file:/data/mydb;USER=sa;PASSWORD=sa"
 
 ### Incremental Mode
 
-Uses standard JDBC prepared statements and requires an orderable tracking
-column. PostgreSQL is integration-tested; validate this mode with other drivers.
+Uses standard JDBC prepared statements and requires a supported canonical
+tracking type. PostgreSQL and MySQL are integration-tested; validate this mode
+with other drivers.
 
 ```toml
 mode = "incremental"
@@ -605,8 +611,8 @@ initial_offset = "2024-01-01 00:00:00"  # value appropriate for the column type
 - Avoids re-reading rows below the tracked offset (at-least-once, not exactly-once)
 - Tracks offset automatically
 - Efficient for large tables
-- Works with timestamps, IDs, or other orderable, non-null columns; a unique
-  strictly increasing value avoids fail-closed tie boundaries
+- Works with numeric IDs and date/time/timestamp columns; a unique strictly
+  increasing value avoids fail-closed tie boundaries
 
 **Database Examples** (the query must order by the tracking column; a unique,
 strictly-increasing key like an auto-increment ID is safest, see the tracking

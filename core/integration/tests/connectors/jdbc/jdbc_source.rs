@@ -140,18 +140,12 @@ async fn incremental_mode_advances_offset_across_polls(
     server(connectors_runtime(config_path = "tests/connectors/jdbc/config_postgres.toml")),
     seed = seeds::connector_stream
 )]
-async fn incremental_text_offset_with_backslash_preserves_cursor_boundary(
+async fn incremental_text_tracking_column_fails_closed(
     harness: &TestHarness,
     _fixture: JdbcTextCursorFixture,
 ) {
-    let client = harness.root_client().await.expect("root client");
-    let (ids, received) =
-        poll_until_ids_seen(&client, &consumer("jdbc_text_cursor"), &[2], POLL_TIMEOUT).await;
-    assert_eq!(
-        ids,
-        vec![2],
-        "expected only the row after the exact cursor, got {ids:?} from {received} messages"
-    );
+    assert_source_running(harness).await;
+    assert_no_messages_for(harness, "jdbc_text_cursor", Duration::from_millis(600)).await;
 }
 
 #[iggy_harness(

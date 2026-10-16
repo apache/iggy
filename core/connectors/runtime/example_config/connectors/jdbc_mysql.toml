@@ -63,7 +63,8 @@ tracking_column = "updated_at"
 initial_offset = "2024-01-01 00:00:00"
 
 # Source mode: "incremental" or "bulk"
-# Note: Both modes work with ALL JDBC databases (MySQL, Oracle, PostgreSQL, etc.)
+# Both modes use standard JDBC APIs. PostgreSQL and MySQL are integration-tested;
+# validate query syntax, type mapping, and timeout behavior for other drivers.
 # - incremental: Tracks last offset, avoids duplicate reads
 # - bulk: Full table scan, no offset tracking
 mode = "incremental"
