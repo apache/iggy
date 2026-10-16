@@ -296,7 +296,7 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_gap_debounce_interval: IggyDuration,
-    /// Prepares a peer serves per repair round before the requester walks to
+    /// Prepares a peer serves per repair round before the requester asks for
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
     /// overruns the queue and silently drops frames (enforced at the top
