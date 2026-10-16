@@ -73,6 +73,7 @@ impl CliCommand for GetClusterMetadataCmd {
                 let mut table = Table::new();
 
                 table.set_header(vec![
+                    "Replica ID",
                     "Name",
                     "IP",
                     "TCP",
@@ -85,6 +86,7 @@ impl CliCommand for GetClusterMetadataCmd {
 
                 cluster_metadata.nodes.iter().for_each(|node| {
                     table.add_row(vec![
+                        node.replica_id.to_string(),
                         node.name.to_string(),
                         node.ip.to_string(),
                         node.endpoints.tcp.to_string(),
@@ -101,7 +103,7 @@ impl CliCommand for GetClusterMetadataCmd {
             GetClusterMetadataOutput::List => {
                 cluster_metadata.nodes.iter().for_each(|node| {
                     event!(target: PRINT_TARGET, Level::INFO,
-                        "{}|{}|{}|{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                         node.name,
                         node.ip,
                         node.endpoints.tcp,
@@ -109,7 +111,8 @@ impl CliCommand for GetClusterMetadataCmd {
                         node.endpoints.http,
                         node.endpoints.websocket,
                         node.role,
-                        node.status
+                        node.status,
+                        node.replica_id
                     );
                 });
             }

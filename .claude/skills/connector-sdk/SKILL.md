@@ -45,7 +45,7 @@ sdk/src/
 ├── sink.rs             SinkContainer + sink_connector! macro (FFI plumbing).
 ├── source.rs           SourceContainer + source_connector! macro (FFI plumbing).
 ├── api.rs              ConnectorStatus, ConnectorStats (feature = "api").
-├── convert.rs          owned_value_to_serde_json (simd_json ⇄ serde_json bridge).
+├── convert.rs          owned_value_into_serde_json / owned_value_to_serde_json (simd_json ⇄ serde_json bridge).
 ├── log.rs              CallbackLayer for tracing across FFI.
 ├── retry.rs            retry_async + RetryPolicy, CircuitBreaker, HttpRetryMiddleware.
 ├── decoders/           One per schema: json, raw, text, proto, flatbuffer, avro.
@@ -60,7 +60,7 @@ sdk/src/
 2. **`Send + Sync`** on every public trait (FFI runs across thread pools).
 3. **`#[repr(C)]`** on every type that crosses FFI (`Schema`, `TopicMetadata`, `MessagesMetadata`, `RawMessage`, `ProducedMessages`, `ConsumedMessage`, `DecodedMessage`, etc. in `lib.rs`). Adding fields requires bumping the SDK version - existing plugins built against the old layout will misalign on `postcard::from_bytes`.
 4. **postcard** for FFI message serialization (handled by `SinkContainer::consume`, `SourceContainer`'s `handle_messages`). **MessagePack (`rmp_serde`)** for `ConnectorState`. **JSON** (`serde_json`) only for human-editable config that crosses FFI. Don't mix.
-5. **`simd_json::OwnedValue`** for JSON payloads, not `serde_json::Value`. Use `convert::owned_value_to_serde_json` as a bridge when interop is required.
+5. **`simd_json::OwnedValue`** for JSON payloads, not `serde_json::Value`. Use `convert::owned_value_into_serde_json` as a bridge when you own the value (the common case - it moves strings instead of copying them); fall back to the borrowing `convert::owned_value_to_serde_json` only when you still need the `OwnedValue` afterward.
 6. **`BTreeMap`** for headers - deterministic ordering. Never `HashMap` on the wire.
 7. **No breaking changes** to `Sink`/`Source`/`StreamDecoder`/`StreamEncoder`/`Transform` trait signatures without coordinating with all in-tree plugins in the same PR.
 8. **A `Schema` variant that changes meaning is as breaking as a new variant.** The discriminant crosses FFI unchanged, so a plugin built against the old SDK keeps decoding it the old way and misreads every batch with no error anywhere. Same process as a trait change: bump the SDK minor version, update every in-tree plugin in the same PR, and state in the PR description that plugins built against the previous SDK must be rebuilt.

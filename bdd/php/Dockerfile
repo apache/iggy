@@ -48,7 +48,7 @@ ENV PHP_CONFIG=/usr/bin/php-config8.3
 ENV BDD_FEATURE_FILE=/workspace/bdd/scenarios/basic_messaging.feature
 
 RUN rustup component add llvm-tools-preview \
-    && cargo install cargo-php --locked --version 0.1.21 \
+    && cargo install cargo-php --locked --version 0.2.1 \
     && cargo install cargo-llvm-cov --locked
 
 WORKDIR /workspace

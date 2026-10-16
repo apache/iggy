@@ -1454,12 +1454,10 @@ class IggyClient:
         for the rest of `reestablish_after` (5 s by default). The sign-in made
         with `login_user` is dropped, so it must be repeated after reconnecting.
         A client configured with auto-login credentials signs in again on
-        `connect`. Over HTTP there is no connection to close and this call does
-        nothing.
-
-        Known issue: unless reconnection is disabled, the heartbeat of a client
-        with auto-login credentials connects it again and signs in within one
-        heartbeat interval. See https://github.com/apache/iggy/issues/4287.
+        `connect`. Until then, requests fail with `RuntimeError`, and nothing
+        connects the client again in the background, even with auto-login
+        credentials. Over HTTP there is no connection to close and this call
+        does nothing.
 
         Raises:
             RuntimeError: If the connection cannot be closed.
@@ -1739,6 +1737,42 @@ class IggyClient:
                 `manage_streams` or `manage_topics`, per-stream `manage_stream` or
                 `manage_topics`, or per-topic `manage_topic` permission, or the
                 request fails.
+        """
+    def delete_segments(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partition_id: builtins.int,
+        segments_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete the oldest sealed segments of a partition, including all messages
+        stored in them. The active segment is never deleted, and deletion stops at
+        the lowest offset any consumer or consumer group has committed on the
+        partition, so fewer than `segments_count` segments may be removed at first.
+        The server keeps the request and removes the remaining segments later, up
+        to the requested count, as consumers commit past them.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partition_id: Partition ID as `int`.
+            segments_count: Maximum number of segments to delete as `int`, starting
+                from the oldest; `0` deletes nothing.
+
+        Returns:
+            An awaitable that resolves to `None` when deletion is accepted; segment
+            files are removed asynchronously.
+
+        Raises:
+            ValueError: If an identifier is invalid.
+            TypeError: If an integer identifier is outside the unsigned 32-bit range.
+            OverflowError: If `partition_id` or `segments_count` is outside the
+                unsigned 32-bit range.
+            RuntimeError: If the client is not authenticated, lacks global
+                `manage_streams` or `manage_topics`, per-stream `manage_stream` or
+                `manage_topics`, or per-topic `manage_topic` permission, the
+                stream, topic, or partition does not exist, or the request fails.
         """
     def create_consumer_group(
         self,

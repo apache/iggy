@@ -23,7 +23,13 @@ use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 pub const CONSUMER_GROUP_OWNERS_MAX: u32 = 1 << 20;
 
 /// Committed metadata proves IDs below the allocation boundary absent from the
-/// live catalog permanently deleted. Only the newest catalog must be retained.
+/// live list permanently deleted.
+///
+/// The live list can also hold deleted groups that a primary keeps while they
+/// have a durable stranded offset, so a newer catalog can list an ID that an
+/// older one retired. A partition keeps the merge of every catalog it applies,
+/// and a store or transfer path must keep that merge, not only the newest raw
+/// catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireConsumerGroupOwnersRequest {
     pub incarnation: u64,

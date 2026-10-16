@@ -56,7 +56,7 @@ COPY --from=builder /iggy-gateway-kafka .
 
 ENV IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
 # No baked IGGY_KAFKA_ADVERTISED_HOST default: wildcard bind means the gateway cannot derive
-# its own advertised host (server.rs's BrokerAdvertise::from_server_config refuses to start
+# its own advertised host (listener.rs's BrokerAdvertise::for_listener refuses to start
 # without one), and that refusal is deliberate - it forces whoever runs this image to say what
 # host a client can actually reach it on, rather than silently advertising "localhost" to a
 # client on a different machine. docker-compose.yml sets it explicitly for this quick start.

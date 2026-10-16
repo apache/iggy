@@ -27,7 +27,7 @@ use requests::*;
 use rmcp::{
     ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
@@ -733,8 +733,8 @@ impl IggyService {
 
 #[tool_handler]
 impl ServerHandler for IggyService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("Iggy service")
     }
 }

@@ -81,9 +81,9 @@ impl IntoResponse for CustomError {
                     // the op never committed - a transient server condition,
                     // retryable like the other cannot-commit-right-now 503s
                     // (see `service_unavailable`), never a caller error.
-                    IggyError::TransientNotCommitted | IggyError::TransientNotAccepted => {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
+                    IggyError::TransientNotCommitted
+                    | IggyError::TransientNotAccepted
+                    | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
                     _ => StatusCode::BAD_REQUEST,
                 };
                 let response =
@@ -93,7 +93,9 @@ impl IntoResponse for CustomError {
                 // (`service_unavailable`, `server_busy`).
                 if matches!(
                     error,
-                    IggyError::TransientNotCommitted | IggyError::TransientNotAccepted
+                    IggyError::TransientNotCommitted
+                        | IggyError::TransientNotAccepted
+                        | IggyError::NotPrimary
                 ) {
                     with_retry_after(response)
                 } else {
@@ -775,6 +777,13 @@ mod tests {
     #[test]
     fn transient_not_accepted_renders_503_with_retry_after() {
         let response = CustomError::from(IggyError::TransientNotAccepted).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    #[test]
+    fn not_primary_renders_503_with_retry_after() {
+        let response = CustomError::from(IggyError::NotPrimary).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().contains_key(RETRY_AFTER));
     }

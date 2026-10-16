@@ -281,7 +281,7 @@ impl OffsetPool {
         }
     }
 
-    /// Shuts down each client that connected. See [`LazyClient::close_all`].
+    /// Closes each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         let clients = self
             .slots
@@ -402,18 +402,14 @@ async fn create_offset_group(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use iggy::prelude::{ConsumerKind, IggyClientBuilder};
-    use secrecy::SecretString;
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::bridge::iggy_bridge::FetchPool;
-    use crate::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
 
     fn target(topic: &str) -> TopicTarget {
         TopicTarget {
@@ -450,17 +446,6 @@ mod tests {
         read_clients: [Arc<IggyClient>; OFFSET_SLOTS],
     ) -> IggyBridge {
         IggyBridge {
-            client: offline_client(),
-            config: IggyBridgeConfig {
-                address: "127.0.0.1:1".to_string(),
-                username: "iggy".to_string(),
-                password: SecretString::from("iggy"),
-                topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new()).unwrap(),
-                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            },
-            send_slot: Arc::new(Semaphore::new(1)),
-            fetch_pool: Arc::new(FetchPool::new()),
-            probe_client: LazyClient::default(),
             offset_pool: OffsetPool {
                 slots: commit_clients
                     .into_iter()
@@ -471,6 +456,7 @@ mod tests {
                     })
                     .collect(),
             },
+            ..IggyBridge::offline()
         }
     }
 

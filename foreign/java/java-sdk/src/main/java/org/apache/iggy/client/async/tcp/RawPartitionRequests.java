@@ -57,17 +57,17 @@ final class RawPartitionRequests {
             + " Send balanced or messages-key batches with MessagesClient.sendMessages.";
 
     private final Supplier<AsyncTcpConnection> connection;
-    private final PartitionContexts sendContexts;
+    private final PollRouter pollRouter;
     private final MessagesTcpClient messages;
     private final ConsumerOffsetsTcpClient offsets;
 
     RawPartitionRequests(
             Supplier<AsyncTcpConnection> connection,
-            PartitionContexts sendContexts,
+            PollRouter pollRouter,
             MessagesTcpClient messages,
             ConsumerOffsetsTcpClient offsets) {
         this.connection = connection;
-        this.sendContexts = sendContexts;
+        this.pollRouter = pollRouter;
         this.messages = messages;
         this.offsets = offsets;
     }
@@ -84,6 +84,10 @@ final class RawPartitionRequests {
             }
             if (code == POLL_MESSAGES) {
                 return pollMessages(payload);
+            }
+            if (code == CommandCode.ConsumerOffset.GET.getValue()) {
+                targetEnd(payload, code);
+                return pollRouter.partitionRequest(code, Unpooled.copiedBuffer(payload), Optional.empty());
             }
             if (code == STORE_CONSUMER_OFFSET || code == DELETE_CONSUMER_OFFSET) {
                 return writeOffset(code, payload);
@@ -111,7 +115,7 @@ final class RawPartitionRequests {
         ByteBuf discovery = Unpooled.buffer(partitioning - streamStart + PARTITION_ID_BYTES)
                 .writeBytes(payload, streamStart, partitioning - streamStart)
                 .writeBytes(payload, partitionId, PARTITION_ID_BYTES);
-        return sendContexts.send(SEND_MESSAGES, Unpooled.copiedBuffer(payload), discovery, discovery.readableBytes());
+        return pollRouter.sendMessages(Unpooled.copiedBuffer(payload), discovery);
     }
 
     private CompletableFuture<ByteBuf> pollMessages(byte[] payload) {

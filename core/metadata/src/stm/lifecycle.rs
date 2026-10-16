@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::AHashMap;
 use bytes::{BufMut, Bytes, BytesMut};
+pub use iggy_binary_protocol::LIFECYCLE_COMPLETIONS_MAX;
 use iggy_binary_protocol::codec::{read_u32_le, read_u64_le};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_groups::DeleteConsumerGroupRequest;
@@ -28,7 +29,10 @@ use iggy_binary_protocol::requests::partitions::{
 };
 use iggy_binary_protocol::requests::streams::DeleteStreamRequest;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
-use iggy_binary_protocol::{Operation, WireDecode, WireEncode, WireError, WireIdentifier};
+use iggy_binary_protocol::{
+    LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE, Operation, WireDecode, WireEncode,
+    WireError, WireIdentifier,
+};
 use iggy_common::{IggyError, IggyTimestamp};
 use serde::{Deserialize, Serialize};
 
@@ -85,11 +89,11 @@ pub struct LifecycleIntent {
 pub(crate) type LifecycleScope = (usize, Option<usize>, u64);
 
 impl LifecycleIntent {
-    pub(crate) fn scope(&self, metadata_op: u64) -> LifecycleScope {
+    pub(crate) fn scope(&self) -> LifecycleScope {
         (
             self.stream_id as usize,
             self.topic_id.map(|id| id as usize),
-            metadata_op,
+            self.context.metadata_op,
         )
     }
 
@@ -112,14 +116,6 @@ impl LifecycleIntent {
 /// can install its fence, so a durable retirement fence that keeps the
 /// incarnation offline completes it instead.
 pub const RETIRED_PARTITION_OP: u64 = u64::MAX;
-
-/// Upper bound on the targets of one [`CompleteLifecycleRequest`], which keeps
-/// one metadata prepare small. A reporter with more ready targets sends the
-/// rest in its next batch.
-pub const LIFECYCLE_COMPLETIONS_MAX: usize = 1024;
-
-const COMPLETION_BATCH_HEADER_SIZE: usize = size_of::<u64>() + 2 * size_of::<u32>();
-const COMPLETION_SIZE: usize = 2 * size_of::<u32>() + size_of::<u64>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleCompletion {
@@ -172,7 +168,7 @@ impl CompleteLifecycleRequest {
 
 impl WireEncode for CompleteLifecycleRequest {
     fn encoded_size(&self) -> usize {
-        COMPLETION_BATCH_HEADER_SIZE + self.completions.len() * COMPLETION_SIZE
+        LIFECYCLE_BATCH_HEADER_SIZE + self.completions.len() * LIFECYCLE_COMPLETION_SIZE
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -207,7 +203,7 @@ impl WireDecode for CompleteLifecycleRequest {
         let count = read_u32_le(buf, 12)? as usize;
         let mut completions = Vec::with_capacity(count.min(LIFECYCLE_COMPLETIONS_MAX));
         for index in 0..count {
-            let offset = COMPLETION_BATCH_HEADER_SIZE + index * COMPLETION_SIZE;
+            let offset = LIFECYCLE_BATCH_HEADER_SIZE + index * LIFECYCLE_COMPLETION_SIZE;
             completions.push(LifecycleCompletion {
                 topic_id: read_u32_le(buf, offset)?,
                 partition_id: read_u32_le(buf, offset + size_of::<u32>())?,
@@ -236,15 +232,6 @@ impl Streams {
 
     pub fn lifecycle_blocks(&self, stream_id: usize, topic_id: Option<usize>) -> bool {
         self.read(|state| state.lifecycle_blocks(stream_id, topic_id))
-    }
-
-    pub fn lifecycle_blocks_consumer(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        group_id: Option<u64>,
-    ) -> bool {
-        self.read(|state| state.lifecycle_blocks_consumer(stream_id, topic_id, group_id))
     }
 
     pub fn request_lifecycle_blocked(&self, operation: Operation, body: &[u8]) -> bool {
@@ -343,15 +330,18 @@ impl StreamsInner {
         self.lifecycle_scopes
             .range(stream_wide)
             .chain(self.lifecycle_scopes.range(topic_scoped))
-            .filter(move |_| !self.finalizing_lifecycle)
             .filter_map(move |(_, _, op)| self.lifecycle_intents.get(op))
     }
 
-    /// Keeps `lifecycle_scopes` exact, also when `op` already holds an intent.
-    fn insert_lifecycle(&mut self, op: u64, intent: LifecycleIntent) {
-        let scope = intent.scope(op);
-        if let Some(replaced) = self.lifecycle_intents.insert(op, intent) {
-            self.lifecycle_scopes.remove(&replaced.scope(op));
+    /// Keeps `lifecycle_scopes` exact, also when the op of `intent` already
+    /// holds an intent.
+    fn insert_lifecycle(&mut self, intent: LifecycleIntent) {
+        let scope = intent.scope();
+        if let Some(replaced) = self
+            .lifecycle_intents
+            .insert(intent.context.metadata_op, intent)
+        {
+            self.lifecycle_scopes.remove(&replaced.scope());
         }
         self.lifecycle_scopes.insert(scope);
     }
@@ -392,17 +382,18 @@ impl StreamsInner {
             for partition in &topic.partitions[first..] {
                 let incarnation = partition.created_revision;
                 let fence = if let LifecycleAction::DeleteConsumerGroup { group_id } = action {
-                    let group = topic.consumer_groups.get(&u64::from(group_id))?;
-                    let Some(generation) = group.generation.checked_add(1) else {
-                        return Some(ApplyReply::err(IggyError::InvalidCommand.as_code()));
-                    };
+                    if !topic.consumer_groups.contains_key(&u64::from(group_id)) {
+                        return None;
+                    }
+                    // A partition skips an install below its owner's generation.
+                    // The delete op exceeds every op that decided an owner before it.
                     LifecycleFence::Owner(InstallConsumerGroupOwnerRequest {
                         incarnation,
                         group_id: u64::from(group_id),
                         owner: ConsumerGroupOwner {
                             client_id: 0,
                             session: 0,
-                            generation,
+                            generation: self.apply_context.metadata_op,
                         },
                         metadata_op: self.apply_context.metadata_op,
                     })
@@ -441,7 +432,7 @@ impl StreamsInner {
             remaining_partitions: 0,
         };
         intent.rebuild_partition_index();
-        self.insert_lifecycle(self.apply_context.metadata_op, intent);
+        self.insert_lifecycle(intent);
         self.revision = self.revision.wrapping_add(1);
         Some(ApplyReply::ok(Bytes::new()))
     }
@@ -488,13 +479,11 @@ impl StateHandler for CompleteLifecycleRequest {
             return ApplyReply::ok(Bytes::new());
         }
         let mut intent = entry.remove();
-        state
-            .lifecycle_scopes
-            .remove(&intent.scope(self.metadata_op));
+        state.lifecycle_scopes.remove(&intent.scope());
         let stream_id = WireIdentifier::numeric(intent.stream_id);
         let topic_id = WireIdentifier::numeric(intent.topic_id.unwrap_or_default());
-        let context = state.apply_context;
-        state.apply_context = intent.context;
+        // The deferred request applies at this op, not at the intent op: an
+        // owner its rebalance decides must outrank every owner decided since.
         state.finalizing_lifecycle = true;
         let reply = match intent.action {
             LifecycleAction::DeleteStream => {
@@ -519,7 +508,6 @@ impl StateHandler for CompleteLifecycleRequest {
             .apply(state, timestamp),
         };
         state.finalizing_lifecycle = false;
-        state.apply_context = context;
         if reply.code != 0 {
             // Keep the final report pending so reconciliation can retry finalization.
             for &(index, _) in &recorded {
@@ -528,19 +516,7 @@ impl StateHandler for CompleteLifecycleRequest {
                 }
             }
             intent.remaining_partitions += recorded.len();
-            state.insert_lifecycle(self.metadata_op, intent);
-        } else if matches!(intent.action, LifecycleAction::DeleteConsumerGroup { .. })
-            && let Some(topic) = intent.topic_id.and_then(|topic_id| {
-                state
-                    .items
-                    .get_mut(intent.stream_id as usize)?
-                    .topics
-                    .get_mut(topic_id as usize)
-            })
-        {
-            // A sibling group created after the intent may already hold a later
-            // op, and the label must keep growing with the catalog.
-            topic.consumer_group_catalog_op = context.metadata_op;
+            state.insert_lifecycle(intent);
         }
         reply
     }
@@ -605,7 +581,7 @@ impl StreamsSnapshot {
                                 || owner.client_id == 0
                                 || owner.session == 0
                                 || owner.generation == 0
-                                || owner.generation > group.generation
+                                || owner.generation > metadata_op
                                 || (assignment.pending.is_none()
                                     && !members.contains(&(owner.client_id, Some(owner.session))))
                         }) {
@@ -616,7 +592,7 @@ impl StreamsSnapshot {
                         if let Some(pending) = assignment.pending
                             && ((pending.owner.client_id == 0) != (pending.owner.session == 0)
                                 || pending.owner.generation == 0
-                                || pending.owner.generation > group.generation
+                                || pending.owner.generation != pending.metadata_op
                                 || pending.metadata_op == 0
                                 || pending.metadata_op > metadata_op
                                 || (!pending.owner.is_unassigned()
@@ -710,20 +686,21 @@ impl StreamsSnapshot {
                         LifecycleAction::DeleteConsumerGroup { group_id },
                         LifecycleFence::Owner(installation),
                     ) => {
-                        let group = topic
+                        if !topic
                             .consumer_groups
                             .iter()
-                            .find(|(id, _)| *id == u64::from(group_id))
-                            .map(|(_, group)| group)
-                            .ok_or(SnapshotError::InvalidState(
+                            .any(|(id, _)| *id == u64::from(group_id))
+                        {
+                            return Err(SnapshotError::InvalidState(
                                 "deleted consumer group is absent",
-                            ))?;
+                            ));
+                        }
                         if installation.incarnation != partition.created_revision
                             || installation.metadata_op != op
                             || installation.group_id != u64::from(group_id)
                             || !installation.owner.is_unassigned()
                             || installation.owner.generation == 0
-                            || installation.owner.generation > group.generation.saturating_add(1)
+                            || installation.owner.generation != op
                         {
                             return Err(SnapshotError::InvalidState(
                                 "incorrect consumer group deletion fence",
@@ -796,8 +773,8 @@ mod tests {
     use super::*;
     use crate::stm::State;
     use crate::stm::consumer_group::{
-        CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupMember,
-        ConsumerGroupSnapshot,
+        CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupAssignment,
+        ConsumerGroupMember, ConsumerGroupOwnershipTransition, ConsumerGroupSnapshot,
     };
     use crate::stm::snapshot::Snapshotable;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -888,6 +865,186 @@ mod tests {
             INTENT_OP + 1 + u64::from(partition_id),
         );
         assert_eq!(reply.code, 0);
+    }
+
+    /// One member owns partition 0 and awaits partition 1, both decided at
+    /// `owner_op`, and the group's deletion is pending at `INTENT_OP`.
+    fn pending_owned_group_deletion(owner_op: u64) -> Streams {
+        let streams = streams();
+        let partitions = streams.read(|inner| inner.items[0].topics[0].partitions.clone());
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        let mut member = ConsumerGroupMember::new(0, 17);
+        member.session = Some(5);
+        group.members.insert(member);
+        group.rebalance_members(&partitions, owner_op, 100);
+        let assignment = &group.assignments[&0];
+        let pending = assignment.pending.unwrap();
+        let installation = InstallConsumerGroupOwnerRequest {
+            incarnation: assignment.incarnation,
+            group_id: group.id,
+            owner: pending.owner,
+            metadata_op: pending.metadata_op,
+        };
+        assert!(group.complete_revocation(0, &installation, 12));
+        let mut snapshot = streams.to_snapshot();
+        let topic = &mut snapshot.items[0].1.topics[0].1;
+        topic.next_consumer_group_id = 1;
+        topic
+            .consumer_groups
+            .push((0, ConsumerGroupSnapshot::from_group(&group)));
+        let streams = Streams::from_snapshot(snapshot).unwrap();
+        let reply = apply(
+            &streams,
+            Operation::DeleteConsumerGroup,
+            &DeleteConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+            },
+            context(),
+        );
+        assert_eq!(reply.code, 0);
+        assert!(streams.lifecycle_pending(INTENT_OP));
+        streams
+    }
+
+    fn snapshot_assignment(
+        snapshot: &mut StreamsSnapshot,
+        partition_id: usize,
+    ) -> &mut ConsumerGroupAssignment {
+        snapshot.items[0].1.topics[0].1.consumer_groups[0]
+            .1
+            .assignments
+            .get_mut(&partition_id)
+            .unwrap()
+    }
+
+    fn snapshot_deletion_fence(snapshot: &mut StreamsSnapshot) -> &mut ConsumerGroupOwner {
+        let intent = snapshot.lifecycle_intents.get_mut(&INTENT_OP).unwrap();
+        let LifecycleFence::Owner(installation) = &mut intent.partitions[0].fence else {
+            panic!("a group deletion fences owners");
+        };
+        &mut installation.owner
+    }
+
+    #[test]
+    fn given_group_with_owners_when_deleting_should_fence_partitions_at_the_delete_op() {
+        let streams = pending_owned_group_deletion(INTENT_OP - 1);
+        let decided = streams.read(|inner| {
+            inner.items[0].topics[0].consumer_groups[&0]
+                .assignments
+                .values()
+                .flat_map(|assignment| {
+                    assignment
+                        .owner
+                        .into_iter()
+                        .chain(assignment.pending.map(|pending| pending.owner))
+                })
+                .map(|owner| owner.generation)
+                .max()
+                .unwrap()
+        });
+        let intents = streams.pending_lifecycles();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].partitions.len(), 2);
+        for target in &intents[0].partitions {
+            let LifecycleFence::Owner(installation) = target.fence else {
+                panic!("a group deletion fences owners, got {:?}", target.fence);
+            };
+            assert!(installation.owner.is_unassigned());
+            assert_eq!(installation.owner.generation, INTENT_OP);
+            assert_eq!(installation.metadata_op, INTENT_OP);
+            assert!(installation.owner.generation > decided);
+        }
+    }
+
+    /// The finalization removes the group's transitions, so a read under one
+    /// guard never offers a decision that the deletion made obsolete.
+    #[test]
+    fn given_pending_group_deletion_when_a_member_reregisters_should_offer_no_transition_for_the_group()
+     {
+        const REGISTER_OP: u64 = INTENT_OP + 1;
+        const NEW_SESSION: u64 = 6;
+        const NO_TRANSITIONS: [ConsumerGroupOwnershipTransition; 0] = [];
+        let streams = pending_owned_group_deletion(INTENT_OP - 1);
+        streams.refresh_consumer_group_session(
+            17,
+            NEW_SESSION,
+            REGISTER_OP,
+            IggyTimestamp::default(),
+        );
+        let decided = streams.consumer_group_pending_revocations();
+        assert_eq!(decided.len(), 2);
+        for transition in &decided {
+            assert_eq!(transition.installation.owner.session, NEW_SESSION);
+            assert_eq!(transition.installation.owner.generation, REGISTER_OP);
+        }
+        assert_eq!(
+            streams.consumer_group_unblocked_revocations(),
+            NO_TRANSITIONS
+        );
+
+        let reply = complete_batch(
+            &streams,
+            vec![completion(0, 12), completion(1, 23)],
+            REGISTER_OP + 1,
+        );
+        assert_eq!(reply.code, 0);
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+        assert_eq!(streams.consumer_group_pending_revocations(), NO_TRANSITIONS);
+        assert_eq!(
+            streams.consumer_group_unblocked_revocations(),
+            NO_TRANSITIONS
+        );
+    }
+
+    #[test]
+    fn given_op_minted_ownership_when_restoring_snapshot_should_enforce_strict_op_bounds() {
+        const OWNER_OP: u64 = INTENT_OP - 1;
+        let valid = pending_owned_group_deletion(OWNER_OP).to_snapshot();
+        let restore = |streams: StreamsSnapshot| {
+            let mut snapshot = crate::stm::snapshot::MetadataSnapshot::new(INTENT_OP);
+            snapshot.streams = Some(streams);
+            crate::stm::snapshot::MetadataSnapshot::decode(&snapshot.encode().unwrap())
+        };
+        assert!(restore(valid.clone()).is_ok());
+        #[allow(clippy::type_complexity)]
+        let mutations: &[(&str, fn(&mut StreamsSnapshot))] = &[
+            ("owner decided after the snapshot", |snapshot| {
+                snapshot_assignment(snapshot, 0)
+                    .owner
+                    .as_mut()
+                    .unwrap()
+                    .generation = INTENT_OP + 1;
+            }),
+            ("pending owner minted below its op", |snapshot| {
+                snapshot_assignment(snapshot, 1)
+                    .pending
+                    .as_mut()
+                    .unwrap()
+                    .owner
+                    .generation = OWNER_OP - 1;
+            }),
+            ("pending owner minted above its op", |snapshot| {
+                snapshot_assignment(snapshot, 1)
+                    .pending
+                    .as_mut()
+                    .unwrap()
+                    .owner
+                    .generation = OWNER_OP + 1;
+            }),
+            ("deletion fence below its op", |snapshot| {
+                snapshot_deletion_fence(snapshot).generation = INTENT_OP - 1;
+            }),
+            ("deletion fence above its op", |snapshot| {
+                snapshot_deletion_fence(snapshot).generation = INTENT_OP + 1;
+            }),
+        ];
+        for (label, mutate) in mutations {
+            let mut invalid = valid.clone();
+            mutate(&mut invalid);
+            assert!(restore(invalid).is_err(), "{label}");
+        }
     }
 
     #[test]
@@ -1132,6 +1289,93 @@ mod tests {
         assert_eq!(restored.consumer_group_pending_revocations().len(), 3);
     }
 
+    /// Each of three members owns one partition. While the deletion of the last
+    /// partition waits, a logout moves partition 1 to another member, and that
+    /// owner installs. The finalization moves partition 1 again, and a
+    /// partition ignores an install below its installed generation.
+    #[test]
+    fn given_owner_installed_during_partition_deletion_when_finalizing_should_decide_above_it() {
+        const OWNER_OP: u64 = 10;
+        const LOGOUT_OP: u64 = INTENT_OP + 1;
+        let streams: Streams = StreamsInner::new().into();
+        streams.seed_namespace(IggyNamespace::new(0, 0, 2), 3, 0);
+        let partitions = streams.read(|inner| inner.items[0].topics[0].partitions.clone());
+        let mut group = ConsumerGroup::new(0, Arc::from("group"));
+        for (member_id, client_id, session) in [(0, 17, 5), (1, 18, 6), (2, 19, 7)] {
+            let mut member = ConsumerGroupMember::new(member_id, client_id);
+            member.session = Some(session);
+            group.members.insert(member);
+        }
+        group.rebalance_members(&partitions, OWNER_OP, 100);
+        for partition in &partitions {
+            let assignment = &group.assignments[&partition.id];
+            let pending = assignment.pending.unwrap();
+            let installation = InstallConsumerGroupOwnerRequest {
+                incarnation: assignment.incarnation,
+                group_id: 0,
+                owner: pending.owner,
+                metadata_op: pending.metadata_op,
+            };
+            assert!(group.complete_revocation(partition.id, &installation, 12));
+        }
+        let mut snapshot = streams.to_snapshot();
+        let topic = &mut snapshot.items[0].1.topics[0].1;
+        topic.next_consumer_group_id = 1;
+        topic
+            .consumer_groups
+            .push((0, ConsumerGroupSnapshot::from_group(&group)));
+        let streams = Streams::from_snapshot(snapshot).unwrap();
+        let delete = DeletePartitionsRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partitions_count: 1,
+        };
+        assert_eq!(
+            apply(&streams, Operation::DeletePartitions, &delete, context()).code,
+            0
+        );
+        assert!(streams.lifecycle_pending(INTENT_OP));
+
+        streams.remove_consumer_group_member(18, IggyTimestamp::default(), LOGOUT_OP);
+        let moved = streams.consumer_group_pending_revocations();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].partition_id, 1);
+        assert_eq!(moved[0].installation.owner.client_id, 17);
+        assert_eq!(moved[0].installation.owner.generation, LOGOUT_OP);
+        let install = CompleteConsumerGroupRevocationRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 1,
+            installation: moved[0].installation,
+            partition_op: 13,
+        };
+        assert_eq!(
+            apply(
+                &streams,
+                Operation::CompleteConsumerGroupRevocation,
+                &install,
+                ApplyContext {
+                    metadata_op: LOGOUT_OP + 1,
+                    ..context()
+                },
+            )
+            .code,
+            0
+        );
+
+        complete(&streams, 2, 14);
+        assert!(!streams.lifecycle_pending(INTENT_OP));
+        let decided = streams.consumer_group_pending_revocations();
+        assert_eq!(decided.len(), 1);
+        assert_eq!(decided[0].partition_id, 1);
+        assert_eq!(decided[0].installation.owner.client_id, 19);
+        assert!(
+            decided[0].installation.owner.generation > LOGOUT_OP,
+            "generation {} must outrank the installed owner from op {LOGOUT_OP}",
+            decided[0].installation.owner.generation
+        );
+    }
+
     #[test]
     fn given_pending_group_deletion_when_other_consumers_arrive_should_isolate_the_group() {
         let streams = streams();
@@ -1162,9 +1406,9 @@ mod tests {
             0
         );
         assert!(streams.lifecycle_pending(INTENT_OP));
-        assert!(streams.lifecycle_blocks_consumer(0, 0, Some(0)));
-        assert!(!streams.lifecycle_blocks_consumer(0, 0, Some(1)));
-        assert!(!streams.lifecycle_blocks_consumer(0, 0, None));
+        assert!(streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, Some(0))));
+        assert!(!streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, Some(1))));
+        assert!(!streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, None)));
         for group_id in 0..2 {
             let request = JoinConsumerGroupRequest {
                 stream_id: WireIdentifier::numeric(0),
@@ -1189,9 +1433,9 @@ mod tests {
             )
         );
         complete(&streams, 0, 12);
-        assert!(streams.lifecycle_blocks_consumer(0, 0, Some(0)));
+        assert!(streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, Some(0))));
         complete(&streams, 1, 23);
-        assert!(!streams.lifecycle_blocks_consumer(0, 0, Some(0)));
+        assert!(!streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, Some(0))));
         assert!(!streams.lifecycle_pending(INTENT_OP));
         assert_eq!(
             streams.read(|inner| inner.items[0].topics[0]
@@ -1585,7 +1829,7 @@ mod tests {
         let mut replacement = reused.lifecycle_intents[&STREAM_DELETE_OP].clone();
         replacement.stream_id = 0;
         replacement.topic_id = Some(0);
-        reused.insert_lifecycle(STREAM_DELETE_OP, replacement);
+        reused.insert_lifecycle(replacement);
         assert_eq!(
             reused.lifecycle_scopes,
             BTreeSet::from([(0, Some(0), STREAM_DELETE_OP)]),
@@ -1656,16 +1900,13 @@ mod tests {
         for ((stream_id, topic_id, expected), found) in cases.into_iter().zip(found) {
             assert_eq!(found, expected, "stream {stream_id} topic {topic_id:?}");
         }
-        assert!(!streams.lifecycle_blocks_consumer(0, 0, None));
+        assert!(!streams.read(|inner| inner.lifecycle_blocks_consumer(0, 0, None)));
         let topic_creation = streams.read(|inner| {
             [0, 1, 2].map(|stream_id| inner.lifecycle_blocks_topic_creation(stream_id))
         });
         assert_eq!(topic_creation, [false, true, false]);
 
-        let mut inner = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
+        let inner = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
         assert_eq!(blockers(&inner, 1, Some(0)), [STREAM_OP]);
-        inner.finalizing_lifecycle = true;
-        assert_eq!(blockers(&inner, 0, None), [] as [u64; 0]);
-        assert_eq!(blockers(&inner, 1, Some(0)), [] as [u64; 0]);
     }
 }

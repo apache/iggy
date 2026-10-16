@@ -583,13 +583,15 @@ public struct TransportEndpoints: Sendable, Hashable {
 
 /// One node of the cluster roster.
 public struct ClusterNode: Sendable, Hashable {
+    public var replicaID: UInt8
     public var name: String
     public var ip: String
     public var endpoints: TransportEndpoints
     public var role: ClusterNodeRole
     public var status: ClusterNodeStatus
 
-    public init(name: String, ip: String, endpoints: TransportEndpoints, role: ClusterNodeRole, status: ClusterNodeStatus) {
+    public init(replicaID: UInt8, name: String, ip: String, endpoints: TransportEndpoints, role: ClusterNodeRole, status: ClusterNodeStatus) {
+        self.replicaID = replicaID
         self.name = name
         self.ip = ip
         self.endpoints = endpoints

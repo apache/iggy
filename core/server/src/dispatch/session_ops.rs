@@ -363,16 +363,18 @@ const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     }
 }
 
-/// Per-shard heartbeat verifier: evict connections that have not pinged within
-/// `1.2 x interval`. Mirrors the legacy `verify_heartbeats` periodic task.
-/// Eviction removes the connection binding and sends `Eviction(StaleClient)`.
-/// The shared logical session and its group membership remain until committed
+/// Per-shard heartbeat verifier: every `interval`, evict group-member
+/// connections that sent nothing for `max_age`, the session timeout.
+/// Mirrors the legacy `verify_heartbeats` periodic task. Eviction
+/// removes the connection binding and sends `Eviction(StaleClient)`. The
+/// shared logical session and its group membership remain until committed
 /// lease expiry or explicit logout.
 #[allow(clippy::future_not_send)]
 pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     interval: std::time::Duration,
+    max_age: std::time::Duration,
     stop_rx: shard::Receiver<()>,
 ) where
     B: ShellBus,
@@ -381,9 +383,6 @@ pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Legacy `MAX_THRESHOLD`: a client is stale once it misses 1.2 intervals.
-    // Integer 6/5 rather than `mul_f64`, which panics on an absurd interval.
-    let max_age = interval.saturating_mul(6) / 5;
     loop {
         // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
         // Waiting on the stop channel rather than sleeping past it keeps this

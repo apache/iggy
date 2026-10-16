@@ -24,7 +24,7 @@ use crate::harness::traits::{IggyServerDependent, TestBinary};
 use assert_cmd::prelude::CommandCargoExt;
 use rmcp::{
     RoleClient, ServiceExt,
-    model::{ClientCapabilities, ClientInfo, Implementation, InitializeRequestParams},
+    model::{ClientCapabilities, ClientConfig, Implementation, InitializeRequestParams},
     service::RunningService,
     transport::StreamableHttpClientTransport,
 };
@@ -82,7 +82,7 @@ impl McpHandle {
     pub async fn create_client(&self) -> Result<McpClient, TestBinaryError> {
         let mcp_url = self.mcp_url();
         let transport = StreamableHttpClientTransport::from_uri(mcp_url.clone());
-        let client_info = ClientInfo::new(
+        let client_info = ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::new("test-mcp-client", "1.0.0"),
         );
