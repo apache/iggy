@@ -23,7 +23,6 @@ components:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
-      - ".config/**" # nextest + cargo-rail config gate every Rust test job
 
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes
@@ -162,6 +161,7 @@ components:
       - "core/partitions/**"
       - "core/shard/**" # drives the shutdown flush and boot-time partition recovery
       - "scripts/ci/storage-compat.sh"
+      - ".config/nextest.toml" # storage-compat.sh drives its own nextest run
       # The check itself, so weakening it re-runs it. Scoped to the test, the
       # module wiring that keeps it compiled in, the crate manifest and the
       # harness it drives rather than `core/integration/**`, which would fire
@@ -204,6 +204,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
+      - ".config/**" # nextest + cargo-rail config, read only by the test-* tasks
       - "!foreign/**" # Exclude foreign SDKs
       - "!web/**" # Exclude web UI
     tasks:
