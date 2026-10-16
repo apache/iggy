@@ -57,6 +57,10 @@ let package = Package(
             ],
             resources: [.copy("Fixtures")]
         ),
+        .testTarget(
+            name: "IggyE2ETests",
+            dependencies: ["Iggy"]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
