@@ -19,16 +19,17 @@ name: PR Description
 
 # Flags a contributor PR whose description leaves out a linked issue, a
 # description of the change, or how it was tested, the three things
-# PULL_REQUEST_TEMPLATE.md asks for. It looks for the content anywhere in the
-# body, so a free-form description passes when it covers all three. A gap
-# fails this check and the job summary names each missing part. Plain pattern
-# checks, no model.
+# PULL_REQUEST_TEMPLATE.md asks for. The check is
+# scripts/ci/pr-description-check.mjs, which maintainers can also run by hand
+# on any PR. A gap fails this check and the job summary names each missing
+# part. Plain pattern checks, no model.
 #
 # Skipped for bots, drafts, and authors with write access (OWNER, MEMBER,
 # COLLABORATOR).
 #
-# SECURITY: reads the PR body from the event payload only. No checkout, no
-# exec of PR contents, read-only token.
+# SECURITY: checks out only the check script, from the base commit, without
+# persisted credentials. PR code is never checked out or executed. Read-only
+# token.
 
 on:
   pull_request:
@@ -49,43 +50,15 @@ jobs:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 2
     steps:
-      - name: Check issue, description and test notes
-        uses: actions/github-script@v9
+      - uses: actions/checkout@v7.0.1
         with:
-          script: |
-            // Drop template comments and the template lines left unedited.
-            const body = (context.payload.pull_request.body || '')
-              .replace(/\r\n/g, '\n')
-              .replace(/<!--[\s\S]*?-->/g, '')
-              .split('\n')
-              .filter(l => !/^\s*(Closes|Relates to)\s+#\s*$/i.test(l))
-              .filter(l => !/^\s*-?\s*(Passed \/ not passed|Pre-commit hooks ran \/ not ran)\s*$/i.test(l))
-              .join('\n');
-            const issueSection = (body.match(
-              /(?:^|\n)##[ \t]+Which issue does this PR address\?[ \t]*\n([\s\S]*?)(?=\n##[ \t]|$)/,
-            ) || [])[1] || '';
-            const prose = body.replace(/^\s*#+.*$/gm, '').replace(/\s+/g, ' ').trim();
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: scripts/ci/pr-description-check.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
-            const problems = [];
-            // An explicit "N/A" or "None" under the issue heading is an answer.
-            if (!/#\d+|github\.com\/apache\/iggy\/issues\/\d+/.test(body)
-                && !/^\s*(N\/A|None)\b/im.test(issueSection)) {
-              problems.push('Link the issue this PR addresses, for example `Closes #123` or `Relates to #123`, or write N/A under "Which issue does this PR address?".');
-            }
-            if (prose.length < 100) {
-              problems.push('Describe why the change is needed and what it changes.');
-            }
-            if (!/\b(tested|tests? pass|passed|passing|ran|run locally|pre-commit|prek|cargo (test|nextest|clippy)|go test|pytest|npm test|dotnet test|mvn|gradlew?|verified|verification|nothing to run)\b/i.test(body)) {
-              problems.push('Say how you tested the change locally, under "Local Execution": passed or not passed, and whether pre-commit hooks ran.');
-            }
-
-            if (problems.length === 0) {
-              core.info('PR description covers the issue, the change and testing');
-              return;
-            }
-            await core.summary
-              .addHeading('PR description is missing parts of the template', 3)
-              .addList(problems)
-              .addRaw('Edit the PR description to fix these. The check runs again on each edit.')
-              .write();
-            core.setFailed(problems.join('\n'));
+      - name: Check issue, description and test notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node scripts/ci/pr-description-check.mjs --pr "$PR_NUMBER"
