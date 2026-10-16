@@ -32,6 +32,7 @@ use iggy_connector_sdk::{
 use rumqttc::QoS as MqttQos;
 use secrecy::SecretString;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     str::FromStr,
@@ -42,7 +43,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use driver::{MqttDriver, MqttProtocol};
+use driver::{MqttDriver, MqttProtocol, validate_tls_config};
 use routing::{
     DEFAULT_TOPIC_TEMPLATE, PreparedPublication, TopicMode, prepare_publication, validate_topic,
     validate_topic_template,
@@ -71,6 +72,9 @@ pub struct MqttSinkConfig {
     pub client_id: Option<String>,
     pub username: Option<String>,
     pub password: Option<SecretString>,
+    pub tls_ca_file: Option<PathBuf>,
+    pub tls_client_cert_file: Option<PathBuf>,
+    pub tls_client_key_file: Option<PathBuf>,
     #[serde(default = "default_topic")]
     pub topic: Option<String>,
     #[serde(default)]
@@ -219,6 +223,7 @@ impl MqttSink {
 
     fn validate_config(&self) -> Result<(), Error> {
         validate_broker_url(&self.config.broker_url)?;
+        validate_tls_config(&self.config)?;
         self.qos()?;
         if let Some(topic) = self.config.topic.as_deref() {
             validate_topic(topic, "topic")?;
@@ -576,6 +581,9 @@ mod tests {
             client_id: Some("test-client".to_string()),
             username: None,
             password: None,
+            tls_ca_file: None,
+            tls_client_cert_file: None,
+            tls_client_key_file: None,
             topic: Some("test/topic".to_string()),
             topic_mode: TopicMode::Static,
             topic_template: None,
@@ -666,6 +674,48 @@ mod tests {
         let sink = MqttSink::new(1, config);
 
         assert!(sink.validate_config().is_ok());
+    }
+
+    #[test]
+    fn given_client_certificate_without_private_key_when_validating_should_return_configuration_error()
+     {
+        let mut config = test_config();
+        config.broker_url = "mqtts://localhost:8883".to_string();
+        config.tls_ca_file = Some("ca.pem".into());
+        config.tls_client_cert_file = Some("client.pem".into());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("together")
+        ));
+    }
+
+    #[test]
+    fn given_mutual_tls_without_ca_file_when_validating_should_return_configuration_error() {
+        let mut config = test_config();
+        config.broker_url = "mqtts://localhost:8883".to_string();
+        config.tls_client_cert_file = Some("client.pem".into());
+        config.tls_client_key_file = Some("client.key".into());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("tls_ca_file")
+        ));
+    }
+
+    #[test]
+    fn given_tls_file_with_unencrypted_broker_url_when_validating_should_return_configuration_error()
+     {
+        let mut config = test_config();
+        config.tls_ca_file = Some("ca.pem".into());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("mqtts:// or ssl://")
+        ));
     }
 
     #[test]

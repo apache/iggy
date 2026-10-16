@@ -51,6 +51,22 @@ max_in_flight = 1
 verbose_logging = false
 ```
 
+For TLS, use an `mqtts://` or `ssl://` broker URL. If `tls_ca_file` is not set,
+the connector uses the system trust store. If you set `tls_ca_file`, it must
+contain PEM CA certificates and replaces the system trust store. The connector
+validates the broker certificate and hostname. It has no option to disable this
+validation.
+
+For mutual TLS, set all three file paths. The certificate and private key files
+must contain PEM data. The connector does not log certificate or key contents.
+
+```toml
+broker_url = "mqtts://broker.example.com:8883"
+tls_ca_file = "/run/secrets/mqtt-ca.pem"
+tls_client_cert_file = "/run/secrets/mqtt-client.pem"
+tls_client_key_file = "/run/secrets/mqtt-client.key"
+```
+
 `qos = 0` is best effort and has no broker acknowledgement. `qos = 1` waits for
 `PUBACK` and may duplicate messages during retries. `qos = 2` waits for completion
 of the MQTT QoS 2 exchange.
