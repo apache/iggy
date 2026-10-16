@@ -28,6 +28,7 @@ mod influxdb;
 mod meilisearch;
 mod mongodb;
 mod postgres;
+mod questdb;
 mod quickwit;
 mod rabbitmq;
 mod random;

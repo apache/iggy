@@ -1,0 +1,318 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use crate::connectors::fixtures;
+use integration::harness::TestBinaryError;
+use reqwest_middleware::ClientWithMiddleware as HttpClient;
+use reqwest_retry::RetryTransientMiddleware;
+use reqwest_retry::policies::ExponentialBackoff;
+use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tracing::info;
+
+const QUESTDB_IMAGE: &str = "docker.io/questdb/questdb";
+/// QWP over WebSocket requires QuestDB 10.0 or newer, so this tag cannot be
+/// rolled back to a 9.x line without disabling the whole suite.
+const QUESTDB_TAG: &str = "10.0.1";
+/// QuestDB serves the REST API and the QWP WebSocket upgrade on the same port.
+const QUESTDB_HTTP_PORT: u16 = 9000;
+
+/// Emitted once the server is accepting connections.
+const QUESTDB_READY_LOG: &str = "server-main enjoy";
+
+/// Attempts to resolve the published host port before giving up.
+const PORT_LOOKUP_ATTEMPTS: usize = 30;
+const PORT_LOOKUP_INTERVAL_MS: u64 = 200;
+
+pub const HEALTH_CHECK_ATTEMPTS: usize = 60;
+pub const HEALTH_CHECK_INTERVAL_MS: u64 = 1_000;
+
+pub const DEFAULT_TEST_STREAM: &str = "test_stream";
+pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
+
+// ── env-var keys injected into the connectors runtime ────────────────────────
+
+pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PATH";
+
+/// Where the connectors runtime looks for the plugin, relative to its working
+/// directory. Cargo runs the test with the same working directory, so the same
+/// relative path resolves here.
+pub const SINK_PLUGIN_PATH: &str = "../../target/debug/libiggy_connector_questdb_sink";
+/// Everything that changes what gets built into the plugin, for the staleness
+/// check in [`ensure_plugin_built`]. `Cargo.toml` is in the list because a
+/// dependency or feature change rebuilds the library without touching a source
+/// file. `config.toml` is not, because the runtime reads it from the source
+/// tree at start and no build is involved.
+const SINK_SOURCE_PATHS: &[&str] = &[
+    "../connectors/sinks/questdb_sink/src/lib.rs",
+    "../connectors/sinks/questdb_sink/src/mapping.rs",
+    "../connectors/sinks/questdb_sink/Cargo.toml",
+];
+pub const ENV_SINK_CONNECTION_STRING: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_CONNECTION_STRING";
+pub const ENV_SINK_TABLE: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_TABLE";
+pub const ENV_SINK_TIMESTAMP_SOURCE: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_TIMESTAMP_SOURCE";
+pub const ENV_SINK_TIMESTAMP_FIELD: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_TIMESTAMP_FIELD";
+pub const ENV_SINK_TIMESTAMP_UNIT: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_TIMESTAMP_UNIT";
+pub const ENV_SINK_SYMBOL_COLUMNS: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_SYMBOL_COLUMNS";
+pub const ENV_SINK_UUID_COLUMNS: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_UUID_COLUMNS";
+pub const ENV_SINK_INTEGER_COLUMNS: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INTEGER_COLUMNS";
+pub const ENV_SINK_INCLUDE_STREAM_COLUMN: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INCLUDE_STREAM_COLUMN";
+pub const ENV_SINK_INCLUDE_TOPIC_COLUMN: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INCLUDE_TOPIC_COLUMN";
+pub const ENV_SINK_INCLUDE_PARTITION_COLUMN: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INCLUDE_PARTITION_COLUMN";
+pub const ENV_SINK_INCLUDE_OFFSET_COLUMN: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INCLUDE_OFFSET_COLUMN";
+pub const ENV_SINK_INCLUDE_HEADERS: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INCLUDE_HEADERS";
+pub const ENV_SINK_NUMBERS_AS_DOUBLE: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_NUMBERS_AS_DOUBLE";
+pub const ENV_SINK_LOG_REJECTED_PAYLOAD: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_LOG_REJECTED_PAYLOAD";
+pub const ENV_SINK_BATCH_SIZE: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_BATCH_SIZE";
+pub const ENV_SINK_FLUSH_TIMEOUT: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_FLUSH_TIMEOUT";
+pub const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_STREAM";
+pub const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_TOPICS";
+pub const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_SCHEMA";
+pub const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
+    "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_CONSUMER_GROUP";
+
+/// Fails with an actionable message when the plugin has not been built.
+///
+/// Cargo has no dependency edge to a plugin: the runtime `dlopen`s it at a
+/// path, so `cargo test` never builds it. Without this check the runtime
+/// starts, fails to load the connector, and the test dies somewhere far away
+/// from the cause, typically as a timeout waiting for rows that were never
+/// going to arrive.
+pub fn ensure_plugin_built() -> Result<(), TestBinaryError> {
+    let setup_error = |message: String| TestBinaryError::FixtureSetup {
+        fixture_type: "QuestDbContainer".to_string(),
+        message,
+    };
+    // The runtime appends the platform's suffix, so the configured path has
+    // none and every candidate has to be tried.
+    let Some(plugin) = ["dylib", "so", "dll"]
+        .iter()
+        .map(|extension| PathBuf::from(format!("{SINK_PLUGIN_PATH}.{extension}")))
+        .find(|candidate| candidate.exists())
+    else {
+        return Err(setup_error(format!(
+            "the QuestDB sink plugin is not built, so the connectors runtime would have \
+             nothing to load. Run `cargo build -p iggy_connector_questdb_sink` first. \
+             Looked for {SINK_PLUGIN_PATH}.{{dylib,so,dll}}"
+        )));
+    };
+
+    // Existence is not enough. `cargo test` rebuilds the test binary but not the
+    // plugin, so an edit to the sink leaves the runtime loading the previous
+    // build and the suite passes or fails on code that is no longer there.
+    // Compare the timestamps and say so instead.
+    let built_at = modified_at(&plugin).map_err(setup_error)?;
+    let newest_source = SINK_SOURCE_PATHS
+        .iter()
+        .map(Path::new)
+        .filter(|path| path.exists())
+        .map(modified_at)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(setup_error)?
+        .into_iter()
+        .max();
+    if let Some(changed_at) = newest_source
+        && changed_at > built_at
+    {
+        return Err(setup_error(format!(
+            "the QuestDB sink plugin at {} is older than its sources, so the connectors \
+             runtime would load the previous build. Run \
+             `cargo build -p iggy_connector_questdb_sink` and try again.",
+            plugin.display()
+        )));
+    }
+    Ok(())
+}
+
+fn modified_at(path: &Path) -> Result<SystemTime, String> {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| format!("cannot read the timestamp of {}: {error}", path.display()))
+}
+
+// ── Container ────────────────────────────────────────────────────────────────
+
+pub struct QuestDbContainer {
+    container: ContainerAsync<GenericImage>,
+    pub base_url: String,
+    pub host_port: u16,
+}
+
+impl QuestDbContainer {
+    pub async fn start() -> Result<Self, TestBinaryError> {
+        // Wait on the startup log rather than an HTTP probe. An HTTP wait has
+        // to resolve the mapped host port while the container is still
+        // starting, and Docker occasionally has not published the mapping yet,
+        // which fails the whole fixture with "does not expose port 9000/tcp".
+        // The log line needs no port, and readiness is confirmed by the `/ping`
+        // poll in the sink fixture anyway.
+        let container: ContainerAsync<GenericImage> = GenericImage::new(QUESTDB_IMAGE, QUESTDB_TAG)
+            .with_exposed_port(QUESTDB_HTTP_PORT.tcp())
+            .with_wait_for(WaitFor::message_on_stdout(QUESTDB_READY_LOG))
+            .with_mapped_port(0, QUESTDB_HTTP_PORT.tcp())
+            .with_container_name(fixtures::unique_container_name("questdb"))
+            .start()
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "QuestDbContainer".to_string(),
+                message: format!("Failed to start container: {e}"),
+            })?;
+
+        // The mapping can lag the container being up, so this retries rather
+        // than failing the fixture on the first miss.
+        let mut host_port = None;
+        for _ in 0..PORT_LOOKUP_ATTEMPTS {
+            if let Ok(ports) = container.ports().await
+                && let Some(port) = ports
+                    .map_to_host_port_ipv4(QUESTDB_HTTP_PORT)
+                    .or_else(|| ports.map_to_host_port_ipv6(QUESTDB_HTTP_PORT))
+            {
+                host_port = Some(port);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(PORT_LOOKUP_INTERVAL_MS)).await;
+        }
+        let host_port = host_port.ok_or_else(|| TestBinaryError::FixtureSetup {
+            fixture_type: "QuestDbContainer".to_string(),
+            message: format!(
+                "No host mapping for port {QUESTDB_HTTP_PORT} after {PORT_LOOKUP_ATTEMPTS} attempts"
+            ),
+        })?;
+
+        let base_url = format!("http://localhost:{host_port}");
+        info!("QuestDB container available at {base_url}");
+
+        Ok(Self {
+            container,
+            base_url,
+            host_port,
+        })
+    }
+
+    /// Connect string handed to the sink. QWP shares the REST port.
+    pub fn connection_string(&self) -> String {
+        format!("ws::addr=localhost:{};", self.host_port)
+    }
+
+    /// Freeze the server to simulate an outage.
+    ///
+    /// Pause rather than stop: the container was published with an ephemeral
+    /// host port (`-p 0:9000`), and Docker re-resolves that to a *different*
+    /// port when a stopped container is started again, which would strand both
+    /// the sink and this fixture on a dead address. Pausing leaves networking
+    /// untouched, so the port survives and the sink reconnects to the same
+    /// endpoint.
+    pub async fn simulate_outage(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .pause()
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to pause QuestDB container: {e}"),
+            })
+    }
+
+    pub async fn resume(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .unpause()
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to unpause QuestDB container: {e}"),
+            })
+    }
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
+
+pub fn create_http_client() -> HttpClient {
+    let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+    reqwest_middleware::ClientBuilder::new(client)
+        .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+        .build()
+}
+
+// ── Shared QuestDB operations ─────────────────────────────────────────────────
+
+pub trait QuestDbOps: Sync {
+    fn container(&self) -> &QuestDbContainer;
+    fn http_client(&self) -> &HttpClient;
+
+    /// Run SQL through the REST `/exec` endpoint and return the parsed JSON.
+    fn exec(
+        &self,
+        query: &str,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, TestBinaryError>> + Send {
+        async move {
+            let url = format!("{}/exec", self.container().base_url);
+            let response = self
+                .http_client()
+                .get(&url)
+                .query(&[("query", query)])
+                .send()
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to query QuestDB: {e}"),
+                })?;
+
+            let text = response.text().await.unwrap_or_default();
+            serde_json::from_str(&text).map_err(|e| TestBinaryError::InvalidState {
+                message: format!("QuestDB returned non-JSON for `{query}`: {e}. Body: {text}"),
+            })
+        }
+    }
+
+    /// Row count for `table`, or `None` while the table does not exist yet.
+    /// QWP auto-creates on first write, so "missing" is a normal early state
+    /// rather than a failure.
+    fn count_rows(
+        &self,
+        table: &str,
+    ) -> impl std::future::Future<Output = Result<Option<usize>, TestBinaryError>> + Send {
+        async move {
+            let value = self.exec(&format!("select count() from '{table}'")).await?;
+            if value.get("error").is_some() {
+                return Ok(None);
+            }
+            let count = value
+                .get("dataset")
+                .and_then(|rows| rows.get(0))
+                .and_then(|row| row.get(0))
+                .and_then(serde_json::Value::as_u64);
+            Ok(count.map(|count| count as usize))
+        }
+    }
+}
