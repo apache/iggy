@@ -97,7 +97,7 @@ pub use mysql::{
     MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
     MySqlSourceRawFixture, MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
-    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimeColumnFixture,
     MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
     MySqlSourceTinyintTrackingFixture,
 };

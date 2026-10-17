@@ -94,6 +94,7 @@ At startup the connector also reads the column from `information_schema` and ref
 - `TINYINT` holds at most 256 distinct values, which cannot be unique per row, and at display width 1 MySQL spells the type `BOOLEAN`, which reaches the connector as `true`/`false` with no ordered scalar form at all. The whole family is refused rather than the `tinyint(1)` spelling alone, because MySQL 8.0.19 and later drop the display width for unsigned columns while MariaDB keeps it, so the declared type cannot be trusted to reveal which case it is.
 - `BINARY`, `VARBINARY` and the `BLOB` family are carried as base64 text, which does not order the way the underlying bytes do. The cursor would be compared in one order while `ORDER BY` used another, and the base64 literal would be compared against raw bytes. `BINARY(16)` UUID keys are the common case here; track an auto-increment key or a `CHAR(36)` column instead.
 - `ENUM` and `SET` are sorted by MySQL on declaration index, not on the label the connector sees, so the two disagree whenever the members are not declared in alphabetical order. A bounded set of labels cannot be unique per row either.
+- `TIME` is either a time of day, which repeats every day, or a duration, which has no relation to insertion order, so neither is unique and monotonically increasing. Track a `DATETIME`, `TIMESTAMP` or auto-increment column instead.
 
 A table that does not exist yet at startup gets the same checks on the first poll after it is created, before anything is read from it. A rejected type then disables that table until the connector restarts instead of stopping the connector.
 
@@ -116,7 +117,7 @@ Safe under collation: zero-padded numbers (`'000017'`), ULIDs, KSUIDs, and anyth
 
 The collation decides uniqueness too. The default `utf8mb4_0900_ai_ci` is case- and accent-insensitive, so `'ORD-1a'` and `'ORD-1A'` compare **equal** and `> 'ORD-1a'` silently drops the other one. Declare text tracking columns with a `_bin` (or `_as_cs`) collation when the keys carry letters. A `_bin` column is still text: it is published and compared as text, not refused as binary.
 
-The connector cannot tell a safe column from an unsafe one without reading the data, so it warns at startup for every `CHAR`, `VARCHAR` or `TEXT` tracking column, naming the table, the column and its type. Temporal columns are compared as text too but are not warned about: their rendering is fixed-width, so their text order is their chronological order whatever the collation is.
+The connector cannot tell a safe column from an unsafe one without reading the data, so it warns at startup for every `CHAR`, `VARCHAR` or `TEXT` tracking column, naming the table, the column and its type. `DATE`, `DATETIME` and `TIMESTAMP` columns are compared as text too but are not warned about: their rendering is fixed-width, so their text order is their chronological order whatever the collation is. `TIME` is not, and is refused (see above).
 
 The warning is only raised for a column the connector can find in `information_schema`. A `custom_query` projecting a computed or aliased tracking column has no such row, so its comparison order is settled from the first result set at poll time and no startup warning is possible. Such a column cannot be combined with `delete_after_read` or `processed_column` (see [Delete After Read / Mark as Processed](#delete-after-read--mark-as-processed)).
 
@@ -490,7 +491,7 @@ The connector handles these MySQL types in JSON mode:
 | `BIT` | number (u64) |
 | `YEAR` | number (u16 → u64) |
 | `DATE` | string (YYYY-MM-DD) |
-| `TIME` | string (HH:MM:SS) |
+| `TIME` | string ([-]H:MM:SS[.ffffff], a signed interval with hours up to 838) |
 | `DATETIME` | string (YYYY-MM-DD HH:MM:SS[.ffffff]) |
 | `TIMESTAMP` | string (YYYY-MM-DD HH:MM:SS[.ffffff] UTC) |
 | `CHAR`, `VARCHAR`, `TINYTEXT`, `TEXT`, `MEDIUMTEXT`, `LONGTEXT` | string |

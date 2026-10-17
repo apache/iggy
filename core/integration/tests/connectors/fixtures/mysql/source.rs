@@ -1231,6 +1231,87 @@ impl TestFixture for MySqlSourceDecimalTrackingFixture {
     }
 }
 
+/// MySQL source fixture with a `TIME(6)` column holding values outside one day.
+///
+/// `TIME` is a signed interval of up to 838 hours, so a negative or multi-day value
+/// is as valid as a time of day. The tracking column is an auto-increment `id`.
+pub struct MySqlSourceTimeColumnFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceTimeColumnFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceTimeColumnFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceTimeColumnFixture {
+    const TABLE: &'static str = "test_time_column";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                elapsed TIME(6) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, elapsed: &str) {
+        let query = format!("INSERT INTO `{}` (elapsed) VALUES (?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(elapsed)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceTimeColumnFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture whose `custom_query` orders rows descending by a computed
 /// column that does not exist on the table.
 ///

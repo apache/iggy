@@ -17,7 +17,7 @@
 
 use async_trait::async_trait;
 use base64::Engine;
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{NaiveDate, NaiveDateTime};
 use humantime::Duration as HumanDuration;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
@@ -26,6 +26,7 @@ use iggy_connector_sdk::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use sqlx::mysql::types::MySqlTime;
 use sqlx::mysql::{MySqlColumn, MySqlDatabaseError, MySqlRow};
 use sqlx::types::BigDecimal;
 use sqlx::{Column, MySql, Pool, Row, Type, TypeInfo, mysql::MySqlPoolOptions};
@@ -269,6 +270,9 @@ fn unusable_tracking_type(data_type: &str) -> Option<&'static str> {
     }
     if data_type.eq_ignore_ascii_case("enum") || data_type.eq_ignore_ascii_case("set") {
         return Some("MySQL orders these by declaration index, not by label");
+    }
+    if data_type.eq_ignore_ascii_case("time") {
+        return Some("a time of day repeats daily and a duration does not follow insertion order");
     }
     None
 }
@@ -2235,9 +2239,9 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
                 .unwrap_or(serde_json::Value::Null))
         }
         "TIME" => {
-            let value: Option<NaiveTime> = row.try_get(column_index).map_err(to_err)?;
+            let value: Option<MySqlTime> = row.try_get(column_index).map_err(to_err)?;
             Ok(value
-                .map(|t| serde_json::Value::String(t.to_string()))
+                .map(|time| serde_json::Value::String(time.to_string()))
                 .unwrap_or(serde_json::Value::Null))
         }
         "DATETIME" => {
@@ -3974,7 +3978,8 @@ mod tests {
     fn given_declared_type_without_a_usable_cursor_should_be_rejected() {
         // Each family for a different reason: no scalar form at all, a domain too small
         // to hold one value per row, base64 text that does not order like the bytes it
-        // stands for, and labels MySQL sorts by declaration index instead. The whole
+        // stands for, labels MySQL sorts by declaration index instead, and a TIME that
+        // is a repeating time of day or a duration unrelated to insertion. The whole
         // `data_type` decides it, so a `tinyint(1) unsigned` that MariaDB reports with
         // its width and MySQL 8.0.19+ reports without one is rejected either way.
         for data_type in [
@@ -3987,6 +3992,8 @@ mod tests {
             "longblob",
             "enum",
             "set",
+            "time",
+            "TIME",
         ] {
             assert!(
                 unusable_tracking_type(data_type).is_some(),
@@ -4003,6 +4010,8 @@ mod tests {
             "smallint",
             "varchar",
             "timestamp",
+            "datetime",
+            "date",
             "decimal",
         ] {
             assert_eq!(

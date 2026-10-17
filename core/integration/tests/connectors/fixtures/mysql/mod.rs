@@ -32,7 +32,7 @@ pub use source::{
     MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceRawFixture,
     MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
-    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimeColumnFixture,
     MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
     MySqlSourceTinyintTrackingFixture,
 };

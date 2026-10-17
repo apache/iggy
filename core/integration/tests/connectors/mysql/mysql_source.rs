@@ -30,7 +30,7 @@ use crate::connectors::fixtures::{
     MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
     MySqlSourceRawFixture, MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
-    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimeColumnFixture,
     MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
     MySqlSourceTinyintTrackingFixture,
 };
@@ -2039,6 +2039,75 @@ async fn decimal_tracking_column_publishes_exact_values_and_strands_no_row(
     assert!(
         late_seen,
         "Row '{LATE}' was never published: the cursor was rounded past it. Saw {seen:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn time_column_publishes_negative_and_multi_day_values(
+    harness: &TestHarness,
+    fixture: MySqlSourceTimeColumnFixture,
+) {
+    // `chrono::NaiveTime` dropped the sign of a negative TIME and failed to decode
+    // anything from 24 hours up, which failed the whole batch on every poll.
+    const ROWS: [(&str, &str); 8] = [
+        ("09:15:00", "9:15:00"),
+        ("23:59:59.5", "23:59:59.5"),
+        ("00:00:00.000001", "0:00:00.000001"),
+        ("-01:30:00", "-1:30:00"),
+        ("24:00:00", "24:00:00"),
+        ("100:00:00.25", "100:00:00.25"),
+        ("838:59:59", "838:59:59"),
+        ("-838:59:59", "-838:59:59"),
+    ];
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for (stored, _) in ROWS {
+        fixture.insert_row(&pool, stored).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "time_column_consumer".try_into().unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                50,
+                true,
+            )
+            .await
+        {
+            for message in polled.messages {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&message.payload)
+                    && let Some(elapsed) = json.get("elapsed").and_then(|elapsed| elapsed.as_str())
+                {
+                    seen.push(elapsed.to_string());
+                }
+            }
+        }
+        if seen.len() >= ROWS.len() {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    pool.close().await;
+    let expected: Vec<&str> = ROWS.iter().map(|(_, published)| *published).collect();
+    assert_eq!(
+        seen, expected,
+        "Expected every TIME value published with its sign and full hour range"
     );
 }
 
