@@ -53,7 +53,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 use tokio_tungstenite::{
     Connector, client_async_tls_with_config, client_async_with_config,
     tungstenite::client::IntoClientRequest,
@@ -104,6 +103,10 @@ pub struct WebSocketClient {
     /// connection that drops without a `disconnect()` call leaves it clear, so
     /// that loss still heals.
     disconnected_by_caller: AtomicBool,
+    /// Serializes the caller intent: `Client::connect` holds it while it
+    /// clears `disconnected_by_caller`, and `Client::disconnect` holds it from
+    /// the moment it sets the flag until its teardown ends.
+    caller_intent: Mutex<()>,
     /// Set when `shutdown()` finishes its cleanup. The state turns `Shutdown`
     /// before that cleanup and stays there, so it cannot tell a finished
     /// shutdown from a cancelled one: a cancelled `shutdown()` leaves the
@@ -125,20 +128,35 @@ impl Default for WebSocketClient {
 #[async_trait]
 impl Client for WebSocketClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        // A sweep that started before the last disconnect ends at its next
-        // read of the flag. Joined, it would go on with the session that the
-        // disconnect reset, and hand its failure to this connect. Once
-        // another connect cleared the flag, its sweep is the one to join.
-        self.connect_coordinator
-            .wait_until_inactive(|| self.caller_disconnected())
-            .await;
-        self.disconnected_by_caller.store(false, Ordering::SeqCst);
+        {
+            // Held so that the flag cannot be cleared in the middle of a
+            // disconnect.
+            let _intent = self.caller_intent.lock().await;
+            // A sweep that started before the last disconnect ends at its next
+            // read of the flag. Joined, it would go on with the session that the
+            // disconnect reset, and hand its failure to this connect. Once
+            // another connect cleared the flag, its sweep is the one to join.
+            self.connect_coordinator
+                .wait_until_inactive(|| self.caller_disconnected())
+                .await;
+            self.disconnected_by_caller.store(false, Ordering::SeqCst);
+        }
         WebSocketClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        // Held until the teardown ends: a connect cannot clear the flag, and
+        // so start a sweep, while this disconnect resets the session.
+        let _intent = self.caller_intent.lock().await;
         self.disconnected_by_caller.store(true, Ordering::SeqCst);
         self.forget_session_credentials().await;
+        // A sweep in flight stops at its next check. Woken from its pause
+        // and waited for, it is over before the teardown, so no dial runs
+        // during it and none outlives this call.
+        self.connect_coordinator.interrupt();
+        self.connect_coordinator
+            .wait_until_inactive(|| self.caller_disconnected())
+            .await;
         WebSocketClient::disconnect_transport(self).await?;
         self.reset_vsr_session().await
     }
@@ -629,6 +647,7 @@ impl WebSocketClient {
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
             disconnected_by_caller: AtomicBool::new(false),
+            caller_intent: Mutex::new(()),
             shutdown_complete: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
@@ -766,7 +785,9 @@ impl WebSocketClient {
                         let remaining =
                             IggyDuration::new(std::time::Duration::from_micros(interval - elapsed));
                         info!("Trying to connect to the server in: {remaining}");
-                        sleep(remaining.get_duration()).await;
+                        self.connect_coordinator
+                            .pause(remaining.get_duration())
+                            .await;
                     }
                 }
 
@@ -1061,7 +1082,9 @@ impl WebSocketClient {
                 "Retrying to connect to server ({}/{}): {} in: {}",
                 retry_count, max_retries_str, self.config.server_address, interval_str
             );
-            sleep(self.config.reconnection.interval.get_duration()).await;
+            self.connect_coordinator
+                .pause(self.config.reconnection.interval.get_duration())
+                .await;
             return Err(IggyError::Disconnected); // signal to retry
         }
 
@@ -1219,11 +1242,15 @@ impl WebSocketClient {
         // Set before the link is taken: a reconnect sweep that installs a link
         // after this point sees `Shutdown` and drops it.
         self.set_state(ClientState::Shutdown).await;
+        self.connect_coordinator.interrupt();
 
         let link = self.link.lock().await.take();
         if let Some(link) = link {
             link.shutdown().await;
         }
+        // The sweep that this shutdown stops can still be dialing or signing
+        // in. Once it is over, nothing installs a link after the cleanup.
+        self.connect_coordinator.wait_until_inactive(|| true).await;
 
         self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Shutdown).await;
@@ -1485,6 +1512,8 @@ mod tests {
     };
     use std::str::FromStr;
     use std::time::Duration;
+    use tokio::task::JoinHandle;
+    use tokio::time::sleep;
 
     use futures_util::{SinkExt, StreamExt};
     use iggy_binary_protocol::codes::{GET_ME_CODE, JOIN_CONSUMER_GROUP_CODE, SEND_MESSAGES_CODE};
@@ -2588,5 +2617,107 @@ mod tests {
             }
         }
         assert_eq!(shutdowns, 1);
+    }
+
+    /// A client whose sweep waits a minute between two dials to an endpoint
+    /// that refuses them, with that sweep started and in its pause.
+    async fn sweep_in_a_retry_pause() -> (Arc<WebSocketClient>, JoinHandle<Result<(), IggyError>>) {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = dead_listener.local_addr().unwrap().to_string();
+        drop(dead_listener);
+        let client = Arc::new(
+            WebSocketClient::create(Arc::new(WebSocketClientConfig {
+                server_address: address,
+                reconnection: WebSocketClientReconnectionConfig {
+                    enabled: true,
+                    max_retries: None,
+                    interval: NonZeroIggyDuration::from_str("60s").unwrap(),
+                    reestablish_after: IggyDuration::from_str("0s").unwrap(),
+                },
+                ..Default::default()
+            }))
+            .unwrap(),
+        );
+        let sweep = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { WebSocketClient::connect(&client).await }
+        });
+        // The first dial is refused at once.
+        sleep(Duration::from_millis(100)).await;
+        (client, sweep)
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_during_a_retry_pause_returns_once_the_sweep_stops() {
+        let (client, sweep) = sweep_in_a_retry_pause().await;
+
+        tokio::time::timeout(Duration::from_secs(1), Client::disconnect(&*client))
+            .await
+            .expect("the disconnect must not wait out the pause")
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(50), sweep)
+            .await
+            .expect("no sweep may run after the disconnect")
+            .unwrap();
+        assert!(
+            matches!(result, Err(IggyError::NotConnected)),
+            "got {result:?}"
+        );
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_a_retry_pause_returns_once_the_sweep_stops() {
+        let (client, sweep) = sweep_in_a_retry_pause().await;
+
+        tokio::time::timeout(Duration::from_secs(1), Client::shutdown(&*client))
+            .await
+            .expect("the shutdown must not wait out the pause")
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(50), sweep)
+            .await
+            .expect("no sweep may run after the shutdown")
+            .unwrap();
+        assert!(
+            matches!(result, Err(IggyError::ClientShutdown)),
+            "got {result:?}"
+        );
+        assert_eq!(client.get_state().await, ClientState::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_connect_during_a_disconnect_dials_only_after_the_disconnect_returns() {
+        let (client, sweep) = sweep_in_a_retry_pause().await;
+        let address = client.current_server_address.lock().await.clone();
+        // The endpoint comes back, so the connect below can dial it.
+        let listener = tokio::net::TcpListener::bind(&address).await.unwrap();
+        // Held by the test: the teardown of the disconnect waits for it.
+        let link = client.link.lock().await;
+        let disconnect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::disconnect(&*client).await }
+        });
+        sleep(Duration::from_millis(50)).await;
+        let connect = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { Client::connect(&*client).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "a connect must not dial while the disconnect tears down"
+        );
+        drop(link);
+        disconnect.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("the connect dials once the disconnect returned")
+            .unwrap();
+        connect.abort();
+        assert!(matches!(sweep.await.unwrap(), Err(IggyError::NotConnected)));
     }
 }
