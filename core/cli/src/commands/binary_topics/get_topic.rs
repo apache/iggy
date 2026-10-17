@@ -317,5 +317,18 @@ mod tests {
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
+        let rows = output
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
+        for expected in [
+            "| | max_topic_size | 18446744073709551615 | default |",
+            "| | size_of_messages_required_to_save | 1048576 | default |",
+        ] {
+            assert!(
+                rows.iter().any(|row| row == expected),
+                "missing {expected}: {output}"
+            );
+        }
     }
 }
