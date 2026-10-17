@@ -1091,6 +1091,35 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[test]
+    fn should_construct_http_clients_from_fully_qualified_and_unicode_hostnames() {
+        for hostname in ["iggy.example.com.", "例子.example"] {
+            let connection_string = format!("iggy+http://user:secret@{hostname}:3000");
+            let client = IggyClient::from_connection_string(&connection_string);
+            assert!(
+                client.is_ok(),
+                "Failed to construct HTTP client for {hostname}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn should_construct_clients_from_ipv6_connection_strings() {
+        for authority in ["user:secret@[::1]", "iggypat-1234567890abcdef@[::1]"] {
+            for (scheme, port) in [
+                ("iggy", 8090),
+                ("iggy+tcp", 8090),
+                ("iggy+quic", 8080),
+                ("iggy+http", 3000),
+                ("iggy+ws", 8092),
+            ] {
+                let connection_string = format!("{scheme}://{authority}:{port}");
+                let client = IggyClient::from_connection_string(&connection_string);
+                assert!(client.is_ok(), "Failed to construct {scheme} client");
+            }
+        }
+    }
+
+    #[test]
     fn should_fail_with_empty_connection_string() {
         let value = "";
         let client = IggyClient::from_connection_string(value);
