@@ -206,10 +206,10 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             ));
         assertion = match self.durability {
             Durability::Persisted => assertion.stdout(contains(
-                "| durability                        | persisted            | explicit",
+                "|  durability                        | persisted            | explicit",
             )),
             Durability::Replicated => assertion.stdout(contains(
-                "| durability                        | replicated           | explicit",
+                "|  durability                        | replicated           | explicit",
             )),
         };
         assertion = match self.consumer_offset_durability {
@@ -227,27 +227,22 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         }
         let stdout = std::str::from_utf8(&assertion.get_output().stdout)
             .expect("CLI output should be UTF-8");
+        let rows = stdout
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
         for (index, partition_id) in self.partition_ids.iter().enumerate() {
-            let row = stdout
-                .lines()
-                .find(|line| line.contains(&format!("| {partition_id:<12} |")))
+            let prefix = format!("| | {partition_id} |");
+            let row = rows
+                .iter()
+                .find(|line| line.starts_with(&prefix))
                 .expect("partition should have a row in CLI output");
             if self.populate_partitions {
-                assert!(
-                    row.contains(&format!("| 1              | {index:<14} |")),
-                    "{row}"
-                );
-                assert!(row.contains(" B ") && !row.contains("| 0 B"), "{row}");
-                assert!(
-                    row.trim_end().ends_with(&format!("| {:<14} |", index + 1)),
-                    "{row}"
-                );
+                assert!(row.contains(&format!("| 1 | {index} |")), "{row}");
+                assert!(row.contains(" B |") && !row.contains("| 0 B |"), "{row}");
+                assert!(row.ends_with(&format!("| {} |", index + 1)), "{row}");
             } else {
-                assert!(
-                    row.contains("| 1              | 0              | 0 B"),
-                    "{row}"
-                );
-                assert!(row.trim_end().ends_with("| 0              |"), "{row}");
+                assert!(row.contains("| 1 | 0 | 0 B | 0 |"), "{row}");
             }
         }
     }
@@ -532,7 +527,7 @@ pub async fn should_show_persisted_durability_created_through_cli() {
         .stdout(contains("Messages count"))
         .stdout(contains("Source"))
         .stdout(contains(
-            "| durability                        | persisted            | explicit",
+            "|  durability                        | persisted            | explicit",
         ))
         .stdout(contains(
             "consumer_offset_durability        | replicated           | explicit",
@@ -544,7 +539,7 @@ pub async fn should_show_persisted_durability_created_through_cli() {
             "messages_required_to_save         | 1024                 | default",
         ));
     for partition in &details.partitions {
-        assertion = assertion.stdout(contains(format!("| {:<12} |", partition.id)));
+        assertion = assertion.stdout(contains(format!("|  {:<12} |", partition.id)));
     }
 
     client

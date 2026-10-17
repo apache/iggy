@@ -277,4 +277,45 @@ mod tests {
                 && line.chars().count() == option_lines[0].chars().count()
         }));
     }
+
+    #[test]
+    fn resolved_options_keep_full_width_values_and_sources() {
+        let mut fixture = topic();
+        fixture.options = ResourceOptions::from([
+            (
+                HeaderKey::try_from("max_topic_size").unwrap(),
+                OptionValue::derived(HeaderValue::from(u64::MAX)),
+            ),
+            (
+                HeaderKey::try_from("size_of_messages_required_to_save").unwrap(),
+                OptionValue::derived(HeaderValue::from(1_048_576_u64)),
+            ),
+            (
+                HeaderKey::try_from("messages_required_to_save").unwrap(),
+                OptionValue::derived(HeaderValue::from(1024_u32)),
+            ),
+            (
+                HeaderKey::try_from("preallocate_segments").unwrap(),
+                OptionValue::explicit(HeaderValue::from(false)),
+            ),
+            (
+                HeaderKey::try_from("durability").unwrap(),
+                OptionValue::explicit(HeaderValue::try_from("persisted").unwrap()),
+            ),
+            (
+                HeaderKey::try_from("consumer_offset_durability").unwrap(),
+                OptionValue::explicit(HeaderValue::try_from("replicated").unwrap()),
+            ),
+        ]);
+        let output = topic_table(&fixture).to_string();
+        for expected in [
+            "Option                            | Value",
+            "preallocate_segments              | false                | explicit",
+            "messages_required_to_save         | 1024                 | default",
+            "|  durability                        | persisted            | explicit",
+            "consumer_offset_durability        | replicated           | explicit",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+    }
 }
