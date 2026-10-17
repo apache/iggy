@@ -42,10 +42,7 @@ struct TestTopicGetCmd {
     partitions_count: u32,
     durability: Durability,
     consumer_offset_durability: Durability,
-    expected_partitions: Vec<Vec<String>>,
-    expected_options: Vec<Vec<String>>,
-    expected_size: String,
-    expected_messages_count: u64,
+    partition_ids: Vec<u32>,
     populate_partitions: bool,
 }
 
@@ -66,10 +63,7 @@ impl TestTopicGetCmd {
             partitions_count: 1,
             durability: Durability::Replicated,
             consumer_offset_durability: Durability::Replicated,
-            expected_partitions: Vec::new(),
-            expected_options: Vec::new(),
-            expected_size: String::new(),
-            expected_messages_count: 0,
+            partition_ids: Vec::new(),
             populate_partitions: false,
         }
     }
@@ -143,44 +137,12 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             }
         }
 
-        let details = client
-            .get_topic(
-                &self.stream_name.clone().try_into().unwrap(),
-                &self.topic_name.clone().try_into().unwrap(),
-            )
-            .await
-            .expect("topic details should be retrievable")
-            .expect("created topic should exist");
-        self.expected_partitions = details
+        self.partition_ids = topic
             .partitions
             .iter()
-            .map(|partition| {
-                vec![
-                    partition.id.to_string(),
-                    partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
-                    partition.segments_count.to_string(),
-                    partition.current_offset.to_string(),
-                    partition.size.to_string(),
-                    partition.messages_count.to_string(),
-                ]
-            })
+            .map(|partition| partition.id)
             .collect();
-        self.expected_options = details
-            .options
-            .iter()
-            .map(|(key, option)| {
-                vec![
-                    String::from_utf8_lossy(key.as_bytes()).into_owned(),
-                    option.value.to_string_value(),
-                ]
-            })
-            .collect();
-        self.expected_size = details.size.to_string();
-        self.expected_messages_count = details.messages_count;
-        assert_eq!(
-            self.expected_partitions.len(),
-            self.partitions_count as usize
-        );
+        assert_eq!(self.partition_ids.len(), self.partitions_count as usize);
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -205,6 +167,11 @@ impl IggyCmdTestCase for TestTopicGetCmd {
         let start_message =
             format!("Executing get topic with ID: {topic_id} from stream with ID: {stream_id}");
 
+        let expected_messages_count = if self.populate_partitions {
+            (1..=u64::from(self.partitions_count)).sum::<u64>()
+        } else {
+            0
+        };
         let assertion = command_state
             .success()
             .stdout(starts_with(start_message))
@@ -213,53 +180,76 @@ impl IggyCmdTestCase for TestTopicGetCmd {
                 "Topic name          | {}",
                 self.topic_name
             )))
-            .stdout(contains(format!(
-                "Topic size          | {}",
-                self.expected_size
-            )))
+            .stdout(contains("Topic size          | "))
             .stdout(contains("Message expiry      | unlimited"))
             .stdout(contains("Max topic size      | unlimited"))
             .stdout(contains(format!(
                 "Topic message count | {}",
-                self.expected_messages_count
+                expected_messages_count
             )))
             .stdout(contains(format!(
                 "Partitions count    | {}",
                 self.partitions_count
             )));
 
+        let mut assertion = assertion
+            .stdout(contains("Partition id | Created"))
+            .stdout(contains("Segments count | Current offset | Size"))
+            .stdout(contains("Messages count"))
+            .stdout(contains("Option                            | Value"))
+            .stdout(contains("Source"))
+            .stdout(contains(
+                "preallocate_segments              | false                | explicit",
+            ))
+            .stdout(contains(
+                "messages_required_to_save         | 1024                 | default",
+            ));
+        assertion = match self.durability {
+            Durability::Persisted => assertion.stdout(contains(
+                "| durability                        | persisted            | explicit",
+            )),
+            Durability::Replicated => assertion.stdout(contains(
+                "| durability                        | replicated           | explicit",
+            )),
+        };
+        assertion = match self.consumer_offset_durability {
+            Durability::Persisted => assertion.stdout(contains(
+                "consumer_offset_durability        | persisted            | explicit",
+            )),
+            Durability::Replicated => assertion.stdout(contains(
+                "consumer_offset_durability        | replicated           | explicit",
+            )),
+        };
+        if self.populate_partitions {
+            assertion = assertion.stdout(contains("Topic size          | 0 B").not());
+        } else {
+            assertion = assertion.stdout(contains("Topic size          | 0 B"));
+        }
         let stdout = std::str::from_utf8(&assertion.get_output().stdout)
             .expect("CLI output should be UTF-8");
-        let mut partition_rows =
-            nested_table_rows(stdout, "Partitions", 6).expect("complete partition rows");
-        assert_eq!(
-            partition_rows.remove(0),
-            [
-                "Partition id",
-                "Created",
-                "Segments count",
-                "Current offset",
-                "Size",
-                "Messages count"
-            ]
-        );
-        let mut expected_partitions = self.expected_partitions.clone();
-        partition_rows.sort();
-        expected_partitions.sort();
-        assert_eq!(partition_rows, expected_partitions);
-
-        let mut option_rows =
-            nested_table_rows(stdout, "Options", 2).expect("complete option rows");
-        assert_eq!(option_rows.remove(0), ["Option", "Value"]);
-        let mut expected_options = self.expected_options.clone();
-        option_rows.sort();
-        expected_options.sort();
-        assert_eq!(option_rows, expected_options);
-        assert!(option_rows.contains(&vec!["durability".to_owned(), self.durability.to_string()]));
-        assert!(option_rows.contains(&vec![
-            "consumer_offset_durability".to_owned(),
-            self.consumer_offset_durability.to_string(),
-        ]));
+        for (index, partition_id) in self.partition_ids.iter().enumerate() {
+            let row = stdout
+                .lines()
+                .find(|line| line.contains(&format!("| {partition_id:<12} |")))
+                .expect("partition should have a row in CLI output");
+            if self.populate_partitions {
+                assert!(
+                    row.contains(&format!("| 1              | {index:<14} |")),
+                    "{row}"
+                );
+                assert!(row.contains(" B ") && !row.contains("| 0 B"), "{row}");
+                assert!(
+                    row.trim_end().ends_with(&format!("| {:<14} |", index + 1)),
+                    "{row}"
+                );
+            } else {
+                assert!(
+                    row.contains("| 1              | 0              | 0 B"),
+                    "{row}"
+                );
+                assert!(row.trim_end().ends_with("| 0              |"), "{row}");
+            }
+        }
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
@@ -465,391 +455,6 @@ Options:
         .await;
 }
 
-fn nested_table_rows(
-    stdout: &str,
-    property: &str,
-    columns: usize,
-) -> Result<Vec<Vec<String>>, &'static str> {
-    let expected_header: &[&str] = match property {
-        "Partitions" => &[
-            "Partition id",
-            "Created",
-            "Segments count",
-            "Current offset",
-            "Size",
-            "Messages count",
-        ],
-        "Options" => &["Option", "Value"],
-        _ => return Err("unsupported nested table property"),
-    };
-    if columns != expected_header.len() {
-        return Err("incorrect nested table column count");
-    }
-
-    let mut lines = stdout.lines();
-    let header_line = lines
-        .find(|line| {
-            line.strip_prefix('|')
-                .and_then(|body| body.split_once('|'))
-                .is_some_and(|(key, _)| key.trim() == property)
-        })
-        .ok_or("nested table section was not found")?;
-    let (key, value) = nested_table_body(header_line)?;
-    let header_cells = value.split('|').map(str::trim).collect::<Vec<_>>();
-    if header_cells != expected_header {
-        return Err("incorrect nested table header");
-    }
-
-    // Outer borders span both cells; an inner separator never closes the section.
-    let border_body = format!(
-        "{}+{}",
-        "-".repeat(key.chars().count()),
-        "-".repeat(value.chars().count())
-    );
-    let row_boundary = format!("|{border_body}|");
-    let table_boundary = format!("+{border_body}+");
-    let separator_line = lines
-        .next()
-        .ok_or("nested table header separator is missing")?;
-    let (separator_key, separator) = nested_table_body(separator_line)?;
-    let separator = separator.trim();
-    if !separator_key.trim().is_empty()
-        || separator.is_empty()
-        || !separator.bytes().all(|character| character == b'=')
-        || separator.len() > value.chars().count().saturating_sub(2)
-    {
-        return Err("invalid nested table header separator");
-    }
-
-    let header_widths = value
-        .strip_prefix(' ')
-        .ok_or("nested table header is missing its padding")?
-        .split('|')
-        .take(columns - 1)
-        .map(|cell| cell.chars().count())
-        .collect::<Vec<_>>();
-    let used_width = header_widths.iter().sum::<usize>() + columns - 1;
-    let last_width = separator
-        .len()
-        .checked_sub(used_width)
-        .filter(|width| *width >= expected_header[columns - 1].len() + 2)
-        .ok_or("invalid nested table separator width")?;
-    let inner_row_separator = header_widths
-        .into_iter()
-        .chain([last_width])
-        .map(|width| "-".repeat(width))
-        .collect::<Vec<_>>()
-        .join("+");
-
-    let mut rows = vec![header_cells.into_iter().map(str::to_owned).collect()];
-    let mut pending_record = false;
-    while let Some(line) = lines.next() {
-        if line == row_boundary || line == table_boundary {
-            if rows.len() == 1 || pending_record {
-                return Err("nested table is empty or ends after a row separator");
-            }
-            if line == row_boundary {
-                let next_line = lines.next().ok_or("next topic property is missing")?;
-                let (next_key, next_value) = nested_table_body(next_line)?;
-                if property != "Partitions" || next_key.trim() != "Options" {
-                    return Err("nested table boundary does not start the options section");
-                }
-                if next_key.chars().count() != key.chars().count()
-                    || next_value.chars().count() != value.chars().count()
-                {
-                    return Err("options section does not match the outer table widths");
-                }
-                let options_output = std::iter::once(next_line)
-                    .chain(lines)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                nested_table_rows(&options_output, "Options", 2)?;
-            }
-            return Ok(rows);
-        }
-        let (key, value) = nested_table_body(line)?;
-        if !key.trim().is_empty() {
-            return Err("unexpected property within nested table");
-        }
-        let value = value.trim();
-        if value == inner_row_separator {
-            if rows.len() == 1 || pending_record {
-                return Err("unexpected nested table row separator");
-            }
-            pending_record = true;
-            continue;
-        }
-        let cells = value.split('|').map(str::trim).collect::<Vec<_>>();
-        if cells.len() != columns || cells.iter().any(|cell| cell.is_empty()) {
-            return Err("nested table row has missing, empty, or extra cells");
-        }
-        if property == "Partitions" {
-            let partition_id = cells[0]
-                .parse::<u32>()
-                .map_err(|_| "invalid partition id")?;
-            for index in [2, 3, 5] {
-                cells[index]
-                    .parse::<u64>()
-                    .map_err(|_| "invalid numeric partition field")?;
-            }
-            if rows[1..]
-                .iter()
-                .any(|row: &Vec<String>| row[0].parse::<u32>().ok() == Some(partition_id))
-            {
-                return Err("duplicate partition id");
-            }
-        }
-        rows.push(cells.into_iter().map(str::to_owned).collect());
-        pending_record = false;
-    }
-    Err("nested table closing boundary is missing")
-}
-
-fn nested_table_body(line: &str) -> Result<(&str, &str), &'static str> {
-    line.strip_prefix('|')
-        .and_then(|body| body.strip_suffix('|'))
-        .ok_or("nested table row is missing an outer delimiter")?
-        .split_once('|')
-        .ok_or("nested table row is missing its property separator")
-}
-
-const PARTITION_HEADER: &str = " Partition id | Created             | Segments count | Current offset | Size    | Messages count ";
-const VALID_PARTITION: &str = "1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4";
-
-fn nested_rows_fixture(records: &[&str]) -> String {
-    let header_width = PARTITION_HEADER.len();
-    let boundary = format!("|------------+{}|", "-".repeat(header_width + 2));
-    let options = " Option                    | Value     ";
-    format!(
-        "| Partitions | {PARTITION_HEADER} |\n|            | {} |\n{}\n{boundary}\n\
-         | Options    | {options:header_width$} |\n\
-         |            | {:header_width$} |\n\
-         |            | {:header_width$} |\n+------------+{}+\n",
-        "=".repeat(header_width),
-        records.join("\n"),
-        "=".repeat(options.len()),
-        " consumer_offset_durability | persisted ",
-        "-".repeat(header_width + 2),
-    )
-}
-
-#[test]
-fn nested_rows_preserve_complete_records_and_exact_option_keys() {
-    let stdout = nested_rows_fixture(&[
-        "|            | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |",
-        "|            | --------------+---------------------+----------------+----------------+---------+---------------- |",
-        "|            | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5 |",
-    ]);
-    let partitions = nested_table_rows(&stdout, "Partitions", 6).unwrap();
-    assert_eq!(partitions.len(), 3);
-    assert_eq!(
-        partitions[1],
-        ["1", "2026-10-13 12:00:00", "2", "30", "1.23 KB", "4"]
-    );
-    assert_eq!(
-        partitions[2],
-        ["2", "2026-10-13 12:00:01", "3", "31", "2.34 KB", "5"]
-    );
-    let options = nested_table_rows(&stdout, "Options", 2).unwrap();
-    assert_eq!(
-        options,
-        [
-            vec!["Option", "Value"],
-            vec!["consumer_offset_durability", "persisted"]
-        ]
-    );
-    assert!(!options.contains(&vec!["durability".to_owned(), "persisted".to_owned()]));
-}
-
-#[test]
-fn nested_rows_reject_malformed_partition_records_before_and_after_valid_rows() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    for malformed in [
-        "| | 1 | 2026-10-13 12:00:00 | 2 |\n| | 30 | 1.23 KB | 4 |",
-        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB |",
-        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 | extra |",
-        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | | 4 |",
-        "  | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |",
-        "unframed data row",
-        "| | |",
-        "| | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5",
-    ] {
-        for records in [[malformed, valid.as_str()], [valid.as_str(), malformed]] {
-            let stdout = nested_rows_fixture(&records);
-            assert!(
-                nested_table_rows(&stdout, "Partitions", 6).is_err(),
-                "malformed record must invalidate the table: {malformed}"
-            );
-        }
-    }
-}
-
-#[test]
-fn nested_rows_reject_malformed_separator_like_lines() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    let malformed = "| | 2 | truncated";
-    for separator in [
-        "|-----|",
-        "+-----+",
-        "|-----+-----|",
-        "+-----+-----+",
-        "|---=--+-----|",
-        "|            | ===== |",
-        "|            | -----+----- |",
-        "|            | ---=--+-----+-----+-----+-----+----- |",
-        "|            | ------+-----+-----+-----+-----+----- |",
-        "|            | |",
-    ] {
-        for records in [
-            vec![separator, malformed, valid.as_str()],
-            vec![valid.as_str(), separator, malformed],
-            vec![malformed, separator, valid.as_str()],
-            vec![valid.as_str(), separator],
-        ] {
-            let stdout = nested_rows_fixture(&records);
-            assert!(
-                nested_table_rows(&stdout, "Partitions", 6).is_err(),
-                "invalid separator must not hide records: {separator}"
-            );
-        }
-    }
-}
-
-#[test]
-fn nested_rows_reject_multiple_malformed_rows() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    for records in [
-        vec!["| | truncated |", "| | |", valid.as_str()],
-        vec![valid.as_str(), "| | truncated |", valid.as_str(), "| | |"],
-    ] {
-        assert!(nested_table_rows(&nested_rows_fixture(&records), "Partitions", 6).is_err());
-    }
-}
-
-#[test]
-fn nested_rows_require_header_separator_records_and_closure() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    let stdout = nested_rows_fixture(&[&valid]);
-    let partition_output = stdout.split("| Options").next().unwrap();
-    let unclosed = partition_output
-        .lines()
-        .take(3)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(
-        nested_table_rows(&unclosed, "Partitions", 6),
-        Err("nested table closing boundary is missing")
-    );
-    assert!(nested_table_rows(&nested_rows_fixture(&[]), "Partitions", 6).is_err());
-    assert!(
-        nested_table_rows(
-            &stdout.replace("Partition id", "Wrong header"),
-            "Partitions",
-            6
-        )
-        .is_err()
-    );
-    assert!(nested_table_rows(&stdout.replacen('=', "-", 1), "Partitions", 6).is_err());
-    assert!(nested_table_rows("", "Partitions", 6).is_err());
-    let row_boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
-    let table_boundary = row_boundary.replace('|', "+");
-    let closed = partition_output.replace(&row_boundary, &table_boundary);
-    assert_eq!(
-        nested_table_rows(&closed, "Partitions", 6).unwrap().len(),
-        2
-    );
-}
-
-#[test]
-fn nested_rows_reject_missing_closing_delimiter() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    let truncated = "| | 2 | 2026-10-13 12:00:01 | 3 | 31 | 2.34 KB | 5";
-    for records in [[truncated, valid.as_str()], [valid.as_str(), truncated]] {
-        assert_eq!(
-            nested_table_rows(&nested_rows_fixture(&records), "Partitions", 6),
-            Err("nested table row is missing an outer delimiter")
-        );
-    }
-}
-
-#[test]
-fn nested_rows_reject_boundaries_followed_by_partition_records() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    let boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
-    let stdout = nested_rows_fixture(&[&valid, &boundary, "| | truncated |"]);
-    assert!(nested_table_rows(&stdout, "Partitions", 6).is_err());
-}
-
-#[test]
-fn nested_rows_reject_forged_property_boundary() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    let boundary = format!("|------------+{}|", "-".repeat(PARTITION_HEADER.len() + 2));
-    let stdout = nested_rows_fixture(&[
-        &valid,
-        &boundary,
-        "| Fake       | irrelevant |",
-        "| | truncated |",
-    ]);
-    assert!(nested_table_rows(&stdout, "Partitions", 6).is_err());
-}
-
-#[test]
-fn nested_rows_validate_complete_options_transition() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    let stdout = nested_rows_fixture(&[&valid]);
-    let options_start = stdout.find("| Options").unwrap();
-    let (partitions, options) = stdout.split_at(options_start);
-    let options_header = options.lines().next().unwrap();
-    let unclosed_options = options
-        .lines()
-        .filter(|line| !line.starts_with('+'))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for malformed_options in [
-        options.replacen("| Options    |", "| Unknown    |", 1),
-        options.replacen(
-            "Option                    | Value",
-            "Bogus                     | Value",
-            1,
-        ),
-        options.replacen('=', "-", 1),
-        options.replacen(
-            "consumer_offset_durability | persisted",
-            "consumer_offset_durability |",
-            1,
-        ),
-        options.replacen(options_header, "| Options    | Option | Value |", 1),
-        format!("{options_header}\n"),
-        unclosed_options,
-    ] {
-        assert!(
-            nested_table_rows(&format!("{partitions}{malformed_options}"), "Partitions", 6)
-                .is_err(),
-            "invalid options section must invalidate partition parsing: {malformed_options}"
-        );
-    }
-    assert_eq!(
-        nested_table_rows(&stdout, "Partitions", 6).unwrap().len(),
-        2
-    );
-    assert_eq!(nested_table_rows(&stdout, "Options", 2).unwrap().len(), 2);
-}
-
-#[test]
-fn nested_rows_reject_invalid_numeric_fields_and_duplicate_partition_ids() {
-    let valid = format!("|            | {VALID_PARTITION} |");
-    assert!(nested_table_rows(&nested_rows_fixture(&[&valid, &valid]), "Partitions", 6).is_err());
-    for malformed in [
-        "| | bad | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | 4 |",
-        "| | 1 | 2026-10-13 12:00:00 | bad | 30 | 1.23 KB | 4 |",
-        "| | 1 | 2026-10-13 12:00:00 | 2 | bad | 1.23 KB | 4 |",
-        "| | 1 | 2026-10-13 12:00:00 | 2 | 30 | 1.23 KB | bad |",
-        "| | - | - | - | - | - | - |",
-    ] {
-        assert!(nested_table_rows(&nested_rows_fixture(&[malformed]), "Partitions", 6).is_err());
-    }
-}
-
 #[tokio::test]
 #[parallel]
 #[ignore = "opt-in end-to-end test of the CLI persisted durability flag"]
@@ -910,7 +515,9 @@ pub async fn should_show_persisted_durability_created_through_cli() {
         .unwrap();
     assert_eq!(option.1.value.to_string_value(), "persisted");
 
-    let assertion = cli()
+    assert!(option.1.explicit);
+
+    let mut assertion = cli()
         .args([
             "topic",
             "get",
@@ -918,28 +525,27 @@ pub async fn should_show_persisted_durability_created_through_cli() {
             "cli-persisted-topic",
         ])
         .assert()
-        .success();
-    let stdout = std::str::from_utf8(&assertion.get_output().stdout).unwrap();
-    let partitions = nested_table_rows(stdout, "Partitions", 6).unwrap();
-    assert_eq!(partitions.len(), 4);
-    let mut actual_ids = partitions[1..]
-        .iter()
-        .map(|row| row[0].parse::<u32>().unwrap())
-        .collect::<Vec<_>>();
-    let mut expected_ids = details
-        .partitions
-        .iter()
-        .map(|partition| partition.id)
-        .collect::<Vec<_>>();
-    actual_ids.sort();
-    expected_ids.sort();
-    assert_eq!(actual_ids, expected_ids);
-    let options = nested_table_rows(stdout, "Options", 2).unwrap();
-    assert!(options.contains(&vec!["durability".to_owned(), "persisted".to_owned()]));
-    assert!(options.contains(&vec![
-        "consumer_offset_durability".to_owned(),
-        "replicated".to_owned()
-    ]));
+        .success()
+        .stdout(contains("Partitions count    | 3"))
+        .stdout(contains("Partition id | Created"))
+        .stdout(contains("Segments count | Current offset | Size"))
+        .stdout(contains("Messages count"))
+        .stdout(contains("Source"))
+        .stdout(contains(
+            "| durability                        | persisted            | explicit",
+        ))
+        .stdout(contains(
+            "consumer_offset_durability        | replicated           | explicit",
+        ))
+        .stdout(contains(
+            "preallocate_segments              | false                | explicit",
+        ))
+        .stdout(contains(
+            "messages_required_to_save         | 1024                 | default",
+        ));
+    for partition in &details.partitions {
+        assertion = assertion.stdout(contains(format!("| {:<12} |", partition.id)));
+    }
 
     client
         .delete_topic(

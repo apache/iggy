@@ -138,11 +138,17 @@ fn topic_table(topic: &TopicDetails) -> Table {
     if !topic.options.is_empty() {
         let mut options_table = Table::new();
         options_table.load_style(ASCII_NO_BORDERS);
-        options_table.set_header(vec!["Option", "Value"]);
+        options_table.set_header(vec!["Option", "Value", "Source"]);
         for (key, option) in &topic.options {
             options_table.add_row(vec![
                 String::from_utf8_lossy(key.as_bytes()).into_owned(),
                 option.value.to_string_value(),
+                if option.explicit {
+                    "explicit"
+                } else {
+                    "default"
+                }
+                .to_owned(),
             ]);
         }
         table.add_row(vec!["Options", options_table.to_string().as_str()]);
@@ -247,11 +253,28 @@ mod tests {
             .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
             .collect::<Vec<_>>();
         assert!(
-            rows.contains(&"| Options | Option | Value |".to_owned()),
+            rows.contains(&"| Options | Option | Value | Source |".to_owned()),
             "{output}"
         );
-        assert!(rows.contains(&format!("| | future_option | {} |", long_value.trim())));
-        assert!(rows.contains(&"| | preallocate_segments | false |".to_owned()));
-        assert!(rows.contains(&"| | messages_required_to_save | 17 |".to_owned()));
+        assert!(rows.contains(&format!(
+            "| | future_option | {} | explicit |",
+            long_value.trim()
+        )));
+        assert!(rows.contains(&"| | preallocate_segments | false | default |".to_owned()));
+        assert!(rows.contains(&"| | messages_required_to_save | 17 | explicit |".to_owned()));
+        let option_lines = output
+            .lines()
+            .filter(|line| {
+                line.contains("future_option")
+                    || line.contains("preallocate_segments")
+                    || line.contains("messages_required_to_save")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(option_lines.len(), 3);
+        assert!(output.contains(&long_value));
+        assert!(option_lines.iter().all(|line| {
+            line.chars().filter(|&character| character == '|').count() == 5
+                && line.chars().count() == option_lines[0].chars().count()
+        }));
     }
 }
