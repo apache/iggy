@@ -1680,8 +1680,6 @@ impl MySqlSource {
                     if !batch.messages.is_empty() {
                         self.cursor_regressions.lock().await.remove(table);
                     }
-                    // A full batch means the LIMIT was hit, so more rows are waiting.
-                    any_batch_full |= batch.messages.len() as u32 >= batch_size;
                     batches.push(batch);
                 }
                 Err(
@@ -1827,6 +1825,10 @@ impl MySqlSource {
                 });
             }
 
+            // A full batch means the LIMIT was hit, so more rows are waiting. Counted
+            // only once staged: a discarded batch moved no offset, so skipping the
+            // pause would re-fetch the same rows in a tight loop.
+            any_batch_full |= batch.messages.len() as u32 >= batch_size;
             total_processed += batch.messages.len() as u64;
             messages.append(&mut batch.messages);
             if let Some(offset) = batch.max_offset {
