@@ -499,7 +499,7 @@ The connector handles these MySQL types in JSON mode:
 | `BINARY`, `VARBINARY`, `TINYBLOB`, `BLOB`, `MEDIUMBLOB`, `LONGBLOB` | base64 string |
 | `JSON` | object |
 | `NULL` | null |
-| Unknown | string (text fallback), or base64 string (binary fallback) |
+| Unknown | string (text fallback), or base64 string (binary fallback). A non-null value that decodes as neither (e.g. `GEOMETRY`) fails the batch and stalls the table until the value is cleared or the column is left out of a `custom_query` |
 
 > **TIMESTAMP suffix:** `TIMESTAMP` is the only type that reaches the payload with a zone suffix, because it is the only one that arrives as a zoned value rather than a naive one. The cursor and the primary-key binding are written without it (see [Tracking Column Requirements](#tracking-column-requirements)); the suffix is the payload's alone.
 >

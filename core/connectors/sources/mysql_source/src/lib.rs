@@ -2301,11 +2301,12 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
                     })
                     .unwrap_or(serde_json::Value::Null));
             }
-            error!(
-                "Column '{column_name}' has unsupported MySQL type '{type_name}', \
-                 returning null"
-            );
-            Ok(serde_json::Value::Null)
+            // Publishing null here would advance the cursor past a value that was
+            // never delivered, and delete_after_read would then drop the source row.
+            Err(Error::InvalidRecordValue(format!(
+                "column '{column_name}' has unsupported MySQL type '{type_name}' \
+                 that decodes as neither text nor bytes"
+            )))
         }
     }
 }
