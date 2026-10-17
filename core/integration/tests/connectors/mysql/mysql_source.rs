@@ -18,12 +18,16 @@
 use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingDeleteAtPollFixture,
+    MySqlOps, MySqlSourceAliasedTextTrackingFixture, MySqlSourceAliasedTrackingFixture,
+    MySqlSourceBinCollationTrackingAtPollFixture, MySqlSourceBinCollationTrackingAtStartupFixture,
+    MySqlSourceBinCollationTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
+    MySqlSourceComputedBinaryTrackingFixture, MySqlSourceComputedTrackingDeleteAtPollFixture,
     MySqlSourceComputedTrackingDeleteAtStartupFixture, MySqlSourceComputedTrackingFixture,
     MySqlSourceDecimalTrackingFixture, MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture,
     MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture,
-    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceLateBinaryTrackingFixture, MySqlSourceLateSetTrackingFixture,
+    MySqlSourceLateTrackingTypeFixture, MySqlSourceMarkFixture,
+    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
     MySqlSourceRawFixture, MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
     MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,
@@ -990,9 +994,11 @@ async fn descending_custom_query_publishes_nothing_and_leaves_rows_in_place(
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
-    for i in 0..TEST_MESSAGE_COUNT {
-        fixture.insert_row(&pool, &format!("row_{i}")).await;
-    }
+    // One transaction, so no poll can read a lone row, which is trivially in order.
+    let names: Vec<String> = (0..TEST_MESSAGE_COUNT)
+        .map(|i| format!("row_{i}"))
+        .collect();
+    fixture.insert_rows(&pool, &names).await;
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -1142,9 +1148,10 @@ async fn text_tracking_column_keeps_reading_values_below_the_numeric_maximum(
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
-    for code in SEEDED {
-        fixture.insert_row(&pool, code).await;
-    }
+    // Seeded in one transaction: the codes are not in collation order, so a poll
+    // landing between separate inserts would rightly strand the later ones below
+    // its cursor, which is the hazard this test is not about.
+    fixture.insert_rows(&pool, &SEEDED).await;
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -1209,10 +1216,11 @@ async fn text_tracking_column_keeps_reading_values_below_the_numeric_maximum(
 )]
 async fn first_fetch_on_an_unresolved_table_discards_a_batch_its_filter_disagreed_with(
     harness: &TestHarness,
-    fixture: MySqlSourceTextTrackingFixture,
+    fixture: MySqlSourceAliasedTextTrackingFixture,
 ) {
-    // The table is created after the runtime is up, so the startup probe defers and
-    // the first poll builds its filter from the unresolved kind: `code > 0`, bare.
+    // The tracking column is a custom_query alias the table does not declare, so
+    // `information_schema` cannot type it and the first poll builds its filter from
+    // the unresolved kind: `code > 0`, bare.
     // MySQL coerces the column to a double for that comparison, which drops '0abc',
     // while ORDER BY sorts by collation, where '0abc' precedes '500'. The result set
     // then reports VARCHAR, so the filter that ran is not the one the corrected kind
@@ -1290,7 +1298,9 @@ async fn first_fetch_on_an_unresolved_table_discards_a_batch_its_filter_disagree
         .collect_logs();
     let logs = format!("{stdout}{stderr}");
     assert!(
-        logs.contains("tracking_column 'code' type differs from the one detected at startup"),
+        logs.contains(
+            "tracking_column 'cursor_code' type differs from the one detected at startup"
+        ),
         "Expected the first batch to be discarded for filtering on a stale comparison order"
     );
 }
@@ -1836,11 +1846,11 @@ async fn tinyint_tracking_value_under_a_custom_query_publishes_nothing(
 ) {
     // The startup gate judges the column the table declares, so it never sees this
     // one: the query aliases `is_active` to a name the table does not have, and the
-    // probe defers to the result set. sqlx names a width-1 tinyint `BOOLEAN` and
-    // decodes it to true/false, which has no ordered scalar form, so the value is
-    // only refused once the row is in hand. The batch must fail before anything is
-    // published, since a cursor of "true" would advance nothing and re-read the same
-    // rows forever.
+    // probe defers to the result set. sqlx names a width-1 tinyint `BOOLEAN`, which
+    // has too few values to order rows by, so the batch must fail before anything is
+    // published: a cursor of "true" would advance nothing and re-read the same rows
+    // forever. The type belongs to the query rather than to a row, so no row can fix
+    // it and the table is disabled.
     let client = harness.root_client().await.unwrap();
     let pool = fixture.create_pool().await.expect("Failed to create pool");
 
@@ -1885,15 +1895,19 @@ async fn tinyint_tracking_value_under_a_custom_query_publishes_nothing(
 
     // A connector that failed to start publishes nothing either, and the startup gate
     // rejecting the aliased column would be the wrong reason for this to pass: only
-    // the per-row check names the column and the row it stalled on.
+    // the result-set check names the type the query returned.
     let (stdout, stderr) = harness
         .connectors_runtime()
         .expect("connectors runtime should be running")
         .collect_logs();
     let logs = format!("{stdout}{stderr}");
     assert!(
-        logs.contains("has no usable value for tracking_column 'flag'"),
-        "Expected the row loop to refuse the BOOLEAN tracking value, not open() to fail"
+        logs.contains("tracking_column 'flag' has type 'BOOLEAN' in the result set"),
+        "Expected the result-set check to refuse the BOOLEAN tracking column, not open() to fail"
+    );
+    assert!(
+        logs.contains("Table disabled until restart"),
+        "Expected the table to be disabled, since no row can change the column's type"
     );
 }
 
@@ -2025,5 +2039,198 @@ async fn decimal_tracking_column_publishes_exact_values_and_strands_no_row(
     assert!(
         late_seen,
         "Row '{LATE}' was never published: the cursor was rounded past it. Saw {seen:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn bin_collation_tracking_column_publishes_text_and_every_row(
+    harness: &TestHarness,
+    fixture: MySqlSourceBinCollationTrackingAtStartupFixture,
+) {
+    bin_collation_tracking_publishes_text_and_every_row(harness, &fixture).await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn bin_collation_tracking_column_on_a_late_table_publishes_text_and_every_row(
+    harness: &TestHarness,
+    fixture: MySqlSourceBinCollationTrackingAtPollFixture,
+) {
+    bin_collation_tracking_publishes_text_and_every_row(harness, &fixture).await;
+}
+
+/// A `_bin` text column is reported as `VARBINARY` in result metadata. Decoded as
+/// bytes, every value is published as base64 and the cursor becomes base64 text,
+/// which MySQL compares against the column's characters: `T1JELTFh` (from `ORD-1a`)
+/// sorts above `ORD-3a`, so the row inserted after the first batch is never read.
+/// Refusing the column as binary would publish nothing at all.
+async fn bin_collation_tracking_publishes_text_and_every_row<const TABLE_AT_STARTUP: bool>(
+    harness: &TestHarness,
+    fixture: &MySqlSourceBinCollationTrackingFixture<TABLE_AT_STARTUP>,
+) {
+    const SEEDED: [&str; 2] = ["ORD-1a", "ORD-2a"];
+    const LATE: &str = "ORD-3a";
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    if !TABLE_AT_STARTUP {
+        MySqlSourceBinCollationTrackingFixture::<TABLE_AT_STARTUP>::create_table(&pool)
+            .await
+            .expect("Failed to create table");
+    }
+    for code in SEEDED {
+        fixture.insert_row(&pool, code).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "bin_collation_consumer".try_into().unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut inserted_late = false;
+    for _ in 0..(POLL_ATTEMPTS * 2) {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                50,
+                true,
+            )
+            .await
+        {
+            for message in polled.messages {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&message.payload)
+                    && let Some(code) = json.get("code").and_then(|code| code.as_str())
+                {
+                    seen.push(code.to_string());
+                }
+            }
+        }
+
+        // Inserted once the seeded rows are out, so it is read with a stored cursor.
+        if !inserted_late && SEEDED.iter().all(|code| seen.iter().any(|s| s == code)) {
+            fixture.insert_row(&pool, LATE).await;
+            inserted_late = true;
+        }
+        if inserted_late && seen.iter().any(|code| code == LATE) {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    pool.close().await;
+    assert!(
+        inserted_late,
+        "Expected the seeded codes {SEEDED:?} to be published as text, got {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|code| code == LATE),
+        "Row '{LATE}' was never published, so the cursor did not compare as text. Saw {seen:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn binary_tracking_column_on_a_late_table_publishes_nothing_and_disables_it(
+    harness: &TestHarness,
+    fixture: MySqlSourceLateBinaryTrackingFixture,
+) {
+    late_unordered_tracking_type_disables_the_table(
+        harness,
+        &fixture,
+        "binary values are compared as base64 text",
+    )
+    .await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn set_tracking_column_on_a_late_table_publishes_nothing_and_disables_it(
+    harness: &TestHarness,
+    fixture: MySqlSourceLateSetTrackingFixture,
+) {
+    late_unordered_tracking_type_disables_the_table(
+        harness,
+        &fixture,
+        "MySQL orders these by declaration index",
+    )
+    .await;
+}
+
+/// `open()` refuses these types on a table that exists, so a table created after
+/// startup must be held to the same rule before its first batch moves the cursor.
+async fn late_unordered_tracking_type_disables_the_table<const SET_COLUMN: bool>(
+    harness: &TestHarness,
+    fixture: &MySqlSourceLateTrackingTypeFixture<SET_COLUMN>,
+    reason: &str,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+    for seq in ["a", "b", "c"] {
+        fixture.insert_row(&pool, seq).await;
+    }
+
+    let received = count_published_messages(harness, "late_tracking_type_consumer").await;
+    pool.close().await;
+
+    assert_eq!(received, 0, "Expected no messages, got {received}");
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime should be running")
+        .collect_logs();
+    let logs = format!("{stdout}{stderr}");
+    assert!(
+        logs.contains(reason),
+        "Expected the late table's tracking column to be refused with '{reason}'"
+    );
+    assert!(
+        logs.contains("Table disabled until restart"),
+        "Expected the table to be disabled, since its column type cannot change by itself"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn computed_binary_tracking_column_publishes_nothing_and_disables_the_table(
+    harness: &TestHarness,
+    fixture: MySqlSourceComputedBinaryTrackingFixture,
+) {
+    // `information_schema` has no column to type, so only the result set can show
+    // that the cursor would be taken from bytes.
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let received = count_published_messages(harness, "computed_binary_consumer").await;
+    pool.close().await;
+
+    assert_eq!(received, 0, "Expected no messages, got {received}");
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime should be running")
+        .collect_logs();
+    let logs = format!("{stdout}{stderr}");
+    assert!(
+        logs.contains("tracking_column 'seq' has type 'VARBINARY' in the result set"),
+        "Expected the result-set check to refuse the computed binary tracking column"
+    );
+    assert!(
+        logs.contains("Table disabled until restart"),
+        "Expected the table to be disabled, since the query cannot correct itself"
     );
 }

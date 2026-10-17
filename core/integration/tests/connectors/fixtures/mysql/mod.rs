@@ -20,12 +20,16 @@ mod source;
 
 pub use container::{MySqlOps, MySqlSourceOps};
 pub use source::{
-    MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
-    MySqlSourceComputedTrackingDeleteAtPollFixture,
+    MySqlSourceAliasedTextTrackingFixture, MySqlSourceAliasedTrackingFixture,
+    MySqlSourceBinCollationTrackingAtPollFixture, MySqlSourceBinCollationTrackingAtStartupFixture,
+    MySqlSourceBinCollationTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
+    MySqlSourceComputedBinaryTrackingFixture, MySqlSourceComputedTrackingDeleteAtPollFixture,
     MySqlSourceComputedTrackingDeleteAtStartupFixture, MySqlSourceComputedTrackingFixture,
     MySqlSourceDecimalTrackingFixture, MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture,
     MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture,
-    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceLateBinaryTrackingFixture, MySqlSourceLateSetTrackingFixture,
+    MySqlSourceLateTrackingTypeFixture, MySqlSourceMarkFixture,
+    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceRawFixture,
     MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
     MySqlSourceReusedKeyQueueFixture, MySqlSourceTextTrackingFixture,

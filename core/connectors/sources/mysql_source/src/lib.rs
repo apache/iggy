@@ -26,9 +26,9 @@ use iggy_connector_sdk::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use sqlx::mysql::{MySqlDatabaseError, MySqlRow};
+use sqlx::mysql::{MySqlColumn, MySqlDatabaseError, MySqlRow};
 use sqlx::types::BigDecimal;
-use sqlx::{Column, MySql, Pool, Row, TypeInfo, mysql::MySqlPoolOptions};
+use sqlx::{Column, MySql, Pool, Row, Type, TypeInfo, mysql::MySqlPoolOptions};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -85,6 +85,8 @@ pub struct MySqlSource {
     last_batch_full: AtomicBool,
     poisoned_tables: Mutex<HashSet<String>>,
     tracking_kinds: Mutex<HashMap<String, OffsetKind>>,
+    /// Tables that did not exist at `open()`, so their tracking column is still unjudged.
+    deferred_tracking_checks: Mutex<HashSet<String>>,
     polls: AtomicU64,
     cursor_regressions: Mutex<HashMap<String, u32>>,
 }
@@ -139,6 +141,9 @@ enum FetchError {
     /// row is there, so it can clear without a config change.
     CursorRegression(String),
     MissingTrackingColumn(String),
+    /// The result set types the tracking column as something `open()` would have
+    /// refused. A property of the query rather than of a row, so it cannot clear.
+    UnusableTrackingType(String),
     UnusableTrackingValue(String),
     StaleOffsetKind(String),
     Other(Error),
@@ -147,6 +152,28 @@ enum FetchError {
 impl From<Error> for FetchError {
     fn from(error: Error) -> Self {
         FetchError::Other(error)
+    }
+}
+
+/// What the schema probe learned about a table's tracking column.
+enum TrackingColumnProbe {
+    TableMissing,
+    Resolved(OffsetKind),
+}
+
+/// Why the schema probe produced no kind.
+enum ProbeError {
+    /// The probe could not ask, which says nothing about the table.
+    Query(String),
+    /// The column cannot back a cursor, or the configuration cannot work with it.
+    Rejected(String),
+}
+
+impl From<ProbeError> for Error {
+    fn from(error: ProbeError) -> Self {
+        match error {
+            ProbeError::Query(reason) | ProbeError::Rejected(reason) => Error::InitError(reason),
+        }
     }
 }
 
@@ -281,8 +308,47 @@ fn observed_tracking_kind(row: &MySqlRow, tracking_column: &str) -> Option<Offse
     row.columns()
         .iter()
         .find(|column| column.name().eq_ignore_ascii_case(tracking_column))
-        .map(|column| offset_kind_for_type_name(column.type_info().name()))
+        .map(|column| {
+            if is_bin_collated_text(column) {
+                OffsetKind::Lexical
+            } else {
+                offset_kind_for_type_name(column.type_info().name())
+            }
+        })
         .filter(|kind| *kind != OffsetKind::Unknown)
+}
+
+/// Refuses a tracking column the result set types as `open()` would have refused it
+/// in `information_schema`. A table created after startup and a `custom_query`
+/// computing the column both reach the first batch with nothing else having judged
+/// the type, and the cursor must not be taken from it.
+fn ensure_tracking_type_usable(row: &MySqlRow, tracking_column: &str) -> Result<(), FetchError> {
+    let Some(column) = row
+        .columns()
+        .iter()
+        .find(|column| column.name().eq_ignore_ascii_case(tracking_column))
+    else {
+        return Ok(());
+    };
+    match unusable_result_type(column) {
+        Some(reason) => Err(FetchError::UnusableTrackingType(format!(
+            "tracking_column '{tracking_column}' has type '{}' in the result set: {reason}",
+            column.type_info().name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `unusable_tracking_type` for a result-set column, which sqlx names from the wire
+/// protocol rather than as `information_schema` spells the type.
+fn unusable_result_type(column: &MySqlColumn) -> Option<&'static str> {
+    if is_bin_collated_text(column) {
+        return None;
+    }
+    match column.type_info().name() {
+        "BOOLEAN" | "TINYINT UNSIGNED" => unusable_tracking_type("tinyint"),
+        type_name => unusable_tracking_type(type_name),
+    }
 }
 
 /// `Clone` so the passing case, which is every batch, walks the names without collecting.
@@ -594,7 +660,9 @@ impl Source for MySqlSource {
 
         self.validate_pending_cleanup()?;
         self.connect().await?;
-        *self.tracking_kinds.get_mut() = self.resolve_tracking_columns().await?;
+        let (kinds, deferred) = self.resolve_tracking_columns().await?;
+        *self.tracking_kinds.get_mut() = kinds;
+        *self.deferred_tracking_checks.get_mut() = deferred;
         self.validate_cleanup_keys().await?;
 
         info!(
@@ -791,6 +859,7 @@ impl MySqlSource {
             last_batch_full: AtomicBool::new(false),
             poisoned_tables: Mutex::new(HashSet::new()),
             tracking_kinds: Mutex::new(HashMap::new()),
+            deferred_tracking_checks: Mutex::new(HashSet::new()),
             polls: AtomicU64::new(0),
             cursor_regressions: Mutex::new(HashMap::new()),
         }
@@ -837,147 +906,167 @@ impl MySqlSource {
     /// Fail fast if a tracking column can't yield a stable, ordered scalar
     /// cursor. `value_as_string` drops NULL, tinyint(1) (decoded as BOOLEAN),
     /// and JSON to `None`, which silently stalls offset advancement and re-reads
-    /// rows every cycle.
-    async fn resolve_tracking_columns(&self) -> Result<HashMap<String, OffsetKind>, Error> {
-        // Whether the connector owns the query, and can therefore hold the schema to
-        // what that query will do with it.
-        let strict = self.config.custom_query.is_none();
+    /// rows every cycle. Also returns the tables that do not exist yet, whose
+    /// columns `poll_tables` probes once they appear.
+    async fn resolve_tracking_columns(
+        &self,
+    ) -> Result<(HashMap<String, OffsetKind>, HashSet<String>), Error> {
         let pool = self.get_pool()?;
         let tracking_column = self.tracking_column();
         let mut kinds = HashMap::with_capacity(self.config.tables.len());
+        let mut deferred = HashSet::new();
 
         for table in &self.config.tables {
-            let (schema, table_name) = table
-                .split_once('.')
-                .map(|(schema, name)| (schema.to_string(), name.to_string()))
-                .unwrap_or_else(|| (String::new(), table.clone()));
-
-            let row = sqlx::query(
-                "SELECT is_nullable, data_type, column_type \
-                 FROM information_schema.columns \
-                 WHERE table_schema = IF(? = '', DATABASE(), ?) \
-                   AND table_name = ? AND column_name = ?",
-            )
-            .bind(&schema)
-            .bind(&schema)
-            .bind(&table_name)
-            .bind(tracking_column)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| {
-                Error::InitError(format!(
-                    "failed to probe schema for tracking_column '{tracking_column}' on table '{table}': {e}"
-                ))
-            })?;
-
-            let Some(row) = row else {
-                // A missing columns row means either the table doesn't exist yet
-                // or the column is absent. Only the latter is a misconfiguration:
-                // a table created after the connector starts is legitimate, so
-                // defer validation rather than permanently disabling the source.
-                let table_exists = sqlx::query(
-                    "SELECT 1 FROM information_schema.tables \
-                     WHERE table_schema = IF(? = '', DATABASE(), ?) \
-                       AND table_name = ?",
-                )
-                .bind(&schema)
-                .bind(&schema)
-                .bind(&table_name)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| {
-                    Error::InitError(format!("failed to probe existence of table '{table}': {e}"))
-                })?
-                .is_some();
-
-                if !table_exists {
+            match self.probe_tracking_column(pool, table).await? {
+                TrackingColumnProbe::Resolved(kind) => {
+                    kinds.insert(table.clone(), kind);
+                }
+                // A table created after the connector starts is legitimate, so its
+                // validation waits for the table rather than disabling the source.
+                TrackingColumnProbe::TableMissing => {
                     warn!(
                         "table '{table}' does not exist yet; deferring tracking_column \
                          '{tracking_column}' validation until the table is created"
                     );
                     kinds.insert(table.clone(), OffsetKind::Unknown);
-                    continue;
+                    deferred.insert(table.clone());
                 }
+            }
+        }
+        Ok((kinds, deferred))
+    }
 
-                if strict {
-                    return Err(Error::InitError(format!(
-                        "tracking_column '{tracking_column}' not found on table '{table}'"
-                    )));
-                }
-                if self.cleanup_target().is_some() {
-                    return Err(Error::InitError(missing_bound_column_message(
-                        table,
-                        tracking_column,
-                    )));
-                }
+    async fn probe_tracking_column(
+        &self,
+        pool: &Pool<MySql>,
+        table: &str,
+    ) -> Result<TrackingColumnProbe, ProbeError> {
+        // Whether the connector owns the query, and can therefore hold the schema to
+        // what that query will do with it.
+        let strict = self.config.custom_query.is_none();
+        let tracking_column = self.tracking_column();
+        let (schema, table_name) = table.split_once('.').unwrap_or(("", table));
 
-                warn!(
-                    "tracking_column '{tracking_column}' is not a column of table '{table}'; \
-                     assuming custom_query projects it. Its comparison order is resolved from \
-                     the first result set instead."
-                );
-                kinds.insert(table.clone(), OffsetKind::Unknown);
-                continue;
-            };
+        // Existence is asked first because the two lookups are separate statements. A
+        // `CREATE TABLE` committing between them would otherwise read as a table that
+        // lacks the column. MySQL 8 commits a table and its columns atomically, so once
+        // the table is visible its columns are too.
+        let table_exists = sqlx::query(
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = IF(? = '', DATABASE(), ?) \
+               AND table_name = ?",
+        )
+        .bind(schema)
+        .bind(schema)
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            ProbeError::Query(format!("failed to probe existence of table '{table}': {e}"))
+        })?
+        .is_some();
 
-            // Read by position: MySQL returns information_schema column names
-            // uppercased (IS_NULLABLE, ...), so try_get by lowercase name misses.
-            let is_nullable: String = row.try_get(0).map_err(|e| {
-                Error::InitError(format!(
-                    "failed to read is_nullable for table '{table}': {e}"
-                ))
-            })?;
-            let data_type: String = row.try_get(1).map_err(|e| {
-                Error::InitError(format!("failed to read data_type for table '{table}': {e}"))
-            })?;
-            let column_type: String = row.try_get(2).map_err(|e| {
-                Error::InitError(format!(
-                    "failed to read column_type for table '{table}': {e}"
-                ))
-            })?;
+        if !table_exists {
+            return Ok(TrackingColumnProbe::TableMissing);
+        }
 
-            // The column's type survives a plain projection, so it is worth rejecting
-            // whatever the query looks like. A custom_query aliasing an expression onto
-            // a name the table also uses is the one false positive, hence the hint.
-            if let Some(reason) = unusable_tracking_type(&data_type) {
-                let aliasing_hint = if self.config.custom_query.is_some() {
-                    " If custom_query aliases a different expression to this name, rename the \
-                      alias so it does not collide with the column."
-                } else {
-                    ""
-                };
-                return Err(Error::InitError(format!(
-                    "tracking_column '{tracking_column}' on table '{table}' has type \
-                     '{column_type}': {reason}. Use an integer, timestamp, or string \
-                     column.{aliasing_hint}"
+        let row = sqlx::query(
+            "SELECT is_nullable, data_type, column_type \
+             FROM information_schema.columns \
+             WHERE table_schema = IF(? = '', DATABASE(), ?) \
+               AND table_name = ? AND column_name = ?",
+        )
+        .bind(schema)
+        .bind(schema)
+        .bind(table_name)
+        .bind(tracking_column)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            ProbeError::Query(format!(
+                "failed to probe schema for tracking_column '{tracking_column}' on table '{table}': {e}"
+            ))
+        })?;
+
+        let Some(row) = row else {
+            if strict {
+                return Err(ProbeError::Rejected(format!(
+                    "tracking_column '{tracking_column}' not found on table '{table}'"
+                )));
+            }
+            if self.cleanup_target().is_some() {
+                return Err(ProbeError::Rejected(missing_bound_column_message(
+                    table,
+                    tracking_column,
                 )));
             }
 
-            if is_nullable.eq_ignore_ascii_case("YES") {
-                if strict {
-                    return Err(Error::InitError(format!(
-                        "tracking_column '{tracking_column}' on table '{table}' is nullable; \
-                         a NULL value stalls offset tracking. Declare it NOT NULL."
-                    )));
-                }
-                warn!(
-                    "tracking_column '{tracking_column}' on table '{table}' is nullable; a row \
-                     whose value is NULL cannot produce a cursor and will fail that table's batch. \
-                     Have custom_query exclude those rows, or declare the column NOT NULL."
-                );
-            }
+            warn!(
+                "tracking_column '{tracking_column}' is not a column of table '{table}'; \
+                 assuming custom_query projects it. Its comparison order is resolved from \
+                 the first result set instead."
+            );
+            return Ok(TrackingColumnProbe::Resolved(OffsetKind::Unknown));
+        };
 
-            if is_collation_ordered(&data_type) {
-                warn!(
-                    "tracking_column '{tracking_column}' on table '{table}' has type \
-                     '{column_type}': values must be unique and increase in its collation order \
-                     (zero-pad numbers, prefer a _bin collation)"
-                );
-            }
+        // Read by position: MySQL returns information_schema column names
+        // uppercased (IS_NULLABLE, ...), so try_get by lowercase name misses.
+        let is_nullable: String = row.try_get(0).map_err(|e| {
+            ProbeError::Query(format!(
+                "failed to read is_nullable for table '{table}': {e}"
+            ))
+        })?;
+        let data_type: String = row.try_get(1).map_err(|e| {
+            ProbeError::Query(format!("failed to read data_type for table '{table}': {e}"))
+        })?;
+        let column_type: String = row.try_get(2).map_err(|e| {
+            ProbeError::Query(format!(
+                "failed to read column_type for table '{table}': {e}"
+            ))
+        })?;
 
-            kinds.insert(table.clone(), offset_kind_for_data_type(&data_type));
+        // The column's type survives a plain projection, so it is worth rejecting
+        // whatever the query looks like. A custom_query aliasing an expression onto
+        // a name the table also uses is the one false positive, hence the hint.
+        if let Some(reason) = unusable_tracking_type(&data_type) {
+            let aliasing_hint = if self.config.custom_query.is_some() {
+                " If custom_query aliases a different expression to this name, rename the \
+                  alias so it does not collide with the column."
+            } else {
+                ""
+            };
+            return Err(ProbeError::Rejected(format!(
+                "tracking_column '{tracking_column}' on table '{table}' has type \
+                 '{column_type}': {reason}. Use an integer, timestamp, or string \
+                 column.{aliasing_hint}"
+            )));
         }
-        Ok(kinds)
+
+        if is_nullable.eq_ignore_ascii_case("YES") {
+            if strict {
+                return Err(ProbeError::Rejected(format!(
+                    "tracking_column '{tracking_column}' on table '{table}' is nullable; \
+                     a NULL value stalls offset tracking. Declare it NOT NULL."
+                )));
+            }
+            warn!(
+                "tracking_column '{tracking_column}' on table '{table}' is nullable; a row \
+                 whose value is NULL cannot produce a cursor and will fail that table's batch. \
+                 Have custom_query exclude those rows, or declare the column NOT NULL."
+            );
+        }
+
+        if is_collation_ordered(&data_type) {
+            warn!(
+                "tracking_column '{tracking_column}' on table '{table}' has type \
+                 '{column_type}': values must be unique and increase in its collation order \
+                 (zero-pad numbers, prefer a _bin collation)"
+            );
+        }
+
+        Ok(TrackingColumnProbe::Resolved(offset_kind_for_data_type(
+            &data_type,
+        )))
     }
 
     fn payload_format(&self) -> PayloadFormat {
@@ -1172,6 +1261,30 @@ impl MySqlSource {
                 })
             }
             PayloadFormat::Json => Err(Error::InvalidConfig), // unreachable! if payload_column is there then payload_format can never be json
+        }
+    }
+
+    /// Holds a table that did not exist at `open()` to the checks `open()` would have
+    /// run, before its first batch can move the cursor. `Ok(false)` while it is still
+    /// missing, since there is nothing to read and nothing yet to judge.
+    async fn deferred_table_ready(
+        &self,
+        pool: &Pool<MySql>,
+        table: &str,
+    ) -> Result<bool, ProbeError> {
+        if !self.deferred_tracking_checks.lock().await.contains(table) {
+            return Ok(true);
+        }
+        match self.probe_tracking_column(pool, table).await? {
+            TrackingColumnProbe::TableMissing => Ok(false),
+            TrackingColumnProbe::Resolved(kind) => {
+                self.tracking_kinds
+                    .lock()
+                    .await
+                    .insert(table.to_string(), kind);
+                self.deferred_tracking_checks.lock().await.remove(table);
+                Ok(true)
+            }
         }
     }
 
@@ -1521,6 +1634,23 @@ impl MySqlSource {
                 continue;
             }
 
+            match self.deferred_table_ready(pool, table).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    debug!("Table '{table}' does not exist yet, skipping this poll");
+                    continue;
+                }
+                Err(ProbeError::Rejected(reason)) => {
+                    error!("Table '{table}': {reason}. Table disabled until restart.");
+                    newly_poisoned.push(table.clone());
+                    continue;
+                }
+                Err(ProbeError::Query(reason)) => {
+                    error!("Table '{table}': {reason}, skipping this cycle");
+                    continue;
+                }
+            }
+
             // Get last offset with minimal lock time
             let last_offset = {
                 let state = self.state.lock().await;
@@ -1550,7 +1680,11 @@ impl MySqlSource {
                     any_batch_full |= batch.messages.len() as u32 >= batch_size;
                     batches.push(batch);
                 }
-                Err(FetchError::Ordering(reason) | FetchError::MissingTrackingColumn(reason)) => {
+                Err(
+                    FetchError::Ordering(reason)
+                    | FetchError::MissingTrackingColumn(reason)
+                    | FetchError::UnusableTrackingType(reason),
+                ) => {
                     error!(
                         "Table '{table}' at offset {}: {reason}. Table disabled until restart.",
                         last_offset.as_deref().unwrap_or("<start>")
@@ -1747,6 +1881,7 @@ impl MySqlSource {
                 first.columns().iter().map(|column| column.name()),
                 tracking_column,
             )?;
+            ensure_tracking_type_usable(first, tracking_column)?;
         }
 
         let resume_from = if self.cursor_gates_query() {
@@ -1944,7 +2079,7 @@ impl MySqlSource {
 /// else takes the string form MySQL parses back to the same value. Returns None
 /// only for a NULL pk, which a real primary key cannot be.
 fn extract_pk_value(row: &MySqlRow, column_index: usize) -> Result<Option<PkValue>, Error> {
-    if is_binary_column(row, column_index) {
+    if is_binary_column(&row.columns()[column_index]) {
         return binary_pk_value(row, column_index);
     }
     let value = extract_column_value(row, column_index)?;
@@ -1958,17 +2093,31 @@ fn pk_value_from_decoded(
     column_index: usize,
     value: &serde_json::Value,
 ) -> Result<Option<PkValue>, Error> {
-    if is_binary_column(row, column_index) {
+    if is_binary_column(&row.columns()[column_index]) {
         return binary_pk_value(row, column_index);
     }
     Ok(column_value_as_string(row, column_index, value)?.map(PkValue::Text))
 }
 
-fn is_binary_column(row: &MySqlRow, column_index: usize) -> bool {
-    matches!(
-        row.columns()[column_index].type_info().name(),
-        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB"
-    )
+const BINARY_TYPE_NAMES: &[&str] = &[
+    "BINARY",
+    "VARBINARY",
+    "TINYBLOB",
+    "BLOB",
+    "MEDIUMBLOB",
+    "LONGBLOB",
+];
+
+fn is_binary_column(column: &MySqlColumn) -> bool {
+    BINARY_TYPE_NAMES.contains(&column.type_info().name()) && !is_bin_collated_text(column)
+}
+
+/// MySQL sets the BINARY flag on `_bin`-collated text as well as on bytes, so sqlx
+/// names `VARCHAR ... COLLATE utf8mb4_bin` `VARBINARY`. Only bytes carry the `binary`
+/// collation, and that is what `str` refuses to decode from.
+fn is_bin_collated_text(column: &MySqlColumn) -> bool {
+    BINARY_TYPE_NAMES.contains(&column.type_info().name())
+        && <str as Type<MySql>>::compatible(column.type_info())
 }
 
 fn binary_pk_value(row: &MySqlRow, column_index: usize) -> Result<Option<PkValue>, Error> {
@@ -2103,13 +2252,9 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
                 .map(|dt| serde_json::Value::String(dt.to_string()))
                 .unwrap_or(serde_json::Value::Null))
         }
-        "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" | "SET" => {
-            let value: Option<String> = row.try_get(column_index).map_err(to_err)?;
-            Ok(value
-                .map(serde_json::Value::String)
-                .unwrap_or(serde_json::Value::Null))
-        }
-        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
+        "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB"
+            if is_binary_column(column) =>
+        {
             let value: Option<Vec<u8>> = row.try_get(column_index).map_err(to_err)?;
             Ok(value
                 .map(|bytes| {
@@ -2117,6 +2262,14 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
                         base64::engine::general_purpose::STANDARD.encode(&bytes),
                     )
                 })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        // The binary names that reach this arm are `_bin`-collated text.
+        "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" | "SET"
+        | "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
+            let value: Option<String> = row.try_get(column_index).map_err(to_err)?;
+            Ok(value
+                .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null))
         }
         "JSON" => {

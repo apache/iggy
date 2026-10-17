@@ -95,6 +95,10 @@ At startup the connector also reads the column from `information_schema` and ref
 - `BINARY`, `VARBINARY` and the `BLOB` family are carried as base64 text, which does not order the way the underlying bytes do. The cursor would be compared in one order while `ORDER BY` used another, and the base64 literal would be compared against raw bytes. `BINARY(16)` UUID keys are the common case here; track an auto-increment key or a `CHAR(36)` column instead.
 - `ENUM` and `SET` are sorted by MySQL on declaration index, not on the label the connector sees, so the two disagree whenever the members are not declared in alphabetical order. A bounded set of labels cannot be unique per row either.
 
+A table that does not exist yet at startup gets the same checks on the first poll after it is created, before anything is read from it. A rejected type then disables that table until the connector restarts instead of stopping the connector.
+
+A computed or aliased `custom_query` column has no `information_schema` row, so its type is checked from the result set before the cursor moves, and a rejected type disables the table the same way. That check cannot recognise `SET`, which the result set reports as `CHAR`.
+
 A nullable column is refused only when the connector builds its own query. With a `custom_query` it is a warning instead, because a query moves nullability in both directions: a `LEFT JOIN` introduces NULLs into a `NOT NULL` column, `WHERE ts IS NOT NULL` removes them from a nullable one. The per-poll check above catches an actual NULL.
 
 ### Text columns sort by collation, not by value
@@ -110,7 +114,7 @@ Nothing reports it. Every batch was correctly ordered, and every poll after the 
 
 Safe under collation: zero-padded numbers (`'000017'`), ULIDs, KSUIDs, and anything else whose textual order is its generation order. Unsafe: unpadded numbers, and any scheme whose width varies.
 
-The collation decides uniqueness too. The default `utf8mb4_0900_ai_ci` is case- and accent-insensitive, so `'ORD-1a'` and `'ORD-1A'` compare **equal** and `> 'ORD-1a'` silently drops the other one. Declare text tracking columns with a `_bin` (or `_as_cs`) collation when the keys carry letters.
+The collation decides uniqueness too. The default `utf8mb4_0900_ai_ci` is case- and accent-insensitive, so `'ORD-1a'` and `'ORD-1A'` compare **equal** and `> 'ORD-1a'` silently drops the other one. Declare text tracking columns with a `_bin` (or `_as_cs`) collation when the keys carry letters. A `_bin` column is still text: it is published and compared as text, not refused as binary.
 
 The connector cannot tell a safe column from an unsafe one without reading the data, so it warns at startup for every `CHAR`, `VARCHAR` or `TEXT` tracking column, naming the table, the column and its type. Temporal columns are compared as text too but are not warned about: their rendering is fixed-width, so their text order is their chronological order whatever the collation is.
 
