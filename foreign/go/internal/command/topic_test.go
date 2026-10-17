@@ -284,3 +284,38 @@ func TestCreateTopic_NonStringOptionKeyIsRejected(t *testing.T) {
 		t.Error("expected an error for a non-string option key, got nil")
 	}
 }
+
+func TestCreateTopic_OutOfByteOptionValueKindEncodesAsReservedZero(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	command := CreateTopic{
+		StreamId:        streamId,
+		Name:            "t",
+		PartitionsCount: 1,
+		Options: []iggcon.HeaderEntry{{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("future_option")},
+			Value: iggcon.HeaderValue{Kind: 257, Value: []byte("x")},
+		}},
+	}
+
+	serialized, err := command.MarshalBinary()
+	if err != nil {
+		t.Fatalf("failed to serialize CreateTopic: %v", err)
+	}
+
+	const streamIdSize = 2 + 4
+	position := streamIdSize + 4 + 1 + len(command.Name)
+	block := serialized[position:]
+	key := command.Options[0].Key.Value
+	entry := append(append([]byte{byte(iggcon.String)}, binary.LittleEndian.AppendUint32(nil, uint32(len(key)))...), key...)
+	index := bytes.Index(block, entry)
+	if index < 0 {
+		t.Fatal("the caller's option entry is missing from the options block")
+	}
+	// 257 truncates to 1, which would let a reader decode the value as Raw.
+	if kind := block[index+len(entry)]; kind != 0 {
+		t.Fatalf("value kind byte = %d, want the reserved 0", kind)
+	}
+}
