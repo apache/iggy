@@ -1113,6 +1113,15 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 	}
 }
 
+// GetNoDelay reports whether TCP_NODELAY is set on new connections, which
+// tests and callers can use to observe the parsed nodelay option before a
+// connection exists to read it off.
+func (c *IggyTcpClient) GetNoDelay() bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.config.noDelay
+}
+
 // Connect establishes the TCP connection to the server.
 //
 // Single-flighted: one attempt dials, and every caller that arrives while it
