@@ -270,6 +270,7 @@ mod tests {
             "[]:8090",
             "[localhost]:8090",
             "[gggg::1]:8090",
+            "localhost",
         ] {
             let value = format!("iggy://user:secret@{server_address}");
             assert!(
