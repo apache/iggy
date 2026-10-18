@@ -68,7 +68,7 @@ Configuration operates in **two distinct layers**:
 
 | Field | Type | Required | Default | Description |
 | :--- | :--- | :---: | :--- | :--- |
-| `broker_url` | String | **Yes** | — | Broker URL with an `mqtt://`, `mqtts://`, or `ssl://` scheme. It must not contain credentials. |
+| `broker_url` | String | **Yes** | — | Broker URL with an `mqtt://`, `mqtts://`, or `ssl://` scheme. It must not contain credentials or MQTT transport query options. |
 | `protocol` | String | No | `"mqtt5"` | MQTT version: `"mqtt5"` or `"mqtt311"`. |
 | `client_id` | String | Conditional | None | MQTT client identifier. It is required and non-empty when `clean_start = false`. |
 | `username` | String | No | None | Broker username. It must be supplied with `password`. |
@@ -93,6 +93,11 @@ Configuration operates in **two distinct layers**:
 | `tls.ca_file` | String | No | None | Custom CA certificates in PEM format. The system trust store is used when omitted. |
 | `tls.client_cert_file` | String | No | None | mTLS client certificate in PEM format. It must pair with `client_key_file`. |
 | `tls.client_key_file` | String | No | None | mTLS client private key in PEM format. It must pair with `client_cert_file`. |
+
+Use `broker_url` only for the broker address. Configure `client_id`, `keep_alive`,
+`clean_start`, and `max_in_flight` in `[plugin_config]`. The connector rejects
+the URL query options `client_id`, `keep_alive_secs`, `clean_session`, and
+`inflight_num`.
 
 ---
 
@@ -189,11 +194,6 @@ The connector validates the broker certificate and hostname. It has no option
 to disable certificate validation. The nested TLS table belongs in the
 connector TOML file because flat environment overrides cannot update it.
 
-TLS configuration uses the nested `[plugin_config.tls]` table. Replace the
-previous `tls_ca_file`, `tls_client_cert_file`, and `tls_client_key_file`
-fields with `ca_file`, `client_cert_file`, and `client_key_file` in that
-table.
-
 ### 5. Multiple Sink Routes
 
 Run one connector instance per MQTT route. Give every instance a unique
@@ -275,6 +275,3 @@ confirms the publication.
 4. **Malformed records**: The connector logs malformed records and rejects their batch. It does not provide a dead-letter queue.
 5. **Deferred broker limits**: The current driver does not retain broker-negotiated topic-alias or maximum-packet-size limits.
 6. **Broker rejection classification**: The SDK has no broker-rejection error. The plugin uses `CannotStoreData` with an internal non-retryable flag. The runtime records the error and continues.
-
-This is a breaking configuration change for users of the old TLS fields.
-Move the old fields into `[plugin_config.tls]` before upgrading.
