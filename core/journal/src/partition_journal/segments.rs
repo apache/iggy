@@ -332,7 +332,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                         .storage
                         .open(&reference.path(&self.directory), OpenMode::Create)
                         .await?;
-                    self.storage
+                    let _charge = self
+                        .storage
                         .charge_allocation((prepare.len() - size_of::<PrepareHeader>()) as u64);
                     file.write_frozen(0, prepare.slice(size_of::<PrepareHeader>()..))
                         .await?;
@@ -425,7 +426,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
                 buffers.push(prepares[index].slice(size_of::<PrepareHeader>()..));
                 bodies.next();
             }
-            self.storage
+            let _charge = self
+                .storage
                 .charge_allocation(self.newly_allocated(first.position, end));
             self.segment_writing_file(first)
                 .await?
@@ -441,7 +443,8 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
         prepare: &Frozen<4096>,
     ) -> io::Result<()> {
         let end = reference.position + (prepare.len() - size_of::<PrepareHeader>()) as u64;
-        self.storage
+        let _charge = self
+            .storage
             .charge_allocation(self.newly_allocated(reference.position, end));
         self.segment_writing_file(reference)
             .await?

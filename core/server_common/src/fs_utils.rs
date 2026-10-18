@@ -125,18 +125,15 @@ fn reserve(file: &std::fs::File, len: i64, usage: &DiskUsage) -> io::Result<()> 
     // is unsupported, the estimate stays up to one segment above the volume
     // until the next sample.
     let expected = len.unsigned_abs().saturating_sub(before.unwrap_or(0));
-    if expected > 0 {
-        usage.charge(expected);
-    }
+    let charge = usage.charge(expected);
 
     fallocate(file, FallocateFlags::FALLOC_FL_KEEP_SIZE, 0, len).map_err(io::Error::from)?;
+    drop(charge);
 
     // Filesystem metadata, such as extent tree blocks, can grow it further.
+    // Those blocks are allocated already, so their charge settles at once.
     if let (Some(before), Some(after)) = (before, allocated()) {
-        let beyond = after.saturating_sub(before).saturating_sub(expected);
-        if beyond > 0 {
-            usage.charge(beyond);
-        }
+        drop(usage.charge(after.saturating_sub(before).saturating_sub(expected)));
     }
     Ok(())
 }
@@ -405,6 +402,15 @@ mod tests {
             USAGE.charged_bytes(),
             RESERVATION_BYTES,
             "the segment charged up front stays charged after the failure"
+        );
+
+        // The volume never held the reservation, so the next sample drops it.
+        let sample = 100 * RESERVATION_BYTES;
+        USAGE.rebase(|| Some(((), sample)));
+        assert_eq!(
+            USAGE.used_bytes(),
+            sample,
+            "the next sample must remove the charge of a failed reservation"
         );
     }
 }

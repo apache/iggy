@@ -21,10 +21,10 @@ use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use futures::{Stream, stream};
-use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::{run_blocking, truncate_file};
 use server_common::iobuf::{Frozen, Owned};
+use server_common::{Charge, DISK_USAGE};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -65,9 +65,13 @@ pub struct StorageEntry {
 pub trait DurableStorage {
     type File: DurableFile;
 
-    /// Count `bytes` just allocated on disk towards the process-wide disk
-    /// usage estimate. Backends that do not write to the data volume ignore it.
-    fn charge_allocation(&self, _bytes: u64) {}
+    /// Count `bytes` about to be allocated on disk towards the process-wide
+    /// disk usage estimate. Hold the returned charge until the write finishes
+    /// or fails. Backends that do not write to the data volume ignore it.
+    #[must_use = "a charge settles when dropped, so hold it until the write finishes"]
+    fn charge_allocation(&self, _bytes: u64) -> Option<Charge<'static>> {
+        None
+    }
 
     /// Process-local identity for exclusive writer ownership.
     ///
@@ -224,8 +228,8 @@ pub struct DiskStorage;
 impl DurableStorage for DiskStorage {
     type File = File;
 
-    fn charge_allocation(&self, bytes: u64) {
-        DISK_USAGE.charge(bytes);
+    fn charge_allocation(&self, bytes: u64) -> Option<Charge<'static>> {
+        Some(DISK_USAGE.charge(bytes))
     }
 
     fn writer_identity(&self, path: &Path) -> io::Result<Option<std::path::PathBuf>> {

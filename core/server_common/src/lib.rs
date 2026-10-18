@@ -43,7 +43,7 @@ pub use consensus_message::{
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
     ResponseFragments,
 };
-pub use disk_usage::{DISK_USAGE, DiskUsage};
+pub use disk_usage::{Charge, DISK_USAGE, DiskUsage};
 pub use executor::create_shard_executor;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
 pub use reactor_yield::yield_to_reactor;

@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn given_no_sample_when_encoding_disk_usage_should_export_only_the_charged_bytes() {
         static USAGE: DiskUsage = DiskUsage::new();
-        USAGE.charge(3 * MIB);
+        drop(USAGE.charge(3 * MIB));
 
         let output = disk_usage_exposition(&USAGE);
 
@@ -482,7 +482,7 @@ mod tests {
         USAGE.rebase(|| Some(((), 100 * MIB)));
         let sampled = disk_usage_exposition(&USAGE);
 
-        USAGE.charge(MIB);
+        drop(USAGE.charge(MIB));
         let charged = disk_usage_exposition(&USAGE);
 
         for (output, used, total) in [(&sampled, 100 * MIB, 0), (&charged, 101 * MIB, MIB)] {

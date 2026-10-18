@@ -1341,8 +1341,10 @@ async fn stage_rebuilt_index(
             );
             PartitionRecoveryError::from(IggyError::CannotWriteToFile)
         })?;
-    DISK_USAGE.charge(staged_bytes);
-    file.write_all_at(entries, 0).await.0.map_err(|source| {
+    let charge = DISK_USAGE.charge(staged_bytes);
+    let (result, _) = file.write_all_at(entries, 0).await.into();
+    drop(charge);
+    result.map_err(|source| {
         error!(
             path = %staging_path,
             error = %source,

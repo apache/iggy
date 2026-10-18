@@ -28,6 +28,11 @@
 //! a sample only moves the base under it. The total then says what Iggy
 //! charged, apart from what the volume did, which is how a test checks that
 //! every write site charges while the sampler keeps running.
+//!
+//! A write site charges before it writes, so a sample taken while the write is
+//! in flight does not hold its bytes yet. Each charge therefore returns a
+//! [`Charge`], and a sample only takes over the charges whose [`Charge`] was
+//! dropped, once their writes finished or failed.
 
 use crossbeam::utils::CachePadded;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,9 +42,11 @@ pub static DISK_USAGE: DiskUsage = DiskUsage::new();
 
 #[derive(Debug)]
 pub struct DiskUsage {
-    // Every shard adds to it, so it gets a cache line of its own.
+    // Every shard adds to both, so each gets a cache line of its own.
     charged: CachePadded<AtomicU64>,
-    /// The last sample minus what was charged before it. Charges outgrow the
+    /// The part of `charged` whose writes finished or failed.
+    settled: CachePadded<AtomicU64>,
+    /// The last sample minus what was settled before it. Charges outgrow the
     /// volume once files are deleted, so it wraps below zero and the
     /// estimate adds the charges back with wrapping arithmetic.
     base: AtomicU64,
@@ -51,15 +58,20 @@ impl DiskUsage {
     pub const fn new() -> Self {
         Self {
             charged: CachePadded::new(AtomicU64::new(0)),
+            settled: CachePadded::new(AtomicU64::new(0)),
             base: AtomicU64::new(0),
             measured: AtomicBool::new(false),
         }
     }
 
-    /// Adds `bytes` that Iggy is about to write to, or has reserved on, the volume.
+    /// Adds `bytes` that Iggy is about to write to, or has reserved on, the
+    /// volume. Hold the returned [`Charge`] until the write finishes or fails.
     #[inline]
-    pub fn charge(&self, bytes: u64) {
-        self.charged.fetch_add(bytes, Ordering::Relaxed);
+    pub fn charge(&self, bytes: u64) -> Charge<'_> {
+        if bytes > 0 {
+            self.charged.fetch_add(bytes, Ordering::Relaxed);
+        }
+        Charge { usage: self, bytes }
     }
 
     /// Estimated bytes used on the volume: the last sample plus the bytes
@@ -89,16 +101,20 @@ impl DiskUsage {
     /// Runs `measure` and re-bases the estimate on the used bytes it returns,
     /// passing its sample through. Call it from one thread only.
     ///
-    /// The base subtracts the charges read before `measure` runs, so a charge
-    /// that lands after `measure` returns is kept. A charge that lands while
+    /// The base subtracts only the charges settled before `measure` runs,
+    /// because their writes are on the volume when it is measured. A charge
+    /// whose write is still in flight stays in the estimate, and so does a
+    /// charge that lands after `measure` returns. A write that settles while
     /// `measure` runs is counted twice until the next sample, which errs
     /// towards a fuller disk. When `measure` returns `None` the estimate keeps
     /// counting from the previous base.
     pub fn rebase<T>(&self, measure: impl FnOnce() -> Option<(T, u64)>) -> Option<T> {
-        let charged = self.charged.load(Ordering::Relaxed);
+        // Pairs with the release in `Charge::drop`: every write settled here
+        // finished before the volume is measured.
+        let settled = self.settled.load(Ordering::Acquire);
         let (sample, used_bytes) = measure()?;
         self.base
-            .store(used_bytes.wrapping_sub(charged), Ordering::Relaxed);
+            .store(used_bytes.wrapping_sub(settled), Ordering::Relaxed);
         self.measured.store(true, Ordering::Release);
         Some(sample)
     }
@@ -107,6 +123,25 @@ impl DiskUsage {
 impl Default for DiskUsage {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Bytes charged before they are written. Dropping it, once the write finished
+/// or failed, lets the next sample take them over: a finished write is on the
+/// volume, and a failed one allocated only what the volume shows.
+#[derive(Debug)]
+#[must_use = "a charge settles when dropped, so hold it until the write finishes"]
+pub struct Charge<'a> {
+    usage: &'a DiskUsage,
+    bytes: u64,
+}
+
+impl Drop for Charge<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.usage.settled.fetch_add(self.bytes, Ordering::Release);
+        }
     }
 }
 
@@ -122,7 +157,7 @@ mod tests {
     fn given_no_sample_when_charging_should_count_from_zero() {
         let usage = DiskUsage::new();
 
-        usage.charge(3 * MIB);
+        drop(usage.charge(3 * MIB));
 
         assert_eq!(usage.used_bytes(), 3 * MIB);
         assert!(!usage.is_measured());
@@ -131,7 +166,7 @@ mod tests {
     #[test]
     fn given_charges_when_rebasing_should_replace_them_with_the_sample() {
         let usage = DiskUsage::new();
-        usage.charge(5 * MIB);
+        drop(usage.charge(5 * MIB));
 
         let sample = usage.rebase(|| Some(("sample", 100 * MIB)));
 
@@ -144,7 +179,7 @@ mod tests {
     fn given_a_sample_below_the_estimate_when_rebasing_should_lower_it() {
         let usage = DiskUsage::new();
         usage.rebase(|| Some(((), 100 * MIB)));
-        usage.charge(40 * MIB);
+        drop(usage.charge(40 * MIB));
 
         usage.rebase(|| Some(((), 90 * MIB)));
 
@@ -165,7 +200,7 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| {
                 measured.wait();
-                usage.charge(MIB);
+                drop(usage.charge(MIB));
                 charged.wait();
             });
             usage.rebase(|| {
@@ -192,7 +227,7 @@ mod tests {
         usage.rebase(|| Some(((), 100 * MIB)));
 
         usage.rebase(|| {
-            usage.charge(MIB);
+            drop(usage.charge(MIB));
             Some(((), 100 * MIB))
         });
 
@@ -204,10 +239,76 @@ mod tests {
     }
 
     #[test]
+    fn given_a_write_in_flight_when_rebasing_should_keep_its_charge_until_it_settles() {
+        let usage = DiskUsage::new();
+        usage.rebase(|| Some(((), 100 * MIB)));
+        let write = usage.charge(MIB);
+
+        // The write has not reached the volume, so the sample does not hold it.
+        usage.rebase(|| Some(((), 100 * MIB)));
+
+        assert_eq!(
+            usage.used_bytes(),
+            101 * MIB,
+            "a sample taken while a write is in flight must not drop its charge"
+        );
+
+        drop(write);
+        usage.rebase(|| Some(((), 101 * MIB)));
+
+        assert_eq!(
+            usage.used_bytes(),
+            101 * MIB,
+            "the first sample that holds a settled write must replace its charge"
+        );
+    }
+
+    #[test]
+    fn given_a_write_in_flight_on_another_thread_when_rebasing_should_keep_its_charge() {
+        let usage = DiskUsage::new();
+        usage.rebase(|| Some(((), 100 * MIB)));
+        let charged = Barrier::new(2);
+        let sampled = Barrier::new(2);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let write = usage.charge(MIB);
+                charged.wait();
+                // The bytes reach the volume only after the sample.
+                sampled.wait();
+                drop(write);
+            });
+            charged.wait();
+            usage.rebase(|| Some(((), 100 * MIB)));
+            sampled.wait();
+        });
+
+        assert_eq!(
+            usage.used_bytes(),
+            101 * MIB,
+            "a sample must not drop the charge of a write that was still in flight"
+        );
+    }
+
+    #[test]
+    fn given_a_failed_write_when_its_charge_settles_should_let_the_next_sample_remove_it() {
+        let usage = DiskUsage::new();
+        usage.rebase(|| Some(((), 100 * MIB)));
+        let write = usage.charge(MIB);
+
+        // The write failed before allocating anything.
+        drop(write);
+        usage.rebase(|| Some(((), 100 * MIB)));
+
+        assert_eq!(usage.used_bytes(), 100 * MIB);
+        assert_eq!(usage.charged_bytes(), MIB);
+    }
+
+    #[test]
     fn given_a_failed_sample_when_rebasing_should_keep_counting_from_the_previous_base() {
         let usage = DiskUsage::new();
         usage.rebase(|| Some(((), 100 * MIB)));
-        usage.charge(MIB);
+        drop(usage.charge(MIB));
 
         let sample: Option<()> = usage.rebase(|| None);
 
@@ -218,9 +319,9 @@ mod tests {
     #[test]
     fn given_samples_between_charges_when_reading_the_charged_total_should_count_only_charges() {
         let usage = DiskUsage::new();
-        usage.charge(5 * MIB);
+        drop(usage.charge(5 * MIB));
         usage.rebase(|| Some(((), 100 * MIB)));
-        usage.charge(2 * MIB);
+        drop(usage.charge(2 * MIB));
         usage.rebase(|| Some(((), 50 * MIB)));
 
         assert_eq!(usage.charged_bytes(), 7 * MIB);
@@ -231,9 +332,9 @@ mod tests {
     fn given_charges_past_u64_max_when_reading_the_charged_total_should_wrap_instead_of_panicking()
     {
         let usage = DiskUsage::new();
-        usage.charge(u64::MAX);
+        drop(usage.charge(u64::MAX));
 
-        usage.charge(2);
+        drop(usage.charge(2));
 
         assert_eq!(
             usage.charged_bytes(),
@@ -246,10 +347,10 @@ mod tests {
     fn given_the_charged_total_wraps_after_a_sample_when_reading_the_estimate_should_keep_the_charges()
      {
         let usage = DiskUsage::new();
-        usage.charge(u64::MAX - MIB);
+        drop(usage.charge(u64::MAX - MIB));
         usage.rebase(|| Some(((), 100 * MIB)));
 
-        usage.charge(2 * MIB);
+        drop(usage.charge(2 * MIB));
 
         assert!(
             usage.charged_bytes() < MIB,
@@ -262,11 +363,11 @@ mod tests {
     fn given_the_charged_total_wrapped_before_a_sample_when_rebasing_should_count_from_the_sample()
     {
         let usage = DiskUsage::new();
-        usage.charge(u64::MAX);
-        usage.charge(5 * MIB);
+        drop(usage.charge(u64::MAX));
+        drop(usage.charge(5 * MIB));
 
         usage.rebase(|| Some(((), 100 * MIB)));
-        usage.charge(MIB);
+        drop(usage.charge(MIB));
 
         assert_eq!(usage.used_bytes(), 101 * MIB);
     }
@@ -274,10 +375,10 @@ mod tests {
     #[test]
     fn given_more_charged_than_the_volume_holds_when_rebasing_should_wrap_the_base() {
         let usage = DiskUsage::new();
-        usage.charge(30000 * MIB);
+        drop(usage.charge(30000 * MIB));
 
         usage.rebase(|| Some(((), 100 * MIB)));
-        usage.charge(MIB);
+        drop(usage.charge(MIB));
 
         assert_eq!(usage.used_bytes(), 101 * MIB);
         assert_eq!(usage.charged_bytes(), 30001 * MIB);

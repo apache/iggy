@@ -200,12 +200,12 @@ async fn write_frozen_chunked<const ALIGN: usize>(
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
         let end = position + chunk_size as u64;
-        DISK_USAGE.charge(end.saturating_sub(position.max(reserved_end)));
-
+        let charge = DISK_USAGE.charge(end.saturating_sub(position.max(reserved_end)));
         let (result, _) = (&*file)
             .write_vectored_all_at(chunk_vec, position)
             .await
             .into();
+        drop(charge);
         result.map_err(|err| {
             error!(
                 target: "iggy.partitions.storage",
