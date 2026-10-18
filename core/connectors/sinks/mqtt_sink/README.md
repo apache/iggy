@@ -83,7 +83,7 @@ Configuration operates in **two distinct layers**:
 | `retain` | Boolean | No | `false` | Sets the MQTT retain flag. |
 | `keep_alive` | Duration | No | `"30s"` | MQTT keep-alive. MQTT 3.1.1 accepts `0s` or at least `1s`. MQTT 5 requires at least `5s`. |
 | `request_capacity` | Integer | No | `32` | Bounded `rumqttc` request capacity. It must be greater than zero. |
-| `publish_timeout` | Duration | No | `"30s"` | Maximum wait for publication acknowledgements. |
+| `publish_timeout` | Duration | No | `"30s"` | Maximum wait for broker CONNACK and publication acknowledgements. |
 | `shutdown_timeout` | Duration | No | `"30s"` | Maximum time for draining and disconnecting. |
 | `max_retries` | Integer | No | `5` | Maximum retry attempts for connection or uncertain publication failures. |
 | `retry_delay` | Duration | No | `"1s"` | Initial retry delay. |

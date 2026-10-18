@@ -61,6 +61,7 @@ const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_MAX_RETRY_DELAY: &str = "30s";
 const DEFAULT_TOPIC: &str = "iggy.messages";
 const DEFAULT_MAX_RETRIES: u32 = 5;
+const DEFAULT_REQUEST_CAPACITY: usize = 32;
 const DEFAULT_SESSION_EXPIRY_INTERVAL: u32 = 3600;
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +135,8 @@ fn validate_broker_url(config: &MqttSinkConfig) -> Result<(), Error> {
         ("keep_alive_secs", "keep_alive"),
         ("inflight_num", "max_in_flight"),
         ("clean_session", "clean_start"),
+        ("clean_start", "clean_start"),
+        ("request_channel_capacity_num", "request_capacity"),
         ("client_id", "client_id"),
     ] {
         if url.query_pairs().any(|(key, _)| key == option) {
@@ -262,7 +265,10 @@ impl MqttSink {
                 "request_capacity must be greater than zero".to_string(),
             ));
         }
-        let request_capacity = self.config.request_capacity.unwrap_or(32);
+        let request_capacity = self
+            .config
+            .request_capacity
+            .unwrap_or(DEFAULT_REQUEST_CAPACITY);
         let max_in_flight = self.config.max_in_flight.unwrap_or(1);
         if max_in_flight > request_capacity {
             return Err(Error::InvalidConfigValue(
@@ -277,7 +283,7 @@ impl MqttSink {
                 .is_some_and(|client_id| !client_id.trim().is_empty())
         {
             return Err(Error::InvalidConfigValue(
-                "client_id must be configured when clean_start is false".to_string(),
+                "client_id must be present and non-empty when clean_start is false".to_string(),
             ));
         }
         Ok((
@@ -304,7 +310,9 @@ impl MqttSink {
             self.client_id(),
             self.keep_alive,
             self.publish_timeout,
-            self.config.request_capacity.unwrap_or(32),
+            self.config
+                .request_capacity
+                .unwrap_or(DEFAULT_REQUEST_CAPACITY),
             self.max_in_flight,
         )
         .await
@@ -327,7 +335,15 @@ impl MqttSink {
             self.config.topic_mode,
             self.config.topic.as_deref(),
             self.config.topic_template.as_deref(),
-        )?;
+        )
+        .map_err(|error| {
+            warn!(
+                "Rejecting MQTT batch for connector with ID {} because batch topic is invalid, stream: {}, topic: {}: {error}",
+                self.id, topic_metadata.stream, topic_metadata.topic
+            );
+            self.publish_errors.fetch_add(1, Ordering::Relaxed);
+            error
+        })?;
         let mut publications = Vec::with_capacity(messages.len());
         for message in messages {
             let offset = message.offset;
@@ -359,21 +375,22 @@ impl MqttSink {
         topic_metadata: &TopicMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<u64, Error> {
-        // A single event loop cannot safely be driven by concurrent consumers.
-        // Serializing the batch also keeps acknowledgement events associated
-        // with the publication that caused them.
-        let _publish_guard = self.publish_lock.lock().await;
         let qos = self.qos()?;
         let publications = self.prepare_publications(topic_metadata, messages)?;
         if publications.is_empty() {
             return Ok(0);
         }
+        // A single event loop cannot safely be driven by concurrent consumers.
+        // Serializing MQTT delivery keeps acknowledgement events associated
+        // with the publication that caused them.
+        let _publish_guard = self.publish_lock.lock().await;
         let mut confirmed = vec![false; publications.len()];
         self.in_flight_publications
             .fetch_add(publications.len() as u64, Ordering::Relaxed);
         let mut driver = self.driver.lock().await.take();
 
-        for attempts in 1..=self.max_retries {
+        let mut attempts = 1;
+        loop {
             let mut active_driver = match driver.take() {
                 Some(driver) => driver,
                 None => match self.connect_driver().await {
@@ -409,9 +426,8 @@ impl MqttSink {
                     .publish_window(&window, qos, self.config.retain, self.publish_timeout)
                     .await
                 {
-                    Ok(window_confirmed) => {
-                        for local_index in window_confirmed {
-                            let index = window_indices[local_index];
+                    Ok(()) => {
+                        for &index in window_indices {
                             if !confirmed[index] {
                                 confirmed[index] = true;
                                 self.in_flight_publications.fetch_sub(1, Ordering::Relaxed);
@@ -432,17 +448,18 @@ impl MqttSink {
                 }
             }
 
-            if failure.is_none() {
-                *self.driver.lock().await = Some(active_driver);
-                return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64);
-            }
-
-            let Some(window_error) = failure else {
-                continue;
+            let window_error = match failure {
+                Some(window_error) => window_error,
+                None => {
+                    *self.driver.lock().await = Some(active_driver);
+                    return Ok(confirmed.iter().filter(|confirmed| **confirmed).count() as u64);
+                }
             };
+            // A failed QoS 2 handshake can leave rumqttc's outgoing window
+            // full. Do not reuse the event loop after any window failure.
+            drop(active_driver);
             if !window_error.retryable {
                 self.finish_unconfirmed_publications(&confirmed);
-                *self.driver.lock().await = Some(active_driver);
                 return Err(window_error.error);
             }
             if attempts >= self.max_retries {
@@ -457,18 +474,10 @@ impl MqttSink {
                 self.max_retries,
                 window_error.error
             );
-            // The broker can accept a publication before its acknowledgement is
-            // lost. Dropping this event loop prevents its late acknowledgements
-            // from matching packet identifiers that a replacement connection reuses.
-            drop(active_driver);
             let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
             tokio::time::sleep(delay).await;
+            attempts += 1;
         }
-
-        self.finish_unconfirmed_publications(&confirmed);
-        Err(Error::Connection(
-            "MQTT publication retries ended without a terminal error".to_string(),
-        ))
     }
 }
 
@@ -822,6 +831,8 @@ mod tests {
             ("keep_alive_secs", "keep_alive"),
             ("inflight_num", "max_in_flight"),
             ("clean_session", "clean_start"),
+            ("clean_start", "clean_start"),
+            ("request_channel_capacity_num", "request_capacity"),
             ("client_id", "client_id"),
         ] {
             let mut config = test_config();
@@ -896,6 +907,19 @@ mod tests {
     }
 
     #[test]
+    fn given_blank_client_id_when_clean_start_is_false_should_return_configuration_error() {
+        let mut config = test_config();
+        config.client_id = Some("   ".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message))
+                if message == "client_id must be present and non-empty when clean_start is false"
+        ));
+    }
+
+    #[test]
     fn given_unconfirmed_publications_when_finishing_should_clear_and_report_them() {
         let sink = MqttSink::new(1, test_config());
         sink.in_flight_publications.store(1, Ordering::Relaxed);
@@ -917,7 +941,16 @@ mod tests {
             .prepare_publications(&metadata, test_messages())
             .unwrap();
 
-        assert!(Arc::ptr_eq(&publications[0].topic, &publications[1].topic));
+        assert!(Arc::ptr_eq(
+            publications[0]
+                .topic
+                .as_shared()
+                .expect("static topics must be shared"),
+            publications[1]
+                .topic
+                .as_shared()
+                .expect("static topics must be shared"),
+        ));
     }
 
     #[test]
@@ -935,7 +968,16 @@ mod tests {
             .prepare_publications(&metadata, test_messages())
             .unwrap();
 
-        assert!(Arc::ptr_eq(&publications[0].topic, &publications[1].topic));
+        assert!(Arc::ptr_eq(
+            publications[0]
+                .topic
+                .as_shared()
+                .expect("template topics must be shared"),
+            publications[1]
+                .topic
+                .as_shared()
+                .expect("template topics must be shared"),
+        ));
         assert_eq!(publications[0].topic.as_str(), "devices/output/telemetry");
     }
 
@@ -979,6 +1021,24 @@ mod tests {
         let error = sink
             .prepare_publications(&metadata, messages)
             .expect_err("malformed record must reject the batch");
+
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
+        assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_invalid_batch_topic_when_preparing_should_count_publish_error() {
+        let mut config = test_config();
+        config.topic = Some("invalid\0topic".to_string());
+        let sink = MqttSink::new(1, config);
+        let metadata = TopicMetadata {
+            stream: "devices".to_string(),
+            topic: "telemetry".to_string(),
+        };
+
+        let error = sink
+            .prepare_publications(&metadata, test_messages())
+            .expect_err("invalid batch topic must reject the batch");
 
         assert!(matches!(error, Error::InvalidRecordValue(_)));
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
