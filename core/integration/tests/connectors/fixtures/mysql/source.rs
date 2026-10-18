@@ -28,6 +28,30 @@ use integration::harness::{TestBinaryError, TestFixture};
 use sqlx::{MySql, Pool};
 use std::collections::HashMap;
 
+fn base_envs(container: &MySqlContainer, table: &str, schema: &str) -> HashMap<String, String> {
+    let mut envs = HashMap::new();
+    envs.insert(
+        ENV_SOURCE_CONNECTION_STRING.to_string(),
+        container.connection_string.clone(),
+    );
+    envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{table}]"));
+    envs.insert(
+        ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+        DEFAULT_TEST_STREAM.to_string(),
+    );
+    envs.insert(
+        ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+        DEFAULT_TEST_TOPIC.to_string(),
+    );
+    envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), schema.to_string());
+    envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+    envs.insert(
+        ENV_SOURCE_PATH.to_string(),
+        ENV_SOURCE_PLUGIN_PATH.to_string(),
+    );
+    envs
+}
+
 /// MySQL source fixture for JSON rows with metadata.
 ///
 /// Creates a table with typed columns that get serialized as JSON with metadata.
@@ -107,28 +131,9 @@ impl TestFixture for MySqlSourceJsonFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -210,28 +215,9 @@ impl TestFixture for MySqlSourceNoMetadataFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -289,29 +275,10 @@ impl TestFixture for MySqlSourceRawFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "raw");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_string(), "payload".to_string());
         envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_string(), "bytea".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "raw".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -372,32 +339,13 @@ impl TestFixture for MySqlSourceMissingPayloadColumnFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "raw");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(
             ENV_SOURCE_PAYLOAD_COLUMN.to_string(),
             Self::MISSPELLED_PAYLOAD_COLUMN.to_string(),
         );
         envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_string(), "bytea".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "raw".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -455,31 +403,12 @@ impl TestFixture for MySqlSourceJsonDirectFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_PAYLOAD_COLUMN.to_string(), "data".to_string());
         envs.insert(
             ENV_SOURCE_PAYLOAD_FORMAT.to_string(),
             "json_direct".to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
         );
         envs
     }
@@ -542,30 +471,11 @@ impl TestFixture for MySqlSourceDeleteFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -631,32 +541,13 @@ impl TestFixture for MySqlSourceNonUniqueKeyDeleteFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(
             ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(),
             "batch_no".to_string(),
         );
         envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -761,12 +652,7 @@ impl<const QUEUE_QUERY: bool> TestFixture for MySqlSourceReusedKeyFixture<QUEUE_
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "seq".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "sku".to_string());
         envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
@@ -777,20 +663,6 @@ impl<const QUEUE_QUERY: bool> TestFixture for MySqlSourceReusedKeyFixture<QUEUE_
                 "SELECT * FROM $table ORDER BY seq LIMIT $limit".to_string(),
             );
         }
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -873,12 +745,7 @@ impl<const TABLE_AT_STARTUP: bool> TestFixture
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(
             ENV_SOURCE_TRACKING_COLUMN.to_string(),
             "cursor_key".to_string(),
@@ -889,20 +756,6 @@ impl<const TABLE_AT_STARTUP: bool> TestFixture
             ENV_SOURCE_CUSTOM_QUERY.to_string(),
             "SELECT *, id * 10 AS cursor_key FROM $table ORDER BY cursor_key LIMIT $limit"
                 .to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
         );
         envs
     }
@@ -991,12 +844,7 @@ impl TestFixture for MySqlSourceMarkFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         envs.insert(
@@ -1004,20 +852,6 @@ impl TestFixture for MySqlSourceMarkFixture {
             "is_processed".to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1108,12 +942,7 @@ impl<const ALIASED_CURSOR: bool> TestFixture for MySqlSourceTextTrackingFixture<
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         if ALIASED_CURSOR {
             envs.insert(
                 ENV_SOURCE_TRACKING_COLUMN.to_string(),
@@ -1133,20 +962,6 @@ impl<const ALIASED_CURSOR: bool> TestFixture for MySqlSourceTextTrackingFixture<
             envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "code".to_string());
         }
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1205,28 +1020,9 @@ impl TestFixture for MySqlSourceDecimalTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "amount".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1286,28 +1082,9 @@ impl TestFixture for MySqlSourceTimeColumnFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1373,12 +1150,7 @@ impl TestFixture for MySqlSourceComputedTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(
             ENV_SOURCE_TRACKING_COLUMN.to_string(),
             "tracking_id".to_string(),
@@ -1390,20 +1162,6 @@ impl TestFixture for MySqlSourceComputedTrackingFixture {
                 .to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1475,32 +1233,13 @@ impl TestFixture for MySqlSourceDescendingQueryFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(
             ENV_SOURCE_CUSTOM_QUERY.to_string(),
             "SELECT * FROM $table WHERE id > $offset ORDER BY id DESC LIMIT $limit".to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1562,12 +1301,7 @@ impl TestFixture for MySqlSourceAliasedTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
         envs.insert(
             ENV_SOURCE_CUSTOM_QUERY.to_string(),
@@ -1576,20 +1310,6 @@ impl TestFixture for MySqlSourceAliasedTrackingFixture {
                 .to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1680,12 +1400,7 @@ impl TestFixture for MySqlSourceNullTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(
             ENV_SOURCE_TRACKING_COLUMN.to_string(),
             "updated_at".to_string(),
@@ -1705,20 +1420,6 @@ impl TestFixture for MySqlSourceNullTrackingFixture {
                 .to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1803,12 +1504,7 @@ impl TestFixture for MySqlSourceTimestampTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(
             ENV_SOURCE_TRACKING_COLUMN.to_string(),
             "updated_at".to_string(),
@@ -1819,20 +1515,6 @@ impl TestFixture for MySqlSourceTimestampTrackingFixture {
             Self::INITIAL_OFFSET.to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -1904,12 +1586,7 @@ impl TestFixture for MySqlSourceTimestampDeleteFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(
             ENV_SOURCE_TRACKING_COLUMN.to_string(),
             "updated_at".to_string(),
@@ -1920,20 +1597,6 @@ impl TestFixture for MySqlSourceTimestampDeleteFixture {
         );
         envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -2007,12 +1670,7 @@ impl TestFixture for MySqlSourceJsonTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "doc".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         envs.insert(
@@ -2020,20 +1678,6 @@ impl TestFixture for MySqlSourceJsonTrackingFixture {
             "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit".to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -2105,28 +1749,9 @@ impl TestFixture for MySqlSourceCaseMismatchedTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "ID".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -2200,12 +1825,7 @@ impl TestFixture for MySqlSourceTinyintTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "flag".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         // Ordered and filtered by `id`, so the only thing wrong with the batch is the
@@ -2216,20 +1836,6 @@ impl TestFixture for MySqlSourceTinyintTrackingFixture {
                 .to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -2313,28 +1919,9 @@ impl<const TABLE_AT_STARTUP: bool> TestFixture
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "code".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -2407,28 +1994,9 @@ impl<const SET_COLUMN: bool> TestFixture for MySqlSourceLateTrackingTypeFixture<
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "seq".to_string());
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
@@ -2490,12 +2058,7 @@ impl TestFixture for MySqlSourceComputedBinaryTrackingFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SOURCE_CONNECTION_STRING.to_string(),
-            self.container.connection_string.clone(),
-        );
-        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
         envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "seq".to_string());
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         // Filtered and ordered by `id`, so the only thing wrong with the batch is the
@@ -2507,20 +2070,6 @@ impl TestFixture for MySqlSourceComputedBinaryTrackingFixture {
                 .to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
-            DEFAULT_TEST_STREAM.to_string(),
-        );
-        envs.insert(
-            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
-            DEFAULT_TEST_TOPIC.to_string(),
-        );
-        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
-        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
-        envs.insert(
-            ENV_SOURCE_PATH.to_string(),
-            ENV_SOURCE_PLUGIN_PATH.to_string(),
-        );
         envs
     }
 }
