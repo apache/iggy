@@ -47,8 +47,8 @@ use url::Url;
 
 use driver::{MqttDriver, MqttProtocol, validate_tls_config};
 use routing::{
-    DEFAULT_TOPIC_TEMPLATE, PreparedPublication, TopicMode, prepare_publication, validate_topic,
-    validate_topic_template,
+    DEFAULT_TOPIC_TEMPLATE, PreparedPublication, TopicMode, prepare_batch_topic,
+    prepare_publication_with_batch_topic, validate_topic, validate_topic_template,
 };
 
 sink_connector!(MqttSink);
@@ -119,7 +119,7 @@ fn default_qos() -> u8 {
     1
 }
 
-fn validate_broker_url_options(config: &MqttSinkConfig) -> Result<(), Error> {
+fn validate_broker_url(config: &MqttSinkConfig) -> Result<(), Error> {
     let url = Url::parse(&config.broker_url)
         .map_err(|error| Error::InvalidConfigValue(format!("broker_url: {error}")))?;
 
@@ -130,57 +130,19 @@ fn validate_broker_url_options(config: &MqttSinkConfig) -> Result<(), Error> {
         ));
     }
 
-    if let Some(keep_alive_secs) = url
-        .query_pairs()
-        .filter(|(key, _)| key == "keep_alive_secs")
-        .map(|(_, value)| value.into_owned())
-        .last()
-    {
-        let keep_alive_secs = keep_alive_secs.parse::<u64>().map_err(|_| {
-            Error::InvalidConfigValue(
-                "broker_url keep_alive_secs must be an unsigned integer".to_string(),
-            )
-        })?;
-        validate_keep_alive(
-            config.protocol,
-            Duration::from_secs(keep_alive_secs),
-            "broker_url keep_alive_secs",
-        )?;
-    }
-    if let Some(inflight_num) = url
-        .query_pairs()
-        .filter(|(key, _)| key == "inflight_num")
-        .map(|(_, value)| value.into_owned())
-        .last()
-    {
-        let inflight_num = inflight_num.parse::<u16>().map_err(|_| {
-            Error::InvalidConfigValue(
-                "broker_url inflight_num must be an unsigned 16-bit integer".to_string(),
-            )
-        })?;
-        if inflight_num == 0 {
-            return Err(Error::InvalidConfigValue(
-                "broker_url inflight_num must be greater than zero".to_string(),
-            ));
+    for (option, field) in [
+        ("keep_alive_secs", "keep_alive"),
+        ("inflight_num", "max_in_flight"),
+        ("clean_session", "clean_start"),
+        ("client_id", "client_id"),
+    ] {
+        if url.query_pairs().any(|(key, _)| key == option) {
+            return Err(Error::InvalidConfigValue(format!(
+                "broker_url must not contain {option}; configure {field} separately"
+            )));
         }
     }
-    if config.protocol == MqttProtocol::Mqtt311
-        && config
-            .client_id
-            .as_deref()
-            .is_some_and(|client_id| client_id.trim().is_empty())
-        && url
-            .query_pairs()
-            .filter(|(key, _)| key == "clean_session")
-            .map(|(_, value)| value.into_owned())
-            .last()
-            .as_deref()
-            == Some("false")
-    {
-        return Err(Error::InvalidConfigValue(
-            "broker_url clean_session=false requires a non-empty client_id".to_string(),
-        ));
-    }
+
     Ok(())
 }
 
@@ -251,7 +213,7 @@ impl MqttSink {
                 "username and password must be configured together".to_string(),
             ));
         }
-        validate_broker_url_options(&self.config)?;
+        validate_broker_url(&self.config)?;
         validate_tls_config(&self.config)?;
         let keep_alive = parse_duration(
             self.config.keep_alive.as_deref(),
@@ -360,13 +322,20 @@ impl MqttSink {
         topic_metadata: &TopicMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<Vec<PreparedPublication>, Error> {
+        let batch_topic = prepare_batch_topic(
+            topic_metadata,
+            self.config.topic_mode,
+            self.config.topic.as_deref(),
+            self.config.topic_template.as_deref(),
+        )?;
         let mut publications = Vec::with_capacity(messages.len());
         for message in messages {
-            match prepare_publication(
-                &message,
+            let offset = message.offset;
+            match prepare_publication_with_batch_topic(
+                message,
                 topic_metadata,
                 self.config.topic_mode,
-                self.config.topic.as_deref(),
+                batch_topic.as_ref(),
                 self.config.topic_template.as_deref(),
                 self.config.fallback_topic.as_deref(),
                 self.config.protocol,
@@ -375,7 +344,7 @@ impl MqttSink {
                 Err(error) => {
                     warn!(
                         "Rejecting MQTT batch for connector with ID {} because record is invalid, stream: {}, topic: {}, offset: {}: {error}",
-                        self.id, topic_metadata.stream, topic_metadata.topic, message.offset
+                        self.id, topic_metadata.stream, topic_metadata.topic, offset
                     );
                     self.publish_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(error);
@@ -524,13 +493,10 @@ impl Sink for MqttSink {
         // Connection establishment waits for CONNACK, so a successful open
         // means the broker accepted the session rather than only queueing a
         // local rumqttc request.
-        let mut driver = None;
-        for attempt in 1..=self.max_retries {
+        let mut attempt = 1;
+        let driver = loop {
             match self.connect_driver().await {
-                Ok(connected) => {
-                    driver = Some(connected);
-                    break;
-                }
+                Ok(driver) => break driver,
                 Err(Error::Connection(error)) if attempt < self.max_retries => {
                     warn!(
                         "Retrying MQTT connection for connector with ID {} (attempt {attempt}/{}): {error}",
@@ -538,11 +504,11 @@ impl Sink for MqttSink {
                     );
                     let delay = retry_backoff(self.retry_delay, attempt, self.max_retry_delay);
                     tokio::time::sleep(delay).await;
+                    attempt += 1;
                 }
                 Err(error) => return Err(error),
             }
-        }
-        let driver = driver.ok_or_else(|| Error::InitError("MQTT connection failed".into()))?;
+        };
         *self.driver.get_mut() = Some(driver);
         info!(
             "Opened {CONNECTOR_NAME} connector with ID {}, protocol: {:?}, topic: {:?}, mode: {:?}, qos: {:?}, retain: {}",
@@ -690,6 +656,29 @@ mod tests {
         }
     }
 
+    fn test_messages() -> Vec<ConsumedMessage> {
+        vec![
+            ConsumedMessage {
+                id: 1,
+                offset: 10,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Raw(b"first".to_vec()),
+            },
+            ConsumedMessage {
+                id: 2,
+                offset: 11,
+                checksum: 1,
+                timestamp: 1,
+                origin_timestamp: 1,
+                headers: None,
+                payload: Payload::Raw(b"second".to_vec()),
+            },
+        ]
+    }
+
     #[test]
     fn given_qos_one_when_new_should_keep_default_delivery_mode() {
         let sink = MqttSink::new(1, test_config());
@@ -828,6 +817,28 @@ mod tests {
     }
 
     #[test]
+    fn given_broker_url_transport_option_when_validating_should_return_configuration_error() {
+        for (option, field) in [
+            ("keep_alive_secs", "keep_alive"),
+            ("inflight_num", "max_in_flight"),
+            ("clean_session", "clean_start"),
+            ("client_id", "client_id"),
+        ] {
+            let mut config = test_config();
+            config.broker_url = format!("mqtt://localhost:1883?{option}=value");
+            let sink = MqttSink::new(1, config);
+
+            assert!(matches!(
+                sink.validate_config(),
+                Err(Error::InvalidConfigValue(message))
+                    if message == format!(
+                        "broker_url must not contain {option}; configure {field} separately"
+                    )
+            ));
+        }
+    }
+
+    #[test]
     fn given_client_certificate_without_private_key_when_validating_should_return_configuration_error()
      {
         let mut config = test_config();
@@ -893,6 +904,39 @@ mod tests {
 
         assert_eq!(sink.in_flight_publications.load(Ordering::Relaxed), 0);
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn given_static_mode_when_preparing_batch_should_share_topic_storage() {
+        let sink = MqttSink::new(1, test_config());
+        let metadata = TopicMetadata {
+            stream: "devices".to_string(),
+            topic: "telemetry".to_string(),
+        };
+        let publications = sink
+            .prepare_publications(&metadata, test_messages())
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&publications[0].topic, &publications[1].topic));
+    }
+
+    #[test]
+    fn given_template_mode_when_preparing_batch_should_share_topic_storage() {
+        let mut config = test_config();
+        config.topic_mode = TopicMode::Template;
+        config.topic_template = Some("{stream}/output/{topic}".to_string());
+        let sink = MqttSink::new(1, config);
+        let metadata = TopicMetadata {
+            stream: "devices".to_string(),
+            topic: "telemetry".to_string(),
+        };
+
+        let publications = sink
+            .prepare_publications(&metadata, test_messages())
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&publications[0].topic, &publications[1].topic));
+        assert_eq!(publications[0].topic.as_str(), "devices/output/telemetry");
     }
 
     #[test]

@@ -23,7 +23,9 @@ use rumqttc::tokio_rustls::rustls::{
 use rumqttc::v5::{
     AsyncClient as Mqtt5Client, ConnectionError as Mqtt5ConnectionError, Event as Mqtt5Event,
     EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
-    mqttbytes::v5::{ConnectReturnCode as Mqtt5ConnectReturnCode, PubAckReason, PubCompReason},
+    mqttbytes::v5::{
+        ConnectReturnCode as Mqtt5ConnectReturnCode, PubAckReason, PubCompReason, PubRecReason,
+    },
 };
 use rumqttc::{
     AsyncClient as Mqtt311Client, ConnectionError as Mqtt311ConnectionError, Event as Mqtt311Event,
@@ -35,7 +37,7 @@ use rustls_pemfile::{certs, private_key};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fs,
     io::{BufReader, Cursor},
     sync::Arc,
@@ -75,6 +77,10 @@ enum DriverEvent {
         packet_id: u16,
         reason: PubAckReason,
     },
+    Mqtt5PubRec {
+        packet_id: u16,
+        reason: PubRecReason,
+    },
     Mqtt5PubComp {
         packet_id: u16,
         reason: PubCompReason,
@@ -99,7 +105,7 @@ impl PublishWindowFailure {
 
 struct PublishWindowState {
     qos: rumqttc::QoS,
-    submitted: VecDeque<usize>,
+    next_submitted_index: usize,
     packet_to_index: HashMap<u16, usize>,
     confirmed: Vec<bool>,
 }
@@ -108,7 +114,7 @@ impl PublishWindowState {
     fn new(length: usize, qos: rumqttc::QoS) -> Self {
         Self {
             qos,
-            submitted: VecDeque::with_capacity(length),
+            next_submitted_index: 0,
             packet_to_index: HashMap::with_capacity(length),
             confirmed: vec![false; length],
         }
@@ -121,11 +127,13 @@ impl PublishWindowState {
     fn apply(&mut self, event: DriverEvent) -> Result<(), PublishWindowFailure> {
         match event {
             DriverEvent::OutgoingPublish(packet_id) => {
-                let Some(index) = self.submitted.pop_front() else {
+                if self.next_submitted_index == self.confirmed.len() {
                     return Err(PublishWindowFailure::Protocol(
                         "received an unexpected MQTT publish packet".to_string(),
                     ));
-                };
+                }
+                let index = self.next_submitted_index;
+                self.next_submitted_index += 1;
                 if self.qos == rumqttc::QoS::AtMostOnce {
                     self.confirmed[index] = true;
                 } else {
@@ -158,6 +166,19 @@ impl PublishWindowState {
                     }
                 }
             }
+            DriverEvent::Mqtt5PubRec { packet_id, reason }
+                if self.qos == rumqttc::QoS::ExactlyOnce =>
+            {
+                if !matches!(
+                    reason,
+                    PubRecReason::Success | PubRecReason::NoMatchingSubscribers
+                ) && self.packet_to_index.remove(&packet_id).is_some()
+                {
+                    return Err(PublishWindowFailure::BrokerRejected(format!(
+                        "MQTT 5 PUBREC rejected packet ID {packet_id}: {reason:?}"
+                    )));
+                }
+            }
             DriverEvent::Mqtt5PubComp { packet_id, reason }
                 if self.qos == rumqttc::QoS::ExactlyOnce =>
             {
@@ -174,6 +195,7 @@ impl PublishWindowState {
             DriverEvent::PubAck(_)
             | DriverEvent::PubComp(_)
             | DriverEvent::Mqtt5PubAck { .. }
+            | DriverEvent::Mqtt5PubRec { .. }
             | DriverEvent::Mqtt5PubComp { .. }
             | DriverEvent::Other => {}
         }
@@ -316,11 +338,10 @@ impl MqttDriver {
             return Ok(Vec::new());
         }
 
-        // AsyncClient::publish queues a request but does not return its packet
-        // identifier. Keep submitted indexes until the event loop emits the
-        // matching Outgoing::Publish event.
+        // AsyncClient::publish queues requests in order but does not return
+        // packet identifiers. Outgoing::Publish assigns them in that order.
         let mut state = PublishWindowState::new(publications.len(), qos);
-        for (index, &publication) in publications.iter().enumerate() {
+        for &publication in publications {
             if let Err(error) = self.enqueue_publication(publication, qos, retain).await {
                 return Err(PublishWindowError {
                     confirmed: state.confirmed_indexes(),
@@ -328,7 +349,6 @@ impl MqttDriver {
                     retryable: true,
                 });
             }
-            state.submitted.push_back(index);
         }
 
         let deadline = Instant::now() + publish_timeout;
@@ -383,14 +403,19 @@ impl MqttDriver {
     ) -> Result<(), iggy_connector_sdk::Error> {
         match &mut self.connection {
             MqttConnection::Mqtt311 { client, .. } => client
-                .publish(&publication.topic, qos, retain, publication.payload.clone())
+                .publish(
+                    publication.topic.as_str(),
+                    qos,
+                    retain,
+                    publication.payload.clone(),
+                )
                 .await
                 .map_err(|error| iggy_connector_sdk::Error::Connection(error.to_string())),
             MqttConnection::Mqtt5 { client, .. } => {
                 let result = if let Some(properties) = publication.properties.clone() {
                     client
                         .publish_with_properties(
-                            &publication.topic,
+                            publication.topic.as_str(),
                             mqtt5_qos(qos),
                             retain,
                             publication.payload.clone(),
@@ -400,7 +425,7 @@ impl MqttDriver {
                 } else {
                     client
                         .publish(
-                            &publication.topic,
+                            publication.topic.as_str(),
                             mqtt5_qos(qos),
                             retain,
                             publication.payload.clone(),
@@ -441,6 +466,10 @@ impl MqttDriver {
                 Mqtt5Event::Incoming(Mqtt5Incoming::PubAck(ack)) => Ok(DriverEvent::Mqtt5PubAck {
                     packet_id: ack.pkid,
                     reason: ack.reason,
+                }),
+                Mqtt5Event::Incoming(Mqtt5Incoming::PubRec(rec)) => Ok(DriverEvent::Mqtt5PubRec {
+                    packet_id: rec.pkid,
+                    reason: rec.reason,
                 }),
                 Mqtt5Event::Incoming(Mqtt5Incoming::PubComp(comp)) => {
                     Ok(DriverEvent::Mqtt5PubComp {
@@ -827,7 +856,9 @@ fn mqtt5_connack_error(code: Mqtt5ConnectReturnCode, id: u32) -> iggy_connector_
 mod tests {
     use std::fs;
 
-    use rumqttc::v5::mqttbytes::v5::{ConnectReturnCode, PubAckReason, PubCompReason};
+    use rumqttc::v5::mqttbytes::v5::{
+        ConnectReturnCode, PubAckReason, PubCompReason, PubRecReason,
+    };
 
     use super::{
         DriverEvent, Mqtt311Options, PublishWindowFailure, PublishWindowState,
@@ -901,7 +932,6 @@ mod tests {
     fn given_out_of_order_qos_one_acknowledgements_when_applied_should_confirm_matching_publications()
      {
         let mut state = PublishWindowState::new(3, rumqttc::QoS::AtLeastOnce);
-        state.submitted.extend([0, 1, 2]);
 
         state.apply(DriverEvent::OutgoingPublish(41)).unwrap();
         state.apply(DriverEvent::OutgoingPublish(42)).unwrap();
@@ -917,7 +947,6 @@ mod tests {
     fn given_out_of_order_qos_two_acknowledgements_when_applied_should_confirm_matching_publications()
      {
         let mut state = PublishWindowState::new(2, rumqttc::QoS::ExactlyOnce);
-        state.submitted.extend([0, 1]);
 
         state.apply(DriverEvent::OutgoingPublish(51)).unwrap();
         state.apply(DriverEvent::OutgoingPublish(52)).unwrap();
@@ -934,11 +963,24 @@ mod tests {
     fn given_qos_zero_when_outgoing_publish_is_applied_should_confirm_without_broker_acknowledgement()
      {
         let mut state = PublishWindowState::new(1, rumqttc::QoS::AtMostOnce);
-        state.submitted.push_back(0);
 
         state.apply(DriverEvent::OutgoingPublish(0)).unwrap();
 
         assert!(state.is_complete());
+    }
+
+    #[test]
+    fn given_outgoing_publish_beyond_window_when_applied_should_return_protocol_error() {
+        let mut state = PublishWindowState::new(1, rumqttc::QoS::AtLeastOnce);
+
+        state.apply(DriverEvent::OutgoingPublish(41)).unwrap();
+        let error = state.apply(DriverEvent::OutgoingPublish(42)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PublishWindowFailure::Protocol(message)
+                if message.contains("unexpected MQTT publish packet")
+        ));
     }
 
     #[test]
@@ -947,7 +989,6 @@ mod tests {
         let mut state = PublishWindowState::new(1, rumqttc::QoS::AtLeastOnce);
 
         state.apply(DriverEvent::PubAck(71)).unwrap();
-        state.submitted.push_back(0);
         state.apply(DriverEvent::OutgoingPublish(71)).unwrap();
 
         assert!(!state.is_complete());
@@ -956,7 +997,6 @@ mod tests {
     #[test]
     fn given_mqtt_five_no_matching_subscribers_puback_when_applied_should_confirm_publication() {
         let mut state = PublishWindowState::new(1, rumqttc::QoS::AtLeastOnce);
-        state.submitted.push_back(0);
         state.apply(DriverEvent::OutgoingPublish(61)).unwrap();
 
         state
@@ -972,7 +1012,6 @@ mod tests {
     #[test]
     fn given_mqtt_five_rejected_puback_when_applied_should_return_error_without_confirmation() {
         let mut state = PublishWindowState::new(1, rumqttc::QoS::AtLeastOnce);
-        state.submitted.push_back(0);
         state.apply(DriverEvent::OutgoingPublish(62)).unwrap();
 
         let error = state
@@ -996,9 +1035,33 @@ mod tests {
     }
 
     #[test]
+    fn given_mqtt_five_rejected_pubrec_when_applied_should_return_error_without_confirmation() {
+        let mut state = PublishWindowState::new(1, rumqttc::QoS::ExactlyOnce);
+        state.apply(DriverEvent::OutgoingPublish(63)).unwrap();
+
+        let error = state
+            .apply(DriverEvent::Mqtt5PubRec {
+                packet_id: 63,
+                reason: PubRecReason::NotAuthorized,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            PublishWindowFailure::BrokerRejected(message)
+                if message.contains("PUBREC rejected")
+        ));
+        assert!(matches!(
+            error.error(),
+            iggy_connector_sdk::Error::CannotStoreData(message)
+                if message.contains("PUBREC rejected")
+        ));
+        assert!(!state.is_complete());
+    }
+
+    #[test]
     fn given_mqtt_five_rejected_pubcomp_when_applied_should_return_error_without_confirmation() {
         let mut state = PublishWindowState::new(1, rumqttc::QoS::ExactlyOnce);
-        state.submitted.push_back(0);
         state.apply(DriverEvent::OutgoingPublish(63)).unwrap();
 
         let error = state
