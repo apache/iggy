@@ -684,6 +684,13 @@ impl<S: DurableStorage> PartitionPrepareJournal<S> {
             return Err(invalid("segment lost durably published bytes"));
         }
         file.truncate(cursor.position.length).await?;
+        // Truncating frees the reservation past the new length, reserved
+        // blocks included. Reserving again keeps the segment reserved up to
+        // `max_size`, which charging only body bytes past it relies on.
+        if self.preallocate_segments {
+            file.preallocate(&cursor.path(&self.directory), segments.max_size)
+                .await;
+        }
         file.sync().await?;
         self.poisoned = false;
         Ok(())
