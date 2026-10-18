@@ -32,8 +32,10 @@ use iggy_connector_sdk::{
 use rumqttc::QoS as MqttQos;
 use secrecy::SecretString;
 use serde::Deserialize;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::{
     str::FromStr,
     time::{Duration, Instant},
@@ -52,29 +54,31 @@ use routing::{
 sink_connector!(MqttSink);
 
 const CONNECTOR_NAME: &str = "MQTT sink";
-const DEFAULT_BROKER_URL: &str = "mqtt://127.0.0.1:1883";
 const DEFAULT_KEEP_ALIVE: &str = "30s";
 const DEFAULT_PUBLISH_TIMEOUT: &str = "30s";
 const DEFAULT_SHUTDOWN_TIMEOUT: &str = "30s";
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_MAX_RETRY_DELAY: &str = "30s";
 const DEFAULT_TOPIC: &str = "iggy.messages";
-const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_MAX_RETRIES: u32 = 5;
+const DEFAULT_SESSION_EXPIRY_INTERVAL: u32 = 3600;
 
 #[derive(Debug, Deserialize)]
 pub struct MqttSinkConfig {
     // Credentials are kept secret so logging a deserialized config cannot
     // accidentally expose the broker password.
-    #[serde(default = "default_broker_url")]
     pub broker_url: String,
     #[serde(default)]
     pub protocol: MqttProtocol,
     pub client_id: Option<String>,
     pub username: Option<String>,
     pub password: Option<SecretString>,
-    pub tls_ca_file: Option<PathBuf>,
-    pub tls_client_cert_file: Option<PathBuf>,
-    pub tls_client_key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub tls: Option<MqttTlsConfig>,
+    #[serde(default)]
+    pub clean_start: bool,
+    #[serde(default = "default_session_expiry_interval")]
+    pub session_expiry_interval: Option<u32>,
     #[serde(default = "default_topic")]
     pub topic: Option<String>,
     #[serde(default)]
@@ -96,8 +100,15 @@ pub struct MqttSinkConfig {
     pub verbose_logging: Option<bool>,
 }
 
-fn default_broker_url() -> String {
-    DEFAULT_BROKER_URL.to_string()
+#[derive(Debug, Deserialize)]
+pub struct MqttTlsConfig {
+    pub ca_file: Option<String>,
+    pub client_cert_file: Option<String>,
+    pub client_key_file: Option<String>,
+}
+
+fn default_session_expiry_interval() -> Option<u32> {
+    Some(DEFAULT_SESSION_EXPIRY_INTERVAL)
 }
 
 fn default_topic() -> Option<String> {
@@ -108,9 +119,9 @@ fn default_qos() -> u8 {
     1
 }
 
-fn validate_broker_url(broker_url: &str) -> Result<(), Error> {
-    let url = Url::parse(broker_url)
-        .map_err(|error| Error::InvalidConfigValue(format!("broker_url is invalid: {error}")))?;
+fn validate_broker_url_options(config: &MqttSinkConfig) -> Result<(), Error> {
+    let url = Url::parse(&config.broker_url)
+        .map_err(|error| Error::InvalidConfigValue(format!("broker_url: {error}")))?;
 
     if !url.username().is_empty() || url.password().is_some() {
         return Err(Error::InvalidConfigValue(
@@ -119,6 +130,57 @@ fn validate_broker_url(broker_url: &str) -> Result<(), Error> {
         ));
     }
 
+    if let Some(keep_alive_secs) = url
+        .query_pairs()
+        .filter(|(key, _)| key == "keep_alive_secs")
+        .map(|(_, value)| value.into_owned())
+        .last()
+    {
+        let keep_alive_secs = keep_alive_secs.parse::<u64>().map_err(|_| {
+            Error::InvalidConfigValue(
+                "broker_url keep_alive_secs must be an unsigned integer".to_string(),
+            )
+        })?;
+        validate_keep_alive(
+            config.protocol,
+            Duration::from_secs(keep_alive_secs),
+            "broker_url keep_alive_secs",
+        )?;
+    }
+    if let Some(inflight_num) = url
+        .query_pairs()
+        .filter(|(key, _)| key == "inflight_num")
+        .map(|(_, value)| value.into_owned())
+        .last()
+    {
+        let inflight_num = inflight_num.parse::<u16>().map_err(|_| {
+            Error::InvalidConfigValue(
+                "broker_url inflight_num must be an unsigned 16-bit integer".to_string(),
+            )
+        })?;
+        if inflight_num == 0 {
+            return Err(Error::InvalidConfigValue(
+                "broker_url inflight_num must be greater than zero".to_string(),
+            ));
+        }
+    }
+    if config.protocol == MqttProtocol::Mqtt311
+        && config
+            .client_id
+            .as_deref()
+            .is_some_and(|client_id| client_id.trim().is_empty())
+        && url
+            .query_pairs()
+            .filter(|(key, _)| key == "clean_session")
+            .map(|(_, value)| value.into_owned())
+            .last()
+            .as_deref()
+            == Some("false")
+    {
+        return Err(Error::InvalidConfigValue(
+            "broker_url clean_session=false requires a non-empty client_id".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -135,7 +197,7 @@ pub struct MqttSink {
     max_in_flight: usize,
     verbose: bool,
     driver: Mutex<Option<MqttDriver>>,
-    publish_lock: Mutex<()>,
+    publish_lock: Arc<Mutex<()>>,
     messages_published: AtomicU64,
     publish_errors: AtomicU64,
     in_flight_publications: AtomicU64,
@@ -143,51 +205,6 @@ pub struct MqttSink {
 
 impl MqttSink {
     pub fn new(id: u32, config: MqttSinkConfig) -> Self {
-        let keep_alive = parse_duration(
-            config.keep_alive.as_deref().unwrap_or(DEFAULT_KEEP_ALIVE),
-            Duration::from_secs(30),
-            "keep_alive",
-            id,
-        );
-        let publish_timeout = parse_duration(
-            config
-                .publish_timeout
-                .as_deref()
-                .unwrap_or(DEFAULT_PUBLISH_TIMEOUT),
-            Duration::from_secs(30),
-            "publish_timeout",
-            id,
-        );
-        let shutdown_timeout = parse_duration(
-            config
-                .shutdown_timeout
-                .as_deref()
-                .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT),
-            Duration::from_secs(30),
-            "shutdown_timeout",
-            id,
-        );
-        let retry_delay = parse_duration(
-            config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY),
-            Duration::from_secs(1),
-            "retry_delay",
-            id,
-        );
-        let max_retry_delay = parse_duration(
-            config
-                .max_retry_delay
-                .as_deref()
-                .unwrap_or(DEFAULT_MAX_RETRY_DELAY),
-            Duration::from_secs(30),
-            "max_retry_delay",
-            id,
-        );
-        let keep_alive = if keep_alive < Duration::from_secs(5) {
-            warn!("keep_alive must be at least 5s for MQTT sink connector ID: {id}; using 5s");
-            Duration::from_secs(5)
-        } else {
-            keep_alive
-        };
         let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES).max(1);
         let max_in_flight = config.max_in_flight.unwrap_or(1).max(1);
 
@@ -195,15 +212,15 @@ impl MqttSink {
             id,
             verbose: config.verbose_logging.unwrap_or(false),
             config,
-            keep_alive,
-            publish_timeout,
-            shutdown_timeout,
-            retry_delay,
-            max_retry_delay: max_retry_delay.max(retry_delay),
+            keep_alive: Duration::from_secs(30),
+            publish_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(30),
+            retry_delay: Duration::from_secs(1),
+            max_retry_delay: Duration::from_secs(30),
             max_retries,
             max_in_flight,
             driver: Mutex::new(None),
-            publish_lock: Mutex::new(()),
+            publish_lock: Arc::new(Mutex::new(())),
             messages_published: AtomicU64::new(0),
             publish_errors: AtomicU64::new(0),
             in_flight_publications: AtomicU64::new(0),
@@ -221,9 +238,47 @@ impl MqttSink {
         }
     }
 
-    fn validate_config(&self) -> Result<(), Error> {
-        validate_broker_url(&self.config.broker_url)?;
+    fn validate_config(
+        &self,
+    ) -> Result<(Duration, Duration, Duration, Duration, Duration, usize), Error> {
+        if self.config.broker_url.trim().is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "broker_url must not be empty".to_string(),
+            ));
+        }
+        if self.config.username.is_some() != self.config.password.is_some() {
+            return Err(Error::InvalidConfigValue(
+                "username and password must be configured together".to_string(),
+            ));
+        }
+        validate_broker_url_options(&self.config)?;
         validate_tls_config(&self.config)?;
+        let keep_alive = parse_duration(
+            self.config.keep_alive.as_deref(),
+            DEFAULT_KEEP_ALIVE,
+            "keep_alive",
+        )?;
+        validate_keep_alive(self.config.protocol, keep_alive, "keep_alive")?;
+        let publish_timeout = parse_duration(
+            self.config.publish_timeout.as_deref(),
+            DEFAULT_PUBLISH_TIMEOUT,
+            "publish_timeout",
+        )?;
+        let shutdown_timeout = parse_duration(
+            self.config.shutdown_timeout.as_deref(),
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            "shutdown_timeout",
+        )?;
+        let retry_delay = parse_duration(
+            self.config.retry_delay.as_deref(),
+            DEFAULT_RETRY_DELAY,
+            "retry_delay",
+        )?;
+        let max_retry_delay = parse_duration(
+            self.config.max_retry_delay.as_deref(),
+            DEFAULT_MAX_RETRY_DELAY,
+            "max_retry_delay",
+        )?;
         self.qos()?;
         if let Some(topic) = self.config.topic.as_deref() {
             validate_topic(topic, "topic")?;
@@ -252,7 +307,25 @@ impl MqttSink {
                 "max_in_flight must not exceed request_capacity".to_string(),
             ));
         }
-        Ok(())
+        if !self.config.clean_start
+            && !self
+                .config
+                .client_id
+                .as_deref()
+                .is_some_and(|client_id| !client_id.trim().is_empty())
+        {
+            return Err(Error::InvalidConfigValue(
+                "client_id must be configured when clean_start is false".to_string(),
+            ));
+        }
+        Ok((
+            keep_alive,
+            publish_timeout,
+            shutdown_timeout,
+            retry_delay,
+            max_retry_delay.max(retry_delay),
+            max_in_flight.max(1),
+        ))
     }
 
     fn client_id(&self) -> String {
@@ -299,14 +372,14 @@ impl MqttSink {
                 self.config.protocol,
             ) {
                 Ok(publication) => publications.push(publication),
-                Err(error) if is_malformed_record_error(&error) => {
+                Err(error) => {
                     warn!(
-                        "Dropping malformed MQTT record for connector ID: {}, stream: {}, topic: {}, offset: {}: {error}",
+                        "Rejecting MQTT batch for connector with ID {} because record is invalid, stream: {}, topic: {}, offset: {}: {error}",
                         self.id, topic_metadata.stream, topic_metadata.topic, message.offset
                     );
                     self.publish_errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
             }
         }
         Ok(publications)
@@ -342,7 +415,7 @@ impl MqttSink {
                     }
                     Err(error) => {
                         warn!(
-                            "Retrying MQTT connection for connector ID: {} (attempt {attempts}/{}): {error}",
+                            "Retrying MQTT connection for connector with ID {} (attempt {attempts}/{}): {error}",
                             self.id, self.max_retries
                         );
                         let delay = retry_backoff(self.retry_delay, attempts, self.max_retry_delay);
@@ -409,7 +482,7 @@ impl MqttSink {
             }
 
             warn!(
-                "Discarding uncertain MQTT connection for connector ID: {} before retry {}/{}: {}",
+                "Discarding uncertain MQTT connection for connector with ID {} before retry {}/{}: {}",
                 self.id,
                 attempts + 1,
                 self.max_retries,
@@ -433,12 +506,20 @@ impl MqttSink {
 #[async_trait]
 impl Sink for MqttSink {
     async fn open(&mut self) -> Result<(), Error> {
-        self.validate_config()?;
-        if self.config.username.is_some() != self.config.password.is_some() {
-            return Err(Error::InvalidConfigValue(
-                "username and password must be configured together".to_string(),
-            ));
-        }
+        let (
+            keep_alive,
+            publish_timeout,
+            shutdown_timeout,
+            retry_delay,
+            max_retry_delay,
+            max_in_flight,
+        ) = self.validate_config()?;
+        self.keep_alive = keep_alive;
+        self.publish_timeout = publish_timeout;
+        self.shutdown_timeout = shutdown_timeout;
+        self.retry_delay = retry_delay;
+        self.max_retry_delay = max_retry_delay;
+        self.max_in_flight = max_in_flight;
         let qos = self.qos()?;
         // Connection establishment waits for CONNACK, so a successful open
         // means the broker accepted the session rather than only queueing a
@@ -452,7 +533,7 @@ impl Sink for MqttSink {
                 }
                 Err(Error::Connection(error)) if attempt < self.max_retries => {
                     warn!(
-                        "Retrying MQTT connection for connector ID: {} (attempt {attempt}/{}): {error}",
+                        "Retrying MQTT connection for connector with ID {} (attempt {attempt}/{}): {error}",
                         self.id, self.max_retries
                     );
                     let delay = retry_backoff(self.retry_delay, attempt, self.max_retry_delay);
@@ -464,7 +545,7 @@ impl Sink for MqttSink {
         let driver = driver.ok_or_else(|| Error::InitError("MQTT connection failed".into()))?;
         *self.driver.get_mut() = Some(driver);
         info!(
-            "Opened {CONNECTOR_NAME} connector ID: {}, protocol: {:?}, topic: {:?}, mode: {:?}, qos: {:?}, retain: {}",
+            "Opened {CONNECTOR_NAME} connector with ID {}, protocol: {:?}, topic: {:?}, mode: {:?}, qos: {:?}, retain: {}",
             self.id,
             self.config.protocol,
             self.config.topic,
@@ -486,12 +567,12 @@ impl Sink for MqttSink {
             .fetch_add(published, Ordering::Relaxed);
         if self.verbose {
             info!(
-                "Published {published} messages to MQTT for connector ID: {}",
+                "Published {published} messages to MQTT for connector with ID {}",
                 self.id
             );
         } else {
             debug!(
-                "Published {published} messages to MQTT for connector ID: {}",
+                "Published {published} messages to MQTT for connector with ID {}",
                 self.id
             );
         }
@@ -505,7 +586,7 @@ impl Sink for MqttSink {
             .map_err(|_| {
                 let unfinished = self.in_flight_publications.load(Ordering::Relaxed);
                 error!(
-                    "MQTT shutdown timed out for connector ID: {} with {unfinished} unfinished publications",
+                    "MQTT shutdown timed out for connector with ID {} with {unfinished} unfinished publications",
                     self.id
                 );
                 Error::Connection(format!(
@@ -519,7 +600,7 @@ impl Sink for MqttSink {
         if let Some(mut driver) = driver {
             if remaining.is_zero() {
                 error!(
-                    "MQTT shutdown timed out for connector ID: {} before disconnecting",
+                    "MQTT shutdown timed out for connector with ID {} before disconnecting",
                     self.id
                 );
                 return Err(Error::Connection(
@@ -530,14 +611,14 @@ impl Sink for MqttSink {
                 .await
                 .map_err(|_| {
                     error!(
-                        "MQTT shutdown timed out for connector ID: {} while disconnecting",
+                        "MQTT shutdown timed out for connector with ID {} while disconnecting",
                         self.id
                     );
                     Error::Connection("MQTT shutdown timed out while disconnecting".to_string())
                 })??;
         }
         info!(
-            "Closed {CONNECTOR_NAME} connector ID: {} processed {} messages with {} errors and {} unfinished publications",
+            "Closed {CONNECTOR_NAME} connector with ID {} processed {} messages with {} errors and {} unfinished publications",
             self.id,
             self.messages_published.load(Ordering::Relaxed),
             self.publish_errors.load(Ordering::Relaxed),
@@ -547,26 +628,33 @@ impl Sink for MqttSink {
     }
 }
 
-fn parse_duration(raw: &str, default: Duration, field: &str, id: u32) -> Duration {
-    match HumanDuration::from_str(raw) {
-        Ok(duration) if !duration.is_zero() => duration.into(),
-        _ => {
-            warn!("Invalid {field} for MQTT sink connector ID: {id}; using {default:?}");
-            default
-        }
-    }
+fn parse_duration(value: Option<&str>, default: &str, field: &str) -> Result<Duration, Error> {
+    let value = value.unwrap_or(default);
+    HumanDuration::from_str(value)
+        .map(|duration| *duration)
+        .map_err(|error| Error::InvalidConfigValue(format!("{field}: {error}")))
 }
 
-fn is_malformed_record_error(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::InvalidRecord
-            | Error::InvalidRecordValue(_)
-            | Error::InvalidPayloadType
-            | Error::InvalidJsonPayload
-            | Error::InvalidTextPayload
-            | Error::InvalidProtobufPayload
-    )
+fn validate_keep_alive(
+    protocol: MqttProtocol,
+    keep_alive: Duration,
+    field: &str,
+) -> Result<(), Error> {
+    let minimum_keep_alive = match protocol {
+        MqttProtocol::Mqtt311 => Duration::from_secs(1),
+        MqttProtocol::Mqtt5 => Duration::from_secs(5),
+    };
+    let invalid = match protocol {
+        MqttProtocol::Mqtt311 => !keep_alive.is_zero() && keep_alive < minimum_keep_alive,
+        MqttProtocol::Mqtt5 => keep_alive < minimum_keep_alive,
+    };
+    if invalid {
+        return Err(Error::InvalidConfigValue(format!(
+            "{field} must be at least {:?} for {:?}",
+            minimum_keep_alive, protocol
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -581,9 +669,9 @@ mod tests {
             client_id: Some("test-client".to_string()),
             username: None,
             password: None,
-            tls_ca_file: None,
-            tls_client_cert_file: None,
-            tls_client_key_file: None,
+            tls: None,
+            clean_start: false,
+            session_expiry_interval: Some(DEFAULT_SESSION_EXPIRY_INTERVAL),
             topic: Some("test/topic".to_string()),
             topic_mode: TopicMode::Static,
             topic_template: None,
@@ -594,7 +682,7 @@ mod tests {
             request_capacity: Some(32),
             publish_timeout: Some("5s".to_string()),
             shutdown_timeout: Some("5s".to_string()),
-            max_retries: Some(3),
+            max_retries: Some(5),
             retry_delay: Some("1s".to_string()),
             max_retry_delay: Some("30s".to_string()),
             max_in_flight: Some(1),
@@ -607,6 +695,69 @@ mod tests {
         let sink = MqttSink::new(1, test_config());
         assert_eq!(sink.config.qos, 1);
         assert_eq!(sink.max_in_flight, 1);
+    }
+
+    #[test]
+    fn given_no_max_retries_should_use_default() {
+        let mut config = test_config();
+        config.max_retries = None;
+        let sink = MqttSink::new(1, config);
+
+        assert_eq!(sink.max_retries, DEFAULT_MAX_RETRIES);
+    }
+
+    #[test]
+    fn given_keep_alive_above_protocol_minimum_should_accept_configuration() {
+        let sink = MqttSink::new(1, test_config());
+
+        assert!(sink.validate_config().is_ok());
+    }
+
+    #[test]
+    fn given_mqtt311_zero_keep_alive_should_accept_configuration() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.keep_alive = Some("0s".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(sink.validate_config().is_ok());
+    }
+
+    #[test]
+    fn given_mqtt5_zero_keep_alive_should_reject_configuration() {
+        let mut config = test_config();
+        config.keep_alive = Some("0s".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("keep_alive")
+        ));
+    }
+
+    #[test]
+    fn given_keep_alive_below_protocol_minimum_should_reject_configuration() {
+        let mut config = test_config();
+        config.protocol = MqttProtocol::Mqtt311;
+        config.keep_alive = Some("500ms".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("keep_alive")
+        ));
+    }
+
+    #[test]
+    fn given_unparsable_keep_alive_should_reject_configuration() {
+        let mut config = test_config();
+        config.keep_alive = Some("not a duration".to_string());
+        let sink = MqttSink::new(1, config);
+
+        assert!(matches!(
+            sink.validate_config(),
+            Err(Error::InvalidConfigValue(message)) if message.contains("keep_alive")
+        ));
     }
 
     #[test]
@@ -681,8 +832,11 @@ mod tests {
      {
         let mut config = test_config();
         config.broker_url = "mqtts://localhost:8883".to_string();
-        config.tls_ca_file = Some("ca.pem".into());
-        config.tls_client_cert_file = Some("client.pem".into());
+        config.tls = Some(MqttTlsConfig {
+            ca_file: Some("ca.pem".to_string()),
+            client_cert_file: Some("client.pem".to_string()),
+            client_key_file: None,
+        });
         let sink = MqttSink::new(1, config);
 
         assert!(matches!(
@@ -692,24 +846,28 @@ mod tests {
     }
 
     #[test]
-    fn given_mutual_tls_without_ca_file_when_validating_should_return_configuration_error() {
+    fn given_mutual_tls_without_ca_file_when_validating_should_accept_configuration() {
         let mut config = test_config();
         config.broker_url = "mqtts://localhost:8883".to_string();
-        config.tls_client_cert_file = Some("client.pem".into());
-        config.tls_client_key_file = Some("client.key".into());
+        config.tls = Some(MqttTlsConfig {
+            ca_file: None,
+            client_cert_file: Some("client.pem".to_string()),
+            client_key_file: Some("client.key".to_string()),
+        });
         let sink = MqttSink::new(1, config);
 
-        assert!(matches!(
-            sink.validate_config(),
-            Err(Error::InvalidConfigValue(message)) if message.contains("tls_ca_file")
-        ));
+        assert!(sink.validate_config().is_ok());
     }
 
     #[test]
     fn given_tls_file_with_unencrypted_broker_url_when_validating_should_return_configuration_error()
      {
         let mut config = test_config();
-        config.tls_ca_file = Some("ca.pem".into());
+        config.tls = Some(MqttTlsConfig {
+            ca_file: Some("ca.pem".to_string()),
+            client_cert_file: None,
+            client_key_file: None,
+        });
         let sink = MqttSink::new(1, config);
 
         assert!(matches!(
@@ -738,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn given_malformed_dynamic_record_when_preparing_should_publish_valid_siblings() {
+    fn given_malformed_dynamic_record_when_preparing_should_reject_batch() {
         let mut config = test_config();
         config.topic_mode = TopicMode::Dynamic;
         config.fallback_topic = Some("fallback/{stream}/{topic}".to_string());
@@ -774,13 +932,11 @@ mod tests {
             },
         ];
 
-        let publications = sink
+        let error = sink
             .prepare_publications(&metadata, messages)
-            .expect("malformed record must not fail the batch");
+            .expect_err("malformed record must reject the batch");
 
-        assert_eq!(publications.len(), 1);
-        assert_eq!(publications[0].topic, "fallback/devices/telemetry");
-        assert_eq!(publications[0].payload.as_ref(), b"valid");
+        assert!(matches!(error, Error::InvalidRecordValue(_)));
         assert_eq!(sink.publish_errors.load(Ordering::Relaxed), 1);
     }
 
@@ -795,10 +951,35 @@ mod tests {
     }
 
     #[test]
-    fn given_minimal_json_when_deserialized_should_apply_defaults() {
-        let config: MqttSinkConfig = serde_json::from_str("{}").unwrap();
+    fn given_publications_in_flight_when_shutdown_times_out_should_report_them() {
+        let mut sink = MqttSink::new(1, test_config());
+        sink.shutdown_timeout = Duration::from_millis(10);
+        sink.in_flight_publications.store(2, Ordering::Relaxed);
+        let publish_lock = Arc::clone(&sink.publish_lock);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime must start");
+
+        runtime.block_on(async {
+            let _publish_guard = publish_lock.lock().await;
+            let result = timeout(Duration::from_secs(1), sink.close())
+                .await
+                .expect("shutdown must respect its timeout");
+
+            assert!(
+                matches!(result, Err(Error::Connection(message)) if message.contains("2 unfinished publications")),
+                "shutdown must report the number of publications that did not drain"
+            );
+        });
+    }
+
+    #[test]
+    fn given_minimal_json_when_deserialized_should_require_broker_url() {
+        let error = serde_json::from_str::<MqttSinkConfig>("{}").unwrap_err();
+        assert!(error.to_string().contains("broker_url"));
+        let config: MqttSinkConfig = serde_json::from_str(
+            r#"{"broker_url":"mqtt://localhost:1883","client_id":"test-client"}"#,
+        )
+        .unwrap();
         let sink = MqttSink::new(1, config);
-        assert_eq!(sink.config.broker_url, DEFAULT_BROKER_URL);
         assert_eq!(sink.config.topic.as_deref(), Some(DEFAULT_TOPIC));
         assert_eq!(sink.config.qos, 1);
         assert_eq!(sink.max_in_flight, 1);

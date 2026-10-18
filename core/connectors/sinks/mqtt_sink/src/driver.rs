@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use rumqttc::tokio_rustls::rustls;
+use rumqttc::tokio_rustls::rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
 use rumqttc::v5::{
     AsyncClient as Mqtt5Client, ConnectionError as Mqtt5ConnectionError, Event as Mqtt5Event,
     EventLoop as Mqtt5EventLoop, Incoming as Mqtt5Incoming, MqttOptions as Mqtt5Options,
@@ -23,22 +28,22 @@ use rumqttc::v5::{
 use rumqttc::{
     AsyncClient as Mqtt311Client, ConnectionError as Mqtt311ConnectionError, Event as Mqtt311Event,
     EventLoop as Mqtt311EventLoop, Incoming as Mqtt311Incoming, MqttOptions as Mqtt311Options,
-    Outgoing, Transport,
+    Outgoing, TlsConfiguration, Transport,
 };
+use rustls_native_certs::load_native_certs;
+use rustls_pemfile::{certs, private_key};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::{BufReader, Cursor, Read},
-    path::Path,
+    io::{BufReader, Cursor},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::time::timeout;
 
 use crate::{MqttSinkConfig, routing::PreparedPublication};
-
-const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 
 /// MQTT protocol selection is kept in the plugin because rumqttc exposes
 /// separate client/event-loop types for MQTT 3.1.1 and MQTT 5.
@@ -86,9 +91,8 @@ enum PublishWindowFailure {
 impl PublishWindowFailure {
     fn error(self) -> iggy_connector_sdk::Error {
         match self {
-            Self::BrokerRejected(message) | Self::Protocol(message) => {
-                iggy_connector_sdk::Error::Connection(message)
-            }
+            Self::BrokerRejected(message) => iggy_connector_sdk::Error::CannotStoreData(message),
+            Self::Protocol(message) => iggy_connector_sdk::Error::Connection(message),
         }
     }
 }
@@ -229,6 +233,7 @@ impl MqttDriver {
         request_capacity: usize,
         max_in_flight: usize,
     ) -> Result<Self, iggy_connector_sdk::Error> {
+        install_rustls_provider();
         if request_capacity == 0 {
             return Err(iggy_connector_sdk::Error::InvalidConfigValue(
                 "request_capacity must be greater than zero".to_string(),
@@ -243,17 +248,16 @@ impl MqttDriver {
 
         let connection = match config.protocol {
             MqttProtocol::Mqtt311 => {
-                let mut options =
-                    Mqtt311Options::parse_url(&config.broker_url).map_err(|error| {
-                        iggy_connector_sdk::Error::InvalidConfigValue(format!(
-                            "broker_url: {error}"
-                        ))
-                    })?;
+                let options_url = broker_url_with_client_id(&config.broker_url, &client_id)?;
+                let mut options = Mqtt311Options::parse_url(options_url).map_err(|error| {
+                    iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
+                })?;
                 options
                     .set_client_id(client_id)
                     .set_keep_alive(keep_alive)
                     .set_request_channel_capacity(request_capacity)
-                    .set_inflight(max_in_flight);
+                    .set_inflight(max_in_flight)
+                    .set_clean_session(config.clean_start);
                 if let (Some(username), Some(password)) =
                     (config.username.as_deref(), config.password.as_ref())
                 {
@@ -270,14 +274,17 @@ impl MqttDriver {
                 }
             }
             MqttProtocol::Mqtt5 => {
-                let mut options = Mqtt5Options::parse_url(&config.broker_url).map_err(|error| {
+                let options_url = broker_url_with_client_id(&config.broker_url, &client_id)?;
+                let mut options = Mqtt5Options::parse_url(options_url).map_err(|error| {
                     iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
                 })?;
                 options
                     .set_client_id(client_id)
                     .set_keep_alive(keep_alive)
                     .set_request_channel_capacity(request_capacity)
-                    .set_outgoing_inflight_upper_limit(max_in_flight);
+                    .set_outgoing_inflight_upper_limit(max_in_flight)
+                    .set_clean_start(config.clean_start)
+                    .set_session_expiry_interval(config.session_expiry_interval);
                 if let (Some(username), Some(password)) =
                     (config.username.as_deref(), config.password.as_ref())
                 {
@@ -473,139 +480,168 @@ impl MqttDriver {
 pub(crate) fn validate_tls_config(
     config: &MqttSinkConfig,
 ) -> Result<(), iggy_connector_sdk::Error> {
-    let has_ca = config.tls_ca_file.is_some();
-    let has_client_cert = config.tls_client_cert_file.is_some();
-    let has_client_key = config.tls_client_key_file.is_some();
-
-    for (field, path) in [
-        ("tls_ca_file", config.tls_ca_file.as_ref()),
-        ("tls_client_cert_file", config.tls_client_cert_file.as_ref()),
-        ("tls_client_key_file", config.tls_client_key_file.as_ref()),
-    ] {
-        if path.is_some_and(|path| path.as_os_str().is_empty()) {
-            return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
-                "{field} must not be empty"
-            )));
-        }
-    }
-
-    if has_client_cert != has_client_key {
+    let Some(tls) = &config.tls else {
+        return Ok(());
+    };
+    let broker_url = url::Url::parse(&config.broker_url).map_err(|error| {
+        iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url: {error}"))
+    })?;
+    if !matches!(broker_url.scheme(), "mqtts" | "ssl") {
         return Err(iggy_connector_sdk::Error::InvalidConfigValue(
-            "tls_client_cert_file and tls_client_key_file must be configured together".to_string(),
+            "tls requires an mqtts:// or ssl:// broker_url".to_string(),
         ));
     }
-    if (has_client_cert || has_client_key) && !has_ca {
+    if tls.client_cert_file.is_some() != tls.client_key_file.is_some() {
         return Err(iggy_connector_sdk::Error::InvalidConfigValue(
-            "tls_ca_file is required when mutual TLS is configured".to_string(),
+            "tls client_cert_file and client_key_file must be configured together".to_string(),
         ));
     }
-    if has_ca || has_client_cert || has_client_key {
-        let scheme = broker_scheme(&config.broker_url)?;
-        if !matches!(scheme.as_str(), "mqtts" | "ssl") {
-            return Err(iggy_connector_sdk::Error::InvalidConfigValue(
-                "TLS files require a broker_url with the mqtts:// or ssl:// scheme".to_string(),
-            ));
-        }
-    }
-
     Ok(())
 }
 
 fn tls_transport(config: &MqttSinkConfig) -> Result<Option<Transport>, iggy_connector_sdk::Error> {
-    validate_tls_config(config)?;
-
-    let Some(ca_path) = config.tls_ca_file.as_deref() else {
+    let Some(tls) = &config.tls else {
         return Ok(None);
     };
-    let ca = read_pem_file(ca_path, "tls_ca_file")?;
-    validate_certificate_chain(&ca, "tls_ca_file")?;
-
-    let client_auth = match (
-        config.tls_client_cert_file.as_deref(),
-        config.tls_client_key_file.as_deref(),
-    ) {
-        (Some(certificate_path), Some(key_path)) => {
-            let certificate = read_pem_file(certificate_path, "tls_client_cert_file")?;
-            validate_certificate_chain(&certificate, "tls_client_cert_file")?;
-            let key = read_pem_file(key_path, "tls_client_key_file")?;
-            validate_private_key(&key)?;
-            Some((certificate, key))
-        }
+    let ca = tls
+        .ca_file
+        .as_deref()
+        .map(|path| read_certificate_file(path, "tls.ca_file"))
+        .transpose()?;
+    let client_auth = match (&tls.client_cert_file, &tls.client_key_file) {
+        (Some(certificate_path), Some(key_path)) => Some((
+            read_certificate_file(certificate_path, "tls.client_cert_file")?,
+            read_private_key_file(key_path, "tls.client_key_file")?,
+        )),
         (None, None) => None,
         _ => unreachable!("TLS configuration was validated before loading files"),
     };
 
-    Ok(Some(Transport::tls(ca, client_auth, None)))
+    let tls_config = TlsConfiguration::Rustls(Arc::new(build_tls_config(ca, client_auth)?));
+    Ok(Some(Transport::tls_with_config(tls_config)))
 }
 
-fn broker_scheme(broker_url: &str) -> Result<String, iggy_connector_sdk::Error> {
-    let url = url::Url::parse(broker_url).map_err(|error| {
+fn broker_url_with_client_id(
+    broker_url: &str,
+    client_id: &str,
+) -> Result<String, iggy_connector_sdk::Error> {
+    let mut url = url::Url::parse(broker_url).map_err(|error| {
         iggy_connector_sdk::Error::InvalidConfigValue(format!("broker_url is invalid: {error}"))
     })?;
-    Ok(url.scheme().to_string())
+    let query_pairs = url
+        .query_pairs()
+        .filter(|(key, _)| key != "client_id")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let mut query = url.query_pairs_mut();
+    query.clear();
+    for (key, value) in &query_pairs {
+        query.append_pair(key, value);
+    }
+    query.append_pair("client_id", client_id);
+    drop(query);
+
+    Ok(url.into())
 }
 
-fn read_pem_file(path: &Path, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
-    let mut file = fs::File::open(path).map_err(|_| {
-        iggy_connector_sdk::Error::InvalidConfigValue(format!("cannot read {field}"))
-    })?;
-    let metadata = file.metadata().map_err(|_| {
-        iggy_connector_sdk::Error::InvalidConfigValue(format!("cannot read {field}"))
-    })?;
-    if !metadata.is_file() {
-        return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
-            "{field} must be a regular file"
-        )));
-    }
-    if metadata.len() > MAX_TLS_FILE_BYTES {
-        return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
-            "{field} exceeds the maximum size of {MAX_TLS_FILE_BYTES} bytes"
-        )));
-    }
-
-    let mut pem = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(MAX_TLS_FILE_BYTES + 1)
-        .read_to_end(&mut pem)
-        .map_err(|_| {
-            iggy_connector_sdk::Error::InvalidConfigValue(format!("cannot read {field}"))
-        })?;
-    if pem.len() as u64 > MAX_TLS_FILE_BYTES {
-        return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
-            "{field} exceeds the maximum size of {MAX_TLS_FILE_BYTES} bytes"
-        )));
-    }
-
-    Ok(pem)
+fn install_rustls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn validate_certificate_chain(pem: &[u8], field: &str) -> Result<(), iggy_connector_sdk::Error> {
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(Cursor::new(pem)))
+fn read_file(path: &str, field: &str) -> Result<Vec<u8>, iggy_connector_sdk::Error> {
+    fs::read(path).map_err(|error| {
+        iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} could not be read: {error}"))
+    })
+}
+
+fn read_certificate_file(
+    path: &str,
+    field: &str,
+) -> Result<Vec<CertificateDer<'static>>, iggy_connector_sdk::Error> {
+    let contents = read_file(path, field)?;
+    let mut reader = BufReader::new(Cursor::new(&contents));
+    let certificates = certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} is not valid PEM"))
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} is invalid: {error}"))
         })?;
     if certificates.is_empty() {
         return Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
-            "{field} must contain a PEM certificate"
+            "{field} does not contain a PEM certificate"
         )));
     }
-    Ok(())
+    Ok(certificates)
 }
 
-fn validate_private_key(pem: &[u8]) -> Result<(), iggy_connector_sdk::Error> {
-    rustls_pemfile::private_key(&mut BufReader::new(Cursor::new(pem)))
-        .map_err(|_| {
-            iggy_connector_sdk::Error::InvalidConfigValue(
-                "tls_client_key_file is not valid PEM".to_string(),
-            )
+fn read_private_key_file(
+    path: &str,
+    field: &str,
+) -> Result<PrivateKeyDer<'static>, iggy_connector_sdk::Error> {
+    let contents = read_file(path, field)?;
+    let mut reader = BufReader::new(Cursor::new(&contents));
+    private_key(&mut reader)
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!("{field} is invalid: {error}"))
         })?
         .ok_or_else(|| {
-            iggy_connector_sdk::Error::InvalidConfigValue(
-                "tls_client_key_file must contain a private key".to_string(),
-            )
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "{field} does not contain a PEM private key"
+            ))
+        })
+}
+
+fn system_root_cert_store() -> Result<RootCertStore, iggy_connector_sdk::Error> {
+    let mut root_cert_store = RootCertStore::empty();
+    let native_certificates = load_native_certs();
+    for certificate in native_certificates.certs {
+        root_cert_store.add(certificate).map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "system TLS certificate is invalid: {error}"
+            ))
         })?;
-    Ok(())
+    }
+    if root_cert_store.is_empty() {
+        return Err(iggy_connector_sdk::Error::InvalidConfigValue(
+            "no system TLS root certificates were found".to_string(),
+        ));
+    }
+    Ok(root_cert_store)
+}
+
+fn build_tls_config(
+    ca: Option<Vec<CertificateDer<'static>>>,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<ClientConfig, iggy_connector_sdk::Error> {
+    let root_cert_store = match ca {
+        Some(ca) => {
+            let mut root_cert_store = RootCertStore::empty();
+            for certificate in ca {
+                root_cert_store.add(certificate).map_err(|error| {
+                    iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                        "tls.ca_file contains an invalid certificate: {error}"
+                    ))
+                })?;
+            }
+            if root_cert_store.is_empty() {
+                return Err(iggy_connector_sdk::Error::InvalidConfigValue(
+                    "tls.ca_file does not contain a usable certificate".to_string(),
+                ));
+            }
+            root_cert_store
+        }
+        None => system_root_cert_store()?,
+    };
+    let client_config = ClientConfig::builder().with_root_certificates(root_cert_store);
+    let Some((client_certificates, client_key)) = client_auth else {
+        return Ok(client_config.with_no_client_auth());
+    };
+    client_config
+        .with_client_auth_cert(client_certificates, client_key)
+        .map_err(|error| {
+            iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "TLS client certificate and key do not match: {error}"
+            ))
+        })
 }
 
 fn confirmed_indexes(confirmed: &[bool]) -> Vec<usize> {
@@ -791,117 +827,43 @@ fn mqtt5_connack_error(code: Mqtt5ConnectReturnCode, id: u32) -> iggy_connector_
 mod tests {
     use std::fs;
 
-    use rcgen::generate_simple_self_signed;
     use rumqttc::v5::mqttbytes::v5::{ConnectReturnCode, PubAckReason, PubCompReason};
 
     use super::{
-        DriverEvent, MAX_TLS_FILE_BYTES, PublishWindowFailure, PublishWindowState,
-        mqtt5_connack_error, mqtt5_connection_error, mqtt311_connection_error, read_pem_file,
-        tls_transport, validate_certificate_chain, validate_private_key,
+        DriverEvent, Mqtt311Options, PublishWindowFailure, PublishWindowState,
+        broker_url_with_client_id, mqtt5_connack_error, mqtt5_connection_error,
+        mqtt311_connection_error, read_certificate_file, read_private_key_file,
     };
-    use crate::{MqttSinkConfig, routing::TopicMode};
-
-    fn test_config() -> MqttSinkConfig {
-        MqttSinkConfig {
-            broker_url: "mqtts://localhost:8883".to_string(),
-            protocol: super::MqttProtocol::Mqtt5,
-            client_id: None,
-            username: None,
-            password: None,
-            tls_ca_file: None,
-            tls_client_cert_file: None,
-            tls_client_key_file: None,
-            topic: Some("test/topic".to_string()),
-            topic_mode: TopicMode::Static,
-            topic_template: None,
-            fallback_topic: None,
-            qos: 1,
-            retain: false,
-            keep_alive: None,
-            request_capacity: None,
-            publish_timeout: None,
-            shutdown_timeout: None,
-            max_retries: None,
-            retry_delay: None,
-            max_retry_delay: None,
-            max_in_flight: None,
-            verbose_logging: None,
-        }
-    }
 
     #[test]
     fn given_invalid_ca_pem_when_validating_should_return_configuration_error() {
-        let error = validate_certificate_chain(b"not a certificate", "tls_ca_file")
+        let path =
+            std::env::temp_dir().join(format!("iggy-mqtt-sink-invalid-ca-{}", std::process::id()));
+        fs::write(&path, b"not a certificate").expect("invalid CA file must write");
+        let error = read_certificate_file(path.to_str().unwrap(), "tls.ca_file")
             .expect_err("invalid PEM must be rejected");
+        fs::remove_file(path).expect("invalid CA file must remove");
 
         assert!(matches!(
             error,
             iggy_connector_sdk::Error::InvalidConfigValue(message)
-                if message.contains("tls_ca_file")
+                if message.contains("tls.ca_file")
         ));
     }
 
     #[test]
     fn given_invalid_private_key_pem_when_validating_should_return_configuration_error() {
-        let error =
-            validate_private_key(b"not a private key").expect_err("invalid PEM must be rejected");
+        let path =
+            std::env::temp_dir().join(format!("iggy-mqtt-sink-invalid-key-{}", std::process::id()));
+        fs::write(&path, b"not a private key").expect("invalid key file must write");
+        let error = read_private_key_file(path.to_str().unwrap(), "tls.client_key_file")
+            .expect_err("invalid PEM must be rejected");
+        fs::remove_file(path).expect("invalid key file must remove");
 
         assert!(matches!(
             error,
-            iggy_connector_sdk::Error::InvalidConfigValue(message)
-                if message.contains("tls_client_key_file")
-        ));
-    }
-
-    #[test]
-    fn given_tls_ca_file_when_building_transport_should_create_tls_transport() {
-        let certificate = generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("test certificate must generate");
-        let path = std::env::temp_dir().join(format!(
-            "iggy-mqtt-sink-tls-{}-{}.pem",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::write(&path, certificate.cert.pem()).expect("test certificate must write");
-
-        let mut config = test_config();
-        config.tls_ca_file = Some(path.clone());
-        let transport = tls_transport(&config);
-
-        fs::remove_file(path).expect("test certificate must remove");
-        assert!(transport.is_ok_and(|transport| transport.is_some()));
-    }
-
-    #[test]
-    fn given_tls_directory_when_reading_pem_should_return_configuration_error() {
-        let error = read_pem_file(&std::env::temp_dir(), "tls_ca_file")
-            .expect_err("a directory must not be accepted as a TLS file");
-
-        assert!(matches!(
-            error,
-            iggy_connector_sdk::Error::InvalidConfigValue(message)
-                if message.contains("regular file")
-        ));
-    }
-
-    #[test]
-    fn given_oversized_tls_file_when_reading_pem_should_return_configuration_error() {
-        let path = std::env::temp_dir().join(format!(
-            "iggy-mqtt-sink-oversized-tls-{}-{}.pem",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::write(&path, vec![0; MAX_TLS_FILE_BYTES as usize + 1])
-            .expect("oversized test file must write");
-
-        let error = read_pem_file(&path, "tls_ca_file")
-            .expect_err("an oversized TLS file must be rejected");
-
-        fs::remove_file(path).expect("oversized test file must remove");
-        assert!(matches!(
-            error,
-            iggy_connector_sdk::Error::InvalidConfigValue(message)
-                if message.contains("maximum size")
+                iggy_connector_sdk::Error::InvalidConfigValue(message)
+                if message.contains("tls.client_key_file")
         ));
     }
 
@@ -1021,8 +983,13 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(
-            error,
+            &error,
             PublishWindowFailure::BrokerRejected(message)
+                if message.contains("PUBACK rejected")
+        ));
+        assert!(matches!(
+            error.error(),
+            iggy_connector_sdk::Error::CannotStoreData(message)
                 if message.contains("PUBACK rejected")
         ));
         assert!(!state.is_complete());
@@ -1069,5 +1036,16 @@ mod tests {
             iggy_connector_sdk::Error::Connection(message)
                 if message.contains("temporarily rejected")
         ));
+    }
+
+    #[test]
+    fn given_broker_url_without_client_id_when_building_driver_options_should_add_client_id() {
+        let broker_url = broker_url_with_client_id("mqtt://localhost:1883", "sink-client")
+            .expect("broker URL must accept a client identifier");
+
+        let options =
+            Mqtt311Options::parse_url(broker_url).expect("driver options must parse broker URL");
+
+        assert_eq!(options.client_id(), "sink-client");
     }
 }
