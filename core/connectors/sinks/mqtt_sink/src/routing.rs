@@ -224,13 +224,13 @@ fn prepare_dynamic(
     }
 
     if let Payload::Json(value) = &message.payload {
-        let bytes = simd_json::to_vec(value).map_err(|_| Error::InvalidJsonPayload)?;
-        let json_value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(|_| Error::InvalidJsonPayload)?;
-        let envelope_marked = json_value.as_object().is_some_and(|object| {
-            object.contains_key("version") || object.contains_key("payload_base64")
-        });
+        let envelope_marked = matches!(
+            value,
+            simd_json::OwnedValue::Object(object)
+                if object.contains_key("version") || object.contains_key("payload_base64")
+        );
         if envelope_marked {
+            let json_value = iggy_connector_sdk::convert::owned_value_to_serde_json(value);
             let envelope = serde_json::from_value::<MqttEnvelope>(json_value).map_err(|error| {
                 Error::InvalidRecordValue(format!("invalid MQTT envelope: {error}"))
             })?;

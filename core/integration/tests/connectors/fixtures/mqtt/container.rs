@@ -170,6 +170,71 @@ impl MqttBrokerContainer {
             message: format!("Timed out waiting for MQTT client {client_id} after disconnection"),
         })?
     }
+
+    pub(super) async fn deny_publish(
+        &self,
+        username: &str,
+        topic: &str,
+    ) -> Result<(), TestBinaryError> {
+        let token = wait_for_dashboard_token(&self.dashboard_url).await?;
+        let client = reqwest::Client::new();
+        let source_url = format!("{}/api/v5/authorization/sources", self.dashboard_url);
+        let source_response = client
+            .post(source_url)
+            .bearer_auth(&token)
+            .json(&json!({
+                "enable": true,
+                "max_rules": 100,
+                "type": "built_in_database"
+            }))
+            .send()
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!("Failed to configure EMQX authorization: {error}"),
+            })?;
+        if !source_response.status().is_success() && source_response.status().as_u16() != 409 {
+            return Err(TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!(
+                    "Failed to enable EMQX built-in authorization: HTTP {}",
+                    source_response.status()
+                ),
+            });
+        }
+
+        let rules_url = format!(
+            "{}/api/v5/authorization/sources/built_in_database/rules/users",
+            self.dashboard_url
+        );
+        let response = client
+            .post(rules_url)
+            .bearer_auth(token)
+            .json(&json!([{
+                "username": username,
+                "rules": [{
+                    "action": "publish",
+                    "permission": "deny",
+                    "topic": topic
+                }]
+            }]))
+            .send()
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!("Failed to configure EMQX publish rejection: {error}"),
+            })?;
+        if !response.status().is_success() {
+            return Err(TestBinaryError::FixtureSetup {
+                fixture_type: "MqttBrokerContainer".to_string(),
+                message: format!(
+                    "Failed to configure EMQX publish rejection: HTTP {}",
+                    response.status()
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 async fn wait_for_dashboard_token(dashboard_url: &str) -> Result<String, TestBinaryError> {
@@ -210,34 +275,36 @@ async fn wait_for_dashboard_token(dashboard_url: &str) -> Result<String, TestBin
 /// whose reply was lost.
 async fn create_mqtt_user(dashboard_url: &str, token: &str) -> Result<(), TestBinaryError> {
     let client = reqwest::Client::new();
-    let users_url =
+    let user_url =
         format!("{dashboard_url}/api/v5/authentication/password_based%3Abuilt_in_database/users");
-    let mut last_failure = String::from("no attempt was made");
-    for _ in 0..EMQX_START_ATTEMPTS {
-        match client
-            .post(&users_url)
-            .bearer_auth(token)
-            .json(&json!({
-                "user_id": MQTT_USERNAME,
-                "password": MQTT_PASSWORD,
-            }))
-            .send()
-            .await
-        {
-            Ok(response)
-                if response.status().is_success() || response.status() == StatusCode::CONFLICT =>
+
+    timeout(EMQX_START_INTERVAL * EMQX_START_ATTEMPTS as u32, async {
+        for _ in 0..EMQX_START_ATTEMPTS {
+            if let Ok(response) = client
+                .post(&user_url)
+                .bearer_auth(token)
+                .json(&json!({
+                    "user_id": MQTT_USERNAME,
+                    "password": MQTT_PASSWORD,
+                }))
+                .send()
+                .await
+                && response.status().is_success()
             {
                 return Ok(());
             }
-            Ok(response) => last_failure = format!("HTTP {}", response.status()),
-            Err(error) => last_failure = error.to_string(),
+            sleep(EMQX_START_INTERVAL).await;
         }
-        sleep(EMQX_START_INTERVAL).await;
-    }
-    Err(TestBinaryError::FixtureSetup {
-        fixture_type: "MqttBrokerContainer".to_string(),
-        message: format!("Failed to create EMQX MQTT test user: {last_failure}"),
+        Err(TestBinaryError::FixtureSetup {
+            fixture_type: "MqttBrokerContainer".to_string(),
+            message: "EMQX did not accept the MQTT test user".to_string(),
+        })
     })
+    .await
+    .map_err(|_| TestBinaryError::FixtureSetup {
+        fixture_type: "MqttBrokerContainer".to_string(),
+        message: "Timed out creating the EMQX MQTT test user".to_string(),
+    })?
 }
 
 async fn wait_for_mqtt(

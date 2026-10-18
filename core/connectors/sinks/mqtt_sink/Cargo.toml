@@ -40,6 +40,7 @@ humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 rumqttc = { workspace = true }
+rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -48,9 +49,6 @@ simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-
-[dev-dependencies]
-rcgen = { workspace = true }
 
 [lints]
 workspace = true
