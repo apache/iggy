@@ -21,6 +21,7 @@ use iggy_common::HeaderKey;
 use iggy_connector_sdk::{ConsumedMessage, Error, Payload, TopicMetadata};
 use rumqttc::v5::mqttbytes::v5::PublishProperties;
 use serde::Deserialize;
+use std::sync::Arc;
 
 use crate::MqttProtocol;
 
@@ -41,7 +42,7 @@ pub enum TopicMode {
 
 #[derive(Debug)]
 pub struct PreparedPublication {
-    pub topic: String,
+    pub topic: Arc<String>,
     pub payload: Bytes,
     pub properties: Option<PublishProperties>,
 }
@@ -161,11 +162,53 @@ fn is_mqtt_noncharacter(character: char) -> bool {
         || matches!(character as u32, value if value & 0xffff == 0xfffe || value & 0xffff == 0xffff)
 }
 
-pub fn prepare_publication(
-    message: &ConsumedMessage,
+pub fn prepare_batch_topic(
     metadata: &TopicMetadata,
     mode: TopicMode,
     configured_topic: Option<&str>,
+    topic_template: Option<&str>,
+) -> Result<Option<Arc<String>>, Error> {
+    let template = topic_template.unwrap_or(DEFAULT_TOPIC_TEMPLATE);
+    let topic = match mode {
+        TopicMode::Static => configured_topic
+            .filter(|topic| !topic.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| render_template(template, metadata)),
+        TopicMode::Template => render_template(template, metadata),
+        TopicMode::Dynamic => return Ok(None),
+    };
+    validate_topic(&topic, "resolved topic")
+        .map_err(|error| Error::InvalidRecordValue(error.to_string()))?;
+    Ok(Some(Arc::new(topic)))
+}
+
+#[cfg(test)]
+pub fn prepare_publication(
+    message: ConsumedMessage,
+    metadata: &TopicMetadata,
+    mode: TopicMode,
+    configured_topic: Option<&str>,
+    topic_template: Option<&str>,
+    fallback_topic: Option<&str>,
+    protocol: MqttProtocol,
+) -> Result<PreparedPublication, Error> {
+    let batch_topic = prepare_batch_topic(metadata, mode, configured_topic, topic_template)?;
+    prepare_publication_with_batch_topic(
+        message,
+        metadata,
+        mode,
+        batch_topic.as_ref(),
+        topic_template,
+        fallback_topic,
+        protocol,
+    )
+}
+
+pub fn prepare_publication_with_batch_topic(
+    message: ConsumedMessage,
+    metadata: &TopicMetadata,
+    mode: TopicMode,
+    batch_topic: Option<&Arc<String>>,
     topic_template: Option<&str>,
     fallback_topic: Option<&str>,
     protocol: MqttProtocol,
@@ -176,19 +219,12 @@ pub fn prepare_publication(
     let template = topic_template.unwrap_or(DEFAULT_TOPIC_TEMPLATE);
     let fallback = fallback_topic.unwrap_or(template);
     let (topic, payload, properties) = match mode {
-        TopicMode::Static => (
-            configured_topic
-                .filter(|topic| !topic.trim().is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| render_template(template, metadata)),
-            message.payload.try_to_bytes()?.into(),
-            None,
-        ),
-        TopicMode::Template => (
-            render_template(template, metadata),
-            message.payload.try_to_bytes()?.into(),
-            None,
-        ),
+        TopicMode::Static | TopicMode::Template => {
+            let topic = batch_topic.ok_or_else(|| {
+                Error::InvalidConfigValue("missing static or template batch topic".to_string())
+            })?;
+            (topic.clone(), message.payload.try_into_vec()?.into(), None)
+        }
         TopicMode::Dynamic => prepare_dynamic(message, metadata, fallback, protocol)?,
     };
     validate_topic(&topic, "resolved topic")
@@ -201,16 +237,18 @@ pub fn prepare_publication(
 }
 
 fn prepare_dynamic(
-    message: &ConsumedMessage,
+    message: ConsumedMessage,
     metadata: &TopicMetadata,
     fallback: &str,
     protocol: MqttProtocol,
-) -> Result<(String, Bytes, Option<PublishProperties>), Error> {
+) -> Result<(Arc<String>, Bytes, Option<PublishProperties>), Error> {
     // Raw messages can carry only the source topic header. JSON messages may
     // additionally contain the versioned MQTT 5 envelope used by mqtt_source.
-    if let Payload::Raw(_) = &message.payload {
-        let topic = message
-            .headers
+    let ConsumedMessage {
+        headers, payload, ..
+    } = message;
+    if let Payload::Raw(_) = &payload {
+        let topic = headers
             .as_ref()
             .and_then(|headers| {
                 HeaderKey::try_from(MQTT_TOPIC_HEADER)
@@ -220,54 +258,52 @@ fn prepare_dynamic(
             .map(|value| value.to_string_value())
             .filter(|topic| !topic.trim().is_empty())
             .unwrap_or_else(|| render_template(fallback, metadata));
-        return Ok((topic, message.payload.try_to_bytes()?.into(), None));
+        return Ok((Arc::new(topic), payload.try_into_vec()?.into(), None));
     }
 
-    if let Payload::Json(value) = &message.payload {
-        let envelope_marked = matches!(
-            value,
-            simd_json::OwnedValue::Object(object)
-                if object.contains_key("version") || object.contains_key("payload_base64")
-        );
-        if envelope_marked {
-            let json_value = iggy_connector_sdk::convert::owned_value_to_serde_json(value);
-            let envelope = serde_json::from_value::<MqttEnvelope>(json_value).map_err(|error| {
-                Error::InvalidRecordValue(format!("invalid MQTT envelope: {error}"))
-            })?;
-            // A recognized envelope must not be silently downgraded to MQTT
-            // 3.1.1, because that would discard its publish properties.
-            if protocol == MqttProtocol::Mqtt311 {
-                return Err(Error::InvalidRecordValue(
-                    "MQTT envelopes require protocol = mqtt5".to_string(),
-                ));
-            }
-            if envelope.version != 1 {
-                return Err(Error::InvalidRecordValue(format!(
-                    "unsupported MQTT envelope version: {}",
-                    envelope.version
-                )));
-            }
-            let topic = envelope
-                .topic
-                .filter(|topic| !topic.trim().is_empty())
-                .unwrap_or_else(|| render_template(fallback, metadata));
-            let payload =
-                Bytes::from(STANDARD.decode(envelope.payload_base64).map_err(|error| {
-                    Error::InvalidRecordValue(format!(
-                        "invalid MQTT envelope payload_base64: {error}"
-                    ))
-                })?);
-            let properties = envelope
-                .properties
-                .map(prepare_publish_properties)
-                .transpose()?;
-            return Ok((topic, payload, properties));
+    let envelope_marked = matches!(
+        &payload,
+        Payload::Json(simd_json::OwnedValue::Object(object))
+            if object.contains_key("version") && object.contains_key("payload_base64")
+    );
+    if envelope_marked {
+        let Payload::Json(value) = payload else {
+            unreachable!("MQTT envelope marker requires a JSON payload");
+        };
+        let json_value = iggy_connector_sdk::convert::owned_value_into_serde_json(value);
+        let envelope = serde_json::from_value::<MqttEnvelope>(json_value).map_err(|error| {
+            Error::InvalidRecordValue(format!("invalid MQTT envelope: {error}"))
+        })?;
+        // A recognized envelope must not be silently downgraded to MQTT
+        // 3.1.1, because that would discard its publish properties.
+        if protocol == MqttProtocol::Mqtt311 {
+            return Err(Error::InvalidRecordValue(
+                "MQTT envelopes require protocol = mqtt5".to_string(),
+            ));
         }
+        if envelope.version != 1 {
+            return Err(Error::InvalidRecordValue(format!(
+                "unsupported MQTT envelope version: {}",
+                envelope.version
+            )));
+        }
+        let topic = envelope
+            .topic
+            .filter(|topic| !topic.trim().is_empty())
+            .unwrap_or_else(|| render_template(fallback, metadata));
+        let payload = Bytes::from(STANDARD.decode(envelope.payload_base64).map_err(|error| {
+            Error::InvalidRecordValue(format!("invalid MQTT envelope payload_base64: {error}"))
+        })?);
+        let properties = envelope
+            .properties
+            .map(prepare_publish_properties)
+            .transpose()?;
+        return Ok((Arc::new(topic), payload, properties));
     }
 
     Ok((
-        render_template(fallback, metadata),
-        message.payload.try_to_bytes()?.into(),
+        Arc::new(render_template(fallback, metadata)),
+        payload.try_into_vec()?.into(),
         None,
     ))
 }
@@ -413,7 +449,7 @@ mod tests {
     #[test]
     fn template_mode_renders_stream_and_topic() {
         let publication = prepare_publication(
-            &message(Payload::Raw(vec![1, 2])),
+            message(Payload::Raw(vec![1, 2])),
             &metadata(),
             TopicMode::Template,
             None,
@@ -422,7 +458,27 @@ mod tests {
             MqttProtocol::Mqtt5,
         )
         .unwrap();
-        assert_eq!(publication.topic, "iggy/devices/telemetry");
+        assert_eq!(publication.topic.as_str(), "iggy/devices/telemetry");
+    }
+
+    #[test]
+    fn static_raw_payload_should_move_storage_into_publication() {
+        let payload = vec![1, 2, 3];
+        let payload_ptr = payload.as_ptr();
+
+        let publication = prepare_publication(
+            message(Payload::Raw(payload)),
+            &metadata(),
+            TopicMode::Static,
+            Some("devices/output"),
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.payload.as_ptr(), payload_ptr);
+        assert_eq!(publication.payload.as_ref(), [1, 2, 3]);
     }
 
     #[test]
@@ -433,7 +489,7 @@ mod tests {
         let mut message = message(Payload::Raw(vec![1]));
         message.headers = Some(headers);
         let publication = prepare_publication(
-            &message,
+            message,
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -442,7 +498,7 @@ mod tests {
             MqttProtocol::Mqtt5,
         )
         .unwrap();
-        assert_eq!(publication.topic, "devices/living-room");
+        assert_eq!(publication.topic.as_str(), "devices/living-room");
     }
 
     #[test]
@@ -459,7 +515,7 @@ mod tests {
         let mut bytes = serde_json::to_vec(&payload).unwrap();
         let json = simd_json::to_owned_value(&mut bytes).unwrap();
         let publication = prepare_publication(
-            &message(Payload::Json(json)),
+            message(Payload::Json(json)),
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -468,12 +524,43 @@ mod tests {
             MqttProtocol::Mqtt5,
         )
         .unwrap();
-        assert_eq!(publication.topic, "devices/test/telemetry");
+        assert_eq!(publication.topic.as_str(), "devices/test/telemetry");
         assert_eq!(publication.payload.as_ref(), [1, 2, 3]);
         assert_eq!(
             publication.properties.unwrap().user_properties[0],
             ("device-type".into(), "sensor".into())
         );
+    }
+
+    #[test]
+    fn dynamic_json_envelope_should_move_topic_storage_into_publication() {
+        let payload = serde_json::json!({
+            "version": 1,
+            "topic": "devices/test/telemetry",
+            "payload_base64": "AQID"
+        });
+        let mut bytes = serde_json::to_vec(&payload).unwrap();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+        let topic_ptr = match &json {
+            simd_json::OwnedValue::Object(object) => match object.get("topic") {
+                Some(simd_json::OwnedValue::String(topic)) => topic.as_ptr(),
+                _ => panic!("envelope topic must be a string"),
+            },
+            _ => panic!("envelope must be an object"),
+        };
+
+        let publication = prepare_publication(
+            message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            None,
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.topic.as_ptr(), topic_ptr);
     }
 
     #[test]
@@ -486,7 +573,7 @@ mod tests {
         let json = simd_json::to_owned_value(&mut bytes).unwrap();
 
         let error = prepare_publication(
-            &message(Payload::Json(json)),
+            message(Payload::Json(json)),
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -509,7 +596,7 @@ mod tests {
         let json = simd_json::to_owned_value(&mut bytes).unwrap();
 
         let error = prepare_publication(
-            &message(Payload::Json(json)),
+            message(Payload::Json(json)),
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -531,7 +618,7 @@ mod tests {
         let json = simd_json::to_owned_value(&mut bytes).unwrap();
 
         let publication = prepare_publication(
-            &message(Payload::Json(json)),
+            message(Payload::Json(json)),
             &metadata(),
             TopicMode::Dynamic,
             None,
@@ -541,7 +628,53 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(publication.topic, "fallback/devices/telemetry");
+        assert_eq!(publication.topic.as_str(), "fallback/devices/telemetry");
+        assert!(publication.properties.is_none());
+    }
+
+    #[test]
+    fn dynamic_json_with_only_version_should_use_fallback_topic() {
+        let payload = serde_json::json!({"version": 1, "value": "ordinary-json"});
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let mut bytes = payload_bytes.clone();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let publication = prepare_publication(
+            message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            Some("fallback/{stream}/{topic}"),
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.topic.as_str(), "fallback/devices/telemetry");
+        assert_eq!(publication.payload.as_ref(), payload_bytes);
+        assert!(publication.properties.is_none());
+    }
+
+    #[test]
+    fn dynamic_json_with_only_payload_base64_should_use_fallback_topic() {
+        let payload = serde_json::json!({"payload_base64": "AQID", "value": "ordinary-json"});
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let mut bytes = payload_bytes.clone();
+        let json = simd_json::to_owned_value(&mut bytes).unwrap();
+
+        let publication = prepare_publication(
+            message(Payload::Json(json)),
+            &metadata(),
+            TopicMode::Dynamic,
+            None,
+            None,
+            Some("fallback/{stream}/{topic}"),
+            MqttProtocol::Mqtt5,
+        )
+        .unwrap();
+
+        assert_eq!(publication.topic.as_str(), "fallback/devices/telemetry");
+        assert_eq!(publication.payload.as_ref(), payload_bytes);
         assert!(publication.properties.is_none());
     }
 
@@ -577,7 +710,7 @@ mod tests {
             let json = simd_json::to_owned_value(&mut bytes).unwrap();
 
             let error = prepare_publication(
-                &message(Payload::Json(json)),
+                message(Payload::Json(json)),
                 &metadata(),
                 TopicMode::Dynamic,
                 None,
