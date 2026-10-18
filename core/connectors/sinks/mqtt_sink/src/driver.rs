@@ -333,9 +333,9 @@ impl MqttDriver {
         qos: rumqttc::QoS,
         retain: bool,
         publish_timeout: Duration,
-    ) -> Result<Vec<usize>, PublishWindowError> {
+    ) -> Result<(), PublishWindowError> {
         if publications.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // AsyncClient::publish queues requests in order but does not return
@@ -392,7 +392,7 @@ impl MqttDriver {
             }
         }
 
-        Ok(state.confirmed_indexes())
+        Ok(())
     }
 
     async fn enqueue_publication(
