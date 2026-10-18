@@ -1579,10 +1579,13 @@ impl MySqlSource {
         };
 
         // The query and its binds are rebuilt on every attempt because with_retry
-        // calls the closure once per try and each `execute` consumes the query.
+        // calls the closure once per try and each `execute` consumes the query. Not
+        // persistent for the same reason as the polling query: the inlined tracking
+        // bound and the IN list length make the SQL text unique per batch.
         with_retry(
             || {
-                let mut prepared = sqlx::query(sqlx::AssertSqlSafe(query.as_str()));
+                let mut prepared =
+                    sqlx::query(sqlx::AssertSqlSafe(query.as_str())).persistent(false);
                 for id in ids {
                     prepared = match id {
                         PkValue::Text(text) => prepared.bind(text),
@@ -1872,9 +1875,13 @@ impl MySqlSource {
             self.build_polling_query(table, tracking_column, last_offset, batch_size, query_kind)?
         };
 
-        // Database I/O without holding the lock
+        // Database I/O without holding the lock. Cache Not persistent
         let rows = with_retry(
-            || sqlx::query(sqlx::AssertSqlSafe(query.as_str())).fetch_all(pool),
+            || {
+                sqlx::query(sqlx::AssertSqlSafe(query.as_str()))
+                    .persistent(false)
+                    .fetch_all(pool)
+            },
             self.get_max_retries(),
             self.retry_delay.as_millis() as u64,
         )
