@@ -67,7 +67,7 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 
 ## Tracking Column Requirements
 
-Polling is **insert-only**. Each poll runs roughly `SELECT ... WHERE tracking_column > last_offset ORDER BY tracking_column ASC LIMIT batch_size` and stores the largest tracking value it saw as the next offset. For this to be lossless the **`tracking_column` must be unique and monotonically increasing under the order MySQL sorts that column in** — an auto-increment primary key is the canonical choice.
+Polling is **insert-only**. Each poll runs roughly `SELECT ... WHERE tracking_column > last_offset ORDER BY tracking_column ASC LIMIT batch_size` and stores the largest tracking value it saw as the next offset. The **`tracking_column` must be unique and monotonically increasing under the order MySQL sorts that column in**, and must meet the [commit-order visibility requirements](#commit-order-visibility-requirements). An auto-increment primary key is the canonical choice.
 
 Which order that is depends on the type. Numeric columns sort by value; string columns sort by their collation, which is a different contract and an easy one to fail. See [Text columns sort by collation, not by value](#text-columns-sort-by-collation-not-by-value).
 
@@ -101,6 +101,19 @@ A table that does not exist yet at startup gets the same checks on the first pol
 A computed or aliased `custom_query` column has no `information_schema` row, so its type is checked from the result set before the cursor moves, and a rejected type disables the table the same way. That check cannot recognise `SET`, which the result set reports as `CHAR`.
 
 A nullable column is refused only when the connector builds its own query. With a `custom_query` it is a warning instead, because a query moves nullability in both directions: a `LEFT JOIN` introduces NULLs into a `NOT NULL` column, `WHERE ts IS NOT NULL` removes them from a nullable one. The per-poll check above catches an actual NULL.
+
+### Commit-order visibility requirements
+
+An `AUTO_INCREMENT` id is assigned at insert, not at commit, so with concurrent writers an id can commit after a higher id has already advanced the cursor. That row is skipped silently:
+
+```text
+T1: INSERT -> id 10, not committed
+T2: INSERT -> id 11, COMMIT
+poll       -> sees 11, cursor = 11
+T1: COMMIT -> id 10 is never read
+```
+
+`CURRENT_TIMESTAMP` columns have the same gap. Polling is lossless only when tracking values become visible in the order they are assigned, such as with a single writer or writers that serialize insert and commit. Otherwise use binlog-based CDC.
 
 ### Text columns sort by collation, not by value
 
@@ -456,8 +469,11 @@ does the connector take over the offsets and run the `DELETE` or `UPDATE`.
 - **The connector crashes after the send but before the state is saved.** The
   batch is read and sent again on restart.
 
-Delivery is therefore at-least-once with every option, including plain offset
-tracking. Replays carry the same message ids (see
+Delivery is therefore at-least-once for selected rows with every option,
+including plain offset tracking. A row that commits below the cursor is never
+selected (see
+[Commit-order visibility requirements](#commit-order-visibility-requirements)).
+Replays carry the same message ids (see
 [Message IDs and Idempotent Replay](#message-ids-and-idempotent-replay)), so
 downstream can drop them.
 

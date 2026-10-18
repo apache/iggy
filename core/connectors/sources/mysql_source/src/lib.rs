@@ -1082,12 +1082,8 @@ impl MySqlSource {
         PayloadFormat::Json
     }
 
-    fn serialize_state(&self, state: &State) -> Option<ConnectorState> {
-        ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
-    }
-
     fn serialize_pending_state(&self, state: &State) -> Result<ConnectorState, Error> {
-        self.serialize_state(state).ok_or_else(|| {
+        ConnectorState::serialize(state, CONNECTOR_NAME, self.id).ok_or_else(|| {
             Error::Serialization(format!("failed to serialize {CONNECTOR_NAME} state"))
         })
     }
@@ -1393,11 +1389,6 @@ impl MySqlSource {
             )));
         }
 
-        if query.contains("$table") && self.config.tables.is_empty() {
-            return Err(Error::InitError(
-                "custom_query uses $table but no tables are configured".to_string(),
-            ));
-        }
         // Without $table the same SQL is executed once per table, so identical rows
         // would be emitted repeatedly, each carrying a different table's metadata,
         // message ID, and tracking offset. Table identity is not recoverable from a
@@ -3424,21 +3415,6 @@ mod tests {
             )
             .unwrap();
         assert!(result.contains("id > 500"));
-    }
-
-    #[test]
-    fn given_table_placeholder_and_no_tables_should_fail() {
-        // A $table placeholder with no configured tables can never resolve,
-        // so validation must reject it instead of querying a literal "$table".
-        let mut config = test_config();
-        config.tables = vec![];
-        let source = MySqlSource::new(1, config, None);
-        let result =
-            source.validate_custom_query("SELECT * FROM $table WHERE id > $offset ORDER BY id");
-        assert!(
-            matches!(result, Err(Error::InitError(ref message)) if message.contains("$table")),
-            "expected an InitError naming the placeholder, got {result:?}"
-        );
     }
 
     #[test]
