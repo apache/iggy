@@ -74,12 +74,9 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let first_poll = owner.partition_read(
         namespace,
         PartitionRead::Poll {
+            metadata: None,
             consumer,
-            args: PollingArgs {
-                strategy: PollingStrategy::next(),
-                count: 3,
-                auto_commit: true,
-            },
+            args: PollingArgs::new(PollingStrategy::next(), 3, true),
         },
     );
     futures::pin_mut!(first_poll);
@@ -88,6 +85,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
         namespace: requested_namespace,
         read:
             PartitionRead::Poll {
+                metadata: None,
                 consumer: requested_consumer,
                 args,
             },
@@ -121,7 +119,7 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     );
     assert!(
         matches!(
-            late_reply.try_send(PartitionReadReply::Ack),
+            late_reply.try_send(PartitionReadReply::NotFound),
             Err(crossfire::TrySendError::Disconnected(_))
         ),
         "timeout closed the reply channel before completion"
@@ -169,12 +167,9 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
     let next_poll = owner.partition_read(
         namespace,
         PartitionRead::Poll {
+            metadata: None,
             consumer,
-            args: PollingArgs {
-                strategy: PollingStrategy::next(),
-                count: 4,
-                auto_commit: false,
-            },
+            args: PollingArgs::new(PollingStrategy::next(), 4, false),
         },
     );
     futures::pin_mut!(next_poll);
@@ -247,6 +242,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
         .on_partition_read(
             namespace,
             PartitionRead::Poll {
+                metadata: None,
                 consumer,
                 args: args.clone(),
             },
@@ -273,6 +269,7 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
         .on_partition_read(
             namespace,
             PartitionRead::Poll {
+                metadata: None,
                 consumer,
                 args: args.clone(),
             },
@@ -314,7 +311,15 @@ async fn given_reserved_completion_capacity_when_disk_polls_arrive_should_reject
     );
     let (reply, replies) = channel(1);
     owner
-        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args,
+                metadata: None,
+            },
+            reply,
+        )
         .await;
     assert_eq!(
         bus.spawned_tasks.borrow().len(),
@@ -352,7 +357,15 @@ async fn given_missing_owner_route_when_disk_poll_arrives_should_reject_before_d
     let (reply, replies) = channel(1);
 
     owner
-        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args,
+                metadata: None,
+            },
+            reply,
+        )
         .await;
 
     assert!(matches!(
@@ -396,7 +409,15 @@ async fn given_disconnected_owner_when_disk_poll_arrives_should_reject_before_di
     let (reply, replies) = channel(1);
 
     owner
-        .on_partition_read(namespace, PartitionRead::Poll { consumer, args }, reply)
+        .on_partition_read(
+            namespace,
+            PartitionRead::Poll {
+                consumer,
+                args,
+                metadata: None,
+            },
+            reply,
+        )
         .await;
 
     assert!(matches!(

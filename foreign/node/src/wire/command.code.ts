@@ -46,6 +46,7 @@ export const COMMAND_CODE = {
   SendMessages: 101,
   GetPollRouting: 103,
   PollMessagesOnPrimary: 104,
+  GetPartitionRoute: 105,
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,

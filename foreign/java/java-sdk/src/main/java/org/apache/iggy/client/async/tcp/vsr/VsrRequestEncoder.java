@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp.vsr;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import org.apache.iggy.partition.PartitionContext;
 
 /**
  * Encodes a (code, payload) command into a VSR request frame:
@@ -65,6 +66,19 @@ public final class VsrRequestEncoder {
      * {@code payload}; its reader index is not advanced.
      */
     public ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload) {
+        return encode(alloc, commandCode, payload, PartitionContext.EMPTY);
+    }
+
+    public ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload, PartitionContext context) {
+        return encode(alloc, commandCode, payload, context, 0);
+    }
+
+    public ByteBuf encode(
+            ByteBufAllocator alloc,
+            int commandCode,
+            ByteBuf payload,
+            PartitionContext context,
+            long retainedRequestId) {
         int operation;
         long requestId;
         long sessionId;
@@ -91,14 +105,14 @@ public final class VsrRequestEncoder {
                 // Non-replicated ops bypass dedup but still need a unique
                 // correlation id. Bootstrap ping and cluster metadata remain
                 // sessionless before login.
-                requestId = session.nextCorrelationId();
+                requestId = retainedRequestId != 0 ? retainedRequestId : session.nextCorrelationId();
                 sessionId = session.sessionOrZero();
             } else {
                 // Partition ops consume the dedup counter too: dedup needs each
                 // send to carry a distinct number, and the metadata watermark
                 // tolerates the gaps.
                 sessionId = session.boundSession();
-                requestId = session.nextRequestId();
+                requestId = retainedRequestId != 0 ? retainedRequestId : session.nextRequestId();
             }
         }
 
@@ -113,6 +127,13 @@ public final class VsrRequestEncoder {
             frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
             frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
             frame.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
+            frame.setLongLE(
+                    VsrHeaders.REQUEST_INCARNATION_OFFSET, context.incarnation().longValue());
+            frame.setLongLE(
+                    VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET,
+                    context.ownerGeneration().longValue());
+            frame.setLongLE(
+                    VsrHeaders.REQUEST_METADATA_OP_OFFSET, context.metadataOp().longValue());
             if (operation == VsrOperation.NON_REPLICATED) {
                 frame.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, commandCode);
             }

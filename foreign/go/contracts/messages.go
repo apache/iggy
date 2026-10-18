@@ -56,6 +56,7 @@ type PollMessageRequest struct {
 }
 
 type PolledMessage struct {
+	Context       PartitionContext
 	PartitionId   uint32
 	CurrentOffset uint64
 	MessageCount  uint32

@@ -15,23 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stm::StateHandler;
 use crate::stm::consumer_group::{
-    CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupSnapshot,
-    JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RefreshConsumerGroupSessionRequest,
-    RemoveConsumerGroupMemberRequest,
+    CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupOwnershipTransition,
+    ConsumerGroupSnapshot, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
+    RefreshConsumerGroupSessionRequest, RemoveConsumerGroupMemberRequest,
 };
 use crate::stm::id_slab::IdSlab;
+use crate::stm::lifecycle::{
+    CompleteLifecycleRequest, LifecycleAction, LifecycleIntent, LifecycleScope,
+};
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
-    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, TruncatePartitionResult,
-    UpdateStreamResult, UpdateTopicResult,
+    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, DeletedResource,
+    TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::snapshot::Snapshotable;
+use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use std::collections::{BTreeMap, BTreeSet};
 // Only `seed_namespace` (sim/test-gated) uses this at module scope, so keep the
 // import under the same gate. The test module re-imports it independently.
 #[cfg(any(test, feature = "simulator"))]
@@ -51,6 +55,7 @@ use iggy_binary_protocol::requests::streams::{
 // Only the slab-seeding helpers build a bare `CreateTopicRequest`; without
 // their cfg the import is dead and `-p <crate>` clippy (which skips the
 // simulator feature) rejects it.
+use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
@@ -66,9 +71,9 @@ use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
 use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire_split};
 use iggy_common::{
-    CompressionAlgorithm, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, PartitionStats,
-    ResourceOptions, StreamStats, TopicCreateOptions, TopicRuntimeOptions, TopicStats,
-    topic_option_keys,
+    CompressionAlgorithm, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize,
+    PartitionResizePolicy, PartitionStats, ResourceOptions, StreamStats, TopicCreateOptions,
+    TopicRuntimeOptions, TopicStats, topic_option_keys,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -174,6 +179,8 @@ pub struct TopicSnapshot {
     pub next_consumer_group_id: u64,
     #[serde(default)]
     pub options: ResourceOptions,
+    #[serde(default)]
+    pub consumer_group_catalog_op: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +215,10 @@ pub struct Topic {
     /// clamped wire ids all collide on `u32::MAX`, including with a live
     /// group's offset key.
     pub next_consumer_group_id: u64,
+    /// Op of the last apply that changed `next_consumer_group_id` or the group
+    /// set. A partition expects one allocation boundary per op, so a reader
+    /// takes the catalog and this op from the same published state.
+    pub consumer_group_catalog_op: u64,
 }
 
 impl Default for Topic {
@@ -226,6 +237,7 @@ impl Default for Topic {
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         }
     }
 }
@@ -253,21 +265,13 @@ impl Topic {
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         }
     }
 
-    /// Re-run round-robin assignment for every consumer group under this topic
-    /// against the current partition set. Called after a partition-count change
-    /// (`CreatePartitions`/`DeletePartitions`) so groups pick up added
-    /// partitions and drop removed ones; each `rebalance_members` bumps the
-    /// group generation so stale clients re-sync.
-    pub fn rebalance_consumer_groups(&mut self) {
-        if self.consumer_groups.is_empty() {
-            return;
-        }
-        let partition_ids: Vec<usize> = self.partitions.iter().map(|p| p.id).collect();
+    pub fn rebalance_consumer_groups(&mut self, metadata_op: u64, timestamp: IggyTimestamp) {
         for group in self.consumer_groups.values_mut() {
-            group.rebalance_members(&partition_ids);
+            group.rebalance_members(&self.partitions, metadata_op, timestamp.as_micros());
         }
     }
 
@@ -393,7 +397,8 @@ impl Stream {
 /// * `WriteCell::apply` is `append(cmd).publish()`, so a batch is one op. Batch
 ///   two and a delete could be absorbed on the second buffer AFTER a create
 ///   that re-minted the same id, and the delete would then evict the new
-///   partition's entry.
+///   partition's entry. The one multi-op batch,
+///   `Streams::remove_consumer_group_members`, touches no entry here.
 /// * `left_right` drains the previous batch's `absorb_second` before the
 ///   current batch's `absorb_first` (0.11.8 `write.rs`), which is an
 ///   implementation detail, not a contract -- which is why the workspace
@@ -774,13 +779,13 @@ define_state! {
         // Retirement proofs survive truncation, but not a changed set of
         // partition incarnations.
         pub namespace_revision: u64,
-        // Total pending cooperative revocations across all groups, recomputed
-        // once per commit by `post_apply`. The consensus tick reads it O(1)
-        // every 10ms instead of walking every stream/topic/group/member to
-        // decide whether to wake the reconciler. Deterministic (same ops, same
-        // recompute on every replica).
-        pub(crate) pending_revocations_count: u64,
-        // Derived with the revocation count after membership changes and restore.
+        pub lifecycle_intents: BTreeMap<u64, LifecycleIntent>,
+        // The keys of `lifecycle_intents` ordered by stream and topic, so a
+        // blocker query visits only its own scope. Rebuilt on restore.
+        pub(crate) lifecycle_scopes: BTreeSet<LifecycleScope>,
+        pub(crate) finalizing_lifecycle: bool,
+        // Rebuilt after membership changes and restore; ticks visit only open transitions.
+        pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
         // Locations are (stream, topic, group, member); never persisted.
         pub(crate) consumer_group_members: AHashMap<u128, Vec<(usize, usize, u64, usize)>>,
         // Shared aggregate stats, one `Arc` per stream/topic across both
@@ -890,6 +895,10 @@ impl StateHandler for TruncatePartitionRequest {
             let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
                 return ApplyReply::err(TruncatePartitionResult::TopicNotFound);
             };
+            if state.lifecycle_blocks(stream_id, Some(topic_id)) {
+                return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+            }
+
             let Some(stream) = state.items.get_mut(stream_id) else {
                 return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
@@ -947,23 +956,29 @@ collect_handlers! {
         RemoveConsumerGroupMember,
         CompleteConsumerGroupRevocation,
         TruncatePartition,
+        CompleteLifecycle,
     }
     internal { RefreshConsumerGroupSession }
 }
 
 impl StreamsInner {
     /// Rebuild derived group metadata after membership/revocation changes or restore.
-    /// Session refreshes use the membership index without rescanning unrelated clients.
+    /// A session refresh changes no membership, so it re-indexes only the groups it
+    /// rebalances instead of calling this.
     pub(crate) fn recompute_consumer_group_metadata(&mut self) {
-        let mut count: u64 = 0;
+        self.pending_revocations.clear();
         for memberships in self.consumer_group_members.values_mut() {
             memberships.clear();
         }
         for (stream_id, stream) in &self.items {
             for (topic_id, topic) in &stream.topics {
                 for group in topic.consumer_groups.values() {
+                    group.index_pending_revocations(
+                        stream_id,
+                        topic_id,
+                        &mut self.pending_revocations,
+                    );
                     for (member_id, member) in &group.members {
-                        count += member.pending_revocations.len() as u64;
                         self.consumer_group_members
                             .entry(member.client_id)
                             .or_default()
@@ -972,7 +987,6 @@ impl StreamsInner {
                 }
             }
         }
-        self.pending_revocations_count = count;
         self.consumer_group_members
             .retain(|_, memberships| !memberships.is_empty());
     }
@@ -1012,19 +1026,6 @@ impl StreamsInner {
             WireIdentifier::String(name) => stream.topic_index.get(name.as_str()).copied(),
         }
     }
-
-    /// Mutable topic resolved from (stream, topic) identifiers -- the
-    /// consumer-group `StateHandler`s in [`crate::stm::consumer_group`] operate
-    /// through this.
-    pub(crate) fn topic_mut(
-        &mut self,
-        stream_id: &WireIdentifier,
-        topic_id: &WireIdentifier,
-    ) -> Option<&mut Topic> {
-        let stream_id = self.resolve_stream_id(stream_id)?;
-        let topic_id = self.resolve_topic_id(stream_id, topic_id)?;
-        self.items.get_mut(stream_id)?.topics.get_mut(topic_id)
-    }
 }
 
 /// Metadata identity for a consumer operation, independent of unrelated groups.
@@ -1037,8 +1038,34 @@ pub struct PollMetadata {
 
 impl PollMetadata {
     #[must_use]
+    pub const fn context(&self, metadata_op: u64) -> PartitionContext {
+        PartitionContext {
+            incarnation: self.created_revision,
+            owner_generation: match self.group {
+                Some((_, generation)) => generation,
+                None => 0,
+            },
+            metadata_op,
+        }
+    }
+
+    #[must_use]
+    pub const fn client_id(&self) -> u128 {
+        self.client_id
+    }
+
+    #[must_use]
     pub fn matches_partition(&self, created_revision: Option<u64>) -> bool {
         created_revision == Some(self.created_revision)
+    }
+
+    /// Whether `owner`, installed on the partition for `group_id`, is the
+    /// owner this metadata activated for the caller.
+    #[must_use]
+    pub fn is_installed_owner(&self, group_id: u64, owner: ConsumerGroupOwner) -> bool {
+        !owner.is_unassigned()
+            && owner.client_id == self.client_id
+            && self.group == Some((group_id, owner.generation))
     }
 
     #[must_use]
@@ -1088,6 +1115,13 @@ impl Streams {
         require_pollable: bool,
     ) -> Option<PollMetadata> {
         self.read(|inner| {
+            if inner.lifecycle_blocks_consumer(
+                namespace.stream_id(),
+                namespace.topic_id(),
+                group_id,
+            ) {
+                return None;
+            }
             let topic = inner
                 .items
                 .get(namespace.stream_id())?
@@ -1106,7 +1140,14 @@ impl Streams {
                 }) {
                     return None;
                 }
-                Some((group.id, group.generation))
+                let assignment = group.assignments.get(&namespace.partition_id())?;
+                let owner = assignment.owner?;
+                if owner.client_id != client_id
+                    || assignment.incarnation != partition.created_revision
+                {
+                    return None;
+                }
+                Some((group.id, owner.generation))
             } else {
                 None
             };
@@ -1191,6 +1232,27 @@ impl Streams {
                 topic.partitions.len(),
                 TopicRuntimeOptions::from_resource_options(&topic.options).segment_size,
             ))
+        })
+    }
+
+    /// A partition's incarnation and its topic's partition count, read under
+    /// one guard so a recreated topic never pairs an old incarnation with a
+    /// new count. `None` while a lifecycle operation blocks the topic, as for
+    /// [`Self::poll_metadata`]. The count matches `GetTopic`, so a keyed send
+    /// hashes over the same partitions either way.
+    #[must_use]
+    pub fn partition_route(&self, namespace: IggyNamespace) -> Option<(u64, usize)> {
+        self.read(|inner| {
+            if inner.lifecycle_blocks_consumer(namespace.stream_id(), namespace.topic_id(), None) {
+                return None;
+            }
+            let topic = inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?;
+            let partition = find_partition(&topic.partitions, namespace.partition_id())?;
+            Some((partition.created_revision, topic.partitions.len()))
         })
     }
 
@@ -1346,17 +1408,18 @@ impl Streams {
     }
 
     /// Whether any consumer group has a pending cooperative revocation. O(1):
-    /// reads the `pending_revocations_count` that `post_apply` maintains per
+    /// reads the open-transition index maintained after each membership
     /// commit. The consensus tick polls this every 10ms to wake the reconciler
     /// promptly when a source drains a revoked partition, so it must not walk.
     #[must_use]
     pub fn has_pending_revocations(&self) -> bool {
-        self.inner.read(|inner| inner.pending_revocations_count > 0)
+        self.inner
+            .read(|inner| !inner.pending_revocations.is_empty())
     }
 
-    /// The topic's current partition ids, for the join-time in-flight gather
-    /// (the home shard reads each partition's poll/commit state to classify the
-    /// cooperative handoff). `None` if the stream/topic does not resolve.
+    /// The topic's current partition ids, or `None` if the stream or topic
+    /// does not resolve. The server's `resolve_partition_namespace` checks
+    /// only for `None`, to tell a missing partition from a missing topic.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn topic_partition_ids(
@@ -1372,66 +1435,51 @@ impl Streams {
         })
     }
 
-    /// Partitions currently owned by some live member of the group (union over
-    /// members, pending-revoked included since the source still owns them until
-    /// completion). The join-time in-flight gather uses this to tell a genuine
-    /// in-flight hold (a live member polled past its commit) from a stale
-    /// `last_polled` left by a since-removed member: only an owned partition can
-    /// be in flight, so an unowned one with uncommitted data is the dead-member
-    /// residue of a reconnect and must be reassigned, not protected.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn consumer_group_assigned_partitions(
+    pub fn consumer_group_pending_revocations(&self) -> Vec<ConsumerGroupOwnershipTransition> {
+        self.inner
+            .read(|inner| inner.pending_revocations.values().copied().collect())
+    }
+
+    /// The pending revocation of `group_id` on the partition `namespace` names.
+    #[must_use]
+    pub fn consumer_group_pending_revocation(
         &self,
-        stream_id: &WireIdentifier,
-        topic_id: &WireIdentifier,
-        group_id: &WireIdentifier,
-    ) -> Option<std::collections::HashSet<u32>> {
+        namespace: IggyNamespace,
+        group_id: u64,
+    ) -> Option<ConsumerGroupOwnershipTransition> {
         self.inner.read(|inner| {
-            let stream_id = inner.resolve_stream_id(stream_id)?;
-            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
-            let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
-            let group = topic
-                .consumer_groups
-                .get(&topic.resolve_group_id(group_id)?)?;
-            Some(
-                group
-                    .members
-                    .iter()
-                    .flat_map(|(_, member)| member.partitions.iter().map(|&p| p as u32))
-                    .collect(),
-            )
+            inner
+                .pending_revocations
+                .get(&(
+                    namespace.stream_id(),
+                    namespace.topic_id(),
+                    group_id,
+                    namespace.partition_id(),
+                ))
+                .copied()
         })
     }
 
-    /// Every pending cooperative revocation across all groups, as
-    /// `(stream_id, topic_id, group_id, source_client_id, partition_id,
-    /// created_at_micros)`. The reconciler reads this each pass to decide which
-    /// revocations to complete (source drained, or timed out).
+    /// Pending transitions that no lifecycle intent blocks, read under one
+    /// guard. A gate read after the copy can miss an intent that finished in
+    /// between and pass a decision that the finished intent made obsolete.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::type_complexity)]
-    pub fn consumer_group_pending_revocations(&self) -> Vec<(u32, u32, u64, u128, u32, u64)> {
+    pub fn consumer_group_unblocked_revocations(&self) -> Vec<ConsumerGroupOwnershipTransition> {
         self.inner.read(|inner| {
-            let mut out = Vec::new();
-            for (stream_id, stream) in &inner.items {
-                for (topic_id, topic) in &stream.topics {
-                    for group in topic.consumer_groups.values() {
-                        for (source_client_id, partition_id, created_at) in
-                            group.pending_revocations()
-                        {
-                            out.push((
-                                stream_id as u32,
-                                topic_id as u32,
-                                group.id,
-                                source_client_id,
-                                partition_id as u32,
-                                created_at,
-                            ));
-                        }
-                    }
-                }
-            }
-            out
+            inner
+                .pending_revocations
+                .values()
+                .filter(|transition| {
+                    !inner.lifecycle_blocks_consumer(
+                        transition.stream_id as usize,
+                        transition.topic_id as usize,
+                        Some(transition.installation.group_id),
+                    )
+                })
+                .copied()
+                .collect()
         })
     }
 
@@ -1538,7 +1586,13 @@ impl Streams {
     }
 
     /// Apply the session fence from a committed Register, including on replay.
-    pub fn refresh_consumer_group_session(&self, client_id: u128, session: u64) {
+    pub fn refresh_consumer_group_session(
+        &self,
+        client_id: u128,
+        session: u64,
+        metadata_op: u64,
+        timestamp: IggyTimestamp,
+    ) {
         if session == 0
             || !self
                 .inner
@@ -1548,7 +1602,11 @@ impl Streams {
         }
         let cmd = StreamsCommand::RefreshConsumerGroupSession(
             RefreshConsumerGroupSessionRequest { client_id, session },
-            IggyTimestamp::from(0),
+            timestamp,
+            ApplyContext {
+                metadata_op,
+                ..ApplyContext::default()
+            },
         );
         if let Err(error) = self.inner.try_apply(cmd) {
             tracing::error!(client_id, %error, "consumer session refresh dispatched to reader-only Streams STM");
@@ -1560,16 +1618,43 @@ impl Streams {
     /// side-effect of the `Logout` commit on each replica (not a separate
     /// replicated op). A no-op on the reader-mode peers, where commits aren't
     /// applied.
-    pub fn remove_consumer_group_member(&self, client_id: u128, timestamp: IggyTimestamp) {
-        let cmd = StreamsCommand::RemoveConsumerGroupMember(
-            RemoveConsumerGroupMemberRequest { client_id },
-            timestamp,
-        );
-        if let Err(error) = self.inner.try_apply(cmd) {
+    pub fn remove_consumer_group_member(
+        &self,
+        client_id: u128,
+        timestamp: IggyTimestamp,
+        metadata_op: u64,
+    ) {
+        self.remove_consumer_group_members(&[client_id], timestamp, metadata_op);
+    }
+
+    /// Remove `client_ids` in order, as [`Self::remove_consumer_group_member`]
+    /// would, with one publish. The removals of one op decide owners at the
+    /// same generation, so a reader that installed an owner between two of
+    /// them could never install the final one.
+    pub fn remove_consumer_group_members(
+        &self,
+        client_ids: &[u128],
+        timestamp: IggyTimestamp,
+        metadata_op: u64,
+    ) {
+        if client_ids.is_empty() {
+            return;
+        }
+        let cmds = client_ids.iter().map(|&client_id| {
+            StreamsCommand::RemoveConsumerGroupMember(
+                RemoveConsumerGroupMemberRequest { client_id },
+                timestamp,
+                ApplyContext {
+                    metadata_op,
+                    ..ApplyContext::default()
+                },
+            )
+        });
+        if let Err(error) = self.inner.try_apply_all(cmds) {
             tracing::error!(
-                client_id,
+                ?client_ids,
                 %error,
-                "remove_consumer_group_member dispatched to reader-only Streams STM"
+                "remove_consumer_group_members dispatched to reader-only Streams STM"
             );
         }
     }
@@ -1744,6 +1829,21 @@ impl Streams {
         })
     }
 
+    /// Name of the stream that [`Self::seed_namespace`] creates at `slab`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn seeded_stream_name(slab: usize) -> String {
+        format!("sim-stream-{slab}")
+    }
+
+    /// Name of the topic that [`Self::seed_namespace`] creates at `slab` under
+    /// stream slab `stream_slab`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn seeded_topic_name(stream_slab: usize, slab: usize) -> String {
+        format!("sim-topic-{stream_slab}-{slab}")
+    }
+
     /// Create stream slabs `0..=stream_slab`, skipping those already present.
     #[cfg(any(test, feature = "simulator"))]
     fn seed_stream_slabs(&self, stream_slab: usize) {
@@ -1754,11 +1854,12 @@ impl Streams {
             self.inner
                 .try_apply(StreamsCommand::CreateStream(
                     CreateStreamRequest {
-                        name: WireName::new(format!("sim-stream-{slab}"))
+                        name: WireName::new(Self::seeded_stream_name(slab))
                             .expect("sim stream name is valid"),
                         options: WireOptions::empty(),
                     },
                     IggyTimestamp::from(1),
+                    ApplyContext::default(),
                 ))
                 .expect("sim stream seed applies on the metadata writer");
         }
@@ -1798,7 +1899,7 @@ impl Streams {
                             stream_id: stream_wire.clone(),
                             partitions_count: u32::try_from(partitions.len())
                                 .expect("sim partition count fits u32"),
-                            name: WireName::new(format!("sim-topic-{stream_slab}-{slab}"))
+                            name: WireName::new(Self::seeded_topic_name(stream_slab, slab))
                                 .expect("sim topic name is valid"),
                             options: iggy_common::TopicCreateOptions {
                                 durability: iggy_common::Durability::Persisted,
@@ -1813,6 +1914,7 @@ impl Streams {
                         created_view,
                     },
                     IggyTimestamp::from(1),
+                    ApplyContext::default(),
                 ))
                 .expect("sim topic seed applies on the metadata writer");
         }
@@ -1912,6 +2014,7 @@ impl Streams {
                     created_view,
                 },
                 IggyTimestamp::from(1),
+                ApplyContext::default(),
             ))
             .expect("sim partition seed applies on the metadata writer");
     }
@@ -2046,6 +2149,10 @@ impl StateHandler for UpdateStreamRequest {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return ApplyReply::err(UpdateStreamResult::StreamNotFound);
         };
+
+        if state.lifecycle_blocks(stream_id, None) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(UpdateStreamResult::StreamNotFound);
         };
@@ -2080,6 +2187,9 @@ impl StateHandler for DeleteStreamRequest {
             return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
 
+        if let Some(reply) = state.begin_lifecycle(stream_id, None, LifecycleAction::DeleteStream) {
+            return reply;
+        }
         let Some(stream) = state.items.get(stream_id) else {
             return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
@@ -2093,18 +2203,24 @@ impl StateHandler for DeleteStreamRequest {
         state.namespace_revision = state.revision;
         // The dropped stream may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            deleted_resource: Some(DeletedResource::Stream(stream_id)),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
 impl StateHandler for CreateTopicWithAssignmentsRequest {
     type State = StreamsInner;
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return ApplyReply::err(CreateTopicResult::StreamNotFound);
         };
 
+        if state.lifecycle_blocks_topic_creation(stream_id) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
         let name_arc: Arc<str> = Arc::from(self.request.name.as_str());
         // Validate under a short immutable borrow that ends before the
         // revision bump below takes `&mut state`.
@@ -2203,6 +2319,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             consumer_groups: AHashMap::default(),
             consumer_group_index: AHashMap::default(),
             next_consumer_group_id: 0,
+            consumer_group_catalog_op: 0,
         };
 
         let inserted = stream.topics.insert(topic);
@@ -2230,6 +2347,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             &self.request.name,
             topic_id,
             topic,
+            state.apply_context.metadata_op,
         ))
     }
 }
@@ -2239,7 +2357,12 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
 /// reply deserializes without a schema break. Returns empty bytes on a
 /// `u32` overflow (same contract as a validation rejection) rather than
 /// saturating to `u32::MAX`.
-fn encode_create_topic_reply(name: &WireName, topic_id: usize, topic: &Topic) -> Bytes {
+fn encode_create_topic_reply(
+    name: &WireName,
+    topic_id: usize,
+    topic: &Topic,
+    metadata_op: u64,
+) -> Bytes {
     let Ok(topic_id_u32) = u32::try_from(topic_id) else {
         return Bytes::new();
     };
@@ -2273,6 +2396,11 @@ fn encode_create_topic_reply(name: &WireName, topic_id: usize, topic: &Topic) ->
                 current_offset: 0,
                 size_bytes: 0,
                 messages_count: 0,
+                context: PartitionContext {
+                    incarnation: p.created_revision,
+                    owner_generation: 0,
+                    metadata_op,
+                },
             })
         })
         .collect::<Result<Vec<PartitionResponse>, _>>()
@@ -2303,6 +2431,9 @@ impl StateHandler for UpdateTopicRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
+        if state.lifecycle_blocks(stream_id, Some(topic_id)) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
 
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(UpdateTopicResult::StreamNotFound);
@@ -2323,6 +2454,13 @@ impl StateHandler for UpdateTopicRequest {
         let Ok(mut updated_options) = resource_options_from_wire(&self.options, true) else {
             return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
         };
+        if self
+            .options
+            .into_iter()
+            .any(|entry| entry.key == topic_option_keys::PARTITION_RESIZE_POLICY.as_bytes())
+        {
+            return ApplyReply::err(UpdateTopicResult::UnsupportedOptionKey);
+        }
         // Read leniently, like every other committed op: a key this build does
         // not know is skipped rather than failing an operation its peers
         // accepted.
@@ -2362,6 +2500,11 @@ impl StateHandler for DeleteTopicRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
             return ApplyReply::err(DeleteTopicResult::TopicNotFound);
         };
+        if let Some(reply) =
+            state.begin_lifecycle(stream_id, Some(topic_id), LifecycleAction::DeleteTopic)
+        {
+            return reply;
+        }
         let Some(stream) = state.items.get_mut(stream_id) else {
             return ApplyReply::err(DeleteTopicResult::StreamNotFound);
         };
@@ -2388,7 +2531,13 @@ impl StateHandler for DeleteTopicRequest {
         state.namespace_revision = state.revision;
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            deleted_resource: Some(DeletedResource::Topic {
+                stream_id,
+                topic_id,
+            }),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2401,6 +2550,9 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.request.topic_id) else {
             return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
+        if state.lifecycle_blocks(stream_id, Some(topic_id)) {
+            return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
+        }
 
         // Resolve absolute partition ids under a borrow that ends before
         // the revision bump. Validate every id transition before mutating
@@ -2413,6 +2565,11 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             let Some(topic) = stream.topics.get_mut(topic_id) else {
                 return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
             };
+            if TopicCreateOptions::from_resource_options(&topic.options).partition_resize_policy
+                == Some(PartitionResizePolicy::Fixed)
+            {
+                return ApplyReply::err(CreatePartitionsResult::PartitionResizeDisabled);
+            }
 
             let base_partition_id = topic
                 .partitions
@@ -2474,7 +2631,8 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             });
         }
         // Added partitions are unassigned until the groups rebalance.
-        topic.rebalance_consumer_groups();
+        topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
+        state.recompute_consumer_group_metadata();
 
         // Matches legacy CreatePartitions wire contract: empty-ok body on
         // success. SDK discards the reply payload (resolved ids are derivable
@@ -2485,7 +2643,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
 
 impl StateHandler for DeletePartitionsRequest {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner, _timestamp: IggyTimestamp) -> ApplyReply {
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return ApplyReply::err(DeletePartitionsResult::StreamNotFound);
         };
@@ -2501,9 +2659,30 @@ impl StateHandler for DeletePartitionsRequest {
         };
 
         let count_to_delete = self.partitions_count as usize;
+        if TopicCreateOptions::from_resource_options(&topic.options).partition_resize_policy
+            == Some(PartitionResizePolicy::Fixed)
+        {
+            return ApplyReply::err(DeletePartitionsResult::PartitionResizeDisabled);
+        }
         if count_to_delete > topic.partitions.len() {
             return ApplyReply::err(DeletePartitionsResult::InvalidPartitionsCount);
         }
+        if let Some(reply) = state.begin_lifecycle(
+            stream_id,
+            Some(topic_id),
+            LifecycleAction::DeletePartitions {
+                count: self.partitions_count,
+            },
+        ) {
+            return reply;
+        }
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(DeletePartitionsResult::TopicNotFound);
+        };
         // Zero count is rejected pre-consensus; a replayed legacy entry still
         // applies as the historical ok no-op.
         if count_to_delete > 0 {
@@ -2517,7 +2696,8 @@ impl StateHandler for DeletePartitionsRequest {
                 .collect();
             topic.partitions.truncate(retained);
             // Members assigned the removed partitions must give them up.
-            topic.rebalance_consumer_groups();
+            topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
+            state.recompute_consumer_group_metadata();
             // Roll the removed partitions out of the topic and stream totals
             // and evict their entries, so re-minted ids start from zero.
             state
@@ -2544,6 +2724,7 @@ pub struct StreamsSnapshot {
     #[serde(default)]
     pub revision: u64,
     pub namespace_revision: u64,
+    pub lifecycle_intents: BTreeMap<u64, LifecycleIntent>,
 }
 
 impl Snapshotable for Streams {
@@ -2597,6 +2778,7 @@ impl Snapshotable for Streams {
                                         })
                                         .collect(),
                                     next_consumer_group_id: topic.next_consumer_group_id,
+                                    consumer_group_catalog_op: topic.consumer_group_catalog_op,
                                 },
                             )
                         })
@@ -2622,6 +2804,7 @@ impl Snapshotable for Streams {
                 items,
                 revision: inner.revision,
                 namespace_revision: inner.namespace_revision,
+                lifecycle_intents: inner.lifecycle_intents.clone(),
             }
         })
     }
@@ -2629,6 +2812,7 @@ impl Snapshotable for Streams {
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        snapshot.validate_ownership_history(u64::MAX)?;
         // Boot: no live registry exists yet, so mint one. Safe because
         // `new_from_empty` clones this single inner onto the other left-right
         // buffer rather than building a second one.
@@ -2733,6 +2917,7 @@ impl StreamsInner {
                             .max()
                             .unwrap_or(0),
                     ),
+                    consumer_group_catalog_op: topic_snap.consumer_group_catalog_op,
                     consumer_groups: topic_snap
                         .consumer_groups
                         .into_iter()
@@ -2761,15 +2946,27 @@ impl StreamsInner {
         }
 
         let items: IdSlab<Stream> = stream_entries.into_iter().collect();
+        let mut lifecycle_intents = snapshot.lifecycle_intents;
+        for intent in lifecycle_intents.values_mut() {
+            intent.rebuild_partition_index();
+        }
+        let lifecycle_scopes = lifecycle_intents
+            .values()
+            .map(LifecycleIntent::scope)
+            .collect();
         let mut inner = Self {
             index,
             items,
             revision: snapshot.revision,
             namespace_revision: snapshot.namespace_revision,
+            lifecycle_intents,
+            lifecycle_scopes,
+            finalizing_lifecycle: false,
             // Recomputed from the restored groups just below.
-            pending_revocations_count: 0,
+            pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),
             last_result: None,
+            apply_context: ApplyContext::default(),
             stats_registry,
         };
         inner.recompute_consumer_group_metadata();
@@ -3115,6 +3312,7 @@ mod tests {
             .try_apply(StreamsCommand::CreateStream(
                 request,
                 IggyTimestamp::from(1),
+                ApplyContext::default(),
             ))
             .expect("create stream applies");
 
@@ -3146,6 +3344,150 @@ mod tests {
             partitions_count,
             name: WireName::new(name).unwrap(),
             options: WireOptions::empty(),
+        }
+    }
+
+    fn streams_with_resize_policy(policy: Option<PartitionResizePolicy>) -> StreamsInner {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let mut request = make_topic_request(0, 2, "topic");
+        request.options = TopicCreateOptions {
+            partition_resize_policy: policy,
+            ..TopicCreateOptions::default()
+        }
+        .to_wire()
+        .unwrap();
+        let created = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
+            request,
+            derived_options: WireOptions::empty(),
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 2,
+                },
+            ],
+        };
+        assert_eq!(
+            StateHandler::apply(&created, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        inner
+    }
+
+    #[test]
+    fn given_resize_policy_when_resizing_after_snapshot_restore_should_preserve_the_contract() {
+        for policy in [
+            None,
+            Some(PartitionResizePolicy::Mutable),
+            Some(PartitionResizePolicy::Fixed),
+        ] {
+            let inner = streams_with_resize_policy(policy);
+            let streams: Streams = inner.into();
+            let mut snapshot = MetadataSnapshot::new(1);
+            snapshot.streams = Some(streams.to_snapshot());
+            let decoded = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+            let mut restored =
+                StreamsInner::inner_from_snapshot(decoded.streams.unwrap(), Arc::default());
+            let revision = restored.revision;
+            let create = CreatePartitionsWithAssignmentsRequest {
+                created_view: 0,
+                request: WireCreatePartitionsRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                },
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 3,
+                }],
+            };
+            let delete = DeletePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            };
+            let fixed = policy == Some(PartitionResizePolicy::Fixed);
+            let expected = if fixed {
+                iggy_common::IggyError::PartitionResizeDisabled.as_code()
+            } else {
+                0
+            };
+            assert_eq!(
+                crate::stm::lifecycle::apply_with_lifecycle_completion(
+                    &create,
+                    &mut restored,
+                    IggyTimestamp::now()
+                )
+                .code,
+                expected,
+                "{policy:?}"
+            );
+            assert_eq!(
+                restored.items[0].topics[0].partitions.len(),
+                if fixed { 2 } else { 3 }
+            );
+            assert_eq!(
+                crate::stm::lifecycle::apply_with_lifecycle_completion(
+                    &delete,
+                    &mut restored,
+                    IggyTimestamp::now()
+                )
+                .code,
+                expected,
+                "{policy:?}"
+            );
+            assert_eq!(restored.items[0].topics[0].partitions.len(), 2);
+            assert_eq!(restored.revision, revision + if fixed { 0 } else { 3 });
+            if fixed {
+                let streams: Streams = restored.into();
+                let mut after = MetadataSnapshot::new(1);
+                after.streams = Some(streams.to_snapshot());
+                assert_eq!(
+                    after.encode().unwrap(),
+                    snapshot.encode().unwrap(),
+                    "rejected resize must preserve all metadata"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_resize_policy_when_updating_in_ordered_apply_should_reject_without_renaming() {
+        for policy in [PartitionResizePolicy::Mutable, PartitionResizePolicy::Fixed] {
+            let mut inner = streams_with_resize_policy(Some(policy));
+            let replacement = if policy == PartitionResizePolicy::Fixed {
+                PartitionResizePolicy::Mutable
+            } else {
+                PartitionResizePolicy::Fixed
+            };
+            let update = UpdateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: WireName::new("renamed").unwrap(),
+                options: TopicCreateOptions {
+                    partition_resize_policy: Some(replacement),
+                    ..TopicCreateOptions::default()
+                }
+                .to_wire()
+                .unwrap(),
+            };
+            let revision = inner.revision;
+            assert_eq!(
+                StateHandler::apply(&update, &mut inner, IggyTimestamp::now()).code,
+                u32::from(UpdateTopicResult::UnsupportedOptionKey),
+            );
+            assert_eq!(inner.items[0].topics[0].name.as_ref(), "topic");
+            assert_eq!(
+                TopicCreateOptions::from_resource_options(&inner.items[0].topics[0].options)
+                    .partition_resize_policy,
+                Some(policy),
+            );
+            assert_eq!(inner.revision, revision);
         }
     }
 
@@ -3464,14 +3806,22 @@ mod tests {
                     })
                     .collect(),
             };
-            let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+            let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &create_topic,
+                &mut inner,
+                IggyTimestamp::now(),
+            );
 
             let delete = DeletePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
                 partitions_count: count_to_delete,
             };
-            let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+            let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &delete,
+                &mut inner,
+                IggyTimestamp::now(),
+            );
 
             assert_eq!(
                 apply.code, expected_code,
@@ -3503,7 +3853,11 @@ mod tests {
                 consensus_group_id: 1,
             }],
         };
-        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &create_topic,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         let created_revision = inner.items[0].topics[0].partitions[0].created_revision;
 
         let mut truncate = TruncatePartitionRequest {
@@ -3526,7 +3880,11 @@ mod tests {
         );
 
         truncate.expected_history = Some(created_revision);
-        let apply = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &truncate,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
         assert_eq!(
             inner.items[0].topics[0].partitions[0].deleted_up_to_offset,
@@ -3557,7 +3915,11 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partitions_count: 1,
         };
-        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         let topic_stats = &inner.items[0].topics[0].stats;
@@ -3591,8 +3953,16 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partitions_count: 1,
         };
-        let _ = StateHandler::apply(&delete, &mut first, IggyTimestamp::now());
-        let _ = StateHandler::apply(&delete, &mut second, IggyTimestamp::now());
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut first,
+            IggyTimestamp::now(),
+        );
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut second,
+            IggyTimestamp::now(),
+        );
 
         assert!(
             first.stats_registry.partition_get(0, 0, 0).is_none(),
@@ -3629,7 +3999,11 @@ mod tests {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
         };
-        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         let stream_stats = &inner.items[0].stats;
@@ -3657,7 +4031,11 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partitions_count: 1,
         };
-        let _ = StateHandler::apply(&delete_partitions, &mut inner, IggyTimestamp::now());
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete_partitions,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert!(inner.stats_registry.partition_get(0, 0, 0).is_none());
 
         // The still-mounted partition, writing through the handle it cached
@@ -3670,7 +4048,11 @@ mod tests {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
         };
-        let apply = StateHandler::apply(&delete_topic, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete_topic,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         let stream_stats = &inner.items[0].stats;
@@ -3713,7 +4095,11 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partitions_count: 1,
         };
-        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         let topic_stats = &inner.items[0].topics[0].stats;
@@ -3753,7 +4139,11 @@ mod tests {
                 },
             ],
         };
-        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &create_topic,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         let topic_stats = inner.items[0].topics[0].stats.clone();
         let survivor = inner.stats_registry.partition(
             0,
@@ -3776,7 +4166,11 @@ mod tests {
             topic_id: WireIdentifier::numeric(0),
             partitions_count: 1,
         };
-        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         assert!(
@@ -3816,7 +4210,11 @@ mod tests {
                 })
                 .collect(),
         };
-        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &create_topic,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         let topic_stats = inner.items[0].topics[0].stats.clone();
         for partition_id in 0..4 {
             let stats = inner.stats_registry.partition(
@@ -3835,7 +4233,11 @@ mod tests {
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
         };
-        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         let stream_stats = &inner.items[0].stats;
@@ -3867,7 +4269,11 @@ mod tests {
         let delete = DeleteStreamRequest {
             stream_id: WireIdentifier::numeric(0),
         };
-        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(apply.code, 0);
 
         assert!(
@@ -3886,7 +4292,11 @@ mod tests {
                 consensus_group_id: 1,
             }],
         };
-        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+        let _ = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &create_topic,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
         assert_eq!(inner.items[0].stats.size_bytes_inconsistent(), 0);
         assert_eq!(inner.items[0].topics[0].stats.size_bytes_inconsistent(), 0);
     }

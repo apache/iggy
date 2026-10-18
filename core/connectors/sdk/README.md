@@ -29,11 +29,19 @@ The crash behavior is intentionally at-least-once:
 
 An ACK follows Iggy's quorum confirmation. The topic's `durability` policy decides whether that confirmation also waits for stable storage on the quorum. Both policies normally write messages to disk.
 
-Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after repeated NACKs.
+Source-side ACK work should be idempotent because process termination can interrupt it. NACK handling must discard staged cursor changes and staged delete or mark operations so polling can redeliver the batch. The SDK retries NACKed batches with capped exponential backoff and stops after five consecutive NACKs by default.
 
-The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it. The SDK stops polling if the handler returns an error, preventing a failed rollback from advancing to another batch.
+A source whose accepted input cannot be re-read after a restart can override `Source::batch_policy()` and call `BatchPolicy::with_max_consecutive_nacks(None)` to keep retrying until shutdown. The SDK warns after 30 seconds without a batch result, but keeps that batch in flight until the runtime replies or the source shuts down.
 
-This contract is a breaking FFI change. Source plugins must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK.
+The source receives only ACK or NACK, not the runtime's failure cause. It cannot classify a NACK as transient. Disable the limit only when repeated replay is safer than stopping; a permanent failure still needs operator attention. If `on_batch_result()` returns an error, polling stops because its staged-work outcome is unknown.
+
+The default `Source::on_batch_result()` implementation is a no-op for sources without staged work. Sources that advance cursors, delete rows, or mark rows must override it.
+
+SDK 0.5.1-edge.2 adds `Source::batch_policy()` with a default implementation, so existing source implementations need no code change when rebuilt. Sources that opt out of the NACK breaker must retain and replay their rejected batch; otherwise disabling the stop only turns a visible failure into a silent drop.
+
+Rebuild source plugins to export `iggy_source_register_stop_callback`; the runtime warns when an older plugin lacks it. The callback reports why polling stopped so the runtime can mark the source `Error` and update its running gauge.
+
+The original batch-acknowledgment contract introduced a breaking FFI change. Source plugins built before it must be rebuilt with the matching SDK. The runtime loads `iggy_source_handle_v2`, which supplies a batch ID to the runtime callback, and source plugins export `iggy_source_batch_result` for the corresponding ACK or NACK. SDK 0.5.1-edge.2 also adds the optional stop-callback export; older plugins cannot report an unexpected poll-task exit.
 
 Moreover, it contains both, the `decoders` and `encoders` modules, implementing either `StreamDecoder` or `StreamEncoder` traits, which are used when consuming or producing data from/to Iggy streams.
 
@@ -53,6 +61,8 @@ value.static = "hello"
 ## Retry helpers
 
 `retry_async` runs an operation that fails with `Err` and retries it while `should_retry` accepts the error. It owns attempt counting, backoff and the per-retry log, and returns `RetryFailure { error, attempts, exhausted }` so the caller logs the terminal failure. `retry_backoff` computes a single delay for a loop that cannot use `retry_async`, such as `HttpRetryMiddleware`, which retries on an `Ok` response rather than an `Err`. Its `retry` argument is 1-based.
+
+`HttpRetryMiddleware` reads a server's `Retry-After` header on every status it retries, which is 429 and any 5xx. The header can lengthen the computed backoff but never shorten it, so a zero or a short value keeps the backoff. `max_delay` bounds only the computed backoff. The header has its own one-hour ceiling, and a value past it is drawn from the jitter window just below it. Only the integer-seconds form is read, so an HTTP-date or unparsable value falls back to the computed backoff.
 
 Two symbols were removed and one field changed meaning, each in a way that breaks out-of-tree plugins, so those plugins must be rebuilt against the current source:
 

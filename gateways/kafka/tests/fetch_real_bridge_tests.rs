@@ -47,8 +47,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_FETCH, API_KEY_PRODUCE, BrokerAdvertise, ConnectionState, GatewayState,
-    handle_connection_request, handle_request_bounded,
+    API_KEY_FETCH, API_KEY_PRODUCE, ConnectionState, GatewayState, handle_connection_request,
+    handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{MAPPING_VERSION, TimestampWindow, VERSION_HEADER, to_iggy};
 
@@ -89,10 +89,8 @@ async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayStat
         .await
         .expect("the topic must exist before fetching from it");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -258,8 +256,14 @@ async fn fetch_on(
     request
         .encode(&mut body, VERSION)
         .expect("the request encodes at this version");
-    let handled =
-        handle_connection_request(state, connection, API_KEY_FETCH, VERSION, body.freeze());
+    let handled = handle_connection_request(
+        state,
+        connection,
+        None,
+        API_KEY_FETCH,
+        VERSION,
+        body.freeze(),
+    );
     let mut response = tokio::time::timeout(PROMPT, handled)
         .await
         .expect("records or an error answer at once")
@@ -577,6 +581,14 @@ async fn given_minus_one_holds_on_two_connections_when_both_retry_should_keep_ea
     assert_refused(
         only(&fetch_on(&state, &fresh, &at(2)).await),
         ERROR_NOT_LEADER_OR_FOLLOWER,
+    );
+
+    store(&server, 0, &[keyed(b"a"), keyed(b"b"), keyed(b"c")]).await;
+    let response = fetch_on(&state, &fresh, &at(2)).await;
+    assert_eq!(only(&response).error_code, ERROR_NONE);
+    assert_eq!(
+        values(only(&response)),
+        vec![Some(Bytes::from_static(b"c"))]
     );
 }
 

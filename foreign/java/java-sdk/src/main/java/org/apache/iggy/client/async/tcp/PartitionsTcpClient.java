@@ -38,9 +38,19 @@ public class PartitionsTcpClient implements PartitionsClient {
     private static final Logger log = LoggerFactory.getLogger(PartitionsTcpClient.class);
 
     private final Supplier<AsyncTcpConnection> connectionSupplier;
+    private final Runnable topologyChanged;
 
     public PartitionsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this(connectionSupplier, () -> {});
+    }
+
+    /**
+     * @param topologyChanged runs after this client creates or deletes
+     *     partitions, when the partition contexts cached for them no longer hold
+     */
+    PartitionsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, Runnable topologyChanged) {
         this.connectionSupplier = connectionSupplier;
+        this.topologyChanged = topologyChanged;
     }
 
     private AsyncTcpConnection connection() {
@@ -59,6 +69,7 @@ public class PartitionsTcpClient implements PartitionsClient {
                 .send(CommandCode.Partition.CREATE.getValue(), payload)
                 .thenAccept(response -> {
                     response.release();
+                    topologyChanged.run();
                 });
     }
 
@@ -74,6 +85,7 @@ public class PartitionsTcpClient implements PartitionsClient {
                 .send(CommandCode.Partition.DELETE.getValue(), payload)
                 .thenAccept(response -> {
                     response.release();
+                    topologyChanged.run();
                 });
     }
 

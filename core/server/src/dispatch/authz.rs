@@ -28,6 +28,7 @@
 use std::rc::Rc;
 
 use consensus::MetadataHandle;
+use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
@@ -48,6 +49,22 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 
 use crate::shell::{ShellBus, ShellShard};
+
+/// Run a read's `rule` only while the connection's session is still attached.
+///
+/// The funnel resolves the acting user before the read starts, and the session
+/// can end during any await of the read. A read runs this before its first
+/// await and again after its last one, before it builds the reply.
+pub(in crate::dispatch) fn authorize_attached(
+    attachment: Option<&SessionAttachment>,
+    rule: impl FnOnce() -> Result<(), IggyError>,
+) -> Result<(), IggyError> {
+    match attachment {
+        Some(attachment) if attachment.is_valid() => rule(),
+        Some(_) => Err(IggyError::StaleClient),
+        None => Err(IggyError::Unauthenticated),
+    }
+}
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
 /// acting user, returning the deny status code or `None` to proceed. The
@@ -102,6 +119,10 @@ where
                 | Operation::TruncatePartition
                 | Operation::FinalizeSession
                 | Operation::RetireSession
+                | Operation::CompleteLifecycle
+                | Operation::TransitionPartitionHistory
+                | Operation::InstallConsumerGroupOwner
+                | Operation::RetireConsumerGroupOwners
                 | Operation::CreateStream
                 | Operation::UpdateStream
                 | Operation::DeleteStream
@@ -391,10 +412,10 @@ mod tests {
     use iggy_binary_protocol::codes::{
         BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
         GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
-        GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE,
-        LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
-        LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE,
+        LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
+        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
+        POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
@@ -464,6 +485,7 @@ mod tests {
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
             (BIND_SESSION_CODE, invalid_command, invalid_command),
             (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
+            (GET_PARTITION_ROUTE_CODE, invalid_command, invalid_command),
             (
                 POLL_MESSAGES_ON_PRIMARY_CODE,
                 invalid_command,

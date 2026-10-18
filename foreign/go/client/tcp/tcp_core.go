@@ -328,6 +328,10 @@ const (
 	responseReadTimeout = 30 * time.Second
 	// replayInterval paces the resend of a transiently rejected request.
 	replayInterval = 50 * time.Millisecond
+	// lifecycleRetryMaxInterval caps the pause before retrying a request
+	// refused with ErrLifecycleBusy. Each retry is a new request that commits
+	// another refusal, so the pause doubles from replayInterval up to this cap.
+	lifecycleRetryMaxInterval = time.Second
 	// failoverCheckInterval is how long a request that was never admitted
 	// replays on the same connection before the client re-checks leadership.
 	// A node that stopped being primary answers transient forever, so
@@ -415,36 +419,59 @@ func (c *IggyTcpClient) write(payload []byte) (int, error) {
 // do sends the command and returns the response body. Commands implementing
 // the appender interface encode directly into a pooled buffer.
 func (c *IggyTcpClient) do(ctx context.Context, cmd command.Command) ([]byte, error) {
+	if ctx == nil {
+		return nil, ierror.ErrNilContext
+	}
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
-
 	frame, err := appendCommandFrame(*bp, cmd)
 	if frame != nil {
-		// Keep the grown buffer even when the encode failed, so the pool gets
-		// it back at its new capacity.
 		*bp = frame
 	}
 	if err != nil {
 		return nil, err
 	}
-
+	if isPartitionCommand(cmd.Code()) {
+		query, err := partitionQuery(cmd.Code(), frame[vsr.HeaderSize:])
+		if err != nil {
+			return nil, err
+		}
+		var captured *iggcon.PartitionContext
+		if value, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
+			captured = &value
+		}
+		if poll, ok := cmd.(*command.PollMessages); ok && poll.Strategy.Context != nil {
+			captured = poll.Strategy.Context
+		}
+		return c.sendRouted(ctx, cmd.Code(), query, frame, captured)
+	}
 	return c.exchange(ctx, uint32(cmd.Code()), frame)
 }
 
+// rawRequest carries a SendBinaryRequest through do, so a raw partition
+// command captures and keeps its context exactly as a typed one does.
+type rawRequest struct {
+	code    command.Code
+	payload []byte
+}
+
+func (r rawRequest) Code() command.Code { return r.code }
+
+func (r rawRequest) MarshalBinary() ([]byte, error) { return r.payload, nil }
+
+func (r rawRequest) AppendBinary(b []byte) ([]byte, error) { return append(b, r.payload...), nil }
+
 // SendBinaryRequest sends a command code and payload and returns the raw response body.
 // Session-control codes return ierror.ErrInvalidCommand without writing to the connection.
+// Message sends, polls and consumer offset writes are stamped with the partition context
+// their typed methods would capture, and keep it across retries. A send must name an
+// explicit partition id: a balanced or key-partitioned send returns
+// ierror.ErrFeatureUnavailable without writing, so use SendMessages for those.
 func (c *IggyTcpClient) SendBinaryRequest(ctx context.Context, code uint32, payload []byte) ([]byte, error) {
 	if isSessionControlCode(code) {
 		return nil, ierror.ErrInvalidCommand
 	}
-
-	bp := acquireRequestBuf()
-	defer releaseRequestBuf(bp)
-
-	frame := append(reserveHeader(*bp), payload...)
-	*bp = frame
-
-	return c.exchange(ctx, code, frame)
+	return c.do(ctx, rawRequest{code: command.Code(code), payload: payload})
 }
 
 // reserveHeader returns buf truncated to exactly the header prologue, growing
@@ -531,7 +558,7 @@ func (e *localPreconditionError) Unwrap() error { return e.err }
 // the failure is one a fresh connection recovers from.
 func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte) ([]byte, error) {
 	response, generation, err := c.sendFrame(ctx, code, frame)
-	if err == nil || !isReconnectable(err) {
+	if err == nil || code == uint32(command.GetPartitionRouteCode) || !isReconnectable(err) {
 		return response, err
 	}
 
@@ -663,14 +690,20 @@ func (c *IggyTcpClient) sendFrame(
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
-	if code == uint32(command.PollMessagesOnPrimaryCode) ||
-		code == uint32(command.GetPollRoutingCode) ||
+	if code == uint32(command.GetPartitionRouteCode) ||
 		code == uint32(command.BindSessionCode) {
 		response, generation, _, err := c.sendPollFrame(ctx, code, frame)
 		return response, generation, err
 	}
 
 	deadline := time.Now().Add(responseReadTimeout)
+	// A lasting lifecycle refusal returns ErrLifecycleBusy before the caller's
+	// deadline, rather than a deadline error that hides the refusal.
+	lifecycleDeadline := deadline
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(lifecycleDeadline) {
+		lifecycleDeadline = callerDeadline
+	}
+	lifecycleRetryInterval := replayInterval
 	stamped := false
 	// Once this request starts walking the roster it keeps walking: a leader
 	// recheck between hops would put it straight back on the metadata leader
@@ -697,21 +730,21 @@ func (c *IggyTcpClient) sendFrame(
 		switch {
 		case err == nil:
 			return response, generation, nil
-		case errors.Is(err, ierror.ErrTransientNotAccepted) &&
+		case (errors.Is(err, ierror.ErrTransientNotAccepted) || errors.Is(err, ierror.ErrNotPrimary)) &&
 			!isRegisterCode(code) && time.Now().Before(deadline):
 			// The server never admitted the request, so re-issuing it cannot
 			// double-apply. A same-connection replay keeps the stamped request
 			// id; a redirect registers again, so the frame is stamped afresh.
 			redirect := false
 			walked := false
-			if !walkingRoster {
+			if !walkingRoster || errors.Is(err, ierror.ErrNotPrimary) {
 				var redirectErr error
 				redirect, redirectErr = c.redirectToLeader(ctx, generation)
 				if redirectErr != nil {
 					return nil, generation, redirectErr
 				}
 			}
-			if !redirect {
+			if !redirect && !errors.Is(err, ierror.ErrNotPrimary) {
 				// The roster names this node as the metadata leader (or said
 				// nothing usable), yet it keeps refusing to admit the
 				// request: its replica of the target partition group is not
@@ -746,6 +779,22 @@ func (c *IggyTcpClient) sendFrame(
 				}
 				stamped = false
 			}
+			if errors.Is(err, ierror.ErrNotPrimary) && !redirect {
+				if waitErr := c.pause(ctx, replayInterval); waitErr != nil {
+					return nil, generation, waitErr
+				}
+			}
+		case errors.Is(err, ierror.ErrLifecycleBusy) &&
+			time.Now().Add(lifecycleRetryInterval).Before(lifecycleDeadline):
+			// The refusal committed under this request id, so a resend of it
+			// would only read the refusal back. The retry is a new request,
+			// stamped on its next attempt with the same partition context. The
+			// pause runs outside attempt, so it holds no lock other requests need.
+			if waitErr := c.pause(ctx, lifecycleRetryInterval); waitErr != nil {
+				return nil, generation, waitErr
+			}
+			lifecycleRetryInterval = min(2*lifecycleRetryInterval, lifecycleRetryMaxInterval)
+			stamped = false
 		default:
 			return nil, generation, err
 		}
@@ -777,6 +826,11 @@ func (c *IggyTcpClient) attempt(
 	}
 
 	generation := c.connGeneration
+	if state, ok := ctx.Value(singlePollExchange{}).(*pollExchangeState); ok && state.parent != nil {
+		if c.session == nil || !c.session.Bound() || state.parent.client != c.session.ClientID() || state.parent.session != c.session.SessionID() {
+			return nil, stamped, generation, ierror.ErrUnauthenticated
+		}
+	}
 	switch c.transportState {
 	case iggcon.TransportStateShutdown:
 		c.logger.Debug("Cannot send data. Client is shutdown.")
@@ -799,6 +853,11 @@ func (c *IggyTcpClient) attempt(
 		// the connection is healthy and must not be torn down for it.
 		if err := vsr.StampRequestHeader(c.session, code, frame); err != nil {
 			return nil, false, generation, &localPreconditionError{err}
+		}
+		if captured, ok := ctx.Value(capturedPartitionContext{}).(iggcon.PartitionContext); ok {
+			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), captured)
+		} else {
+			vsr.StampPartitionContext((*[vsr.HeaderSize]byte)(frame[:vsr.HeaderSize]), iggcon.PartitionContext{MetadataOp: c.metadataWatermark.Load()})
 		}
 		stamped = true
 	}
@@ -865,6 +924,7 @@ func (c *IggyTcpClient) exchangeLocked(
 				return nil, err
 			}
 			pollState.written = true
+			pollState.reusable = false
 		}
 		c.logger.Debug("Sending a TCP request",
 			slog.Int("frame_length", len(frame)), slog.Int("code", int(code)))
@@ -905,12 +965,18 @@ func (c *IggyTcpClient) exchangeLocked(
 			}
 			pollState.reusable = c.conn != nil && vsr.PeekCommand(&c.respHeader) == vsr.FrameReply &&
 				(err == nil || !isReconnectable(err))
-			return response, err
+			if uncertain && err != nil && !errors.Is(err, ierror.ErrTransientNotCommitted) {
+				return nil, ierror.ErrTransientNotCommitted
+			}
+			if !pollState.replay || !errors.Is(err, ierror.ErrTransientNotCommitted) {
+				return response, err
+			}
 		}
 		if errors.Is(err, ierror.ErrTransientNotCommitted) {
 			uncertain = true
 		}
-		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) ||
+		if uncertain && (errors.Is(err, ierror.ErrTransientNotAccepted) || errors.Is(err, ierror.ErrNotPrimary) ||
+			errors.Is(err, ierror.ErrHistoryUnavailable) ||
 			errors.Is(err, ierror.ErrUnauthenticated) || errors.Is(err, ierror.ErrStaleClient) ||
 			errors.Is(err, ierror.ErrUnauthorized)) {
 			c.handleReplyFailureLocked(err)
@@ -991,15 +1057,16 @@ func (c *IggyTcpClient) handleReplyFailureLocked(err error) {
 }
 
 // waitBeforeReplay pauses before resending a transiently rejected request,
-// never past the deadline, the caller's cancellation, or a client shutdown.
-// The shutdown channel matters because this wait runs with c.mtx held, which
-// is the lock Close needs; without it Close would block for the rest of the
-// request budget.
+// never past the deadline.
 func (c *IggyTcpClient) waitBeforeReplay(ctx context.Context, deadline time.Time) error {
-	interval := replayInterval
-	if remaining := time.Until(deadline); remaining < interval {
-		interval = remaining
-	}
+	return c.pause(ctx, min(replayInterval, time.Until(deadline)))
+}
+
+// pause waits for interval, never past the caller's cancellation or a client
+// shutdown. The shutdown channel matters because a replay wait runs with c.mtx
+// held, which is the lock Close needs; without it Close would block for the
+// rest of the request budget.
+func (c *IggyTcpClient) pause(ctx context.Context, interval time.Duration) error {
 	if interval <= 0 {
 		return nil
 	}

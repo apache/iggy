@@ -107,11 +107,6 @@ pub trait Pipeline {
     fn pop_request(&mut self) -> Option<Self::Request> {
         None
     }
-
-    /// Inspect the original queue head without transferring reply ownership.
-    fn request_head(&self) -> Option<&Self::Request> {
-        None
-    }
 }
 
 pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RoutedRequestHeader>;
@@ -137,6 +132,13 @@ pub trait Consensus: Sized {
     fn is_follower(&self) -> bool;
     fn is_normal(&self) -> bool;
     fn is_transferring(&self) -> bool;
+
+    /// A backup that serves its view: the primary of that view can take the
+    /// request at once, so the refusal is `NotPrimary`, not a retry later.
+    /// A ceded primary is still the primary of its view and stays out.
+    fn is_normal_backup(&self) -> bool {
+        self.is_normal() && !self.is_transferring() && self.is_follower()
+    }
 }
 
 /// Shared consensus lifecycle interface for control/data planes.

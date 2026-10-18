@@ -32,6 +32,13 @@ pub trait MessageClient {
     /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
     /// A [`ConsumerKind::ExternalGroup`] consumer only holds offsets, so polling with it returns [`IggyError::FeatureUnavailable`].
     ///
+    /// Binary clients cache the route to a partition with the partition context it reported.
+    /// After another client deletes and recreates the partition, a poll without a caller context
+    /// ([`PollingStrategy::with_context`]) can fail once with `HistoryUnavailable` (87), or with
+    /// `ConsumerGroupPartitionNotOwned` (5009) for a consumer group. The failed route is dropped,
+    /// so the next call routes again and takes the new context. A poll with a caller context keeps
+    /// getting the refusal for that context.
+    ///
     /// With automatic commits enabled, a new consumer offset key can be
     /// rejected with `TooManyConsumerOffsets` at the partition's configured
     /// limit. That poll returns no messages. Existing keys remain writable,
@@ -128,6 +135,10 @@ pub trait MessageClient {
     /// implies uniqueness. Confirmation follows VSR quorum commit. Persisted
     /// message durability also requires recoverable stable-storage copies on
     /// the quorum.
+    ///
+    /// Binary clients refresh the partition context once after a definitive
+    /// `HistoryUnavailable` (87) refusal. A refusal after an uncertain send
+    /// keeps its original context and returns `TransientNotCommitted` (57).
     async fn send_messages(
         &self,
         stream_id: &Identifier,

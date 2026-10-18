@@ -115,14 +115,14 @@ func TestEncodeRequest_SendsNonReplicatedCommandsBeforeRegister(t *testing.T) {
 	assert.Equal(t, uint64(1), binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 }
 
-func TestEncodeRequest_DoesNotAdvanceTheWatermarkForNonReplicated(t *testing.T) {
+func TestEncodeRequest_AllocatesUniqueIDsForNonReplicated(t *testing.T) {
 	session := boundSession(t)
 
 	for range 3 {
 		_, err := EncodeRequest(session, uint32(command.PingCode), nil)
 		require.NoError(t, err)
 	}
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
+	assert.Equal(t, uint64(4), session.CurrentRequestID())
 }
 
 func TestEncodeRequest_PartitionCommandConsumesTheWatermark(t *testing.T) {

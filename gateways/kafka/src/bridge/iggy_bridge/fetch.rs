@@ -31,7 +31,7 @@ use tokio::time::{Instant, timeout_at};
 
 use super::offsets::high_watermark;
 use super::{
-    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, with_request_timeout,
+    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, sign_out_and_shut_down,
 };
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
@@ -77,7 +77,7 @@ impl FetchPool {
         })
     }
 
-    /// Shuts down each client that connected. See [`LazyClient::close_all`].
+    /// Closes each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         LazyClient::close_all(&self.all).await
     }
@@ -99,6 +99,12 @@ impl LazyClient {
         Self(Arc::new(AsyncMutex::new(Some(client))))
     }
 
+    /// Puts `client` in hand, so a test needs no server.
+    #[cfg(test)]
+    pub(super) async fn hold(&self, client: Arc<IggyClient>) {
+        *self.0.lock().await = Some(client);
+    }
+
     /// The client, connected at the first call. Callers that come during a connect wait for it.
     pub(super) async fn connected(
         &self,
@@ -112,6 +118,24 @@ impl LazyClient {
         *held = Some(Arc::clone(&connected));
         drop(held);
         Ok(connected)
+    }
+
+    /// The client, if it connected.
+    pub(super) async fn held(&self) -> Option<Arc<IggyClient>> {
+        self.0.lock().await.clone()
+    }
+
+    /// Forgets `client` and closes its connection once the call running on it ends. For a send
+    /// that was given up on: the SDK goes on writing it, and it must not land after a later send
+    /// on a new connection.
+    ///
+    /// No timeout. The SDK ends a call by its 30 s read deadline, and a new connection opened
+    /// before that could send ahead of it.
+    pub(super) async fn retire(&self, client: &IggyClient) {
+        self.0.lock().await.take();
+        if let Err(error) = client.shutdown().await {
+            tracing::debug!(%error, "failed to shut down a retired Iggy client");
+        }
     }
 
     /// Runs `call` until `deadline`. A call that times out drops the client.
@@ -129,15 +153,32 @@ impl LazyClient {
         result
     }
 
-    /// Shuts the client down, if it connected.
+    /// [`Self::until`] on a task of its own, so the deadline still drops a stuck client when the
+    /// caller stops waiting first.
+    pub(super) async fn until_detached<T, Call>(
+        &self,
+        deadline: Instant,
+        call: Call,
+    ) -> Result<T, BridgeError>
+    where
+        T: Send + 'static,
+        Call: Future<Output = Result<T, BridgeError>> + Send + 'static,
+    {
+        let client = self.clone();
+        tokio::spawn(async move { client.until(deadline, call).await })
+            .await
+            .unwrap_or(Err(BridgeError::Timeout))
+    }
+
+    /// Signs the client out and shuts it down, if it connected.
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         let Some(client) = self.0.lock().await.take() else {
             return Ok(());
         };
-        with_request_timeout(client.shutdown()).await
+        sign_out_and_shut_down(&client).await
     }
 
-    /// Shuts down each client that connected, and returns the first error. A client that fails to
+    /// Closes each client that connected, and returns the first error. A client that fails to
     /// shut down stops none of the others.
     pub(super) async fn close_all(
         clients: impl IntoIterator<Item = &Self>,
@@ -376,6 +417,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_a_detached_call_whose_caller_gave_up_when_its_deadline_passes_should_drop_the_client()
+     {
+        let client = LazyClient::default();
+        *client.0.lock().await = Some(unconnected());
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let caller = tokio::time::timeout(
+            Duration::from_millis(10),
+            client.until_detached(deadline, std::future::pending::<Result<u8, BridgeError>>()),
+        )
+        .await;
+        assert!(
+            caller.is_err(),
+            "the caller stops waiting before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            client.0.lock().await.is_none(),
+            "the stuck client is dropped at its own deadline, not left for the next lookup"
+        );
+    }
+
+    #[tokio::test]
     async fn given_a_call_past_its_deadline_when_given_up_on_should_drop_the_client() {
         let client = LazyClient::default();
         let held = unconnected();
@@ -452,6 +516,7 @@ mod tests {
             current_offset,
             size: IggyByteSize::from(size),
             messages_count,
+            context: iggy::prelude::PartitionContext::default(),
         }
     }
 

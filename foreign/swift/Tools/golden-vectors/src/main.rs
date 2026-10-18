@@ -36,6 +36,7 @@ use iggy_binary_protocol::consensus::{
     Command, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
 };
 use iggy_binary_protocol::primitives::options::WireOptions;
+use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
@@ -43,7 +44,7 @@ use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -66,7 +67,8 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
-    PollMessagesResponseHeader, SendMessagesConfirmationResponse, SendMessagesResponse,
+    PartitionRouteResponse, PollMessagesResponseHeader, PollRoutingResponse,
+    SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
@@ -299,6 +301,15 @@ fn request_header(
 fn main() {
     let output = std::env::args().nth(1).expect("output path argument");
     let mut vectors = BTreeMap::new();
+    add(
+        &mut vectors,
+        "partition.context",
+        &PartitionContext {
+            incarnation: 17,
+            owner_generation: 9,
+            metadata_op: 52,
+        },
+    );
 
     let mut lengths: Vec<usize> = (0..=300).collect();
     lengths.extend([
@@ -617,6 +628,15 @@ fn main() {
     );
     add(
         &mut vectors,
+        "request.get_partition_route",
+        &GetPartitionRouteRequest {
+            stream_id: numeric(10),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partition_id: 5,
+        },
+    );
+    add(
+        &mut vectors,
         "request.create_user",
         &CreateUserRequest {
             username: name("admin"),
@@ -884,6 +904,17 @@ fn main() {
             &[9, 9, 9, 9],
         ))),
     );
+    let mut fenced_send = request_header(SEND_MESSAGES_CODE, client_id, 2, 99, &[9, 9, 9, 9]);
+    PartitionContext {
+        incarnation: 17,
+        owner_generation: 9,
+        metadata_op: 52,
+    }
+    .stamp(&mut fenced_send);
+    vectors.insert(
+        "vsr.request.send_messages.fenced".to_owned(),
+        hex(bytemuck::bytes_of(&fenced_send)),
+    );
     vectors.insert(
         "vsr.request.logout".to_owned(),
         hex(bytemuck::bytes_of(&request_header(
@@ -910,6 +941,7 @@ fn main() {
         operation: Operation::CreateStream,
         size: (HEADER_SIZE + 12) as u32,
         request: 7,
+        commit: 12,
         status: 0,
         client: client_id,
         ..Default::default()
@@ -969,6 +1001,7 @@ fn main() {
     );
     let partitions = vec![
         PartitionResponse {
+            context: Default::default(),
             id: 0,
             created_at: 1_710_000_000_000_000,
             segments_count: 2,
@@ -977,6 +1010,7 @@ fn main() {
             messages_count: 100,
         },
         PartitionResponse {
+            context: Default::default(),
             id: 1,
             created_at: 1_710_000_000_000_001,
             segments_count: 1,
@@ -985,6 +1019,7 @@ fn main() {
             messages_count: 0,
         },
         PartitionResponse {
+            context: Default::default(),
             id: 2,
             created_at: 1_710_000_000_000_002,
             segments_count: 3,
@@ -1269,6 +1304,7 @@ fn main() {
             name: "prod-cluster".to_owned(),
             nodes: vec![
                 ClusterNodeResponse {
+                    replica_id: 0,
                     name: "node-1".to_owned(),
                     ip: "10.0.0.1".to_owned(),
                     tcp_port: 8090,
@@ -1279,6 +1315,7 @@ fn main() {
                     status: 0,
                 },
                 ClusterNodeResponse {
+                    replica_id: 1,
                     name: "node-2".to_owned(),
                     ip: "fd00::2".to_owned(),
                     tcp_port: 8091,
@@ -1354,6 +1391,7 @@ fn main() {
         let second = batch_record(7, 102, 6_000, 2_000, &[frame(13, 0, 0, b"c", &[])]);
         let mut body = BytesMut::new();
         PollMessagesResponseHeader {
+            context: Default::default(),
             partition_id: 7,
             current_offset: 102,
             messages_count: 3,
@@ -1364,6 +1402,7 @@ fn main() {
         vectors.insert("response.poll_messages".to_owned(), hex(&body));
         let mut empty = BytesMut::new();
         PollMessagesResponseHeader {
+            context: Default::default(),
             partition_id: 0,
             current_offset: 0,
             messages_count: 0,
@@ -1371,6 +1410,44 @@ fn main() {
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
     }
+    add(
+        &mut vectors,
+        "response.partition_route",
+        &PartitionRouteResponse {
+            incarnation: 7,
+            metadata_op: 10,
+            view: 3,
+            partitions_count: 4,
+            primary_replica: 2,
+        },
+    );
+    add(
+        &mut vectors,
+        "response.poll_routing",
+        &PollRoutingResponse {
+            consumer_session: SessionIdentity {
+                client_id: 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
+                session: 42,
+                metadata_watermark: 120,
+            },
+            context: PartitionContext {
+                incarnation: 7,
+                owner_generation: 3,
+                metadata_op: 110,
+            },
+            primary: ClusterNodeResponse {
+                replica_id: 2,
+                name: "node-3".to_owned(),
+                ip: "10.0.0.3".to_owned(),
+                tcp_port: 8092,
+                quic_port: 0,
+                http_port: 3002,
+                websocket_port: 0,
+                role: 1,
+                status: 0,
+            },
+        },
+    );
 
     // Domain option blocks.
     let create_options = TopicCreateOptions {
@@ -1383,6 +1460,7 @@ fn main() {
         segment_size: Some(IggyByteSize::from(1_048_576)),
         durability: Durability::Persisted,
         consumer_offset_durability: Durability::Replicated,
+        partition_resize_policy: None,
         messages_required_to_save: Some(7),
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),

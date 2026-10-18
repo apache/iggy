@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
 	"github.com/stretchr/testify/require"
 )
@@ -40,6 +41,7 @@ const (
 	frameOffsetOperation = 176
 	frameOffsetSession   = 184
 	frameOffsetReserved  = 196
+	frameOffsetContext   = 200
 
 	replyFrameOffsetRequest   = 200
 	replyFrameOffsetOperation = 208
@@ -65,6 +67,9 @@ func (r request) requestID() uint64 {
 }
 func (r request) sessionID() uint64 {
 	return binary.LittleEndian.Uint64(r.header[frameOffsetSession:])
+}
+func (r request) incarnation() uint64 {
+	return binary.LittleEndian.Uint64(r.header[frameOffsetContext:])
 }
 func (r request) clientID() vsr.ClientID {
 	return vsr.ClientID{
@@ -163,6 +168,7 @@ func clusterMetadataFrame(t *testing.T, leaderIndex int, addresses ...string) []
 			role = iggcon.RoleLeader
 		}
 		metadata.Nodes = append(metadata.Nodes, iggcon.ClusterNode{
+			ReplicaID: uint8(index),
 			Name:      host,
 			IP:        host,
 			Role:      role,
@@ -244,6 +250,27 @@ func (s *fakeServer) recorded() []request {
 	return append([]request(nil), s.requests...)
 }
 
+func servePartitionOperations(t *testing.T, conn net.Conn, handler func(index int, read request) []byte, partitionsCount ...uint32) *fakeServer {
+	t.Helper()
+	return serve(conn, func(index int, read request) []byte {
+		switch read.code() {
+		case uint32(command.GetPartitionRouteCode):
+			body := binary.LittleEndian.AppendUint64(nil, 17)
+			body = binary.LittleEndian.AppendUint64(body, 100)
+			body = binary.LittleEndian.AppendUint32(body, 0)
+			count := uint32(1)
+			if len(partitionsCount) != 0 {
+				count = partitionsCount[0]
+			}
+			body = binary.LittleEndian.AppendUint32(body, count)
+			body = append(body, 0)
+			return replyFrame(vsr.OperationNonReplicated, body)
+		default:
+			return handler(index, read)
+		}
+	})
+}
+
 // newPipeClient builds a client wired to one end of an in-memory pipe, with a
 // session already bound so replicated commands encode.
 func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
@@ -254,6 +281,8 @@ func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 	client.session.BeginRegister()
 	require.NoError(t, client.session.Bind(100))
 	client.sessionState = iggcon.SessionStateAuthenticated
+	client.topologyKnown.Store(true)
+	client.rememberLogin(NewUsernamePasswordCredentials("iggy", "secret"))
 
 	t.Cleanup(func() {
 		_ = clientConn.Close()

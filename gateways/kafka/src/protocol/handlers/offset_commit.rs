@@ -201,7 +201,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::BridgeError;
-    use crate::protocol::api::{BrokerAdvertise, ERROR_UNKNOWN_MEMBER_ID};
+    use crate::protocol::api::ERROR_UNKNOWN_MEMBER_ID;
 
     fn request(generation_id: i32, member_id: &'static str) -> OffsetCommitRequest {
         OffsetCommitRequest::default()
@@ -229,7 +229,7 @@ mod tests {
     }
 
     async fn codes(version: i16, request: &OffsetCommitRequest) -> Vec<(String, i32, i16)> {
-        let state = GatewayState::stub(BrokerAdvertise::default(), 8 * 1024 * 1024);
+        let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
         let mut response = handle(&state, &connection, version, body(version, request))
             .await
@@ -307,7 +307,7 @@ mod tests {
     /// may go back.
     #[tokio::test]
     async fn given_an_unreadable_request_should_close_rather_than_answer() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), 8 * 1024 * 1024);
+        let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
 
         let truncated = body(9, &request(-1, "")).slice(..5);

@@ -57,6 +57,7 @@ const SERVER_SCAN_ONLY_ENV_VARS: &[&str] = &[
     "IGGY_HOME",
     "IGGY_USERNAME",
     "IGGY_PASSWORD",
+    "IGGY_TOKEN",
 ];
 
 /// Non-config env vars supported by the server and advertised to operators.
@@ -84,7 +85,7 @@ pub fn server_process_env_vars() -> impl Iterator<Item = &'static str> {
 }
 
 pub(crate) const SERVER_ALLOWED_ENV_PREFIXES: &[&str] =
-    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_"];
+    &["IGGY_CONNECTORS_", "IGGY_KAFKA_", "IGGY_MCP_", "IGGY_TEST_"];
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 
@@ -151,6 +152,14 @@ const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
     RelocatedKey {
         path: "extra",
         replacement: RelocatedTarget::Removed,
+    },
+    // Refusing the old key keeps an operator's timeout from changing without
+    // notice.
+    RelocatedKey {
+        path: "consumer_group.session_timeout",
+        replacement: RelocatedTarget::Superseded(
+            "the session timeout is now 1.2 x heartbeat.interval",
+        ),
     },
 ];
 

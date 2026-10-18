@@ -30,9 +30,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
 
-// Visibility rule: `pub` = named external consumer. main.rs consumes `boot`
-// (including `boot::systemd`) and `server_error`; the simulator consumes
-// `shell` and `boot::ServerHost`. Everything else is internal to the
+// Visibility rule: `pub` = named external consumer. main.rs consumes
+// `VERSION`, `boot` (including `boot::systemd`) and `server_error`; the
+// simulator consumes `shell`, `boot::ServerHost` and the reconciler exports
+// (`LifecycleReports`, `reconcile_partition_lifecycles`,
+// `reconcile_pending_revocations`). Everything else is internal to the
 // crate.
 
 // boot: process entry, shard threads, recovery orchestration.
@@ -59,6 +61,9 @@ pub(crate) mod http;
 
 // background: per-shard maintenance loops.
 pub(crate) mod partition_reconciler;
+pub use partition_reconciler::{
+    LifecycleReports, reconcile_partition_lifecycles, reconcile_pending_revocations,
+};
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod segment_cleaner;
 pub(crate) mod snapshot;

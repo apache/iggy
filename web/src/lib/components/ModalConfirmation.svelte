@@ -23,7 +23,7 @@ under the License.
   import { createEventDispatcher } from 'svelte';
   import Input from './Input.svelte';
   import Icon from './Icon.svelte';
-  import { Keys } from '$lib/utils/constants/keys';
+  import { Keys } from '#lib/utils/constants/keys.js';
 
   interface Props {
     open: boolean;

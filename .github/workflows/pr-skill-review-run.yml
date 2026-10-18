@@ -231,6 +231,8 @@ jobs:
       - name: Setup Node
         if: steps.parse.outputs.status == 'ok'
         uses: actions/setup-node@v7
+        with:
+          package-manager-cache: false
 
       - name: Install the agent
         if: steps.parse.outputs.status == 'ok'

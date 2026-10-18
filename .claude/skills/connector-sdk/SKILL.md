@@ -45,7 +45,7 @@ sdk/src/
 ├── sink.rs             SinkContainer + sink_connector! macro (FFI plumbing).
 ├── source.rs           SourceContainer + source_connector! macro (FFI plumbing).
 ├── api.rs              ConnectorStatus, ConnectorStats (feature = "api").
-├── convert.rs          owned_value_to_serde_json (simd_json ⇄ serde_json bridge).
+├── convert.rs          owned_value_into_serde_json / owned_value_to_serde_json (simd_json ⇄ serde_json bridge).
 ├── log.rs              CallbackLayer for tracing across FFI.
 ├── retry.rs            retry_async + RetryPolicy, CircuitBreaker, HttpRetryMiddleware.
 ├── decoders/           One per schema: json, raw, text, proto, flatbuffer, avro.
@@ -60,7 +60,7 @@ sdk/src/
 2. **`Send + Sync`** on every public trait (FFI runs across thread pools).
 3. **`#[repr(C)]`** on every type that crosses FFI (`Schema`, `TopicMetadata`, `MessagesMetadata`, `RawMessage`, `ProducedMessages`, `ConsumedMessage`, `DecodedMessage`, etc. in `lib.rs`). Adding fields requires bumping the SDK version - existing plugins built against the old layout will misalign on `postcard::from_bytes`.
 4. **postcard** for FFI message serialization (handled by `SinkContainer::consume`, `SourceContainer`'s `handle_messages`). **MessagePack (`rmp_serde`)** for `ConnectorState`. **JSON** (`serde_json`) only for human-editable config that crosses FFI. Don't mix.
-5. **`simd_json::OwnedValue`** for JSON payloads, not `serde_json::Value`. Use `convert::owned_value_to_serde_json` as a bridge when interop is required.
+5. **`simd_json::OwnedValue`** for JSON payloads, not `serde_json::Value`. Use `convert::owned_value_into_serde_json` as a bridge when you own the value (the common case - it moves strings instead of copying them); fall back to the borrowing `convert::owned_value_to_serde_json` only when you still need the `OwnedValue` afterward.
 6. **`BTreeMap`** for headers - deterministic ordering. Never `HashMap` on the wire.
 7. **No breaking changes** to `Sink`/`Source`/`StreamDecoder`/`StreamEncoder`/`Transform` trait signatures without coordinating with all in-tree plugins in the same PR.
 8. **A `Schema` variant that changes meaning is as breaking as a new variant.** The discriminant crosses FFI unchanged, so a plugin built against the old SDK keeps decoding it the old way and misreads every batch with no error anywhere. Same process as a trait change: bump the SDK minor version, update every in-tree plugin in the same PR, and state in the PR description that plugins built against the previous SDK must be rebuilt.
@@ -154,7 +154,7 @@ Plugin authors call this on every consumed message. The implementation in `lib.r
 - `CircuitBreaker`: threshold + cooldown, `try_lock()` on the success path to avoid hot-path contention.
 - `retry_async(policy, context, should_retry, op)`: the retry loop for anything failing as `Err`. Owns attempt counting, backoff and the per-retry log; returns `RetryFailure { error, attempts, exhausted }` so callers write their own terminal log.
 - `retry_backoff(base, retry, max)`: backoff only, for a loop that computes its own delay. `retry` is 1-based. `exponential_backoff` is the 0-based primitive underneath and applies no jitter, so call it directly only when the delay must be exact (`source.rs::nack_retry_delay`, whose tests assert exact values).
-- `HttpRetryMiddleware`: integrates with `reqwest-middleware`. Retries 429 + 5xx + network errors. Honors `Retry-After`.
+- `HttpRetryMiddleware`: integrates with `reqwest-middleware`. Retries 429 + 5xx + network errors. Honors `Retry-After` on 429 and 5xx as a floor over the computed backoff, capped at a one-hour `MAX_RETRY_AFTER`, not `max_delay`.
 - `max_retries` = **total attempts** including the first try, not extra retries. Document if you change this convention. `meilisearch_sink` is the standing exception: its `max_retries` / `max_open_retries` count retries *after* the first, as its README states.
 - New helpers must take `Duration` (not `u64 millis`) on the public API. Internal computation uses `humantime` parsing of `String`.
 

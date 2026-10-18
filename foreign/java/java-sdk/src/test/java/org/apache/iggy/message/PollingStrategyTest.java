@@ -19,11 +19,14 @@
 
 package org.apache.iggy.message;
 
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PollingStrategyTest {
     @Test
@@ -64,5 +67,38 @@ class PollingStrategyTest {
 
         assertThat(strategy.value()).isEqualTo(BigInteger.ZERO);
         assertThat(strategy.kind()).isEqualTo(PollingKind.Next);
+    }
+
+    @Test
+    void factoriesAndConstructorReturnStrategiesWithoutContext() {
+        var strategies = List.of(
+                PollingStrategy.offset(BigInteger.ONE),
+                PollingStrategy.timestamp(BigInteger.TWO),
+                PollingStrategy.first(),
+                PollingStrategy.last(),
+                PollingStrategy.next(),
+                new PollingStrategy(PollingKind.Offset, BigInteger.TEN));
+
+        assertThat(strategies)
+                .allSatisfy(strategy -> assertThat(strategy.context()).isEmpty());
+    }
+
+    @Test
+    void withContextReturnsCopyWithContext() {
+        var context = new PartitionContext(BigInteger.valueOf(7), BigInteger.valueOf(8), BigInteger.valueOf(9));
+        var strategy = PollingStrategy.offset(BigInteger.TEN);
+
+        var continued = strategy.withContext(context);
+
+        assertThat(continued.kind()).isEqualTo(PollingKind.Offset);
+        assertThat(continued.value()).isEqualTo(BigInteger.TEN);
+        assertThat(continued.context()).contains(context);
+        assertThat(strategy.context()).isEmpty();
+    }
+
+    @Test
+    void constructorRejectsNullContext() {
+        assertThatThrownBy(() -> new PollingStrategy(PollingKind.Offset, BigInteger.ONE, null))
+                .isInstanceOf(NullPointerException.class);
     }
 }

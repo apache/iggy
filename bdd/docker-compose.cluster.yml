@@ -52,6 +52,7 @@ x-cluster-node: &cluster-node
       hard: -1
 
 x-cluster-topology: &cluster-topology
+  LLVM_PROFILE_FILE: ${BDD_SERVER_PROFILE_FILE:-}
   IGGY_ROOT_USERNAME: iggy
   IGGY_ROOT_PASSWORD: iggy
   IGGY_CLUSTER_ENABLED: "true"
@@ -59,7 +60,6 @@ x-cluster-topology: &cluster-topology
   # Keep role-specific scenarios on view 0 when a loaded CI runner delays
   # one replica during startup.
   IGGY_CLUSTER_HEARTBEAT_TIMEOUT: "30s"
-  IGGY_CONSUMER_GROUP_SESSION_TIMEOUT: "60s"
   IGGY_CLUSTER_NODES_0_NAME: leader-node
   IGGY_CLUSTER_NODES_0_IP: 172.28.0.101
   IGGY_CLUSTER_NODES_0_REPLICA_ID: "0"
@@ -116,6 +116,7 @@ services:
         ipv4_address: 172.28.0.101
     volumes:
       - iggy_leader_data:/app/local_data_leader
+      - ../target:/profiles
 
   iggy-follower:
     <<: *cluster-node
@@ -142,6 +143,7 @@ services:
         ipv4_address: 172.28.0.102
     volumes:
       - iggy_follower_data:/app/local_data_follower
+      - ../target:/profiles
 
   rust-bdd:
     <<: *cluster-bdd-deps

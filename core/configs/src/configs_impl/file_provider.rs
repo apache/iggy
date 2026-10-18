@@ -33,6 +33,8 @@ pub enum RelocatedTarget {
     TopicOption(&'static str),
     MovedTo(&'static str),
     Removed,
+    /// Removed, and another setting now decides the value. The text names it.
+    Superseded(&'static str),
 }
 
 /// A config key that no longer exists, and what took over from it.
@@ -58,6 +60,7 @@ impl RelocatedKey {
             }
             RelocatedTarget::MovedTo(path) => format!("move this setting to '{path}'"),
             RelocatedTarget::Removed => "this setting or table was removed".to_string(),
+            RelocatedTarget::Superseded(successor) => successor.to_string(),
         }
     }
 }
@@ -379,6 +382,20 @@ mod tests {
         assert_eq!(key.guidance(), "move this setting to 'encryption'");
     }
 
+    #[test]
+    fn superseded_settings_name_what_decides_the_value_now() {
+        let key = RelocatedKey {
+            path: "consumer_group.session_timeout",
+            replacement: RelocatedTarget::Superseded(
+                "the session timeout is now 1.2 x heartbeat.interval",
+            ),
+        };
+        assert_eq!(
+            key.guidance(),
+            "the session timeout is now 1.2 x heartbeat.interval"
+        );
+    }
+
     fn names(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
     }
@@ -458,6 +475,13 @@ mod tests {
     }
 
     #[test]
+    fn given_cli_token_when_checking_then_only_the_exact_name_should_be_allowed() {
+        let unknown = server_unknown_env_names(&["IGGY_TOKEN", "IGGY_TOKEN_TYPO"]);
+
+        assert_eq!(unknown, vec!["IGGY_TOKEN_TYPO"]);
+    }
+
+    #[test]
     fn given_another_configs_prefix_when_matching_then_should_report_none() {
         let found = relocated_env_vars(
             names(&["IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC"]).into_iter(),
@@ -494,6 +518,18 @@ mod tests {
         assert!(
             unknown.is_empty(),
             "the boot check must accept every variable the server reads outside its config, got: {unknown:?}"
+        );
+    }
+
+    /// The integration harness forwards every `IGGY_*` variable to the servers
+    /// it starts, its own `IGGY_TEST_*` knobs included.
+    #[test]
+    fn given_test_harness_variables_when_checking_then_the_server_should_boot() {
+        let unknown = server_unknown_env_names(&["IGGY_TEST_VERBOSE", "IGGY_TEST_CHAOS_SEED"]);
+
+        assert!(
+            unknown.is_empty(),
+            "the boot check must accept the test harness knobs, got: {unknown:?}"
         );
     }
 

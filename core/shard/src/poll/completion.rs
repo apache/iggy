@@ -37,7 +37,7 @@ use iggy_common::IggyError;
 use partitions::PollReadResult;
 use server_common::sharding::IggyNamespace;
 
-use super::{ConsumerAttachment, PollCompleted};
+use super::{PollAttachment, PollCompleted};
 use crate::coordinator::classify_try_send_err;
 use crate::metrics::{FrameDropMetrics, ShardMetrics, frame_drop_reason, frame_drop_variant};
 use crate::{PartitionReadReply, Receiver, Sender, channel};
@@ -77,7 +77,7 @@ impl PollCompletionLane {
         &self,
         namespace: IggyNamespace,
         reply: Sender<PartitionReadReply>,
-        attachment: Option<ConsumerAttachment>,
+        attachment: Option<PollAttachment>,
     ) -> Option<PollCompletionSender> {
         if self.state.closed.load(Ordering::Relaxed) || self.sender.is_disconnected() {
             reject(&reply, &self.state.metrics, frame_drop_reason::DISCONNECTED);
@@ -154,7 +154,7 @@ pub struct PollCompletionSender {
     slot: CompletionSlot,
     namespace: IggyNamespace,
     reply: Sender<PartitionReadReply>,
-    attachment: Option<ConsumerAttachment>,
+    attachment: Option<PollAttachment>,
 }
 
 impl PollCompletionSender {
@@ -499,11 +499,7 @@ mod tests {
             .build_poll_snapshot(
                 &namespace(),
                 PollingConsumer::Consumer(consumer_id, partition_id),
-                &PollingArgs {
-                    strategy: PollingStrategy::next(),
-                    count: 0,
-                    auto_commit: true,
-                },
+                &PollingArgs::new(PollingStrategy::next(), 0, true),
             )
             .expect("partition has a read snapshot")
             .execute_resident()

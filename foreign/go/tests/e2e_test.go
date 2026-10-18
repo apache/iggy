@@ -157,6 +157,7 @@ func TestE2E_ConsumerGroupFlow(t *testing.T) {
 	groupId, err := iggcon.NewIdentifier(group.Id)
 	require.NoError(t, err)
 	require.NoError(t, connected.JoinConsumerGroup(ctx, streamId, topicId, groupId))
+	waitForGroupAssignment(t, connected, streamId, topicId, groupId)
 
 	assignment, err := connected.SyncConsumerGroup(ctx, streamId, topicId, groupId)
 	require.NoError(t, err)
@@ -215,16 +216,27 @@ func TestE2E_SplitPrimaryPollsPreserveCoordinatorMembership(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
+	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
-	partition := uint32(0)
-	payload, err := (&command.PollMessages{StreamId: stream, TopicId: topic, Consumer: consumer,
-		PartitionId: &partition, Strategy: iggcon.NextPollingStrategy(), Count: 1, AutoCommit: true}).MarshalBinary()
+	streamBytes, err := stream.MarshalBinary()
 	require.NoError(t, err)
-	route, err := connected.SendBinaryRequest(ctx, uint32(command.GetPollRoutingCode), payload)
+	topicBytes, err := topic.MarshalBinary()
 	require.NoError(t, err)
-	require.Greater(t, len(route), 32)
-	var primary iggcon.ClusterNode
-	require.NoError(t, primary.UnmarshalBinary(route[32:]))
+	payload := binary.LittleEndian.AppendUint32(append(streamBytes, topicBytes...), 0)
+	body, err := connected.SendBinaryRequest(ctx, uint32(command.GetPartitionRouteCode), payload)
+	require.NoError(t, err)
+	var route iggcon.PartitionRoute
+	require.NoError(t, route.UnmarshalBinary(body))
+	metadata, err := connected.GetClusterMetadata(ctx)
+	require.NoError(t, err)
+	var primary *iggcon.ClusterNode
+	for index := range metadata.Nodes {
+		if metadata.Nodes[index].ReplicaID == route.PrimaryReplica {
+			primary = &metadata.Nodes[index]
+			break
+		}
+	}
+	require.NotNil(t, primary, "route primary must be a configured replica")
 	coordinator := connected.GetConnectionInfo().ServerAddress
 	primaryAddress := net.JoinHostPort(strings.Trim(primary.IP, "[]"), strconv.Itoa(int(primary.Endpoints.Tcp)))
 	coordinatorEndpoint, err := net.ResolveTCPAddr("tcp", coordinator)
@@ -289,6 +301,7 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = connected.DeleteConsumerGroup(context.Background(), stream, topic, groupID) })
 	require.NoError(t, connected.JoinConsumerGroup(ctx, stream, topic, groupID))
+	waitForGroupAssignment(t, connected, stream, topic, groupID)
 	consumer := iggcon.NewGroupConsumer(groupID)
 	coordinator := connected.GetConnectionInfo().ServerAddress
 	beforeClient, err := connected.GetMe(ctx)
@@ -303,17 +316,17 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 		assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress,
 			"the commit must not move the coordinator session")
 	}
-	stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	assert.Equal(t, uint64(1), stored.StoredOffset)
+	require.Eventually(t, func() bool {
+		stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+		return err == nil && stored != nil && stored.StoredOffset == 1
+	}, 5*time.Second, 50*time.Millisecond, "the manual group commit must replicate to the coordinator's backup")
 	afterClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
 	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
 }
 
-func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {
+func TestE2E_MetadataRequestsAcceptCounterGapsFromRawRequests(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 
