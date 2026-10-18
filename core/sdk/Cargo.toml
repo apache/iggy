@@ -42,7 +42,9 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+percent-encoding = { workspace = true }
 quinn = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
@@ -60,6 +62,7 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }
+rcgen = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

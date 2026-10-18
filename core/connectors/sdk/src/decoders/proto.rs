@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Error, Payload, Schema, StreamDecoder};
+use crate::{Error, Payload, Schema, StreamDecoder, convert::apply_field_mappings};
 use base64::Engine;
 use prost::Message;
 use prost_types::Any;
@@ -521,35 +521,11 @@ impl ProtoStreamDecoder {
             .ok_or(Error::InvalidProtobufPayload)
     }
 
-    fn apply_field_transformations(&self, payload: Payload) -> Result<Payload, Error> {
+    fn apply_field_transformations(&self, payload: Payload) -> Payload {
         if let Some(mappings) = &self.config.field_mappings {
-            match payload {
-                Payload::Json(json_value) => {
-                    if let simd_json::OwnedValue::Object(mut map) = json_value {
-                        let mut new_entries = Vec::new();
-
-                        for (key, value) in map.iter() {
-                            if let Some(new_key) = mappings.get(key) {
-                                new_entries.push((new_key.clone(), value.clone()));
-                            } else {
-                                new_entries.push((key.clone(), value.clone()));
-                            }
-                        }
-
-                        map.clear();
-                        for (key, value) in new_entries {
-                            map.insert(key, value);
-                        }
-
-                        Ok(Payload::Json(simd_json::OwnedValue::Object(map)))
-                    } else {
-                        Ok(Payload::Json(json_value))
-                    }
-                }
-                other => Ok(other),
-            }
+            apply_field_mappings(payload, |key| mappings.get(&key).cloned().unwrap_or(key))
         } else {
-            Ok(payload)
+            payload
         }
     }
 
@@ -586,7 +562,7 @@ impl StreamDecoder for ProtoStreamDecoder {
 
         let decoded_payload = self.decode_with_schema(payload)?;
 
-        self.apply_field_transformations(decoded_payload)
+        Ok(self.apply_field_transformations(decoded_payload))
     }
 }
 
@@ -655,40 +631,28 @@ mod tests {
 
     #[test]
     fn decode_should_apply_field_mappings_when_configured() {
+        // use_any_wrapper alone always emits literal type_url/value keys, making a mapping unobservable, so decode via a real schema instead.
         let mut field_mappings = HashMap::new();
-        field_mappings.insert("old_field".to_string(), "new_field".to_string());
-        field_mappings.insert("user_id".to_string(), "id".to_string());
+        field_mappings.insert("id".to_string(), "user_id".to_string());
 
         let config = ProtoConfig {
+            schema_path: Some(PathBuf::from("examples/user.proto")),
+            message_type: Some("com.example.User".to_string()),
+            use_any_wrapper: false,
             field_mappings: Some(field_mappings),
-            use_any_wrapper: true,
             ..ProtoConfig::default()
         };
         let decoder = ProtoStreamDecoder::new(config);
 
-        let json_content = simd_json::json!({
-            "old_field": "should_be_renamed",
-            "user_id": 123,
-            "unchanged_field": "stays_same"
-        });
-        let json_string = simd_json::to_string(&json_content).unwrap();
+        // Hand-encode a second, unmapped field (name) alongside id so the rename isn't the message's only field.
+        let mut encoded = 42i32.encode_to_vec();
+        encoded.extend_from_slice(&[0x12, 3, b'B', b'o', b'b']);
 
-        let any = Any {
-            type_url: "type.googleapis.com/custom.Message".to_string(),
-            value: json_string.into_bytes(),
-        };
-
-        let encoded = any.encode_to_vec();
         let result = decoder.decode(encoded);
 
         assert!(result.is_ok());
         if let Ok(Payload::Json(json_value)) = result {
-            if let simd_json::OwnedValue::Object(map) = &json_value {
-                assert!(map.contains_key("type_url"));
-                assert!(map.contains_key("value"));
-            } else {
-                panic!("Expected JSON object");
-            }
+            assert_eq!(json_value, simd_json::json!({"user_id": 42, "name": "Bob"}));
         } else {
             panic!("Expected JSON payload");
         }

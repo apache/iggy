@@ -71,10 +71,22 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 			message:  "request is below the deduplication window; outcome unknown, resending may duplicate the write",
 		},
 		{
+			err:      PartitionHistoryChanged{},
+			sentinel: ErrPartitionHistoryChanged,
+			code:     Code(3014),
+			message:  "partition history changed after the request was resolved",
+		},
+		{
 			err:      ConsumerGroupPartitionNotOwned{ClientId: 4, PartitionId: 9},
 			sentinel: ErrConsumerGroupPartitionNotOwned,
 			code:     ConsumerGroupPartitionNotOwnedCode,
 			message:  "consumer group member with client id: 4 does not own partition: 9 at the current generation (rebalance in progress).",
+		},
+		{
+			err:      TooManyConsumerGroups{},
+			sentinel: ErrTooManyConsumerGroups,
+			code:     Code(5010),
+			message:  "too many consumer groups",
 		},
 		{
 			err:      IncompatibleProtocolVersion{ClientVersion: 1, ServerVersionMin: 2, ServerVersionMax: 3},

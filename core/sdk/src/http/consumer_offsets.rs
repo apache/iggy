@@ -17,16 +17,38 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
+use crate::http::path::encode_segment;
 use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
-use iggy_common::{Consumer, ConsumerOffsetInfo};
+use iggy_common::{Consumer, ConsumerOffsetInfo, ConsumerPosition};
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
+    async fn store_consumer_position(
+        &self,
+        consumer: &Consumer,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        position: ConsumerPosition,
+    ) -> Result<(), IggyError> {
+        self.put(
+            &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+            &StoreConsumerOffset {
+                consumer: consumer.clone(),
+                partition_id: Some(position.partition_id),
+                offset: position.offset,
+                context: Some(position.context),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,
@@ -41,6 +63,7 @@ impl ConsumerOffsetClient for HttpClient {
                 consumer: consumer.clone(),
                 partition_id,
                 offset,
+                context: None,
             },
         )
         .await?;
@@ -85,19 +108,47 @@ impl ConsumerOffsetClient for HttpClient {
         topic_id: &Identifier,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        let partition_id = partition_id
-            .map(|id| format!("?partition_id={id}"))
-            .unwrap_or_default();
         let path = format!(
-            "{}/{}{partition_id}",
+            "{}/{}",
             get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            consumer.id
+            encode_segment(&consumer.id.as_cow_str())
         );
-        self.delete(&path).await?;
+        self.delete_with_query(
+            &path,
+            &DeleteConsumerOffset {
+                consumer_kind: consumer.kind,
+                partition_id,
+            },
+        )
+        .await?;
         Ok(())
     }
 }
 
 fn get_path(stream_id: &str, topic_id: &str) -> String {
-    format!("streams/{stream_id}/topics/{topic_id}/consumer-offsets")
+    let encoded_stream = encode_segment(stream_id);
+    let encoded_topic = encode_segment(topic_id);
+    format!("streams/{encoded_stream}/topics/{encoded_topic}/consumer-offsets")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_plain_ids_when_building_path_should_join_segments() {
+        let path = get_path("1", "orders");
+
+        assert_eq!(path, "streams/1/topics/orders/consumer-offsets");
+    }
+
+    #[test]
+    fn given_reserved_characters_when_building_path_should_percent_encode() {
+        let path = get_path("my stream", "my/topic");
+
+        assert_eq!(
+            path,
+            "streams/my%20stream/topics/my%2Ftopic/consumer-offsets"
+        );
+    }
 }

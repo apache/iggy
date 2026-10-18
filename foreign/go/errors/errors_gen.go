@@ -733,6 +733,28 @@ func (e RequestTooOld) Is(target error) bool {
 	return ok
 }
 
+type HistoryUnavailable struct{}
+
+func (e HistoryUnavailable) Error() string {
+	return "request history is no longer available; retry cannot execute it again"
+}
+func (e HistoryUnavailable) Code() Code { return 87 }
+func (e HistoryUnavailable) Is(target error) bool {
+	_, ok := target.(HistoryUnavailable)
+	return ok
+}
+
+type LifecycleBusy struct{}
+
+func (e LifecycleBusy) Error() string {
+	return "a committed lifecycle operation prevents this mutation; retry as a new request"
+}
+func (e LifecycleBusy) Code() Code { return 88 }
+func (e LifecycleBusy) Is(target error) bool {
+	_, ok := target.(LifecycleBusy)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -1380,6 +1402,17 @@ func (e PartitionsLimitReached) Is(target error) bool {
 	return ok
 }
 
+type PartitionResizeDisabled struct{}
+
+func (e PartitionResizeDisabled) Error() string {
+	return "partition resizing is disabled for this fixed topic"
+}
+func (e PartitionResizeDisabled) Code() Code { return 2023 }
+func (e PartitionResizeDisabled) Is(target error) bool {
+	_, ok := target.(PartitionResizeDisabled)
+	return ok
+}
+
 type CannotCreatePartition struct {
 	PartitionId uint32
 	StreamId    uint32
@@ -1625,6 +1658,17 @@ func (e PartitionIdSpaceExhausted) Error() string {
 func (e PartitionIdSpaceExhausted) Code() Code { return 3013 }
 func (e PartitionIdSpaceExhausted) Is(target error) bool {
 	_, ok := target.(PartitionIdSpaceExhausted)
+	return ok
+}
+
+type PartitionHistoryChanged struct{}
+
+func (e PartitionHistoryChanged) Error() string {
+	return "partition history changed after the request was resolved"
+}
+func (e PartitionHistoryChanged) Code() Code { return 3014 }
+func (e PartitionHistoryChanged) Is(target error) bool {
+	_, ok := target.(PartitionHistoryChanged)
 	return ok
 }
 
@@ -2338,6 +2382,15 @@ func (e ConsumerGroupPartitionNotOwned) Is(target error) bool {
 	return ok
 }
 
+type TooManyConsumerGroups struct{}
+
+func (e TooManyConsumerGroups) Error() string { return "too many consumer groups" }
+func (e TooManyConsumerGroups) Code() Code    { return 5010 }
+func (e TooManyConsumerGroups) Is(target error) bool {
+	_, ok := target.(TooManyConsumerGroups)
+	return ok
+}
+
 type MissingBaseOffsetRetainedMessageBatch struct{}
 
 func (e MissingBaseOffsetRetainedMessageBatch) Error() string { return "base offset is missing" }
@@ -2676,6 +2729,29 @@ func (e IncompatibleProtocolVersion) Is(target error) bool {
 	return ok
 }
 
+type SessionMismatch struct {
+	Requested uint64
+	Bound     uint64
+}
+
+func (e SessionMismatch) Error() string {
+	return fmt.Sprintf("vsr session mismatch: requested %d, server bound %d", e.Requested, e.Bound)
+}
+func (e SessionMismatch) Code() Code { return 14004 }
+func (e SessionMismatch) Is(target error) bool {
+	_, ok := target.(SessionMismatch)
+	return ok
+}
+
+type RequestIdExhausted struct{}
+
+func (e RequestIdExhausted) Error() string { return "vsr request id exhausted" }
+func (e RequestIdExhausted) Code() Code    { return 14005 }
+func (e RequestIdExhausted) Is(target error) bool {
+	_, ok := target.(RequestIdExhausted)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2746,6 +2822,8 @@ var (
 	ErrInvalidBooleanValue                        = InvalidBooleanValue{}
 	ErrInvalidNumberValue                         = InvalidNumberValue{}
 	ErrRequestTooOld                              = RequestTooOld{}
+	ErrHistoryUnavailable                         = HistoryUnavailable{}
+	ErrLifecycleBusy                              = LifecycleBusy{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -2802,6 +2880,7 @@ var (
 	ErrTopicDirectoryNotFound                     = TopicDirectoryNotFound{}
 	ErrTooManyTopics                              = TooManyTopics{}
 	ErrPartitionsLimitReached                     = PartitionsLimitReached{}
+	ErrPartitionResizeDisabled                    = PartitionResizeDisabled{}
 	ErrCannotCreatePartition                      = CannotCreatePartition{}
 	ErrCannotCreatePartitionsDirectory            = CannotCreatePartitionsDirectory{}
 	ErrCannotCreatePartitionDirectory             = CannotCreatePartitionDirectory{}
@@ -2821,6 +2900,7 @@ var (
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
 	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
+	ErrPartitionHistoryChanged                    = PartitionHistoryChanged{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
 	ErrInvalidSegmentSize                         = InvalidSegmentSize{}
@@ -2884,6 +2964,7 @@ var (
 	ErrCannotCreateConsumerGroupInfo              = CannotCreateConsumerGroupInfo{}
 	ErrCannotDeleteConsumerGroupInfo              = CannotDeleteConsumerGroupInfo{}
 	ErrConsumerGroupPartitionNotOwned             = ConsumerGroupPartitionNotOwned{}
+	ErrTooManyConsumerGroups                      = TooManyConsumerGroups{}
 	ErrMissingBaseOffsetRetainedMessageBatch      = MissingBaseOffsetRetainedMessageBatch{}
 	ErrMissingLastOffsetDeltaRetainedMessageBatch = MissingLastOffsetDeltaRetainedMessageBatch{}
 	ErrMissingMaxTimestampRetainedMessageBatch    = MissingMaxTimestampRetainedMessageBatch{}
@@ -2918,6 +2999,8 @@ var (
 	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
 	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
+	ErrSessionMismatch                            = SessionMismatch{}
+	ErrRequestIdExhausted                         = RequestIdExhausted{}
 )
 
 type Code uint32
@@ -2992,6 +3075,8 @@ const (
 	InvalidBooleanValueCode                        Code = 83
 	InvalidNumberValueCode                         Code = 84
 	RequestTooOldCode                              Code = 85
+	HistoryUnavailableCode                         Code = 87
+	LifecycleBusyCode                              Code = 88
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3048,6 +3133,7 @@ const (
 	TopicDirectoryNotFoundCode                     Code = 2020
 	TooManyTopicsCode                              Code = 2021
 	PartitionsLimitReachedCode                     Code = 2022
+	PartitionResizeDisabledCode                    Code = 2023
 	CannotCreatePartitionCode                      Code = 3000
 	CannotCreatePartitionsDirectoryCode            Code = 3001
 	CannotCreatePartitionDirectoryCode             Code = 3002
@@ -3067,6 +3153,7 @@ const (
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
 	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
+	PartitionHistoryChangedCode                    Code = 3014
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
 	InvalidSegmentSizeCode                         Code = 4002
@@ -3130,6 +3217,7 @@ const (
 	CannotCreateConsumerGroupInfoCode              Code = 5007
 	CannotDeleteConsumerGroupInfoCode              Code = 5008
 	ConsumerGroupPartitionNotOwnedCode             Code = 5009
+	TooManyConsumerGroupsCode                      Code = 5010
 	MissingBaseOffsetRetainedMessageBatchCode      Code = 6000
 	MissingLastOffsetDeltaRetainedMessageBatchCode Code = 6001
 	MissingMaxTimestampRetainedMessageBatchCode    Code = 6002
@@ -3164,6 +3252,8 @@ const (
 	AlreadyAuthenticatedCode                       Code = 14000
 	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
+	SessionMismatchCode                            Code = 14004
+	RequestIdExhaustedCode                         Code = 14005
 )
 
 func (c Code) String() string {
@@ -3306,6 +3396,10 @@ func (c Code) String() string {
 		return "InvalidNumberValue"
 	case RequestTooOldCode:
 		return "RequestTooOld"
+	case HistoryUnavailableCode:
+		return "HistoryUnavailable"
+	case LifecycleBusyCode:
+		return "LifecycleBusy"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3418,6 +3512,8 @@ func (c Code) String() string {
 		return "TooManyTopics"
 	case PartitionsLimitReachedCode:
 		return "PartitionsLimitReached"
+	case PartitionResizeDisabledCode:
+		return "PartitionResizeDisabled"
 	case CannotCreatePartitionCode:
 		return "CannotCreatePartition"
 	case CannotCreatePartitionsDirectoryCode:
@@ -3456,6 +3552,8 @@ func (c Code) String() string {
 		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
+	case PartitionHistoryChangedCode:
+		return "PartitionHistoryChanged"
 	case SegmentNotFoundCode:
 		return "SegmentNotFound"
 	case SegmentClosedCode:
@@ -3582,6 +3680,8 @@ func (c Code) String() string {
 		return "CannotDeleteConsumerGroupInfo"
 	case ConsumerGroupPartitionNotOwnedCode:
 		return "ConsumerGroupPartitionNotOwned"
+	case TooManyConsumerGroupsCode:
+		return "TooManyConsumerGroups"
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return "MissingBaseOffsetRetainedMessageBatch"
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:
@@ -3650,6 +3750,10 @@ func (c Code) String() string {
 		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
+	case SessionMismatchCode:
+		return "SessionMismatch"
+	case RequestIdExhaustedCode:
+		return "RequestIdExhausted"
 	default:
 		return "Unknown error code"
 	}
@@ -3795,6 +3899,10 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidNumberValue
 	case RequestTooOldCode:
 		return ErrRequestTooOld
+	case HistoryUnavailableCode:
+		return ErrHistoryUnavailable
+	case LifecycleBusyCode:
+		return ErrLifecycleBusy
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -3907,6 +4015,8 @@ func FromCode(code Code) IggyError {
 		return ErrTooManyTopics
 	case PartitionsLimitReachedCode:
 		return ErrPartitionsLimitReached
+	case PartitionResizeDisabledCode:
+		return ErrPartitionResizeDisabled
 	case CannotCreatePartitionCode:
 		return ErrCannotCreatePartition
 	case CannotCreatePartitionsDirectoryCode:
@@ -3945,6 +4055,8 @@ func FromCode(code Code) IggyError {
 		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
+	case PartitionHistoryChangedCode:
+		return ErrPartitionHistoryChanged
 	case SegmentNotFoundCode:
 		return ErrSegmentNotFound
 	case SegmentClosedCode:
@@ -4071,6 +4183,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotDeleteConsumerGroupInfo
 	case ConsumerGroupPartitionNotOwnedCode:
 		return ErrConsumerGroupPartitionNotOwned
+	case TooManyConsumerGroupsCode:
+		return ErrTooManyConsumerGroups
 	case MissingBaseOffsetRetainedMessageBatchCode:
 		return ErrMissingBaseOffsetRetainedMessageBatch
 	case MissingLastOffsetDeltaRetainedMessageBatchCode:
@@ -4139,6 +4253,10 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
+	case SessionMismatchCode:
+		return ErrSessionMismatch
+	case RequestIdExhaustedCode:
+		return ErrRequestIdExhausted
 	default:
 		return ErrError
 	}

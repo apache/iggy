@@ -12,10 +12,11 @@ Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message str
 
 The SDK is built up in stages. This stage carries the package scaffold, the error table,
 the byte codec the wire protocol is encoded with, native XXH3-64 and XXH32 hashes pinned
-to the Rust crates by golden vectors, and the domain models (streams, topics, messages,
-user headers, options, permissions) with their wire encodings. The protocol layer, the
-TCP and TLS client, the producer and consumer, examples, and BDD scenarios follow in
-later changes.
+to the Rust crates by golden vectors, the domain models (streams, topics, messages,
+user headers, options, permissions) with their wire encodings, and the protocol layer:
+the consensus frame, the session and request id rules, the request encoders, the reply
+decoders, and the message batch format. The TCP and TLS client, the producer and
+consumer, examples, and BDD scenarios follow in later changes.
 
 ## Requirements
 
@@ -78,8 +79,8 @@ cd foreign/swift
 swift test
 ```
 
-The hash and error-code tests compare against `Tests/IggyTests/Fixtures/golden.json`, a
-fixture dumped from the Rust protocol crates. Regenerate it after a protocol change, from
+The hash, error-code, model, request, reply, and consensus header tests compare against
+`Tests/IggyTests/Fixtures/golden.json`, a fixture dumped from the Rust protocol crates. Regenerate it after a protocol change, from
 `foreign/swift`, and commit the result; CI fails when the checked-in copy is stale:
 
 ```bash

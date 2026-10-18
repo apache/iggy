@@ -576,9 +576,9 @@ async fn given_sasl_disabled_when_a_client_connects_should_serve_without_authent
 
     let advertised = send(&mut stream, API_KEY_API_VERSIONS, 1, 2, &[]).await;
     assert!(
-        !advertised
-            .windows(2)
-            .any(|w| i16::from_be_bytes([w[0], w[1]]) == API_KEY_SASL_HANDSHAKE),
+        !parse_api_versions(&advertised)
+            .iter()
+            .any(|&(key, _, _)| key == API_KEY_SASL_HANDSHAKE),
         "the SASL keys must not be advertised while the feature is off"
     );
 }

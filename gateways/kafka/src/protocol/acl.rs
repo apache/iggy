@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn given_no_permissions_when_rendered_should_produce_no_bindings() {
-        assert!(bindings_for(&PrincipalPermissions::default()).is_empty());
+        assert_eq!(bindings_for(&PrincipalPermissions::default()), []);
     }
 
     #[test]
@@ -595,6 +595,6 @@ mod tests {
                 .iter()
                 .all(|binding| binding.resource_type == resource_type::CLUSTER)
         );
-        assert!(!selected.is_empty());
+        assert_ne!(selected, []);
     }
 }

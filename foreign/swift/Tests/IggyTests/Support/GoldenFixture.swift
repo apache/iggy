@@ -35,6 +35,8 @@ struct GoldenFixture: Decodable {
         let name: String
     }
 
+    let protocolVersion: UInt32
+    let protocolVersionMin: UInt32
     /// `NO_ASSIGNED_PARTITION` and `RESYNC_REQUIRED_PARTITION_SENTINEL` from
     /// `core/common`.
     let noAssignedPartition: UInt32
@@ -61,6 +63,8 @@ struct GoldenFixture: Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case protocolVersionMin = "protocol_version_min"
         case noAssignedPartition = "no_assigned_partition"
         case resyncRequiredPartition = "resync_required_partition"
         case xxh3_64Table = "xxh3_64"

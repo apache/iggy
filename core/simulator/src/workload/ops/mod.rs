@@ -44,8 +44,6 @@ pub mod delete_segments;
 pub mod delete_stream;
 pub mod delete_topic;
 pub mod delete_user;
-pub mod purge_stream;
-pub mod purge_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
 pub mod update_permissions;
@@ -53,7 +51,9 @@ pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::{KIND_CONSUMER, KIND_CONSUMER_GROUP, RoutedRequestHeader};
+use iggy_binary_protocol::{
+    KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, RoutedRequestHeader,
+};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
@@ -65,20 +65,17 @@ use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
 /// Draw a consumer kind for the four consumer-offset ops, as the WIRE
-/// discriminant rather than a bare boolean.
+/// discriminant.
 ///
-/// `WireConsumer::decode` accepts only [`KIND_CONSUMER`] (1) and
-/// [`KIND_CONSUMER_GROUP`] (2). Anything else maps to
-/// `IggyError::InvalidCommand`, which the partition plane answers by logging a
-/// WARN and dropping the frame with NO reply, so one malformed draw wedges that
-/// client's in-flight slot for the rest of the run. One bool draw either way, so
-/// the PRNG trace shape is unchanged.
+/// `WireConsumer::decode` accepts only [`KIND_CONSUMER`] (1),
+/// [`KIND_CONSUMER_GROUP`] (2) and [`KIND_EXTERNAL_GROUP`] (3). Anything else
+/// maps to `IggyError::InvalidCommand`, which the partition plane answers by
+/// logging a WARN and dropping the frame with NO reply, so one malformed draw
+/// wedges that client's in-flight slot for the rest of the run. One range draw
+/// over every kind.
 pub(crate) fn sample_consumer_kind(prng: &mut Xoshiro256PlusPlus) -> u8 {
-    if prng.random::<bool>() {
-        KIND_CONSUMER_GROUP
-    } else {
-        KIND_CONSUMER
-    }
+    const KINDS: [u8; 3] = [KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP];
+    KINDS[prng.random_range(0..KINDS.len())]
 }
 
 /// Generates per-op enums (`InFlightInput`, `InFlightOutcome`) plus four
@@ -192,11 +189,9 @@ op_dispatch! {
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
-    PurgeStream               => purge_stream,
     CreateTopic               => create_topic,
     UpdateTopic               => update_topic,
     DeleteTopic               => delete_topic,
-    PurgeTopic                => purge_topic,
     CreatePartitions          => create_partitions,
     DeletePartitions          => delete_partitions,
     DeleteSegments            => delete_segments,

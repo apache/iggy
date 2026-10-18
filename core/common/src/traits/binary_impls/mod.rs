@@ -28,6 +28,7 @@ mod topics;
 mod users;
 
 pub use messages::decode_send_confirmations;
+pub(crate) use messages::send_raw_messages;
 
 use crate::IggyError;
 use crate::http::users::defaults::{
@@ -44,7 +45,7 @@ pub(crate) const RUST_SDK_NAME: &str = "rust-sdk";
 /// Version prefix for both login-register request shapes. `sdk_version`
 /// comes from [`crate::VsrSessionControl::sdk_version`] so it is the SDK
 /// crate's version, not this crate's.
-pub(crate) fn rust_sdk_version_info(sdk_version: &str) -> Result<ClientVersionInfo, IggyError> {
+pub fn rust_sdk_version_info(sdk_version: &str) -> Result<ClientVersionInfo, IggyError> {
     Ok(ClientVersionInfo {
         protocol_version: IGGY_PROTOCOL_VERSION,
         sdk_name: WireName::new(RUST_SDK_NAME).expect("RUST_SDK_NAME is 1-255 bytes"),

@@ -16,15 +16,16 @@
 // under the License.
 
 using System.Buffers.Binary;
+using Apache.Iggy.Contracts;
 
 namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     The 256-byte consensus header, read and written by wire offset. Offsets mirror
 ///     <c>core/binary_protocol/src/consensus/header.rs</c>. Checksums stay zero: the frame and body checksums
-///     are not read on the client request path, and <c>request_checksum</c> treats zero as unstamped, which
-///     opts out of the server's payload comparison. Stamping it is optional -- the Rust SDK does so for
-///     deduped operations, this SDK does not yet.
+///     are not read on the client request path, and a zero <c>request_checksum</c> is unstamped, which skips
+///     the server's payload verification. Stamping it is optional. The Rust SDK stamps metadata, session and
+///     DeleteSegments operations. This SDK does not stamp it yet.
 /// </summary>
 internal static class VsrHeader
 {
@@ -43,6 +44,9 @@ internal static class VsrHeader
     internal const int REQUEST_OPERATION_OFFSET = 176;
     internal const int REQUEST_SESSION_OFFSET = 184;
     internal const int REQUEST_RESERVED_OFFSET = 196;
+    internal const int REQUEST_INCARNATION_OFFSET = 200;
+    internal const int REQUEST_OWNER_GENERATION_OFFSET = 208;
+    internal const int REQUEST_METADATA_OP_OFFSET = 216;
 
     internal const int REPLY_OPERATION_OFFSET = 208;
     internal const int REPLY_COMMIT_OFFSET = 184;
@@ -63,7 +67,7 @@ internal static class VsrHeader
     ///     different request would let the client table answer that request from the first one's cached reply.
     /// </remarks>
     internal static int EncodeRequestHeader(Span<byte> header, ConsensusSession session, int code,
-        ReadOnlySpan<byte> payload)
+        ReadOnlySpan<byte> payload, PartitionContext context = default)
     {
         if (header.Length < HEADER_SIZE)
         {
@@ -90,6 +94,9 @@ internal static class VsrHeader
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_ID_OFFSET..], frame.RequestId);
         header[REQUEST_OPERATION_OFFSET] = (byte)operation;
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_SESSION_OFFSET..], frame.SessionId);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_INCARNATION_OFFSET..], context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_OWNER_GENERATION_OFFSET..], context.OwnerGeneration);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_METADATA_OP_OFFSET..], context.MetadataOp);
 
         if (operation == VsrOperation.NonReplicated)
         {

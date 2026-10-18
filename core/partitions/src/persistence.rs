@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
 use futures::TryStreamExt;
 use iggy_binary_protocol::{Operation, PrepareHeader};
+use iggy_common::ConsumerKind;
 use journal::PartitionPrepareJournal;
 use journal::durable_storage::{DiskStorage, DurableFile, DurableStorage};
 use journal::partition_journal::{PARTITION_WAL_BYTES_MAX, SegmentPosition, SegmentReference};
@@ -30,12 +32,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use nix::sys::resource::{Resource, getrlimit};
 
 // Group commit bounds, not throughput bounds. Every prepare in a group is
 // already queued and waiting, so widening the group moves work off the barrier
@@ -49,58 +48,19 @@ const APPEND_BATCH_WAL_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const APPEND_BATCH_SEGMENT_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const APPEND_BATCH_OPS_MAX: usize = 256;
 const CHECKPOINT_DIRTY_FILES_MAX: usize = 1024;
+/// Writer backlog a Replicated commit may run ahead of while no checkpoint is
+/// pending. It holds the backlog one checkpoint leaves on a busy partition, so
+/// the commits after it do not wait, and it caps the bodies a slow writer pins.
+const RUN_AHEAD_BYTES_MAX: u64 = 16 * 1024 * 1024;
 /// Mutations a partition may apply before its obsolete files are reclaimed
 /// whether or not the queue has drained. Reclaiming only on an idle queue
 /// keeps the unlinks off every acknowledgement, but a partition under
 /// continuous load never goes idle and would hold its old generations until
 /// it did.
 const RECLAIM_MUTATIONS_MAX: u32 = 64;
-#[cfg(unix)]
-const OFFSET_FILES_TOTAL_MAX: usize = 1024;
-const OFFSET_FILES_PER_PARTITION_MAX: usize = 64;
-#[cfg(unix)]
-const OFFSET_FILE_LIMIT_DIVISOR: u64 = 4;
 const PERSISTENCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
-
-static RETAINED_OFFSET_FILES: AtomicUsize = AtomicUsize::new(0);
-static OFFSET_FILE_LIMIT: LazyLock<usize> = LazyLock::new(|| {
-    // Leave descriptor space for sockets, journals, indexes, and active I/O.
-    #[cfg(unix)]
-    let limit = getrlimit(Resource::RLIMIT_NOFILE).map_or(0, |(soft, _)| {
-        usize::try_from(soft / OFFSET_FILE_LIMIT_DIVISOR)
-            .unwrap_or(OFFSET_FILES_TOTAL_MAX)
-            .min(OFFSET_FILES_TOTAL_MAX)
-    });
-    #[cfg(not(unix))]
-    let limit = 0;
-    limit
-});
-
-struct RetainedOffsetFile<F> {
-    file: F,
-    _permit: OffsetFilePermit,
-}
-
-struct OffsetFilePermit;
-
-impl OffsetFilePermit {
-    fn acquire() -> Option<Self> {
-        RETAINED_OFFSET_FILES
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < *OFFSET_FILE_LIMIT).then_some(count + 1)
-            })
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-impl Drop for OffsetFilePermit {
-    fn drop(&mut self) {
-        RETAINED_OFFSET_FILES.fetch_sub(1, Ordering::Relaxed);
-    }
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct PersistenceCompletion {
@@ -166,12 +126,12 @@ impl CheckpointBarrier {
 pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     group: u64,
     instance: u64,
+    recovered_frontier: bool,
     lease: Option<Arc<WriterLease>>,
     epoch: Cell<u64>,
     journal: RefCell<Option<PartitionPrepareJournal<S>>>,
     queue: RefCell<VecDeque<Mutation<S>>>,
-    offset_files: RefCell<HashMap<String, RetainedOffsetFile<S::File>>>,
-    retired_offset_files: RefCell<Vec<RetainedOffsetFile<S::File>>>,
+    offset_files: RetainedOffsetFiles<S::File>,
     accepted: RefCell<AcceptedPrepares>,
     // Published with written_head so readers never borrow the journal across writer I/O.
     segment_references: RefCell<BTreeMap<u64, SegmentReference>>,
@@ -186,9 +146,8 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     checkpoint_running: Cell<bool>,
     checkpoint_needed: Cell<bool>,
     dirty_segments: RefCell<BTreeSet<u64>>,
-    dirty_offsets: [RefCell<BTreeSet<u32>>; 2],
-    purge_generation: Cell<u64>,
-    purge_floor: Cell<u64>,
+    dirty_offsets: [RefCell<BTreeSet<u32>>; ConsumerKind::COUNT],
+    dirty_offset_directories: [Cell<bool>; ConsumerKind::COUNT],
     capacity: u64,
     disk_bytes: Cell<u64>,
     retained_bytes: Cell<u64>,
@@ -199,6 +158,7 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     running: Cell<bool>,
     writer_active: Cell<bool>,
     retired: Cell<bool>,
+    enqueue_paused: Cell<bool>,
     failure: RefCell<Option<Arc<io::Error>>>,
     failure_operation: Cell<Operation>,
     notifier: RefCell<Option<PersistenceNotifier>>,
@@ -212,6 +172,14 @@ pub struct PartitionPersistence<S: DurableStorage = DiskStorage> {
     group_commit_waits: Cell<u64>,
     completed_checkpoints: Cell<u64>,
     failed_writes: Cell<u64>,
+}
+
+/// One full-drain observation, including its original worker epoch and deadline.
+pub struct PersistenceDrain {
+    instance: u64,
+    epoch: u64,
+    // TODO: Use injected monotonic time so owner-observed drains follow simulated time.
+    started: Instant,
 }
 
 struct WriterLease {
@@ -439,22 +407,24 @@ enum Mutation<S: DurableStorage> {
         initial: SegmentPosition,
         max_size: u64,
     },
+    ReanchorSegments {
+        epoch: u64,
+        next_offset: u64,
+    },
     CertifyView {
         epoch: u64,
         view: u32,
         op: u64,
         checksum: u128,
     },
-    Purge {
-        epoch: u64,
-        generation: u64,
-        floor: u64,
-    },
     Append {
         epoch: u64,
         prepare: Frozen<4096>,
         durable: bool,
         retained_bytes: u64,
+    },
+    Sync {
+        epoch: u64,
     },
     Truncate {
         epoch: u64,
@@ -488,6 +458,23 @@ struct AppendBatchBytes {
 }
 
 impl PartitionPersistence {
+    /// Persist the recovery fence before a replacement WAL can publish an
+    /// empty frontier that a later process could mistake for intact history.
+    ///
+    /// # Errors
+    /// Returns an error if the prior frontier or recovery fence cannot be read or written.
+    pub async fn fence_missing_history(directory: &Path, incarnation: u64) -> io::Result<()> {
+        if !PartitionPrepareJournal::has_published_frontier(directory).await? {
+            let partition_directory =
+                directory.parent().and_then(Path::to_str).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid partition path")
+                })?;
+            crate::state_transfer::mark_materialization_missing(partition_directory, incarnation)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// # Errors
     /// Returns an error if the partition WAL cannot be recovered.
     pub async fn open(
@@ -563,6 +550,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         let persistence = Rc::new(Self {
             group,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            recovered_frontier: journal.recovered_frontier(),
             lease,
             epoch: Cell::new(0),
             accepted_head: Cell::new(journal.head()),
@@ -577,8 +565,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             checkpoint_needed: Cell::new(false),
             dirty_segments: RefCell::new(BTreeSet::new()),
             dirty_offsets: std::array::from_fn(|_| RefCell::new(BTreeSet::new())),
-            purge_generation: Cell::new(journal.purge_marker().0),
-            purge_floor: Cell::new(journal.purge_marker().1),
+            // Recovery may have completed a rename or unlink without its final barrier.
+            dirty_offset_directories: std::array::from_fn(|_| Cell::new(true)),
             capacity,
             disk_bytes: Cell::new(journal.size_bytes()),
             retained_bytes: Cell::new(journal.retained_bytes()),
@@ -586,8 +574,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             segment_references: RefCell::new(journal.written_segment_references(0).collect()),
             journal: RefCell::new(Some(journal)),
             queue: RefCell::new(VecDeque::new()),
-            offset_files: RefCell::new(HashMap::new()),
-            retired_offset_files: RefCell::new(Vec::new()),
+            offset_files: RetainedOffsetFiles::default(),
             accepted: RefCell::new(accepted),
             queued_bytes: Cell::new(0),
             in_flight_bytes: Cell::new(0),
@@ -595,6 +582,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             running: Cell::new(false),
             writer_active: Cell::new(false),
             retired: Cell::new(false),
+            enqueue_paused: Cell::new(false),
             failure: RefCell::new(None),
             failure_operation: Cell::new(Operation::SendMessages),
             notifier: RefCell::new(None),
@@ -608,6 +596,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             failed_writes: Cell::new(0),
         });
         Ok((persistence, prepares))
+    }
+
+    #[must_use]
+    pub const fn recovered_frontier(&self) -> bool {
+        self.recovered_frontier
     }
 
     #[cfg(test)]
@@ -686,6 +679,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.segment_checkpoint.get()
     }
 
+    /// Queue a reserved offset boundary after checkpointing the preceding chain.
+    pub fn reanchor_segments(&self, next_offset: u64) {
+        self.queue
+            .borrow_mut()
+            .push_back(Mutation::ReanchorSegments {
+                epoch: self.epoch.get(),
+                next_offset,
+            });
+    }
+
     pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
         self.queue.borrow_mut().push_back(Mutation::EnableSegments {
             epoch: self.epoch.get(),
@@ -734,6 +737,10 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         Ok(position - initial)
     }
 
+    pub const fn written_op(&self) -> u64 {
+        self.written_head.get()
+    }
+
     pub const fn durable_op(&self) -> u64 {
         self.durable_head.get()
     }
@@ -748,6 +755,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         };
         let bytes = bytes as u64;
         !self.retired.get()
+            && !self.enqueue_paused.get()
             && self.failure.borrow().is_none()
             && self
                 .retained_bytes
@@ -806,11 +814,8 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.dirty_segments.borrow_mut().insert(start_offset);
     }
 
-    pub fn take_offset_file(&self, path: &str) -> Option<S::File> {
-        self.offset_files
-            .borrow_mut()
-            .remove(path)
-            .map(|retained| retained.file)
+    pub fn take_offset_file(&self, path: &str) -> Option<RetainedOffsetFile<S::File>> {
+        self.offset_files.take(path)
     }
 
     /// Retain the original writer or synchronize it before closing at the budget.
@@ -818,33 +823,36 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     /// # Errors
     /// Returns a barrier error that the caller must fence like a failed write.
     pub async fn retain_offset_file(&self, path: String, file: S::File) -> io::Result<()> {
-        let retained_count =
-            self.offset_files.borrow().len() + self.retired_offset_files.borrow().len();
-        if retained_count >= OFFSET_FILES_PER_PARTITION_MAX {
-            return file.sync().await;
+        if let Some(permit) = self.offset_files.reserve(&path) {
+            self.offset_files.put(&path, file, permit);
+            Ok(())
+        } else {
+            file.sync().await
         }
-        let Some(permit) = OffsetFilePermit::acquire() else {
-            return file.sync().await;
-        };
-        if let Some(previous) = self.offset_files.borrow_mut().insert(
-            path,
-            RetainedOffsetFile {
-                file,
-                _permit: permit,
-            },
-        ) {
-            self.retired_offset_files.borrow_mut().push(previous);
-        }
-        Ok(())
+    }
+
+    pub(crate) fn checkout_offset_file(
+        &self,
+        path: &str,
+    ) -> Option<(Option<S::File>, Rc<OffsetFilePermit>)> {
+        self.offset_files.checkout(path)
+    }
+
+    pub(crate) fn return_offset_file(
+        &self,
+        path: &str,
+        file: S::File,
+        permit: Rc<OffsetFilePermit>,
+    ) {
+        self.offset_files.put(path, file, permit);
     }
 
     pub fn retire_offset_file(&self, path: &str) {
-        if let Some(file) = self.offset_files.borrow_mut().remove(path) {
-            self.retired_offset_files.borrow_mut().push(file);
-        }
+        self.offset_files.retire(path);
     }
 
     pub fn mark_offset_dirty(&self, kind_index: usize, consumer_id: u32, exists: bool) {
+        self.dirty_offset_directories[kind_index].set(true);
         let mut offsets = self.dirty_offsets[kind_index].borrow_mut();
         if exists {
             offsets.insert(consumer_id);
@@ -854,17 +862,22 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     }
 
     pub fn retire_offset_files(&self) {
-        self.retired_offset_files
-            .borrow_mut()
-            .extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
+        self.offset_files.retire_all();
     }
 
-    pub fn take_dirty_files(&self) -> (BTreeSet<u64>, [BTreeSet<u32>; 2]) {
+    pub fn take_dirty_files(
+        &self,
+    ) -> (
+        BTreeSet<u64>,
+        [BTreeSet<u32>; ConsumerKind::COUNT],
+        [bool; ConsumerKind::COUNT],
+    ) {
         (
             std::mem::take(&mut *self.dirty_segments.borrow_mut()),
             std::array::from_fn(|index| {
                 std::mem::take(&mut *self.dirty_offsets[index].borrow_mut())
             }),
+            std::array::from_fn(|index| self.dirty_offset_directories[index].replace(false)),
         )
     }
 
@@ -884,14 +897,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
         self.checkpoint_requested.set(through_op);
         self.checkpoint_needed.set(false);
-        let synced_files = self
-            .offset_files
-            .borrow()
-            .keys()
-            .map(PathBuf::from)
-            .collect();
-        let mut offset_files = std::mem::take(&mut *self.retired_offset_files.borrow_mut());
-        offset_files.extend(self.offset_files.borrow_mut().drain().map(|(_, file)| file));
+        let (offset_files, synced_files) = self.offset_files.take_checkpoint();
         self.queue.borrow_mut().push_back(Mutation::Checkpoint {
             epoch: self.epoch.get(),
             through_op,
@@ -916,6 +922,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             return;
         }
         self.checkpoint_requested.set(self.checkpoint.get());
+        for dirty in &self.dirty_offset_directories {
+            dirty.set(true);
+        }
         self.certified_log_view.set(None);
         self.requested_log_view.set(None);
         let epoch = self.epoch.get().wrapping_add(1);
@@ -983,11 +992,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         prepare: Option<Frozen<4096>>,
         segments: Option<(SegmentPosition, u64)>,
     ) {
-        self.offset_files.borrow_mut().clear();
-        self.retired_offset_files.borrow_mut().clear();
+        self.offset_files.clear();
         self.certified_log_view.set(None);
         self.requested_log_view.set(None);
         self.checkpoint_requested.set(op);
+        for dirty in &self.dirty_offset_directories {
+            dirty.set(true);
+        }
         let epoch = self.epoch.get().wrapping_add(1);
         self.epoch.set(epoch);
         self.queue.borrow_mut().clear();
@@ -1009,24 +1020,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         });
     }
 
-    pub fn mark_purge(&self, generation: u64, floor: u64) {
-        self.queue.borrow_mut().push_back(Mutation::Purge {
-            epoch: self.epoch.get(),
-            generation,
-            floor,
-        });
-    }
-
-    pub const fn purge_marker(&self) -> (u64, u64) {
-        (self.purge_generation.get(), self.purge_floor.get())
-    }
-
     pub fn needs_checkpoint(&self) -> bool {
         !self.checkpoint_pending()
             && (self.checkpoint_needed.get()
                 || self.retained_bytes.get() + self.queued_bytes.get() + self.in_flight_bytes.get()
                     >= self.capacity / 2
-                || self.retired_offset_files.borrow().len() >= CHECKPOINT_DIRTY_FILES_MAX
                 || self.dirty_segments.borrow().len() * 2
                     + self
                         .dirty_offsets
@@ -1034,6 +1032,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                         .map(|offsets| offsets.borrow().len())
                         .sum::<usize>()
                     >= CHECKPOINT_DIRTY_FILES_MAX)
+    }
+
+    /// Whether a Replicated commit may pass a body the writer has not written.
+    /// A pending checkpoint holds the writer, so only admission bounds the
+    /// backlog then. A due checkpoint starts only once the writer reaches
+    /// `commit_min`, so commits wait for the writer until it starts.
+    pub fn can_run_ahead(&self) -> bool {
+        self.checkpoint_pending()
+            || (!self.needs_checkpoint()
+                && self.queued_bytes.get() + self.in_flight_bytes.get() < RUN_AHEAD_BYTES_MAX)
     }
 
     pub fn take_metrics(&self) -> PersistenceMetrics {
@@ -1095,6 +1103,51 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         self.queued_bytes.set(0);
     }
 
+    pub(crate) fn begin_drain(&self) -> PersistenceDrain {
+        self.enqueue_paused.set(true);
+        PersistenceDrain {
+            instance: self.instance,
+            epoch: self.epoch.get(),
+            started: Instant::now(),
+        }
+    }
+
+    pub fn is_quiescent(&self) -> bool {
+        !self.running.get() && !self.writer_active.get() && self.queue.borrow().is_empty()
+    }
+
+    /// # Errors
+    /// Preserves storage/interruption failures and the original drain deadline.
+    pub(crate) fn observe_drain(&self, drain: &PersistenceDrain) -> io::Result<bool> {
+        if drain.instance != self.instance || drain.epoch != self.epoch.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partition WAL drain epoch changed",
+            ));
+        }
+        if !self.running.get() && !self.writer_active.get() {
+            if let Some(error) = self.failure() {
+                return Err(io::Error::new(error.kind(), error));
+            }
+            if self.queue.borrow().is_empty() {
+                return Ok(true);
+            }
+        }
+        if drain.started.elapsed() >= PERSISTENCE_DRAIN_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "partition WAL drain timed out",
+            ));
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn finish_drain(&self, drain: &PersistenceDrain) {
+        if drain.instance == self.instance && drain.epoch == self.epoch.get() {
+            self.enqueue_paused.set(false);
+        }
+    }
+
     /// # Errors
     /// Returns an error if persistence fails, capacity is exhausted, or history is invalid.
     pub async fn drain(&self) -> io::Result<()> {
@@ -1125,6 +1178,13 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         compio::runtime::time::timeout(PERSISTENCE_DRAIN_TIMEOUT, self.drain())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "partition WAL drain timed out"))?
+    }
+
+    /// Queue a barrier for preceding buffered writes; drain before claiming durability.
+    pub fn sync(&self) {
+        self.queue.borrow_mut().push_back(Mutation::Sync {
+            epoch: self.epoch.get(),
+        });
     }
 
     pub fn start(&self) -> bool {
@@ -1184,8 +1244,9 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                     ..
                 } => (*epoch, *retained_bytes),
                 Mutation::CertifyView { epoch, .. }
+                | Mutation::Sync { epoch }
                 | Mutation::EnableSegments { epoch, .. }
-                | Mutation::Purge { epoch, .. }
+                | Mutation::ReanchorSegments { epoch, .. }
                 | Mutation::Truncate { epoch, .. }
                 | Mutation::Checkpoint { epoch, .. }
                 | Mutation::Reset { epoch, .. } => (*epoch, 0),
@@ -1196,7 +1257,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             let rebuild_references = matches!(
                 mutation,
                 Mutation::EnableSegments { .. }
-                    | Mutation::Purge { .. }
+                    | Mutation::ReanchorSegments { .. }
                     | Mutation::Truncate { .. }
                     | Mutation::Checkpoint { .. }
                     | Mutation::Reset { .. }
@@ -1268,8 +1329,6 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         }
         self.checkpoint.set(journal.checkpoint_op());
         self.checkpoint_checksum.set(journal.checkpoint_checksum());
-        self.purge_generation.set(journal.purge_marker().0);
-        self.purge_floor.set(journal.purge_marker().1);
         if advanced {
             self.notify();
         }
@@ -1286,18 +1345,19 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             Mutation::EnableSegments {
                 initial, max_size, ..
             } => journal.enable_segment_storage(initial, max_size).await,
+            Mutation::ReanchorSegments { next_offset, .. } => {
+                journal.reanchor_segment_storage(next_offset).await
+            }
             Mutation::CertifyView {
                 view, op, checksum, ..
             } => journal.certify_log_view(view, op, checksum).await,
-            Mutation::Purge {
-                generation, floor, ..
-            } => journal.mark_purge(generation, floor).await,
             Mutation::Append {
                 prepare, durable, ..
             } => {
                 self.append_batch(journal, prepare, durable, epoch, retained_bytes)
                     .await
             }
+            Mutation::Sync { .. } => journal.sync().await,
             Mutation::Truncate { from_op, .. } => journal.truncate_from(from_op).await,
             Mutation::Checkpoint {
                 through_op,
@@ -1621,13 +1681,15 @@ mod tests {
         persistence.mark_offset_dirty(0, 7, true);
         persistence.mark_offset_dirty(0, 7, false);
         persistence.mark_offset_dirty(1, 9, true);
-        let (segments, offsets) = persistence.take_dirty_files();
+        let (segments, offsets, directories) = persistence.take_dirty_files();
         assert_eq!(segments.into_iter().collect::<Vec<_>>(), vec![0]);
         assert!(offsets[0].is_empty());
         assert!(offsets[1].contains(&9));
-        let (segments, offsets) = persistence.take_dirty_files();
+        assert_eq!(directories, [true; ConsumerKind::COUNT]);
+        let (segments, offsets, directories) = persistence.take_dirty_files();
         assert!(segments.is_empty());
         assert!(offsets.iter().all(BTreeSet::is_empty));
+        assert_eq!(directories, [false; ConsumerKind::COUNT]);
         let first = prepare(1, 0);
         let checkpoint_header = *first.header();
         let second = prepare(2, first.header().checksum);
@@ -1735,6 +1797,51 @@ mod tests {
         }
         assert!(persistence.needs_checkpoint());
         assert_eq!(persistence.disk_bytes.get(), 0);
+    }
+
+    #[compio::test]
+    async fn run_ahead_stops_at_the_backlog_bound_and_while_a_checkpoint_is_due() {
+        let directory = tempdir().unwrap();
+        let wal_directory = directory.path().join("prepares-7");
+        let (persistence, _) = PartitionPersistence::open(&wal_directory, 42, 7)
+            .await
+            .unwrap();
+        let record_bytes = u64::try_from(
+            journal::partition_journal::record_length(size_of::<PrepareHeader>()).unwrap(),
+        )
+        .unwrap();
+        let mut head = 0;
+        let mut parent = 0;
+        while persistence.can_run_ahead() {
+            head += 1;
+            let next = prepare(head, parent);
+            parent = next.header().checksum;
+            persistence.append(next.into_frozen(), false).unwrap();
+        }
+        assert_eq!(head, RUN_AHEAD_BYTES_MAX.div_ceil(record_bytes));
+
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.can_run_ahead());
+
+        persistence.request_checkpoint();
+        assert!(
+            !persistence.can_run_ahead(),
+            "a due checkpoint must wait for the writer to reach commit_min"
+        );
+
+        persistence.checkpoint(head);
+        let bound_ops = head;
+        for _ in 0..bound_ops {
+            head += 1;
+            let next = prepare(head, parent);
+            parent = next.header().checksum;
+            persistence.append(next.into_frozen(), false).unwrap();
+        }
+        assert!(
+            persistence.can_run_ahead(),
+            "a pending checkpoint must leave the backlog to admission"
+        );
     }
 
     /// The barrier is what groups prepares, so a barrier cheaper than the

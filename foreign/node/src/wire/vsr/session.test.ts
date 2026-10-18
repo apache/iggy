@@ -33,6 +33,7 @@ describe('ConsensusSession', () => {
     assert.throws(() => session.bind(0n), /must be > 0/);
     session.bind(42n);
     assert.equal(session.session, 42n);
+    session.bind(42n);
     assert.throws(() => session.bind(43n), /already bound/);
   });
 
@@ -61,13 +62,19 @@ describe('ConsensusSession', () => {
     );
   });
 
-  it('rearms registration with a fresh client ID', () => {
+  it('retains identity, proof and request numbering across login retries', () => {
     const session = new ConsensusSession(7n);
+    const proof = Buffer.from(session.bindSecret);
     session.beginRegister();
+    session.beginRegister();
+    assert.equal(session.clientId, 7n);
+    assert.deepEqual(session.bindSecret, proof);
     session.bind(42n);
+    assert.equal(session.nextRequestId(), 1n);
     session.beginRegister();
-    assert.equal(session.session, null);
-    assert.equal(session.currentRequestId(), 1n);
-    assert.notEqual(session.clientId, 7n);
+    assert.equal(session.session, 42n);
+    assert.equal(session.currentRequestId(), 2n);
+    assert.equal(session.clientId, 7n);
+    assert.deepEqual(session.bindSecret, proof);
   });
 });

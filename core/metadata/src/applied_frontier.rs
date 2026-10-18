@@ -21,7 +21,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -43,8 +43,8 @@ use std::time::Duration;
 /// A `std::sync::Mutex` guards the waiter list, not a `tokio` one: it is taken
 /// and dropped inside [`Self::advance`] and inside one `poll`, never across an
 /// `.await`, and it has to be `Sync` because the writer is shard 0's thread
-/// while the sleepers are on every shard. `parked` keeps [`Self::advance`] off
-/// that lock entirely in the normal case, where no read is waiting.
+/// while the sleepers are on every shard. Advancing takes the same lock as
+/// registration so a waiter cannot miss an advance before it is published.
 ///
 /// Carries the read gates' budget too: it is config-derived (see the server's
 /// `dispatch::reads`), and this cell is the one object minted before the shards
@@ -52,12 +52,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct AppliedFrontier {
     op: AtomicU64,
-    /// Waits currently registered, so an advancing commit can skip the lock.
-    /// `Release` on the way in and `Acquire` on the way out, NOT relaxed: the
-    /// count is what tells [`Self::advance`] a waiter exists at all, so if it
-    /// reads zero it must be guaranteed that no registration it has to wake
-    /// happened before it.
-    parked: AtomicUsize,
+    recovered_revision: AtomicU64,
     waiters: Mutex<Waiters>,
     read_budget: Duration,
 }
@@ -98,7 +93,7 @@ impl AppliedFrontier {
     pub const fn new(read_budget: Duration) -> Self {
         Self {
             op: AtomicU64::new(0),
-            parked: AtomicUsize::new(0),
+            recovered_revision: AtomicU64::new(0),
             waiters: Mutex::new(Waiters {
                 next_id: 0,
                 entries: Vec::new(),
@@ -120,6 +115,17 @@ impl AppliedFrontier {
         self.op.load(Ordering::Acquire)
     }
 
+    /// Highest stream revision imported from recovery or transfer. A missing
+    /// partition at or below it requires recovery rather than fresh bootstrap.
+    pub fn recovered_revision(&self) -> u64 {
+        self.recovered_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_recovery_revision(&self, revision: u64) {
+        self.recovered_revision
+            .fetch_max(revision, Ordering::Release);
+    }
+
     /// Publish `op` as applied and wake every read waiting at or below it.
     /// Monotone, so a lower value is a no-op and wakes nobody.
     ///
@@ -128,11 +134,6 @@ impl AppliedFrontier {
     /// frontier must be guaranteed to see the op's effects.
     pub fn advance(&self, op: u64) {
         if self.op.fetch_max(op, Ordering::Release) >= op {
-            return;
-        }
-        // The normal case is a commit with nobody waiting on it, and this runs
-        // on the commit path: skip the lock rather than contend it per op.
-        if self.parked.load(Ordering::Acquire) == 0 {
             return;
         }
         let woken = {
@@ -145,7 +146,6 @@ impl AppliedFrontier {
                 woken.push(waiter.waker.clone());
                 false
             });
-            self.parked.store(waiters.entries.len(), Ordering::Release);
             woken
         };
         // Woken OUTSIDE the guard: each waker's task deregisters through this
@@ -201,7 +201,6 @@ impl AppliedFrontier {
             });
             id
         };
-        self.parked.store(waiters.entries.len(), Ordering::Release);
         drop(waiters);
         Registered::Waiting(id)
     }
@@ -210,7 +209,6 @@ impl AppliedFrontier {
     fn deregister(&self, id: u64) {
         let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
         waiters.entries.retain(|waiter| waiter.id != id);
-        self.parked.store(waiters.entries.len(), Ordering::Release);
     }
 
     /// Waits currently parked. For tests: a wait that outlives its future is a
@@ -334,8 +332,7 @@ mod tests {
     }
 
     /// The commit path must not wake a reader while holding the lock that
-    /// reader needs to deregister, and it must not take that lock at all when
-    /// nothing is parked - a commit with no waiting read is the normal case.
+    /// reader needs to deregister.
     #[test]
     fn given_an_advance_when_waking_should_not_hold_the_waiter_lock() {
         let frontier = Arc::new(AppliedFrontier::default());

@@ -23,8 +23,9 @@ use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
     AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
-    IggyConsumerState as RustIggyConsumerState, IggyError, NonZeroIggyDuration, ReceivedMessage,
+    ConsumerGroupMember as RustConsumerGroupMember, ConsumerPosition as RustConsumerPosition,
+    Identifier, IggyConsumer as RustIggyConsumer, IggyConsumerState as RustIggyConsumerState,
+    IggyError, NonZeroIggyDuration, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::PyDelta;
@@ -40,7 +41,7 @@ use tokio::task::JoinHandle;
 
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
-use crate::receive_message::ReceiveMessage;
+use crate::receive_message::{ConsumerPosition, ReceiveMessage};
 
 /// A Python class representing the Iggy consumer.
 /// It provides asynchronous functionality through the contained runtime.
@@ -59,17 +60,15 @@ pub struct IggyConsumer {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyConsumer {
-    /// Get the last consumed offset for the given partition, or `None` while that partition
-    /// is untracked. Polling starts tracking a partition at `0`, so `0` also means
-    /// "seen, nothing consumed yet".
+    /// Get the last offset handed over for this partition, or `None` until a message
+    /// from the partition has been consumed.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_consumed_offset(partition_id)
     }
 
-    /// Get the last stored offset for the given partition, or `None` while that partition is
-    /// untracked. Polling starts tracking a partition at `0`, so `0` also means
-    /// "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
+    /// Get the last offset successfully stored for this partition, or `None` until
+    /// this consumer has stored one. Polling under `AutoCommit.Disabled()` leaves it unset.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_stored_offset(partition_id)
@@ -97,6 +96,14 @@ impl IggyConsumer {
 
     /// Stores the provided offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
+    /// The offset is stored under the context of the latest message consumed from the
+    /// partition. To commit a message held across a newer poll or an ownership change,
+    /// pass `message.position()` to `store_position()` instead.
+    /// Before a message is consumed from the partition, the write takes the context its
+    /// route reports. After another client deleted and created the partition again, one
+    /// such write can fail with `HistoryUnavailable` (87), or
+    /// `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
+    /// route is dropped, and the next call routes again.
     /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
@@ -114,8 +121,39 @@ impl IggyConsumer {
         })
     }
 
+    /// Stores the position of a received message, taken from `ReceiveMessage.position()`.
+    /// The write keeps the context that delivered the message, so it fails with
+    /// `HistoryUnavailable` (87) after the partition was deleted and created again, and
+    /// with `ConsumerGroupPartitionNotOwned` (5009) after its consumer group owner
+    /// changed, instead of committing the offset to the new partition.
+    /// A position that is not ahead of the last one stored under the same partition
+    /// incarnation and owner is skipped without a request, unless the consumer was
+    /// created with `allow_replay=True`. The same holds for an offset that
+    /// `store_offset()` stored before a message was consumed from the partition,
+    /// but a position at offset 0 is never skipped in that case.
+    /// Raises `RuntimeError` if the operation fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn store_position<'a>(
+        &self,
+        py: Python<'a>,
+        position: &ConsumerPosition,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let state = self.state.clone();
+        let position = RustConsumerPosition::from(*position);
+        future_into_py(py, async move {
+            state
+                .store_position(position)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+    }
+
     /// Deletes the offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
+    /// The write takes the context its route reports. After another client deleted and
+    /// created the partition again, one such write can fail with `HistoryUnavailable` (87),
+    /// or `ConsumerGroupPartitionNotOwned` (5009) for a consumer group member. The failed
+    /// route is dropped, and the next call routes again.
     /// Raises `RuntimeError` if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
@@ -139,6 +177,11 @@ impl IggyConsumer {
     /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
     /// only the interval part is applied; the `after` mode is ignored.
     /// Use `consume_messages()` if you need commit-after-processing semantics.
+    /// After another client deleted and created a partition again, or after the consumer
+    /// group moved a partition to another member, one iteration can raise `RuntimeError`
+    /// with `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a
+    /// consumer group member. The consumer drops the failed route and the position it
+    /// continued from, and the next iteration routes again.
     #[gen_stub(override_return_type(type_repr="collections.abc.AsyncIterator[ReceiveMessage]", imports=("collections.abc")))]
     fn iter_messages(&self) -> ReceiveMessageIterator {
         let inner = self.inner.clone();
@@ -147,6 +190,10 @@ impl IggyConsumer {
 
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
     /// Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+    /// After another client deleted and created a partition again, one poll can fail with
+    /// `HistoryUnavailable` (87), or `ConsumerGroupPartitionNotOwned` (5009) for a consumer
+    /// group member. The error is logged, not raised: the failed route is dropped, and the
+    /// next poll routes again.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,
@@ -385,14 +432,9 @@ impl ReceiveMessageIterator {
         future_into_py(py, async move {
             let mut inner = inner.lock().await;
             if let Some(message) = inner.next().await {
-                Ok(message
-                    .map(|m| ReceiveMessage {
-                        inner: m.message,
-                        partition_id: m.partition_id,
-                    })
-                    .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                    })?)
+                Ok(message.map(ReceiveMessage::from).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?)
             } else {
                 Err(PyStopAsyncIteration::new_err("No more messages"))
             }
@@ -413,10 +455,7 @@ impl MessageConsumer for PyCallbackConsumer {
     async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
         let callback = self.callback.clone();
         let task_locals = self.task_locals.lock().await.clone();
-        let message = ReceiveMessage {
-            inner: received.message,
-            partition_id: received.partition_id,
-        };
+        let message = ReceiveMessage::from(received);
         get_runtime()
             .spawn(scope(task_locals, async move {
                 Python::attach(|py| {

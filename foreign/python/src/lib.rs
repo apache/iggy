@@ -50,7 +50,7 @@ use producer::{
     ProducerSendError, ProducerSharding,
 };
 use pyo3::prelude::*;
-use receive_message::{PollingStrategy, ReceiveMessage};
+use receive_message::{ConsumerPosition, PartitionContext, PollingStrategy, ReceiveMessage};
 use send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
 use stats::{CacheMetrics, CacheMetricsKey, Stats};
 use stream::{Stream, StreamDetails};
@@ -66,6 +66,8 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessagesResponse>()?;
     m.add_class::<SendMessagesConfirmation>()?;
     m.add_class::<ReceiveMessage>()?;
+    m.add_class::<PartitionContext>()?;
+    m.add_class::<ConsumerPosition>()?;
     m.add_class::<IggyClient>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;
