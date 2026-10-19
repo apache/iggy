@@ -199,6 +199,27 @@ func expectIggyError(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_s
     }
 }
 
+/// ``expectIggyError(_:sourceLocation:_:)`` for a replicated request. The
+/// server refuses one with `transientNotCommitted` while it applies another
+/// test's op, and the SDK then reports every later refusal of that request the
+/// same way. Only a fresh request, a new run of `body`, gets a definite answer.
+func expectReplicatedIggyError(_ code: IggyErrorCode, sourceLocation: SourceLocation = #_sourceLocation, _ body: () async throws -> Void) async {
+    await expectIggyError(code, sourceLocation: sourceLocation) {
+        for _ in 1..<uncertainOutcomeAttempts {
+            do {
+                return try await body()
+            } catch let error as IggyError where error.code == .transientNotCommitted {
+                continue
+            }
+        }
+        try await body()
+    }
+}
+
+/// Runs of `body` in ``expectReplicatedIggyError(_:sourceLocation:_:)``. Each
+/// uncertain run waits out the request timeout.
+private let uncertainOutcomeAttempts = 3
+
 extension IggyClient {
     /// ``sendMessages(streamID:topicID:partitioning:messages:)`` for a batch
     /// the test does not read back, so the call can take a literal.

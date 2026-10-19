@@ -24,7 +24,9 @@
 //! home shard.
 
 use crate::consumer_group::maybe_rewrite_consumer_offset_request;
-use crate::dispatch::authz::{authorize_partition_op, authorize_partition_read};
+use crate::dispatch::authz::{
+    authorize_attached, authorize_partition_op, authorize_partition_read,
+};
 use crate::dispatch::failure::{
     FrameChannel, send_deny_reply, send_host_frame, send_non_replicated_bytes,
     send_non_replicated_deny, send_result_rejection,
@@ -511,7 +513,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
     consumer_client_id: u128,
-    attachment: SessionAttachment,
+    attachment: &SessionAttachment,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -647,7 +649,7 @@ async fn read_polled_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     (namespace, partition_id, consumer, args): DecodedPollRequest,
-    attachment: SessionAttachment,
+    attachment: &SessionAttachment,
     consumer_client_id: u128,
 ) -> Result<BusMessage, ReadPolledMessagesError>
 where
@@ -694,11 +696,25 @@ where
         consumer,
         args,
         attachment: ConsumerAttachment {
-            session: attachment,
+            session: attachment.clone(),
             metadata,
         },
     };
-    match shard.partition_read(namespace, read).await {
+    let reply = shard.partition_read(namespace, read).await;
+    // Auto-commit is at-most-once: denial here can discard an already committed
+    // batch. Delivery must still stop when the session or grant was revoked.
+    let users = shard.plane.metadata().mux_stm.users();
+    authorize_attached(Some(attachment), || {
+        users.authorize(|permissioner| {
+            permissioner.poll_messages(
+                attachment.user_id(),
+                namespace.stream_id(),
+                namespace.topic_id(),
+            )
+        })
+    })
+    .map_err(ReadPolledMessagesError::Rejected)?;
+    match reply {
         Some(PartitionReadReply::Poll {
             context,
             fragments,
@@ -800,6 +816,8 @@ pub(super) fn empty_poll_fallback(partition_id: u32) -> (Bytes, FrameChannel) {
 /// denies with a nonzero status instead, so an addressing typo cannot read
 /// back as a fresh consumer. A read that its owner does not answer in time, or
 /// whose owner does not hold the partition, denies with `TransientNotAccepted`.
+/// The gate runs again after the owner answers, because the session can end
+/// while the read waits.
 // TODO(hubcio): primary-gate binary offset reads when the active Rust clients
 // route GET_CONSUMER_OFFSET to the partition primary.
 #[allow(clippy::future_not_send)]
@@ -808,6 +826,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    attachment: Option<&SessionAttachment>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -829,21 +848,33 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         .await;
         return;
     };
-    if let Some(status) = authorize_partition_read(
-        shard,
-        &wire.stream_id,
-        &wire.topic_id,
-        user_id,
-        |permissioner, uid, stream_id, topic_id| {
-            permissioner.get_consumer_offset(uid, stream_id, topic_id)
-        },
-    ) {
-        send_non_replicated_deny(shard, request, transport_client_id, status).await;
+    let authorize = || {
+        authorize_attached(attachment, || {
+            authorize_partition_read(
+                shard,
+                &wire.stream_id,
+                &wire.topic_id,
+                user_id,
+                |permissioner, uid, stream_id, topic_id| {
+                    permissioner.get_consumer_offset(uid, stream_id, topic_id)
+                },
+            )
+            .map_or(Ok(()), |status| Err(IggyError::from_code(status)))
+        })
+    };
+    if let Err(error) = authorize() {
+        send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
     let body = match resolve_consumer_offset_request(shard, &wire) {
         Ok(Some((namespace, partition_id, read))) => {
-            match shard.partition_read(namespace, read).await {
+            let reply = shard.partition_read(namespace, read).await;
+            if let Err(error) = authorize() {
+                send_non_replicated_deny(shard, request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
+            match reply {
                 Some(PartitionReadReply::ConsumerOffset {
                     stored: Some(stored_offset),
                     current_offset,
@@ -2216,7 +2247,7 @@ mod tests {
             &poll,
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
-            attachment,
+            &attachment,
         )
         .await;
 
@@ -2227,7 +2258,14 @@ mod tests {
             2,
             TRUNCATED_BODY,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(
+            &shard,
+            TRANSPORT,
+            &offset,
+            Some(DEFAULT_ROOT_USER_ID),
+            Some(&attachment),
+        )
+        .await;
 
         let delete = request_message(
             Operation::DeleteSegments,
@@ -2296,7 +2334,7 @@ mod tests {
             &poll,
             Some(DEFAULT_ROOT_USER_ID),
             poll.header().client,
-            attachment,
+            &attachment,
         )
         .await;
 
@@ -2314,7 +2352,14 @@ mod tests {
             2,
             &offset_body,
         );
-        handle_get_consumer_offset(&shard, TRANSPORT, &offset, Some(DEFAULT_ROOT_USER_ID)).await;
+        handle_get_consumer_offset(
+            &shard,
+            TRANSPORT,
+            &offset,
+            Some(DEFAULT_ROOT_USER_ID),
+            Some(&attachment),
+        )
+        .await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -2500,7 +2545,7 @@ mod tests {
             &request,
             Some(DEFAULT_ROOT_USER_ID),
             request.header().client,
-            attachment,
+            &attachment,
         )
         .await;
 
@@ -2593,7 +2638,7 @@ mod tests {
                 &request,
                 Some(DEFAULT_ROOT_USER_ID),
                 VSR_CLIENT_ID,
-                attachment.clone(),
+                &attachment,
             )
             .await;
 
@@ -2682,7 +2727,7 @@ mod tests {
                 &request,
                 Some(DEFAULT_ROOT_USER_ID),
                 VSR_CLIENT_ID,
-                attachment.clone(),
+                &attachment,
             )
             .await;
 
@@ -2831,7 +2876,7 @@ mod tests {
             TRANSPORT_CLIENT_ID,
             &request,
             poll,
-            attachment,
+            &attachment,
             member,
         )
         .await
@@ -2868,12 +2913,14 @@ mod tests {
         }
         .to_bytes();
         let request = request_message(Operation::NonReplicated, 1, 1, 1, &offset_body);
+        let attachment = attach_root_session(&shard, 1, 1);
 
         handle_get_consumer_offset(
             &shard,
             TRANSPORT_CLIENT_ID,
             &request,
             Some(DEFAULT_ROOT_USER_ID),
+            Some(&attachment),
         )
         .await;
 
@@ -2931,12 +2978,14 @@ mod tests {
             }
             .to_bytes();
             let request = request_message(Operation::NonReplicated, 1, 1, 1, &offset_body);
+            let attachment = attach_root_session(&shard, 1, 1);
 
             handle_get_consumer_offset(
                 &shard,
                 TRANSPORT_CLIENT_ID,
                 &request,
                 Some(DEFAULT_ROOT_USER_ID),
+                Some(&attachment),
             )
             .await;
             owner_task.await.expect("the owner task must finish");
@@ -3509,7 +3558,7 @@ mod tests {
             transport_client_id,
             &request,
             resolved_poll,
-            attachment,
+            &attachment,
             transport_client_id,
         )
         .await

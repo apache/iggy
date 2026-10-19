@@ -491,7 +491,7 @@ async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Resp
     // primary's applied op, and this node has to record it as this caller's
     // read-your-writes floor (see `record_relayed_floor`).
     let user_id = match resolve_credential(&state, bearer).await {
-        Ok((_key, user_id, _expiry)) => user_id,
+        Ok((_key, user_id, _user_created_at, _expiry)) => user_id,
         Err(rejection) => return rejection.into_response(),
     };
     let Some(_guard) = ForwardGuard::admit(&state.forward.in_flight) else {

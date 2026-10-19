@@ -603,12 +603,13 @@ async fn should_update_permissions(harness: &TestHarness) {
             "manage_servers": true,
             "read_users": true,
         },
+        // `mcp_standard` seeds one stream with one topic, so both take id 0.
         "streams": {
-            "1": {
+            "0": {
                 "manage_stream": true,
                 "manage_topics": true,
                 "topics": {
-                    "1": {
+                    "0": {
                         "manage_topic": true,
                         "read_topic": true,
                         "poll_messages": true,

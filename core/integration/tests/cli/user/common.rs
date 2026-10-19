@@ -15,7 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::Permissions;
+use iggy::prelude::{Client, Identifier, Permissions, TopicCreateOptions};
+use std::collections::BTreeMap;
+
+/// Creates every stream and topic that `permissions` grants on, because the
+/// server refuses a grant on a missing id. Ids are handed out lowest free, so
+/// creating fills the gaps below an id until the id exists.
+pub(crate) async fn create_grant_targets(client: &dyn Client, permissions: Option<&Permissions>) {
+    let Some(streams) = permissions.and_then(|permissions| permissions.streams.as_ref()) else {
+        return;
+    };
+    for (&stream_id, stream_permissions) in streams {
+        let stream = Identifier::numeric(stream_id as u32).unwrap();
+        let mut created = 0;
+        while client.get_stream(&stream).await.unwrap().is_none() {
+            client
+                .create_stream(&format!("grant-target-{stream_id}-{created}"))
+                .await
+                .unwrap();
+            created += 1;
+        }
+        for &topic_id in stream_permissions.topics.iter().flat_map(BTreeMap::keys) {
+            let topic = Identifier::numeric(topic_id as u32).unwrap();
+            let mut created = 0;
+            while client.get_topic(&stream, &topic).await.unwrap().is_none() {
+                client
+                    .create_topic(
+                        &stream,
+                        &format!("grant-target-{topic_id}-{created}"),
+                        &TopicCreateOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                created += 1;
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PermissionsTestArgs {

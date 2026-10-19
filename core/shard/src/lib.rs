@@ -52,6 +52,7 @@ use iggy_binary_protocol::{
     RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
     RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
     StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    WireDecode,
 };
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
@@ -230,7 +231,7 @@ pub enum MetadataSubmit {
     Register {
         vsr_client_id: u128,
         user_id: u32,
-        verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+        registration: iggy_binary_protocol::requests::users::login_register::RegisterRequest,
         /// The committed bind, or the submit error verbatim. The error must
         /// survive the hop: the ownership refusal is TERMINAL, and flattening it
         /// into "no reply" makes the login look transient, which costs the
@@ -249,7 +250,7 @@ pub enum MetadataSubmit {
     ForwardedRegister {
         vsr_client_id: u128,
         user_id: u32,
-        verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+        registration: iggy_binary_protocol::requests::users::login_register::RegisterRequest,
         /// Correlation the origin minted; echoed verbatim in the result.
         nonce: u128,
         /// Replica the result frame goes back to.
@@ -378,6 +379,8 @@ pub enum PartitionRead {
     UnboundPollOnPrimary {
         consumer: PollingConsumer,
         args: PollingArgs,
+        user_id: u32,
+        user_created_at: u64,
         metadata: metadata::stm::stream::PollMetadata,
     },
     /// A read with no owner check. In production only plain consumers use it.
@@ -3458,7 +3461,11 @@ where
         let Some(body) = control_suffix_body_verified(message, header.checksum_body) else {
             return;
         };
-        let Ok(verifier) = body.try_into() else {
+        let Ok(registration) =
+            iggy_binary_protocol::requests::users::login_register::RegisterRequest::decode_from(
+                body,
+            )
+        else {
             return;
         };
         debug_assert_eq!(
@@ -3469,7 +3476,7 @@ where
             .on_metadata_submit(MetadataSubmit::ForwardedRegister {
                 vsr_client_id: header.client,
                 user_id: header.user_id,
-                verifier,
+                registration,
                 nonce: header.nonce,
                 origin_replica: header.replica,
             });

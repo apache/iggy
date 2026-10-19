@@ -19,6 +19,7 @@ import { randomBytes } from 'node:crypto';
 import { BIND_SECRET_BYTES } from './register.js';
 
 const MAX_U64 = 0xFFFF_FFFF_FFFF_FFFFn;
+const CLIENT_ID_MASK = (1n << 127n) - 1n;
 
 /**
  * Consensus-level session state, ported from `core/sdk/src/session.rs`.
@@ -100,11 +101,11 @@ export class ConsensusSession {
   }
 }
 
-/** Ephemeral random u128, non-zero (retry on the astronomically unlikely 0). */
+/** Keep the top bit clear so generated IDs cannot enter the server-only range. */
 const generateClientId = (): bigint => {
   for (;;) {
     const id = randomBytes(16).reduce(
-      (acc, byte) => (acc << 8n) | BigInt(byte), 0n);
+      (acc, byte) => (acc << 8n) | BigInt(byte), 0n) & CLIENT_ID_MASK;
     if (id !== 0n) return id;
   }
 };
