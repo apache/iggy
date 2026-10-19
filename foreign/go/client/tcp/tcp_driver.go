@@ -380,6 +380,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				continue
 			}
 			c.refreshSignIn(operation.code, operation.frame.data[vsr.HeaderSize:])
+			c.refreshMembership(operation.code, operation.frame.data[vsr.HeaderSize:])
 			return outcome.Body, nil
 		}
 		if uncertain && outcome.Committed {

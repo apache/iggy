@@ -218,6 +218,45 @@ func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 	}
 }
 
+func TestPollMessages_ResolvedLeaveDoesNotRejoinTheGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var leaveID atomic.Uint64
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(signedInUserID, 128)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(signedInUserID, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.code() == uint32(command.SyncGroupCode):
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		case read.operation() == vsr.OperationLeaveConsumerGroup:
+			if leaveID.CompareAndSwap(0, read.requestID()) {
+				cancel()
+				return nil
+			}
+			assert.Equal(t, leaveID.Load(), read.requestID(), "resolve must replay the committed leave")
+			return committedReply(read, 0)
+		default:
+			return committedReply(read, 0)
+		}
+	})
+	client := signedInClient(t, server, true)
+	streamId, topicId, consumer := groupConsumer(t)
+	require.NoError(t, client.JoinConsumerGroup(context.Background(), streamId, topicId, consumer.Id))
+	var uncertain ierror.UncertainOutcome
+	require.ErrorAs(t, client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id), &uncertain)
+	require.NoError(t, client.ResolveOperation(context.Background(), uncertain.OperationID))
+
+	_, err := pollOnce(t, client)
+	require.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound)
+	require.Equal(t, 1, len(requestsFor(server.recorded(), vsr.OperationJoinConsumerGroup)),
+		"polling after a resolved leave must not join the group again")
+}
+
 func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	member := false
