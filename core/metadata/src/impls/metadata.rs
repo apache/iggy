@@ -49,6 +49,7 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsR
 use iggy_binary_protocol::requests::system::{FinalizeSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
+use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
@@ -3018,6 +3019,51 @@ where
     #[must_use]
     pub fn is_caught_up_primary(&self) -> bool {
         self.consensus.as_ref().is_some_and(is_caught_up_primary)
+    }
+
+    /// Replicate initial root creation with a precomputed password hash.
+    ///
+    /// # Errors
+    /// Returns a submission error if this replica cannot commit the initial root user.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_root_user_in_process(
+        &self,
+        request: &CreateUserRequest,
+    ) -> Result<u32, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(MetadataSubmitError::NotCaughtUp);
+        }
+        if !self.mux_stm.users().read(|users| users.items.is_empty()) {
+            return Ok(0);
+        }
+        if consensus.pipeline_has_message_from_client(RESERVED_CLIENT_ID) {
+            return Err(MetadataSubmitError::InProgress);
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::CreateUser,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        self.dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .map(|reply| reply.header().status)
+            .map_err(|Canceled| MetadataSubmitError::Canceled)
     }
 
     /// Submit a replicated `DeletePersonalAccessToken` originated by the

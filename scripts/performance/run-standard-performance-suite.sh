@@ -234,7 +234,7 @@ for ((i = 0; i < ${#DOUBLE_SUITES[@]}; i += 2)); do
         eval "$ENV_VARS target/release/iggy-server" &>/dev/null &
     else
         echo "target/release/iggy-server"
-        target/release/iggy-server &>/dev/null &
+        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/release/iggy-server &>/dev/null &
     fi
     echo
     sleep 1

@@ -191,6 +191,10 @@ impl ServerHandle {
         self.config.extra_envs.insert(key.into(), value.into());
     }
 
+    pub fn remove_env(&mut self, key: impl Into<String>) {
+        self.config.removed_envs.push(key.into());
+    }
+
     pub fn collect_logs(&self) -> (String, String) {
         super::common::collect_logs(&self.stdout_path, &self.stderr_path)
     }
@@ -1058,6 +1062,9 @@ impl TestBinary for ServerHandle {
             command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
+        for key in &self.config.removed_envs {
+            command.env_remove(key);
+        }
         if let Some(current_dir) = &self.config.current_dir {
             command.current_dir(current_dir);
         }

@@ -48,7 +48,7 @@ services:
     environment:
       - IGGY_NODE_ADVERTISED_ADDRESS=localhost
       # Fixed, non-default root credentials: this quick-start's gateway needs a password it
-      # knows ahead of time, and iggy-server otherwise generates a random one per start.
+      # knows ahead of time, and iggy-server refuses to start without root credentials.
       # Dev-only - never reuse these outside a local compose stack.
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy-gateway-quickstart

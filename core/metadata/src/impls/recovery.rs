@@ -338,8 +338,8 @@ pub struct RecoveredMetadata<M> {
 ///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
-/// `seed_baseline` reproduces boot-time state that never reaches the WAL
-/// (today: the locally-ensured root user). It runs on the freshly-defaulted
+/// `seed_baseline` reproduces caller-supplied state outside the WAL.
+/// Production root creation is journaled. The callback runs on the freshly-defaulted
 /// state machine BEFORE journal replay and ONLY when no snapshot exists, so
 /// replayed ops land on the same baseline (and the same slab ids) they were
 /// originally applied over. A snapshot already contains that baseline.

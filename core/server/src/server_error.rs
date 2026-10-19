@@ -323,12 +323,20 @@ pub enum ServerError {
         replica_id: u8,
     },
     #[error(
-        "cluster bootstrap with empty metadata requires both {username_env} and {password_env} to be set before server can create the root user deterministically"
+        "Root credentials are required. Set both {username_env} and {password_env}, or use --with-default-root-credentials for local development only."
     )]
-    ClusterRootCredentialsRequired {
+    RootCredentialsRequired {
         username_env: &'static str,
         password_env: &'static str,
     },
+    #[error("Root initialization was rejected with status {status}")]
+    RootInitializationRejected { status: u32 },
+    #[error("Shutdown was requested before the root user was initialized")]
+    RootInitializationAborted,
+    #[error(
+        "Existing metadata has no persisted root initialization. A validated migration or restore is required before this version can start."
+    )]
+    RootBootstrapNotPersisted,
     #[error(
         "{provided_env} is set but {missing_env} is not; the root user credentials must be \
          provided as a pair"

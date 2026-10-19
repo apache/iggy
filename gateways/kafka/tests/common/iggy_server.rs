@@ -318,9 +318,8 @@ impl TestServer {
             // fixed range (matching the same harness's own fallback for an unreadable core count)
             // caps that instead.
             .env("IGGY_SHARDING_CPU_ALLOCATION", "0..4")
-            // `--with-default-root-credentials` is off by default (args.rs) - without these,
-            // a fresh server provisions no loginable root user at all, and every bridge connect
-            // attempt fails with "invalid credentials" no matter what this test passes.
+            // `--with-default-root-credentials` is off by default (args.rs), and without these
+            // the server refuses to boot. The password is the one the bridge logs in with.
             .env("IGGY_ROOT_USERNAME", "iggy")
             .env("IGGY_ROOT_PASSWORD", password);
         if let Some((cert_file, key_file)) = tls {

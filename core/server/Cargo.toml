@@ -179,6 +179,7 @@ vergen-git2 = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
+iggy = { workspace = true }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 # Reconciler unit tests assert on `ShardMetrics` snapshots and

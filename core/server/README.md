@@ -7,8 +7,10 @@ Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP 
 ## Running
 
 ```sh
-cargo run --bin iggy-server --release
+IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=... cargo run --bin iggy-server --release
 ```
+
+The leader needs `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` to create root. For local development, `--with-default-root-credentials` sets both to `iggy`. The leader records root in the metadata journal and replicates the same username and password hash to followers. Restarts recover root without these inputs. The server never generates a root password or writes either credential value to its output or log files.
 
 Missing or empty storage is initialized automatically. Existing incompatible
 storage is refused without modification. `--fresh` deletes existing data in
@@ -26,7 +28,8 @@ The image binds every listener to `0.0.0.0` so the container is reachable from o
 
 ```sh
 docker run -p 3000:3000 -p 8090:8090 \
-  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=... apache/iggy:latest
 ```
 
 Use the hostname or load balancer address clients actually dial when they are not on the same host. The Helm chart derives it from the Service DNS name.
@@ -48,6 +51,14 @@ complete partition view changes. The `IGGY-BOUND-GRANTS-2` storage gate also
 rejects older data directories without modifying them. Existing data requires a
 separately validated offline migration or restore procedure before this release
 can use it.
+
+The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` are unset. The leader refuses to initialize root without both variables or `--with-default-root-credentials` in development. Once root is persisted, restarts need neither.
+
+Releases up to 0.9 printed a generated password to stdout, and 0.9 also wrote it to the log file. Change any root password that was generated, and delete log files and container logs that still hold it. Snapshots redact that legacy log line.
+
+Older journals can lack a root-creation operation because previous servers created root only in memory. If no metadata checkpoint preserves root, this version refuses those journals before replay. Such data needs a validated migration or restore. It cannot safely assign user IDs from an empty user list.
+
+The diagnostic snapshot (`POST /snapshot`, the binary `GET_SNAPSHOT_FILE` command, `iggy snapshot`) now requires the `manage_servers` permission. `read_servers` alone is rejected, because the archive carries raw server logs and host diagnostics.
 
 All existing self-issued JWT access and refresh tokens are rejected after this
 upgrade. HTTP clients and the web UI must log in again. In

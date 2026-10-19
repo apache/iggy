@@ -19,8 +19,16 @@
 
 use crate::boot::topology::TcpTopology;
 use crate::server_error::ServerError;
-use crate::shell::ServerMuxStateMachine;
+use crate::shell::ServerShard;
 use configs::server::ServerConfig;
+use consensus::MetadataHandle;
+use futures::future::{Either, select};
+use iggy_binary_protocol::requests::users::CreateUserRequest;
+use iggy_binary_protocol::{
+    HEADER_SIZE, Operation, PrepareHeader, WireGlobalPermissions, WireName, WireOptions,
+    WirePermissions,
+};
+use iggy_common::UserStatus;
 use iggy_common::defaults::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
@@ -33,25 +41,106 @@ use message_bus::transports::tls::{
     self_signed_for_loopback,
 };
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::impls::recovery::RecoveryError;
+use metadata::impls::{METADATA_DIR, SNAPSHOT_FILE_NAME};
 use rustls::pki_types::ServerName;
 use server_common::crypto;
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 
 const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
 
-pub(in crate::boot) fn ensure_default_root_user(mux_stm: &ServerMuxStateMachine) {
-    if !mux_stm.users().read(|users| users.items.is_empty()) {
-        return;
-    }
+/// Initial root identity and password hash, resolved before shard startup.
+pub(in crate::boot) struct RootCredentials {
+    username: String,
+    password_hash: String,
+}
 
-    let (username, password_hash) = create_root_credentials();
-    mux_stm.users().ensure_root_user(&username, &password_hash);
+pub(in crate::boot) async fn initialize_root_user(
+    shard: &Rc<ServerShard>,
+    root_credentials: Option<&RootCredentials>,
+) -> Result<(), ServerError> {
+    let metadata = shard.plane.metadata();
+    let shutdown = shard.bus.token();
+    let mut waiting_logged = false;
+    loop {
+        if !metadata
+            .mux_stm
+            .users()
+            .read(|users| users.items.is_empty())
+        {
+            return Ok(());
+        }
+        if shutdown.is_triggered() {
+            return Err(ServerError::RootInitializationAborted);
+        }
+        if metadata.is_caught_up_primary() {
+            let credentials = root_credentials.ok_or(ServerError::RootCredentialsRequired {
+                username_env: IGGY_ROOT_USERNAME_ENV,
+                password_env: IGGY_ROOT_PASSWORD_ENV,
+            })?;
+            let username = WireName::new(credentials.username.clone()).map_err(|_| {
+                ServerError::RootCredentialLength {
+                    env_name: IGGY_ROOT_USERNAME_ENV,
+                    length: credentials.username.len(),
+                    min: MIN_USERNAME_LENGTH,
+                    max: MAX_USERNAME_LENGTH,
+                }
+            })?;
+            let request = CreateUserRequest {
+                username,
+                password: credentials.password_hash.clone(),
+                status: UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: true,
+                        read_servers: true,
+                        manage_users: true,
+                        read_users: true,
+                        manage_streams: true,
+                        read_streams: true,
+                        manage_topics: true,
+                        read_topics: true,
+                        poll_messages: true,
+                        send_messages: true,
+                    },
+                    streams: Vec::new(),
+                }),
+                options: WireOptions::empty(),
+            };
+            match select(
+                Box::pin(metadata.submit_root_user_in_process(&request)),
+                Box::pin(shutdown.wait()),
+            )
+            .await
+            {
+                Either::Left((Ok(0), _)) => {
+                    info!("Root user creation committed through metadata replication.");
+                    return Ok(());
+                }
+                Either::Left((Ok(status), _)) => {
+                    return Err(ServerError::RootInitializationRejected { status });
+                }
+                Either::Left((Err(_), _)) => {}
+                Either::Right(_) => {
+                    return Err(ServerError::RootInitializationAborted);
+                }
+            }
+        } else if !waiting_logged {
+            info!("Waiting for the primary to initialize the root user.");
+            waiting_logged = true;
+        }
+        compio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Apply `--with-default-root-credentials`.
@@ -91,78 +180,61 @@ pub unsafe fn apply_default_root_credentials(enabled: bool) {
     }
     warn!(
         "--with-default-root-credentials: a newly created root user will use the \
-         well-known development credentials; INSECURE outside development"
+         well-known development credentials, INSECURE outside development"
     );
 }
 
-/// Resolve the root user credentials from `IGGY_ROOT_USERNAME` /
-/// `IGGY_ROOT_PASSWORD`, falling back to the default username with a
-/// generated password.
-///
-/// Returns `(username, password_hash)`; the plaintext password never
-/// leaves this function.
-fn create_root_credentials() -> (String, String) {
-    if let Some((username, password)) = root_credentials_from_env() {
-        info!("Using the custom root user credentials.");
-        return (username, crypto::hash_password(&password));
-    }
-
-    info!("Using the default root user credentials...");
-    let password = crypto::generate_secret(20..40);
-    // Through tracing, not stdout: this is the only time the operator can read
-    // the password, so it has to reach the log file too.
-    warn!(
-        "Generated root user password: {password}. It is shown only once. To reset it, stop the server and delete the data directory, or start the server with --fresh. Both delete all stored data."
-    );
-    (
-        DEFAULT_ROOT_USERNAME.to_string(),
-        crypto::hash_password(&password),
-    )
-}
-
-/// The credentials the operator supplied, `None` when neither variable is
-/// set. A half-set pair never reaches here: [`validate_root_credentials`]
-/// rejects it at boot.
-fn root_credentials_from_env() -> Option<(String, String)> {
-    match (
-        env::var(IGGY_ROOT_USERNAME_ENV),
-        env::var(IGGY_ROOT_PASSWORD_ENV),
-    ) {
-        (Ok(username), Ok(password)) => Some((username, password)),
-        _ => None,
-    }
-}
-
-/// Reject root-credential misconfiguration before any shard thread exists.
-///
-/// Shard 0 seeds the root user from inside `recover`'s baseline closure,
-/// which cannot fail, so every operator-facing check has to run here or it
-/// would have to panic a shard thread instead.
-pub(in crate::boot) fn validate_root_credentials_env(
+/// Resolve and hash initial credentials before shard threads start.
+pub(in crate::boot) fn resolve_root_credentials(
     config: &ServerConfig,
-) -> Result<(), ServerError> {
-    // `recover` creates the metadata directory, so its absence is what tells a
-    // first cluster boot (root must come out identical on every replica, hence
-    // explicit credentials) apart from a restart that recovers the root user it
-    // already stored. `--fresh` has already wiped by this point, so a wiped
-    // replica is correctly treated as a first boot.
-    let fresh_cluster = config.cluster.enabled
-        && !Path::new(&config.path)
-            .join(metadata::impls::METADATA_DIR)
-            .exists();
+) -> Result<Option<RootCredentials>, ServerError> {
+    let metadata_path = Path::new(&config.path).join(METADATA_DIR);
+    validate_root_journal(&metadata_path)?;
+    let seed_required = !config.cluster.enabled
+        && !metadata_path.join(SNAPSHOT_FILE_NAME).exists()
+        && !metadata_path.join("journal.wal").exists();
+    let username = env::var(IGGY_ROOT_USERNAME_ENV).ok();
+    let password = env::var(IGGY_ROOT_PASSWORD_ENV).ok();
 
-    validate_root_credentials(
-        fresh_cluster,
-        env::var(IGGY_ROOT_USERNAME_ENV).ok().as_deref(),
-        env::var(IGGY_ROOT_PASSWORD_ENV).ok().as_deref(),
-    )
+    let credentials =
+        validate_root_credentials(seed_required, username.as_deref(), password.as_deref())?;
+    Ok(credentials.map(|(username, password)| RootCredentials {
+        username: username.to_owned(),
+        password_hash: crypto::hash_password(password),
+    }))
 }
 
-fn validate_root_credentials(
-    explicit_required: bool,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> Result<(), ServerError> {
+fn validate_root_journal(metadata_path: &Path) -> Result<(), ServerError> {
+    if metadata_path.join(SNAPSHOT_FILE_NAME).exists() {
+        return Ok(());
+    }
+    let mut journal = match File::open(metadata_path.join("journal.wal")) {
+        Ok(journal) => journal,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ServerError::MetadataRecovery(RecoveryError::Io(error))),
+    };
+    let mut bytes = [0u8; HEADER_SIZE];
+    match journal.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+        Err(error) => return Err(ServerError::MetadataRecovery(RecoveryError::Io(error))),
+    }
+    if let Ok(header) = bytemuck::checked::try_pod_read_unaligned::<PrepareHeader>(&bytes)
+        && (header.op != 1
+            || header.operation != Operation::CreateUser
+            || header.client != 0
+            || header.user_id != 0)
+    {
+        return Err(ServerError::RootBootstrapNotPersisted);
+    }
+    Ok(())
+}
+
+fn validate_root_credentials<'a>(
+    seed_required: bool,
+    username: Option<&'a str>,
+    password: Option<&'a str>,
+) -> Result<Option<(&'a str, &'a str)>, ServerError> {
     match (username, password) {
         (Some(username), Some(password)) => {
             validate_credential_length(
@@ -176,7 +248,8 @@ fn validate_root_credentials(
                 password,
                 MIN_PASSWORD_LENGTH,
                 MAX_PASSWORD_LENGTH,
-            )
+            )?;
+            Ok(Some((username, password)))
         }
         (Some(_), None) => Err(ServerError::RootCredentialsIncomplete {
             provided_env: IGGY_ROOT_USERNAME_ENV,
@@ -186,11 +259,11 @@ fn validate_root_credentials(
             provided_env: IGGY_ROOT_PASSWORD_ENV,
             missing_env: IGGY_ROOT_USERNAME_ENV,
         }),
-        (None, None) if explicit_required => Err(ServerError::ClusterRootCredentialsRequired {
+        (None, None) if seed_required => Err(ServerError::RootCredentialsRequired {
             username_env: IGGY_ROOT_USERNAME_ENV,
             password_env: IGGY_ROOT_PASSWORD_ENV,
         }),
-        (None, None) => Ok(()),
+        (None, None) => Ok(None),
     }
 }
 
@@ -444,48 +517,85 @@ fn warn_ignored_certificate_files(section: &str, cert_file: &str, key_file: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::Command;
 
     #[test]
-    fn fresh_cluster_bootstrap_requires_explicit_root_credentials() {
+    fn given_a_journal_without_root_creation_when_bootstrapping_should_refuse_without_modifying_it()
+    {
+        let metadata_path = tempfile::tempdir().expect("metadata directory");
+        let journal_path = metadata_path.path().join("journal.wal");
+        let header = PrepareHeader {
+            command: Command::Prepare,
+            operation: Operation::Register,
+            client: 7,
+            op: 1,
+            ..PrepareHeader::default()
+        };
+        let bytes = bytemuck::bytes_of(&header);
+        std::fs::write(&journal_path, bytes).expect("write an old root baseline journal");
+
+        assert!(matches!(
+            validate_root_journal(metadata_path.path()),
+            Err(ServerError::RootBootstrapNotPersisted)
+        ));
+        assert_eq!(
+            std::fs::read(journal_path).expect("unchanged journal"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn given_fresh_solo_metadata_and_no_root_credentials_when_validating_should_refuse_to_boot() {
         assert!(matches!(
             validate_root_credentials(true, None, None),
-            Err(ServerError::ClusterRootCredentialsRequired {
+            Err(ServerError::RootCredentialsRequired {
                 username_env: IGGY_ROOT_USERNAME_ENV,
                 password_env: IGGY_ROOT_PASSWORD_ENV,
             })
         ));
-        validate_root_credentials(true, Some("root"), Some("secret"))
-            .expect("both credentials supplied must satisfy the fresh-cluster guard");
     }
 
     #[test]
-    fn single_node_bootstrap_generates_root_credentials_when_unset() {
-        validate_root_credentials(false, None, None)
-            .expect("a single node mints its own root password");
+    fn given_fresh_solo_metadata_and_both_root_credentials_when_validating_should_return_them() {
+        let credentials = validate_root_credentials(true, Some("root"), Some("secret"))
+            .expect("both credentials satisfy root initialization");
+
+        assert_eq!(credentials, Some(("root", "secret")));
     }
 
     #[test]
-    fn half_set_root_credentials_are_rejected_in_both_directions() {
-        assert!(matches!(
-            validate_root_credentials(false, Some("root"), None),
-            Err(ServerError::RootCredentialsIncomplete {
-                provided_env: IGGY_ROOT_USERNAME_ENV,
-                missing_env: IGGY_ROOT_PASSWORD_ENV,
-            })
-        ));
-        assert!(matches!(
-            validate_root_credentials(false, None, Some("secret")),
-            Err(ServerError::RootCredentialsIncomplete {
-                provided_env: IGGY_ROOT_PASSWORD_ENV,
-                missing_env: IGGY_ROOT_USERNAME_ENV,
-            })
-        ));
+    fn given_recoverable_metadata_and_no_root_credentials_when_validating_should_boot_without_them()
+    {
+        let credentials = validate_root_credentials(false, None, None)
+            .expect("persisted metadata holds the root user");
+
+        assert_eq!(credentials, None);
     }
 
     #[test]
-    fn out_of_range_root_credentials_are_rejected() {
+    fn given_half_set_root_credentials_when_validating_should_reject_both_directions() {
+        for seed_required in [true, false] {
+            assert!(matches!(
+                validate_root_credentials(seed_required, Some("root"), None),
+                Err(ServerError::RootCredentialsIncomplete {
+                    provided_env: IGGY_ROOT_USERNAME_ENV,
+                    missing_env: IGGY_ROOT_PASSWORD_ENV,
+                })
+            ));
+            assert!(matches!(
+                validate_root_credentials(seed_required, None, Some("secret")),
+                Err(ServerError::RootCredentialsIncomplete {
+                    provided_env: IGGY_ROOT_PASSWORD_ENV,
+                    missing_env: IGGY_ROOT_USERNAME_ENV,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn given_out_of_range_root_credentials_when_validating_should_reject_them() {
         assert!(matches!(
-            validate_root_credentials(false, Some(""), Some("secret")),
+            validate_root_credentials(true, Some(""), Some("secret")),
             Err(ServerError::RootCredentialLength {
                 env_name: IGGY_ROOT_USERNAME_ENV,
                 length: 0,

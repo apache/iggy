@@ -170,15 +170,13 @@ strategy.
 
 ### Secrets
 
-Four settings have to carry the byte-identical value on every node, so they
-belong in one Secret that all releases reference rather than in each release's
-values. Create it in the release namespace before the first install:
+Use one Secret for initial root credentials and the shared cluster keys. Set `IGGY_ROOT_PASSWORD` to the chosen root password. The chart requires explicit root credentials because its pinned image predates journaled root initialization. Create the Secret in the release namespace before the first install:
 
 ```bash
 JWT="$(head -c 32 /dev/urandom | base64)"
 kubectl create secret generic iggy-cluster-secrets \
   --from-literal=username=iggy \
-  --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
+  --from-literal=password="${IGGY_ROOT_PASSWORD:?set IGGY_ROOT_PASSWORD}" \
   --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
   --from-literal=jwtEncodingSecret="$JWT" \
   --from-literal=jwtDecodingSecret="$JWT" \
@@ -193,10 +191,7 @@ an inline value, which the chart turns into a Secret of its own:
 and a poor fit for a cluster, since the value then lives in every release's
 stored values.
 
-* **`server.users.root`** seeds the root user. Every node creates it locally
-  from its own `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD`, so a password that
-  differs on one release logs in on that node only, and a first cluster boot
-  refuses to start without both.
+* **`server.users.root`** supplies credentials for initial root creation. The first leader journals and replicates its username and password hash. Followers use that account, even if their local variables differ or are absent. Restarts recover the stored account. The leader needs both `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` when root does not yet exist. Use the same initial Secret on nodes that can become the first leader so the initial credentials do not depend on startup order.
 * **`server.cluster.auth`** makes every replica connection complete an
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
