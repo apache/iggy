@@ -562,6 +562,69 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    @Test func anUnprovenNamespaceDenialAfterALostWriteStaysUnknown() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let once = Locked(true)
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .deleteStream {
+                return once.exchange(false) ? .close : .status(IggyErrorCode.streamIdNotFound.rawValue)
+            }
+            return .ok([])
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+
+        let attempts = await server.requests.filter { $0.operation == .deleteStream }
+        #expect(attempts.count > 1)
+        #expect(Set(attempts.map(\.requestID)).count == 1)
+        await client.shutdown()
+    }
+
+    @Test func aCommittedRejectionAfterALostWriteProvesItsOutcome() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let once = Locked(true)
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .deleteStream {
+                return once.exchange(false) ? .close : .committedRejection(IggyErrorCode.streamIdNotFound.rawValue)
+            }
+            return .ok([])
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+
+        await expectCode(.streamIdNotFound) { try await client.deleteStream(1) }
+
+        #expect(await server.requests.filter { $0.operation == .deleteStream }.count == 2)
+        await client.shutdown()
+    }
+
+    @Test func anUncommittedSuccessAfterALostWriteStaysUnknown() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let once = Locked(true)
+        await server.respond { request in
+            if let reply = FakeVSRServer.sessionReply(request) { return reply }
+            if request.operation == .deleteStream {
+                return once.exchange(false) ? .close : .uncommitted([])
+            }
+            return .ok([])
+        }
+        let client = makeClient(server, requestTimeout: .seconds(1))
+        try await client.connect()
+
+        await expectCode(.transientNotCommitted) { try await client.deleteStream(1) }
+
+        let attempts = await server.requests.filter { $0.operation == .deleteStream }
+        #expect(Set(attempts.map(\.requestID)).count == 1)
+        await client.shutdown()
+    }
+
     /// A reconnect that fails after the request was written leaves its
     /// outcome unknown; the reconnect's own error must not hide that.
     @Test func aFailedReconnectKeepsTheUnknownOutcome() async throws {

@@ -44,6 +44,7 @@ final class FakeVSRServer: @unchecked Sendable {
         /// Status zero with this body; result-framed operations get the
         /// empty result section prepended.
         case ok([UInt8])
+        case uncommitted([UInt8])
         /// `ok` from a metadata operation that committed at `commit`.
         case committed([UInt8], commit: UInt64)
         /// A pre-commit denial: the status in the header, no body.
@@ -204,7 +205,9 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
-    static func encodeReply(request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8], commit: UInt64 = 0) -> [UInt8] {
+    static func encodeReply(
+        request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8], commit: UInt64 = 0, committed: Bool = true
+    ) -> [UInt8] {
         var frame = [UInt8](repeating: 0, count: VSRFrame.headerSize)
         frame.withUnsafeMutableBytes { buffer in
             buffer.storeBytes(of: UInt32(VSRFrame.headerSize + body.count).littleEndian, toByteOffset: VSRFrame.ReplyOffset.size, as: UInt32.self)
@@ -212,6 +215,9 @@ final class FakeVSRServer: @unchecked Sendable {
             buffer.storeBytes(of: commit.littleEndian, toByteOffset: VSRFrame.ReplyOffset.commit, as: UInt64.self)
             buffer.storeBytes(of: request.requestID.littleEndian, toByteOffset: VSRFrame.ReplyOffset.request, as: UInt64.self)
             buffer[VSRFrame.ReplyOffset.operation] = operation.rawValue
+            if committed && status == 0 && (operation.isMetadata || operation.isPartition) {
+                buffer[VSRFrame.ReplyOffset.committedResult] = 1
+            }
             buffer.storeBytes(of: status.littleEndian, toByteOffset: VSRFrame.ReplyOffset.status, as: UInt32.self)
         }
         return frame + body
@@ -376,6 +382,8 @@ final class FakeServerHandler: ChannelInboundHandler {
             switch reply {
             case .ok(let body):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
+            case .uncommitted(let body):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), committed: false))
             case .committed(let body, let commit):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), commit: commit))
             case .status(let status):
