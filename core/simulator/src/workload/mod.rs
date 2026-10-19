@@ -753,6 +753,15 @@ impl Workload {
                 return Vec::new();
             }
 
+            if !header.has_committed_result()
+                && code == IggyError::PersonalAccessTokensLimitReached(0, 0).as_code()
+            {
+                self.auditor.note_denial(entry.action, code);
+                self.finish_fixture_request(header.client, &entry, refusal);
+                self.release_outstanding(key);
+                return Vec::new();
+            }
+
             // The state machine only commits codes its own result enum declares,
             // so an unrecognized one is a server bug (a race still yields a
             // declared code). Classify never guesses.
@@ -2299,6 +2308,24 @@ mod tests {
                 "all copies must resolve through the original request identity"
             );
         }
+    }
+
+    #[test]
+    fn given_a_token_limit_admission_reply_when_received_should_record_a_denial() {
+        let (_, mut workload, request) = sample_only(Action::CreatePersonalAccessToken, Vec::new());
+        let error = IggyError::PersonalAccessTokensLimitReached(1, 1);
+        let body = ApplyReply::err(error.as_code()).to_reply_body();
+
+        assert!(workload.on_reply(&reply_to(&request, 0, &body)).is_empty());
+
+        assert_eq!(workload.total_in_flight(), 0);
+        assert_eq!(
+            workload
+                .auditor
+                .stats()
+                .commits(Action::CreatePersonalAccessToken),
+            0
+        );
     }
 
     #[test]
