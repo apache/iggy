@@ -789,6 +789,11 @@ public class AsyncTcpConnection {
             completeWithResponse(callerFuture, response);
             return;
         }
+        Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+        if (commandCode == CommandCode.System.PING.getValue() && cause instanceof IggyTimeoutException) {
+            channel.close();
+            notifyConnectionFailure(new IggyConnectionException("The heartbeat reply timed out", cause));
+        }
         completeFailedRequest(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, failoverState, error);
     }
 

@@ -416,6 +416,54 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         }
     }
 
+    @Test
+    void shouldFailOverWhenTheCoordinatorStopsReplyingWithoutClosingItsSocket() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger leaderPort = new AtomicInteger(primaryPort);
+            AtomicInteger survivorPings = new AtomicInteger();
+            RequestHandler handler = request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, leaderPort.get()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            };
+            MockNode primary = MockNode.serve(primarySocket, handler);
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(PING_CODE, OPERATION_NON_REPLICATED)) {
+                    survivorPings.incrementAndGet();
+                }
+                return handler.handle(request);
+            });
+            AsyncIggyTcpClient client = limitedClient(primaryPort);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                leaderPort.set(survivorPort);
+                primary.silent = true;
+                int pingsBeforeFailure = survivorPings.get();
+
+                AsyncIggyTcpClientEventLoopGroupTest.await(
+                        () -> client.getConnectionInfo().port() == survivorPort
+                                && survivorPings.get() > pingsBeforeFailure,
+                        "automatic recovery from an open but silent coordinator",
+                        RECOVERY);
+                client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                primary.close();
+                survivor.close();
+            }
+        }
+    }
+
     /**
      * A retry budget bounds one redial burst, not the life of the client. After
      * an outage that outlasted many bursts, the heartbeat brings the link back
@@ -1206,6 +1254,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         private final List<Socket> accepted = new CopyOnWriteArrayList<>();
         private volatile boolean killed;
         private volatile boolean down;
+        private volatile boolean silent;
         private volatile boolean rejectBindings;
         private final AtomicInteger bindings = new AtomicInteger();
         private final AtomicInteger dials = new AtomicInteger();
@@ -1247,6 +1296,9 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 OutputStream output = socket.getOutputStream();
                 Request request;
                 while (!killed && (request = AsyncIggyTcpClientTransientFailoverTest.readRequest(input, 0)) != null) {
+                    if (silent) {
+                        continue;
+                    }
                     Response response;
                     if (request.is(
                             AsyncIggyTcpClientTransientFailoverTest.BIND_SESSION_CODE, OPERATION_NON_REPLICATED)) {
