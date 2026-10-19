@@ -212,6 +212,73 @@ class AsyncTcpConnectionConcurrencyTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReplayWaitingResolveAfterThePreviousReplayTimesOutOrIsCancelled(boolean cancel) throws Exception {
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> replayReceived = new CompletableFuture<>();
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(5));
+                    InputStream input = socket.getInputStream();
+                    OutputStream output = socket.getOutputStream();
+                    writeResponse(output, readRequest(input), registerBody());
+                    Request original = readRequest(input);
+                    Request replay = readRequest(input);
+                    assertThat(replay.requestId()).isEqualTo(original.requestId());
+                    assertThat(replay.header()).containsExactly(original.header());
+                    replayReceived.complete(null);
+                    Request waitingReplay = readRequest(input);
+                    assertThat(waitingReplay.requestId()).isEqualTo(original.requestId());
+                    assertThat(waitingReplay.header()).containsExactly(original.header());
+                    writeResponse(output, waitingReplay, new byte[0]);
+                } catch (IOException error) {
+                    replayReceived.completeExceptionally(error);
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 50);
+            PollRouter router = new PollRouter(() -> connection, endpoint -> {
+                throw new IllegalStateException("A direct replay opens no partition link");
+            });
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var state = new AsyncTcpConnection.TransientFailoverState();
+                var original = connection.send(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(),
+                        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300),
+                        state);
+                assertThatThrownBy(() -> original.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class);
+                long operation = state.ticket().operationId();
+                var replay = router.resolve(operation, cancel ? Duration.ofSeconds(5) : Duration.ofSeconds(1));
+                replayReceived.get(5, TimeUnit.SECONDS);
+                var waiting = router.resolve(operation, Duration.ofSeconds(5));
+                assertThat(waiting).isNotDone();
+
+                if (cancel) {
+                    assertThat(replay.cancel(false)).isTrue();
+                } else {
+                    assertThatThrownBy(() -> replay.get(5, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(IggyOperationException.class);
+                }
+
+                waiting.get(5, TimeUnit.SECONDS).release();
+                router.resolve(operation, Duration.ofSeconds(1))
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                server.get(5, TimeUnit.SECONDS);
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
     @Test
     void shouldReleaseTheFrameAliasWhenTheRequestIdCannotBeRenewed() throws Exception {
         try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {

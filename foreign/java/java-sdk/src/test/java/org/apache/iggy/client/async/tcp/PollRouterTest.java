@@ -267,6 +267,36 @@ class PollRouterTest {
     }
 
     @Test
+    void shouldKeepTheNextResolverClaimWhenPreviousCompletionReentersRetention() throws Exception {
+        IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        ManualTimers timers = new ManualTimers();
+        Coordinator coordinator = new Coordinator(group, timers);
+        var owner = coordinator.sessionOwner();
+        try {
+            var ticket = retainOffset(coordinator);
+            long deadline = System.nanoTime() + NEVER.toNanos();
+            owner.resume(OPERATION_ID, deadline, timers).join();
+            var previous = new AsyncTcpConnection.TransientFailoverState();
+            previous.restore(ticket);
+            var waiting = owner.resume(OPERATION_ID, deadline, timers);
+            var completed = waiting.thenRun(previous::retainTicket);
+
+            previous.retainTicket();
+            completed.get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+
+            var later = owner.resume(OPERATION_ID, deadline, timers);
+            assertThat(later).isNotDone();
+            ticket.recordOutcome(Unpooled.EMPTY_BUFFER, null);
+            ticket.complete();
+            assertThat(owner.provedOutcome(OPERATION_ID)).isEmpty();
+        } finally {
+            owner.reset();
+            timers.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void shouldReleaseResolverBytesAfterQueueRejectionAndAbandon() throws Exception {
         IoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         ManualTimers timers = new ManualTimers();

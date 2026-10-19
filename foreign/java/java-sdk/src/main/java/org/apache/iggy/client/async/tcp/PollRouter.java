@@ -375,7 +375,7 @@ final class PollRouter {
                 replayed.whenComplete((response, error) -> {
                     ticket.finishWrite();
                     if (error != null) {
-                        ticket.retain();
+                        state.retainTicket(ticket);
                     }
                 });
             } else {
@@ -1212,7 +1212,7 @@ final class PollRouter {
                         && (state.wasUncertain()
                                 || unwrap(error) instanceof IggyOperationException operationError
                                         && operationError.getErrorCode() == IggyErrorCode.OPERATION_UNCERTAIN)) {
-                    state.ticket().retain();
+                    state.retainTicket();
                 } else {
                     state.ticket().complete();
                 }
@@ -1222,14 +1222,14 @@ final class PollRouter {
         private void fail(Throwable error) {
             result.completeExceptionally(
                     state.ticket() != null && state.wasUncertain() && !state.committed()
-                            ? state.ticket().retain()
+                            ? state.retainTicket()
                             : unwrap(error));
         }
 
         private synchronized void expire() {
             fail(
                     state.ticket() != null && dataSent && !retryingRefusal && lifecycleRefusal == null
-                            ? state.ticket().retain()
+                            ? state.retainTicket()
                             : lifecycleRefusal != null
                                     ? lifecycleRefusal
                                     : retryingRefusal || !dataSent ? notAccepted() : uncommitted());

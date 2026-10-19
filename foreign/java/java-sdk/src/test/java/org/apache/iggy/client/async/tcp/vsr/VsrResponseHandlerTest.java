@@ -27,6 +27,8 @@ import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
@@ -297,6 +299,52 @@ class VsrResponseHandlerTest {
         ByteBuf response = other.join();
         assertThat(response.readByte()).isEqualTo((byte) 42);
         response.release();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldRegisterReplayFromTimeoutOrCancellationCallback(boolean cancel) {
+        long requestId = 7;
+        CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
+        ByteBuf request = requestFrame(VsrOperation.SEND_MESSAGES, requestId);
+        handler.registerRequest(channel, request, attempt, System.nanoTime(), SEND_MESSAGES_CODE);
+        request.release();
+        var replay = attempt.handle((response, error) -> enqueue(VsrOperation.SEND_MESSAGES, requestId))
+                .thenCompose(future -> future);
+
+        if (cancel) {
+            attempt.cancel(false);
+        } else {
+            channel.runScheduledPendingTasks();
+        }
+        assertThat(replay).isNotDone();
+        channel.writeInbound(replyFrame(
+                VsrOperation.SEND_MESSAGES, requestId, Unpooled.buffer().writeByte(42)));
+
+        ByteBuf response = replay.join();
+        try {
+            assertThat(response.readByte()).isEqualTo((byte) 42);
+        } finally {
+            response.release();
+        }
+        assertThat(channel.isActive()).isTrue();
+    }
+
+    @Test
+    void shouldRejectDuplicateRegistrationWhileTheRequestIsPending() {
+        long requestId = 7;
+        var original = enqueue(VsrOperation.SEND_MESSAGES, requestId);
+        ByteBuf duplicate = requestFrame(VsrOperation.SEND_MESSAGES, requestId);
+        try {
+            assertThatThrownBy(() -> handler.registerRequest(
+                            channel, duplicate, new CompletableFuture<>(), System.nanoTime(), SEND_MESSAGES_CODE))
+                    .isInstanceOf(IllegalStateException.class);
+        } finally {
+            duplicate.release();
+        }
+
+        channel.writeInbound(replyFrame(VsrOperation.SEND_MESSAGES, requestId, Unpooled.EMPTY_BUFFER));
+        original.join().release();
     }
 
     @Test

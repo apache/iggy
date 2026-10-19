@@ -58,8 +58,10 @@ import org.apache.iggy.client.async.tcp.vsr.VsrResponseHandler;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyEmptyResponseException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
@@ -559,7 +561,7 @@ public class AsyncTcpConnection {
         var acquisitionTimeout = eventLoop.schedule(
                 () -> {
                     Throwable failure = failoverState.ticket != null && failoverState.uncertain
-                            ? failoverState.ticket.retain()
+                            ? failoverState.retainTicket()
                             : responseTimeout(commandCode);
                     callerFuture.completeExceptionally(failure);
                     acquiring.cancel(false);
@@ -817,7 +819,7 @@ public class AsyncTcpConnection {
         releaseIfPresent(failoverPayload);
         if (failoverState.ticket != null) {
             if (failoverState.uncertain || callerFuture.isCancelled()) {
-                error = failoverState.ticket.retain();
+                error = failoverState.retainTicket();
             } else {
                 failoverState.ticket.complete();
                 failoverState.ticket = null;
@@ -1272,7 +1274,9 @@ public class AsyncTcpConnection {
         ConsensusSession.Ticket ticket = exchange.failoverState().ticket;
         if (ticket != null && nextUncertain) {
             releaseIfPresent(response);
-            exchange.responseFuture().completeExceptionally(error != null ? error : ticket.retain());
+            exchange.responseFuture()
+                    .completeExceptionally(
+                            error != null ? error : exchange.failoverState().retainTicket());
         } else {
             // Recorded while the reply is alive: a routed replay completes its ticket after the callbacks of its
             // caller, which release the reply.
@@ -1810,6 +1814,7 @@ public class AsyncTcpConnection {
         private boolean everUncertain;
         private ConsensusSession.LaneKey lane;
         private ConsensusSession.Ticket ticket;
+        private RuntimeException retainedError;
         private byte[] routingBody;
         private final Set<ConnectionInfo> visitedTargets = new HashSet<>();
 
@@ -1830,6 +1835,25 @@ public class AsyncTcpConnection {
 
         ConsensusSession.Ticket ticket() {
             return ticket;
+        }
+
+        RuntimeException retainTicket() {
+            return retainTicket(ticket);
+        }
+
+        RuntimeException retainTicket(ConsensusSession.Ticket retained) {
+            synchronized (this) {
+                if (retainedError != null) {
+                    return retainedError;
+                }
+                // Retaining wakes resolvers inline, so publish the guard before invoking callbacks without this lock.
+                retainedError = new IggyOperationException(IggyErrorCode.OPERATION_UNCERTAIN, retained.operationId());
+            }
+            RuntimeException error = retained.retain();
+            synchronized (this) {
+                retainedError = error;
+            }
+            return error;
         }
 
         boolean wasUncertain() {

@@ -96,10 +96,14 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     private void registerRequest(PendingRequest pending) {
-        if (pendingRequests.putIfAbsent(pending.requestId, pending) != null) {
-            throw new IllegalStateException(
-                    "A request is already pending for request id " + Long.toUnsignedString(pending.requestId));
-        }
+        pendingRequests.compute(pending.requestId, (requestId, previous) -> {
+            if (previous != null && !previous.future.isDone()) {
+                throw new IllegalStateException(
+                        "A request is already pending for request id " + Long.toUnsignedString(requestId));
+            }
+            // Timeout and cancellation callbacks can replay before the previous entry's cleanup runs.
+            return pending;
+        });
         pending.future.whenComplete((response, error) -> pendingRequests.remove(pending.requestId, pending));
     }
 
