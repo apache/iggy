@@ -281,22 +281,36 @@ impl IggyBridge {
         mut write: impl FnMut() -> F,
     ) -> Result<T, BridgeError> {
         let deadline = (Instant::now() + REQUEST_TIMEOUT).into_std();
-        with_request_timeout(async {
-            loop {
-                let operation = match write().await {
-                    Err(IggyError::LaneBlocked(operation)) => operation,
-                    result => return result,
-                };
-                // A proved rejection belongs to the earlier call and releases its lane too.
-                if let Err(
-                    error @ (IggyError::OperationUncertain(_) | IggyError::OperationNotRetained(_)),
-                ) = self.client.resolve_operation(operation, deadline).await
-                {
-                    return Err(error);
-                }
+        with_request_timeout(write_with_recovery(&self.client, deadline, &mut write)).await
+    }
+}
+
+async fn write_with_recovery<T, F: Future<Output = Result<T, IggyError>>>(
+    client: &IggyClient,
+    deadline: std::time::Instant,
+    mut write: impl FnMut() -> F,
+) -> Result<T, IggyError> {
+    loop {
+        match write().await {
+            Err(IggyError::LaneBlocked(operation)) => {
+                resolve_blocker(client, operation, deadline).await?;
             }
-        })
-        .await
+            result => return result,
+        }
+    }
+}
+
+async fn resolve_blocker(
+    client: &IggyClient,
+    operation: u64,
+    deadline: std::time::Instant,
+) -> Result<(), IggyError> {
+    match client.resolve_operation(operation, deadline).await {
+        Err(error @ (IggyError::OperationUncertain(_) | IggyError::OperationNotRetained(_))) => {
+            Err(error)
+        }
+        // A proved rejection belongs to the earlier call and releases its lane too.
+        _ => Ok(()),
     }
 }
 

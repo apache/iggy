@@ -21,6 +21,7 @@
 //! module invoked from a real (non-unit) test rather than only compiled.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::{
@@ -32,11 +33,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
-    ProduceSessionLimits, TopicCreationOutcome, TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, OffsetCalls,
+    ProduceSessionLimits, Producer, TopicCreationOutcome, TopicMapping, TopicOverride,
 };
+use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
 
 #[path = "common/certs.rs"]
 mod certs;
@@ -48,9 +51,10 @@ use iggy_server::{PortGuard, TestServer, raw_client};
 
 #[tokio::test]
 #[serial]
-async fn given_a_timed_out_metadata_write_when_creating_another_topic_should_resolve_the_blocker() {
+async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lanes() {
     const RELAY_BUFFER_SIZE: usize = 8192;
     const RECOVERY_CANCEL_DELAY: Duration = Duration::from_millis(100);
+    const CALL_DEADLINE: Duration = Duration::from_secs(60);
 
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
@@ -109,6 +113,17 @@ async fn given_a_timed_out_metadata_write_when_creating_another_topic_should_res
             .is_err(),
             "recovery must wait for proof while replies are withheld"
         );
+        if delayed == "delayed" {
+            let recovery = bridge
+                .create_kafka_topic("blocked_deadline", 1)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                recovery.to_kafka_error_code(),
+                ERROR_REQUEST_TIMED_OUT,
+                "{recovery:?}"
+            );
+        }
         replies.send(true).expect("resume replies");
         assert_eq!(
             bridge
@@ -124,7 +139,7 @@ async fn given_a_timed_out_metadata_write_when_creating_another_topic_should_res
                 .expect("next topic")
                 .is_some()
         );
-        for unsent in [delayed, "blocked"] {
+        for unsent in [delayed, "blocked", "blocked_deadline"] {
             assert!(
                 bridge
                     .get_kafka_topic(unsent)
@@ -134,6 +149,77 @@ async fn given_a_timed_out_metadata_write_when_creating_another_topic_should_res
             );
         }
     }
+
+    let target = bridge.topic_target("next").expect("topic target");
+    for (payload, hold) in [("warm", false), ("uncertain", true), ("recovered", false)] {
+        let deadline = Instant::now() + CALL_DEADLINE;
+        let (result, returned) = {
+            let turn = bridge
+                .produce_turn(Producer::Connection(1), deadline)
+                .await
+                .expect("produce turn");
+            replies.send(!hold).expect("reply gate");
+            bridge
+                .send_records(
+                    turn,
+                    (),
+                    &target,
+                    0,
+                    vec![IggyMessage::from_str(payload).expect("message")],
+                    deadline,
+                )
+                .await
+        };
+        assert!(
+            returned.is_some(),
+            "the retained operation must keep its client"
+        );
+        drop(returned);
+        if hold {
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::Iggy(IggyError::OperationUncertain(_)))
+                ),
+                "{result:?}"
+            );
+        } else {
+            result.expect("produce recovers the prior retained send");
+        }
+    }
+    for (offset, hold) in [(0, false), (1, true), (2, false)] {
+        replies.send(!hold).expect("reply gate");
+        let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
+        let result = bridge
+            .commit_group_offsets("recovery", &[(&target, 0, offset)], &calls)
+            .await
+            .remove(0);
+        if hold {
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::Iggy(IggyError::OperationUncertain(_)))
+                ),
+                "{result:?}"
+            );
+        } else {
+            result.expect("offset commit recovers the prior retained store");
+        }
+    }
+    let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
+    let stored = bridge
+        .fetch_group_offsets("recovery", &[(&target, 0)], &calls)
+        .await;
+    assert!(matches!(stored.as_slice(), [Ok(Some(2))]), "{stored:?}");
+    let topic = raw
+        .get_topic(&stream, &Identifier::named("next").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        topic.messages_count, 3,
+        "recovery must not duplicate the retained send"
+    );
     bridge.close().await.expect("close bridge");
 }
 
