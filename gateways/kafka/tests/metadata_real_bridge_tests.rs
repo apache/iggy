@@ -23,16 +23,21 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
+use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
 use iggy_gateway_kafka::bridge::{IggyBridge, TopicMapping, TopicOverride};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
+use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    ConnectionState, ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    ConnectionState, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_TOPIC_AUTHORIZATION_FAILED,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
+use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::protocol::handlers::metadata;
 
 #[path = "common/codec.rs"]
@@ -49,6 +54,11 @@ const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 /// Builds a v9 flexible `Metadata` request. `topics: None` means "all topics" (the null-array
 /// sentinel); `Some(names)` requests exactly those topics.
 fn build_request(topics: Option<&[&str]>) -> Bytes {
+    build_request_allowing(topics, false)
+}
+
+/// [`build_request`] with `allow_auto_topic_creation` set as given.
+fn build_request_allowing(topics: Option<&[&str]>, allow_auto_topic_creation: bool) -> Bytes {
     let mut enc = Encoder::with_capacity(128);
     match topics {
         None => enc.write_varint(0), // null compact array: all topics
@@ -60,7 +70,7 @@ fn build_request(topics: Option<&[&str]>) -> Bytes {
             }
         }
     }
-    enc.write_bool(false); // allow_auto_topic_creation
+    enc.write_bool(allow_auto_topic_creation);
     enc.write_bool(false); // include_cluster_authorized_operations
     enc.write_bool(false); // include_topic_authorized_operations
     enc.write_empty_tagged_fields(); // top-level tagged fields
@@ -145,7 +155,14 @@ fn expected_partitions(count: u32) -> Vec<PartitionEntry> {
 
 async fn send(state: &GatewayState, topics: Option<&[&str]>) -> Vec<TopicEntry> {
     let body = build_request(topics);
-    let outcome = metadata::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+    let outcome = metadata::handle(
+        state,
+        &ConnectionState::default(),
+        None,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
     let resp_body = outcome.expect_response("Metadata request always answers");
     decode_topics(resp_body)
 }
@@ -323,6 +340,7 @@ async fn a_response_projected_over_max_frame_size_closes_instead_of_answering() 
     let outcome = metadata::handle(
         &tiny_state,
         &ConnectionState::default(),
+        None,
         REQUEST_VERSION,
         body,
     )
@@ -422,5 +440,284 @@ async fn a_named_lookup_of_more_than_the_old_topic_cap_resolves_every_name() {
     // rejected as a batch.
     for (_, error_code, _) in &topics {
         assert_eq!(*error_code, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+}
+
+const AUTO_CREATED_PARTITIONS: u32 = 3;
+
+/// How long a test waits for a background creation to land before giving up.
+const AUTO_CREATE_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a test waits before concluding nothing was created. A creation the gateway did start
+/// lands in milliseconds against a local server.
+const NO_CREATE_WAIT: Duration = Duration::from_millis(500);
+
+fn auto_creating(state: GatewayState) -> GatewayState {
+    state
+        .with_auto_topic_creation(AutoTopicCreationConfig {
+            enabled: true,
+            partitions: AUTO_CREATED_PARTITIONS,
+        })
+        .expect("a valid partition count")
+}
+
+async fn send_as(
+    state: &GatewayState,
+    principal: Option<&AuthenticatedPrincipal>,
+    names: &[&str],
+    allow_auto_topic_creation: bool,
+) -> Vec<TopicEntry> {
+    let body = build_request_allowing(Some(names), allow_auto_topic_creation);
+    let outcome = metadata::handle(
+        state,
+        &ConnectionState::default(),
+        principal,
+        REQUEST_VERSION,
+        body,
+    )
+    .await;
+    decode_topics(outcome.expect_response("Metadata request always answers"))
+}
+
+async fn exists(seed: &IggyBridge, name: &str) -> bool {
+    seed.get_kafka_topic(name)
+        .await
+        .expect("topic lookup")
+        .is_some()
+}
+
+fn principal(manage_topics: bool) -> AuthenticatedPrincipal {
+    principal_reading(manage_topics, true)
+}
+
+fn principal_reading(manage_topics: bool, permissions_known: bool) -> AuthenticatedPrincipal {
+    AuthenticatedPrincipal {
+        username: "alice".to_string(),
+        permissions: PrincipalPermissions {
+            manage_topics,
+            ..PrincipalPermissions::default()
+        },
+        permissions_known,
+    }
+}
+
+/// Kafka's own sequence: the first lookup answers `UNKNOWN_TOPIC_OR_PARTITION` while the topic is
+/// being created, and a later refresh finds it with the configured partition count.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_a_lookup_allows_it_should_create_the_missing_topic() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, _seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let first = send_as(&state, None, &["orders"], true).await;
+    assert_eq!(
+        first,
+        vec![(
+            Some("orders".to_string()),
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            Vec::new()
+        )]
+    );
+
+    let deadline = tokio::time::Instant::now() + AUTO_CREATE_WAIT;
+    loop {
+        let topics = send_as(&state, None, &["orders"], true).await;
+        if topics[0].1 == ERROR_NONE {
+            assert_eq!(topics[0].2, expected_partitions(AUTO_CREATED_PARTITIONS));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the topic was not created in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_lookup_does_not_allow_it_should_not_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let topics = send_as(&state, None, &["orders"], false).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    tokio::time::sleep(NO_CREATE_WAIT).await;
+    assert!(!exists(&seed, "orders").await);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_off_when_a_lookup_allows_it_should_not_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+
+    let topics = send_as(&state, None, &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    tokio::time::sleep(NO_CREATE_WAIT).await;
+    assert!(!exists(&seed, "orders").await);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_name_is_invalid_should_answer_invalid_topic() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, _seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let topics = send_as(&state, None, &["has a space"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_INVALID_TOPIC_EXCEPTION);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_principal_lacks_manage_topics_should_refuse_and_not_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let topics = send_as(&state, Some(&principal(false)), &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_TOPIC_AUTHORIZATION_FAILED);
+    tokio::time::sleep(NO_CREATE_WAIT).await;
+    assert!(!exists(&seed, "orders").await);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_principal_holds_manage_topics_should_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let topics = send_as(&state, Some(&principal(true)), &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    let deadline = tokio::time::Instant::now() + AUTO_CREATE_WAIT;
+    while !exists(&seed, "orders").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the topic was not created in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// An existing topic in the same request is answered as usual, and only the missing one is
+/// created.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_one_of_two_topics_exists_should_answer_it_and_create_the_other() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+    seed.ensure_stream_and_topic("payments", 2)
+        .await
+        .expect("seed the topic");
+
+    let topics = send_as(&state, None, &["payments", "orders"], true).await;
+
+    assert_eq!(
+        topics[0],
+        (
+            Some("payments".to_string()),
+            ERROR_NONE,
+            expected_partitions(2)
+        )
+    );
+    assert_eq!(topics[1].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    let deadline = tokio::time::Instant::now() + AUTO_CREATE_WAIT;
+    while !exists(&seed, "orders").await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the topic was not created in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A permission set that was never read may not create, even when its fallback says
+/// `manage_topics`. Answered as unknown, not refused, so the client keeps refreshing.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_principals_permissions_were_never_read_should_answer_unknown_and_not_create()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let unread = principal_reading(true, false);
+    let topics = send_as(&state, Some(&unread), &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    tokio::time::sleep(NO_CREATE_WAIT).await;
+    assert!(!exists(&seed, "orders").await);
+}
+
+/// A connection that proved no identity on a gateway that names principals holds nothing.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_connection_is_anonymous_should_refuse() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let anonymous = AuthenticatedPrincipal::anonymous();
+    let topics = send_as(&state, Some(&anonymous), &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_TOPIC_AUTHORIZATION_FAILED);
+    tokio::time::sleep(NO_CREATE_WAIT).await;
+    assert!(!exists(&seed, "orders").await);
+}
+
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_name_is_kafka_internal_should_not_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+
+    let topics = send_as(&state, None, &["__consumer_offsets"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    tokio::time::sleep(NO_CREATE_WAIT).await;
+    assert!(!exists(&seed, "__consumer_offsets").await);
+}
+
+/// Only Kafka's own internal topics are reserved. Debezium names its heartbeat topics with `__`.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_a_double_underscore_name_is_not_kafka_internal_should_create() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+    let name = "__debezium-heartbeat.inventory";
+
+    let topics = send_as(&state, None, &[name], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    let deadline = tokio::time::Instant::now() + AUTO_CREATE_WAIT;
+    while !exists(&seed, name).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the topic was not created in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

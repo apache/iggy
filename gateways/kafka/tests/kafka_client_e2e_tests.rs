@@ -55,6 +55,7 @@ use iggy_gateway_kafka::bridge::{
     TopicMapping,
 };
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -336,6 +337,16 @@ impl BridgedGateway {
 
 /// As [`spawn_bridged_gateway`], creating each `(topic, partitions)` first.
 async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> BridgedGateway {
+    start_bridged_gateway_with(server, topics, GatewayConfig::default()).await
+}
+
+/// [`start_bridged_gateway`] with `gateway_config` instead of the defaults. Its listeners are
+/// replaced by one plaintext listener on an ephemeral port.
+async fn start_bridged_gateway_with(
+    server: &TestServer,
+    topics: &[(&str, u32)],
+    gateway_config: GatewayConfig,
+) -> BridgedGateway {
     let config = IggyBridgeConfig {
         address: server.address.clone(),
         username: ROOT_USER.to_string(),
@@ -361,7 +372,7 @@ async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> B
         ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
         listener,
     );
-    let gateway = KafkaGateway::new(GatewayConfig::default()).with_bridge(Some(Arc::new(bridge)));
+    let gateway = KafkaGateway::new(gateway_config).with_bridge(Some(Arc::new(bridge)));
     let (shutdown, receiver) = broadcast::channel(1);
     let task = tokio::spawn(async move {
         let _ = gateway.run(vec![listener], receiver).await;
@@ -1198,6 +1209,73 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
         &[],
     )
     .expect_ran("java console consumer in a group")
+}
+
+/// The issue's acceptance case: with auto topic creation on, a stock Java producer sends to a topic
+/// nobody created and succeeds. Its first `Metadata` is answered `UNKNOWN_TOPIC_OR_PARTITION` while
+/// the gateway creates the topic, and it retries until the topic appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_auto_topic_creation_when_the_java_producer_sends_to_a_new_topic_should_succeed() {
+    const NEW_TOPIC: &str = "auto-created";
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway_with(
+        &server,
+        &[],
+        GatewayConfig {
+            auto_topic_creation: AutoTopicCreationConfig {
+                enabled: true,
+                partitions: 1,
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let bootstrap = gateway.addr.to_string();
+
+    let produce = format!(
+        "printf 'k1:alpha\\n' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server \
+         {bootstrap} --topic {NEW_TOPIC} --property parse.key=true --property key.separator=: \
+         --producer-property max.block.ms=20000"
+    );
+    let produced =
+        run_client(KAFKA_IMAGE, &["sh", "-c", &produce], &[]).expect_ran("java console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the producer must send to the new topic, got: {produced}"
+    );
+
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            NEW_TOPIC,
+            "--partition",
+            "0",
+            "--offset",
+            "earliest",
+            "--max-messages",
+            "1",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer");
+    assert_eq!(
+        records_read(&consumed),
+        vec!["Offset:0\tk1\talpha"],
+        "the auto-created topic must hold the record, got: {consumed}"
+    );
+    gateway.stop().await;
 }
 
 /// The records a console consumer printed, as `Offset:<offset>\t<key>\t<value>`.

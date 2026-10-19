@@ -114,7 +114,7 @@ pub async fn dispatch(
         API_KEY_PRODUCE => produce::handle(state, connection, principal, api_version, body).await,
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
-        API_KEY_METADATA => metadata::handle(state, connection, api_version, body).await,
+        API_KEY_METADATA => metadata::handle(state, connection, principal, api_version, body).await,
         API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
         API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
