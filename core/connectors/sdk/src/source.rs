@@ -285,7 +285,16 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
             self.batch_policy = source.batch_policy();
             self.id = id;
             self.source = Some(Arc::new(source));
-            if result.is_ok() { 0 } else { 1 }
+            match result {
+                Ok(()) => 0,
+                Err(_) => {
+                    // Connector errors may contain secrets from external clients
+                    // (for example a JDBC URL echoed by a driver). Only the status
+                    // is safe to log at this generic boundary.
+                    error!("Failed to open source connector with ID: {id}");
+                    1
+                }
+            }
         }
     }
 
