@@ -398,9 +398,9 @@ Full reasoning, including what was rejected and why, is in
 ## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
 
 `src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
-streams/topics, provisions them on demand, looks up high watermarks (one or many partitions of
-a topic per call) for `ListOffsets`, probes and polls partitions for Fetch, and stores and reads
-group offsets for OffsetCommit and OffsetFetch.
+streams/topics, provisions them on demand, looks up high watermarks (one or many partitions of a
+topic per call) and records by time for `ListOffsets`, probes and polls partitions for Fetch, and
+stores and reads group offsets for OffsetCommit and OffsetFetch.
 Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets
 ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics
 ([#3538](https://github.com/apache/iggy/issues/3538)), DescribeConfigs and AlterConfigs , OffsetCommit and OffsetFetchcall it.
@@ -630,7 +630,8 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 - 4 clients sign in at once, 80 a second at most. More wait, up to their request's deadline.
 - `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
 - Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
-  Iggy request at a time. Fetch polls use 4 more, one per read slot. Topic probes use 1 more.
+  Iggy request at a time. Fetch polls use 4 more, one per read slot, and a `ListOffsets` lookup
+  by time borrows one of those slots for its request. Topic probes use 1 more.
   Offset calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.
@@ -678,7 +679,12 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
 
 Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
 OffsetCommit and OffsetFetch fold 6, 7 and `RequestTooOld` into `COORDINATOR_LOAD_IN_PROGRESS`
-(14), which the Java client retries in both (`to_offset_error_code`).
+(14), which the Java client retries in both (`to_offset_error_code`). ListOffsets answers
+`HistoryUnavailable`, `LifecycleBusy` and `ClientShutdown` with 6 and `RequestTooOld` with 7
+instead of -1, because the Java `AdminClient` fails a partition on any non-retriable code
+(`to_list_offsets_error_code`). `HistoryUnavailable` refuses a read routed to an older
+incarnation of the partition, as after a delete and recreate; the retry probes again and answers 3
+if the topic is gone. ListOffsets reads do not get `RequestTooOld` today, so that arm is defensive.
 
 ### Server limits the gateway inherits
 

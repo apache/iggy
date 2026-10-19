@@ -142,6 +142,25 @@ impl BridgeError {
         }
     }
 
+    /// [`Self::to_kafka_error_code`] for `ListOffsets`. The Java `AdminClient` fails a partition
+    /// on any code that is neither 6 nor retriable (`ListOffsetsHandler.handlePartitionError`), so
+    /// these refusals answer 6 or 7 here, not -1. `HistoryUnavailable` refuses a poll that names
+    /// an older incarnation of the partition, as after a delete and recreate. The retry probes
+    /// again and answers 3 if the topic is gone, and clients handle 3 and 6 alike.
+    /// `RequestTooOld` is not returned to `ListOffsets` reads today, so its arm is defensive.
+    #[must_use]
+    pub const fn to_list_offsets_error_code(&self) -> i16 {
+        match self {
+            Self::Iggy(
+                IggyError::HistoryUnavailable
+                | IggyError::LifecycleBusy
+                | IggyError::ClientShutdown,
+            ) => ERROR_NOT_LEADER_OR_FOLLOWER,
+            Self::Iggy(IggyError::RequestTooOld) => ERROR_REQUEST_TIMED_OUT,
+            _ => self.to_kafka_error_code(),
+        }
+    }
+
     /// True when Iggy rejected the bridge's own login. The Kafka client only sees -1.
     #[must_use]
     pub const fn is_bridge_login_rejected(&self) -> bool {
@@ -311,6 +330,47 @@ mod tests {
         // locally instead (`create_topics.rs`, `group_offsets.rs`), close to the write.
         let err = BridgeError::Iggy(IggyError::RequestAlreadyApplied);
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
+    }
+
+    #[test]
+    fn given_a_retriable_iggy_refusal_when_mapped_for_list_offsets_should_answer_retriable() {
+        let retriable = [
+            (IggyError::HistoryUnavailable, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::LifecycleBusy, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::ClientShutdown, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::RequestTooOld, ERROR_REQUEST_TIMED_OUT),
+        ];
+        for (error, code) in retriable {
+            let err = BridgeError::Iggy(error);
+            assert_eq!(
+                err.to_kafka_error_code(),
+                ERROR_UNKNOWN_SERVER_ERROR,
+                "{err}"
+            );
+            assert_eq!(err.to_list_offsets_error_code(), code, "{err}");
+        }
+    }
+
+    #[test]
+    fn given_any_other_failure_when_mapped_for_list_offsets_should_keep_the_shared_code() {
+        let others = [
+            BridgeError::InvalidKafkaTopicName {
+                kafka_topic: " ".to_string(),
+                reason: "whitespace".to_string(),
+            },
+            BridgeError::Iggy(IggyError::Unauthorized),
+            BridgeError::Iggy(IggyError::InvalidCredentials),
+            BridgeError::Iggy(IggyError::TopicNameNotFound(String::new(), String::new())),
+            BridgeError::Iggy(IggyError::Disconnected),
+            BridgeError::Timeout,
+        ];
+        for err in others {
+            assert_eq!(
+                err.to_list_offsets_error_code(),
+                err.to_kafka_error_code(),
+                "{err}"
+            );
+        }
     }
 
     #[test]

@@ -270,7 +270,7 @@ const RESPONSE_BYTES_TOPIC_OVERHEAD: usize = 13;
 /// Estimated encoded byte cost of one [`TopicResult`]: the fixed per-topic overhead, the name's
 /// own bytes (compact string: length plus a short varint prefix, charged at a flat +2), and -
 /// only for a successful result, since `encode_real_response` sends an empty array otherwise -
-/// [`RESPONSE_BYTES_PER_PARTITION`] per partition.
+/// [`template_partition_bytes`] per partition.
 ///
 /// `bounds_guard` cannot see any of this: it charges the request by name count alone, with no way
 /// to know a name's length, a topic's per-entry overhead, or its partition count before this
