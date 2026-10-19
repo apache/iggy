@@ -159,6 +159,7 @@ export class CommandResponseStream extends EventEmitter {
   get busy(): boolean { return this.pendingSubmissions > 0; }
 
   async sendCommand(command: number, payload: Buffer, options: SendCommandOptions = {}): Promise<CommandResponse> {
+    payload = Buffer.from(payload);
     const release = this.hold();
     const deadline = options.deadline ?? Date.now() + OPERATION_TIMEOUT_MS;
     const signal = AbortSignal.any([this.lifetime.signal, ...(options.signal ? [options.signal] : [])]);
@@ -241,9 +242,6 @@ export class CommandResponseStream extends EventEmitter {
     let previousLink: IggyConnection | undefined;
     try {
       if (target) {
-        const cached = this.partitionRoutes.get(target.key);
-        if (cached && (replicated || progress) && !retained)
-          this.lanes.throwIfRetained(cached.group);
         selected = await this.routeFor(target, deadline, signal, generation);
         context ??= { ...selected.route.context };
       }

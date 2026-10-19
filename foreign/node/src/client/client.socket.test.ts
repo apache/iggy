@@ -2532,6 +2532,53 @@ const waitUntil = async (predicate: () => boolean): Promise<void> => {
 };
 
 describe('native mutation recovery', () => {
+  it('freezes a raw request before awaiting route discovery', async () => {
+    const payload = Buffer.from(explicitSend);
+    const submitted = Buffer.from(payload);
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute)
+        payload.fill(0xff);
+      offsetCommittingHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.sendCommand(COMMAND_CODE.SendMessages, payload);
+      assert.deepEqual(framesOf(server, Operation.SendMessages)[0].subarray(HEADER_SIZE), submitted);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('admits a recreated history while retaining an unresolved write to its old history', async () => {
+    let incarnation = 1n;
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
+        const route = routingBody(0n, 0n, 0);
+        route.writeBigUInt64LE(incarnation, 0);
+        socket.write(replyFrame(frame, Operation.NonReplicated, route));
+      } else if (frame[REQUEST_OFFSET.operation] === Operation.SendMessages) {
+        socket.write(incarnation === 1n
+          ? replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), 85)
+          : provedReply(frame));
+      } else if (frame[REQUEST_OFFSET.operation] === Operation.DeleteTopic) {
+        incarnation = 2n;
+        socket.write(replyFrame(frame, Operation.DeleteTopic, metadataResult(0)));
+      } else singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      let retained!: bigint;
+      await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, explicitSend), (error: unknown) => {
+        assert.ok(error instanceof OperationUncertainError);
+        retained = error.operationId!;
+        return true;
+      });
+      await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, explicitSend), LaneBlockedError);
+      await client.sendCommand(COMMAND_CODE.DeleteTopic, Buffer.alloc(0));
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      assert.deepEqual(framesOf(server, Operation.SendMessages).map((frame) => stampedContext(frame).incarnation), [1n, 2n]);
+      client.abandonOperation(retained);
+    } finally { client.destroy(); await server.close(); }
+  });
+
   for (const resolving of [false, true]) {
     it(`preserves uncertainty when a session resets before ${resolving ? 'a retained replay' : 'a retry'} reaches the wire`, async () => {
       let retain = resolving;
