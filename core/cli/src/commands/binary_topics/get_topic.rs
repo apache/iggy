@@ -187,6 +187,7 @@ mod tests {
         assert!(output.contains("Topic name          | test-topic"));
         assert!(output.contains("Partitions count    | 0"));
         assert!(!output.contains("Partition id"));
+        assert!(!output.contains("Segments count"));
         assert!(!output.contains("Options"));
     }
 
