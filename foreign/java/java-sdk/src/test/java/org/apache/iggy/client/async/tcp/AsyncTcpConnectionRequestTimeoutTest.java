@@ -83,6 +83,9 @@ class AsyncTcpConnectionRequestTimeoutTest {
                     second = client.system().ping();
                 }
                 var secondRequest = AsyncIggyTcpClientTransientFailoverTest.readRequest(socket.getInputStream(), 0);
+                assertThat(secondRequest)
+                        .as("an explicit request timeout or cancellation keeps the shared channel open")
+                        .isNotNull();
                 assertThat(secondRequest.requestId()).isNotEqualTo(firstRequest.requestId());
                 AsyncIggyTcpClientTransientFailoverTest.writeResponse(
                         socket.getOutputStream(),

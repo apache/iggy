@@ -313,7 +313,9 @@ public class AsyncTcpConnection {
         }
         CompletableFuture<ByteBuf> heartbeat;
         try {
-            heartbeat = send(CommandCode.System.PING.getValue(), Unpooled.EMPTY_BUFFER);
+            TransientFailoverState state = new TransientFailoverState();
+            state.heartbeat = true;
+            heartbeat = send(CommandCode.System.PING.getValue(), Unpooled.EMPTY_BUFFER, 0, state);
         } catch (RuntimeException error) {
             log.warn("Failed to send heartbeat: {}", error.getMessage());
             scheduleNextHeartbeat();
@@ -790,7 +792,7 @@ public class AsyncTcpConnection {
             return;
         }
         Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
-        if (commandCode == CommandCode.System.PING.getValue() && cause instanceof IggyTimeoutException) {
+        if (failoverState.heartbeat && cause instanceof IggyTimeoutException) {
             channel.close();
             notifyConnectionFailure(new IggyConnectionException("The heartbeat reply timed out", cause));
         }
@@ -1812,6 +1814,7 @@ public class AsyncTcpConnection {
     static final class TransientFailoverState {
         private PartitionContext context;
         private boolean routed;
+        private boolean heartbeat;
         private long requestId;
         private boolean committed;
         private boolean linkFailed;
