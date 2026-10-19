@@ -7151,6 +7151,7 @@ version = "0.14.1-edge.1"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
+ "async-broadcast",
  "async-trait",
  "bytes",
  "cfg_aliases",
