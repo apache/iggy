@@ -1185,6 +1185,13 @@ where
                     if messages.is_empty() {
                         return Ok(());
                     }
+                } else if let IggyError::LaneBlocked(op) = *cause {
+                    // A restart loses the old producer's ownership set. Replaying
+                    // its blocker preserves the outcome for its original caller
+                    // and never confirms any messages in this unsent tail.
+                    if matches!(resolve(op).await, Err(IggyError::OperationUncertain(_))) {
+                        return Err(IggyError::LaneBlocked(op));
+                    }
                 }
                 retry += 1;
             }
@@ -1271,6 +1278,7 @@ mod tests {
     use iggy_common::IggyTimestamp;
     use iggy_connector_sdk::source::SendCallback;
     use secrecy::SecretString;
+    use std::cell::Cell;
     use std::collections::VecDeque;
     use std::future::{Ready, ready};
     use std::sync::Mutex;
@@ -1446,6 +1454,14 @@ mod tests {
         let mut failure = failed_send(messages);
         if let IggyError::ProducerSendFailed { cause, .. } = &mut failure {
             **cause = IggyError::OperationUncertain(op);
+        }
+        failure
+    }
+
+    fn blocked_send(op: u64, messages: Vec<IggyMessage>) -> IggyError {
+        let mut failure = failed_send(messages);
+        if let IggyError::ProducerSendFailed { cause, .. } = &mut failure {
+            **cause = IggyError::LaneBlocked(op);
         }
         failure
     }
@@ -2162,6 +2178,72 @@ mod tests {
                 assert_eq!(topic_name, "test-topic");
                 assert_eq!(attempts, 1, "reconnect failure must not resubmit the tail");
             }
+        });
+    }
+
+    #[test]
+    fn given_previous_source_blocker_when_resolved_should_send_the_entire_unsent_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            for outcome in [
+                Ok(()),
+                Err(IggyError::StreamNameNotFound("previous-stream".to_string())),
+                Err(IggyError::OperationNotRetained(7)),
+            ] {
+                let resolved = Cell::new(false);
+                let mut attempts = Vec::new();
+                let result = send_with_failed_tail_retries(
+                    vec![test_message(1), test_message(2), test_message(3)],
+                    NonZeroU32::MIN,
+                    47,
+                    &IggyClient::default(),
+                    |messages| {
+                        attempts.push(markers(&messages));
+                        ready(if resolved.get() {
+                            Ok(())
+                        } else {
+                            Err(blocked_send(7, messages))
+                        })
+                    },
+                    |op| {
+                        assert_eq!(op, 7);
+                        resolved.set(true);
+                        ready(outcome.clone())
+                    },
+                )
+                .await;
+
+                assert_eq!(result, Ok(()), "earlier operation outcome: {outcome:?}");
+                assert_eq!(attempts, [vec![1, 2, 3], vec![1, 2, 3]]);
+            }
+        });
+    }
+
+    #[test]
+    fn given_previous_source_blocker_when_still_uncertain_should_not_send_the_unsent_tail() {
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let mut attempts = Vec::new();
+            let mut resolved = Vec::new();
+            let result = send_with_failed_tail_retries(
+                vec![test_message(1), test_message(2), test_message(3)],
+                NonZeroU32::MIN,
+                47,
+                &IggyClient::default(),
+                |messages| {
+                    attempts.push(markers(&messages));
+                    ready(Err::<(), _>(blocked_send(7, messages)))
+                },
+                |op| {
+                    resolved.push(op);
+                    ready(Err(IggyError::OperationUncertain(op)))
+                },
+            )
+            .await;
+
+            assert_eq!(result, Err(IggyError::LaneBlocked(7)));
+            assert_eq!(attempts, [vec![1, 2, 3]]);
+            assert_eq!(resolved, [7]);
         });
     }
 

@@ -956,7 +956,9 @@ mod tests {
     use crate::clients::producer_config::DirectConfig;
     use crate::http::http_client::HttpClient;
     use crate::links::OPERATION_TIMEOUT;
-    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint, topic_body};
+    use crate::links::fake_cluster::{
+        Answer, FakeCluster, connected, endpoint, eventually, topic_body,
+    };
     use crate::tcp::tcp_client::TcpClient;
     use bytes::Bytes;
     use iggy_binary_protocol::codes::{GET_TOPIC_CODE, SEND_MESSAGES_CODE};
@@ -1270,6 +1272,65 @@ mod tests {
 
         assert_eq!(*cause, IggyError::LaneBlocked(op));
         assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_stopped_producer_when_rebuilt_should_recover_its_previous_operation() {
+        for abort_send in [false, true] {
+            let (cluster, producer) = connected_producer().await;
+            let client = (*producer.core.client).clone();
+            cluster.script(
+                &endpoint(0),
+                SEND_MESSAGES_CODE,
+                [
+                    Answer::Silence,
+                    confirmation(0),
+                    confirmation(1),
+                    confirmation(2),
+                ],
+            );
+            let sending = tokio::spawn(async move { producer.send(vec![message(b"old")]).await });
+            eventually("the stopped producer's frame should leave", || {
+                cluster.count(SEND_MESSAGES_CODE) == 1
+            })
+            .await;
+            let op = cluster.received(SEND_MESSAGES_CODE)[0].header.request;
+            if abort_send {
+                sending.abort();
+                assert!(sending.await.unwrap_err().is_cancelled());
+            } else {
+                let Err(IggyError::ProducerSendFailed { cause, .. }) = sending.await.unwrap()
+                else {
+                    panic!("the unanswered send should stay uncertain");
+                };
+                assert_eq!(*cause, IggyError::OperationUncertain(op));
+            }
+
+            let restarted = producer_on(client);
+            let Err(IggyError::ProducerSendFailed { cause, failed, .. }) = restarted
+                .send(vec![message(b"new-first"), message(b"new-last")])
+                .await
+            else {
+                panic!("the restarted producer must preserve its predecessor's blocker");
+            };
+            assert_eq!(*cause, IggyError::LaneBlocked(op));
+            assert_eq!(cluster.count(SEND_MESSAGES_CODE), 1);
+
+            resolve(&restarted, op).await.unwrap();
+            let response = restarted
+                .send(Arc::try_unwrap(failed).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.confirmations.len(), 2);
+            let sends = cluster.received(SEND_MESSAGES_CODE);
+            assert_eq!(sends.len(), 4);
+            assert_eq!(sends[0].header.request, sends[1].header.request);
+            assert_eq!(sends[0].body, sends[1].body);
+            assert_ne!(sends[1].header.request, sends[2].header.request);
+            assert_ne!(sends[2].header.request, sends[3].header.request);
+            assert_eq!(resolve(&restarted, op).await, Ok(()));
+            assert_eq!(cluster.count(SEND_MESSAGES_CODE), 4);
+        }
     }
 
     #[tokio::test(start_paused = true)]
