@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ext_php_rs::{convert::IntoZval, error::Error, exception::PhpException, php_class, zend::ce};
+use ext_php_rs::{error::Error, exception::PhpException, php_class, zend::ce};
 use iggy::prelude::IggyError;
 
 #[php_class]
@@ -76,13 +76,9 @@ impl IntoPhpException for IggyError {
 
 impl IntoPhpException for Error {
     fn into_php_exception(self) -> PhpException {
-        match self {
-            Error::Exception(exception) => match exception.into_zval(false) {
-                Ok(object) => PhpException::default(String::new()).with_object(object),
-                Err(error) => PhpException::from_class::<IggyException>(error.to_string()),
-            },
-            error => PhpException::from_class::<IggyException>(error.to_string()),
-        }
+        // A callback exception stays pending in the engine (ExceptionPending), and
+        // throwing while one is pending is a no-op, so PHP receives the original.
+        PhpException::from_class::<IggyException>(self.to_string())
     }
 }
 

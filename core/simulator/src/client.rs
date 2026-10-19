@@ -53,7 +53,9 @@ use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
     WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
 };
-use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
+use metadata::stm::user::{
+    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
+};
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
@@ -241,12 +243,19 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let verifier =
-            consensus::client_table::bind_verifier(self.client_id, 0, &self.bind_secret());
+        let registration = iggy_binary_protocol::requests::users::login_register::RegisterRequest {
+            user_created_at: ROOT_USER_CREATED_AT_MICROS,
+            bind_verifier: consensus::client_table::bind_verifier(
+                self.client_id,
+                0,
+                &self.bind_secret(),
+            ),
+        }
+        .to_bytes();
         let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
-            size: (header_size + verifier.len()) as u32,
+            size: (header_size + registration.len()) as u32,
             client: self.client_id,
             session: 0,
             request: 0,
@@ -259,7 +268,7 @@ impl SimClient {
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = header_bytes.to_vec();
-        buffer.extend_from_slice(&verifier);
+        buffer.extend_from_slice(&registration);
 
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("register request must be valid")

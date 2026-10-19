@@ -17,7 +17,9 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
-use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
+use crate::stm::authz::{
+    PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
+};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
@@ -47,6 +49,7 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsR
 use iggy_binary_protocol::requests::system::{FinalizeSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ProtocolVersion, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode,
@@ -650,6 +653,8 @@ pub enum MetadataSubmitError {
     ///   the previous boot's ids while the HTTP id minter restarts at 1, so
     ///   an honest login lands on a recovered entry owned by another user.
     ClientIdOwnedByAnotherUser,
+    /// The verified account is no longer active or the client ID is reserved.
+    Unauthenticated,
     /// The request is at or below the watermark without a retained receipt.
     RequestTooOld,
     /// The request identity already belongs to another operation.
@@ -665,7 +670,10 @@ impl MetadataSubmitError {
     pub const fn is_transient(&self) -> bool {
         !matches!(
             self,
-            Self::ClientIdOwnedByAnotherUser | Self::RequestTooOld | Self::OperationMismatch
+            Self::ClientIdOwnedByAnotherUser
+                | Self::Unauthenticated
+                | Self::RequestTooOld
+                | Self::OperationMismatch
         )
     }
 }
@@ -689,6 +697,7 @@ impl std::fmt::Display for MetadataSubmitError {
             Self::ClientIdOwnedByAnotherUser => {
                 f.write_str("client id already registered to a different user")
             }
+            Self::Unauthenticated => f.write_str("verified account is no longer active"),
         }
     }
 }
@@ -769,6 +778,21 @@ where
         );
     }
     if header.operation == Operation::Register {
+        let registration = RegisterRequest::decode_from(prepare.body()).unwrap_or_else(|_| {
+            fatal(
+                FatalReason::UnreconcilableLogFrontier,
+                "invalid committed Register identity",
+            )
+        });
+        if !mux_stm
+            .users()
+            .is_active_account(header.user_id, registration.user_created_at)
+        {
+            let denied = crate::stm::result::ApplyReply::err(IggyError::Unauthenticated.as_code());
+            return build_reply_message_with(&header, denied.reply_body_len(), |dst| {
+                denied.write_reply_body(dst);
+            });
+        }
         if table_mutations_allowed {
             let reply = build_reply_message(&header, &bytes::Bytes::new());
             client_table
@@ -776,12 +800,7 @@ where
                 .commit_register(
                     header.client,
                     header.user_id,
-                    prepare.body().try_into().unwrap_or_else(|_| {
-                        fatal(
-                            FatalReason::UnreconcilableLogFrontier,
-                            "committed Register has no bind verifier",
-                        )
-                    }),
+                    registration.bind_verifier,
                     reply,
                 )
                 .unwrap_or_else(|error| {
@@ -849,12 +868,14 @@ where
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
     // the reply body, replayed on retry.
-    let apply = gated_apply(mux_stm, prepare).unwrap_or_else(|err| {
-        panic!(
-            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
-            header.op
-        );
-    });
+    let apply = reject_stale_session(&header, &client_table.borrow())
+        .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
+        .unwrap_or_else(|err| {
+            panic!(
+                "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+                header.op
+            );
+        });
     if let Some(user_id) = apply.revoked_user {
         apply_user_revocation(
             mux_stm,
@@ -1383,6 +1404,7 @@ where
                     user_id,
                     message.body(),
                     request_checksum,
+                    |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
                 );
                 apply_preflight_consensus_plane(
                     consensus,
@@ -2392,9 +2414,12 @@ where
         &self,
         client_id: u128,
         user_id: u32,
-        bind_verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+        registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        if message_bus::is_server_internal_client(client_id) {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let consensus = self
             .consensus
             .as_ref()
@@ -2403,8 +2428,15 @@ where
             return Err(MetadataSubmitError::NotPrimary);
         }
         if is_caught_up_primary(consensus) {
+            if !self
+                .mux_stm
+                .users()
+                .is_active_account(user_id, registration.user_created_at)
+            {
+                return Err(MetadataSubmitError::Unauthenticated);
+            }
             let table = self.client_table.borrow();
-            match table.registered_session(client_id, user_id, bind_verifier) {
+            match table.registered_session(client_id, user_id, registration.bind_verifier) {
                 Ok(Some(epoch)) => {
                     return Ok(BoundSession {
                         epoch,
@@ -2421,7 +2453,7 @@ where
         if consensus.pipeline_has_message_from_client(client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
-        let request = build_register_request_message(consensus, client_id, user_id, bind_verifier);
+        let request = build_register_request_message(consensus, client_id, user_id, registration);
         if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
             if consensus.push_queued_request(entry).is_err() {
@@ -2434,18 +2466,25 @@ where
                 .expect("Register is a client-allowed operation");
             let _ = self.dispatch_prepare_and_await(consensus, prepare).await;
         }
-        self.bound_session(client_id, user_id, bind_verifier)
+        self.bound_session(client_id, user_id, registration)
     }
 
     fn bound_session(
         &self,
         client_id: u128,
         user_id: u32,
-        bind_verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+        registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
+        if !self
+            .mux_stm
+            .users()
+            .is_active_account(user_id, registration.user_created_at)
+        {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let table = self.client_table.borrow();
         let epoch = table
-            .registered_session(client_id, user_id, bind_verifier)
+            .registered_session(client_id, user_id, registration.bind_verifier)
             .map_err(|_| MetadataSubmitError::ClientIdOwnedByAnotherUser)?
             .ok_or(MetadataSubmitError::Canceled)?;
         Ok(BoundSession {
@@ -3610,6 +3649,7 @@ where
                         user_id,
                         req.message.body(),
                         request_checksum,
+                        |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
                     );
                     apply_preflight_consensus_plane(
                         consensus,
@@ -3976,7 +4016,7 @@ where
 
         // Stamp the acting user id into the replicated header so the in-apply
         // RBAC gate (`crate::stm::authz`) resolves the same identity on every
-        // replica, WAL replay included (no session table there). Every client-op
+        // replica, WAL replay included. Every client-op
         // prepare funnels through here, primary-only by construction, so stamping
         // here -- not in the in-process client path alone -- also covers the
         // wire-plane ingresses (`on_request` and the request-queue drain). The
@@ -4354,27 +4394,27 @@ where
 
 /// In-process Register `Message<RoutedRequestHeader>`. Mirrors
 /// `SimClient::register`: `session=0`, `request=0` per
-/// [`RoutedRequestHeader::validate`]; empty body.
+/// [`RoutedRequestHeader::validate`]; the body identifies the verified account.
 ///
 /// `cluster` + `view` from `consensus` for self-consistency before
 /// `Project::project` overwrites. `release = 0` matches wire today; both
 /// paths should switch to `consensus.release()` once
 /// `ClientReleaseTooLow/TooHigh` lands.
 ///
-/// Buffer is `size_of::<RoutedRequestHeader>()`; `prepare_request` transmutes into
-/// `PrepareHeader` (also 256 bytes), no realloc.
+/// `prepare_request` transmutes the header into `PrepareHeader` without reallocating.
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
     user_id: u32,
-    bind_verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+    registration: RegisterRequest,
 ) -> Message<RoutedRequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header_size = size_of::<RoutedRequestHeader>();
-    let message_size = header_size + bind_verifier.len();
+    let body = registration.to_bytes();
+    let message_size = header_size + body.len();
     let mut msg = Message::<RoutedRequestHeader>::new(message_size);
     let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
         &mut msg.as_mut_slice()[..header_size],
@@ -4399,7 +4439,7 @@ where
         group: server_common::sharding::METADATA_GROUP,
         ..RoutedRequestHeader::default()
     };
-    msg.as_mut_slice()[header_size..].copy_from_slice(&bind_verifier);
+    msg.as_mut_slice()[header_size..].copy_from_slice(&body);
     msg
 }
 
@@ -5220,7 +5260,7 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         md.client_table
@@ -5229,8 +5269,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            md.submit_register_in_process(CLIENT, IMPOSTOR, [0x5a; 32])
-                .await,
+            md.submit_register_in_process(
+                CLIENT,
+                IMPOSTOR,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32]
+                }
+            )
+            .await,
             Err(MetadataSubmitError::ClientIdOwnedByAnotherUser),
             "a different user must not be resumed onto this entry"
         );
@@ -5245,13 +5292,54 @@ mod tests {
         );
 
         assert_eq!(
-            md.submit_register_in_process(CLIENT, OWNER, [0x5a; 32])
-                .await,
+            md.submit_register_in_process(
+                CLIENT,
+                OWNER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32]
+                }
+            )
+            .await,
             Ok(BoundSession {
                 epoch: 1,
                 watermark: 0
             })
         );
+    }
+
+    #[compio::test]
+    async fn given_reserved_client_id_when_registering_in_process_should_reject_before_queueing() {
+        const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let metadata = metadata_plane();
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let consensus = metadata.consensus.as_ref().unwrap();
+        for commit_max in [0, 1] {
+            consensus.advance_commit_max(commit_max);
+            for client in [
+                message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                let result = compio::time::timeout(
+                    REGISTRATION_TIMEOUT,
+                    metadata.submit_register_in_process(
+                        client,
+                        0,
+                        RegisterRequest {
+                            user_created_at: 1,
+                            bind_verifier: [0x5a; 32],
+                        },
+                    ),
+                )
+                .await
+                .expect("reserved IDs must be rejected without waiting for consensus");
+                let error = result.expect_err("reserved IDs cannot acquire a session");
+                assert_eq!(error, MetadataSubmitError::Unauthenticated);
+                assert!(!error.is_transient());
+                assert_eq!(metadata.client_table.borrow().get_epoch(client), None);
+                assert!(!consensus.pipeline_has_message_from_client(client));
+            }
+        }
     }
 
     #[test]
@@ -6963,7 +7051,14 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER, [0x5a; 32])
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap()
             .epoch;
@@ -6991,7 +7086,14 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER, [0x5a; 32])
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap()
             .epoch;
@@ -7097,7 +7199,14 @@ mod tests {
         let (_dir, metadata) = metadata_with_group_member(1).await;
         for client in 2..=8 {
             metadata
-                .submit_register_in_process(client, 7, [0x5a; 32])
+                .submit_register_in_process(
+                    client,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -7237,7 +7346,14 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let new_session = metadata
-            .submit_register_in_process(CLIENT, USER, [0x5a; 32])
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap()
             .epoch;
@@ -7342,13 +7458,18 @@ mod tests {
         let epoch = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
         let request = RoutedRequestHeader {
             client: CLIENT,
+            user_id: GROUP_MEMBER_USER,
             ..Default::default()
         };
         let prepare = build_prepare_message(
             metadata.consensus.as_ref().unwrap(),
             &request,
             Operation::Register,
-            &[0x5a; 32],
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
         );
         apply_committed_prepare(
             &*metadata.mux_stm,
@@ -7665,6 +7786,26 @@ mod tests {
         }
     }
 
+    fn session_users() -> Users {
+        const LAST_USER: u32 = 9;
+        let mut users = UsersInner::new();
+        for user_id in 0..=LAST_USER {
+            let created = StateHandler::apply(
+                &CreateUserRequest {
+                    username: WireName::new(format!("session-user-{user_id}")).unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                },
+                &mut users,
+                IggyTimestamp::from(1),
+            );
+            assert_eq!(created.code, 0);
+        }
+        users.into()
+    }
+
     /// The user of every session that [`join_group_member`] registers.
     const GROUP_MEMBER_USER: u32 = 7;
 
@@ -7719,7 +7860,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        metadata.mux_stm = Rc::new(TestMux::new((Users::default(), (inner.into(), ()))));
+        metadata.mux_stm = Rc::new(TestMux::new((session_users(), (inner.into(), ()))));
         metadata.mux_stm.users().ensure_root_user("root", "hash");
         join_group_member(&metadata, client_id).await;
         (dir, metadata)
@@ -7733,7 +7874,14 @@ mod tests {
         client_id: u128,
     ) {
         metadata
-            .submit_register_in_process(client_id, GROUP_MEMBER_USER, [0x5a; 32])
+            .submit_register_in_process(
+                client_id,
+                GROUP_MEMBER_USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap();
         let consensus = metadata.consensus.as_ref().unwrap();
@@ -7816,7 +7964,7 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         let consensus = md.consensus.as_ref().unwrap();
@@ -7851,8 +7999,14 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed, not bounced.
-        let mut register =
-            Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER, [0x5a; 32]));
+        let mut register = Box::pin(md.submit_register_in_process(
+            CLIENT_C,
+            ACTING_USER,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        ));
         assert!(
             register.as_mut().poll(&mut cx).is_pending(),
             "mid-window register must park in the request queue, not error"
@@ -7930,7 +8084,14 @@ mod tests {
         );
         metadata.mux_stm.users().ensure_root_user("root", "hash");
         let original_session = metadata
-            .submit_register_in_process(CLIENT, USER, BIND_VERIFIER)
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: BIND_VERIFIER,
+                },
+            )
             .await
             .unwrap();
         let consensus = metadata.consensus.as_ref().unwrap();
@@ -7951,7 +8112,14 @@ mod tests {
             Some(0),
         );
         let new_session = metadata
-            .submit_register_in_process(NEW_CLIENT, USER, BIND_VERIFIER)
+            .submit_register_in_process(
+                NEW_CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: BIND_VERIFIER,
+                },
+            )
             .await
             .unwrap();
         let local_applied = consensus.commit_min();
@@ -7989,14 +8157,28 @@ mod tests {
         );
         assert_eq!(
             metadata
-                .bound_session(CLIENT, USER, BIND_VERIFIER)
+                .bound_session(
+                    CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: BIND_VERIFIER
+                    }
+                )
                 .unwrap()
                 .epoch,
             original_session.epoch,
         );
         assert_eq!(
             metadata
-                .bound_session(NEW_CLIENT, USER, BIND_VERIFIER)
+                .bound_session(
+                    NEW_CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: BIND_VERIFIER
+                    }
+                )
                 .unwrap()
                 .epoch,
             new_session.epoch,
@@ -8386,7 +8568,7 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         let consensus = md.consensus.as_ref().unwrap();
@@ -8422,8 +8604,14 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed into the request queue.
-        let mut register =
-            Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER, [0x5a; 32]));
+        let mut register = Box::pin(md.submit_register_in_process(
+            CLIENT_C,
+            ACTING_USER,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        ));
         assert!(register.as_mut().poll(&mut cx).is_pending());
         assert_eq!(consensus.request_queue_len(), 1);
 

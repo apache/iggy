@@ -35,6 +35,7 @@ path = "src/main.rs"
 [dependencies]
 # Required by kafka-protocol: its custom-decompression hook is typed on anyhow::Result.
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 # The four codecs are driven from `records::decompress` rather than through kafka-protocol,
@@ -46,6 +47,9 @@ iggy = { workspace = true }
 kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
 lz4 = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 snap = { workspace = true }
@@ -60,12 +64,14 @@ tokio = { workspace = true, features = [
     "sync",
     "signal",
 ] }
+tokio-rustls = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+x509-parser = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
@@ -73,6 +79,8 @@ zstd = { workspace = true }
 crc32c = { workspace = true }
 # The client half, so a test encodes requests and decodes responses the way a consumer does.
 kafka-protocol = { workspace = true, features = ["client"] }
+# Certificates for the TLS listener tests, minted per test so nothing in the tree expires.
+rcgen = { workspace = true }
 # Reads the JSON events that kafka-verifiable-consumer.sh prints.
 serde_json = { workspace = true }
 serial_test = { workspace = true }

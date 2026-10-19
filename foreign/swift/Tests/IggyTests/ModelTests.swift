@@ -206,6 +206,20 @@ struct IdentifierTests {
         try Identifier(numeric: UInt32.max).encode(into: &writer)
         #expect(writer.bytes == [1, 4, 0xFF, 0xFF, 0xFF, 0xFF])
     }
+
+    @Test func decodingReadsWhatEncodingWrites() throws {
+        for identifier: Identifier in [0, 7, "café", Identifier(numeric: UInt32.max)] {
+            var writer = ByteWriter()
+            try identifier.encode(into: &writer)
+            var reader = ByteReader(writer.bytes[...])
+            #expect(try Identifier.decode(from: &reader) == identifier)
+            #expect(reader.isAtEnd)
+        }
+        for malformed: [UInt8] in [[1, 2, 7, 0], [3, 4, 0, 0, 0, 0], [2, 0], [1, 4, 0]] {
+            var reader = ByteReader(malformed[...])
+            #expect(throws: (any Error).self) { try Identifier.decode(from: &reader) }
+        }
+    }
 }
 
 @Suite("Messages")
@@ -293,10 +307,23 @@ struct PartitioningTests {
         #expect(try encode(.partition(9)) == [2, 4, 9, 0, 0, 0])
     }
 
+    @Test func decodingReadsWhatEncodingWrites() throws {
+        for partitioning: Partitioning in [.balanced, .partition(9), .messagesKey("user-1")] {
+            var reader = ByteReader(try encode(partitioning)[...])
+            #expect(try Partitioning.decode(from: &reader) == partitioning)
+            #expect(reader.isAtEnd)
+        }
+        for malformed: [UInt8] in [[1, 4, 0, 0, 0, 0], [2, 3, 9, 0, 0], [2, 4, 9], [3, 0], [4, 0]] {
+            var reader = ByteReader(malformed[...])
+            #expect(throws: (any Error).self) { try Partitioning.decode(from: &reader) }
+        }
+    }
+
     /// The poll sentinel is compared against the value the Rust generator
     /// dumped from `core/common`, so the golden lane catches drift.
     @Test func noAssignedPartitionMatchesTheServerConstant() {
         #expect(PolledMessages.noAssignedPartition == GoldenFixture.shared.noAssignedPartition)
+        #expect(PolledMessages.resyncRequiredPartition == GoldenFixture.shared.resyncRequiredPartition)
         #expect(GoldenFixture.shared.resyncRequiredPartition != GoldenFixture.shared.noAssignedPartition)
     }
 

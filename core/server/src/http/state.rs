@@ -30,10 +30,13 @@ use axum::response::Response;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{ClusterMetadata, IggyError, IggyTimestamp, UserStatus};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::user::User;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -43,7 +46,7 @@ use crate::consumer_group::lease::{ConsumerGroupLiveness, SessionActivity};
 use crate::dispatch::session_ops::{submit_logout_on_owner, submit_register_on_owner};
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 
-use crate::http::jwt::JwtManager;
+use crate::http::jwt::{JwtManager, TrustedIssuer};
 use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
@@ -296,10 +299,11 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         loop {
-            self.ensure_active_user(user_id)?;
+            self.ensure_active_user(user_id, Some(user_created_at))?;
             let now = IggyTimestamp::now().to_secs();
             if let Some(session) = self.live_session(&key, now) {
                 return Ok(session);
@@ -339,7 +343,9 @@ impl HttpInner {
                 BarrierEntry::Lead(_guard) => {
                     // The guard reserves local capacity across Register and
                     // releases it on failure or cancellation, waking waiters.
-                    let fresh = self.register_session(key.clone(), user_id, expiry).await?;
+                    let fresh = self
+                        .register_session(key.clone(), user_id, user_created_at, expiry)
+                        .await?;
                     self.sessions
                         .borrow_mut()
                         .insert(key.clone(), Rc::clone(&fresh));
@@ -349,17 +355,51 @@ impl HttpInner {
         }
     }
 
-    pub(in crate::http) fn ensure_active_user(&self, user_id: u32) -> Result<(), AuthError> {
-        let active = self.shard.plane.metadata().mux_stm.users().read(|users| {
-            users
-                .items
-                .get(user_id as usize)
-                .is_some_and(|user| user.status == UserStatus::Active)
-        });
-        if !active {
-            return Err(IggyError::Unauthenticated.into());
-        }
-        Ok(())
+    /// `created_at` of the active user at `user_id`. Refused when the id is
+    /// free, the user is not active, or `expected` is another account's stamp:
+    /// a delete frees the id for the next create, so a credential pins the
+    /// account it was issued to and every later check compares the stamp.
+    pub(in crate::http) fn ensure_active_user(
+        &self,
+        user_id: u32,
+        expected: Option<IggyTimestamp>,
+    ) -> Result<IggyTimestamp, IggyError> {
+        self.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| {
+                users
+                    .items
+                    .get(user_id as usize)
+                    .filter(|user| user.status == UserStatus::Active)
+                    .map(|user| user.created_at)
+            })
+            // A token carries micros, so compare at that precision.
+            .filter(|created_at| {
+                expected.is_none_or(|expected| expected.as_micros() == created_at.as_micros())
+            })
+            .ok_or(IggyError::Unauthenticated)
+    }
+
+    /// `(id, created_at)` of the account a trusted issuer's tokens act as: the
+    /// user named by the issuer, looked up per request. See
+    /// [`trusted_issuer_account`].
+    pub(in crate::http) fn trusted_issuer_user(
+        &self,
+        issuer: &TrustedIssuer,
+    ) -> Result<(u32, IggyTimestamp), IggyError> {
+        self.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| trusted_issuer_account(users.user_by_name(&issuer.config.username)))
+            .ok_or_else(|| {
+                issuer.warn_invalid_account();
+                IggyError::Unauthenticated
+            })
     }
 
     /// Highest metadata op `user_id` was told committed here; see
@@ -402,6 +442,7 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         /// A collision is rare enough that this many in a row means the minter
@@ -410,7 +451,7 @@ impl HttpInner {
 
         for attempt in 1..=MINT_ATTEMPTS {
             match self
-                .register_session_once(key.clone(), user_id, expiry)
+                .register_session_once(key.clone(), user_id, user_created_at, expiry)
                 .await
             {
                 Ok(session) => return Ok(session),
@@ -434,6 +475,7 @@ impl HttpInner {
         &self,
         key: String,
         user_id: u32,
+        user_created_at: IggyTimestamp,
         expiry: u64,
     ) -> Result<Rc<HttpSession>, AuthError> {
         let coordinator = self
@@ -457,9 +499,15 @@ impl HttpInner {
         let (result_slot, committed) = oneshot::channel();
         let shard = Rc::clone(&self.shard);
         compio::runtime::spawn(async move {
-            let verifier =
-                consensus::client_table::bind_verifier(client_id, user_id, &rand::random());
-            let result = submit_register_on_owner(&shard, client_id, user_id, verifier).await;
+            let registration = RegisterRequest {
+                user_created_at: user_created_at.as_micros(),
+                bind_verifier: consensus::client_table::bind_verifier(
+                    client_id,
+                    user_id,
+                    &rand::random(),
+                ),
+            };
+            let result = submit_register_on_owner(&shard, client_id, user_id, registration).await;
             if let Err(Ok(bound)) = result_slot.send(result)
                 && bound.watermark == FRESH_ENTRY_WATERMARK
             {
@@ -508,7 +556,7 @@ impl HttpInner {
         .await
         .ok_or(AuthError::SessionUnavailable)?;
         // Register and catch-up may yield to a user revocation.
-        self.ensure_active_user(user_id)?;
+        self.ensure_active_user(user_id, Some(user_created_at))?;
         let attachment = metadata
             .client_table
             .borrow_mut()
@@ -594,6 +642,9 @@ const fn register_submit_auth_error(error: &MetadataSubmitError) -> AuthError {
         | MetadataSubmitError::PipelineFull
         | MetadataSubmitError::PrimaryUnreachable => AuthError::SessionNotAccepted,
         MetadataSubmitError::ClientIdOwnedByAnotherUser => AuthError::SessionIdOwnedByAnotherUser,
+        MetadataSubmitError::Unauthenticated => {
+            AuthError::Unauthenticated(IggyError::Unauthenticated)
+        }
         // The proposal may still commit. Unknown future outcomes fail closed
         // into the same client-only retry class.
         MetadataSubmitError::InProgress
@@ -633,11 +684,25 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
     response
 }
 
+/// `(id, created_at)` of `user` when a trusted issuer may act as it: active and
+/// not root. A deleted user's id goes to the next user created, so the issuer
+/// is matched by username, and an external issuer never holds root.
+fn trusted_issuer_account(user: Option<&User>) -> Option<(u32, IggyTimestamp)> {
+    let user = user?;
+    if user.id == DEFAULT_ROOT_USER_ID {
+        return None;
+    }
+    (user.status == UserStatus::Active).then_some((user.id, user.created_at))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MetadataWatermarks, register_submit_auth_error};
+    use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
     use crate::http::error::AuthError;
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use iggy_common::{IggyTimestamp, UserStatus};
     use metadata::MetadataSubmitError;
+    use metadata::stm::user::User;
 
     /// The floor is what the read gate waits for, so nothing may lower it: two
     /// concurrent requests by one user can have their committed replies land
@@ -698,6 +763,37 @@ mod tests {
                 register_submit_auth_error(&error),
                 AuthError::SessionUnavailable
             ));
+        }
+    }
+
+    #[test]
+    fn given_root_inactive_or_unknown_user_when_trusted_issuer_maps_onto_it_should_refuse() {
+        let root = user(DEFAULT_ROOT_USER_ID, UserStatus::Active);
+        let inactive = user(1, UserStatus::Inactive);
+        assert_eq!(
+            trusted_issuer_account(Some(&root)),
+            None,
+            "an external issuer must never act as root"
+        );
+        assert_eq!(trusted_issuer_account(Some(&inactive)), None);
+        assert_eq!(trusted_issuer_account(None), None);
+    }
+
+    #[test]
+    fn given_active_user_when_trusted_issuer_maps_onto_it_should_resolve_its_account() {
+        let active = user(1, UserStatus::Active);
+        assert_eq!(
+            trusted_issuer_account(Some(&active)),
+            Some((1, active.created_at))
+        );
+    }
+
+    fn user(id: u32, status: UserStatus) -> User {
+        User {
+            id,
+            status,
+            created_at: IggyTimestamp::from(1_700_000_000_000_000),
+            ..User::default()
         }
     }
 }

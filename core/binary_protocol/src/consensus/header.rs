@@ -2548,7 +2548,7 @@ impl ConsensusHeader for ForwardRegisterHeader {
                 found: self.command,
             });
         }
-        let expected = HEADER_SIZE + crate::requests::users::login_register::BIND_SECRET_BYTES;
+        let expected = HEADER_SIZE + crate::requests::users::login_register::REGISTER_REQUEST_BYTES;
         if self.size as usize != expected {
             return Err(ConsensusError::InvalidSize {
                 expected: u32::try_from(expected).expect("fixed register frame fits u32"),
@@ -2619,8 +2619,8 @@ const _: () = {
 /// Wire verdict on a forwarded register.
 ///
 /// Mirrors the server-side submit error one-for-one so the backup can surface
-/// the primary's exact answer: every variant but
-/// [`Self::ClientIdOwnedByAnotherUser`] is transient and replayable.
+/// the primary's exact answer. Ownership and authentication refusals are
+/// terminal; other errors are transient and replayable.
 ///
 /// **Wire-version pinned**, like [`EvictionReason`]: reordering or reusing a
 /// discriminant silently reinterprets a live cluster's frames.
@@ -2639,6 +2639,8 @@ pub enum ForwardRegisterOutcome {
     Canceled = 5,
     /// Terminal: the presented client id belongs to another user.
     ClientIdOwnedByAnotherUser = 6,
+    /// Terminal: the verified account was deleted, replaced, or disabled.
+    Unauthenticated = 7,
 }
 
 impl ConsensusHeader for ForwardRegisterResultHeader {
@@ -3685,7 +3687,10 @@ mod tests {
             checksum: 0,
             checksum_body: 0,
             cluster: 7,
-            size: u32::try_from(HEADER_SIZE + 32).expect("HEADER_SIZE fits u32"),
+            size: u32::try_from(
+                HEADER_SIZE + crate::requests::users::login_register::REGISTER_REQUEST_BYTES,
+            )
+            .expect("Register size fits u32"),
             view: 3,
             release: 0,
             command: Command::ForwardRegister,
@@ -3734,6 +3739,13 @@ mod tests {
                 Command::ForwardRegisterResult,
                 bytemuck::bytes_of(&forward_register_result(ForwardRegisterOutcome::Ok)).to_vec(),
             ),
+            (
+                Command::ForwardRegisterResult,
+                bytemuck::bytes_of(&forward_register_result(
+                    ForwardRegisterOutcome::Unauthenticated,
+                ))
+                .to_vec(),
+            ),
         ] {
             // 16-byte alignment: `Vec<u8>` requests align=1 and fails Miri.
             let mut buf = aligned_zeroed(HEADER_SIZE);
@@ -3745,7 +3757,7 @@ mod tests {
                 generic.size as usize,
                 HEADER_SIZE
                     + if command == Command::ForwardRegister {
-                        32
+                        crate::requests::users::login_register::REGISTER_REQUEST_BYTES
                     } else {
                         0
                     }
@@ -3853,7 +3865,7 @@ mod tests {
         buf.copy_from_slice(bytemuck::bytes_of(&forward_register_result(
             ForwardRegisterOutcome::Ok,
         )));
-        buf[OUTCOME_OFFSET] = 7;
+        buf[OUTCOME_OFFSET] = u8::MAX;
         assert!(bytemuck::checked::try_from_bytes::<ForwardRegisterResultHeader>(&buf).is_err());
     }
 
@@ -3867,6 +3879,7 @@ mod tests {
         assert_eq!(ForwardRegisterOutcome::InProgress as u8, 4);
         assert_eq!(ForwardRegisterOutcome::Canceled as u8, 5);
         assert_eq!(ForwardRegisterOutcome::ClientIdOwnedByAnotherUser as u8, 6);
+        assert_eq!(ForwardRegisterOutcome::Unauthenticated as u8, 7);
     }
 
     fn forward_logout() -> ForwardLogoutHeader {

@@ -108,8 +108,8 @@ impl Display for ConsumerGroupConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ rebalancing_timeout: {}, session_timeout: {}, heartbeat_interval: {} }}",
-            self.rebalancing_timeout, self.session_timeout, self.heartbeat_interval
+            "{{ rebalancing_timeout: {}, heartbeat_interval: {} }}",
+            self.rebalancing_timeout, self.heartbeat_interval
         )
     }
 }

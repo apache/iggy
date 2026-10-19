@@ -26,11 +26,12 @@ use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest,
 };
+use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
     Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireEncode,
-    WireIdentifier, WireName, WireOptions,
+    WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
 };
-use iggy_common::variadic;
+use iggy_common::{UserStatus, variadic};
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
@@ -354,11 +355,14 @@ pub fn prepare_message(
 /// Creates one stream with one single-partition topic, and returns the
 /// namespace of its partition. No route names the partition yet.
 pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
+    create_one_partition_in(&shard.plane.metadata().mux_stm)
+}
+
+/// [`create_one_partition`] on the metadata state machine of any shard.
+pub fn create_one_partition_in(mux_stm: &TestMux) -> IggyNamespace {
     const VSR_CLIENT_ID: u128 = 1;
-    let metadata = shard.plane.metadata();
-    metadata.mux_stm.users().ensure_root_user("iggy", "hash");
-    metadata
-        .mux_stm
+    mux_stm.users().ensure_root_user("iggy", "hash");
+    mux_stm
         .update(prepare_message(
             Operation::CreateStream,
             VSR_CLIENT_ID,
@@ -370,8 +374,7 @@ pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
             .to_bytes(),
         ))
         .unwrap();
-    metadata
-        .mux_stm
+    mux_stm
         .update(prepare_message(
             Operation::CreateTopicWithAssignments,
             VSR_CLIENT_ID,
@@ -393,9 +396,34 @@ pub fn create_one_partition(shard: &TestShard) -> IggyNamespace {
             .to_bytes(),
         ))
         .unwrap();
-    metadata
-        .mux_stm
+    mux_stm
         .streams()
         .namespace_from_partition(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0), 0)
         .unwrap()
+}
+
+/// A `CreateUser` request for a user that may read server state and poll
+/// every stream, and nothing more.
+pub fn create_reader_request() -> CreateUserRequest {
+    CreateUserRequest {
+        username: WireName::new("reader").unwrap(),
+        password: "hash".to_owned(),
+        status: UserStatus::Active.as_code(),
+        permissions: Some(WirePermissions {
+            global: WireGlobalPermissions {
+                manage_servers: false,
+                read_servers: true,
+                manage_users: false,
+                read_users: false,
+                manage_streams: false,
+                read_streams: false,
+                manage_topics: false,
+                read_topics: false,
+                poll_messages: true,
+                send_messages: false,
+            },
+            streams: Vec::new(),
+        }),
+        options: WireOptions::empty(),
+    }
 }

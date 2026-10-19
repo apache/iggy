@@ -89,12 +89,14 @@ The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
 `heartbeatInterval` also accepts a duration expression such as `"10s"` or
 `"1h 30m"`, like the Rust SDK.
-With the default heartbeat settings, a group member becomes eligible for
-eviction after 36 s of silence (1.2 x the 30 s interval); the verifier checks
-once per interval. Raising the client interval past that window, or setting it
-to 0 to disable client heartbeats, exposes an idle consumer-group member to
-eviction; a connection holding no group membership is left alone. Any other
-unusable value is rejected instead of silently disabling the heartbeat.
+With the default heartbeat settings, a client that sends nothing for 36 s
+(1.2 x the 30 s interval) stops renewing its session, and the server ends the
+session about 36 s later. The verifier checks once per interval and also evicts
+the connection of a consumer-group member that is silent past 36 s. If the
+client interval exceeds 36 s, the verifier evicts an idle group member. If it
+exceeds about 72 s, or is 0 to disable client heartbeats, any idle session
+expires. Any other unusable value is rejected instead of silently disabling the
+heartbeat.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
