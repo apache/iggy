@@ -518,7 +518,7 @@ func (c *IggyTcpClient) readOnLink(ctx context.Context, link *tcpLink, code comm
 // A detached connection can still belong to a live session. Only its next
 // bind can decide whether to discard the session's retained operations.
 func closeIfDetached(link *tcpLink, outcome vsr.ReplyOutcome, bound bool) bool {
-	if outcome.Committed || !(errors.Is(outcome.Err, ierror.ErrStaleClient) || bound && errors.Is(outcome.Err, ierror.ErrUnauthenticated)) {
+	if outcome.Committed || !errors.Is(outcome.Err, ierror.ErrStaleClient) && (!bound || !errors.Is(outcome.Err, ierror.ErrUnauthenticated)) {
 		return false
 	}
 	link.close(ierror.ErrTransientNotCommitted)

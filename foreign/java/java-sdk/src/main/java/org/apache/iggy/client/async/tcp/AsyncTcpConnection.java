@@ -920,20 +920,19 @@ public class AsyncTcpConnection {
                             return CompletableFuture.completedFuture(response);
                         }
                         IggyServerException serverError = findServerError(error);
-                        // A stale client eviction drops the link and keeps the session, so the request
-                        // binds it again on a new link.
-                        if (serverError != null
-                                && serverError.getRawErrorCode() == STALE_CLIENT
-                                && lostLink(bindState, serverError)) {
-                            payload.release();
-                            return CompletableFuture.<ByteBuf>failedFuture(new IggyConnectionException(
-                                    "The server dropped the link during BindSession", serverError));
-                        }
-                        if (serverError != null
-                                && (serverError.getRawErrorCode() == UNAUTHENTICATED
-                                        || serverError.getRawErrorCode() == STALE_CLIENT)) {
-                            resetRefusedSession(identity[0], identity[1], serverError.getRawErrorCode());
-                            return sendAuthenticationFrame(channel, payload, commandCode, requestDeadlineNanos);
+                        if (serverError != null) {
+                            // A stale client eviction drops the link and keeps the session, so the request
+                            // binds it again on a new link.
+                            if (serverError.getRawErrorCode() == STALE_CLIENT && lostLink(bindState, serverError)) {
+                                payload.release();
+                                return CompletableFuture.<ByteBuf>failedFuture(new IggyConnectionException(
+                                        "The server dropped the link during BindSession", serverError));
+                            }
+                            if (serverError.getRawErrorCode() == UNAUTHENTICATED
+                                    || serverError.getRawErrorCode() == STALE_CLIENT) {
+                                resetRefusedSession(identity[0], identity[1], serverError.getRawErrorCode());
+                                return sendAuthenticationFrame(channel, payload, commandCode, requestDeadlineNanos);
+                            }
                         }
                         payload.release();
                         return CompletableFuture.<ByteBuf>failedFuture(error);

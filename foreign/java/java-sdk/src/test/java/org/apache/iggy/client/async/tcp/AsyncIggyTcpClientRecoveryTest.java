@@ -20,6 +20,7 @@
 package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Request;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.Response;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
@@ -28,6 +29,10 @@ import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.serde.CommandCode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -51,6 +56,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.EVICTION_STALE_CLIENT;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.TRANSIENT_NOT_ACCEPTED;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.connection;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.registerBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata;
@@ -59,6 +65,57 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AsyncIggyTcpClientRecoveryTest {
+    @Test
+    void shouldPreserveTheOperationIdWhenClearingARouterWithAnUnansweredWrite() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Request> written = new CompletableFuture<>();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == VsrOperation.REGISTER) {
+                    return Response.success(VsrOperation.REGISTER, registerBody(1));
+                }
+                if (request.is(CommandCode.System.GET_CLUSTER_METADATA.getValue(), VsrOperation.NON_REPLICATED)) {
+                    return Response.success(VsrOperation.NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.is(CommandCode.Messages.GET_PARTITION_ROUTE.getValue(), VsrOperation.NON_REPLICATED)) {
+                    return Response.success(
+                            VsrOperation.NON_REPLICATED,
+                            AsyncIggyTcpClientTransientFailoverTest.pollRoute(request, 1, 1, socket.getLocalPort()));
+                }
+                written.complete(request);
+                return Response.noReply();
+            });
+            AsyncTcpConnection parent = connection(socket);
+            PollRouter router = new PollRouter(() -> parent, endpoint -> {
+                throw new IllegalStateException("The coordinator owns the partition");
+            });
+            router.coordinatorEndpoint(
+                    () -> new ConnectionInfo(socket.getInetAddress().getHostAddress(), socket.getLocalPort()));
+            try {
+                parent.connect().get(5, TimeUnit.SECONDS);
+                new UsersTcpClient(() -> parent).login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                var pending = new MessagesTcpClient(() -> parent, new ClientRoutingState(), router)
+                        .sendMessages(
+                                StreamId.of(1L),
+                                TopicId.of(1L),
+                                Partitioning.partitionId(0L),
+                                List.of(Message.of("retained")));
+                var original = written.get(5, TimeUnit.SECONDS);
+                router.clearSession().get(5, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> pending.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> {
+                            var uncertain = (IggyOperationException) error.getCause();
+                            assertThat(uncertain.getErrorCode()).isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN);
+                            assertThat(uncertain.getOperationId()).isEqualTo(original.requestId());
+                        });
+            } finally {
+                router.clearSession().get(5, TimeUnit.SECONDS);
+                parent.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
     @Test
     void shouldRejectNonPositiveResolutionTimeouts() {
         var client = AsyncIggyTcpClient.builder().build();

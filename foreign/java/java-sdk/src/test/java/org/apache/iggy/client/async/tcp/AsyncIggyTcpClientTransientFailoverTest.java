@@ -25,14 +25,11 @@ import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
-import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.identifier.UserId;
-import org.apache.iggy.message.Message;
-import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.serde.CommandCode;
@@ -778,56 +775,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
         }
     }
 
-    @Test
-    void shouldPreserveTheOperationIdWhenClearingARouterWithAnUnansweredWrite() throws Exception {
-        try (ServerSocket socket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
-            CompletableFuture<Request> written = new CompletableFuture<>();
-            CompletableFuture<Void> server = serve(socket, request -> {
-                if (request.operation() == OPERATION_REGISTER) {
-                    return Response.success(OPERATION_REGISTER, registerBody(1));
-                }
-                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
-                }
-                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, pollRoute(request, 1, 1, socket.getLocalPort()));
-                }
-                written.complete(request);
-                return Response.noReply();
-            });
-            AsyncTcpConnection parent = connection(socket);
-            PollRouter router = new PollRouter(() -> parent, endpoint -> {
-                throw new IllegalStateException("The coordinator owns the partition");
-            });
-            router.coordinatorEndpoint(
-                    () -> new ConnectionInfo(socket.getInetAddress().getHostAddress(), socket.getLocalPort()));
-            try {
-                parent.connect().get(5, TimeUnit.SECONDS);
-                new UsersTcpClient(() -> parent).login("iggy", "iggy").get(5, TimeUnit.SECONDS);
-                var pending = new MessagesTcpClient(() -> parent, new ClientRoutingState(), router)
-                        .sendMessages(
-                                StreamId.of(1L),
-                                TopicId.of(1L),
-                                Partitioning.partitionId(0L),
-                                List.of(Message.of("retained")));
-                var original = written.get(5, TimeUnit.SECONDS);
-                router.clearSession().get(5, TimeUnit.SECONDS);
-                assertThatThrownBy(() -> pending.get(5, TimeUnit.SECONDS))
-                        .hasCauseInstanceOf(IggyOperationException.class)
-                        .satisfies(error -> {
-                            var uncertain = (IggyOperationException) error.getCause();
-                            assertThat(uncertain.getErrorCode()).isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN);
-                            assertThat(uncertain.getOperationId()).isEqualTo(original.requestId());
-                        });
-            } finally {
-                router.clearSession().get(5, TimeUnit.SECONDS);
-                parent.close().get(5, TimeUnit.SECONDS);
-            }
-            server.get(5, TimeUnit.SECONDS);
-        }
-    }
-
-    private static AsyncTcpConnection connection(ServerSocket server) {
+    static AsyncTcpConnection connection(ServerSocket server) {
         return new AsyncTcpConnection(
                 server.getInetAddress().getHostAddress(),
                 server.getLocalPort(),
