@@ -660,6 +660,8 @@ pub struct ReplyHeader {
     /// no existing field offset moves and `validate` does not inspect it.
     pub status: u32,
     /// Byte 220 is [`Self::COMMITTED_RESULT`] only for a final committed result.
+    /// Replayed successful PAT creation preserves this proof but returns
+    /// `PersonalAccessTokenAlreadyExists` because its secret cannot be recovered.
     /// Zero and unknown values carry no commitment proof.
     pub reserved: [u8; 4],
     /// Echoes the request, and the plain poll reply overwrites it with the
@@ -779,6 +781,8 @@ impl ReplyHeader {
 
     /// Header evidence of a final committed result. The caller must also validate
     /// the result body and its correlation with the original request.
+    /// PAT creation can replace a committed success with an already-exists error
+    /// when replay cannot recover the original secret.
     #[must_use]
     pub fn has_committed_result(&self) -> bool {
         self.command == Command::Reply

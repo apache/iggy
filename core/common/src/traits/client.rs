@@ -88,7 +88,10 @@ pub trait Client:
     ///
     /// `Ok(())` means a successful commit was proved. A proved committed business
     /// rejection returns its original error. Both release the retained operation
-    /// and its lane. `OperationUncertain(op)` keeps the original frame and lane:
+    /// and its lane. Successful personal access token creation is an exception:
+    /// replay returns `PersonalAccessTokenAlreadyExists` because its original
+    /// secret is unrecoverable, even though the create committed successfully.
+    /// `OperationUncertain(op)` keeps the original frame and lane:
     /// a later denial without committed-result proof cannot settle an earlier send.
     /// TCP, QUIC and WebSocket support recovery; HTTP returns `FeatureUnavailable`.
     ///
