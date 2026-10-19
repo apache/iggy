@@ -39,6 +39,7 @@ use crate::auth::{
     AuthError, AuthenticatedPrincipal, FailedLoginThrottle, PrincipalResolver, SaslAuthenticator,
 };
 use crate::bridge::IggyBridge;
+use crate::cluster_id::ClusterId;
 use crate::error::{KafkaProtocolError, Result};
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
 use crate::listener::{ListenerConfig, SecurityProtocol};
@@ -309,6 +310,7 @@ pub struct KafkaGateway {
     authenticator: Option<Arc<dyn SaslAuthenticator>>,
     bridge: Option<Arc<IggyBridge>>,
     principal_resolver: Option<Arc<dyn PrincipalResolver>>,
+    cluster_id: Option<ClusterId>,
 }
 
 /// Owned by [`KafkaGateway::run`] and shared by every connection it serves.
@@ -377,6 +379,7 @@ impl KafkaGateway {
             authenticator: None,
             bridge: None,
             principal_resolver: None,
+            cluster_id: None,
         }
     }
 
@@ -388,6 +391,17 @@ impl KafkaGateway {
     #[must_use]
     pub fn with_bridge(mut self, bridge: Option<Arc<IggyBridge>>) -> Self {
         self.bridge = bridge;
+        self
+    }
+
+    /// Reports `cluster_id`, already loaded from Iggy, instead of loading it in [`Self::run`].
+    ///
+    /// `main` loads it before it binds the listeners, so a client is never queued behind the
+    /// calls to Iggy. Without a bridge or this, the id is random and lasts as long as the
+    /// process.
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = Some(cluster_id);
         self
     }
 
@@ -421,7 +435,8 @@ impl KafkaGateway {
     /// # Errors
     ///
     /// Returns an error on invalid config, unusable TLS material, or a non-transient `accept()`
-    /// error on any listener.
+    /// error on any listener. With a bridge and no [`Self::with_cluster_id`], also returns the
+    /// bridge's error when it cannot load the cluster id from Iggy.
     pub async fn run(
         self,
         listeners: Vec<BoundListener>,
@@ -478,12 +493,16 @@ impl KafkaGateway {
         // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
-        let state = Arc::new(GatewayState::new(
-            self.bridge.clone(),
-            self.config.max_frame_size,
-            self.config.instance_id,
-            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
-        ));
+        let cluster_id = self.cluster_id().await?;
+        let state = Arc::new(
+            GatewayState::new(
+                self.bridge.clone(),
+                self.config.max_frame_size,
+                self.config.instance_id,
+                GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
+            )
+            .with_cluster_id(cluster_id),
+        );
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -537,6 +556,19 @@ impl KafkaGateway {
         accept_loops.shutdown().await;
         drain(&tracker, &cancel, drain_timeout).await;
         outcome
+    }
+
+    /// The id set by [`Self::with_cluster_id`], else the one stored in Iggy, else a random one.
+    async fn cluster_id(&self) -> Result<ClusterId> {
+        if let Some(cluster_id) = &self.cluster_id {
+            return Ok(cluster_id.clone());
+        }
+        let Some(bridge) = &self.bridge else {
+            let cluster_id = ClusterId::random();
+            info!("no Iggy bridge, so cluster id {cluster_id} lasts only as long as this process");
+            return Ok(cluster_id);
+        };
+        Ok(bridge.load_cluster_id().await?)
     }
 
     /// Refuses to start when the SASL listeners and the configured authenticator disagree.
