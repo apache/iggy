@@ -31,9 +31,10 @@
 //! kcat and the Java consumer read them back through Fetch. The group tests run Java consumers in
 //! one group across a gateway restart and a member leaving.
 //!
-//! Prerequisites are Docker and an already-built `iggy-server`. Missing either skips, the way the
-//! wire-fixture suites do, unless `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure
-//! so a broken CI step cannot leave these silently green.
+//! Prerequisites are Docker, an already-built `iggy-server`, and a host JDK (`javac`) for the
+//! `offsetsForTimes` probe. Missing any skips, the way the wire-fixture suites do, unless
+//! `KAFKA_E2E_REQUIRED=1` is set, which turns a skip into a failure so a broken CI step cannot
+//! leave these silently green.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read};
@@ -44,6 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use iggy::prelude::IggyTimestamp;
 use secrecy::SecretString;
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -347,6 +349,11 @@ async fn start_bridged_gateway_with(
     topics: &[(&str, u32)],
     gateway_config: GatewayConfig,
 ) -> BridgedGateway {
+    start_gateway(server, topics, false, gateway_config).await
+}
+
+/// A bridge to `server` as the root user, with the default topic mapping.
+async fn root_bridge(server: &TestServer) -> IggyBridge {
     let config = IggyBridgeConfig {
         address: server.address.clone(),
         username: ROOT_USER.to_string(),
@@ -357,9 +364,20 @@ async fn start_bridged_gateway_with(
         tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
     };
-    let bridge = IggyBridge::connect(config)
+    IggyBridge::connect(config)
         .await
-        .expect("the bridge connects to a ready server");
+        .expect("the bridge connects to a ready server")
+}
+
+/// A bridged gateway on `gateway_config`, with SASL on when `sasl` is set, creating each
+/// `(topic, partitions)` first. Its listeners are replaced by one on an ephemeral port.
+async fn start_gateway(
+    server: &TestServer,
+    topics: &[(&str, u32)],
+    sasl: bool,
+    gateway_config: GatewayConfig,
+) -> BridgedGateway {
+    let bridge = root_bridge(server).await;
     for &(topic, partitions) in topics {
         bridge
             .ensure_stream_and_topic(topic, partitions)
@@ -368,11 +386,17 @@ async fn start_bridged_gateway_with(
     }
     let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    let listener = BoundListener::new(
-        ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
-        listener,
-    );
-    let gateway = KafkaGateway::new(gateway_config).with_bridge(Some(Arc::new(bridge)));
+    let protocol = if sasl {
+        SecurityProtocol::SaslPlaintext
+    } else {
+        SecurityProtocol::Plaintext
+    };
+    let listener = BoundListener::new(ListenerConfig::new(protocol, addr.to_string()), listener);
+    let mut gateway = KafkaGateway::new(gateway_config).with_bridge(Some(Arc::new(bridge)));
+    if sasl {
+        gateway =
+            gateway.with_authenticator(Arc::new(IggyAuthenticator::new(server.address.clone())));
+    }
     let (shutdown, receiver) = broadcast::channel(1);
     let task = tokio::spawn(async move {
         let _ = gateway.run(vec![listener], receiver).await;
@@ -691,6 +715,16 @@ async fn bridged_stack() -> Option<(TestServer, SocketAddr)> {
     Some((server, gateway))
 }
 
+/// As [`bridged_stack`], with SASL on, so every client has to authenticate before the bridge
+/// serves it.
+async fn sasl_bridged_stack() -> Option<(TestServer, SocketAddr)> {
+    let server = ready_server()?;
+    let gateway = start_gateway(&server, &[(TOPIC, 1)], true, GatewayConfig::default()).await;
+    // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
+    std::mem::forget(gateway.shutdown);
+    Some((server, gateway.addr))
+}
+
 /// Brings up a server once every prerequisite holds, or reports why it could not.
 fn ready_server() -> Option<TestServer> {
     if host_unsupported() || docker_missing() {
@@ -727,6 +761,31 @@ fn produce_to_partition(
     partition: u32,
     records: &[(&str, &str)],
 ) {
+    kcat_produce(gateway, topic, partition, records, &[]).expect_ran("kcat produce");
+}
+
+/// The kcat properties that authenticate as `username` with SASL/PLAIN.
+fn sasl_plain_args(username: &str, password: &str) -> Vec<String> {
+    [
+        "security.protocol=SASL_PLAINTEXT".to_string(),
+        "sasl.mechanisms=PLAIN".to_string(),
+        format!("sasl.username={username}"),
+        format!("sasl.password={password}"),
+    ]
+    .into_iter()
+    .flat_map(|property| ["-X".to_string(), property])
+    .collect()
+}
+
+/// Writes `records` to `partition` of `topic` with kcat's producer, one header on each record,
+/// with `auth` prepended to kcat's arguments.
+fn kcat_produce(
+    gateway: SocketAddr,
+    topic: &str,
+    partition: u32,
+    records: &[(&str, &str)],
+    auth: &[String],
+) -> ClientRun {
     let dir = tempfile::tempdir().expect("create records dir");
     let path = dir.path().join("records.txt");
     let lines: String = records
@@ -734,29 +793,80 @@ fn produce_to_partition(
         .flat_map(|&(key, value)| [key, ":", value, "\n"])
         .collect();
     std::fs::write(&path, lines).expect("write records");
+    let bootstrap = gateway.to_string();
+    let partition = partition.to_string();
+    let mut args: Vec<&str> = vec!["-b", &bootstrap];
+    args.extend(auth.iter().map(String::as_str));
+    args.extend([
+        "-P",
+        "-t",
+        topic,
+        "-p",
+        &partition,
+        "-K",
+        ":",
+        "-H",
+        "trace=e2e",
+        "-l",
+        "/tmp/records.txt",
+    ]);
     run_client(
         KCAT_IMAGE,
-        &[
-            "-b",
-            &gateway.to_string(),
-            "-P",
-            "-t",
-            topic,
-            "-p",
-            &partition.to_string(),
-            "-K",
-            ":",
-            "-H",
-            "trace=e2e",
-            "-l",
-            "/tmp/records.txt",
-        ],
+        &args,
         &[(
             path.to_str().expect("records path is utf-8"),
             "/tmp/records.txt",
         )],
     )
-    .expect_ran("kcat produce");
+}
+
+/// Reads partition 0 of `TOPIC` from the beginning to the high watermark with kcat's consumer,
+/// with `auth` prepended to kcat's arguments. One `record <offset> <key>=<value> <headers>` line
+/// per record.
+fn kcat_consume(gateway: SocketAddr, auth: &[String]) -> ClientRun {
+    let bootstrap = gateway.to_string();
+    let mut args: Vec<&str> = vec!["-b", &bootstrap];
+    args.extend(auth.iter().map(String::as_str));
+    // `-e` stops at the end of the partition, which kcat takes from the high watermark that Fetch
+    // sends. A wrong watermark stops it early or holds it until the container timeout.
+    args.extend([
+        "-C",
+        "-t",
+        TOPIC,
+        "-p",
+        "0",
+        "-o",
+        "beginning",
+        "-e",
+        "-f",
+        "record %o %k=%s %h\n",
+    ]);
+    run_client(KCAT_IMAGE, &args, &[])
+}
+
+/// Asserts `output` holds exactly `records`, in order from offset 0, and that kcat stopped at the
+/// high watermark after them.
+fn assert_read_in_order(output: &str, records: &[(&str, &str)]) {
+    let read: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("record "))
+        .collect();
+    let expected: Vec<String> = records
+        .iter()
+        .enumerate()
+        .map(|(offset, (key, value))| format!("record {offset} {key}={value} trace=e2e"))
+        .collect();
+    assert_eq!(
+        read, expected,
+        "librdkafka must read every record in order, with its key and header, got: {output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "Reached end of topic {TOPIC} [0] at offset {}",
+            records.len()
+        )),
+        "kcat must stop at the high watermark, got: {output}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1109,46 +1219,62 @@ async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back
         return;
     };
     produce_with_kcat(gateway, &RECORDS);
-    // `-e` stops at the end of the partition, which kcat takes from the high watermark that Fetch
-    // sends. A wrong watermark stops it early or holds it until the container timeout.
-    let output = run_client(
-        KCAT_IMAGE,
-        &[
-            "-b",
-            &gateway.to_string(),
-            "-C",
-            "-t",
-            TOPIC,
-            "-p",
-            "0",
-            "-o",
-            "beginning",
-            "-e",
-            "-f",
-            "record %o %k=%s %h\n",
-        ],
-        &[],
+    let output = kcat_consume(gateway, &[]).expect_ran("kcat consume");
+    assert_read_in_order(&output, &RECORDS);
+}
+
+/// #4340: SASL and the bridge together. Every other SASL test stops at Metadata on a gateway with
+/// no bridge, and every produce and consume test runs with SASL off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_sasl_and_the_bridge_when_kcat_produces_and_consumes_should_read_back_in_order() {
+    let Some((_server, gateway)) = sasl_bridged_stack().await else {
+        return;
+    };
+    let auth = sasl_plain_args(ROOT_USER, ROOT_PASSWORD);
+    kcat_produce(gateway, TOPIC, 0, &RECORDS, &auth).expect_ran("kcat produce over SASL");
+    let output = kcat_consume(gateway, &auth).expect_ran("kcat consume over SASL");
+    assert_read_in_order(&output, &RECORDS);
+}
+
+/// The other half of the same path: a client the gateway refuses must not reach the bridge. kcat
+/// exits non-zero here by design, so only its output and what the partition holds are asserted.
+///
+/// What the partition holds is read from Iggy, not through the gateway. Every container shares
+/// the host's address, so the rejected logins put that address in the gateway's failed-login
+/// delay, and a SASL read-back right after could be refused for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_sasl_and_the_bridge_when_a_rejected_client_produces_should_write_nothing() {
+    let Some((server, gateway)) = sasl_bridged_stack().await else {
+        return;
+    };
+    let auth = sasl_plain_args(ROOT_USER, ROOT_PASSWORD);
+    kcat_produce(gateway, TOPIC, 0, &RECORDS, &auth).expect_ran("kcat produce over SASL");
+
+    let rejected = kcat_produce(
+        gateway,
+        TOPIC,
+        0,
+        &[("k4", "delta")],
+        &sasl_plain_args(ROOT_USER, "definitely-not-the-password"),
     )
-    .expect_ran("kcat consume");
-    let read: Vec<&str> = output
-        .lines()
-        .filter(|line| line.starts_with("record "))
-        .collect();
-    let expected: Vec<String> = RECORDS
-        .iter()
-        .enumerate()
-        .map(|(offset, (key, value))| format!("record {offset} {key}={value} trace=e2e"))
-        .collect();
-    assert_eq!(
-        read, expected,
-        "librdkafka must read every record in order, with its key and header, got: {output}"
-    );
+    .text();
     assert!(
-        output.contains(&format!(
-            "Reached end of topic {TOPIC} [0] at offset {}",
-            RECORDS.len()
-        )),
-        "kcat must stop at the high watermark, got: {output}"
+        rejected.contains("Authentication failed"),
+        "a rejected credential must reach the producer as an auth failure, got: {rejected}"
+    );
+    // A client that never authenticates is cut off before Produce; the read-back below is what
+    // proves its record never landed.
+    kcat_produce(gateway, TOPIC, 0, &[("k5", "epsilon")], &[]);
+
+    let watermark = root_bridge(&server)
+        .await
+        .high_watermark(TOPIC, 0)
+        .await
+        .expect("read the partition's high watermark");
+    assert_eq!(
+        watermark,
+        i64::try_from(RECORDS.len()).expect("record count fits i64"),
+        "only the authenticated producer's records may land"
     );
 }
 
@@ -1487,6 +1613,212 @@ fn records_by_partition(output: &[String]) -> BTreeMap<i64, Vec<i64>> {
         }
     }
     read
+}
+
+/// Milliseconds since the epoch, the unit Kafka timestamps use.
+fn now_millis() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch");
+    i64::try_from(elapsed.as_millis()).expect("now fits an i64")
+}
+
+/// `millis` as the `YYYY-MM-DDTHH:mm:SS.sssZ` that `--to-datetime` reads. The zone is explicit,
+/// so the client container's own zone does not matter.
+fn utc_datetime(millis: i64) -> String {
+    let micros = u64::try_from(millis).expect("a time after the epoch") * 1000;
+    IggyTimestamp::from(micros).to_utc_string("%Y-%m-%dT%H:%M:%S%.3fZ")
+}
+
+/// Runs `command` under the same GNU `timeout` bound as [`run_client`].
+fn output_bounded(command: &[&str], what: &str) -> std::process::Output {
+    Command::new("timeout")
+        .args(["--kill-after=10s", CLIENT_RUN_TIMEOUT])
+        .args(command)
+        .output()
+        .unwrap_or_else(|error| panic!("run {what}: {error}"))
+}
+
+/// Compiles `tests/java/OffsetsForTimesProbe.java` against the `kafka-clients` jar of the client
+/// image, into a directory the client container mounts. `None`, after reporting why, when there
+/// is no JDK.
+fn compile_offsets_for_times_probe() -> Option<tempfile::TempDir> {
+    let javac = Command::new("javac")
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !javac {
+        skip("javac is unavailable, so the consumer offsetsForTimes probe cannot be built");
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("create probe dir");
+    let jar = dir.path().join("kafka-clients.jar");
+    let (_, kafka_version) = KAFKA_IMAGE
+        .rsplit_once(':')
+        .expect("the client image is pinned to a version tag");
+    let image_jar = format!("/opt/kafka/libs/kafka-clients-{kafka_version}.jar");
+    let extracted = output_bounded(
+        &[
+            "docker",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--entrypoint",
+            "cat",
+            KAFKA_IMAGE,
+            &image_jar,
+        ],
+        "kafka-clients extraction",
+    );
+    assert!(
+        extracted.status.success(),
+        "extracting {image_jar} failed: {}",
+        String::from_utf8_lossy(&extracted.stderr)
+    );
+    std::fs::write(&jar, extracted.stdout).expect("write kafka-clients jar");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/java/OffsetsForTimesProbe.java");
+    let (jar, out, source) = (
+        jar.to_str().expect("jar path is utf-8"),
+        dir.path().to_str().expect("probe dir is utf-8"),
+        source.to_str().expect("probe source path is utf-8"),
+    );
+    let compiled = output_bounded(
+        &["javac", "--release", "17", "-cp", jar, "-d", out, source],
+        "javac",
+    );
+    assert!(
+        compiled.status.success(),
+        "javac failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    Some(dir)
+}
+
+/// #4516 acceptance: Java's lookups by time resolve against what the gateway stored. Three
+/// records, then a time, then a fourth record a second later, so every lookup has one right
+/// answer whichever clock the client and Iggy stamp with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_records_on_both_sides_of_a_time_when_java_looks_up_by_time_should_find_the_later_one()
+ {
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+    produce_with_kcat(gateway, &RECORDS);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let between = now_millis();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    produce_with_kcat(gateway, &[("k4", "delta")]);
+
+    let get_offsets = |time: &str| {
+        run_client(
+            KAFKA_IMAGE,
+            &[
+                "/opt/kafka/bin/kafka-get-offsets.sh",
+                "--bootstrap-server",
+                &gateway.to_string(),
+                "--topic",
+                TOPIC,
+                "--time",
+                time,
+            ],
+            &[],
+        )
+        .expect_ran(&format!("kafka-get-offsets --time {time}"))
+    };
+    let at = get_offsets(&between.to_string());
+    assert!(
+        at.lines().any(|line| line.trim() == format!("{TOPIC}:0:3")),
+        "a lookup by time must find the record after the time, got: {at}"
+    );
+    let start = get_offsets("0");
+    assert!(
+        start
+            .lines()
+            .any(|line| line.trim() == format!("{TOPIC}:0:0")),
+        "time 0 finds where the partition starts, as AKHQ asks, got: {start}"
+    );
+    let max = get_offsets("-3");
+    assert!(
+        max.lines()
+            .any(|line| line.trim() == format!("{TOPIC}:0:3")),
+        "max-timestamp names the last record, got: {max}"
+    );
+    let future = now_millis() + 3_600_000;
+    let after = get_offsets(&future.to_string());
+    assert!(
+        !after
+            .lines()
+            .any(|line| line.starts_with(&format!("{TOPIC}:0:"))),
+        "a time past every record has no offset, which the tool prints as nothing, got: {after}"
+    );
+
+    let reset = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "--bootstrap-server",
+            &gateway.to_string(),
+            "--group",
+            "e2e-reset-by-time",
+            "--topic",
+            TOPIC,
+            "--reset-offsets",
+            "--to-datetime",
+            &utc_datetime(between),
+            "--execute",
+        ],
+        &[],
+    )
+    .expect_ran("kafka-consumer-groups --reset-offsets --to-datetime");
+    // The tool prints its header and rows without a line break between them, so the row is
+    // matched as a run of fields anywhere in the output.
+    let fields: Vec<&str> = reset.split_whitespace().collect();
+    let moved = fields
+        .windows(4)
+        .any(|row| row == ["e2e-reset-by-time", TOPIC, "0", "3"]);
+    assert!(
+        moved,
+        "the group must move to the first record after the time, got: {reset}"
+    );
+
+    // The consumer's own `offsetsForTimes`, which plain consumers and Kafka Streams seek by time
+    // with, not the Admin call the tools above use. Same request on the wire, different client
+    // code.
+    let Some(probe) = compile_offsets_for_times_probe() else {
+        return;
+    };
+    let probe_dir = probe.path().to_str().expect("probe path is utf-8");
+    let consumer = run_client(
+        KAFKA_IMAGE,
+        &[
+            "java",
+            "-cp",
+            "/opt/kafka/libs/*:/probe",
+            "OffsetsForTimesProbe",
+            &gateway.to_string(),
+            TOPIC,
+            "0",
+            &between.to_string(),
+            "0",
+            &future.to_string(),
+        ],
+        &[(probe_dir, "/probe")],
+    )
+    .expect_ran("java consumer offsetsForTimes");
+    for expected in [
+        format!("time={between} offset=3"),
+        "time=0 offset=0".to_string(),
+        format!("time={future} offset=null"),
+    ] {
+        assert!(
+            consumer.lines().any(|line| line.trim() == expected),
+            "offsetsForTimes must answer `{expected}`, got: {consumer}"
+        );
+    }
 }
 
 /// The TLS-side stack: a bridged gateway with an `SSL` and a `SASL_SSL` listener, client
