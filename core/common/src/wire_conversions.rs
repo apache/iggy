@@ -486,6 +486,7 @@ impl From<StatsResponse> for Stats {
 impl From<ClusterNode> for ClusterNodeResponse {
     fn from(node: ClusterNode) -> Self {
         Self {
+            replica_id: node.replica_id,
             name: node.name,
             ip: node.ip,
             tcp_port: node.endpoints.tcp,
@@ -503,6 +504,7 @@ impl TryFrom<ClusterNodeResponse> for ClusterNode {
 
     fn try_from(w: ClusterNodeResponse) -> Result<Self, Self::Error> {
         Ok(Self {
+            replica_id: w.replica_id,
             name: w.name,
             ip: w.ip,
             endpoints: TransportEndpoints::new(
@@ -1109,5 +1111,23 @@ mod tests {
 
         assert_eq!(options.len(), 1);
         assert!(options.contains_key(&HeaderKey::from_str("segment_size").unwrap()));
+    }
+
+    #[test]
+    fn given_cluster_node_when_converted_to_wire_and_back_should_keep_its_replica_id() {
+        let node = ClusterNode {
+            replica_id: 2,
+            name: "node-2".to_owned(),
+            ip: "10.0.0.2".to_owned(),
+            endpoints: TransportEndpoints::new(8090, 8080, 3000, 8092),
+            role: ClusterNodeRole::Follower,
+            status: ClusterNodeStatus::Healthy,
+        };
+
+        let wire = ClusterNodeResponse::from(node);
+        assert_eq!(wire.replica_id, 2);
+
+        let node = ClusterNode::try_from(wire).unwrap();
+        assert_eq!(node.replica_id, 2);
     }
 }

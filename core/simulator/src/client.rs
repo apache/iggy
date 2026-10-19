@@ -21,6 +21,7 @@ use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest, JoinConsumerGroupRequest,
+    LeaveConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -52,7 +53,9 @@ use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
     WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
 };
-use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
+use metadata::stm::user::{
+    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
+};
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
@@ -147,7 +150,6 @@ impl SimClient {
             header.partition_incarnation = context.incarnation;
             header.owner_generation = context.owner_generation;
             header.minimum_metadata_op = context.metadata_op;
-            header.metadata_watermark = context.metadata_op;
         }
     }
 
@@ -181,16 +183,17 @@ impl SimClient {
     /// nothing, because `ClientTable` admits anything above the watermark
     /// (`client_table.rs`: "There is no `RequestGap`").
     ///
-    /// `NonReplicated` reads never reach here — the poll path builds its own
-    /// header and reads the counter without advancing it, matching the SDK,
-    /// since the server ignores the id for ops the table never sees.
+    /// `NonReplicated` reads never reach here. The poll path builds its own
+    /// header and reads the counter without advancing it, because the server
+    /// ignores the id for ops the table never sees. The SDK spends one id per
+    /// bound read, so a link can match each reply to its request.
     fn next_request_id(&self) -> u64 {
         let next = self.request_counter.get() + 1;
         self.request_counter.set(next);
         next
     }
 
-    fn session_id(&self) -> u64 {
+    pub(crate) fn session_id(&self) -> u64 {
         let s = self.session.get();
         assert!(
             s > 0,
@@ -240,12 +243,19 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let verifier =
-            consensus::client_table::bind_verifier(self.client_id, 0, &self.bind_secret());
+        let registration = iggy_binary_protocol::requests::users::login_register::RegisterRequest {
+            user_created_at: ROOT_USER_CREATED_AT_MICROS,
+            bind_verifier: consensus::client_table::bind_verifier(
+                self.client_id,
+                0,
+                &self.bind_secret(),
+            ),
+        }
+        .to_bytes();
         let header = RoutedRequestHeader {
             command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
-            size: (header_size + verifier.len()) as u32,
+            size: (header_size + registration.len()) as u32,
             client: self.client_id,
             session: 0,
             request: 0,
@@ -258,7 +268,7 @@ impl SimClient {
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = header_bytes.to_vec();
-        buffer.extend_from_slice(&verifier);
+        buffer.extend_from_slice(&registration);
 
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("register request must be valid")
@@ -488,6 +498,22 @@ impl SimClient {
             group_id: WireIdentifier::named(group).expect("group name must be valid"),
         };
         self.build_request(Operation::JoinConsumerGroup, &wire.to_bytes())
+    }
+
+    /// # Panics
+    /// Panics if any identifier is not a valid name.
+    pub fn leave_consumer_group(
+        &self,
+        stream: &str,
+        topic: &str,
+        group: &str,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = LeaveConsumerGroupRequest {
+            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
+            group_id: WireIdentifier::named(group).expect("group name must be valid"),
+        };
+        self.build_request(Operation::LeaveConsumerGroup, &wire.to_bytes())
     }
 
     /// # Panics

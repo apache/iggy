@@ -1337,7 +1337,7 @@ mod tests {
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
     const OFFSETS_MAGIC: &[u8; 4] = b"ICO1";
-    const OFFSETS_VERSION: u8 = 7;
+    const OFFSETS_VERSION: u8 = 8;
     const RETRY_CHECKPOINT_MAGIC: &[u8; 4] = b"IRP2";
 
     #[compio::test]
@@ -2237,7 +2237,8 @@ mod tests {
         }
         let mut protection = OFFSETS_MAGIC.to_vec();
         protection.push(OFFSETS_VERSION);
-        for value in [1_u64, 0] {
+        // next_offset, emptied_at, required_metadata_frontier
+        for value in [1_u64, 0, 0] {
             protection.extend_from_slice(&value.to_le_bytes());
         }
         protection.extend_from_slice(

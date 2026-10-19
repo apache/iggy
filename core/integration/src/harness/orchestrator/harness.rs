@@ -16,7 +16,7 @@
 // under the License.
 
 use super::builder::TestHarnessBuilder;
-use crate::harness::config::{ClientConfig, JwksConfig};
+use crate::harness::config::{ClientConfig, JWKS_ISSUER_USERNAME, JwksConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
@@ -144,7 +144,10 @@ impl TestHarness {
                     jwks_url.as_str(),
                 );
                 server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_AUDIENCE", "iggy");
-                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_USER_ID", "1");
+                server.add_env(
+                    "IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_USERNAME",
+                    JWKS_ISSUER_USERNAME,
+                );
             }
 
             self.jwks_server = Some(mock_server);

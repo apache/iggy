@@ -182,11 +182,11 @@ const DEFAULT_KILL_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_DOWNTIME: Duration = Duration::from_secs(5);
 
 /// Every reconnect gives a client a new id, so a member whose node dies stays
-/// behind as a stale member until its lease expires. These values (taken from
-/// client_table_restart.rs) expire it within one kill interval instead of the
-/// default 30 s.
+/// behind as a stale member until its lease expires. The lease lasts 1.2 x the
+/// client heartbeat interval. These values (taken from client_table_restart.rs)
+/// expire it within one kill interval instead of the default 36 s.
 const GROUP_HEARTBEAT_INTERVAL: &str = "500ms";
-const GROUP_SESSION_TIMEOUT: &str = "8s";
+const CLIENT_HEARTBEAT_INTERVAL: &str = "7s";
 /// Each node runs its own segment cleaner on a timer that starts at boot.
 /// With the default one-minute interval, a node killed within a minute of its
 /// boot never cleans, so expiry would barely run during the chaos phase.
@@ -483,8 +483,8 @@ fn build_cluster() -> TestHarness {
             GROUP_HEARTBEAT_INTERVAL.to_owned(),
         ),
         (
-            "consumer_group.session_timeout".to_owned(),
-            GROUP_SESSION_TIMEOUT.to_owned(),
+            "heartbeat.interval".to_owned(),
+            CLIENT_HEARTBEAT_INTERVAL.to_owned(),
         ),
         (
             "data_maintenance.messages.interval".to_owned(),
@@ -2557,7 +2557,7 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
             "producer_batch": PRODUCER_BATCH,
             "producer_pause_ms": PRODUCER_PAUSE.as_millis(),
             "heartbeat_interval": GROUP_HEARTBEAT_INTERVAL,
-            "session_timeout": GROUP_SESSION_TIMEOUT,
+            "client_heartbeat_interval": CLIENT_HEARTBEAT_INTERVAL,
             "cleaner_interval": CLEANER_INTERVAL,
         },
         "host": {

@@ -19,14 +19,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
     UserClient,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::auth::{AuthError, AuthenticatedPrincipal, PrincipalResolver, resolve_principal};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
@@ -132,8 +134,8 @@ async fn permit_by(turn: &Arc<Semaphore>, deadline: Instant) -> Option<OwnedSema
 ///
 /// Each producer sends on a client of its own, one request at a time. Producers past the session
 /// limit share one more. Metadata, `CreateTopics`, `DeleteTopics`, `DescribeConfigs` and
-/// `AlterConfigs` share another. Topic probes use a client of their own, Fetch polls one per read
-/// slot, and offset calls two per offset slot.
+/// `AlterConfigs` share another. Topic probes and certificate user lookups each use a client of
+/// their own, Fetch polls one per read slot, and offset calls two per offset slot.
 ///
 /// Each client signs in at the metadata leader, and a view change or a refused call can move it to
 /// another node. So in a cluster, two clients can read replicas that are not at the same offset.
@@ -148,6 +150,8 @@ pub struct IggyBridge {
     fetch_pool: Arc<FetchPool>,
     /// The client of every topic probe, Fetch's and `ListOffsets`'. See `probe`.
     probe_client: LazyClient,
+    /// The client of every certificate user lookup. See `resolve`.
+    lookup_client: LazyClient,
     /// Group offset slots, each with a commit client and a read client. See `OffsetPool`.
     offset_pool: OffsetPool,
 }
@@ -189,6 +193,7 @@ impl IggyBridge {
             produce_pool,
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
         })
     }
@@ -245,16 +250,25 @@ impl IggyBridge {
     /// one fails, and the error is the first one.
     pub async fn close(&self) -> Result<(), BridgeError> {
         // At once, so a client that is slow to close does not use up the time of the others.
-        let (produce_clients, fetch_clients, probe_client, offset_clients, shared_client) = tokio::join!(
+        let (
+            produce_clients,
+            fetch_clients,
+            probe_client,
+            lookup_client,
+            offset_clients,
+            shared_client,
+        ) = tokio::join!(
             self.produce_pool.close(),
             self.fetch_pool.close(),
             self.probe_client.close(),
+            self.lookup_client.close(),
             self.offset_pool.close(),
             sign_out_and_shut_down(&self.client),
         );
         produce_clients
             .and(fetch_clients)
             .and(probe_client)
+            .and(lookup_client)
             .and(offset_clients)
             .and(shared_client)
     }
@@ -281,6 +295,7 @@ impl IggyBridge {
             .expect("a valid mapping"),
             max_message_size: crate::bridge::DEFAULT_MAX_MESSAGE_SIZE,
             produce_sessions: crate::bridge::ProduceSessionLimits::default(),
+            tls: crate::bridge::IggyTls::default(),
         };
         Self {
             client: Arc::new(client),
@@ -288,6 +303,7 @@ impl IggyBridge {
             config,
             fetch_pool: Arc::new(FetchPool::new()),
             probe_client: LazyClient::default(),
+            lookup_client: LazyClient::default(),
             offset_pool: OffsetPool::new(),
         }
     }
@@ -305,14 +321,58 @@ async fn connect_client(config: &IggyBridgeConfig) -> Result<IggyClient, BridgeE
         Credentials::UsernamePassword(config.username.clone(), config.password.clone());
     // A send over the SDK's 8 KiB write buffer leaves as two writes, header then payload. With
     // Nagle on, the payload waits for the server's delayed ACK of the header: about 40 ms a send.
-    let client = IggyClientBuilder::new()
+    let mut builder = IggyClientBuilder::new()
         .with_tcp()
         .with_server_address(config.address.clone())
         .with_no_delay()
         .with_auto_sign_in(AutoLogin::Enabled(credentials))
-        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES))
-        .build()
-        .map_err(BridgeError::Iggy)?;
+        .with_reconnection_max_retries(Some(RECONNECTION_RETRIES));
+    if config.tls.enabled {
+        builder = builder.with_tls_enabled(true);
+        if !config.tls.domain.is_empty() {
+            builder = builder.with_tls_domain(config.tls.domain.clone());
+        }
+        if let Some(ref ca_file) = config.tls.ca_file {
+            builder = builder.with_tls_ca_file(ca_file.clone());
+        }
+    }
+    let client = builder.build().map_err(BridgeError::Iggy)?;
     with_request_timeout(client.connect()).await?;
     Ok(client)
+}
+
+impl std::fmt::Debug for IggyBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IggyBridge").finish_non_exhaustive()
+    }
+}
+
+/// A session of the bridge's own answers for the users client certificates name. It runs as the
+/// bridge's Iggy user, so that account needs `read_users` for any certificate to be admitted.
+///
+/// Not the lockstep client: a stuck Produce send would hold every new mTLS connection past its
+/// handshake budget, and a burst of handshakes would queue ahead of Produce.
+///
+/// Detached because the caller's `pre_auth_timeout` can be shorter than `REQUEST_TIMEOUT`:
+/// cancelling the lookup there would also cancel the deadline that drops a stuck client, and
+/// every later lookup would queue behind it.
+#[async_trait]
+impl PrincipalResolver for IggyBridge {
+    async fn resolve(&self, username: &str) -> Result<AuthenticatedPrincipal, AuthError> {
+        let client = self.lookup_client.clone();
+        let config = self.config.clone();
+        let username = username.to_owned();
+        let lookup = async move {
+            let connected = client.connected(&config).await?;
+            Ok(resolve_principal(connected.as_ref(), &username).await)
+        };
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        match self.lookup_client.until_detached(deadline, lookup).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                warn!(%error, "could not reach Iggy to look up the certificate's user");
+                Err(AuthError::Unavailable)
+            }
+        }
+    }
 }

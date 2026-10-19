@@ -29,6 +29,9 @@ mod legacy_login_vsr;
 // arm) must deny typed (InvalidCommand) at the read gate, and an undeclared
 // operation byte at the funnel, not stall or reply empty-ok.
 mod unknown_code_vsr;
+// A read held for the metadata frontier runs off the connection drain, so a
+// frame pipelined behind it gets its reply first.
+mod pipelined_frames_vsr;
 // A failed credential login must report the credential failure, not the
 // payload shape it fell through to.
 mod login_credentials_vsr;

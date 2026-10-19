@@ -45,6 +45,10 @@ const SELF_NODE_NAME: &str = "iggy-node";
 /// single-node label.
 const SINGLE_NODE_CLUSTER_NAME: &str = "single-node";
 
+/// Replica id of a cluster-disabled server: boot refuses any other
+/// `--replica-id` in that mode, so the synthesized self node reports it too.
+pub const SINGLE_NODE_REPLICA_ID: u8 = 0;
+
 /// Client-facing host for the cluster-disabled single node, normalized the way
 /// [`client_host`] normalizes the roster path so one address cannot publish in
 /// two spellings. Normalizing matters beyond tidiness: an SDK that brackets an
@@ -196,6 +200,7 @@ impl ClusterRoster {
                 .nodes
                 .iter()
                 .map(|node| ClusterNode {
+                    replica_id: node.config().replica_id,
                     name: node.config().name.clone(),
                     ip: client_host(node, client_ip),
                     endpoints: ports_to_endpoints(&node.config().ports),
@@ -218,6 +223,7 @@ impl ClusterRoster {
         ClusterMetadata {
             name: SINGLE_NODE_CLUSTER_NAME.to_owned(),
             nodes: vec![ClusterNode {
+                replica_id: SINGLE_NODE_REPLICA_ID,
                 name: SELF_NODE_NAME.to_owned(),
                 ip: self.self_advertised.clone(),
                 endpoints: ports_to_endpoints(self.self_ports()),
@@ -286,6 +292,38 @@ mod tests {
 
     fn roster(advertised_address: Option<String>) -> ClusterRoster {
         roster_of(node_config(advertised_address))
+    }
+
+    #[test]
+    fn cluster_metadata_reports_each_node_under_its_configured_replica_id() {
+        // Listed out of replica-id order, so an id taken from the position
+        // would name the wrong replica.
+        let mut cluster_roster = roster(None);
+        cluster_roster.nodes = [("node-a", 2), ("node-b", 0), ("node-c", 1)]
+            .into_iter()
+            .map(|(name, replica_id)| {
+                let mut node = node_config(None);
+                node.name = name.to_owned();
+                node.replica_id = replica_id;
+                ResolvedClusterNode::try_from(node).expect("valid roster node")
+            })
+            .collect();
+
+        let metadata = cluster_roster.cluster_metadata(Some(0), None);
+
+        let reported: Vec<_> = metadata
+            .nodes
+            .iter()
+            .map(|node| (node.name.as_str(), node.replica_id, node.role))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("node-a", 2, ClusterNodeRole::Follower),
+                ("node-b", 0, ClusterNodeRole::Leader),
+                ("node-c", 1, ClusterNodeRole::Follower),
+            ]
+        );
     }
 
     #[test]
@@ -448,6 +486,7 @@ mod tests {
         let metadata = roster.cluster_metadata(None, None);
 
         assert_eq!(metadata.nodes.len(), 1);
+        assert_eq!(metadata.nodes[0].replica_id, 0);
         assert_eq!(metadata.nodes[0].ip, "broker-1.example.com");
         assert_eq!(metadata.nodes[0].endpoints.tcp, 8090);
         assert_eq!(metadata.nodes[0].role, ClusterNodeRole::Leader);

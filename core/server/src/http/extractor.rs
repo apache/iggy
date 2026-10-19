@@ -24,12 +24,13 @@ use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use iggy_common::{IggyError, PersonalAccessToken};
+use iggy_common::{IggyError, IggyTimestamp, PersonalAccessToken};
 use send_wrapper::SendWrapper;
 use tracing::debug;
 
 use super::HttpState;
 use super::error::AuthError;
+use super::jwt::TokenSubject;
 use super::session::HttpSession;
 use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
 use crate::http::ClientAddr;
@@ -74,17 +75,35 @@ impl FromRequestParts<HttpState> for Authenticated {
         // `RefCell` borrow or `DashMap` guard across the `.await` (each such
         // critical section is synchronous), so a cooperatively-scheduled sibling
         // task on this thread never observes a borrowed session table.
-        let (key, user_id, expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
-        let session = SendWrapper::new(state.resolve_session(key, user_id, expiry)).await?;
+        let (jwt_id, user_id, user_created_at, expiry) =
+            SendWrapper::new(resolve_credential(state, bearer)).await?;
+        // External issuers choose their own jti, and their configured username
+        // can resolve to another account later. Scope the session to this account.
+        let key = jwt_id.map_or_else(
+            || {
+                format!(
+                    "{PAT_KEY_PREFIX}{}",
+                    PersonalAccessToken::hash_token(bearer)
+                )
+            },
+            |jwt_id| {
+                format!(
+                    "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
+                    user_created_at.as_micros()
+                )
+            },
+        );
+        let session =
+            SendWrapper::new(state.resolve_session(key, user_id, user_created_at, expiry)).await?;
         Ok(Self {
             session: SendWrapper::new(session),
         })
     }
 }
 
-/// Read-only caller identity for a protected read route: the authenticated user
-/// id plus the request path/query used for follower redirects, and no minted VSR
-/// session.
+/// Read-only caller identity: the account's id and creation timestamp, plus the
+/// request path/query used for follower redirects. The timestamp prevents user
+/// ID reuse from changing the caller across a wait.
 ///
 /// Unlike [`Authenticated`], it verifies the bearer WITHOUT minting or
 /// Registering a VSR session. Reads are served from the local metadata STM and
@@ -94,6 +113,7 @@ impl FromRequestParts<HttpState> for Authenticated {
 /// [`resolve_credential`] chokepoint, so a JWT and a PAT are honored identically.
 pub struct Identity {
     pub user_id: u32,
+    pub user_created_at: IggyTimestamp,
     /// Original request path + query (e.g. `/streams?consistency=linearizable`),
     /// captured so a linearizable read that reaches a follower can build the
     /// `Location` for its 307 redirect to the primary. Empty only when the URI
@@ -116,7 +136,7 @@ impl FromRequestParts<HttpState> for Identity {
     ) -> Result<Self, Self::Rejection> {
         let bearer = bearer_token(&parts.headers)?;
 
-        // Verify only. The session key and expiry `resolve_credential` also
+        // Verify only. The JWT id and expiry `resolve_credential` also
         // returns feed the write path's session table; a read discards them -
         // its read-your-writes floor is keyed by user id, not by credential
         // (see `MetadataWatermarks`).
@@ -126,7 +146,8 @@ impl FromRequestParts<HttpState> for Identity {
         // ever runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell`
         // borrow or `DashMap` guard across the `.await`, so a sibling task
         // scheduled on this thread meanwhile never observes a borrowed cell.
-        let (_key, user_id, _expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
+        let (_jwt_id, user_id, user_created_at, _expiry) =
+            SendWrapper::new(resolve_credential(state, bearer)).await?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -144,6 +165,7 @@ impl FromRequestParts<HttpState> for Identity {
         }
         Ok(Self {
             user_id,
+            user_created_at,
             path_and_query,
             client_ip,
         })
@@ -163,37 +185,43 @@ pub(in crate::http) fn bearer_token(headers: &HeaderMap) -> Result<&str, IggyErr
         .ok_or(IggyError::AccessTokenMissing)
 }
 
-/// Map a bearer credential to its `(session key, user id, expiry secs)`.
+/// Map a bearer credential to its `(optional JWT id, user id, user created_at,
+/// expiry secs)`. Only `Authenticated` builds a session key from these facts.
 ///
-/// A JWT is the primary credential, keyed by its `jti`. A raw PAT presented as
-/// the bearer is the documented fallback, keyed by the same 256-bit BLAKE3
-/// digest (`PersonalAccessToken::hash_token`) Iggy already indexes PATs by, so
-/// the key is stable and collision-free while the raw secret never enters the
-/// table. The JWT verify is `async` and `!Send` (a trusted-issuer token may
-/// fetch the issuer's JWKS on a cache miss), so both call sites drive it inside
-/// a `SendWrapper`; the PAT check is local and synchronous. Also the forward
-/// middleware's verify-only gate: a follower proves the bearer before relaying
-/// a request, without minting a session.
+/// A JWT is the primary credential, keyed by its account and `jti`. A raw PAT
+/// presented as the bearer is the documented fallback, keyed by the same
+/// 256-bit BLAKE3 digest (`PersonalAccessToken::hash_token`) Iggy already
+/// indexes PATs by, so the key is stable and collision-free while the raw
+/// secret never enters the table. The JWT verify is `async` and `!Send` (a
+/// trusted-issuer token may fetch the issuer's JWKS on a cache miss), so both
+/// call sites drive it inside a `SendWrapper`; the PAT check is local and
+/// synchronous. Also the forward middleware's verify-only gate: a follower
+/// proves the bearer before relaying a request, without minting a session.
+///
+/// The `created_at` names the account behind the credential, because a deleted
+/// user's id goes to the next user created. A self-issued JWT must name the
+/// account that holds its id now, and a trusted-issuer JWT resolves the
+/// username its issuer config names.
 pub(in crate::http) async fn resolve_credential(
     state: &HttpState,
     bearer: &str,
-) -> Result<(String, u32, u64), AuthError> {
-    if let Ok(claims) = state.jwt.decode(bearer).await
-        && let Ok(user_id) = claims.sub.parse::<u32>()
-    {
-        state.ensure_active_user(user_id)?;
-        return Ok((
-            format!("{JWT_KEY_PREFIX}{}", claims.jti),
-            user_id,
-            claims.exp,
-        ));
+) -> Result<(Option<String>, u32, IggyTimestamp, u64), AuthError> {
+    if let Ok(token) = state.jwt.decode(bearer).await {
+        let (user_id, user_created_at) = match token.subject {
+            TokenSubject::Account {
+                user_id,
+                created_at,
+            } => (
+                user_id,
+                state.ensure_active_user(user_id, Some(created_at))?,
+            ),
+            TokenSubject::TrustedIssuer(issuer) => state.trusted_issuer_user(&issuer)?,
+        };
+        return Ok((Some(token.jti), user_id, user_created_at, token.exp));
     }
 
-    let (user_id, expiry) = verify_pat_credentials_with_expiry(&state.shard, bearer)
-        .map_err(|_| IggyError::Unauthenticated)?;
-    let key = format!(
-        "{PAT_KEY_PREFIX}{}",
-        PersonalAccessToken::hash_token(bearer)
-    );
-    Ok((key, user_id, expiry))
+    let (user_id, user_created_at, expiry) =
+        verify_pat_credentials_with_expiry(&state.shard, bearer)
+            .map_err(|_| IggyError::Unauthenticated)?;
+    Ok((None, user_id, user_created_at, expiry))
 }

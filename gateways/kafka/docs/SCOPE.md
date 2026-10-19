@@ -14,7 +14,7 @@ once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
-| TCP listener on `127.0.0.1:9093` (configurable) | Done | `src/server.rs`, `src/main.rs` |
+| TCP listener on `127.0.0.1:9093` (configurable), one listener per security protocol with TLS on the `SSL` ones | Done | `src/server.rs`, `src/listener.rs`, `src/tls/`, `src/main.rs` |
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
 | Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
@@ -50,7 +50,7 @@ it knows the server supports flexible encoding.
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
-| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
+| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
@@ -107,9 +107,9 @@ All API keys not listed above close the connection (see Governance model above) 
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
-| 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
-| 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
-| 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 17 | SaslHandshake | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 29 | DescribeAcls | Implemented on listeners that name a principal: the SASL ones, and `SSL` with client certificates; advertised only there ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
+| 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
 | 23, 27, 30, 31, 34, 35, 37+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, IncrementalAlterConfigs (44), etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
@@ -424,7 +424,12 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 - [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
       bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
       (31) are not implemented and not advertised
-- [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
+- [x] TLS on the gateway listener ([#4510](https://github.com/apache/iggy/issues/4510)):
+      Kafka-style listeners, one per security protocol, each advertising its own address;
+      rustls with certificate reload; client certificates mapped to Iggy users through
+      `ssl.principal.mapping.rules` on an `SSL` listener; TLS on the bridge's own hop to Iggy.
+      Acting as the mapped user on the data plane is
+      [#4518](https://github.com/apache/iggy/issues/4518)
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys
 

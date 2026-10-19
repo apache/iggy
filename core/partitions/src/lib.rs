@@ -130,12 +130,11 @@ pub struct RetainedPartitionState {
     pub durable_offset: u64,
     /// Highest offset it had written, durable or not.
     pub write_offset: u64,
-    /// Whether that incarnation ever stamped an offset, i.e. whether the two
-    /// numbers above describe an offset space at all.
-    pub offset_space_used: bool,
+    pub(crate) offset_space: iggy_partition::OffsetSpace,
     pub consumer_offsets: Vec<(u32, u64)>,
     pub consumer_group_offsets: Vec<(u32, u64)>,
     pub external_group_offsets: Vec<(u32, u64)>,
+    pub(crate) emptied_at: u64,
     pub(crate) consumer_group_owners:
         std::collections::BTreeMap<u64, iggy_partition::InstalledConsumerGroupOwner>,
     pub(crate) history_transition: Option<iggy_partition::InstalledPartitionHistory>,

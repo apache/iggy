@@ -49,7 +49,7 @@ import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailov
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.OPERATION_REGISTER;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.assertServerError;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.client;
-import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.partitionContext;
+import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.partitionRoute;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.registerBody;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.serve;
 import static org.apache.iggy.client.async.tcp.AsyncIggyTcpClientTransientFailoverTest.singleNodeMetadata;
@@ -61,7 +61,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * client's own stream, topic and partition changes drop them all.
  */
 class AsyncIggyTcpClientSendContextCacheTest {
-    private static final int GET_SEND_CONTEXT_CODE = 105;
+    private static final int GET_PARTITION_ROUTE_CODE = 105;
     private static final int OPERATION_SEND_MESSAGES = 160;
     private static final int OPERATION_DELETE_STREAM = 130;
     private static final int OPERATION_DELETE_TOPIC = 134;
@@ -128,7 +128,64 @@ class AsyncIggyTcpClientSendContextCacheTest {
     }
 
     @Test
-    void shouldNotClearTheSendContextCacheWhenItOutgrowsTheRouteCacheLimit() {
+    void shouldRetryCountDiscoveryAndRefreshBalancedAndKeyPartitioningFromEveryRoute() throws Exception {
+        try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+            AtomicInteger routes = new AtomicInteger();
+            List<Long> partitions = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> server = serve(socket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    int lookup = routes.incrementAndGet();
+                    if (lookup == 1) {
+                        return Response.error(OPERATION_NON_REPLICATED, AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED);
+                    }
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            Unpooled.buffer()
+                                    .writeLongLE(1)
+                                    .writeLongLE(0)
+                                    .writeIntLE(0)
+                                    .writeIntLE(lookup == 2 ? 2 : 4)
+                                    .writeByte(0));
+                }
+                if (request.operation() == OPERATION_SEND_MESSAGES) {
+                    partitions.add(Integer.toUnsignedLong(ByteBuffer.wrap(request.body())
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .getInt(18)));
+                    return Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
+                }
+                throw new IllegalStateException("Unexpected request: " + request);
+            });
+            AsyncIggyTcpClient client = client(socket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                for (int sent = 0; sent < 3; sent++) {
+                    client.messages()
+                            .sendMessages(STREAM, TopicId.of(1L), Partitioning.balanced(), List.of(Message.of("m")))
+                            .get(5, TimeUnit.SECONDS);
+                }
+                Partitioning keyed = Partitioning.messagesKey("updated-count");
+                client.messages()
+                        .sendMessages(STREAM, TopicId.of(1L), keyed, List.of(Message.of("m")))
+                        .get(5, TimeUnit.SECONDS);
+                assertThat(partitions)
+                        .containsExactly(0L, 1L, 2L, org.apache.iggy.hash.XxHash32.hashUnsigned(keyed.value()) % 4);
+                assertThat(routes).hasValueGreaterThanOrEqualTo(4);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldBoundTheSharedRouteCache() {
         // Thousands of round trips through a fake server take longer than the
         // client's heartbeat interval, so this runs in memory.
         InMemoryConnection connection = new InMemoryConnection();
@@ -142,7 +199,7 @@ class AsyncIggyTcpClientSendContextCacheTest {
             messages.sendMessages(STREAM, TopicId.of(1L), Partitioning.partitionId(0L), List.of(Message.of("m")))
                     .join();
 
-            assertThat(connection.discoveries).hasValue(ROUTE_CACHE_LIMIT + 1);
+            assertThat(connection.discoveries).hasValue(ROUTE_CACHE_LIMIT + 2);
         } finally {
             connection.close().join();
         }
@@ -159,10 +216,10 @@ class AsyncIggyTcpClientSendContextCacheTest {
                 if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
                     return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
                 }
-                if (request.is(GET_SEND_CONTEXT_CODE, OPERATION_NON_REPLICATED)) {
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
                     fake.discoveries.incrementAndGet();
                     long incarnation = fake.incarnation(request, SEND_CONTEXT_TOPIC_OFFSET);
-                    return Response.success(OPERATION_NON_REPLICATED, partitionContext(Unpooled.buffer(), incarnation));
+                    return Response.success(OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), incarnation));
                 }
                 if (request.operation() == OPERATION_SEND_MESSAGES) {
                     fake.sentIncarnations.add(request.incarnation());
@@ -233,14 +290,36 @@ class AsyncIggyTcpClientSendContextCacheTest {
         }
 
         @Override
-        CompletableFuture<ByteBuf> send(
-                int commandCode, ByteBuf payload, long requestDeadlineNanos, TransientFailoverState failoverState) {
+        boolean isAuthenticated() {
+            return true;
+        }
+
+        @Override
+        long[] sessionIdentity() {
+            return new long[] {1, 2, 3};
+        }
+
+        @Override
+        byte[] bindSecret(long low, long high, long epoch) {
+            return new byte[32];
+        }
+
+        @Override
+        CompletableFuture<ByteBuf> sendRouted(
+                int commandCode,
+                ByteBuf payload,
+                long generation,
+                long requestDeadlineNanos,
+                TransientFailoverState failoverState) {
             payload.release();
-            if (commandCode != GET_SEND_CONTEXT_CODE) {
+            if (commandCode == GET_CLUSTER_METADATA_CODE) {
+                return CompletableFuture.completedFuture(singleNodeMetadata(1));
+            }
+            if (commandCode != GET_PARTITION_ROUTE_CODE) {
                 return CompletableFuture.completedFuture(Unpooled.EMPTY_BUFFER);
             }
             discoveries.incrementAndGet();
-            return CompletableFuture.completedFuture(partitionContext(Unpooled.buffer(), 1));
+            return CompletableFuture.completedFuture(partitionRoute(Unpooled.buffer(), 1));
         }
     }
 

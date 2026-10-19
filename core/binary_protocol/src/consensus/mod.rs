@@ -51,9 +51,10 @@ pub use consumer_session::{
 pub use error::ConsensusError;
 pub use header::{
     CHECKSUM_UNSEALED, CommitHeader, ConsensusHeader, DVC_HEADERS_MAX, DoViewChangeHeader,
-    EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
-    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, PrepareHeader, PrepareOkHeader,
+    EvictionHeader, EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader,
+    ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
+    LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, PrepareHeader, PrepareOkHeader,
     RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
     RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
     RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,

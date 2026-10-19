@@ -52,12 +52,6 @@ public sealed class VsrReplyDecoderTests
         return VsrTestPayloads.Concat(VsrTestPayloads.UInt32(0), payload);
     }
 
-    private static byte[] RejectionBody(uint code)
-    {
-        return VsrTestPayloads.Concat(VsrTestPayloads.UInt32(1), VsrTestPayloads.UInt32(0),
-            VsrTestPayloads.UInt32((int)code));
-    }
-
     [Fact]
     public void Decode_StripsTheResultSectionFromACommittedMetadataReply()
     {
@@ -72,7 +66,7 @@ public sealed class VsrReplyDecoderTests
     [Fact]
     public void Decode_CommittedRejectionThrowsTheTypedError()
     {
-        var body = RejectionBody(1009);
+        var body = VsrTestPayloads.Rejection(1009);
 
         var exception = Assert.Throws<IggyInvalidStatusCodeException>(() =>
             VsrReplyDecoder.Decode(ReplyHeader(VsrOperation.CreateStream, body.Length), body));
@@ -284,7 +278,7 @@ public sealed class VsrReplyDecoderTests
     public void ReadResultSectionLength_CoversTheCountAndItsEntries()
     {
         Assert.Equal(4, VsrReplyDecoder.ReadResultSectionLength(SuccessBody(1, 2)));
-        Assert.Equal(12, VsrReplyDecoder.ReadResultSectionLength(RejectionBody(1009)));
+        Assert.Equal(12, VsrReplyDecoder.ReadResultSectionLength(VsrTestPayloads.Rejection(1009)));
         Assert.Null(VsrReplyDecoder.ReadResultSectionLength(VsrTestPayloads.UInt32(1)));
 
         // Shorter than the count itself, so there is no section to measure.

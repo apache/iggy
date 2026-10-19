@@ -47,6 +47,7 @@ enum VSRFrame {
     enum ReplyOffset {
         static let size = 48
         static let command = 60
+        static let commit = 184
         static let request = 200
         static let operation = 208
         static let status = 216
@@ -91,6 +92,10 @@ enum VSRFrame {
         let bytes: [UInt8]
         let requestID: UInt64
         let operation: ConsensusOperation
+        /// The session the frame was stamped under, which decides whether it
+        /// can be replayed as it is after a reconnect.
+        let clientID: UInt128Value
+        let session: UInt64
     }
 
     /// Builds the complete request frame for a command code and its encoded
@@ -151,7 +156,7 @@ enum VSRFrame {
             buffer.storeBytes(of: partitionContext.metadataOp.littleEndian, toByteOffset: RequestOffset.minimumMetadataOp, as: UInt64.self)
         }
         frame.append(contentsOf: payload)
-        return EncodedRequest(bytes: frame, requestID: requestID, operation: operation)
+        return EncodedRequest(bytes: frame, requestID: requestID, operation: operation, clientID: session.clientID, session: sessionID)
     }
 
     /// Reads the total frame length, header included, from any consensus
@@ -178,6 +183,14 @@ enum VSRFrame {
             return nil
         }
         let start = header.startIndex + ReplyOffset.request
+        return UInt64(littleEndianBytes: header[start..<start + 8])
+    }
+
+    static func readReplyCommit(_ header: ArraySlice<UInt8>) -> UInt64? {
+        guard header.count >= ReplyOffset.commit + 8 else {
+            return nil
+        }
+        let start = header.startIndex + ReplyOffset.commit
         return UInt64(littleEndianBytes: header[start..<start + 8])
     }
 

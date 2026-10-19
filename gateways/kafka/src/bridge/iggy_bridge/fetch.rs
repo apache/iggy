@@ -153,6 +153,23 @@ impl LazyClient {
         result
     }
 
+    /// [`Self::until`] on a task of its own, so the deadline still drops a stuck client when the
+    /// caller stops waiting first.
+    pub(super) async fn until_detached<T, Call>(
+        &self,
+        deadline: Instant,
+        call: Call,
+    ) -> Result<T, BridgeError>
+    where
+        T: Send + 'static,
+        Call: Future<Output = Result<T, BridgeError>> + Send + 'static,
+    {
+        let client = self.clone();
+        tokio::spawn(async move { client.until(deadline, call).await })
+            .await
+            .unwrap_or(Err(BridgeError::Timeout))
+    }
+
     /// Signs the client out and shuts it down, if it connected.
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         let Some(client) = self.0.lock().await.take() else {
@@ -397,6 +414,29 @@ mod tests {
             .build()
             .expect("building a client dials nothing");
         Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn given_a_detached_call_whose_caller_gave_up_when_its_deadline_passes_should_drop_the_client()
+     {
+        let client = LazyClient::default();
+        *client.0.lock().await = Some(unconnected());
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let caller = tokio::time::timeout(
+            Duration::from_millis(10),
+            client.until_detached(deadline, std::future::pending::<Result<u8, BridgeError>>()),
+        )
+        .await;
+        assert!(
+            caller.is_err(),
+            "the caller stops waiting before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            client.0.lock().await.is_none(),
+            "the stuck client is dropped at its own deadline, not left for the next lookup"
+        );
     }
 
     #[tokio::test]

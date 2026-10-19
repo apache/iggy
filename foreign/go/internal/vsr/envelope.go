@@ -58,6 +58,11 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		// Non-replicated operations bypass server-side dedup and are routed by
 		// transport identity, so they travel sessionless before Register.
 		request = session.CurrentRequestID()
+		if session.Bound() {
+			if request, err = session.NextRequestID(); err != nil {
+				return err
+			}
+		}
 		sessionID = session.SessionID()
 	default:
 		sessionID = session.SessionID()
