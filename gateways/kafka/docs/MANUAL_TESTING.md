@@ -344,7 +344,7 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
-| 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
+| 2 | ListOffsets | 1 | 7 | 0, 1, 7, 8 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
 | 20 | DeleteTopics | 1 | 5 | 0, 1, 5, 6 |
 | 8 | OffsetCommit | 2 | 9 | 1, 2, 9, 10 |
@@ -499,6 +499,38 @@ Record wall-clock time from `git clone` to I3 passing - README.md's Quick start 
 target for a new contributor ([#3539](https://github.com/apache/iggy/issues/3539) acceptance
 criteria).
 
+### Category J — ListOffsets by timestamp with AKHQ
+
+AKHQ reads a topic's first and last offsets with `ListOffsets` EARLIEST and LATEST, and its
+time search with `offsetsForTimes`. It is not in the automated suite, which would need one more
+CI image. Start Iggy with `iggy`/`iggy` root credentials and the gateway with
+`IGGY_KAFKA_BRIDGE_ENABLED=true` on `127.0.0.1:9093`, create stream `kafka` with topic `orders`
+(2 partitions), and send a few messages to each partition at different times. Then run AKHQ on
+the host network with this `application.yml`:
+
+```yaml
+micronaut:
+  server:
+    port: 18080
+akhq:
+  connections:
+    iggy:
+      properties:
+        bootstrap.servers: "127.0.0.1:9093"
+```
+
+```bash
+docker run -d --name akhq-iggy --network host \
+  -v "$PWD/application.yml:/app/application.yml:ro" tchiotludo/akhq:0.25.1
+```
+
+| ID | Test | Steps | Expected |
+| ---- | ------ | ------- | ---------- |
+| J1 | Topic sizes | `curl -s 'http://127.0.0.1:18080/api/iggy/topic?show=ALL'` | `orders` with `firstOffset` 0 and `lastOffset` equal to each partition's record count, and `size` the total |
+| J2 | Records | `curl -s 'http://127.0.0.1:18080/api/iggy/topic/orders/data?sort=OLDEST'` (also `sort=NEWEST`) | Every record, with its partition, offset, timestamp and value |
+| J3 | Time search | Add `&timestamp=<ISO-8601 time between two sends>` to J2 | Only the records sent after that time |
+| J4 | Teardown | `docker rm -f akhq-iggy` | Container removed |
+
 ---
 
 ## 4. Validation reference
@@ -509,9 +541,9 @@ criteria).
 | ------ | ------ | --------------- |
 | -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
-| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection |
-| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored) |
+| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce or ListOffsets with a bridge: missing topic or partition |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection. ListOffsets with a bridge: Iggy unreachable, partition loading, Iggy refused the read for now, or a lookup by time polled empty without proof that no record matches |
+| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored). ListOffsets with a bridge: past the 100-topic cap, the request deadline passed, or a lookup by time ran out of its time |
 | 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
@@ -591,6 +623,7 @@ kcat version (if used): ___________
 [ ] G1–G11  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3; G11's default `--describe` is expected to fail)
 [ ] H1–H6  Adversarial input
 [ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
+[ ] J1–J4  AKHQ ListOffsets by timestamp
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist

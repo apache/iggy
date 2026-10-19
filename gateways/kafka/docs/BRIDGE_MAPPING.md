@@ -300,10 +300,65 @@ Produce takes the base offset from the send confirmation
 example for a request it classifies as a duplicate, in which case the response carries `-1`
 rather than a guessed offset; Kafka clients surface that as an unknown offset.
 
-ListOffsets LATEST is the high watermark from `IggyBridge::high_watermarks`. EARLIEST has no
+ListOffsets LATEST is the high watermark of the topic probe `IggyBridge::partition_probes` reads
+on the bridge's probe client. EARLIEST has no
 server-side field today (`Partition` carries no log start offset), so it answers `0`. The
 `(messages_count, current_offset) == (0, 0)` ambiguity documented on `high_watermark` in
 `src/bridge/iggy_bridge/offsets.rs` applies to LATEST.
+
+ListOffsets by timestamp ([#4516](https://github.com/apache/iggy/issues/4516)) polls one record
+by time and answers its offset and its timestamp as Fetch reports it: the producer timestamp when
+one was set, otherwise the append time.
+
+| Request | Answer |
+| --- | --- |
+| A timestamp | The first record Iggy appended at or after it |
+| A timestamp past the last record, or any time on a partition that retains no message | No error, offset and timestamp `-1`, as Kafka answers |
+| A lookup that polls empty without proof that no record matches (below) | `NOT_LEADER_OR_FOLLOWER` (6), which clients retry |
+| `MAX_TIMESTAMP` (`-3`, a v7 sentinel, answered at every version) | The last record |
+| A negative time other than the sentinels | The first record, as on a Kafka broker |
+
+Iggy searches by the time it appended each batch, not by the producer timestamp. A Kafka broker
+searches a `CreateTime` topic by producer timestamps, so the two differ when producer clocks
+disagree with Iggy's or records arrive late: a record stamped earlier by its producer but
+appended after the time is found here and skipped there. With clocks in step the difference is
+the delay between send and append. `MAX_TIMESTAMP` is the last record for the same reason, where
+Kafka would name the record with the largest producer timestamp.
+
+The timestamp answered is the producer timestamp when one was set, while the search runs on
+append time. So on a `CreateTime` topic the answer can carry a timestamp earlier than the one
+asked for, which a Kafka broker never sends. Clients seek by the offset, but
+`OffsetAndTimestamp.timestamp()` shows the timestamp to applications as it is.
+
+Iggy can poll empty while records remain: on a read fault, or before a partition seeds its commit
+point. In a cluster the polls can also reach a node behind the one the probe read, which serves a
+shorter tail. An empty lookup therefore answers `-1` only when:
+
+- a poll of the last record shows it was appended before the time and its offset + 1 reaches the
+  probed high watermark, so the polled node is not behind the probe; or
+- the probe counted no message and the poll of the last record comes back empty too.
+
+Otherwise it answers 6 and the client asks again, since a `-1` would make
+`kafka-consumer-groups --to-datetime` fall back to LATEST and skip the records.
+
+The server reports a message count of 0 both when retention removed every message and when it has
+no stats for the partition, with the high watermark above 0 in both. So a count of 0 alone answers
+nothing, and the lookup polls. When both polls come back empty as well, it answers `-1`, as Kafka
+does for a partition that retains nothing. A node that has no stats for a partition and also polls
+it empty while it holds records answers `-1` too: nothing the probe or the polls return tells the
+two apart, and answering 6 instead would never let a reset by time finish on an expired partition.
+
+A partition Iggy is still loading can read `(messages_count, current_offset) == (0, 0)`, the same
+as an empty one, and the probe cannot tell them apart without a server-side signal. A lookup by
+time in that window still polls, and answers `-1` only when the polls come back empty as well. A
+reset by time there then moves to LATEST.
+
+Lookups by time run one partition at a time and reuse one Fetch read slot, however many
+partitions the request names. A poll that times out frees its slot as it stops, so for a moment
+the request can hold a second one. Each lookup gets a quarter of the request deadline, capped by
+the deadline itself. One whose time has already passed answers `REQUEST_TIMED_OUT` (7) without
+taking or using a slot, and one that does not finish in time answers 7 too. Clients retry 7.
+Repeated entries for one partition and time are looked up once.
 
 ### Header order
 
