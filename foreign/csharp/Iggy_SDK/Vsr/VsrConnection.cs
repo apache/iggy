@@ -35,10 +35,11 @@ internal sealed class VsrConnection : IDisposable
     internal const int MAX_PENDING_REQUESTS = 256;
     private const int TransientRetryIntervalMs = 50;
 
-    private sealed class PendingRequest(byte[] frame, int code, bool clearSensitiveReply, SharedRequestFrame? owner)
+    private sealed class PendingRequest(byte[] frame, int code, long deadline, bool clearSensitiveReply, SharedRequestFrame? owner)
     {
         internal readonly byte[] Frame = frame;
         internal readonly int Code = code;
+        internal readonly long Deadline = deadline;
         internal readonly bool ClearSensitiveReply = clearSensitiveReply;
         internal readonly SharedRequestFrame? Owner = owner;
         internal readonly TaskCompletionSource<VsrAttempt> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -64,6 +65,8 @@ internal sealed class VsrConnection : IDisposable
     private readonly ILogger _logger;
     private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _started;
+    private long _replySilenceDeadline;
+    private bool _waitingForActiveDeadlines;
     private Exception? _failure;
 
     internal Task Closed => _closed.Task;
@@ -164,7 +167,7 @@ internal sealed class VsrConnection : IDisposable
                 VsrHeader.EncodeRequestHeader(encoded, _session, code, body.Span, context, frame);
                 body.CopyTo(encoded.AsMemory(VsrHeader.HEADER_SIZE));
             }
-            request = new PendingRequest(encoded, code, clearSensitiveReply, owner);
+            request = new PendingRequest(encoded, code, deadline, clearSensitiveReply, owner);
             lock (_gate)
             {
                 if (_failure is { } failure)
@@ -198,6 +201,10 @@ internal sealed class VsrConnection : IDisposable
                         request.Started = true;
                         if (_writes.Writer.TryWrite(request))
                         {
+                            if (_replySilenceDeadline == 0)
+                            {
+                                _replySilenceDeadline = Environment.TickCount64 + _requestTimeoutMs;
+                            }
                             break;
                         }
                         owner?.Release();
@@ -294,7 +301,7 @@ internal sealed class VsrConnection : IDisposable
         {
             while (true)
             {
-                await _stream.ReadExactlyAsync(header.AsMemory(0, 1), _lifetime.Token);
+                await ReadFirstReplyByteAsync(header);
                 using var frameCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
                 frameCancellation.CancelAfter(_requestTimeoutMs);
                 await _stream.ReadExactlyAsync(header.AsMemory(1), frameCancellation.Token);
@@ -327,6 +334,9 @@ internal sealed class VsrConnection : IDisposable
                     lock (_gate)
                     {
                         _pending.TryGetValue(requestId, out request);
+                        _replySilenceDeadline = _pending.Count > (request is null ? 0 : 1)
+                            ? Environment.TickCount64 + _requestTimeoutMs : 0;
+                        _waitingForActiveDeadlines = false;
                     }
                     if (request is null)
                     {
@@ -406,6 +416,47 @@ internal sealed class VsrConnection : IDisposable
         catch (Exception error)
         {
             Fail(error);
+        }
+    }
+
+    private async Task ReadFirstReplyByteAsync(byte[] header)
+    {
+        var read = _stream.ReadExactlyAsync(header.AsMemory(0, 1), _lifetime.Token).AsTask();
+        while (true)
+        {
+            try
+            {
+                await read.WaitAsync(TimeSpan.FromMilliseconds(_requestTimeoutMs), _lifetime.Token);
+                return;
+            }
+            catch (TimeoutException)
+            {
+                lock (_gate)
+                {
+                    var now = Environment.TickCount64;
+                    if (_replySilenceDeadline == 0 || _replySilenceDeadline > now)
+                    {
+                        continue;
+                    }
+                    if (!_waitingForActiveDeadlines)
+                    {
+                        // Later arrivals must not keep a silent connection alive indefinitely.
+                        _waitingForActiveDeadlines = true;
+                        foreach (var request in _pending.Values)
+                        {
+                            if (request.Started)
+                            {
+                                _replySilenceDeadline = Math.Max(_replySilenceDeadline, request.Deadline);
+                            }
+                        }
+                        if (_replySilenceDeadline > now)
+                        {
+                            continue;
+                        }
+                    }
+                }
+                throw new IOException("The connection stopped replying before its requests completed.");
+            }
         }
     }
 

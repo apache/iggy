@@ -297,7 +297,7 @@ public sealed partial class TcpMessageStream
                                 operation.Identity.RequestId);
                         }
                         terminal = true;
-                        RefreshCommittedCredentials(code, payload.Span);
+                        RefreshCommittedCredentials(code, (operation?.Body ?? payload).Span);
                         return attempt.Response!;
                     }
                     if (IsSessionFailure(attempt.Error))

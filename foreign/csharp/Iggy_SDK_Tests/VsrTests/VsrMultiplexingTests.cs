@@ -137,6 +137,61 @@ public sealed class VsrMultiplexingTests
     }
 
     [Fact]
+    public async Task given_a_silent_peer_when_requests_expire_should_retire_the_link()
+    {
+        const int DeadlineMs = 100;
+        using var pair = await LinkPair.ConnectAsync(frameTimeoutMs: DeadlineMs);
+        var pending = pair.SendAsync(token: TestContext.Current.CancellationToken, timeoutMs: DeadlineMs);
+        _ = await pair.ReadAsync();
+
+        Assert.IsType<IOException>((await pending).Error);
+        await pair.DropNotified.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, pair.Dropped);
+    }
+
+    [Fact]
+    public async Task given_a_short_deadline_when_another_request_is_active_should_allow_its_late_reply()
+    {
+        const int ShortDeadlineMs = 100;
+        using var pair = await LinkPair.ConnectAsync(frameTimeoutMs: ShortDeadlineMs);
+        var shortCall = pair.SendAsync(token: TestContext.Current.CancellationToken, timeoutMs: ShortDeadlineMs);
+        var longCall = pair.SendAsync(token: TestContext.Current.CancellationToken);
+        var shortRequest = await pair.ReadAsync();
+        var longRequest = await pair.ReadAsync();
+        Assert.IsType<IOException>((await shortCall).Error);
+        await Task.Delay(2 * ShortDeadlineMs, TestContext.Current.CancellationToken);
+
+        await pair.ReplyAsync(shortRequest, [1]);
+        await pair.ReplyAsync(longRequest, [2]);
+
+        using var reply = (await longCall).Response;
+        Assert.NotNull(reply);
+        Assert.Equal([2], reply.Memory.ToArray());
+        await Task.Delay(2 * ShortDeadlineMs, TestContext.Current.CancellationToken);
+        Assert.Equal(0, pair.Dropped);
+    }
+
+    [Fact]
+    public async Task given_a_silent_peer_when_more_requests_arrive_should_bound_the_deadline_grace()
+    {
+        const int FrameDeadlineMs = 100;
+        const int ActiveDeadlineMs = 1000;
+        using var pair = await LinkPair.ConnectAsync(frameTimeoutMs: FrameDeadlineMs);
+        var activeCall = pair.SendAsync(token: TestContext.Current.CancellationToken, timeoutMs: ActiveDeadlineMs);
+        _ = await pair.ReadAsync();
+        await Task.Delay(3 * FrameDeadlineMs, TestContext.Current.CancellationToken);
+        var laterCall = pair.SendAsync(token: TestContext.Current.CancellationToken);
+        _ = await pair.ReadAsync();
+
+        await pair.DropNotified.WaitAsync(TimeSpan.FromMilliseconds(2 * ActiveDeadlineMs), TestContext.Current.CancellationToken);
+
+        Assert.IsType<IOException>((await activeCall).Error);
+        Assert.IsType<IOException>((await laterCall).Error);
+        Assert.Equal(1, pair.Dropped);
+    }
+
+    [Fact]
     public async Task given_a_partial_reply_when_the_frame_deadline_expires_should_fail_only_that_link()
     {
         const int CompletionTimeoutSeconds = 5;
@@ -266,9 +321,10 @@ public sealed class VsrMultiplexingTests
             return pair;
         }
 
-        internal Task<VsrAttempt> SendAsync(int code = CommandCodes.GET_STATS_CODE, CancellationToken token = default)
+        internal Task<VsrAttempt> SendAsync(int code = CommandCodes.GET_STATS_CODE, CancellationToken token = default,
+            int timeoutMs = RequestTimeoutMs)
         {
-            var deadline = Environment.TickCount64 + RequestTimeoutMs;
+            var deadline = Environment.TickCount64 + timeoutMs;
             return _connection!.SendAttemptAsync(code, ReadOnlyMemory<byte>.Empty, deadline, deadline, false,
                 token == default ? TestContext.Current.CancellationToken : token, retryTransient: false).AsTask();
         }

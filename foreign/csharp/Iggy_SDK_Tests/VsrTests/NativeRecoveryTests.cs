@@ -882,6 +882,37 @@ public sealed class NativeRecoveryTests
             registration.Body);
     }
 
+    [Fact]
+    public async Task given_mutated_raw_credentials_when_the_session_recovers_should_use_the_submitted_password()
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync(heartbeat: TimeSpan.FromMilliseconds(25));
+        var payload = TcpContracts.ChangePassword(Identifier.String("user"), "secret", "rotated");
+        var replacement = TcpContracts.ChangePassword(Identifier.String("user"), "secret", "changed");
+        var submitted = payload.ToArray();
+        cluster.OnMetadata = request =>
+        {
+            Assert.Equal(submitted, request.Body);
+            replacement.CopyTo(payload, 0);
+            return Result(request);
+        };
+
+        _ = await client.SendBinaryRequestAsync(CommandCodes.CHANGE_PASSWORD_CODE, payload, cluster.Token);
+        var registrations = new ConcurrentQueue<MockRequest>();
+        cluster.BeforeReply = (request, _) =>
+        {
+            if (request.Operation == (byte)VsrOperation.Register)
+            {
+                registrations.Enqueue(request);
+            }
+        };
+        cluster.PingEviction = EvictionReason.NoSession;
+        await cluster.UntilAsync(() => !registrations.IsEmpty);
+
+        var registration = Assert.Single(registrations);
+        Assert.Equal(LoginRegister.Serialize("user", "rotated", LoginRegister.ReadBindSecret(registration.Body)), registration.Body);
+    }
+
     [Theory]
     [InlineData(false, false)]
     [InlineData(true, false)]
