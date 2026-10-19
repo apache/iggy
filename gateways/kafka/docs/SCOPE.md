@@ -53,7 +53,7 @@ it knows the server supports flexible encoding.
 | 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
-| 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
+| 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST, a timestamp and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default at every version |
 | 20 | DeleteTopics | 1 | 5 | 1, 2, 3, 4, 5 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 (topic-id-based) not advertised - this bridge has no topic-id concept |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
@@ -81,7 +81,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | --------- | ------ | ---------------------------------- | ---------------------------- |
 | 0 | Produce | 3–9 | v9 |
 | 1 | Fetch | 4–12 | v12 |
-| 2 | ListOffsets | 1–6 | v6 |
+| 2 | ListOffsets | 1–7 | v6 |
 | 3 | Metadata | 0–9 | v9 |
 | 8 | OffsetCommit | 2–9 | v8 |
 | 9 | OffsetFetch | 1–9 | v6 |
@@ -336,12 +336,10 @@ below it are still open for the issues that build on top of it.
       session, so not carried forward as a fix here rather than guessed at. Needs fresh
       reproduction against a real `kcat` before it's re-closed.
 - [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
-      `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::high_watermarks` and
-      `EARLIEST` answers `0`. Any other requested timestamp (arbitrary-timestamp offset search,
-      including `offsetsForTimes`/`by_duration` resets) is unsupported - Iggy exposes no
-      per-message timestamp index - and answers `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43) per
-      partition rather than a fabricated offset; non-retriable, so a Java client resolves this
-      immediately instead of spinning until `default.api.timeout.ms`.
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::partition_probes` and
+      `EARLIEST` answers `0`. A timestamp answers the first record Iggy appended at or after it,
+      and `MAX_TIMESTAMP` (v7) the last record ([#4516](https://github.com/apache/iggy/issues/4516));
+      `BRIDGE_MAPPING.md` has the difference from Kafka on `CreateTime` topics.
       `src/protocol/handlers/list_offsets.rs`, `tests/list_offsets_real_bridge_tests.rs`. With the
       bridge off, the stub from #3421 answers `NOT_LEADER_OR_FOLLOWER` (6) as before.
   - `EARLIEST = 0` is real *only* for a partition this bridge has never had retention trim: Iggy
@@ -353,16 +351,18 @@ below it are still open for the issues that build on top of it.
     Fetch serves no records until the next write.
   - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
     still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
-    one `high_watermarks` call before any bridge work starts (a name repeated across request
-    entries costs one round trip per entry), and a topic whose every partition asks for an
-    unsupported timestamp skips the call entirely. A request naming more than 100 distinct topics
+    one topic probe before any bridge work starts, and every topic gets that probe whatever its
+    partitions ask for. Repeated (topic, partition, timestamp) entries share one record lookup.
+    A request naming more than 100 distinct topics
     resolves the first 100 and answers the rest `REQUEST_TIMED_OUT` (retriable) with no bridge call
     at all, so a client that retries only its still-erroring topics narrows below the cap on its
     own. The whole request's aggregate bridge work runs under one 20s wall-clock deadline
     (`ListOffsets` carries no `timeout_ms` field in any version this gateway supports, so this is a
     fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
-    batch: a topic already resolved when the deadline arrives keeps its real answer, and only the
-    not-yet-started topics answer `REQUEST_TIMED_OUT`.
+    batch: a topic already resolved when the deadline arrives keeps its real answer, and the
+    not-yet-started topics answer `REQUEST_TIMED_OUT`. Each record lookup by time also gets at
+    most a quarter of that deadline, and answers `REQUEST_TIMED_OUT` past it, so one stalled
+    partition leaves time for the rest.
 - [x] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, shared topic probes, paged polls per partition with
       records, and a wait of up to `max_wait_ms` (max 18 s) when there are none. Only codes the

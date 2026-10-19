@@ -31,7 +31,8 @@ use tokio::time::{Instant, timeout_at};
 
 use super::offsets::high_watermark;
 use super::{
-    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, sign_out_and_shut_down,
+    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, permit_by,
+    sign_out_and_shut_down,
 };
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
@@ -59,12 +60,10 @@ impl FetchPool {
         }
     }
 
-    /// A free slot. `None` if none frees by `deadline`.
+    /// A free slot. `None` if none frees before `deadline`: a poll started then would time out at
+    /// once and drop the slot's client.
     async fn take(self: &Arc<Self>, deadline: Instant) -> Option<FetchSlot> {
-        let permit = timeout_at(deadline, Arc::clone(&self.permits).acquire_owned())
-            .await
-            .ok()?
-            .ok()?;
+        let permit = permit_by(&self.permits, deadline).await?;
         let client = self
             .idle
             .lock()
@@ -352,6 +351,28 @@ impl IggyBridge {
         count: u32,
         deadline: Instant,
     ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
+        self.poll_by(
+            slot,
+            kafka_topic,
+            partition,
+            PollingStrategy::offset(offset),
+            count,
+            deadline,
+        )
+        .await
+    }
+
+    /// [`Self::poll`] with any polling strategy, so `ListOffsets` can read by timestamp or the
+    /// last record through the same slots.
+    pub(crate) async fn poll_by(
+        self: &Arc<Self>,
+        slot: FetchSlot,
+        kafka_topic: &str,
+        partition: u32,
+        strategy: PollingStrategy,
+        count: u32,
+        deadline: Instant,
+    ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
         let (bridge, client, topic) = (
             Arc::clone(self),
             slot.client.clone(),
@@ -359,7 +380,7 @@ impl IggyBridge {
         );
         let poll = async move {
             bridge
-                .poll_with(&client, &topic, partition, offset, count, deadline)
+                .poll_with(&client, &topic, partition, &strategy, count, deadline)
                 .await
         };
         in_slot(slot, deadline, poll).await
@@ -370,12 +391,12 @@ impl IggyBridge {
         client: &LazyClient,
         kafka_topic: &str,
         partition: u32,
-        offset: u64,
+        strategy: &PollingStrategy,
         count: u32,
         deadline: Instant,
     ) -> Result<PolledMessages, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
-        let (consumer, strategy) = (Consumer::default(), PollingStrategy::offset(offset));
+        let consumer = Consumer::default();
         let poll = async {
             client
                 .connected(&self.config)
@@ -385,7 +406,7 @@ impl IggyBridge {
                     &target.topic_id,
                     Some(partition),
                     &consumer,
-                    &strategy,
+                    strategy,
                     count,
                     false,
                 )
@@ -395,6 +416,27 @@ impl IggyBridge {
         // The SDK replays a poll that Iggy refuses for up to 30 s. Stop with the request, so the
         // slot frees.
         client.until(deadline, poll).await
+    }
+}
+
+#[cfg(test)]
+impl IggyBridge {
+    /// Gives every Fetch read slot `client`, so a test needs no server.
+    pub(crate) async fn hold_fetch_clients(&self, client: &Arc<IggyClient>) {
+        for slot_client in &self.fetch_pool.all {
+            slot_client.hold(Arc::clone(client)).await;
+        }
+    }
+
+    /// How many Fetch read slots still hold a client.
+    pub(crate) async fn held_fetch_clients(&self) -> usize {
+        let mut held = 0;
+        for slot_client in &self.fetch_pool.all {
+            if slot_client.held().await.is_some() {
+                held += 1;
+            }
+        }
+        held
     }
 }
 
@@ -506,6 +548,21 @@ mod tests {
             "with the freed client"
         );
         drop((next, taken));
+    }
+
+    #[tokio::test]
+    async fn given_a_passed_deadline_when_a_slot_is_free_should_take_none_and_keep_its_client() {
+        let pool = Arc::new(FetchPool::new());
+        let held = unconnected();
+        for client in &pool.all {
+            client.hold(Arc::clone(&held)).await;
+        }
+        assert!(pool.take(Instant::now()).await.is_none());
+        for client in &pool.all {
+            assert!(client.held().await.is_some());
+        }
+        let soon = Instant::now() + Duration::from_millis(20);
+        assert!(pool.take(soon).await.is_some(), "the slot stayed free");
     }
 
     fn partition(current_offset: u64, messages_count: u64, size: u64) -> Partition {
