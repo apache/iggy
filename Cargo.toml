@@ -292,6 +292,7 @@ rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 rcgen = "0.14.10"
 regex = "1.13.1"
+regex-syntax = "0.8.11"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }
 reqwest-retry = "0.9.1"
@@ -391,6 +392,7 @@ web-sys = { version = "0.3", features = [
 webpki-roots = "1.0.9"
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
+x509-parser = "0.18.1"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }

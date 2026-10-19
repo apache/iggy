@@ -37,9 +37,9 @@ runs:
       run: npm install -g npm@11
       shell: bash
 
-    - name: Setup Rust
+    - name: Download runtime binaries
       if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust
+      uses: ./.github/actions/utils/download-runtime
 
     - name: Install netcat
       if: inputs.task == 'e2e'
@@ -94,7 +94,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         wait-timeout-seconds: "90"
 
     - name: E2E tests
@@ -125,7 +125,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:

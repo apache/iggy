@@ -106,49 +106,72 @@ die () {
 #
 #   Gradle Wrapper JAR Auto-Fetch
 #
-#   Since the Apache Software Foundation prohibits binary files in source
-#   repositories, we download the gradle-wrapper.jar from the official
-#   Gradle repository if it's missing.
+#   The Apache Software Foundation prohibits binary files in source
+#   repositories, so gradle-wrapper.jar is downloaded when it is missing.
+#
+#   Gradle publishes the checksum of each wrapper JAR, but ships the JAR only
+#   inside the distribution. The JAR therefore comes from the Gradle source
+#   tree at a release tag. That copy is the wrapper that Gradle used to build
+#   the release, and it can be the JAR of an older release. For example, tag
+#   v9.8.1 holds the 9.8.0 JAR. The wrapper JAR only starts the distribution
+#   set in gradle-wrapper.properties, so the tag does not need to follow the
+#   Gradle version. If you change the tag, pin the SHA-256 of the file at that
+#   tag and make sure that it is listed at https://gradle.org/release-checksums/.
+#
+#   Dependabot removes this block when it updates the wrapper. Restore it as
+#   it is.
 #
 ##############################################################################
 
-GRADLE_WRAPPER_VERSION=9.8.1
-REQUIRED_WRAPPER_JAR_CHECKSUM="238e777fcddd7e34f9708186085def2abd6e08e658505b38718d79d74c21abd5" # checksum of v9.8.0
+GRADLE_WRAPPER_JAR_TAG=v9.8.0
+GRADLE_WRAPPER_JAR_SHA256=238e777fcddd7e34f9708186085def2abd6e08e658505b38718d79d74c21abd5
+GRADLE_WRAPPER_JAR_URL=https://raw.githubusercontent.com/gradle/gradle/$GRADLE_WRAPPER_JAR_TAG/gradle/wrapper/gradle-wrapper.jar
+WRAPPER_JAR=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 
-for _ in 1 2 3; do
-    if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
-        if ! curl -s -S --retry 3 -L -o "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" "https://raw.githubusercontent.com/gradle/gradle/v$GRADLE_WRAPPER_VERSION/gradle/wrapper/gradle-wrapper.jar"; then
-            rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
-            sleep 5
-            continue
-        fi
+wrapper_jar_sha256 () {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$WRAPPER_JAR" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$WRAPPER_JAR" | awk '{print $1}'
+    else
+        warn "Cannot find sha256sum or shasum to verify wrapper JAR."
+        echo "$GRADLE_WRAPPER_JAR_SHA256"
     fi
+}
 
-    if [ -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
-        if command -v sha256sum >/dev/null 2>&1; then
-            LOCAL_WRAPPER_JAR_CHECKSUM=$(sha256sum "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" | awk '{print $1}')
-        elif command -v shasum >/dev/null 2>&1; then
-            LOCAL_WRAPPER_JAR_CHECKSUM=$(shasum -a 256 "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" | awk '{print $1}')
-        else
-            warn "Cannot find sha256sum or shasum to verify wrapper JAR."
-            break
-        fi
+# A JAR left by an older pin no longer matches, so it is downloaded again.
+if [ -e "$WRAPPER_JAR" ] && [ "$( wrapper_jar_sha256 )" != "$GRADLE_WRAPPER_JAR_SHA256" ]; then
+    rm -f "$WRAPPER_JAR"
+fi
 
-        if [ "$LOCAL_WRAPPER_JAR_CHECKSUM" != "$REQUIRED_WRAPPER_JAR_CHECKSUM" ]; then
-            rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
-        else
-            break
-        fi
-    fi
-done
+if [ ! -e "$WRAPPER_JAR" ]; then
+    for _ in 1 2 3; do
+        curl -f -s -S --retry 3 -L -o "$WRAPPER_JAR" "$GRADLE_WRAPPER_JAR_URL" && break
+        rm -f "$WRAPPER_JAR"
+        sleep 5
+    done
 
-if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
-    die "ERROR: Failed to download gradle-wrapper.jar after multiple attempts.
+    if [ ! -e "$WRAPPER_JAR" ]; then
+        die "ERROR: Failed to download gradle-wrapper.jar after multiple attempts.
 
 Please check your network connection or manually download the file from:
-https://raw.githubusercontent.com/gradle/gradle/v$GRADLE_WRAPPER_VERSION/gradle/wrapper/gradle-wrapper.jar
+$GRADLE_WRAPPER_JAR_URL
 
-and place it in $APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+and place it in $WRAPPER_JAR"
+    fi
+
+    DOWNLOADED_WRAPPER_JAR_SHA256=$( wrapper_jar_sha256 )
+    if [ "$DOWNLOADED_WRAPPER_JAR_SHA256" != "$GRADLE_WRAPPER_JAR_SHA256" ]; then
+        rm -f "$WRAPPER_JAR"
+        die "ERROR: The downloaded gradle-wrapper.jar does not have the pinned SHA-256 checksum.
+
+URL:      $GRADLE_WRAPPER_JAR_URL
+Expected: $GRADLE_WRAPPER_JAR_SHA256
+Actual:   $DOWNLOADED_WRAPPER_JAR_SHA256
+
+Make sure that GRADLE_WRAPPER_JAR_SHA256 in $0 is the checksum of the file at
+tag $GRADLE_WRAPPER_JAR_TAG."
+    fi
 fi
 
 # OS specific support (must be 'true' or 'false').

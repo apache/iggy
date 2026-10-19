@@ -38,13 +38,18 @@ use std::time::{Duration, Instant};
 
 /// What the request funnel resolves from one `connections` lookup per frame.
 ///
-/// The bound consensus session, the acting user, the transport peer address
-/// and the read-your-writes floor. `Default` (everything absent, no address,
-/// floor `0`) stands for a connection neither this map nor the bus knows.
-#[derive(Debug, Clone, Copy, Default)]
+/// The bound consensus session and its attachment, the acting user, the
+/// transport peer address and the read-your-writes floor. `Default`
+/// (everything absent, no address, floor `0`) stands for a connection neither
+/// this map nor the bus knows.
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionContext {
     /// `(client_id, session)` once register committed, `None` before.
     pub bound: Option<(u128, u64)>,
+    /// The attachment of the bound session, `None` before register committed.
+    /// The session can end while a read waits, so a read checks it again
+    /// after every await.
+    pub attachment: Option<SessionAttachment>,
     /// Acting user from `login`, `None` while still `Connected`.
     pub user_id: Option<u32>,
     /// Peer address recorded by [`SessionManager::ensure_connection`]; the
@@ -177,7 +182,11 @@ impl SessionManager {
     /// `None` means the connection is not registered yet, which happens
     /// only on a transport's first frame; the caller installs it from the
     /// bus metadata ([`Self::ensure_connection`]) and asks again.
-    pub(crate) fn touch_connection(&mut self, connection_id: u128) -> Option<ConnectionContext> {
+    pub(crate) fn touch_connection(
+        &mut self,
+        connection_id: u128,
+        include_attachment: bool,
+    ) -> Option<ConnectionContext> {
         let conn = self.connections.get_mut(&connection_id)?;
         if conn
             .consumer_session
@@ -199,6 +208,11 @@ impl SessionManager {
         };
         Some(ConnectionContext {
             bound,
+            attachment: conn
+                .consumer_session
+                .as_ref()
+                .filter(|_| include_attachment)
+                .map(|(_, attachment)| attachment.clone()),
             user_id,
             address: Some(conn.address),
             metadata_watermark: conn.metadata_watermark,
@@ -603,7 +617,7 @@ mod tests {
                 session: EPOCH
             }]
         );
-        sessions.touch_connection(1).unwrap();
+        sessions.touch_connection(1, false).unwrap();
         assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 2);
         sessions.remove_connection(2);
         assert_eq!(sessions.iter_consumer_sessions(TIMEOUT).count(), 1);
@@ -684,7 +698,7 @@ mod tests {
         bind(&mut sessions, &mut table, 1);
         sessions.record_metadata_watermark(1, 50);
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
-        let context = sessions.touch_connection(1).unwrap();
+        let context = sessions.touch_connection(1, true).unwrap();
         assert_eq!(context.bound, None);
         assert_eq!(context.user_id, None);
         assert_eq!(context.metadata_watermark, 0);

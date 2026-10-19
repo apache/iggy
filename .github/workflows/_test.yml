@@ -19,14 +19,13 @@ name: _test
 on:
   workflow_call:
     inputs:
-      component:
+      matrix:
         type: string
         required: true
-        description: "Component to test"
-      task:
-        type: string
-        required: true
-        description: "Task to run"
+        description: "Selected component/task entries"
+      fail-fast:
+        type: boolean
+        default: true
     secrets:
       CODECOV_TOKEN:
         required: false
@@ -38,9 +37,13 @@ permissions:
 
 jobs:
   run:
+    name: ${{ matrix.name || matrix.task }}
+    strategy:
+      fail-fast: ${{ inputs.fail-fast }}
+      matrix: ${{ fromJSON(inputs.matrix) }}
     # Select runner based on build target
     runs-on: ${{
-      inputs.task == 'build-macos' && 'macos-15' ||
+      matrix.task == 'build-macos' && 'macos-15' ||
       'ubuntu-26.04'
       }}
     timeout-minutes: 60
@@ -48,23 +51,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
-      - name: Skip noop
-        if: inputs.component == 'noop'
-        run: echo "No changes detected, skipping tests"
-
       # Python SDK
       - name: Set up Docker Buildx for Python
-        if: inputs.component == 'sdk-python' && inputs.task == 'test'
+        if: matrix.component == 'sdk-python' && matrix.task == 'test'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Run Python SDK task
-        if: inputs.component == 'sdk-python'
+        if: matrix.component == 'sdk-python'
         uses: ./.github/actions/python-maturin/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       - name: Upload Python coverage to Codecov
-        if: inputs.component == 'sdk-python' && inputs.task == 'test'
+        if: matrix.component == 'sdk-python' && matrix.task == 'test'
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -77,13 +76,13 @@ jobs:
 
       # PHP SDK
       - name: Run PHP SDK task
-        if: inputs.component == 'sdk-php'
+        if: matrix.component == 'sdk-php'
         uses: ./.github/actions/php/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       - name: Upload PHP coverage to Codecov
-        if: inputs.component == 'sdk-php' && inputs.task == 'test'
+        if: matrix.component == 'sdk-php' && matrix.task == 'test'
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -96,44 +95,44 @@ jobs:
 
       # Node SDK
       - name: Run Node SDK task
-        if: inputs.component == 'sdk-node'
+        if: matrix.component == 'sdk-node'
         uses: ./.github/actions/node-npm/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       - name: Upload Node coverage to Codecov
         if: >-
-          inputs.component == 'sdk-node' &&
-          (inputs.task == 'test' ||
-          inputs.task == 'e2e')
+          matrix.component == 'sdk-node' &&
+          (matrix.task == 'test' ||
+          matrix.task == 'e2e')
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: >-
             reports/node-coverage/${{
-            inputs.task == 'test' && 'unit' || inputs.task
+            matrix.task == 'test' && 'unit' || matrix.task
             }}/lcov.info
           disable_search: true
           flags: >-
-            ${{ inputs.task == 'test' && 'node' ||
-            format('node-{0}', inputs.task) }}
+            ${{ matrix.task == 'test' && 'node' ||
+            format('node-{0}', matrix.task) }}
           fail_ci_if_error: false
           verbose: true
           override_pr: ${{ github.event.pull_request.number }}
 
       # Go SDK
       - name: Run Go SDK task
-        if: inputs.component == 'sdk-go'
+        if: matrix.component == 'sdk-go'
         uses: ./.github/actions/go/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       - name: Upload Go coverage to Codecov
-        if: inputs.component == 'sdk-go' && (inputs.task == 'test' || inputs.task == 'e2e')
+        if: matrix.component == 'sdk-go' && (matrix.task == 'test' || matrix.task == 'e2e')
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: reports/${{ inputs.task == 'test' && 'go-coverage.out' || 'go-coverage-e2e.out' }}
+          files: reports/${{ matrix.task == 'test' && 'go-coverage.out' || 'go-coverage-e2e.out' }}
           disable_search: true
           flags: go
           fail_ci_if_error: false
@@ -142,34 +141,34 @@ jobs:
 
       # Java SDK
       - name: Run Java SDK task
-        if: inputs.component == 'sdk-java'
+        if: matrix.component == 'sdk-java'
         uses: ./.github/actions/java-gradle/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       # C# SDK
       - name: Run C# SDK task
-        if: inputs.component == 'sdk-csharp'
+        if: matrix.component == 'sdk-csharp'
         uses: ./.github/actions/csharp-dotnet/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       # C++ SDK
       - name: Run C++ SDK Task
-        if: inputs.component == 'sdk-cpp'
+        if: matrix.component == 'sdk-cpp'
         uses: ./.github/actions/cpp-bazel/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       # Swift SDK
       - name: Run Swift SDK task
-        if: inputs.component == 'sdk-swift'
+        if: matrix.component == 'sdk-swift'
         uses: ./.github/actions/swift/pre-merge
         with:
-          task: ${{ inputs.task }}
+          task: ${{ matrix.task }}
 
       - name: Upload C++ coverage to Codecov
-        if: inputs.component == 'sdk-cpp' && inputs.task == 'test'
+        if: matrix.component == 'sdk-cpp' && matrix.task == 'test'
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -181,7 +180,7 @@ jobs:
           override_pr: ${{ github.event.pull_request.number }}
 
       - name: Upload Java coverage to Codecov
-        if: inputs.component == 'sdk-java' && inputs.task == 'test'
+        if: matrix.component == 'sdk-java' && matrix.task == 'test'
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -193,7 +192,7 @@ jobs:
           override_pr: ${{ github.event.pull_request.number }}
 
       - name: Upload C# coverage to Codecov
-        if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || startsWith(inputs.task, 'e2e'))
+        if: matrix.component == 'sdk-csharp' && (matrix.task == 'test' || startsWith(matrix.task, 'e2e'))
         uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -206,54 +205,54 @@ jobs:
 
       # Web UI
       - name: Setup Node.js for Web UI
-        if: inputs.component == 'web-ui'
+        if: matrix.component == 'web-ui'
         uses: actions/setup-node@v7
         with:
           node-version: "24"
           package-manager-cache: false
 
       - name: Run Web UI task
-        if: inputs.component == 'web-ui'
+        if: matrix.component == 'web-ui'
         run: |
           cd web
           npm ci
-          if [ "${{ inputs.task }}" = "lint" ]; then
+          if [ "${{ matrix.task }}" = "lint" ]; then
             npm run lint
-          elif [ "${{ inputs.task }}" = "test" ]; then
+          elif [ "${{ matrix.task }}" = "test" ]; then
             npm test
-          elif [ "${{ inputs.task }}" = "build" ]; then
+          elif [ "${{ matrix.task }}" = "build" ]; then
             npm run build
           fi
 
       # Helm chart testing
       - name: Setup Helm test tools
-        if: inputs.component == 'helm' && (inputs.task == 'validate' || inputs.task == 'smoke')
+        if: matrix.component == 'helm' && (matrix.task == 'validate' || matrix.task == 'smoke')
         uses: ./.github/actions/utils/setup-helm-tools
         with:
-          install-kind: ${{ inputs.task == 'smoke' }}
-          install-helm-docs: ${{ inputs.task == 'validate' }}
-          install-yamllint: ${{ inputs.task == 'validate' }}
-          install-helmfmt: ${{ inputs.task == 'validate' }}
+          install-kind: ${{ matrix.task == 'smoke' }}
+          install-helm-docs: ${{ matrix.task == 'validate' }}
+          install-yamllint: ${{ matrix.task == 'validate' }}
+          install-helmfmt: ${{ matrix.task == 'validate' }}
 
       - name: Setup Helm smoke cluster
-        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        if: matrix.component == 'helm' && matrix.task == 'smoke'
         run: scripts/ci/setup-helm-smoke-cluster.sh
 
       - name: Validate Helm chart
-        if: inputs.component == 'helm' && inputs.task == 'validate'
+        if: matrix.component == 'helm' && matrix.task == 'validate'
         run: scripts/ci/test-helm.sh validate
 
       - name: Smoke test Helm chart runtime
-        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        if: matrix.component == 'helm' && matrix.task == 'smoke'
         run: scripts/ci/test-helm.sh smoke --cleanup
 
       - name: Collect Helm smoke diagnostics
-        if: failure() && inputs.component == 'helm' && inputs.task == 'smoke'
+        if: failure() && matrix.component == 'helm' && matrix.task == 'smoke'
         run: scripts/ci/test-helm.sh collect-smoke-diagnostics
 
       # CI workflow validation
       - name: Validate CI workflows
-        if: inputs.component == 'ci-workflows' && inputs.task == 'validate'
+        if: matrix.component == 'ci-workflows' && matrix.task == 'validate'
         run: |
           echo "Validating GitHub Actions workflows..."
           # Basic YAML validation
@@ -262,13 +261,14 @@ jobs:
             python -c "import yaml; yaml.safe_load(open('$workflow'))" || exit 1
           done
           echo "All workflows are valid YAML"
+          python3 scripts/ci/test-runtime-artifacts.py
 
       # Upload reports
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ matrix.component }}-${{ matrix.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             reports/**
             target/llvm-cov/**

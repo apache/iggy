@@ -23,21 +23,6 @@ on:
         description: "JSON with checks (component/task entries) and tests (boolean)"
         type: string
         required: true
-      test-scope:
-        description: "Test selection: affected or workspace"
-        type: string
-        default: affected
-      timeout-minutes:
-        type: number
-        default: 60
-      save-cache:
-        description: "Save dependencies from the test build for subsequent PRs"
-        type: boolean
-        default: false
-      build-metadata:
-        description: "Embed CI build metadata in the server binaries"
-        type: boolean
-        default: false
     secrets:
       CODECOV_TOKEN:
         required: false
@@ -46,12 +31,9 @@ permissions:
   contents: read
   issues: read # live breaking:storage label lookup
 
-env:
-  IGGY_CI_BUILD: ${{ inputs.build-metadata }}
-
 jobs:
   checks:
-    name: ${{ matrix.component }}/${{ matrix.task }}
+    name: ${{ matrix.component == 'rust' && matrix.task || format('{0}/{1}', matrix.component, matrix.task) }}
     if: ${{ fromJSON(inputs.plan).checks[0] != null }}
     strategy:
       fail-fast: true
@@ -63,7 +45,7 @@ jobs:
       matrix.task == 'build-windows-sdk' && 'windows-latest' ||
       'ubuntu-26.04'
       }}
-    timeout-minutes: ${{ inputs.timeout-minutes }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -109,88 +91,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  test-build:
-    name: Build test artifacts
-    if: ${{ fromJSON(inputs.plan).tests }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: ${{ inputs.timeout-minutes }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      - name: Build coverage test archive
-        uses: ./.github/actions/rust/pre-merge
-        with:
-          task: test-build
-          test-scope: ${{ inputs.test-scope }}
-          save-cache: ${{ inputs.save-cache }}
-          free-disk-space-aggressive: ${{ inputs.test-scope == 'workspace' }}
-
-      - name: Upload test artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: rust-test-build-${{ github.run_id }}
-          path: ${{ runner.temp }}/rust-test-build/
-          compression-level: 0
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 7
-
   tests:
-    name: Test shard ${{ matrix.partition }}/${{ strategy.job-total }}
-    needs: test-build
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
-    runs-on: ubuntu-26.04
-    timeout-minutes: ${{ inputs.timeout-minutes }}
-    steps:
-      - uses: actions/checkout@v7.0.1
-
-      - name: Download test artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: rust-test-build-${{ github.run_id }}
-          path: ${{ runner.temp }}/rust-test-build
-
-      - name: Run test shard
-        uses: ./.github/actions/rust/pre-merge
-        with:
-          task: test
-          partition: ${{ matrix.partition }}
-          partitions: ${{ strategy.job-total }}
-
-      - name: Generate coverage report
-        if: always() && !cancelled()
-        run: |
-          if compgen -G 'target/*.profraw' > /dev/null; then
-            cargo llvm-cov report --codecov --output-path codecov.json
-          else
-            echo "::notice::No coverage profiles found; skipping report"
-          fi
-        shell: bash
-
-      - name: Upload coverage to Codecov
-        if: always() && !cancelled() && hashFiles('codecov.json') != ''
-        uses: codecov/codecov-action@v7.1.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: codecov.json
-          disable_search: true
-          flags: rust
-          fail_ci_if_error: false
-          verbose: true
-          override_pr: ${{ github.event.pull_request.number }}
-
-      - name: Upload reports
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: rust-test-${{ matrix.partition }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            reports/**
-            target/llvm-cov/**
-            coverage.lcov
-            codecov.json
-          if-no-files-found: ignore
-          retention-days: 7
+    name: tests
+    if: ${{ fromJSON(inputs.plan).tests }}
+    uses: ./.github/workflows/_rust_tests.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -40,6 +40,18 @@ public sealed class ConsensusSessionTests
     }
 
     [Fact]
+    public void NewAndResetSessions_KeepClientIdsOutsideServerRange()
+    {
+        const int samples = 64;
+        var session = new ConsensusSession();
+        for (var sample = 0; sample < samples; sample++)
+        {
+            Assert.InRange(session.ClientId, UInt128.One, (UInt128)Int128.MaxValue);
+            session.Reset();
+        }
+    }
+
+    [Fact]
     public void BeginRegister_OnFreshSessionKeepsClientId()
     {
         var session = new ConsensusSession(7);

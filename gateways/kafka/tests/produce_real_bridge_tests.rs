@@ -40,9 +40,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::{IggyBridge, Producer};
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, BrokerAdvertise, ERROR_NONE,
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
-    handle_request_bounded,
+    API_KEY_INIT_PRODUCER_ID, API_KEY_PRODUCE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState, handle_request_bounded,
 };
 use iggy_gateway_kafka::records::{KEY_HEADER, MAPPING_VERSION, VERSION_HEADER, from_iggy};
 
@@ -77,10 +76,8 @@ async fn gateway_with_topic(server: &TestServer, partitions: u32) -> GatewayStat
         .await
         .expect("the topic must exist before producing to it");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -923,7 +920,7 @@ async fn given_an_idempotent_batch_sent_twice_when_handled_should_store_both_cop
 async fn given_no_bridge_when_handled_should_still_answer_the_retriable_stub() {
     // Every other suite drives this path, so a regression in it surfaces far from Produce.
     // Pinned here, next to the path that replaced it.
-    let state = GatewayState::stub(BrokerAdvertise::default(), MAX_FRAME_SIZE);
+    let state = GatewayState::stub(MAX_FRAME_SIZE);
     let entries = [(0, batch(&[record(0, None, b"v", &[])], Compression::None))];
 
     assert_eq!(

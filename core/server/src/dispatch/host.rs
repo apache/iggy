@@ -183,10 +183,7 @@ where
             shard,
             submit,
             &self.consumer_group_liveness,
-            self.server_config
-                .consumer_group
-                .session_timeout
-                .get_duration(),
+            self.server_config.heartbeat.session_timeout(),
             &self.completion_relays,
         );
     }
@@ -201,10 +198,7 @@ where
                     self.sessions
                         .borrow()
                         .iter_consumer_sessions(if self.server_config.heartbeat.enabled {
-                            self.server_config
-                                .consumer_group
-                                .session_timeout
-                                .get_duration()
+                            self.server_config.heartbeat.session_timeout()
                         } else {
                             Duration::MAX
                         })

@@ -10,11 +10,11 @@
 
 Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-The SDK is built up in stages. This stage adds the client: a TCP connection with
-optional TLS that speaks the consensus protocol, signs in, keeps the session alive with
-a heartbeat, reconnects, follows the cluster leader, and manages streams, topics,
-partitions, segments, users, and personal access tokens. Sending and polling messages,
-consumer groups and offsets, the producer and consumer, examples, and BDD scenarios
+The SDK is built up in stages. The client is a TCP connection with optional TLS that
+speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
+reconnects, and follows the cluster leader. It manages streams, topics, partitions,
+segments, users, personal access tokens, and consumer groups, sends and polls messages,
+and stores consumer offsets. The producer and consumer, examples, and BDD scenarios
 follow in later changes.
 
 ## Requirements
@@ -100,6 +100,55 @@ when it has credentials to sign in with. In a cluster the client reads the roste
 signing in, moves to the leader, and moves on when a node answers that it is not the
 primary.
 
+### Messages
+
+`sendMessages` writes a batch to one partition. The server routes explicit partitions
+only, so `balanced` (the default) and `messagesKey` are resolved on the client:
+balanced round-robins over the topic's partitions, and a key is hashed with XXH32 the
+way every other SDK hashes it. A message without an id gets a random one, written back
+into the batch, so sending the same batch again after `transientNotCommitted` carries
+the same ids. `pollMessages` reads from a partition, starting where the strategy says:
+
+```swift
+var batch: [IggyMessage] = ["placed"]
+try await client.sendMessages(streamID: "orders", topicID: "created", partitioning: .messagesKey("customer-42"), messages: &batch)
+let polled = try await client.pollMessages(
+    streamID: "orders", topicID: "created", partitionID: 0, consumer: .consumer(1), strategy: .next, count: 100, autoCommit: true)
+for message in polled.messages {
+    print(message.offset, message.payloadString)
+}
+```
+
+Every partition request carries the partition context the server requires: the
+partition's incarnation, which changes when a deleted partition id is reused. The
+client reads it from the partition's route and caches it. A poll reply carries the
+context it was served under; hand it back with `.offset(_:context:)` to continue the
+same partition, or in a `ConsumerPosition` to store a checkpoint. The server refuses
+either with `historyUnavailable` once the partition was recreated, and a consumer-group
+checkpoint with `consumerGroupPartitionNotOwned` once the partition moved to another
+member.
+
+### Consumer groups
+
+A member polls without a partition id and the client takes the next partition of its
+assignment, round-robin, syncing the assignment from the server when it changes. The
+heartbeat syncs every joined group, so a member picks up new partitions on its own:
+
+```swift
+try await client.joinConsumerGroup(streamID: "orders", topicID: "created", groupID: "billing")
+let batch = try await client.pollMessages(
+    streamID: "orders", topicID: "created", partitionID: nil, consumer: .group("billing"), strategy: .next, count: 100, autoCommit: true)
+```
+
+A member holding no partitions gets an empty poll whose partition id is
+`PolledMessages.noAssignedPartition`, and a client that is not a member gets
+`consumerGroupMemberNotFound`. Membership belongs to the session. A reconnect resumes
+the session and keeps it, but when the server no longer holds the session the client
+signs in under a new one and the caller must call `joinConsumerGroup` again: the next
+group poll fails with `consumerGroupMemberNotFound` until it does. In a cluster, polls
+and offset writes go to the partition's primary over a second connection bound to the
+same session.
+
 ### Errors
 
 Every operation throws `IggyError`, a value carrying the typed `code`
@@ -126,6 +175,23 @@ swift test
 
 The client tests run against an in-process server that speaks the consensus framing
 and is scripted per test, so they need no running `iggy-server`.
+
+The end-to-end suite runs against a server at the address in `IGGY_TCP_ADDRESS` and
+skips when that variable is unset. Start one from the repository root:
+
+```bash
+cargo build --bin iggy-server
+IGGY_PATH=/tmp/iggy-swift IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/debug/iggy-server
+```
+
+Then, from `foreign/swift`:
+
+```bash
+IGGY_TCP_ADDRESS=127.0.0.1:8090 swift test --filter IggyE2ETests
+```
+
+Add `IGGY_TCP_TLS_ENABLED=true` to run it against a server started with
+`IGGY_TCP_TLS_ENABLED=true` and the certificate pair in `core/certs`.
 
 The hash, error-code, model, request, reply, and consensus header tests compare against
 `Tests/IggyTests/Fixtures/golden.json`, a fixture dumped from the Rust protocol crates. Regenerate it after a protocol change, from

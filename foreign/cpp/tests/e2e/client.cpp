@@ -354,8 +354,29 @@ TEST_F(E2E_Client, CreateUserPreservesNestedPermissionsInCreateAndGetResponses) 
     RecordProperty("description",
                    "Creates a user with global and per-resource permissions, then verifies create_user and get_user "
                    "return the same flags and numeric stream/topic IDs.");
-    auto client                = GetLoggedInHighLevelClient();
-    const std::string username = GetRandomName(50);
+    auto client                          = GetLoggedInHighLevelClient();
+    const std::string username           = GetRandomName(50);
+    const std::string first_stream_name  = GetRandomName();
+    const std::string second_stream_name = GetRandomName();
+
+    // The server refuses a grant on a stream or topic that does not exist.
+    std::uint32_t first_stream_id  = 0;
+    std::uint32_t second_stream_id = 0;
+    std::uint32_t first_topic_id   = 0;
+    std::uint32_t second_topic_id  = 0;
+    std::uint32_t third_topic_id   = 0;
+    ASSERT_NO_THROW({
+        first_stream_id = client.CreateStream(first_stream_name).Id();
+        TrackStream(first_stream_name);
+        second_stream_id = client.CreateStream(second_stream_name).Id();
+        TrackStream(second_stream_name);
+        first_topic_id  = client.CreateTopic(iggy::Identifier::Numeric(first_stream_id), GetRandomName()).Id();
+        second_topic_id = client.CreateTopic(iggy::Identifier::Numeric(first_stream_id), GetRandomName()).Id();
+        client.CreateTopic(iggy::Identifier::Numeric(second_stream_id), GetRandomName());
+        third_topic_id = client.CreateTopic(iggy::Identifier::Numeric(second_stream_id), GetRandomName()).Id();
+    });
+    ASSERT_NE(first_topic_id, third_topic_id);
+
     iggy::GlobalPermissions global;
     global.SetManageServers(true).SetReadUsers(true).SetManageStreams(true).SetReadTopics(true).SetSendMessages(true);
 
@@ -365,15 +386,16 @@ TEST_F(E2E_Client, CreateUserPreservesNestedPermissionsInCreateAndGetResponses) 
     second_topic.SetReadTopic(true).SetSendMessages(true);
     iggy::StreamPermissions first_stream;
     first_stream.SetManageStream(true).SetReadTopics(true).SetSendMessages(true).SetTopics(
-        {{7, first_topic}, {9, second_topic}});
+        {{first_topic_id, first_topic}, {second_topic_id, second_topic}});
 
     iggy::TopicPermissions third_topic;
     third_topic.SetReadTopic(true);
     iggy::StreamPermissions second_stream;
-    second_stream.SetReadStream(true).SetManageTopics(true).SetPollMessages(true).SetTopics({{3, third_topic}});
+    second_stream.SetReadStream(true).SetManageTopics(true).SetPollMessages(true).SetTopics(
+        {{third_topic_id, third_topic}});
 
     iggy::Permissions permissions;
-    permissions.SetGlobal(global).SetStreams({{42, first_stream}, {84, second_stream}});
+    permissions.SetGlobal(global).SetStreams({{first_stream_id, first_stream}, {second_stream_id, second_stream}});
 
     ASSERT_NO_THROW({
         const auto created = CreateUser(client, username, "secret123", iggy::UserStatus::Active, permissions);
@@ -393,43 +415,43 @@ TEST_F(E2E_Client, CreateUserPreservesNestedPermissionsInCreateAndGetResponses) 
             EXPECT_TRUE(user_permissions.Global().SendMessages());
             ASSERT_EQ(user_permissions.Streams().size(), 2u);
 
-            const auto stream_42 = user_permissions.Streams().find(42);
-            const auto stream_84 = user_permissions.Streams().find(84);
-            ASSERT_NE(stream_42, user_permissions.Streams().end());
-            ASSERT_NE(stream_84, user_permissions.Streams().end());
-            EXPECT_TRUE(stream_42->second.ManageStream());
-            EXPECT_FALSE(stream_42->second.ReadStream());
-            EXPECT_FALSE(stream_42->second.ManageTopics());
-            EXPECT_TRUE(stream_42->second.ReadTopics());
-            EXPECT_FALSE(stream_42->second.PollMessages());
-            EXPECT_TRUE(stream_42->second.SendMessages());
-            ASSERT_EQ(stream_42->second.Topics().size(), 2u);
-            const auto topic_7 = stream_42->second.Topics().find(7);
-            const auto topic_9 = stream_42->second.Topics().find(9);
-            ASSERT_NE(topic_7, stream_42->second.Topics().end());
-            ASSERT_NE(topic_9, stream_42->second.Topics().end());
-            EXPECT_TRUE(topic_7->second.ManageTopic());
-            EXPECT_FALSE(topic_7->second.ReadTopic());
-            EXPECT_TRUE(topic_7->second.PollMessages());
-            EXPECT_FALSE(topic_7->second.SendMessages());
-            EXPECT_FALSE(topic_9->second.ManageTopic());
-            EXPECT_TRUE(topic_9->second.ReadTopic());
-            EXPECT_FALSE(topic_9->second.PollMessages());
-            EXPECT_TRUE(topic_9->second.SendMessages());
-            EXPECT_FALSE(stream_84->second.ManageStream());
-            EXPECT_TRUE(stream_84->second.ReadStream());
-            EXPECT_TRUE(stream_84->second.ManageTopics());
-            EXPECT_FALSE(stream_84->second.ReadTopics());
-            EXPECT_TRUE(stream_84->second.PollMessages());
-            EXPECT_FALSE(stream_84->second.SendMessages());
-            ASSERT_EQ(stream_84->second.Topics().size(), 1u);
-            const auto topic_3 = stream_84->second.Topics().find(3);
-            ASSERT_NE(topic_3, stream_84->second.Topics().end());
-            EXPECT_EQ(topic_3->first, 3u);
-            EXPECT_FALSE(topic_3->second.ManageTopic());
-            EXPECT_TRUE(topic_3->second.ReadTopic());
-            EXPECT_FALSE(topic_3->second.PollMessages());
-            EXPECT_FALSE(topic_3->second.SendMessages());
+            const auto first_stream_grant  = user_permissions.Streams().find(first_stream_id);
+            const auto second_stream_grant = user_permissions.Streams().find(second_stream_id);
+            ASSERT_NE(first_stream_grant, user_permissions.Streams().end());
+            ASSERT_NE(second_stream_grant, user_permissions.Streams().end());
+            EXPECT_TRUE(first_stream_grant->second.ManageStream());
+            EXPECT_FALSE(first_stream_grant->second.ReadStream());
+            EXPECT_FALSE(first_stream_grant->second.ManageTopics());
+            EXPECT_TRUE(first_stream_grant->second.ReadTopics());
+            EXPECT_FALSE(first_stream_grant->second.PollMessages());
+            EXPECT_TRUE(first_stream_grant->second.SendMessages());
+            ASSERT_EQ(first_stream_grant->second.Topics().size(), 2u);
+            const auto first_topic_grant  = first_stream_grant->second.Topics().find(first_topic_id);
+            const auto second_topic_grant = first_stream_grant->second.Topics().find(second_topic_id);
+            ASSERT_NE(first_topic_grant, first_stream_grant->second.Topics().end());
+            ASSERT_NE(second_topic_grant, first_stream_grant->second.Topics().end());
+            EXPECT_TRUE(first_topic_grant->second.ManageTopic());
+            EXPECT_FALSE(first_topic_grant->second.ReadTopic());
+            EXPECT_TRUE(first_topic_grant->second.PollMessages());
+            EXPECT_FALSE(first_topic_grant->second.SendMessages());
+            EXPECT_FALSE(second_topic_grant->second.ManageTopic());
+            EXPECT_TRUE(second_topic_grant->second.ReadTopic());
+            EXPECT_FALSE(second_topic_grant->second.PollMessages());
+            EXPECT_TRUE(second_topic_grant->second.SendMessages());
+            EXPECT_FALSE(second_stream_grant->second.ManageStream());
+            EXPECT_TRUE(second_stream_grant->second.ReadStream());
+            EXPECT_TRUE(second_stream_grant->second.ManageTopics());
+            EXPECT_FALSE(second_stream_grant->second.ReadTopics());
+            EXPECT_TRUE(second_stream_grant->second.PollMessages());
+            EXPECT_FALSE(second_stream_grant->second.SendMessages());
+            ASSERT_EQ(second_stream_grant->second.Topics().size(), 1u);
+            const auto third_topic_grant = second_stream_grant->second.Topics().find(third_topic_id);
+            ASSERT_NE(third_topic_grant, second_stream_grant->second.Topics().end());
+            EXPECT_EQ(third_topic_grant->first, third_topic_id);
+            EXPECT_FALSE(third_topic_grant->second.ManageTopic());
+            EXPECT_TRUE(third_topic_grant->second.ReadTopic());
+            EXPECT_FALSE(third_topic_grant->second.PollMessages());
+            EXPECT_FALSE(third_topic_grant->second.SendMessages());
         }
     });
 }
