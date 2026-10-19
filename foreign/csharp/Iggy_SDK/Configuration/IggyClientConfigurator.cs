@@ -136,7 +136,7 @@ public sealed class IggyClientConfigurator
     ///     Supported options: <c>tls</c>, <c>tls_domain</c>, <c>tls_ca_file</c>, <c>reconnection_retries</c>
     ///     (a count or <c>unlimited</c>), <c>reconnection_interval</c>, <c>heartbeat_interval</c>,
     ///     <c>reestablish_after</c>, <c>nodelay</c>, <c>max_pending_operations</c> (positive integer),
-    ///     and <c>max_pending_operation_bytes</c> (at least 256). Durations look like <c>500ms</c>, <c>5s</c> or <c>1m30s</c>.
+    ///     and <c>max_pending_operation_bytes</c> (positive). Durations look like <c>500ms</c>, <c>5s</c> or <c>1m30s</c>.
     ///     Reconnection defaults to unlimited retries every second, and after each reconnect the client still waits
     ///     <see cref="ReconnectionSettings.WaitAfterReconnect" /> (1 second by default). <c>reestablish_after</c> is
     ///     validated but ignored, since <c>reconnection_interval</c> paces every redial. <c>nodelay</c> is validated

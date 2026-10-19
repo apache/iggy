@@ -41,7 +41,7 @@ internal sealed class MutationLanes(ConsensusSession session, IggyClientConfigur
     }
     private readonly int _maxOperations = configuration.MaxPendingOperations > 0 ? configuration.MaxPendingOperations
         : throw new ArgumentOutOfRangeException(nameof(configuration.MaxPendingOperations));
-    private readonly long _maxBytes = configuration.MaxPendingOperationBytes >= VsrHeader.HEADER_SIZE
+    private readonly long _maxBytes = configuration.MaxPendingOperationBytes > 0
         ? configuration.MaxPendingOperationBytes : throw new ArgumentOutOfRangeException(nameof(configuration.MaxPendingOperationBytes));
     private readonly object _gate = new();
     private readonly List<Waiting> _waiting = [];

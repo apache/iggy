@@ -198,8 +198,10 @@ public sealed partial class TcpMessageStream
                     connection = null;
                 }
                 catch (Exception error) when (!token.IsCancellationRequested && !_disposed
+                    && error is not VsrSessionEvictedException
                     && (VsrConnection.IsConnectionException(error) || error is AuthenticationException or IggyInvalidStatusCodeException
-                    { StatusCode: VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY }))
+                    { StatusCode: VsrError.TRANSIENT_NOT_COMMITTED or VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY }
+                    or IggyInvalidStatusCodeException { FromServer: false, StatusCode: VsrError.INVALID_FORMAT }))
                 {
                     connection?.Dispose();
                 }
@@ -207,7 +209,7 @@ public sealed partial class TcpMessageStream
                 {
                     connection?.Dispose();
                     // The bind is what decides, so a StaleClient refusal of the bind ends the session.
-                    if (IsSessionFailure(error)
+                    if (IsSessionFailure(error, binding: true)
                         || error is IggyInvalidStatusCodeException { FromServer: true, StatusCode: VsrError.STALE_CLIENT })
                     {
                         ScheduleSessionRecovery(slot.Generation);
@@ -468,12 +470,13 @@ public sealed partial class TcpMessageStream
     ///     that carried it, and the bind on a new link decides. A committed StaleClient result comes from the
     ///     replicated session epoch, so it does.
     /// </summary>
-    private static bool IsSessionFailure(Exception? error) => error is VsrSessionEvictedException
-        or IggyInvalidStatusCodeException
-    {
-        FromServer: true,
-        StatusCode: VsrError.UNAUTHENTICATED or VsrError.SESSION_MISMATCH
-    }
+    private static bool IsSessionFailure(Exception? error, bool binding = false) =>
+        (error is VsrSessionEvictedException && (binding || !VsrConnection.IsDetachedSession(error)))
+        || error is IggyInvalidStatusCodeException
+        {
+            FromServer: true,
+            StatusCode: VsrError.UNAUTHENTICATED or VsrError.SESSION_MISMATCH
+        }
         or IggyInvalidStatusCodeException { FromServer: true, Committed: true, StatusCode: VsrError.STALE_CLIENT };
 
     /// <summary>

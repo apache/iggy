@@ -558,24 +558,15 @@ public sealed class PrimaryPollingTests
         };
         using var client = await cluster.ConnectAsync();
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
-        if (status != 0)
+        if (status == (uint)VsrError.STALE_CLIENT)
         {
             var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => PollAsync(client));
             Assert.Equal((int)status, error.StatusCode);
         }
-        if (status == (uint)VsrError.UNAUTHENTICATED)
-        {
-            await cluster.UntilAsync(() => cluster.Coordinator.Registrations == 2);
-            await PollAsync(client);
-            Assert.NotEqual(generation, ((ISessionGenerationProvider)client).SessionGeneration);
-        }
-        else
-        {
-            await PollAsync(client);
-            await cluster.UntilAsync(() => cluster.Coordinator.Requests(CommandCodes.BIND_SESSION_CODE) == 1);
-            Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
-            Assert.Equal(1, cluster.Coordinator.Registrations);
-        }
+        await PollAsync(client);
+        await cluster.UntilAsync(() => cluster.Coordinator.Requests(CommandCodes.BIND_SESSION_CODE) == 1);
+        Assert.Equal(generation, ((ISessionGenerationProvider)client).SessionGeneration);
+        Assert.Equal(1, cluster.Coordinator.Registrations);
         Assert.Equal(1, cluster.Primaries[0].Requests(CommandCodes.POLL_MESSAGES_CODE));
     }
 

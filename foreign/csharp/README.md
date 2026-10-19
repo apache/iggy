@@ -299,7 +299,8 @@ the message-batch-failed event. That caller reads it with `ResolveOperationAsync
 `MaxPendingOperations` and `MaxPendingOperationBytes` bound active plus retained mutation frames across the
 client, defaulting to 256 operations and 64 MiB. Admission waits within the call deadline before allocating an
 id or frozen frame. A replay shares its reservation; outstanding writers keep bytes charged until released.
-The byte limit includes the 256-byte header and must be at least 256; the operation count must be positive.
+Both limits must be positive. The byte limit includes the 256-byte header and the mutation body.
+Smaller positive limits are valid but reject mutations that cannot fit; reads and login remain available.
 Reads and control requests have a separate per-link limit of 256 pending calls and a 32-frame write queue.
 Their bodies, including unknown raw non-replicated commands, are outside the mutation byte budget.
 

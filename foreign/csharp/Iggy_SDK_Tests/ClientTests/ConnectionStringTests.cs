@@ -111,6 +111,7 @@ public sealed class ConnectionStringTests
 
     [Theory]
     [InlineData(1, 256L)]
+    [InlineData(1, 1L)]
     [InlineData(512, 134217728L)]
     [InlineData(int.MaxValue, long.MaxValue)]
     public void FromConnectionString_WithPendingOperationLimits_MapsBoth(int operations, long bytes)
@@ -159,7 +160,6 @@ public sealed class ConnectionStringTests
     [InlineData("max_pending_operations", "unlimited")]
     [InlineData("max_pending_operations", "")]
     [InlineData("max_pending_operation_bytes", "0")]
-    [InlineData("max_pending_operation_bytes", "255")]
     [InlineData("max_pending_operation_bytes", "-256")]
     [InlineData("max_pending_operation_bytes", "+256")]
     [InlineData("max_pending_operation_bytes", "9223372036854775808")]

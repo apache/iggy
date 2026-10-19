@@ -461,6 +461,8 @@ public sealed class NativeRecoveryTests
         await StoreAsync(client, cluster.Token);
         var original = Assert.Single(cluster.Writes);
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
+        cluster.OnBind = request => request.ClientId == original.ClientId
+            ? Reply(request.Operation, [], VsrError.UNAUTHENTICATED) : Answer(request);
         cluster.PingEviction = EvictionReason.NoSession;
         await UntilSessionReplacedAsync(cluster, client);
         await StoreAsync(client, cluster.Token);
@@ -471,8 +473,10 @@ public sealed class NativeRecoveryTests
         Assert.NotEqual(cluster.Writes.Last().ClientId, original.ClientId);
     }
 
-    [Fact]
-    public async Task given_a_stale_client_eviction_when_idle_should_bind_the_same_session_on_a_new_link()
+    [Theory]
+    [InlineData((byte)EvictionReason.StaleClient)]
+    [InlineData((byte)EvictionReason.NoSession)]
+    public async Task given_a_detached_session_when_idle_should_bind_the_same_session_on_a_new_link(byte reason)
     {
         using var cluster = new RecoveryCluster();
         using var client = await cluster.ConnectAsync(heartbeat: TimeSpan.FromMilliseconds(25));
@@ -480,7 +484,7 @@ public sealed class NativeRecoveryTests
         var original = Assert.Single(cluster.Writes);
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
 
-        cluster.PingEviction = EvictionReason.StaleClient;
+        cluster.PingEviction = (EvictionReason)reason;
         await cluster.UntilAsync(() => Binds(cluster) > 1);
         await StoreAsync(client, cluster.Token);
 
@@ -492,16 +496,17 @@ public sealed class NativeRecoveryTests
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task given_a_stale_client_eviction_of_a_written_mutation_should_replay_it_over_the_same_session(
-        bool send)
+    [InlineData(true, (byte)EvictionReason.StaleClient)]
+    [InlineData(false, (byte)EvictionReason.StaleClient)]
+    [InlineData(true, (byte)EvictionReason.NoSession)]
+    [InlineData(false, (byte)EvictionReason.NoSession)]
+    public async Task given_a_detached_mutation_should_replay_it_over_the_same_session(bool send, byte reason)
     {
         using var cluster = new RecoveryCluster();
         using var client = await cluster.ConnectAsync();
         var generation = ((ISessionGenerationProvider)client).SessionGeneration;
         await cluster.UntilAsync(() => Binds(cluster) == 1);
-        var writes = AnswerWrites(cluster, send, _ => Eviction(EvictionReason.StaleClient));
+        var writes = AnswerWrites(cluster, send, _ => Eviction((EvictionReason)reason));
 
         await WriteAsync(client, send, cluster.Token);
 
@@ -531,6 +536,8 @@ public sealed class NativeRecoveryTests
         using var cluster = new RecoveryCluster();
         using var client = await cluster.ConnectAsync();
         var writes = AnswerWrites(cluster, send, _ => Eviction((EvictionReason)reason));
+        cluster.OnBind = request => writes.TryPeek(out var first) && request.ClientId == first.ClientId
+            ? Reply(request.Operation, [], VsrError.UNAUTHENTICATED) : Answer(request);
 
         var error = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
             WriteAsync(client, send, cluster.Token));
@@ -545,34 +552,31 @@ public sealed class NativeRecoveryTests
     }
 
     [Theory]
-    [InlineData(VsrError.UNAUTHENTICATED, true)]
-    [InlineData(VsrError.UNAUTHENTICATED, false)]
-    public async Task given_a_session_refusal_reply_to_a_written_mutation_should_stay_definitive_and_replace_the_session(
-        int status, bool send)
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task given_an_unbound_mutation_when_the_bind_succeeds_should_replay_the_same_request(bool send)
     {
         using var cluster = new RecoveryCluster();
         using var client = await cluster.ConnectAsync();
-        var writes = AnswerWrites(cluster, send, request => Reply(request.Operation, [], (uint)status));
+        var writes = AnswerWrites(cluster, send, request => Reply(request.Operation, [], VsrError.UNAUTHENTICATED));
 
-        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-            WriteAsync(client, send, cluster.Token));
-
-        Assert.Equal(status, error.StatusCode);
-        Assert.True(error.FromServer);
-        Assert.False(error.Committed);
-        var refused = Assert.Single(writes);
-        await Assert.ThrowsAsync<VsrOperationNotRetainedException>(() =>
-            client.ResolveOperationAsync(refused.RequestId, TimeSpan.FromSeconds(1), cluster.Token));
-        await UntilSessionReplacedAsync(cluster, client);
         await WriteAsync(client, send, cluster.Token);
-        Assert.NotEqual(refused.ClientId, writes.Last().ClientId);
+
+        var attempts = writes.ToArray();
+        Assert.Equal(2, attempts.Length);
+        Assert.Equal(attempts[0].RequestId, attempts[1].RequestId);
+        Assert.Equal(attempts[0].ClientId, attempts[1].ClientId);
+        Assert.Equal(attempts[0].Body, attempts[1].Body);
+        Assert.Equal(1, cluster.Coordinator.Registrations);
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task given_a_stale_client_refusal_when_the_bind_succeeds_should_fail_the_call_and_keep_the_session(
-        bool metadata)
+    [InlineData(true, VsrError.STALE_CLIENT)]
+    [InlineData(false, VsrError.STALE_CLIENT)]
+    [InlineData(true, VsrError.UNAUTHENTICATED)]
+    [InlineData(false, VsrError.UNAUTHENTICATED)]
+    public async Task given_a_detached_link_when_the_bind_succeeds_should_preserve_unrelated_retained_operations(
+        bool metadata, int status)
     {
         using var cluster = new RecoveryCluster();
         using var client = await cluster.ConnectAsync();
@@ -582,14 +586,22 @@ public sealed class NativeRecoveryTests
             cluster.Token);
         var operationId = await RetainWriteAsync(cluster, client);
         var original = Assert.Single(cluster.Writes);
-        cluster.OnMetadata = cluster.OnWrite = request => Reply(request.Operation, [], VsrError.STALE_CLIENT);
+        var refusals = 0;
+        cluster.OnMetadata = cluster.OnWrite = request => Interlocked.Increment(ref refusals) == 1
+            ? Reply(request.Operation, [], (uint)status) : Result(request);
 
-        var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => metadata
-            ? client.DeleteStreamAsync(Stream, cluster.Token)
-            : StoreAsync(client, cluster.Token, partition: 1));
-
-        Assert.Equal(VsrError.STALE_CLIENT, error.StatusCode);
-        Assert.False(error.Committed);
+        Task MutateAsync() => metadata ? client.DeleteStreamAsync(Stream, cluster.Token)
+            : StoreAsync(client, cluster.Token, partition: 1);
+        if (status == VsrError.STALE_CLIENT)
+        {
+            var error = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(MutateAsync);
+            Assert.Equal(status, error.StatusCode);
+            Assert.False(error.Committed);
+        }
+        else
+        {
+            await MutateAsync();
+        }
         cluster.OnMetadata = cluster.OnWrite = request => Result(request);
         await cluster.UntilAsync(() => Binds(cluster) == 2);
         await client.ResolveOperationAsync(operationId, TimeSpan.FromSeconds(5), cluster.Token);
@@ -874,7 +886,7 @@ public sealed class NativeRecoveryTests
             }
         };
 
-        cluster.PingEviction = EvictionReason.NoSession;
+        cluster.PingEviction = EvictionReason.SessionError;
         await cluster.UntilAsync(() => !registrations.IsEmpty);
 
         var registration = Assert.Single(registrations);
@@ -906,7 +918,7 @@ public sealed class NativeRecoveryTests
                 registrations.Enqueue(request);
             }
         };
-        cluster.PingEviction = EvictionReason.NoSession;
+        cluster.PingEviction = EvictionReason.SessionError;
         await cluster.UntilAsync(() => !registrations.IsEmpty);
 
         var registration = Assert.Single(registrations);

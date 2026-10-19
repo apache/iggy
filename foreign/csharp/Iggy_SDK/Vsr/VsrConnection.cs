@@ -21,6 +21,7 @@ using System.Net.Sockets;
 using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Vsr;
@@ -88,7 +89,13 @@ internal sealed class VsrConnection : IDisposable
     public void Dispose() => Fail(new ObjectDisposedException(nameof(VsrConnection)), notify: false);
 
     internal static bool IsConnectionException(Exception error) => error is IggyZeroBytesException
-        or NotConnectedException or SocketException or IOException or ObjectDisposedException;
+        or NotConnectedException or SocketException or IOException or ObjectDisposedException
+        || IsDetachedSession(error);
+
+    internal static bool IsDetachedSession(Exception? error) => error is VsrSessionEvictedException
+    {
+        Reason: EvictionReason.NoSession or EvictionReason.StaleClient
+    };
 
     internal Task<VsrAttempt> SendFrameAsync(ClientOperation operation, long deadline, bool clearSensitiveReply,
         CancellationToken token) =>
@@ -310,11 +317,7 @@ internal sealed class VsrConnection : IDisposable
                     var eviction = VsrHeader.ReadEviction(header);
                     _logger.LogWarning("Consensus link evicted by the server: {Reason}", eviction.Reason);
                     var verdict = VsrReplyDecoder.ToException(eviction);
-                    // A stale client eviction removes only this link's binding. The session and its group
-                    // memberships stay until the lease expires, so the link redials and binds the same session.
-                    throw eviction.Reason == EvictionReason.StaleClient
-                        ? new IOException("The server dropped this link as stale.", verdict)
-                        : new VsrSessionEvictedException(verdict);
+                    throw new VsrSessionEvictedException(eviction.Reason, verdict);
                 }
                 if (VsrHeader.PeekCommand(header) != Command.Reply)
                 {
@@ -353,6 +356,7 @@ internal sealed class VsrConnection : IDisposable
                         throw VsrError.Exception(VsrError.INVALID_COMMAND, "Reply operation does not match its request.");
                     }
                     VsrAttempt result;
+                    IggyInvalidStatusCodeException? detached = null;
                     try
                     {
                         if (VsrHeader.ReadCommitted(header) && !MatchesCommittedRequest(header, request))
@@ -382,7 +386,20 @@ internal sealed class VsrConnection : IDisposable
                             _observeMetadataCommit?.Invoke(BinaryPrimitives.ReadUInt64LittleEndian(
                                 header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
                         }
-                        result = VsrAttempt.Failed(true, error, true, this);
+                        if (error.FromServer && !error.Committed && request.Code != CommandCodes.BIND_SESSION_CODE
+                            && BinaryPrimitives.ReadUInt64LittleEndian(request.Frame.AsSpan(VsrHeader.REQUEST_SESSION_OFFSET)) != 0
+                            && error.StatusCode == VsrError.UNAUTHENTICATED)
+                        {
+                            detached = error;
+                            var refusal = VsrError.FromServer(VsrError.TRANSIENT_NOT_ACCEPTED,
+                                "The server detached this connection from its session.");
+                            refusal.CommandCode = request.Code;
+                            result = VsrAttempt.Failed(true, refusal, true, this);
+                        }
+                        else
+                        {
+                            result = VsrAttempt.Failed(true, error, true, this);
+                        }
                     }
                     lock (_gate)
                     {
@@ -395,11 +412,9 @@ internal sealed class VsrConnection : IDisposable
                             result.Response?.Dispose();
                         }
                     }
-                    // A StaleClient refusal says that the server no longer attaches this link to the session. A
-                    // live session gets one too after a replica replaced its client table, so the link fails as
-                    // after a stale client eviction, and the bind on a new link decides whether the session lives.
-                    if (result.Error is IggyInvalidStatusCodeException
-                        { FromServer: true, Committed: false, StatusCode: VsrError.STALE_CLIENT } detached)
+                    detached ??= result.Error is IggyInvalidStatusCodeException
+                    { FromServer: true, Committed: false, StatusCode: VsrError.STALE_CLIENT } stale ? stale : null;
+                    if (detached is not null)
                     {
                         throw new IOException("The server detached this link from the session.", detached);
                     }

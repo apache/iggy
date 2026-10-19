@@ -189,23 +189,14 @@ public sealed class EndpointFailoverTests
             Assert.Equal(original.Body, replay.Body);
         });
         proveCommit = true;
-        if (refusal == VsrError.UNAUTHENTICATED)
-        {
-            await UntilAsync(() => node.Registrations == 2);
-            await Assert.ThrowsAsync<VsrOperationNotRetainedException>(() =>
-                client.ResolveOperationAsync(id, TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
-        }
-        else
-        {
-            var count = attempts.Count;
-            var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() =>
-                client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
-                    TestContext.Current.CancellationToken));
-            Assert.Equal(id, blocked.OperationId);
-            Assert.Equal(count, attempts.Count);
-            await client.ResolveOperationAsync(id, TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
-            Assert.Equal(original.RequestId, attempts.Last().RequestId);
-        }
+        var count = attempts.Count;
+        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() =>
+            client.CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 1,
+                TestContext.Current.CancellationToken));
+        Assert.Equal(id, blocked.OperationId);
+        Assert.Equal(count, attempts.Count);
+        await client.ResolveOperationAsync(id, TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+        Assert.Equal(original.RequestId, attempts.Last().RequestId);
     }
 
     [Theory]
@@ -601,7 +592,7 @@ public sealed class EndpointFailoverTests
     }
 
     [Fact]
-    public async Task CallWaitingOnTheRosterFailsAsNotConnectedAfterASessionFailureWhenReconnectionIsOff()
+    public async Task CallWaitingOnTheRosterFailsAsNotConnectedAfterDetachmentWhenReconnectionIsOff()
     {
         using var node = new MockNode();
         var refusing = false;
@@ -633,11 +624,9 @@ public sealed class EndpointFailoverTests
         var ping = client.PingAsync(TestContext.Current.CancellationToken);
         await UntilAsync(() => node.Requests(GET_CLUSTER_METADATA_CODE) > rosterReads);
 
-        // An unauthenticated reply ends the session and fails only its own request. An eviction would also fail a
-        // roster read in flight on the link.
-        var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+        await Assert.ThrowsAsync<NotConnectedException>(() =>
             client.GetStatsAsync(TestContext.Current.CancellationToken));
-        Assert.Equal(VsrError.UNAUTHENTICATED, refusal.StatusCode);
+        Assert.Equal(1, node.Registrations);
 
         await Assert.ThrowsAsync<NotConnectedException>(() => ping);
     }
@@ -670,7 +659,7 @@ public sealed class EndpointFailoverTests
             {
                 if (request.Code == evicted && Interlocked.Increment(ref evictions) == 1)
                 {
-                    return EvictionFrame((byte)EvictionReason.NoSession);
+                    return EvictionFrame((byte)(call == "session resume" ? EvictionReason.NoSession : EvictionReason.SessionError));
                 }
                 // A refused ping reads the roster again.
                 if (call == "roster read" && request.Code == CommandCodes.PING_CODE)

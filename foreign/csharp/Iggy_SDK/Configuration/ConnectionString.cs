@@ -19,7 +19,6 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Utils;
-using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Configuration;
 
@@ -182,10 +181,10 @@ internal static class ConnectionString
                     break;
                 case "max_pending_operation_bytes":
                     if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out maxPendingOperationBytes)
-                        || maxPendingOperationBytes < VsrHeader.HEADER_SIZE)
+                        || maxPendingOperationBytes <= 0)
                     {
                         throw new FormatException(
-                            $"Option \"{name}\" must be an integer between {VsrHeader.HEADER_SIZE} and {long.MaxValue}.");
+                            $"Option \"{name}\" must be an integer between 1 and {long.MaxValue}.");
                     }
                     break;
                 case "nodelay":

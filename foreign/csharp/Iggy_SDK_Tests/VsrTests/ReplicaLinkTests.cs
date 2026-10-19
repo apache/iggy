@@ -68,6 +68,33 @@ public sealed class ReplicaLinkTests
     }
 
     [Fact]
+    public async Task given_a_malformed_bind_reply_when_the_node_recovers_should_retry_the_slot()
+    {
+        using var node = new MockNode();
+        var drop = 0;
+        var binds = 0;
+        node.Serve(request =>
+        {
+            if (request.Code == PING_CODE && Interlocked.Exchange(ref drop, 0) == 1)
+            {
+                throw new IOException("lost link");
+            }
+            if (request.Code == BIND_SESSION_CODE && Interlocked.Increment(ref binds) == 1)
+            {
+                return Reply(OPERATION_NON_REPLICATED, [0]);
+            }
+            return request.Code == GET_CLUSTER_METADATA_CODE ? StandaloneRoster(node.Port) : Answer(request);
+        });
+        using var client = await SignedInAsync(node.Port);
+        Volatile.Write(ref drop, 1);
+
+        Assert.True(await EventuallyAsync(() => Volatile.Read(ref binds) >= 2),
+            "A malformed bind reply must not leave the replica slot stopped.");
+        await client.PingAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(1, node.Registrations);
+    }
+
+    [Fact]
     public async Task given_one_link_out_of_retries_among_live_ones_when_the_heartbeat_ticks_should_restart_it()
     {
         var token = TestContext.Current.CancellationToken;

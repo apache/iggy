@@ -90,12 +90,12 @@ public sealed class VsrMultiplexingTests
         var request = await pair.ReadAsync();
         var rejection = new byte[12];
         BinaryPrimitives.WriteUInt32LittleEndian(rejection, 1);
-        BinaryPrimitives.WriteUInt32LittleEndian(rejection.AsSpan(8), VsrError.UNAUTHENTICATED);
+        BinaryPrimitives.WriteUInt32LittleEndian(rejection.AsSpan(8), VsrError.UNAUTHORIZED);
         await pair.ReplyAsync(request with { RequestId = ulong.MaxValue }, rejection, marker);
         await pair.ReplyAsync(request, rejection, marker);
         var result = await pending;
         var error = Assert.IsType<IggyInvalidStatusCodeException>(result.Error);
-        Assert.Equal(VsrError.UNAUTHENTICATED, error.StatusCode);
+        Assert.Equal(VsrError.UNAUTHORIZED, error.StatusCode);
         Assert.Equal(committed, error.Committed);
         Assert.Equal(committed, result.Committed);
         Assert.Equal(CommandCodes.STORE_CONSUMER_OFFSET_CODE, error.CommandCode);
