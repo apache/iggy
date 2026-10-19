@@ -21,6 +21,7 @@ use metadata::impls::recovery::RecoveryError;
 use partitions::PartitionRecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
+use std::error::Error as _;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -415,7 +416,14 @@ fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
         }
         match &failure.kind {
             ShardJoinFailureKind::Error(err) => {
+                // The process prints only this error's own source chain, so each
+                // shard's cause has to be inlined or the operator never sees it.
                 let _ = write!(out, "shard {} -> {err}", failure.shard_id);
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    let _ = write!(out, ": {cause}");
+                    source = cause.source();
+                }
             }
             ShardJoinFailureKind::Panic { message } => {
                 let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
@@ -468,6 +476,25 @@ mod tests {
         assert!(
             rendered.contains("shard 2 panicked: boom"),
             "shard 2 panic entry missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_shard_error_with_a_source_when_rendering_join_failures_should_inline_the_cause() {
+        let failures = vec![ShardJoinFailure {
+            shard_id: 0,
+            kind: ShardJoinFailureKind::Error(Box::new(ServerError::ListConfigEnvVars(
+                std::io::Error::other("refusing to truncate"),
+            ))),
+        }];
+
+        let rendered = ServerError::ShardJoinFailures { failures }.to_string();
+
+        assert!(
+            rendered.contains(
+                "shard 0 -> Failed to list config environment variables: refusing to truncate"
+            ),
+            "source chain missing: {rendered}"
         );
     }
 }
