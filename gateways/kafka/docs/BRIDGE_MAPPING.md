@@ -334,7 +334,6 @@ Iggy can poll empty while records remain: on a read fault, or before a partition
 point. In a cluster the polls can also reach a node behind the one the probe read, which serves a
 shorter tail. An empty lookup therefore answers `-1` only when:
 
-- the probe read a high watermark of 0, so nothing was ever appended;
 - a poll of the last record shows it was appended before the time and its offset + 1 reaches the
   probed high watermark, so the polled node is not behind the probe; or
 - the probe counted no message and the poll of the last record comes back empty too.
@@ -351,7 +350,8 @@ two apart, and answering 6 instead would never let a reset by time finish on an 
 
 A partition Iggy is still loading can read `(messages_count, current_offset) == (0, 0)`, the same
 as an empty one, and the probe cannot tell them apart without a server-side signal. A lookup by
-time in that window answers `-1`, and a reset by time there moves to LATEST.
+time in that window still polls, and answers `-1` only when the polls come back empty as well. A
+reset by time there then moves to LATEST.
 
 Lookups by time run one partition at a time and reuse one Fetch read slot, however many
 partitions the request names. A poll that times out frees its slot as it stops, so for a moment

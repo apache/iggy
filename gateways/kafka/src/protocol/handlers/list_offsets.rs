@@ -362,9 +362,6 @@ fn resolve_one_partition(
         // from the oldest kept message, so the consumer skips the gap. Not fixable client-side;
         // needs the bridge to expose a real start offset.
         EARLIEST_TIMESTAMP => offset_response(index, 0),
-        // Nothing was ever appended, so no poll is spent on it. A count of 0 alone is not enough:
-        // the server reports it without stats too.
-        _ if probe.high_watermark == 0 => not_found_response(index),
         timestamp => {
             let lookup = match timestamp {
                 MAX_TIMESTAMP => RecordLookup::Last,
@@ -602,9 +599,12 @@ fn reaches(record: &LocatedRecord, high_watermark: u64) -> bool {
 }
 
 /// `error`'s code, but 6 where it would be -1, which the `AdminClient` fails the partition on.
+/// A rejected bridge login keeps -1, as in Fetch and Produce: retrying cannot fix it.
 const fn retriable_code(error: &BridgeError) -> i16 {
     match error.to_list_offsets_error_code() {
-        ERROR_UNKNOWN_SERVER_ERROR => ERROR_NOT_LEADER_OR_FOLLOWER,
+        ERROR_UNKNOWN_SERVER_ERROR if !error.is_bridge_login_rejected() => {
+            ERROR_NOT_LEADER_OR_FOLLOWER
+        }
         code => code,
     }
 }
@@ -839,15 +839,24 @@ mod tests {
         assert_eq!(answer(&resp), (ERROR_NONE, 17, REQUESTED_MILLIS + 5));
     }
 
+    /// A server without stats for the partition reads a high watermark of 0 too, so only a
+    /// lookup tells it from one that was never appended to.
     #[test]
-    fn a_timestamp_on_an_empty_partition_is_not_found_without_a_lookup() {
-        // Kafka's "no such record": error 0 with -1 offset and timestamp, never an error code.
+    fn a_timestamp_on_a_partition_with_a_high_watermark_of_zero_is_looked_up() {
         let lookup = TopicLookup::Probed(Ok(ok_watermarks(&[(0, 0)])));
         for requested in [1_700_000_000_000, MAX_TIMESTAMP] {
-            let resp = resolved(&partition(0, requested), &lookup);
-            assert_eq!(resp.error_code, ERROR_NONE);
-            assert_eq!(resp.offset, UNKNOWN_OFFSET);
-            assert_eq!(resp.timestamp, UNKNOWN_OFFSET);
+            let answer = resolve_one_partition(&partition(0, requested), &lookup);
+            assert!(
+                matches!(
+                    answer,
+                    PartitionAnswer::Pending(PendingLookup {
+                        retained: 0,
+                        high_watermark: 0,
+                        ..
+                    })
+                ),
+                "timestamp {requested}: {answer:?}"
+            );
         }
     }
 
@@ -916,6 +925,31 @@ mod tests {
             None,
         );
         assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    /// The `AdminClient` fails the partition on -1 instead of retrying until its timeout.
+    #[test]
+    fn a_rejected_bridge_login_answers_unknown_server_error_from_a_record_lookup() {
+        let rejected = || BridgeError::Iggy(IggyError::InvalidCredentials);
+        let lookup = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
+        let found = lookup_answer(
+            &Mutex::default(),
+            "orders",
+            pending(lookup, 42, 42),
+            Err(rejected()),
+            None,
+        );
+        let last = Some(Err(rejected()));
+        let after_empty = lookup_answer(
+            &Mutex::default(),
+            "orders",
+            pending(lookup, 42, 42),
+            Ok(None),
+            last.as_ref(),
+        );
+        for resp in [found, after_empty] {
+            assert_eq!(resp.error_code, ERROR_UNKNOWN_SERVER_ERROR);
+        }
     }
 
     const REQUESTED_MILLIS: i64 = 1_700_000_000_000;
