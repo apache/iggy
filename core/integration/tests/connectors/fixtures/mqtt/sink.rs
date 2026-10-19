@@ -85,6 +85,14 @@ enum MqttTopicMode {
     Dynamic,
 }
 
+struct MqttRoutingConfig {
+    topic_mode: MqttTopicMode,
+    topic: Option<String>,
+    topic_template: Option<String>,
+    fallback_topic: Option<String>,
+    subscription_filters: Vec<String>,
+}
+
 impl MqttTopicMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -115,11 +123,13 @@ impl MqttSinkFixture {
             qos,
             schema,
             max_in_flight,
-            MqttTopicMode::Static,
-            Some(DEFAULT_SINK_TOPIC.to_string()),
-            None,
-            None,
-            vec![DEFAULT_SINK_TOPIC.to_string()],
+            MqttRoutingConfig {
+                topic_mode: MqttTopicMode::Static,
+                topic: Some(DEFAULT_SINK_TOPIC.to_string()),
+                topic_template: None,
+                fallback_topic: None,
+                subscription_filters: vec![DEFAULT_SINK_TOPIC.to_string()],
+            },
         )
         .await
     }
@@ -129,12 +139,15 @@ impl MqttSinkFixture {
         qos: u8,
         schema: Schema,
         max_in_flight: usize,
-        topic_mode: MqttTopicMode,
-        topic: Option<String>,
-        topic_template: Option<String>,
-        fallback_topic: Option<String>,
-        subscription_filters: Vec<String>,
+        routing: MqttRoutingConfig,
     ) -> Result<Self, TestBinaryError> {
+        let MqttRoutingConfig {
+            topic_mode,
+            topic,
+            topic_template,
+            fallback_topic,
+            subscription_filters,
+        } = routing;
         let broker = MqttBrokerContainer::start().await?;
         let subscriber =
             MqttSubscriber::connect(&broker.broker_url, protocol, &subscription_filters).await?;
@@ -452,11 +465,13 @@ impl TestFixture for MqttSinkTemplateTopicFixture {
                 1,
                 Schema::Json,
                 1,
-                MqttTopicMode::Template,
-                None,
-                Some("integration/{stream}/{topic}".to_string()),
-                None,
-                vec!["integration/#".to_string()],
+                MqttRoutingConfig {
+                    topic_mode: MqttTopicMode::Template,
+                    topic: None,
+                    topic_template: Some("integration/{stream}/{topic}".to_string()),
+                    fallback_topic: None,
+                    subscription_filters: vec!["integration/#".to_string()],
+                },
             )
             .await?,
         })
@@ -488,14 +503,16 @@ impl TestFixture for MqttSinkDynamicTopicFixture {
                 1,
                 Schema::Raw,
                 1,
-                MqttTopicMode::Dynamic,
-                None,
-                None,
-                Some("fallback/{stream}/{topic}".to_string()),
-                vec![
-                    "devices/living-room".to_string(),
-                    "fallback/test_stream/test_topic".to_string(),
-                ],
+                MqttRoutingConfig {
+                    topic_mode: MqttTopicMode::Dynamic,
+                    topic: None,
+                    topic_template: None,
+                    fallback_topic: Some("fallback/{stream}/{topic}".to_string()),
+                    subscription_filters: vec![
+                        "devices/living-room".to_string(),
+                        "fallback/test_stream/test_topic".to_string(),
+                    ],
+                },
             )
             .await?,
         })
@@ -527,15 +544,17 @@ impl TestFixture for MqttSinkEnvelopeFixture {
                 1,
                 Schema::Json,
                 1,
-                MqttTopicMode::Dynamic,
-                None,
-                None,
-                Some("fallback/{stream}/{topic}".to_string()),
-                vec![
-                    "devices/roof/telemetry".to_string(),
-                    "devices/valid/one".to_string(),
-                    "devices/valid/two".to_string(),
-                ],
+                MqttRoutingConfig {
+                    topic_mode: MqttTopicMode::Dynamic,
+                    topic: None,
+                    topic_template: None,
+                    fallback_topic: Some("fallback/{stream}/{topic}".to_string()),
+                    subscription_filters: vec![
+                        "devices/roof/telemetry".to_string(),
+                        "devices/valid/one".to_string(),
+                        "devices/valid/two".to_string(),
+                    ],
+                },
             )
             .await?,
         })
@@ -549,11 +568,11 @@ impl TestFixture for MqttSinkEnvelopeFixture {
 enum MqttSubscriber {
     Mqtt311 {
         _client: Mqtt311Client,
-        event_loop: Mqtt311EventLoop,
+        event_loop: Box<Mqtt311EventLoop>,
     },
     Mqtt5 {
         _client: Mqtt5Client,
-        event_loop: Mqtt5EventLoop,
+        event_loop: Box<Mqtt5EventLoop>,
     },
 }
 
@@ -703,7 +722,7 @@ impl MqttSubscriber {
 
         Ok(Self::Mqtt311 {
             _client: client,
-            event_loop,
+            event_loop: Box::new(event_loop),
         })
     }
 
@@ -764,7 +783,7 @@ impl MqttSubscriber {
 
         Ok(Self::Mqtt5 {
             _client: client,
-            event_loop,
+            event_loop: Box::new(event_loop),
         })
     }
 }
