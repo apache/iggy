@@ -55,55 +55,16 @@ publishes them to MQTT brokers such as **EMQX** or Mosquitto.
 
 ---
 
-## Configuration Architecture
+## Configuration
 
-Configuration operates in **two distinct layers**:
+The connector TOML file has two parts. The runtime section identifies the
+sink and selects the Iggy records that it reads. The `[plugin_config]` section
+defines the MQTT connection and publication behavior.
 
-1. **Runtime Layer**: The connector TOML file defines the connector identity, library path, and Iggy stream and topic mapping.
-2. **Plugin Layer (`[plugin_config]`)**: Defines MQTT connection settings, credentials, routing, retries, and TLS. The runtime passes this table to the plugin as JSON across the FFI boundary.
-
----
-
-## Configuration Options (`[plugin_config]`)
-
-| Field | Type | Required | Default | Description |
-| :--- | :--- | :---: | :--- | :--- |
-| `broker_url` | String | **Yes** | — | Broker URL with an `mqtt://`, `mqtts://`, or `ssl://` scheme. It must not contain credentials or MQTT transport query options. |
-| `protocol` | String | No | `"mqtt5"` | MQTT version: `"mqtt5"` or `"mqtt311"`. |
-| `client_id` | String | Conditional | None | MQTT client identifier. It is required and non-empty when `clean_start = false`. |
-| `username` | String | No | None | Broker username. It must be supplied with `password`. |
-| `password` | String | No | None | Broker password. The connector treats it as a secret and never logs it. |
-| `clean_start` | Boolean | No | `false` | Clean start for MQTT 5 or clean session for MQTT 3.1.1. |
-| `session_expiry_interval` | Integer | No | `3600` | MQTT 5 session expiry interval in seconds. |
-| `topic` | String | No | `iggy.messages` | Static output topic. |
-| `topic_mode` | String | No | `static` | Routing mode: `static`, `template`, or `dynamic`. |
-| `topic_template` | String | No | `{stream}/{topic}` | Template that supports only `{stream}` and `{topic}`. |
-| `fallback_topic` | String | No | `{stream}/{topic}` | Topic used when dynamic routing has no valid topic. |
-| `qos` | Integer | No | `1` | MQTT publication QoS: `0`, `1`, or `2`. |
-| `retain` | Boolean | No | `false` | Sets the MQTT retain flag. |
-| `keep_alive` | Duration | No | `"30s"` | MQTT keep-alive. MQTT 3.1.1 accepts `0s` or at least `1s`. MQTT 5 requires at least `5s`. |
-| `request_capacity` | Integer | No | `32` | Bounded `rumqttc` request capacity. It must be greater than zero. |
-| `publish_timeout` | Duration | No | `"30s"` | Maximum wait for broker CONNACK and publication acknowledgements. |
-| `shutdown_timeout` | Duration | No | `"30s"` | Maximum time for draining and disconnecting. |
-| `max_retries` | Integer | No | `5` | Maximum retry attempts for connection or uncertain publication failures. |
-| `retry_delay` | Duration | No | `"1s"` | Initial retry delay. |
-| `max_retry_delay` | Duration | No | `"30s"` | Maximum retry delay. |
-| `max_in_flight` | Integer | No | `1` | Maximum publications awaiting acknowledgement. It must not exceed `request_capacity`. |
-| `verbose_logging` | Boolean | No | `false` | Enables additional plugin logging. |
-| `tls.ca_file` | String | No | None | Custom CA certificates in PEM format. The system trust store is used when omitted. |
-| `tls.client_cert_file` | String | No | None | mTLS client certificate in PEM format. It must pair with `client_key_file`. |
-| `tls.client_key_file` | String | No | None | mTLS client private key in PEM format. It must pair with `client_cert_file`. |
-
-Use `broker_url` only for the broker address. Configure `client_id`, `keep_alive`,
-`clean_start`, and `max_in_flight` in `[plugin_config]`. The connector rejects
-the URL query options `client_id`, `keep_alive_secs`, `clean_session`, and
-`inflight_num`.
-
----
-
-## Configuration Examples
-
-### 1. Basic MQTT 5 Sink
+The default sample uses static routing. It publishes every selected Iggy record
+to one MQTT topic. Optional authentication, TLS, template routing, and dynamic
+routing remain commented. Uncomment the fields that you need and replace the
+active `topic_mode` value when you select another routing mode.
 
 ```toml
 type = "sink"
@@ -126,40 +87,89 @@ consumer_group = "mqtt_telemetry_sink"
 broker_url = "mqtt://127.0.0.1:1883"
 protocol = "mqtt5"
 client_id = "iggy-mqtt-sink"
-username = "iggy_app"
-password = "local-secret-password"
 clean_start = false
 session_expiry_interval = 3600
-topic = "iggy.messages"
+
+# Select one routing block. Keep one topic_mode line active.
+# Static routing publishes every selected Iggy record to one MQTT topic.
 topic_mode = "static"
+topic = "iggy.messages"
 qos = 1
 retain = false
-keep_alive = "30s"
-max_retries = 5
-max_in_flight = 3
+
+# Template routing creates an MQTT topic from the Iggy stream and topic.
+# To select it, comment the active static topic and topic_mode lines above.
+# topic_mode = "template"
+# topic_template = "{stream}/{topic}"
+
+# Dynamic routing reads mqtt.topic from Iggy headers or an MQTT 5 envelope.
+# To select it, comment the active static topic and topic_mode lines above.
+# topic_mode = "dynamic"
+# fallback_topic = "{stream}/{topic}"
+
+# Optional broker authentication.
+# username = "emqx-user"
+# password = "replace-me"
+
+# Optional TLS configuration for mqtts:// brokers.
+# [plugin_config.tls]
+# ca_file = "/etc/iggy/certs/emqx-ca.pem"
+# client_cert_file = "/etc/iggy/certs/client-cert.pem"
+# client_key_file = "/etc/iggy/certs/client-key.pem"
 ```
 
-### 2. Template and Dynamic Routing
+`core/connectors/sinks/mqtt_sink/config.toml` uses this layout. The runtime
+example uses the same plugin configuration with its own Iggy route.
+
+## Runtime Configuration Reference
+
+| Field | Description |
+| :--- | :--- |
+| `type` | Set this value to `"sink"`. |
+| `key` | Names this connector instance. Each loaded connector needs a unique key. |
+| `enabled` | Starts the connector when the runtime starts. |
+| `version` | Selects the stored configuration version. |
+| `name` | Provides a readable name for logs and the control API. |
+| `path` | Gives the path to the MQTT sink shared library. |
+| `plugin_config_format` | Set this value to `"json"`. The runtime sends the plugin section as JSON. |
+| `streams[].stream` | Selects an Iggy stream to read. |
+| `streams[].topics` | Selects one or more Iggy topics in that stream. |
+| `streams[].schema` | Selects the decoder for the Iggy record payload. Use `"raw"` for unchanged bytes. |
+| `streams[].batch_length` | Limits the number of Iggy records in one runtime batch. |
+| `streams[].poll_interval` | Sets the wait time before the next Iggy poll. |
+| `streams[].consumer_group` | Stores the Iggy read position for this sink route. Use a unique name for each sink instance. |
+
+## MQTT Routing Modes
+
+Static mode publishes every Iggy record from one sink route to the value of
+`topic`. This is the default mode. `topic_template` and `fallback_topic` do
+not select the output topic in this mode.
 
 ```toml
-[plugin_config]
-broker_url = "mqtt://127.0.0.1:1883"
-protocol = "mqtt5"
-client_id = "iggy-mqtt-routing"
-topic_mode = "template"
-topic_template = "iggy/{stream}/{topic}"
-fallback_topic = "iggy/fallback"
-qos = 1
+topic_mode = "static"
+topic = "manual/static"
 ```
 
-Template mode supports only `{stream}` and `{topic}`. Dynamic mode reads
-`mqtt.topic` from raw-message headers or reads the topic from the versioned JSON
-envelope. Invalid or missing dynamic topics use `fallback_topic`.
+Template mode creates an MQTT topic from the Iggy stream and topic names. The
+template accepts only `{stream}` and `{topic}`. The `topic` field does not
+select the output topic in this mode.
 
-### 3. MQTT 5 Envelope Properties
+```toml
+topic_mode = "template"
+topic_template = "iggy/{stream}/{topic}"
+```
 
-Dynamic mode accepts the versioned JSON envelope produced by the MQTT source.
-The sink decodes `payload_base64` and publishes supported MQTT 5 properties.
+Dynamic mode reads `mqtt.topic` from raw-message headers. With MQTT 5, it can
+also read the topic from a versioned JSON envelope. `fallback_topic` selects
+the output topic when the record has no valid MQTT topic.
+
+```toml
+topic_mode = "dynamic"
+fallback_topic = "iggy/fallback"
+```
+
+Dynamic mode accepts this MQTT 5 envelope. The connector decodes
+`payload_base64` before it publishes the MQTT payload.
 
 ```json
 {
@@ -174,29 +184,48 @@ The sink decodes `payload_base64` and publishes supported MQTT 5 properties.
 }
 ```
 
-### 4. Secure TLS and Mutual TLS
+## Plugin Configuration Reference
 
-```toml
-[plugin_config]
-broker_url = "mqtts://emqx.example.com:8883"
-protocol = "mqtt5"
-client_id = "iggy-mqtt-tls-sink"
-topic = "iggy.messages"
-qos = 1
+| Field | Used when | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `broker_url` | Always | None | Sets the MQTT broker URL. Use `mqtt://`, `mqtts://`, or `ssl://`. Do not add credentials or MQTT options to this URL. |
+| `protocol` | All modes | `"mqtt5"` | Selects `"mqtt5"` or `"mqtt311"`. |
+| `client_id` | When `clean_start = false` | None | Identifies the MQTT client. Set a stable, non-empty value for persistent sessions. |
+| `username` | Authenticated brokers | None | Sets the broker user name. Set `password` with this field. |
+| `password` | Authenticated brokers | None | Sets the broker password. The connector does not write it to logs. |
+| `clean_start` | All modes | `false` | Starts a clean MQTT 5 session or MQTT 3.1.1 clean session. |
+| `session_expiry_interval` | All modes | `3600` | Sets the MQTT 5 session expiry time in seconds. |
+| `topic_mode` | All modes | `"static"` | Selects `"static"`, `"template"`, or `"dynamic"`. |
+| `topic` | Static mode | `"iggy.messages"` | Sets the MQTT output topic for static routing. |
+| `topic_template` | Template mode | `"{stream}/{topic}"` | Sets the template for template routing. It accepts only `{stream}` and `{topic}`. |
+| `fallback_topic` | Dynamic mode | `"{stream}/{topic}"` | Sets the MQTT output topic when dynamic routing has no valid topic. |
+| `qos` | All modes | `1` | Sets MQTT publication QoS. Use `0`, `1`, or `2`. |
+| `retain` | All modes | `false` | Sets the MQTT retained-message flag. |
+| `keep_alive` | All modes | `"30s"` | Sets the MQTT ping interval. MQTT 3.1.1 accepts `"0s"` or at least `"1s"`. MQTT 5 needs at least `"5s"`. |
+| `request_capacity` | All modes | `32` | Limits queued MQTT client requests. Set a value greater than zero. |
+| `publish_timeout` | All modes | `"30s"` | Limits the wait for broker connection and publication acknowledgments. |
+| `shutdown_timeout` | All modes | `"30s"` | Limits the wait while the connector finishes publications during shutdown. |
+| `max_retries` | All modes | `5` | Limits retries after connection or uncertain publication failures. |
+| `retry_delay` | All modes | `"1s"` | Sets the first retry delay. |
+| `max_retry_delay` | All modes | `"30s"` | Limits the retry delay. |
+| `max_in_flight` | All modes | `1` | Limits publications that wait for acknowledgment. It must not exceed `request_capacity`. |
+| `verbose_logging` | All modes | `false` | Enables extra plugin log records. |
+| `tls.ca_file` | TLS brokers | None | Sets a PEM file that contains custom CA certificates. The system trust store is used when it is omitted. |
+| `tls.client_cert_file` | Mutual TLS | None | Sets the PEM client certificate for mutual TLS. Set `tls.client_key_file` with this field. |
+| `tls.client_key_file` | Mutual TLS | None | Sets the PEM client key for mutual TLS. Set `tls.client_cert_file` with this field. |
 
-[plugin_config.tls]
-ca_file = "/etc/iggy/certs/ca.pem"
-client_cert_file = "/etc/iggy/certs/client-cert.pem"
-client_key_file = "/etc/iggy/certs/client-key.pem"
-```
+Use `broker_url` only for the broker address. Set `client_id`, `keep_alive`,
+`clean_start`, and `max_in_flight` as separate fields. The connector rejects
+the URL options `client_id`, `keep_alive_secs`, `clean_session`, and
+`inflight_num`.
 
-The connector validates the broker certificate and hostname. It has no option
-to disable certificate validation. The nested TLS table belongs in the
-connector TOML file because flat environment overrides cannot update it.
+## TLS and Multiple Routes
 
-### 5. Multiple Sink Routes
+The connector validates the broker certificate and host name. It cannot disable
+certificate validation. Keep the complete `[plugin_config.tls]` table in the
+connector TOML file because environment overrides cannot update nested fields.
 
-Run one connector instance per MQTT route. Give every instance a unique
+Use one connector instance for each MQTT route. Give each instance a unique
 connector key, client ID, consumer group, and output topic. The runtime loads
 each connector TOML file from its configured `config_dir`.
 
@@ -222,9 +251,9 @@ variables. Keep the complete `[plugin_config.tls]` table in the connector TOML.
 
 ## Publication and Acknowledgement Mechanism
 
-The sink provides broker-facing at-least-once MQTT delivery for QoS 1 and QoS
-2. A publication is confirmed only after the expected MQTT acknowledgement
-arrives.
+The sink provides QoS-aware broker delivery for MQTT publications. For QoS 1
+and QoS 2, a publication is confirmed only after the expected MQTT
+acknowledgement arrives.
 
 ```text
   Iggy Server          MQTT Sink Plugin             MQTT Broker
@@ -248,8 +277,10 @@ unconfirmed publications. This favors duplicates over loss.
 
 Iggy offset durability depends on the connectors runtime. The current runtime
 commits offsets when it polls messages, before MQTT publication completes.
-End-to-end Iggy at-least-once delivery requires offset storage after MQTT
-confirms the publication.
+The MQTT sink provides QoS-aware broker delivery and retries unconfirmed QoS 1
+and QoS 2 publications, but the current runtime does not provide end-to-end
+at-least-once delivery because it commits the Iggy offset before publication
+completes.
 
 ---
 

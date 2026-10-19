@@ -32,17 +32,32 @@ poll_interval = "5ms"
 consumer_group = "mqtt_sink_connector"
 
 [plugin_config]
+# Required broker address. Do not add credentials or MQTT options to this URL.
 broker_url = "mqtt://127.0.0.1:1883"
 protocol = "mqtt5"
 client_id = "iggy-mqtt-sink"
 clean_start = false
 session_expiry_interval = 3600
+
+# Select one routing block. Keep one topic_mode line active.
+# Static routing publishes every Iggy record to one MQTT topic.
 topic = "iggy.messages"
 topic_mode = "static"
-topic_template = "{stream}/{topic}"
-fallback_topic = "{stream}/{topic}"
 qos = 1
 retain = false
+
+# Template routing creates an MQTT topic from the Iggy stream and topic.
+# To select it, comment the active static topic and topic_mode lines above.
+# topic_mode = "template"
+# topic_template = "{stream}/{topic}"
+
+# Dynamic routing reads mqtt.topic from Iggy headers or an MQTT 5 envelope.
+# It uses fallback_topic when the record has no valid MQTT topic.
+# To select it, comment the active static topic and topic_mode lines above.
+# topic_mode = "dynamic"
+# fallback_topic = "{stream}/{topic}"
+
+# Connection, publication, and retry settings.
 keep_alive = "30s"
 request_capacity = 32
 publish_timeout = "30s"
