@@ -16,19 +16,20 @@
 // under the License.
 
 import Logging
+import NIOConcurrencyHelpers
 
 /// Appends messages to one topic of one stream, a port of `IggyProducer` in
 /// the Rust SDK.
 ///
-/// Build one with ``IggyClient/producer(stream:topic:configuration:)``, call
-/// ``initialize()`` once, then send. A ``SendMode/direct`` producer writes
-/// from the calling task and returns the confirmations. A
+/// Build one with ``IggyClient/producer(streamID:topicID:configuration:)``,
+/// call ``initialize()`` once, then send. A ``SendMode/direct`` producer
+/// writes from the calling task and returns the confirmations. A
 /// ``SendMode/background`` producer queues the batch and a worker writes it
 /// later, so a send returns once the batch is queued and write failures go to
 /// ``BackgroundSendOptions/errorHandler``.
 ///
 /// ```swift
-/// let producer = client.producer(stream: "orders", topic: "created")
+/// let producer = try client.producer(streamID: "orders", topicID: "created")
 /// try await producer.initialize()
 /// let response = try await producer.send(["placed"])
 /// ```
@@ -37,11 +38,13 @@ public final class IggyProducer: Sendable {
     public let topicID: Identifier
 
     let core: ProducerCore
-    private let dispatcher: ProducerDispatcher?
+    let dispatcher: ProducerDispatcher?
+    private let closed = NIOLockedValueBox(false)
 
-    init(client: IggyClient, stream: Identifier, topic: Identifier, configuration: ProducerConfiguration) {
-        streamID = stream
-        topicID = topic
+    init(client: IggyClient, streamID: Identifier, topicID: Identifier, configuration: ProducerConfiguration) throws {
+        try configuration.validate()
+        self.streamID = streamID
+        self.topicID = topicID
         core = ProducerCore(client: client, configuration: configuration)
         switch configuration.mode {
         case .direct:
@@ -54,8 +57,10 @@ public final class IggyProducer: Sendable {
     /// Makes the producer ready to send: the stream and topic are looked up
     /// and created when missing, named, and allowed by the configuration, and
     /// the producer starts following the client's sign-in state. Calling it
-    /// again after it succeeded does nothing.
+    /// again after it succeeded does nothing. Another producer creating the
+    /// same stream or topic first counts as created.
     public func initialize() async throws {
+        try checkOpen()
         try await core.initialize(streamID: streamID, topicID: topicID)
     }
 
@@ -64,15 +69,16 @@ public final class IggyProducer: Sendable {
     ///
     /// A direct producer returns once every request of the batch was
     /// answered, and throws ``ProducerSendError`` naming the unconfirmed
-    /// tail. A background producer returns once the batch is queued, with no
-    /// confirmations, and throws only what queueing ran into:
-    /// ``IggyErrorCode/producerClosed``,
-    /// ``IggyErrorCode/backgroundSendBufferOverflow``,
-    /// ``IggyErrorCode/backgroundSendTimeout``, or
-    /// ``IggyErrorCode/backgroundSendError``.
+    /// tail, also when the calling task is cancelled. A background producer
+    /// returns once the batch is queued, with no confirmations, and throws
+    /// only what queueing ran into: ``IggyErrorCode/backgroundSendBufferOverflow``,
+    /// ``IggyErrorCode/backgroundSendTimeout``,
+    /// ``IggyErrorCode/backgroundSendError``, or `CancellationError` with
+    /// nothing queued. Both throw ``IggyErrorCode/producerClosed`` after
+    /// ``shutdown()``.
     @discardableResult
     public func send(_ messages: [IggyMessage]) async throws -> SendMessagesResponse {
-        try await send(messages, to: streamID, topicID: topicID, partitioning: nil)
+        try await send(messages, streamID: streamID, topicID: topicID, partitioning: nil)
     }
 
     /// Sends one message; see ``send(_:)``.
@@ -84,15 +90,16 @@ public final class IggyProducer: Sendable {
     /// Sends with a per-call `partitioning`, or the producer's when nil.
     @discardableResult
     public func send(_ messages: [IggyMessage], partitioning: Partitioning?) async throws -> SendMessagesResponse {
-        try await send(messages, to: streamID, topicID: topicID, partitioning: partitioning)
+        try await send(messages, streamID: streamID, topicID: topicID, partitioning: partitioning)
     }
 
     /// Sends to any stream and topic. The target has to exist, since
     /// ``initialize()`` creates only the producer's own.
     @discardableResult
     public func send(
-        _ messages: [IggyMessage], to streamID: Identifier, topicID: Identifier, partitioning: Partitioning? = nil
+        _ messages: [IggyMessage], streamID: Identifier, topicID: Identifier, partitioning: Partitioning? = nil
     ) async throws -> SendMessagesResponse {
+        try checkOpen()
         guard !messages.isEmpty else {
             return SendMessagesResponse()
         }
@@ -104,19 +111,30 @@ public final class IggyProducer: Sendable {
     }
 
     /// Flushes what a background producer still holds and waits for its
-    /// writes and error handler, then stops following the client. Without it
-    /// a background producer can lose buffered messages.
+    /// writes and error handler, then stops following the client. Every
+    /// caller waits for the same drain. A producer released without it
+    /// still writes what it held, but nothing waits for those writes.
     public func shutdown() async {
+        closed.withLockedValue { $0 = true }
         await dispatcher?.shutdown()
         await core.shutdown()
+    }
+
+    private func checkOpen() throws {
+        if closed.withLockedValue({ $0 }) {
+            throw IggyError(.producerClosed)
+        }
     }
 }
 
 extension IggyClient {
     /// A producer for the stream and topic. Building it never talks to the
-    /// server; ``IggyProducer/initialize()`` does.
-    public func producer(stream: Identifier, topic: Identifier, configuration: ProducerConfiguration = ProducerConfiguration()) -> IggyProducer {
-        IggyProducer(client: self, stream: stream, topic: topic, configuration: configuration)
+    /// server; ``IggyProducer/initialize()`` does. Throws
+    /// ``IggyErrorCode/invalidConfiguration`` for a negative option.
+    public func producer(
+        streamID: Identifier, topicID: Identifier, configuration: ProducerConfiguration = ProducerConfiguration()
+    ) throws -> IggyProducer {
+        try IggyProducer(client: self, streamID: streamID, topicID: topicID, configuration: configuration)
     }
 }
 
@@ -128,7 +146,9 @@ protocol ProducerCoreBackend: Sendable {
 }
 
 /// The state both send modes share: readiness, retries, chunking, and the
-/// stream and topic bootstrap, as `ProducerCore` in the Rust SDK.
+/// stream and topic bootstrap, as `ProducerCore` in the Rust SDK. Sends run
+/// outside the actor, so workers and direct callers do not queue on it; it
+/// holds only the sign-in gate and the linger clock.
 actor ProducerCore: ProducerCoreBackend {
     /// A request when chunking is disabled carries at most this many messages.
     static let maxBatchLength = 1_000_000
@@ -139,6 +159,7 @@ actor ProducerCore: ProducerCoreBackend {
     private let logger: Logger
 
     private var isInitialized = false
+    private var isShutDown = false
     /// Follows the client's events once initialized, and is read only while
     /// a retry budget exists.
     private(set) var canSend = true
@@ -156,6 +177,10 @@ actor ProducerCore: ProducerCoreBackend {
         logger = client.logger
     }
 
+    deinit {
+        eventsTask?.cancel()
+    }
+
     func initialize(streamID: Identifier, topicID: Identifier) async throws {
         if isInitialized {
             return
@@ -170,7 +195,11 @@ actor ProducerCore: ProducerCoreBackend {
                 throw IggyError(.streamNameNotFound, context: "stream \(name) does not exist and auto-creation is disabled")
             }
             logger.info("Creating the stream", metadata: ["stream": "\(name)"])
-            _ = try await client.createStream(name: name)
+            do {
+                _ = try await client.createStream(name: name)
+            } catch let error as IggyError where error.code == .streamNameAlreadyExists {
+                logger.info("The stream was created by someone else", metadata: ["stream": "\(name)"])
+            }
         }
         if try await client.getTopic(streamID: streamID, topicID: topicID) == nil {
             guard let name = topicID.name else {
@@ -185,13 +214,18 @@ actor ProducerCore: ProducerCoreBackend {
                 messageExpiry: configuration.topicMessageExpiry == .serverDefault ? nil : configuration.topicMessageExpiry,
                 maxTopicSize: configuration.topicMaxSize == .serverDefault ? nil : configuration.topicMaxSize,
                 durability: configuration.topicDurability)
-            _ = try await client.createTopic(streamID: streamID, name: name, options: options)
+            do {
+                _ = try await client.createTopic(streamID: streamID, name: name, options: options)
+            } catch let error as IggyError where error.code == .topicNameAlreadyExists {
+                logger.info("The topic was created by someone else", metadata: ["stream": "\(streamID)", "topic": "\(name)"])
+            }
         }
         isInitialized = true
         logger.info("The producer has been initialized", metadata: ["stream": "\(streamID)", "topic": "\(topicID)"])
     }
 
     func shutdown() {
+        isShutDown = true
         eventsTask?.cancel()
         eventsTask = nil
     }
@@ -199,8 +233,10 @@ actor ProducerCore: ProducerCoreBackend {
     /// Sends `messages`. A direct producer splits them into requests and
     /// returns every request's confirmations in order; a background worker
     /// sends them as one. Throws ``ProducerSendError`` naming the unconfirmed
-    /// tail, with the ids the client minted for it.
-    func sendInternal(streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?) async throws -> SendMessagesResponse {
+    /// tail, with the ids the client minted for it, whatever stopped the send.
+    nonisolated func sendInternal(
+        streamID: Identifier, topicID: Identifier, messages: [IggyMessage], partitioning: Partitioning?
+    ) async throws -> SendMessagesResponse {
         guard !messages.isEmpty else {
             return SendMessagesResponse()
         }
@@ -213,38 +249,32 @@ actor ProducerCore: ProducerCoreBackend {
         }
         guard let directOptions else {
             do {
-                let response = try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &messages)
-                lastSentAt = .now
-                return response
-            } catch let error as CancellationError {
-                throw error
+                return try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &messages)
             } catch {
                 throw Self.failure(error, failed: messages, committed: [], streamID: streamID, topicID: topicID)
             }
         }
-        if directOptions.lingerTime > .zero, let lastSentAt {
-            let elapsed = ContinuousClock.now - lastSentAt
-            if elapsed < directOptions.lingerTime {
-                try await Task.sleep(for: directOptions.lingerTime - elapsed)
-            }
+        do {
+            try await waitOutLinger(directOptions.lingerTime)
+        } catch {
+            throw Self.failure(error, failed: messages, committed: [], streamID: streamID, topicID: topicID)
         }
-        let chunkLength = directOptions.batchLength == 0 ? Self.maxBatchLength : Int(directOptions.batchLength)
+        // Clamped so a `UInt32` length cannot trap where `Int` is 32 bits.
+        let chunkLength = directOptions.batchLength == 0 ? Self.maxBatchLength : min(Int(clamping: directOptions.batchLength), Self.maxBatchLength)
         var confirmations: [SendConfirmation] = []
-        confirmations.reserveCapacity((messages.count + chunkLength - 1) / chunkLength)
+        confirmations.reserveCapacity((messages.count - 1) / chunkLength + 1)
         var index = 0
         while index < messages.count {
-            let end = min(index + chunkLength, messages.count)
+            let end = index + min(chunkLength, messages.count - index)
             var chunk = Array(messages[index..<end])
             do {
                 let response = try await trySend(streamID: streamID, topicID: topicID, partitioning: resolved, messages: &chunk)
                 confirmations.append(contentsOf: response.confirmations)
-            } catch let error as CancellationError {
-                throw error
             } catch {
                 messages.replaceSubrange(index..<end, with: chunk)
                 throw Self.failure(error, failed: Array(messages[index...]), committed: confirmations, streamID: streamID, topicID: topicID)
             }
-            lastSentAt = .now
+            await markSent()
             index = end
         }
         return SendMessagesResponse(confirmations: confirmations)
@@ -252,7 +282,7 @@ actor ProducerCore: ProducerCoreBackend {
 
     /// A partitioner wins over any partitioning; then the call's, the
     /// producer's, and balanced.
-    private func resolvePartitioning(
+    private nonisolated func resolvePartitioning(
         streamID: Identifier, topicID: Identifier, messages: [IggyMessage], override: Partitioning?
     ) throws -> Partitioning {
         if let partitioner = configuration.partitioner {
@@ -261,9 +291,23 @@ actor ProducerCore: ProducerCoreBackend {
         return override ?? configuration.partitioning ?? .balanced
     }
 
+    private nonisolated func waitOutLinger(_ lingerTime: Duration) async throws {
+        guard lingerTime > .zero, let lastSentAt = await lastSentAt else {
+            return
+        }
+        let elapsed = ContinuousClock.now - lastSentAt
+        if elapsed < lingerTime {
+            try await Task.sleep(for: lingerTime - elapsed)
+        }
+    }
+
+    private func markSent() {
+        lastSentAt = .now
+    }
+
     /// One request with the producer's retry budget. The ids the client mints
     /// on the first attempt stay in `messages`, so every retry carries them.
-    private func trySend(
+    private nonisolated func trySend(
         streamID: Identifier, topicID: Identifier, partitioning: Partitioning, messages: inout [IggyMessage]
     ) async throws -> SendMessagesResponse {
         guard let maxRetries = configuration.sendRetries, maxRetries > 0 else {
@@ -295,10 +339,17 @@ actor ProducerCore: ProducerCoreBackend {
         }
     }
 
-    private func waitUntilConnected(maxRetries: UInt32, streamID: Identifier, topicID: Identifier) async throws {
+    /// Each check asks the client to sign in again, since a client whose
+    /// heartbeat is off or that was never connected does not reconnect on
+    /// its own.
+    private nonisolated func waitUntilConnected(maxRetries: UInt32, streamID: Identifier, topicID: Identifier) async throws {
         var retries: UInt32 = 0
         var ticker = RetryTicker(interval: configuration.sendRetryInterval)
-        while !canSend {
+        while await !canSend {
+            if (try? await client.requireAuthenticated()) != nil {
+                await openGate()
+                return
+            }
             retries += 1
             if retries > maxRetries {
                 logger.error(
@@ -312,12 +363,18 @@ actor ProducerCore: ProducerCoreBackend {
         }
     }
 
+    private func openGate() {
+        canSend = true
+    }
+
     /// A retry is a new request identity, so only a refusal or a failure
     /// before anything was written allows one. An unknown outcome belongs to
-    /// the transport, which replays it under its own identity.
+    /// the transport, which replays it under its own identity. The client
+    /// raises `disconnected` for a send only before writing it: a write it
+    /// lost becomes `transientNotCommitted`.
     static func stopsSendRetries(_ error: IggyError) -> Bool {
         switch error.code {
-        case .transientNotAccepted, .notConnected, .cannotEstablishConnection:
+        case .transientNotAccepted, .notConnected, .cannotEstablishConnection, .disconnected:
             false
         default:
             true
@@ -326,10 +383,14 @@ actor ProducerCore: ProducerCoreBackend {
 
     /// The gate starts open and follows the events seen after initialization:
     /// a connection, disconnection, sign-out, or shutdown closes it, and only
-    /// a sign-in opens it again.
+    /// a sign-in opens it again. Nothing suspends between replacing the task
+    /// and storing it, so concurrent calls leave one subscription.
     private func subscribeEvents() async {
-        eventsTask?.cancel()
         let events = await client.events
+        guard !isShutDown else {
+            return
+        }
+        eventsTask?.cancel()
         eventsTask = Task { [weak self] in
             for await event in events {
                 guard let self else {
@@ -355,8 +416,12 @@ actor ProducerCore: ProducerCoreBackend {
     private static func failure(
         _ error: any Error, failed: [IggyMessage], committed: [SendConfirmation], streamID: Identifier, topicID: Identifier
     ) -> ProducerSendError {
-        let cause = (error as? IggyError) ?? IggyError(.error, context: "\(error)")
-        return ProducerSendError(cause: cause, failed: failed, committed: committed, streamID: streamID, topicID: topicID)
+        if let error = error as? IggyError {
+            return ProducerSendError(cause: error, failed: failed, committed: committed, streamID: streamID, topicID: topicID)
+        }
+        let context = error is CancellationError ? "the send was cancelled" : "\(error)"
+        return ProducerSendError(
+            cause: IggyError(.error, context: context), underlying: error, failed: failed, committed: committed, streamID: streamID, topicID: topicID)
     }
 }
 

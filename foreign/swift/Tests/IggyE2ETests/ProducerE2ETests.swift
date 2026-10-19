@@ -29,7 +29,7 @@ struct ProducerE2ETests {
             await session.track(stream: stream)
             let configuration = ProducerConfiguration(
                 partitioning: .partition(1), topicPartitionsCount: 2, mode: .direct(DirectSendOptions(batchLength: 2)))
-            let producer = client.producer(stream: stream, topic: try Identifier(named: name), configuration: configuration)
+            let producer = try client.producer(streamID: stream, topicID: try Identifier(named: name), configuration: configuration)
             try await producer.initialize()
             let topic = try #require(try await client.getTopic(streamID: stream, topicID: try Identifier(named: name)))
             #expect(topic.partitionsCount == 2)
@@ -49,8 +49,8 @@ struct ProducerE2ETests {
             let client = session.client
             let scratch = try await session.scratchTopic(partitions: 1)
             let options = BackgroundSendOptions(lingerTime: .seconds(60))
-            let producer = client.producer(
-                stream: scratch.stream, topic: scratch.topic, configuration: ProducerConfiguration(partitioning: .partition(0), mode: .background(options)))
+            let producer = try client.producer(
+                streamID: scratch.stream, topicID: scratch.topic, configuration: ProducerConfiguration(partitioning: .partition(0), mode: .background(options)))
             try await producer.initialize()
             for index in 0..<3 {
                 #expect(try await producer.send(try E2EEnvironment.messages(2, prefix: "batch \(index)")).confirmations.isEmpty)
@@ -66,7 +66,7 @@ struct ProducerE2ETests {
 
     @Test func aMissingNumericStreamCannotBeCreated() async throws {
         try await E2EEnvironment.withSession { session in
-            let producer = session.client.producer(stream: Identifier(numeric: UInt32.max - 1), topic: "missing")
+            let producer = try session.client.producer(streamID: Identifier(numeric: UInt32.max - 1), topicID: "missing")
             await expectIggyError(.streamIdNotFound) { try await producer.initialize() }
         }
     }

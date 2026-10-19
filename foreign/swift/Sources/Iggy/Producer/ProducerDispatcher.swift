@@ -56,14 +56,15 @@ struct QueuedBatch: Sendable {
 /// slow handler never stalls a worker.
 final class ProducerDispatcher: Sendable {
     private let options: BackgroundSendOptions
-    private let workers: [ShardWorker]
-    private let byteBudget: AsyncSemaphore?
+    let workers: [ShardWorker]
+    let byteBudget: AsyncSemaphore?
     private let failures: AsyncStream<ProducerSendFailure>.Continuation
     private let errorTask: Task<Void, Never>
     private let state = NIOLockedValueBox(State())
 
     private struct State {
-        var closed = false
+        /// Set once the dispatcher closes; every shutdown waits for it.
+        var drain: Task<Void, Never>?
         var nextWorker = 0
     }
 
@@ -80,15 +81,25 @@ final class ProducerDispatcher: Sendable {
                 await handler(failure)
             }
         }
-        workers = (0..<max(options.workerCount, 1)).map { _ in
+        workers = (0..<options.workerCount).map { _ in
             ShardWorker(backend: backend, options: options, inFlight: inFlight, byteBudget: byteBudget, failures: continuation, logger: logger)
+        }
+    }
+
+    /// The workers' loops keep them alive, so a producer released without a
+    /// shutdown has them write what they hold and end.
+    deinit {
+        state.withLockedValue { state in
+            if state.drain == nil {
+                state.drain = Self.drain(workers: workers, failures: failures, errorTask: errorTask)
+            }
         }
     }
 
     /// Charges the batch against the byte budget and queues it on a worker.
     /// Returns once it is queued, not once it is written.
     func dispatch(_ messages: [IggyMessage], streamID: Identifier, topicID: Identifier, partitioning: Partitioning?) async throws {
-        guard !state.withLockedValue({ $0.closed }) else {
+        guard state.withLockedValue({ $0.drain == nil }) else {
             throw IggyError(.producerClosed)
         }
         let batch = QueuedBatch(streamID: streamID, topicID: topicID, messages: messages, partitioning: partitioning)
@@ -96,6 +107,7 @@ final class ProducerDispatcher: Sendable {
         guard batch.sizeBytes <= UInt32.max else {
             throw IggyError(.backgroundSendBufferOverflow, context: "a batch of \(batch.sizeBytes) bytes exceeds a request")
         }
+        let worker = workers[try pickWorker(for: batch)]
         if let byteBudget {
             guard batch.sizeBytes <= options.maxBufferSize else {
                 throw IggyError(
@@ -105,7 +117,6 @@ final class ProducerDispatcher: Sendable {
                 try await waitForBudget(byteBudget, bytes: batch.sizeBytes)
             }
         }
-        let worker = workers[pickWorker(for: batch)]
         do {
             try await worker.enqueue(batch)
         } catch {
@@ -115,46 +126,48 @@ final class ProducerDispatcher: Sendable {
     }
 
     /// Stops taking sends, has every worker write what it holds, and waits
-    /// for the writes and the error handler.
+    /// for the writes and the error handler. A concurrent call waits for the
+    /// same drain.
     func shutdown() async {
-        let wasClosed = state.withLockedValue { state in
-            defer { state.closed = true }
-            return state.closed
+        let drain = state.withLockedValue { state in
+            if let drain = state.drain {
+                return drain
+            }
+            let drain = Self.drain(workers: workers, failures: failures, errorTask: errorTask)
+            state.drain = drain
+            return drain
         }
-        guard !wasClosed else {
-            return
-        }
-        for worker in workers {
-            await worker.stop()
-        }
-        failures.finish()
-        await errorTask.value
+        await drain.value
     }
 
+    private static func drain(
+        workers: [ShardWorker], failures: AsyncStream<ProducerSendFailure>.Continuation, errorTask: Task<Void, Never>
+    ) -> Task<Void, Never> {
+        Task {
+            for worker in workers {
+                await worker.stop()
+            }
+            failures.finish()
+            await errorTask.value
+        }
+    }
+
+    /// A cancelled wait leaves nothing queued, so it is reported as the
+    /// cancellation it is.
     private func waitForBudget(_ byteBudget: AsyncSemaphore, bytes: Int) async throws {
         switch options.backpressure {
         case .failImmediately:
             throw IggyError(.backgroundSendBufferOverflow, context: "the byte budget is used up")
         case .block:
-            do {
-                _ = try await byteBudget.acquire(bytes)
-            } catch {
-                throw IggyError(.backgroundSendError, context: "the wait for buffer capacity was cancelled")
-            }
+            _ = try await byteBudget.acquire(bytes)
         case .blockWithTimeout(let timeout):
-            let acquired: Bool
-            do {
-                acquired = try await byteBudget.acquire(bytes, deadline: .now + timeout)
-            } catch {
-                throw IggyError(.backgroundSendError, context: "the wait for buffer capacity was cancelled")
-            }
-            guard acquired else {
+            guard try await byteBudget.acquire(bytes, deadline: .now + timeout) else {
                 throw IggyError(.backgroundSendTimeout, context: "no buffer capacity within \(timeout)")
             }
         }
     }
 
-    func pickWorker(for batch: QueuedBatch) -> Int {
+    func pickWorker(for batch: QueuedBatch) throws -> Int {
         let count = workers.count
         switch options.sharding {
         case .ordered:
@@ -169,7 +182,9 @@ final class ProducerDispatcher: Sendable {
             }
         case .custom(let pick):
             let index = pick(count, batch.messages, batch.streamID, batch.topicID)
-            precondition(index >= 0 && index < count, "the sharding strategy picked worker \(index) of \(count)")
+            guard index >= 0, index < count else {
+                throw IggyError(.backgroundSendError, context: "the sharding strategy picked worker \(index) of \(count)")
+            }
             return index
         }
     }
@@ -234,10 +249,8 @@ actor ShardWorker {
         if loop == nil {
             loop = Task { await self.run() }
         }
-        do {
+        if !queueSlots.tryAcquire(1) {
             _ = try await queueSlots.acquire(1)
-        } catch {
-            throw IggyError(.backgroundSendError, context: "the wait for a queue slot was cancelled")
         }
         guard !closed else {
             // The worker stopped while this waited for a slot, as a channel
@@ -264,18 +277,20 @@ actor ShardWorker {
         while true {
             if stopping {
                 closed = true
-                while !queue.isEmpty {
-                    pickUp(queue.removeFirst())
+                for batch in takeQueue() {
+                    pickUp(batch)
                 }
                 await flush()
                 return
             }
             if !queue.isEmpty {
-                pickUp(queue.removeFirst())
-                let exceedsLength = options.batchLength > 0 && buffer.count >= options.batchLength
-                let exceedsSize = options.batchSize > 0 && bufferBytes >= options.batchSize
-                if exceedsLength || exceedsSize {
-                    await flush()
+                for batch in takeQueue() {
+                    pickUp(batch)
+                    let exceedsLength = options.batchLength > 0 && buffer.count >= options.batchLength
+                    let exceedsSize = options.batchSize > 0 && bufferBytes >= options.batchSize
+                    if exceedsLength || exceedsSize {
+                        await flush()
+                    }
                 }
                 continue
             }
@@ -287,16 +302,28 @@ actor ShardWorker {
         }
     }
 
+    /// Sends that arrive while these are picked up wait for the next round,
+    /// behind them.
+    private func takeQueue() -> [QueuedBatch] {
+        let pending = queue
+        queue.removeAll(keepingCapacity: true)
+        return pending
+    }
+
     private func pickUp(_ batch: QueuedBatch) {
         queueSlots.release(1)
         if buffer.isEmpty {
             let deadline = ContinuousClock.now + options.lingerTime
             lingerDeadline = deadline
-            lingerTimer = Task { [weak self] in
-                guard (try? await Task.sleep(until: deadline, clock: .continuous)) != nil else {
-                    return
+            // A zero linger is due as soon as the queue is drained, which the
+            // loop checks without a timer.
+            if options.lingerTime > .zero {
+                lingerTimer = Task { [weak self] in
+                    guard (try? await Task.sleep(until: deadline, clock: .continuous)) != nil else {
+                        return
+                    }
+                    await self?.wake()
                 }
-                await self?.wake()
             }
         }
         bufferBytes += batch.sizeBytes
@@ -311,14 +338,17 @@ actor ShardWorker {
             return
         }
         let merged = Self.merge(buffer)
-        buffer.removeAll()
+        buffer.removeAll(keepingCapacity: true)
         bufferBytes = 0
         for batch in merged {
             // The worker owns the batch until its write returned, so a
             // cancelled wait for a slot still writes it.
             var holdsSlot = false
             if let inFlight {
-                holdsSlot = (try? await inFlight.acquire(1)) == true
+                holdsSlot = inFlight.tryAcquire(1)
+                if !holdsSlot {
+                    holdsSlot = (try? await inFlight.acquire(1)) == true
+                }
             }
             do {
                 _ = try await backend.sendInternal(
@@ -326,10 +356,13 @@ actor ShardWorker {
             } catch let error as ProducerSendError {
                 failures.yield(
                     ProducerSendFailure(
-                        cause: error.cause, streamID: batch.streamID, topicID: batch.topicID, partitioning: batch.partitioning,
-                        messages: error.failed, committed: error.committed))
+                        cause: error.cause, underlying: error.underlying, streamID: batch.streamID, topicID: batch.topicID,
+                        partitioning: batch.partitioning, messages: error.failed, committed: error.committed))
             } catch {
-                logger.error("Background send failed", metadata: ["error": "\(error)"])
+                failures.yield(
+                    ProducerSendFailure(
+                        cause: (error as? IggyError) ?? IggyError(.error, context: "\(error)"), underlying: error is IggyError ? nil : error,
+                        streamID: batch.streamID, topicID: batch.topicID, partitioning: batch.partitioning, messages: batch.messages, committed: []))
             }
             if holdsSlot {
                 inFlight?.release(1)
@@ -344,10 +377,10 @@ actor ShardWorker {
         var merged: [QueuedBatch] = []
         merged.reserveCapacity(batches.count)
         for batch in batches {
-            if var last = merged.last, last.sameDestination(as: batch), last.sizeBytes + batch.sizeBytes <= UInt32.max {
-                last.messages.append(contentsOf: batch.messages)
-                last.sizeBytes += batch.sizeBytes
-                merged[merged.count - 1] = last
+            if let last = merged.indices.last, merged[last].sameDestination(as: batch), merged[last].sizeBytes + batch.sizeBytes <= UInt32.max {
+                // In place, so the growing array is not copied per send.
+                merged[last].messages.append(contentsOf: batch.messages)
+                merged[last].sizeBytes += batch.sizeBytes
                 continue
             }
             merged.append(batch)

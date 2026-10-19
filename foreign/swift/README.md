@@ -156,12 +156,12 @@ they are named and missing, then a send either writes from the calling task (`di
 the default) or queues the batch for a background worker (`background`):
 
 ```swift
-let producer = client.producer(stream: "orders", topic: "created")
+let producer = try client.producer(streamID: "orders", topicID: "created")
 try await producer.initialize()
 let response = try await producer.send(["placed", "paid"])
 
-let background = client.producer(
-    stream: "orders", topic: "created",
+let background = try client.producer(
+    streamID: "orders", topicID: "created",
     configuration: ProducerConfiguration(mode: .background(BackgroundSendOptions(lingerTime: .milliseconds(5)))))
 try await background.initialize()
 try await background.send(["queued"])
@@ -169,19 +169,24 @@ await background.shutdown()
 ```
 
 A direct send splits a batch into requests of `batchLength` messages and returns their
-confirmations; a failure throws `ProducerSendError` with the confirmations so far and
-the unconfirmed tail. A background send returns once queued and reports write failures
-to `errorHandler`; `shutdown()` writes what is still buffered. The producer retries
-only a request the server refused to admit or that found no connection, since a retry
-is a new request: anything that may have committed, such as `transientNotCommitted`,
-is left to the caller. With the default ordered sharding, sends to one topic keep their
-order.
+confirmations; a failure, cancellation included, throws `ProducerSendError` with the
+confirmations so far and the unconfirmed tail. A background send returns once queued
+and reports write failures to `errorHandler`; `shutdown()` writes what is still
+buffered. The producer retries only a request the server refused to admit or that
+found no connection, since a retry is a new request: anything that may have committed,
+such as `transientNotCommitted`, is left to the caller. With the default ordered
+sharding, the sends to one stream and topic identifier are written in order. A topic
+addressed by name and by numeric id counts as two, and a failed request does not hold
+back the ones after it, so a resend from `errorHandler` lands behind them.
 
 ### Errors
 
-Every operation throws `IggyError`, a value carrying the typed `code`
+Every client operation throws `IggyError`, a value carrying the typed `code`
 (`IggyErrorCode`, one case per server error code), the raw wire code, and optional
-context. A cancelled task gets `CancellationError`:
+context. A cancelled task gets `CancellationError`. A direct producer send is the
+exception: it throws `ProducerSendError`, whose `cause` is the `IggyError` and whose
+`failed` tail is what to resend, and a cancelled one is reported the same way since part
+of it may have committed:
 
 ```swift
 func handle(_ error: IggyError) {

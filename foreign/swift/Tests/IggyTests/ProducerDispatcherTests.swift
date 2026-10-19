@@ -69,6 +69,14 @@ private func sized(_ bytes: Int) throws -> IggyMessage {
     try IggyMessage(payload: [UInt8](repeating: 7, count: bytes - 2 * 6 - QueuedBatch.messageHeaderSize))
 }
 
+private final class WeakWorker: @unchecked Sendable {
+    weak var value: ShardWorker?
+
+    init(_ value: ShardWorker?) {
+        self.value = value
+    }
+}
+
 @Suite("Producer dispatcher", .serialized)
 struct ProducerDispatcherTests {
     @Test func aBatchIsChargedForItsDestinationAndMessages() throws {
@@ -128,6 +136,16 @@ struct ProducerDispatcherTests {
         #expect(ShardWorker.merge([]).isEmpty)
     }
 
+    @Test func aFlushMergesManySendsIntoOneRequestInOrder() async throws {
+        let backend = RecordingBackend()
+        let dispatcher = makeDispatcher(backend, BackgroundSendOptions(batchSize: 0, batchLength: 0, lingerTime: .seconds(60)))
+        for index in 0..<2000 {
+            try await dispatcher.dispatch([message("\(index)")], streamID: 1, topicID: 2, partitioning: nil)
+        }
+        await dispatcher.shutdown()
+        #expect(await backend.writes.map(\.payloads) == [(0..<2000).map { "\($0)" }])
+    }
+
     @Test func theByteBudgetBoundsWhatIsQueuedOrInFlight() async throws {
         let backend = RecordingBackend(delay: .milliseconds(300))
         let options = BackgroundSendOptions(batchLength: 1, lingerTime: .zero, maxBufferSize: 1000, backpressure: .failImmediately)
@@ -136,7 +154,7 @@ struct ProducerDispatcherTests {
         try await dispatcher.dispatch([sized(600)], streamID: 1, topicID: 2, partitioning: nil)
         // The first batch is charged until its slow write returned.
         await expectCode(.backgroundSendBufferOverflow) { try await dispatcher.dispatch([sized(600)], streamID: 1, topicID: 2, partitioning: nil) }
-        #expect(await eventually { await backend.writes.count == 1 })
+        #expect(await eventually { dispatcher.byteBudget?.availablePermits == 1000 })
         try await dispatcher.dispatch([sized(600)], streamID: 1, topicID: 2, partitioning: nil)
         await dispatcher.shutdown()
         #expect(await backend.writes.count == 2)
@@ -159,6 +177,21 @@ struct ProducerDispatcherTests {
         #expect(await backend.writes.count == 3)
     }
 
+    /// A cancelled wait for the budget queues nothing, so it is the
+    /// cancellation and not a send error.
+    @Test func aCancelledWaitForTheBudgetQueuesNothing() async throws {
+        let backend = RecordingBackend(delay: .milliseconds(300))
+        let dispatcher = makeDispatcher(backend, BackgroundSendOptions(batchLength: 1, lingerTime: .zero, maxBufferSize: 1000, backpressure: .block))
+        try await dispatcher.dispatch([sized(600)], streamID: 1, topicID: 2, partitioning: nil)
+        let blocked = Task { try await dispatcher.dispatch([sized(600)], streamID: 1, topicID: 2, partitioning: nil) }
+        try await Task.sleep(for: .milliseconds(50))
+        blocked.cancel()
+        await #expect(throws: CancellationError.self) { try await blocked.value }
+        await dispatcher.shutdown()
+        #expect(await backend.writes.count == 1)
+        #expect(dispatcher.byteBudget?.availablePermits == 1000)
+    }
+
     /// Failures reach the handler with the unconfirmed tail; the final flush
     /// of a shutdown reports its failures before the shutdown returns.
     @Test func writeFailuresReachTheErrorHandler() async throws {
@@ -173,10 +206,13 @@ struct ProducerDispatcherTests {
         try await dispatcher.dispatch(["breaks"], streamID: 1, topicID: 3, partitioning: nil)
         await dispatcher.shutdown()
         let failures = reported.withLock { $0 }
-        #expect(failures.count == 1)
+        #expect(failures.count == 2)
         #expect(failures.first?.cause.code == .transientNotCommitted)
         #expect(failures.first?.messages.map(\.payloadString) == ["b"])
         #expect(failures.first?.partitioning == .partition(4))
+        // Any other error still hands the whole batch over.
+        #expect(failures.last?.cause.code == .invalidCommand)
+        #expect(failures.last?.messages.map(\.payloadString) == ["breaks"])
         await expectCode(.producerClosed) { try await dispatcher.dispatch(["late"], streamID: 1, topicID: 2, partitioning: nil) }
     }
 
@@ -184,13 +220,21 @@ struct ProducerDispatcherTests {
         let backend = RecordingBackend()
         let balanced = makeDispatcher(backend, BackgroundSendOptions(workerCount: 3, sharding: .balanced))
         let batch = QueuedBatch(streamID: 1, topicID: 2, messages: ["a"], partitioning: nil)
-        #expect((0..<4).map { _ in balanced.pickWorker(for: batch) } == [0, 1, 2, 0])
+        #expect(try (0..<4).map { _ in try balanced.pickWorker(for: batch) } == [0, 1, 2, 0])
+        // One destination always lands on one worker, and destinations spread
+        // over the workers.
         let ordered = makeDispatcher(backend, BackgroundSendOptions(workerCount: 3, sharding: .ordered))
-        #expect(Set((0..<4).map { _ in ordered.pickWorker(for: batch) }).count == 1)
+        #expect(Set(try (0..<4).map { _ in try ordered.pickWorker(for: batch) }).count == 1)
+        let topics = try (1...32).map { topic in
+            try ordered.pickWorker(for: QueuedBatch(streamID: 1, topicID: Identifier(numeric: UInt32(topic)), messages: ["a"], partitioning: nil))
+        }
+        #expect(Set(topics).count > 1)
         let custom = makeDispatcher(
             backend, BackgroundSendOptions(workerCount: 3, sharding: .custom({ count, messages, _, _ in (count - 1) * messages.count % count })))
-        #expect(custom.pickWorker(for: batch) == 2)
-        for dispatcher in [balanced, ordered, custom] {
+        #expect(try custom.pickWorker(for: batch) == 2)
+        let outOfRange = makeDispatcher(backend, BackgroundSendOptions(workerCount: 3, sharding: .custom({ count, _, _, _ in count })))
+        await expectCode(.backgroundSendError) { try await outOfRange.dispatch(["a"], streamID: 1, topicID: 2, partitioning: nil) }
+        for dispatcher in [balanced, ordered, custom, outOfRange] {
             await dispatcher.shutdown()
         }
     }
@@ -207,5 +251,34 @@ struct ProducerDispatcherTests {
             #expect(await backend.writes.count == 4)
             #expect(await backend.mostInFlight == expected)
         }
+    }
+
+    /// A second shutdown waits for the drain the first one started.
+    @Test func everyShutdownWaitsForTheDrain() async throws {
+        let backend = RecordingBackend(delay: .milliseconds(200))
+        let dispatcher = makeDispatcher(backend, BackgroundSendOptions(lingerTime: .seconds(60)))
+        try await dispatcher.dispatch(["held"], streamID: 1, topicID: 2, partitioning: nil)
+        let first = Task {
+            await dispatcher.shutdown()
+            return await backend.writes.count
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        await dispatcher.shutdown()
+        #expect(await backend.writes.count == 1)
+        #expect(await first.value == 1)
+    }
+
+    /// The workers' loops would keep a dropped dispatcher's workers alive, so
+    /// dropping it drains them.
+    @Test func aDroppedDispatcherWritesWhatItHeldAndEndsItsWorkers() async throws {
+        let backend = RecordingBackend()
+        let worker = WeakWorker(nil)
+        do {
+            let dispatcher = makeDispatcher(backend, BackgroundSendOptions(lingerTime: .seconds(60)))
+            try await dispatcher.dispatch(["held"], streamID: 1, topicID: 2, partitioning: nil)
+            worker.value = dispatcher.workers.first
+        }
+        #expect(await eventually { await backend.writes.map(\.payloads) == [["held"]] })
+        #expect(await eventually { worker.value == nil })
     }
 }

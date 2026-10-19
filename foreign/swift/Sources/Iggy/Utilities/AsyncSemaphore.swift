@@ -128,11 +128,14 @@ final class AsyncSemaphore: Sendable {
 
     private static func serve(_ state: inout State) -> [CheckedContinuation<Bool, Error>] {
         var served: [CheckedContinuation<Bool, Error>] = []
-        while let first = state.waiters.first, state.available >= first.count {
-            state.waiters.removeFirst()
-            state.available -= first.count
-            served.append(first.continuation)
+        for waiter in state.waiters {
+            guard state.available >= waiter.count else {
+                break
+            }
+            state.available -= waiter.count
+            served.append(waiter.continuation)
         }
+        state.waiters.removeFirst(served.count)
         return served
     }
 }
