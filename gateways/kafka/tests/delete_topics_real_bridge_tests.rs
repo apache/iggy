@@ -28,26 +28,44 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use iggy::prelude::{Identifier, StreamClient, TopicClient};
 use serial_test::serial;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::SemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
+use iggy_gateway_kafka::auth::{AuthError, AuthenticatedPrincipal, SaslAuthenticator};
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
+use iggy_gateway_kafka::listener::SecurityProtocol;
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    API_KEY_DELETE_TOPICS, ERROR_INVALID_REQUEST, ERROR_NONE, ERROR_POLICY_VIOLATION,
+    ERROR_TOPIC_AUTHORIZATION_FAILED, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::delete_topics;
+use iggy_gateway_kafka::protocol::sasl::PlainCredentials;
+use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
+use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
+#[path = "common/certs.rs"]
+mod certs;
 #[path = "common/codec.rs"]
 mod codec;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
+#[path = "common/server.rs"]
+mod server;
+#[path = "common/tcp.rs"]
+mod tcp;
 
+use certs::{TestPki, connect_tls};
 use codec::{Decoder, Encoder};
 use iggy_server::{TestServer, raw_client};
+use server::{listener, spawn_gateway};
+use tcp::{build_request_frame, parse_response_payload, read_response_frame};
 
 const REQUEST_VERSION: i16 = 5;
 const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
@@ -104,10 +122,8 @@ async fn connected_state(server: &TestServer) -> GatewayState {
         .await
         .expect("bridge should connect to a ready server");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -332,5 +348,119 @@ async fn delete_topics_over_cap_error_message_names_the_limit() {
     assert!(
         error_message.is_some_and(|m| m.contains("100")),
         "error_message must name the actual cap"
+    );
+}
+
+/// Refuses every login: these tests only need a SASL listener to exist beside the one they use.
+#[derive(Debug)]
+struct NoLogins;
+
+#[async_trait]
+impl SaslAuthenticator for NoLogins {
+    async fn authenticate(
+        &self,
+        _credentials: &PlainCredentials,
+        _slot: SemaphorePermit<'_>,
+    ) -> Result<AuthenticatedPrincipal, AuthError> {
+        Err(AuthError::Rejected)
+    }
+}
+
+/// Sends a v5 `DeleteTopics` for `names` over a gateway connection.
+async fn delete_over<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    names: &[&str],
+) -> Vec<(Option<String>, i16)> {
+    let frame = build_request_frame(
+        API_KEY_DELETE_TOPICS,
+        REQUEST_VERSION,
+        1,
+        Some("anonymous"),
+        &build_request(names),
+    );
+    stream.write_all(&frame).await.expect("write DeleteTopics");
+    let payload = read_response_frame(stream, TEST_MAX_FRAME_SIZE).await;
+    let (_, body) = parse_response_payload(API_KEY_DELETE_TOPICS, REQUEST_VERSION, payload);
+    decode_all_results(body)
+}
+
+/// A bridge to `server` with one topic, `orders`, to delete.
+async fn bridge_with_a_topic(server: &TestServer) -> Arc<IggyBridge> {
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+    bridge
+        .create_kafka_topic("orders", 1)
+        .await
+        .expect("create the topic to delete");
+    Arc::new(bridge)
+}
+
+fn tls_material(pki: &TestPki, dir: &std::path::Path) -> TlsConfig {
+    let (cert_file, key_file) = pki.server_cert("gateway").write(dir, "server");
+    TlsConfig::new(cert_file, key_file)
+}
+
+#[tokio::test]
+#[serial]
+async fn given_requested_client_auth_when_no_certificate_is_presented_should_deny_delete_topics() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = bridge_with_a_topic(&server).await;
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let ca_file = pki.write_ca(certs_dir.path());
+    let config = GatewayConfig {
+        listeners: vec![listener(SecurityProtocol::Ssl)],
+        tls: Some(
+            tls_material(&pki, certs_dir.path()).with_client_auth(ClientAuth::Requested, ca_file),
+        ),
+        ..GatewayConfig::default()
+    };
+    let (addrs, _shutdown) = spawn_gateway(
+        move |config| KafkaGateway::new(config).with_bridge(Some(bridge)),
+        config,
+    );
+
+    let mut stream = connect_tls(addrs[0], pki.client_config(None))
+        .await
+        .expect("a requested certificate may be withheld");
+    assert_eq!(
+        delete_over(&mut stream, &["orders"]).await,
+        vec![(Some("orders".to_string()), ERROR_TOPIC_AUTHORIZATION_FAILED)],
+        "a client that proved nothing holds less than any user, not more"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn given_a_plaintext_listener_beside_sasl_ssl_should_deny_delete_topics_there() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = bridge_with_a_topic(&server).await;
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let config = GatewayConfig {
+        listeners: vec![
+            listener(SecurityProtocol::Plaintext),
+            listener(SecurityProtocol::SaslSsl),
+        ],
+        tls: Some(tls_material(&pki, certs_dir.path())),
+        ..GatewayConfig::default()
+    };
+    let (addrs, _shutdown) = spawn_gateway(
+        move |config| {
+            KafkaGateway::new(config)
+                .with_bridge(Some(bridge))
+                .with_authenticator(Arc::new(NoLogins))
+        },
+        config,
+    );
+
+    let mut stream = TcpStream::connect(addrs[0]).await.expect("connect");
+    assert_eq!(
+        delete_over(&mut stream, &["orders"]).await,
+        vec![(Some("orders".to_string()), ERROR_TOPIC_AUTHORIZATION_FAILED)],
+        "the plaintext listener must not bypass what the SASL listener enforces"
     );
 }

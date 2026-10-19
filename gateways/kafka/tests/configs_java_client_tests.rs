@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
-use iggy_gateway_kafka::server::bind_listener;
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[path = "common/iggy_server.rs"]
@@ -217,14 +218,14 @@ async fn spawn_gateway(server: &TestServer) -> SocketAddr {
         .expect("create topic");
     let listener = bind_listener("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    let gateway = KafkaGateway::new(GatewayConfig {
-        bind_addr: addr.to_string(),
-        ..GatewayConfig::default()
-    })
-    .with_bridge(Some(Arc::new(bridge)));
+    let listener = BoundListener::new(
+        ListenerConfig::new(SecurityProtocol::Plaintext, addr.to_string()),
+        listener,
+    );
+    let gateway = KafkaGateway::new(GatewayConfig::default()).with_bridge(Some(Arc::new(bridge)));
     let (shutdown, receiver) = broadcast::channel::<()>(1);
     tokio::spawn(async move {
-        let _ = gateway.run(listener, receiver).await;
+        let _ = gateway.run(vec![listener], receiver).await;
     });
     std::mem::forget(shutdown);
     addr
@@ -294,10 +295,7 @@ async fn kafka_39_admin_client_describes_and_alters_topic_configs() {
         text.contains("retention.ms=-1 source=DEFAULT_CONFIG"),
         "{text}"
     );
-    assert!(
-        text.contains("cleanup.policy=delete read_only=true source=DEFAULT_CONFIG"),
-        "{text}"
-    );
+    assert!(text.contains("cleanup.policy=absent"), "{text}");
     assert!(
         text.contains("unknown_key_rejected=InvalidConfigurationException"),
         "{text}"

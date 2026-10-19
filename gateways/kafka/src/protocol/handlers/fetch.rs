@@ -1273,7 +1273,7 @@ impl Spell {
     }
 }
 
-/// Per Kafka topic and partition, a spell of probes that read it as loading.
+/// Per Kafka topic and partition, a spell of sightings, such as probes that read it as loading.
 pub(crate) type Spells = PartitionMap<Spell>;
 
 impl Spells {
@@ -1314,6 +1314,21 @@ pub(crate) fn sight_loading(
         );
     }
     sighting.within_grace()
+}
+
+/// Counts a sighting of `partition` of `topic`, and returns whether it starts a new spell, so a
+/// caller can log the first sighting louder than the retries that follow.
+pub(crate) fn sight_first(
+    spells: &Mutex<Spells>,
+    topic: &str,
+    partition: u32,
+    now: Instant,
+) -> bool {
+    spells
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .sight(topic, partition, now)
+        .is_new()
 }
 
 /// Per Kafka topic, then partition, the offset that one connection's Fetches cannot place. A read
@@ -2342,6 +2357,21 @@ mod tests {
         );
         assert!(
             sight_loading(&spells, "a", 0, at(55) + UNPLACED_GRACE),
+            "a quiet grace ends the spell"
+        );
+    }
+
+    #[test]
+    fn given_repeated_sightings_when_counted_should_report_only_the_first_of_each_spell() {
+        let spells = Mutex::default();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        assert!(sight_first(&spells, "a", 0, at(0)), "a new spell");
+        assert!(!sight_first(&spells, "a", 0, at(1)));
+        assert!(sight_first(&spells, "a", 1, at(1)), "per partition");
+        assert!(!sight_first(&spells, "a", 0, at(20)));
+        assert!(
+            sight_first(&spells, "a", 0, at(20) + UNPLACED_GRACE),
             "a quiet grace ends the spell"
         );
     }

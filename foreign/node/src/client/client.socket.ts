@@ -32,12 +32,13 @@ import {
 } from './client.connection.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
-import { deserializeNode } from '../wire/cluster/cluster.utils.js';
+import { deserializePartitionRoute, type PartitionRoute } from '../wire/partition/partition-route.js';
+import { ConsumerKind } from '../wire/offset/offset.utils.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { serializeIdentifier } from '../wire/identifier.utils.js';
 import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import {
-  Command, HEADER_SIZE, REPLY_OFFSET, PARTITION_CONTEXT_SIZE, deserializePartitionContext, type PartitionContext, peekCommand, readReplyOperation, readStatus
+  Command, HEADER_SIZE, REPLY_OFFSET, type PartitionContext, peekCommand, readReplyOperation, readStatus
 } from '../wire/vsr/header.js';
 import { Operation, isKnownOperation } from '../wire/vsr/operation.js';
 import {
@@ -58,18 +59,16 @@ const MAX_LEADER_REDIRECTS = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 const UNAUTHENTICATED = 40;
-const UNAUTHORIZED = 41;
 const STALE_CLIENT = 30;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
+const NOT_PRIMARY = 89;
 const INVALID_COMMAND = 3;
 const FEATURE_UNAVAILABLE = 5;
 /** Each lifecycle retry commits another refusal, so its pause doubles up to this. */
 const LIFECYCLE_RETRY_MAX_INTERVAL_MS = 1_000;
-const MAX_POLL_ROUTES = 4096;
+const MAX_PARTITION_ROUTES = 4096;
 const MAX_POLL_CONNECTIONS = 256;
-const CONSUMER_SESSION_SIZE = 32;
-const METADATA_WATERMARK_OFFSET = 24;
 const POLL_OPTIONS_SIZE = 9 + 4 + 1;
 const IDENTIFIER_PREFIX_SIZE = 2;
 const SEND_METADATA_LENGTH_SIZE = 4;
@@ -91,24 +90,14 @@ const TOPIC_DISCOVERY_RESETS = new Set<number>([
   COMMAND_CODE.DeletePartitions
 ]);
 
-type PollRoute = {
-  context: PartitionContext,
-  endpoint: Endpoint,
-  attachment: Buffer,
-};
-
-/** The context a route reports for a poll or an offset write on this connection. */
-type RouteContext = {
-  context: PartitionContext,
-  /** Stale once the client observes a newer metadata commit */
-  metadataWatermark: bigint
-};
-
 type PollConnection = {
   client: CommandResponseStream,
-  attachment?: Buffer,
+  metadataWatermark?: bigint,
   busy?: Promise<void>,
 };
+
+type RoutedAttempt = { frame?: Buffer, clientId?: bigint };
+
 /**
  * How long a `TRANSIENT_NOT_ACCEPTED` request replays on the same connection
  * before the roster is re-read. A node that stopped being primary refuses
@@ -162,6 +151,7 @@ const UNLOGGED_COMMAND_CODE = [
 type Job = {
   /** Partition context captured for the request, kept through its retries */
   context?: PartitionContext,
+  attempt?: RoutedAttempt,
   /** Command code */
   command: number,
   /** Command payload */
@@ -247,10 +237,8 @@ export class CommandResponseStream extends EventEmitter {
   private clustered?: boolean;
   private metadataWatermark = 0n;
   private routingGeneration = 0;
-  private pollRoutes = new Map<string, PollRoute>();
-  private routeContexts = new Map<string, RouteContext>();
-  /** Send contexts by stream and topic identifier bytes, then partition id */
-  private sendContexts = new Map<string, Map<number, PartitionContext>>();
+  private partitionRoutes = new Map<string, PartitionRoute>();
+  private replicaEndpoints = new Map<number, Endpoint>();
   private pollConnections = new Map<string, PollConnection>();
   /**
    * A connection to a partition primary. Each request on it gets one attempt:
@@ -341,7 +329,7 @@ export class CommandResponseStream extends EventEmitter {
     if (!this.isAuthenticated && !this.isUnloggedCommand(job.command))
       await this.authenticate(this._signInCredentials());
     return this._queueCommand(job.command, job.payload, job.handleResponse,
-      job.last, job.followsLeaderMoves, job.deadline, job.context);
+      job.last, job.followsLeaderMoves, job.deadline, job.context, job.attempt);
   }
 
   /**
@@ -365,9 +353,9 @@ export class CommandResponseStream extends EventEmitter {
         last = true,
         followsLeaderMoves = true
       } = options;
-      // The server serves polls and offset writes on the partition primary only.
+      payload = Buffer.from(payload);
       const route = partitionRoute(command, payload);
-      const routeDeadline = route
+      const routeDeadline = route || command === COMMAND_CODE.GetPartitionRoute
         ? options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS
         : undefined;
 
@@ -386,9 +374,8 @@ export class CommandResponseStream extends EventEmitter {
             GET_CLUSTER_METADATA.serialize(), { deadline, followsLeaderMoves: false }), deadline);
         if (this.clustered === undefined)
           throw new Error('cannot determine the partition routing topology');
-        if (this.clustered)
-          return await this._sendOnPrimary(command, route, payload, deadline,
-            handleResponse, options.context);
+        return await this._sendOnPrimary(command, route, payload, deadline,
+          handleResponse, options.context);
       }
 
       // The roster read is itself a queued command and the queue is
@@ -409,8 +396,7 @@ export class CommandResponseStream extends EventEmitter {
       // after a move keeps the budget it was first submitted with, rather than
       // opening a second one.
       const deadline = options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS;
-      let context = await this._capturePartitionContext(command, payload, deadline, options.context);
-      let contextRefreshed = false;
+      const context = options.context;
       let lifecycleRetryInterval = VSR_RETRY_INTERVAL_MS;
       let response: CommandResponse;
       let walkingRoster = false;
@@ -421,21 +407,6 @@ export class CommandResponseStream extends EventEmitter {
             last, followsLeaderMoves, deadline, context);
           break;
         } catch (error) {
-          // A failed route is dropped, so the next call routes again.
-          if (route)
-            this.routeContexts.delete(route.key);
-          // A history refusal is definitive: no attempt of this request ran,
-          // so one re-issue under a fresh context cannot duplicate the write.
-          // A context the caller supplied is never replaced.
-          if (command === COMMAND_CODE.SendMessages && error instanceof ResponseError &&
-              error.errorCode === HISTORY_UNAVAILABLE) {
-            this.sendContexts.delete(sendTarget(payload).topic);
-            if (!options.context && !contextRefreshed && worthAnotherAttempt(deadline)) {
-              contextRefreshed = true;
-              context = await this._capturePartitionContext(command, payload, deadline);
-              continue;
-            }
-          }
           // A lifecycle refusal is committed, so the request did not apply and
           // its retry is a new request. The pause runs here, outside the queue,
           // so it holds back no other command of this client.
@@ -465,8 +436,9 @@ export class CommandResponseStream extends EventEmitter {
             // metadata leader whose partition replica refused it, and the
             // walk would bounce between two nodes without reaching the rest.
             moved = await this._followLeaderMove(
-              walkingRoster,
-              visitedRosterEndpoints
+              walkingRoster && error.refusal.errorCode !== NOT_PRIMARY,
+              visitedRosterEndpoints,
+              error.refusal.errorCode !== NOT_PRIMARY
             );
             if (typeof moved === 'object') {
               walkingRoster = true;
@@ -503,7 +475,7 @@ export class CommandResponseStream extends EventEmitter {
         }
       }
       if (TOPIC_DISCOVERY_RESETS.has(command)) {
-        this.sendContexts.clear();
+        this.partitionRoutes.clear();
         this.emit('topicDiscoveryReset');
       }
       if (!isLoginCommand(command) || this.settlingLeader)
@@ -528,71 +500,21 @@ export class CommandResponseStream extends EventEmitter {
     }
   }
 
-  /**
-   * The context a partition command carries: the caller's, a cached send
-   * context, or one discovered for it. A partition command whose target cannot
-   * be read fails here, before it could go out under no context.
-   */
-  private async _capturePartitionContext(
-    command: number,
-    payload: Buffer,
-    deadline: number,
-    context?: PartitionContext
-  ): Promise<PartitionContext | undefined> {
-    if (command === COMMAND_CODE.SendMessages) {
-      const target = sendTarget(payload);
-      if (context)
-        return context;
-      const cached = this.sendContexts.get(target.topic)?.get(target.partitionId);
-      if (cached)
-        return cached;
-      const captured = deserializePartitionContext(await this._queryPartition(
-        command, COMMAND_CODE.GetSendContext, target.query, PARTITION_CONTEXT_SIZE, deadline));
-      let contexts = this.sendContexts.get(target.topic);
-      if (!contexts) {
-        contexts = new Map();
-        this.sendContexts.set(target.topic, contexts);
-      }
-      contexts.set(target.partitionId, captured);
-      return captured;
-    }
-    const route = partitionRoute(command, payload);
-    if (!route || context)
-      return context;
-    // The route cache follows the Rust SDK: a route holds until the session
-    // changes or the client observes a newer metadata commit.
-    const cached = this.routeContexts.get(route.key);
-    if (cached && cached.metadataWatermark >= this.metadataWatermark)
-      return cached.context;
-    const generation = this.routingGeneration;
-    const routed = await this._queryPartition(
-      command, route.code, route.query, CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE, deadline);
-    const reported = routed.readBigUInt64LE(METADATA_WATERMARK_OFFSET);
-    const fresh = {
-      context: deserializePartitionContext(routed, CONSUMER_SESSION_SIZE),
-      metadataWatermark: reported > this.metadataWatermark ? reported : this.metadataWatermark
-    };
-    if (generation === this.routingGeneration) {
-      if (this.routeContexts.size >= MAX_POLL_ROUTES)
-        this.routeContexts.clear();
-      this.routeContexts.set(route.key, fresh);
-    }
-    return fresh.context;
+  private async _lookupRoute(partition: PartitionTarget, deadline: number): Promise<PartitionRoute> {
+    const cached = this.partitionRoutes.get(partition.key);
+    if (cached && cached.context.metadataOp >= this.metadataWatermark)
+      return cached;
+    const response = await this._routingControl(partition, deadline);
+    return deserializePartitionRoute(response.data);
   }
 
-  private async _queryPartition(
-    command: number, queryCode: number, query: Buffer, size: number, deadline: number
-  ): Promise<Buffer> {
-    let response: CommandResponse;
-    try {
-      response = await this.sendCommand(queryCode, query, { deadline });
-    } catch (error) {
-      throw error instanceof ResponseError && !(error instanceof VsrEvictionError)
-        ? responseError(command, error.errorCode) : error;
-    }
-    if (response.data.length < size)
-      throw new Error('partition context response is incomplete');
-    return response.data;
+  private _rememberRoute(query: Buffer, response: CommandResponse): void {
+    const route = deserializePartitionRoute(response.data);
+    if (this.partitionRoutes.size >= MAX_PARTITION_ROUTES)
+      this.partitionRoutes.clear();
+    this.partitionRoutes.set(query.toString('hex'), route);
+    this.emit('partitionRoute', { topic: query.subarray(0, -PARTITION_ID_SIZE).toString('hex'),
+      count: route.partitionsCount });
   }
 
   private _queueCommand(
@@ -602,12 +524,14 @@ export class CommandResponseStream extends EventEmitter {
     last: boolean,
     followsLeaderMoves: boolean,
     deadline: number,
-    context?: PartitionContext
+    context?: PartitionContext,
+    attempt?: RoutedAttempt
   ): Promise<CommandResponse> {
     return new Promise<CommandResponse>((resolve, reject) => {
       const job: Job = {
         command,
         context,
+        attempt,
         payload,
         handleResponse,
         last,
@@ -640,7 +564,8 @@ export class CommandResponseStream extends EventEmitter {
    */
   private _followLeaderMove(
     walkPastLeader = false,
-    visitedRosterEndpoints = new Set<string>()
+    visitedRosterEndpoints = new Set<string>(),
+    allowWalk = true
   ): Promise<LeaderMoveVerdict> {
     const inFlight = this.leaderMoveInFlight;
     if (inFlight)
@@ -661,6 +586,8 @@ export class CommandResponseStream extends EventEmitter {
         // the target partition group is not that group's primary, because
         // metadata and partition consensus groups elect independently. Walk
         // the roster instead of re-issuing into the same refusal.
+        if (!allowWalk)
+          return false;
         const next = this.connection.nextRosterEndpoint(visitedRosterEndpoints);
         if (!next)
           return false;
@@ -724,6 +651,9 @@ export class CommandResponseStream extends EventEmitter {
       if (metadata.nodes.length === 0)
         return;
       this.clustered = metadata.nodes.length > 1;
+      this.replicaEndpoints = new Map(metadata.nodes
+        .filter((node) => node.endpoints.tcp !== 0)
+        .map((node) => [node.replicaId, { host: node.ip, port: node.endpoints.tcp }]));
       this.connection.rememberRoster(
         metadata.nodes
           .filter((node) => node.endpoints.tcp !== 0)
@@ -737,48 +667,40 @@ export class CommandResponseStream extends EventEmitter {
 
   private async _sendOnPrimary(
     command: number,
-    partition: PartitionRoute,
+    partition: PartitionTarget,
     payload: Buffer,
     deadline: number,
     handleResponse: boolean,
     context?: PartitionContext
   ): Promise<CommandResponse> {
-    const key = partition.key;
     let captured = context;
+    let refreshedHistory = false;
+    let refusedPrimary = false;
+    let lifecycleRetryInterval = VSR_RETRY_INTERVAL_MS;
+    const attempt: RoutedAttempt = {};
     while (Date.now() < deadline && !this.connection.ending) {
+      let missingReplica = false;
       try {
         const generation = this.routingGeneration;
-        let route = this.pollRoutes.get(key);
-        if (!route ||
-            route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
-              this.metadataWatermark) {
-          const response = await withinDeadline(
-            this._routingControl(partition, deadline), deadline);
-          if (generation !== this.routingGeneration)
-            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
-          if (response.data.length < CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE)
-            throw new Error('partition routing response is incomplete');
-          const node = deserializeNode(response.data, CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE);
-          if (node.length + CONSUMER_SESSION_SIZE + PARTITION_CONTEXT_SIZE !== response.data.length || !node.data.ip)
-            throw new Error('partition routing response has no valid TCP endpoint');
-          if (node.data.endpoints.tcp === 0)
-            throw responseError(command, FEATURE_UNAVAILABLE);
-          const attachment = Buffer.from(response.data.subarray(0, CONSUMER_SESSION_SIZE));
-          if (attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) < this.metadataWatermark)
-            attachment.writeBigUInt64LE(this.metadataWatermark, METADATA_WATERMARK_OFFSET);
-          route = {
-            context: deserializePartitionContext(response.data, CONSUMER_SESSION_SIZE),
-            endpoint: { host: node.data.ip, port: node.data.endpoints.tcp },
-            attachment
-          };
-          if (this.pollRoutes.size >= MAX_POLL_ROUTES)
-            this.pollRoutes.clear();
-          this.pollRoutes.set(key, route);
-        }
-
+        const route = await this._lookupRoute(partition, deadline);
+        if (generation !== this.routingGeneration)
+          throw responseError(command, TRANSIENT_NOT_ACCEPTED);
         captured ??= route.context;
-        const endpoint = endpointKey(route.endpoint);
-        let entry = this.pollConnections.get(endpoint);
+        if (!this.clustered)
+          return await this._queueCommand(command, payload, handleResponse, true, false,
+            deadline, captured, attempt);
+        let endpoint = this.replicaEndpoints.get(route.primaryReplica);
+        if (!endpoint) {
+          await this.sendCommand(GET_CLUSTER_METADATA.code, GET_CLUSTER_METADATA.serialize(),
+            { deadline, followsLeaderMoves: false });
+          endpoint = this.replicaEndpoints.get(route.primaryReplica);
+          if (!endpoint) {
+            missingReplica = true;
+            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+          }
+        }
+        const key = endpointKey(endpoint);
+        let entry = this.pollConnections.get(key);
         if (!entry) {
           if (this.pollConnections.size >= MAX_POLL_CONNECTIONS) {
             const idle = Array.from(this.pollConnections).find(([, value]) => !value.busy);
@@ -790,101 +712,111 @@ export class CommandResponseStream extends EventEmitter {
           entry = {
             client: new CommandResponseStream({
               ...this.options,
-              options: { ...this.options.options, ...route.endpoint },
+              options: { ...this.options.options, ...endpoint },
               heartbeatInterval: 0,
               reconnect: { enabled: false, interval: 0, maxRetries: 0 }
             })
           };
-          // One session object, as Rust shares its consensus session: the
-          // partition deduplicates writes by client id and request id, so a
-          // counter of its own would reuse ids the session already sent.
           entry.client.vsrSession = this.vsrSession;
           entry.client.dataConnection = true;
-          this.pollConnections.set(endpoint, entry);
+          this.pollConnections.set(key, entry);
         }
         while (entry.busy)
           await withinDeadline(entry.busy, deadline);
-        if (generation !== this.routingGeneration ||
-            this.pollConnections.get(endpoint) !== entry ||
-            route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
-              this.metadataWatermark)
+        if (generation !== this.routingGeneration || this.pollConnections.get(key) !== entry)
           throw responseError(command, TRANSIENT_NOT_ACCEPTED);
-
         let release!: () => void;
         entry.busy = new Promise<void>((resolve) => { release = resolve; });
         let sent = false;
         try {
           if (!entry.client.isAuthenticated) {
-            entry.attachment = undefined;
-            await withinDeadline(entry.client.connection.connect(true), deadline,
+            entry.metadataWatermark = undefined;
+            await withinDeadline(entry.client.connection.connect(true),
+              Math.min(deadline, Date.now() + VSR_FAILOVER_CHECK_MS),
               () => entry.client.destroy());
           }
-          if (!entry.attachment?.equals(route.attachment)) {
-            await entry.client._queueCommand(COMMAND_CODE.BindSession,
-              this.vsrSession.bindPayload(route.attachment), true, true, false, deadline);
-            entry.attachment = route.attachment;
+          const watermark = route.context.metadataOp > this.metadataWatermark
+            ? route.context.metadataOp : this.metadataWatermark;
+          if (entry.metadataWatermark === undefined || entry.metadataWatermark < watermark) {
+            const binding = this.vsrSession.resumePayload(watermark);
+            if (!binding)
+              throw responseError(command, UNAUTHENTICATED);
+            await entry.client._queueCommand(COMMAND_CODE.BindSession, binding,
+              true, true, false, deadline);
+            entry.metadataWatermark = watermark;
           }
-          if (generation !== this.routingGeneration ||
-              route.attachment.readBigUInt64LE(METADATA_WATERMARK_OFFSET) <
-                this.metadataWatermark)
+          if (generation !== this.routingGeneration)
             throw responseError(command, TRANSIENT_NOT_ACCEPTED);
           sent = true;
-          return await entry.client._queueCommand(partition.primaryCode,
-            payload, handleResponse, true, false, deadline, captured);
+          return await entry.client._queueCommand(command, payload, handleResponse,
+            true, false, deadline, captured, attempt);
         } catch (error) {
-          if (error instanceof ResponseError &&
-              error.errorCode === TRANSIENT_NOT_ACCEPTED) {
-            entry.attachment = undefined;
-          } else {
-            if (this.pollConnections.get(endpoint) === entry)
-              this.pollConnections.delete(endpoint);
-            entry.client.destroy();
-          }
           if (!(error instanceof ResponseError) || error instanceof VsrEvictionError ||
-              error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT)
-            throw responseError(command,
-              sent ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
+              error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT) {
+            if (this.pollConnections.get(key) === entry)
+              this.pollConnections.delete(key);
+            entry.client.destroy();
+            throw responseError(command, sent ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
+          }
           throw error;
         } finally {
           entry.busy = undefined;
           release();
         }
       } catch (error) {
-        this.pollRoutes.delete(key);
-        if (error instanceof VsrResponseTimeoutError)
-          throw responseError(command, TRANSIENT_NOT_COMMITTED);
-        if (!(error instanceof ResponseError) ||
-            error.errorCode !== TRANSIENT_NOT_ACCEPTED)
-          throw error instanceof ResponseError
-            ? responseError(command, error.errorCode)
-            : error;
-        if (!worthAnotherAttempt(deadline))
+        this.partitionRoutes.delete(partition.key);
+        if (missingReplica || (attempt.clientId !== undefined && attempt.clientId !== this.vsrSession.clientId &&
+            error instanceof ResponseError && error.errorCode !== TRANSIENT_NOT_COMMITTED))
           throw responseError(command, TRANSIENT_NOT_ACCEPTED);
-        await delay(VSR_RETRY_INTERVAL_MS);
+        if (error instanceof ResponseError && error.commandCode === command && error.errorCode === LIFECYCLE_BUSY &&
+            Date.now() + lifecycleRetryInterval < deadline) {
+          await delay(lifecycleRetryInterval);
+          lifecycleRetryInterval = Math.min(lifecycleRetryInterval * 2, LIFECYCLE_RETRY_MAX_INTERVAL_MS);
+          attempt.frame = undefined;
+          continue;
+        }
+        if (command === COMMAND_CODE.SendMessages && error instanceof ResponseError &&
+            error.errorCode === HISTORY_UNAVAILABLE && !context && !refreshedHistory &&
+            worthAnotherAttempt(deadline)) {
+          refreshedHistory = true;
+          const topic = partition.query.subarray(0, -PARTITION_ID_SIZE).toString('hex');
+          for (const key of this.partitionRoutes.keys())
+            if (key.slice(0, -PARTITION_ID_SIZE * 2) === topic)
+              this.partitionRoutes.delete(key);
+          captured = undefined;
+          attempt.frame = undefined;
+          continue;
+        }
+        if (error instanceof VsrResponseTimeoutError)
+          throw responseError(command, attempt.frame ? TRANSIENT_NOT_COMMITTED : TRANSIENT_NOT_ACCEPTED);
+        if (!(error instanceof ResponseError) ||
+            (error.errorCode !== TRANSIENT_NOT_ACCEPTED && error.errorCode !== NOT_PRIMARY))
+          throw error instanceof ResponseError && !(error instanceof VsrEvictionError)
+            ? responseError(command, error.errorCode) : error;
+        if (!worthAnotherAttempt(deadline))
+          throw responseError(command, error.errorCode);
+        if (error.errorCode !== NOT_PRIMARY || refusedPrimary)
+          await delay(VSR_RETRY_INTERVAL_MS);
+        refusedPrimary ||= error.errorCode === NOT_PRIMARY;
       }
     }
     throw responseError(command, TRANSIENT_NOT_ACCEPTED);
   }
 
-  private async _routingControl(partition: PartitionRoute, deadline: number): Promise<CommandResponse> {
-    const options = { deadline, followsLeaderMoves: false };
+  private async _routingControl(partition: PartitionTarget, deadline: number): Promise<CommandResponse> {
+    if (!this.connection.connected || !this.isAuthenticated)
+      throw responseError(COMMAND_CODE.GetPartitionRoute, TRANSIENT_NOT_ACCEPTED);
     try {
-      return await this.sendCommand(partition.code, partition.query, options);
+      return await this._queueCommand(COMMAND_CODE.GetPartitionRoute, partition.query,
+        true, true, false, deadline);
     } catch (error) {
-      if (error instanceof ResponseError &&
-          error.errorCode !== UNAUTHENTICATED && error.errorCode !== STALE_CLIENT)
-        throw error;
-      if (Date.now() >= deadline)
-        throw error;
-      // Only a failed coordinator exchange uses normal session recovery.
-      // A healthy coordinator refusing a route must retain its group membership.
-      if (error instanceof ResponseError) {
+      if (!(error instanceof ResponseError) ||
+          error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT) {
         this.connection.abort();
         this.connection.connected = false;
         this._resetSession();
       }
-      await this.sendCommand(PING.code, PING.serialize(), { deadline });
-      return this.sendCommand(partition.code, partition.query, options);
+      throw error;
     }
   }
 
@@ -938,8 +870,8 @@ export class CommandResponseStream extends EventEmitter {
 
   private _clearPollRouting(): void {
     this.routingGeneration += 1;
-    this.pollRoutes.clear();
-    this.routeContexts.clear();
+    this.partitionRoutes.clear();
+    this.replicaEndpoints.clear();
     for (const entry of this.pollConnections.values())
       entry.client.destroy();
     this.pollConnections.clear();
@@ -969,7 +901,7 @@ export class CommandResponseStream extends EventEmitter {
       if (!next) break;
       const { command, payload, handleResponse, deadline, resolve, reject } = next;
       try {
-        resolve(await this._processNext(command, payload, handleResponse, deadline, next.context));
+        resolve(await this._processNext(command, payload, handleResponse, deadline, next.context, next.attempt));
       } catch (err) {
         if (err instanceof LeaderMovedError && next.followsLeaderMoves)
           // Counted before the rejection is handed out, not after: the caller
@@ -1017,11 +949,12 @@ export class CommandResponseStream extends EventEmitter {
     payload: Buffer,
     handleResp = true,
     deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS,
-    context?: PartitionContext
+    context?: PartitionContext,
+    attempt?: RoutedAttempt
   ): Promise<CommandResponse> {
     if (isLoginCommand(command))
       return this._processVsrLogin(command, payload, handleResp, deadline);
-    return this._processVsr(command, payload, handleResp, deadline, context);
+    return this._processVsr(command, payload, handleResp, deadline, context, attempt);
   }
 
   private async _processVsrLogin(
@@ -1059,13 +992,22 @@ export class CommandResponseStream extends EventEmitter {
     payload: Buffer,
     handleResp: boolean,
     deadline: number,
-    context?: PartitionContext
+    context?: PartitionContext,
+    attempt?: RoutedAttempt
   ): Promise<CommandResponse> {
     let requestWritten = false;
     try {
+      if (attempt?.clientId !== undefined && attempt.clientId !== this.vsrSession.clientId)
+        throw responseError(command, TRANSIENT_NOT_ACCEPTED);
+      if (command === COMMAND_CODE.GetPartitionRoute)
+        context = { incarnation: 0n, ownerGeneration: 0n, metadataOp: this.metadataWatermark };
       const prepared = prepareVsrCommand(command, payload, this.vsrSession.bindSecret);
       // A transient retry must preserve all request identity fields.
-      const frame = this.vsrSession.encode(prepared.command, prepared.payload, context);
+      const frame = attempt?.frame ?? this.vsrSession.encode(prepared.command, prepared.payload, context);
+      if (attempt) {
+        attempt.frame = frame;
+        attempt.clientId = this.vsrSession.clientId;
+      }
       // Derived from the request's own budget rather than read off the clock,
       // so one request spends one budget however many times it is re-issued.
       const notAcceptedDeadline =
@@ -1091,33 +1033,30 @@ export class CommandResponseStream extends EventEmitter {
           requestWritten ||= exchangeState.written;
         }
         this._observeMetadataReply(response);
-        if (!handleResp) {
-          // Routing still needs refusals when the caller decodes the frame.
-          if (this.dataConnection &&
-              peekCommand(response) === Command.Reply &&
-              readStatus(response) === TRANSIENT_NOT_ACCEPTED)
-            throw responseError(command, TRANSIENT_NOT_ACCEPTED);
-          return response as unknown as CommandResponse;
-        }
         try {
+          if (!handleResp) {
+            // Routing still needs refusals when the caller decodes the frame.
+            if ((this.dataConnection || attempt) && peekCommand(response) === Command.Reply &&
+                readStatus(response) !== 0)
+              throw responseError(command, readStatus(response));
+            return response as unknown as CommandResponse;
+          }
           parsed = decodeVsrResponse(response, command);
           break;
         } catch (error) {
           if (error instanceof ResponseError &&
-              lastTransientError?.errorCode === TRANSIENT_NOT_COMMITTED &&
-              (error.errorCode === TRANSIENT_NOT_ACCEPTED ||
-               error.errorCode === HISTORY_UNAVAILABLE ||
-               error.errorCode === UNAUTHENTICATED ||
-               error.errorCode === STALE_CLIENT ||
-               error.errorCode === UNAUTHORIZED))
+              lastTransientError?.errorCode === TRANSIENT_NOT_COMMITTED)
             error = responseError(command, TRANSIENT_NOT_COMMITTED);
           if (!(error instanceof ResponseError) ||
               !isTransientVsrError(error.errorCode))
             throw error;
-          if (this.dataConnection ||
-              command === COMMAND_CODE.GetPollRouting ||
-              command === COMMAND_CODE.BindSession)
+          if (command === COMMAND_CODE.GetPartitionRoute || command === COMMAND_CODE.BindSession ||
+              ((this.dataConnection || attempt) &&
+               (command === COMMAND_CODE.PollMessages || command === COMMAND_CODE.GetOffset)) ||
+              ((this.dataConnection || attempt) && error.errorCode !== TRANSIENT_NOT_COMMITTED))
             throw error;
+          if (error.errorCode === NOT_PRIMARY)
+            throw new LeaderMovedError(error);
           // A later refusal cannot resolve an earlier uncertain attempt.
           lastTransientError = lastTransientError?.errorCode === TRANSIENT_NOT_COMMITTED
             ? lastTransientError : error;
@@ -1153,6 +1092,8 @@ export class CommandResponseStream extends EventEmitter {
       // during a login would leave the candidates stale between logins.
       if (handleResp && command === GET_CLUSTER_METADATA.code)
         this._rememberRoster(parsed);
+      if (handleResp && command === COMMAND_CODE.GetPartitionRoute)
+        this._rememberRoute(payload, parsed);
       return parsed;
     } catch (error) {
       // A not-admitted refusal is an answer, so the session is not in doubt
@@ -1517,53 +1458,53 @@ const withinDeadline = async <T>(
 
 const isTransientVsrError = (errorCode: number): boolean =>
   errorCode === TRANSIENT_NOT_COMMITTED ||
-  errorCode === TRANSIENT_NOT_ACCEPTED;
+  errorCode === TRANSIENT_NOT_ACCEPTED || errorCode === NOT_PRIMARY;
 
-type PartitionRoute = {
-  code: number,
+type PartitionTarget = {
   query: Buffer,
-  /** The target without the poll options or the offset, as Rust keys routes */
-  key: string,
-  /** The command a partition primary serves the request as */
-  primaryCode: number
+  key: string
 };
 
-/**
- * The routing query of a poll or an offset write, or nothing for any other
- * command.
- */
-const partitionRoute = (command: number, payload: Buffer): PartitionRoute | undefined => {
-  if (command === COMMAND_CODE.PollMessages) {
-    if (payload.length <= POLL_OPTIONS_SIZE)
-      throw responseError(command, INVALID_COMMAND);
-    const target = payload.subarray(0, -POLL_OPTIONS_SIZE).toString('hex');
-    return {
-      code: COMMAND_CODE.GetPollRouting,
-      query: payload,
-      key: `${COMMAND_CODE.GetPollRouting}:${target}`,
-      primaryCode: COMMAND_CODE.PollMessagesOnPrimary
-    };
+const partitionRoute = (command: number, payload: Buffer): PartitionTarget | undefined => {
+  if (command === COMMAND_CODE.SendMessages) {
+    const { query } = sendTarget(payload);
+    return { query, key: query.toString('hex') };
   }
-  if (command !== COMMAND_CODE.StoreOffset && command !== COMMAND_CODE.DeleteConsumerOffset)
+  if (command !== COMMAND_CODE.PollMessages && command !== COMMAND_CODE.GetOffset &&
+      command !== COMMAND_CODE.StoreOffset && command !== COMMAND_CODE.DeleteConsumerOffset)
     return undefined;
-  const suffix = command === COMMAND_CODE.StoreOffset
-    ? STORE_OFFSET_SUFFIX_SIZE : DELETE_OFFSET_SUFFIX_SIZE;
-  if (payload.length <= suffix)
+  let position = 1;
+  const consumerEnd = identifierEnd(payload, position, command);
+  const streamEnd = identifierEnd(payload, consumerEnd, command);
+  position = identifierEnd(payload, streamEnd, command);
+  const suffix = command === COMMAND_CODE.PollMessages ? POLL_OPTIONS_SIZE
+    : command === COMMAND_CODE.StoreOffset ? STORE_OFFSET_SUFFIX_SIZE
+      : command === COMMAND_CODE.DeleteConsumerOffset ? DELETE_OFFSET_SUFFIX_SIZE : 0;
+  if (payload.length !== position + 1 + PARTITION_ID_SIZE + suffix || payload[position] > 1)
     throw responseError(command, INVALID_COMMAND);
-  const query = payload.subarray(0, -suffix);
-  return {
-    code: COMMAND_CODE.GetConsumerOffsetRouting,
-    query,
-    key: `${COMMAND_CODE.GetConsumerOffsetRouting}:${query.toString('hex')}`,
-    primaryCode: command
-  };
+  if (payload[position] === 0) {
+    if (command === COMMAND_CODE.StoreOffset || command === COMMAND_CODE.DeleteConsumerOffset ||
+        (command === COMMAND_CODE.PollMessages && payload[0] === ConsumerKind.Group))
+      throw responseError(command, INVALID_COMMAND);
+    payload[position] = 1;
+    payload.writeUInt32LE(0, position + 1);
+  }
+  const query = Buffer.concat([payload.subarray(consumerEnd, position),
+    payload.subarray(position + 1, position + 1 + PARTITION_ID_SIZE)]);
+  return { query, key: query.toString('hex') };
+};
+
+const identifierEnd = (payload: Buffer, position: number, command: number): number => {
+  if (position + IDENTIFIER_PREFIX_SIZE > payload.length)
+    throw responseError(command, INVALID_COMMAND);
+  const end = position + IDENTIFIER_PREFIX_SIZE + payload[position + 1];
+  if (end > payload.length)
+    throw responseError(command, INVALID_COMMAND);
+  return end;
 };
 
 type SendTarget = {
-  /** Stream and topic identifier bytes, the scope a history refusal drops */
-  topic: string,
-  partitionId: number,
-  /** `GetSendContext` body: stream, topic and partition id */
+  /** `GetPartitionRoute` body: stream, topic and partition id */
   query: Buffer
 };
 
@@ -1588,8 +1529,6 @@ const sendTarget = (payload: Buffer): SendTarget => {
     throw responseError(COMMAND_CODE.SendMessages, INVALID_COMMAND);
   const identifiers = payload.subarray(SEND_METADATA_LENGTH_SIZE, position);
   return {
-    topic: identifiers.toString('hex'),
-    partitionId: payload.readUInt32LE(partition),
     query: Buffer.concat([identifiers, payload.subarray(partition, partition + PARTITION_ID_SIZE)])
   };
 };

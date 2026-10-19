@@ -34,6 +34,13 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// </summary>
     public bool FromServer { get; }
 
+    internal int? CommandCode { get; set; }
+
+    /// <summary>
+    ///     Whether the code came from the result section of a reply rather than its status word or an eviction.
+    /// </summary>
+    internal bool FromResultSection { get; init; }
+
     internal IggyInvalidStatusCodeException(int statusCode, string message, bool fromServer = false) : base(message)
     {
         StatusCode = statusCode;

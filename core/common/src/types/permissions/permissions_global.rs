@@ -30,7 +30,11 @@ pub struct Permissions {
     /// Global permissions are applied to all streams.
     pub global: GlobalPermissions,
 
-    /// Stream permissions are applied to a specific stream.
+    /// Stream permissions are applied to a specific stream, keyed by stream ID.
+    ///
+    /// The server refuses a grant on a stream or topic that does not exist, and
+    /// a delete of a stream or topic removes every grant on it. A new stream or
+    /// topic can reuse a deleted ID, so a grant must not outlive its target.
     pub streams: Option<BTreeMap<usize, StreamPermissions>>,
 }
 

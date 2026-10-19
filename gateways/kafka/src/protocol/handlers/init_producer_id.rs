@@ -19,8 +19,9 @@
 //!
 //! A Java producer sets `enable.idempotence=true` without being asked (KIP-679, default since
 //! Kafka 3.0) and sends this before its first record, so answering it is what lets a stock
-//! producer start against this gateway at all. The id is handed out and then ignored: delivery
-//! stays at-least-once, and no retry is deduplicated. See `docs/IDEMPOTENCE.md`.
+//! producer start against this gateway at all. Produce uses the id only to pick the producer's
+//! Iggy session: delivery stays at-least-once, and no retry is deduplicated. See
+//! `docs/IDEMPOTENCE.md`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,26 +65,42 @@ const PRODUCER_EPOCH: i16 = 0;
 /// would hand a restarted gateway's producers the pairs its previous run gave out. Seeding from
 /// the clock keeps every new id above the old ones unless the previous run averaged more than one
 /// allocation per millisecond of its uptime, the clock stepped back across the restart, or the
-/// clock reads before the Unix epoch and seeds 0. Nothing is persisted, and nothing reads the id
-/// yet. Before Produce (#3535) keys anything on it, the allocator has to persist a high-water mark
-/// or bump the epoch on every start.
+/// clock reads before the Unix epoch and seeds 0. Nothing is persisted.
+///
+/// Produce keys an Iggy session on the id, and only on an id of this run (`issued`). A
+/// replayed pair then makes two producers share a session, and nothing more. Before deduplication
+/// reads the id, the allocator has to persist a high-water mark or bump the epoch on every start.
 #[derive(Debug)]
 pub struct ProducerIdAllocator {
     instance_id: u16,
+    /// The first counter of this run.
+    first_counter: u64,
     next_counter: AtomicU64,
 }
 
 impl ProducerIdAllocator {
     #[must_use]
     pub fn new(instance_id: u16) -> Self {
+        let first_counter = clock_counter();
         Self {
             instance_id,
-            next_counter: AtomicU64::new(clock_counter()),
+            first_counter,
+            next_counter: AtomicU64::new(first_counter),
         }
     }
 
+    /// Whether this run gave out `producer_id`. An id a client made up, or one from before a
+    /// restart or from another gateway, is not.
+    pub(crate) fn issued(&self, producer_id: i64) -> bool {
+        let Ok(id) = u64::try_from(producer_id) else {
+            return false;
+        };
+        let given_out = self.first_counter..self.next_counter.load(Ordering::Relaxed);
+        id >> COUNTER_BITS == u64::from(self.instance_id) && given_out.contains(&(id & MAX_COUNTER))
+    }
+
     /// The next id for this instance, or `None` once its counter space is spent.
-    fn allocate(&self) -> Option<i64> {
+    pub(crate) fn allocate(&self) -> Option<i64> {
         let counter = self.next_counter.fetch_add(1, Ordering::Relaxed);
         if counter > MAX_COUNTER {
             return None;
@@ -193,6 +210,21 @@ mod tests {
         assert!(
             first_after_restart > last_of_previous_run,
             "a restart must not replay a (producer_id, epoch 0) pair a live producer still holds"
+        );
+    }
+
+    #[test]
+    fn given_an_id_when_checked_should_be_issued_only_if_this_run_gave_it_out() {
+        let allocator = ProducerIdAllocator::new(3);
+        let id = allocator.allocate().expect("id");
+
+        assert!(allocator.issued(id));
+        assert!(!allocator.issued(id + 1), "not given out yet");
+        assert!(!allocator.issued(id - 1), "from before this run");
+        assert!(!allocator.issued(-1), "no producer id");
+        assert!(
+            !ProducerIdAllocator::new(4).issued(id),
+            "another gateway's id"
         );
     }
 

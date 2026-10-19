@@ -2120,6 +2120,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let node = ClusterNodeResponse {
+            replica_id: 0,
             name: "node".to_owned(),
             ip: address.ip().to_string(),
             tcp_port: address.port(),

@@ -17,7 +17,9 @@
 
 use crate::MuxStateMachine;
 use crate::applied_frontier::AppliedFrontier;
-use crate::stm::authz::{PartitionsCreate, admits_partitions_create, gated_apply};
+use crate::stm::authz::{
+    PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
+};
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
@@ -47,6 +49,7 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsR
 use iggy_binary_protocol::requests::system::{FinalizeSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ProtocolVersion, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode,
@@ -650,6 +653,8 @@ pub enum MetadataSubmitError {
     ///   the previous boot's ids while the HTTP id minter restarts at 1, so
     ///   an honest login lands on a recovered entry owned by another user.
     ClientIdOwnedByAnotherUser,
+    /// The verified account is no longer active or the client ID is reserved.
+    Unauthenticated,
     /// The request is at or below the watermark without a retained receipt.
     RequestTooOld,
     /// The request identity already belongs to another operation.
@@ -665,7 +670,10 @@ impl MetadataSubmitError {
     pub const fn is_transient(&self) -> bool {
         !matches!(
             self,
-            Self::ClientIdOwnedByAnotherUser | Self::RequestTooOld | Self::OperationMismatch
+            Self::ClientIdOwnedByAnotherUser
+                | Self::Unauthenticated
+                | Self::RequestTooOld
+                | Self::OperationMismatch
         )
     }
 }
@@ -689,6 +697,7 @@ impl std::fmt::Display for MetadataSubmitError {
             Self::ClientIdOwnedByAnotherUser => {
                 f.write_str("client id already registered to a different user")
             }
+            Self::Unauthenticated => f.write_str("verified account is no longer active"),
         }
     }
 }
@@ -769,6 +778,21 @@ where
         );
     }
     if header.operation == Operation::Register {
+        let registration = RegisterRequest::decode_from(prepare.body()).unwrap_or_else(|_| {
+            fatal(
+                FatalReason::UnreconcilableLogFrontier,
+                "invalid committed Register identity",
+            )
+        });
+        if !mux_stm
+            .users()
+            .is_active_account(header.user_id, registration.user_created_at)
+        {
+            let denied = crate::stm::result::ApplyReply::err(IggyError::Unauthenticated.as_code());
+            return build_reply_message_with(&header, denied.reply_body_len(), |dst| {
+                denied.write_reply_body(dst);
+            });
+        }
         if table_mutations_allowed {
             let reply = build_reply_message(&header, &bytes::Bytes::new());
             client_table
@@ -776,12 +800,7 @@ where
                 .commit_register(
                     header.client,
                     header.user_id,
-                    prepare.body().try_into().unwrap_or_else(|_| {
-                        fatal(
-                            FatalReason::UnreconcilableLogFrontier,
-                            "committed Register has no bind verifier",
-                        )
-                    }),
+                    registration.bind_verifier,
                     reply,
                 )
                 .unwrap_or_else(|error| {
@@ -849,12 +868,14 @@ where
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
     // the reply body, replayed on retry.
-    let apply = gated_apply(mux_stm, prepare).unwrap_or_else(|err| {
-        panic!(
-            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
-            header.op
-        );
-    });
+    let apply = reject_stale_session(&header, &client_table.borrow())
+        .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
+        .unwrap_or_else(|err| {
+            panic!(
+                "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+                header.op
+            );
+        });
     if let Some(user_id) = apply.revoked_user {
         apply_user_revocation(
             mux_stm,
@@ -899,17 +920,22 @@ fn apply_user_revocation<M: StreamsFrontend>(
     }
     // A transferred table may already contain this end marker while the
     // streams snapshot still needs the matching membership release.
-    let table = client_table.borrow();
-    for identity in table.ended_sessions().filter(|identity| {
-        identity.metadata_watermark == header.op
-            && table.get_user_id(identity.client_id) == Some(user_id)
-    }) {
-        mux_stm.streams().remove_consumer_group_member(
-            identity.client_id,
-            iggy_common::IggyTimestamp::from(header.timestamp),
-            header.op,
-        );
-    }
+    let client_ids: Vec<u128> = {
+        let table = client_table.borrow();
+        table
+            .ended_sessions()
+            .filter(|identity| {
+                identity.metadata_watermark == header.op
+                    && table.get_user_id(identity.client_id) == Some(user_id)
+            })
+            .map(|identity| identity.client_id)
+            .collect()
+    };
+    mux_stm.streams().remove_consumer_group_members(
+        &client_ids,
+        iggy_common::IggyTimestamp::from(header.timestamp),
+        header.op,
+    );
 }
 
 /// Late-bound callback invoked after every committed op on shard 0's metadata
@@ -1378,6 +1404,7 @@ where
                     user_id,
                     message.body(),
                     request_checksum,
+                    |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
                 );
                 apply_preflight_consensus_plane(
                     consensus,
@@ -2387,9 +2414,12 @@ where
         &self,
         client_id: u128,
         user_id: u32,
-        bind_verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+        registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        if message_bus::is_server_internal_client(client_id) {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let consensus = self
             .consensus
             .as_ref()
@@ -2398,8 +2428,15 @@ where
             return Err(MetadataSubmitError::NotPrimary);
         }
         if is_caught_up_primary(consensus) {
+            if !self
+                .mux_stm
+                .users()
+                .is_active_account(user_id, registration.user_created_at)
+            {
+                return Err(MetadataSubmitError::Unauthenticated);
+            }
             let table = self.client_table.borrow();
-            match table.registered_session(client_id, user_id, bind_verifier) {
+            match table.registered_session(client_id, user_id, registration.bind_verifier) {
                 Ok(Some(epoch)) => {
                     return Ok(BoundSession {
                         epoch,
@@ -2416,7 +2453,7 @@ where
         if consensus.pipeline_has_message_from_client(client_id) {
             return Err(MetadataSubmitError::InProgress);
         }
-        let request = build_register_request_message(consensus, client_id, user_id, bind_verifier);
+        let request = build_register_request_message(consensus, client_id, user_id, registration);
         if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
             if consensus.push_queued_request(entry).is_err() {
@@ -2429,18 +2466,25 @@ where
                 .expect("Register is a client-allowed operation");
             let _ = self.dispatch_prepare_and_await(consensus, prepare).await;
         }
-        self.bound_session(client_id, user_id, bind_verifier)
+        self.bound_session(client_id, user_id, registration)
     }
 
     fn bound_session(
         &self,
         client_id: u128,
         user_id: u32,
-        bind_verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+        registration: RegisterRequest,
     ) -> Result<BoundSession, MetadataSubmitError> {
+        if !self
+            .mux_stm
+            .users()
+            .is_active_account(user_id, registration.user_created_at)
+        {
+            return Err(MetadataSubmitError::Unauthenticated);
+        }
         let table = self.client_table.borrow();
         let epoch = table
-            .registered_session(client_id, user_id, bind_verifier)
+            .registered_session(client_id, user_id, registration.bind_verifier)
             .map_err(|_| MetadataSubmitError::ClientIdOwnedByAnotherUser)?
             .ok_or(MetadataSubmitError::Canceled)?;
         Ok(BoundSession {
@@ -2852,9 +2896,11 @@ where
     }
 
     /// Submit a server-originated `CompleteConsumerGroupRevocation` through the
-    /// metadata consensus group (shard 0). The partition reconciler calls this
-    /// to complete a cooperative revocation once the source has drained the
-    /// partition (or it timed out).
+    /// metadata consensus group (shard 0). A partition reconciler, on this node
+    /// or on a relaying backup, asks for this to complete a cooperative
+    /// revocation once the source has drained the partition (or it timed out).
+    /// `namespace` is the partition that `request` completes, and keys its
+    /// internal client.
     ///
     /// Unlike a client op there is no session: a reserved internal client id
     /// (never coordinator-minted) carries it, `request_preflight` is skipped
@@ -2874,27 +2920,12 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn submit_complete_revocation_in_process(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
-        installation: iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest,
-        partition_op: u64,
+        request: CompleteConsumerGroupRevocationRequest,
+        namespace: server_common::sharding::IggyNamespace,
     ) -> Result<u64, MetadataSubmitError> {
-        let request = CompleteConsumerGroupRevocationRequest {
-            stream_id: WireIdentifier::numeric(stream_id),
-            topic_id: WireIdentifier::numeric(topic_id),
-            partition_id,
-            installation,
-            partition_op,
-        };
         self.submit_partition_completion(
             Operation::CompleteConsumerGroupRevocation,
-            server_common::sharding::IggyNamespace::new(
-                stream_id as usize,
-                topic_id as usize,
-                partition_id as usize,
-            )
-            .inner(),
+            namespace.inner(),
             &request.to_bytes(),
         )
         .await
@@ -2937,7 +2968,7 @@ where
     ) -> Result<Message<ReplyHeader>, MetadataSubmitError> {
         // One internal client per key serializes the completions of that key.
         const INTERNAL_REQUEST_ID: u64 = u64::MAX;
-        let internal_client_id = (u128::from(u64::MAX) << 64) | u128::from(internal_client);
+        let internal_client_id = message_bus::server_internal_client_id(internal_client);
         let consensus = self
             .consensus
             .as_ref()
@@ -3107,20 +3138,22 @@ where
             .as_ref()
             .expect("submit_request_in_process: consensus only exists on shard 0");
 
-        // Not-primary is transient: the same request replayed against the
-        // current primary commits fine. Reply with the explicit transient
-        // frame (relayed to the socket by the home shard) so the client
-        // replays immediately rather than waiting out its read-timeout.
-        // `TransientNotAccepted` specifically: the request never entered the
-        // pipeline here, so the client may re-issue it ANYWHERE -- including
-        // under a fresh session after failing over to the current leader --
-        // without double-apply risk. (`TransientNotCommitted` conversely means
-        // the outcome is unknown and only a same-session replay is safe.)
+        // Reply before admission so the client can retry without a read timeout.
+        // This refusal covers only this attempt; earlier copies may still commit.
+        // Retrying with their session and request id preserves deduplication.
         //
         // No catch-up gate: a non-register op admitted mid-commit-window
         // simply pipelines behind the in-flight batch (the wire path has
         // always done this); the register-specific invariant is guarded in
         // `submit_register_in_process` / `register_preflight`.
+        if consensus.is_normal_backup() {
+            return Ok(build_result_rejection_reply(
+                &request_header,
+                consensus.commit_max(),
+                IggyError::NotPrimary.as_code(),
+            )
+            .into_generic());
+        }
         if !(consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring()) {
             return Ok(build_result_rejection_reply(
                 &request_header,
@@ -3168,9 +3201,8 @@ where
         // Prepare queue full: backpressure, not failure. Absorb into the
         // request queue with this caller's reply subscriber; the commit
         // path promotes it as slots free up and the await below resolves
-        // with the committed reply. Only a full request queue is terminal
-        // (`TransientNotAccepted`, re-issuable anywhere: the request never
-        // entered a queue).
+        // with the committed reply. A full request queue refuses this attempt
+        // before admission, without settling the outcome of earlier copies.
         if consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(message);
             if consensus.push_queued_request(entry).is_err() {
@@ -3501,7 +3533,7 @@ where
             // a send to the reserved id only fails with a false error.
             if !had_in_process_subscriber
                 && prepare_header.client != RESERVED_CLIENT_ID
-                && !message_bus::is_auto_commit_client(prepare_header.client)
+                && !message_bus::is_server_internal_client(prepare_header.client)
             {
                 wire_replies.push((event, reply));
             }
@@ -3617,6 +3649,7 @@ where
                         user_id,
                         req.message.body(),
                         request_checksum,
+                        |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
                     );
                     apply_preflight_consensus_plane(
                         consensus,
@@ -3983,7 +4016,7 @@ where
 
         // Stamp the acting user id into the replicated header so the in-apply
         // RBAC gate (`crate::stm::authz`) resolves the same identity on every
-        // replica, WAL replay included (no session table there). Every client-op
+        // replica, WAL replay included. Every client-op
         // prepare funnels through here, primary-only by construction, so stamping
         // here -- not in the in-process client path alone -- also covers the
         // wire-plane ingresses (`on_request` and the request-queue drain). The
@@ -4231,6 +4264,9 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn commit_journal(&self) {
         let consensus = self.consensus.as_ref().unwrap();
+        if consensus.view_log_unproven() {
+            return;
+        }
         let journal = self.journal.as_ref().unwrap();
 
         let mut applied = 0usize;
@@ -4358,27 +4394,27 @@ where
 
 /// In-process Register `Message<RoutedRequestHeader>`. Mirrors
 /// `SimClient::register`: `session=0`, `request=0` per
-/// [`RoutedRequestHeader::validate`]; empty body.
+/// [`RoutedRequestHeader::validate`]; the body identifies the verified account.
 ///
 /// `cluster` + `view` from `consensus` for self-consistency before
 /// `Project::project` overwrites. `release = 0` matches wire today; both
 /// paths should switch to `consensus.release()` once
 /// `ClientReleaseTooLow/TooHigh` lands.
 ///
-/// Buffer is `size_of::<RoutedRequestHeader>()`; `prepare_request` transmutes into
-/// `PrepareHeader` (also 256 bytes), no realloc.
+/// `prepare_request` transmutes the header into `PrepareHeader` without reallocating.
 fn build_register_request_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
     user_id: u32,
-    bind_verifier: [u8; consensus::client_table::BIND_SECRET_BYTES],
+    registration: RegisterRequest,
 ) -> Message<RoutedRequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header_size = size_of::<RoutedRequestHeader>();
-    let message_size = header_size + bind_verifier.len();
+    let body = registration.to_bytes();
+    let message_size = header_size + body.len();
     let mut msg = Message::<RoutedRequestHeader>::new(message_size);
     let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
         &mut msg.as_mut_slice()[..header_size],
@@ -4403,7 +4439,7 @@ where
         group: server_common::sharding::METADATA_GROUP,
         ..RoutedRequestHeader::default()
     };
-    msg.as_mut_slice()[header_size..].copy_from_slice(&bind_verifier);
+    msg.as_mut_slice()[header_size..].copy_from_slice(&body);
     msg
 }
 
@@ -4755,6 +4791,7 @@ mod tests {
     use crate::stm::StateHandler;
     use crate::stm::authz::GatedApply;
     use crate::stm::consumer_group::JoinConsumerGroupRequest;
+    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{Users, UsersInner};
     use consensus::LocalPipeline;
@@ -4775,6 +4812,9 @@ mod tests {
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn given_cancelled_snapshot_writer_when_replaced_should_keep_the_new_snapshot() {
@@ -5220,7 +5260,7 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         md.client_table
@@ -5229,8 +5269,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            md.submit_register_in_process(CLIENT, IMPOSTOR, [0x5a; 32])
-                .await,
+            md.submit_register_in_process(
+                CLIENT,
+                IMPOSTOR,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32]
+                }
+            )
+            .await,
             Err(MetadataSubmitError::ClientIdOwnedByAnotherUser),
             "a different user must not be resumed onto this entry"
         );
@@ -5245,13 +5292,54 @@ mod tests {
         );
 
         assert_eq!(
-            md.submit_register_in_process(CLIENT, OWNER, [0x5a; 32])
-                .await,
+            md.submit_register_in_process(
+                CLIENT,
+                OWNER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32]
+                }
+            )
+            .await,
             Ok(BoundSession {
                 epoch: 1,
                 watermark: 0
             })
         );
+    }
+
+    #[compio::test]
+    async fn given_reserved_client_id_when_registering_in_process_should_reject_before_queueing() {
+        const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        let metadata = metadata_plane();
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let consensus = metadata.consensus.as_ref().unwrap();
+        for commit_max in [0, 1] {
+            consensus.advance_commit_max(commit_max);
+            for client in [
+                message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                message_bus::AUTO_COMMIT_CLIENT_ID,
+            ] {
+                let result = compio::time::timeout(
+                    REGISTRATION_TIMEOUT,
+                    metadata.submit_register_in_process(
+                        client,
+                        0,
+                        RegisterRequest {
+                            user_created_at: 1,
+                            bind_verifier: [0x5a; 32],
+                        },
+                    ),
+                )
+                .await
+                .expect("reserved IDs must be rejected without waiting for consensus");
+                let error = result.expect_err("reserved IDs cannot acquire a session");
+                assert_eq!(error, MetadataSubmitError::Unauthenticated);
+                assert!(!error.is_transient());
+                assert_eq!(metadata.client_table.borrow().get_epoch(client), None);
+                assert!(!consensus.pipeline_has_message_from_client(client));
+            }
+        }
     }
 
     #[test]
@@ -5527,8 +5615,7 @@ mod tests {
     /// delete without its in-process sender. Committing it must not send a
     /// reply to the reserved client id, which no connection owns.
     #[compio::test]
-    async fn given_repipelined_server_originated_delete_when_committed_should_send_no_client_reply()
-    {
+    async fn given_repipelined_server_operations_when_committed_should_send_no_client_reply() {
         const USER: u32 = 7;
         const TOKEN: &str = "expired";
 
@@ -5590,6 +5677,40 @@ mod tests {
         assert!(
             consensus.message_bus().client_sends.borrow().is_empty(),
             "no connection owns the reserved client id, so nothing may be sent to it"
+        );
+
+        let body = CompleteLifecycleRequest::new(
+            1,
+            1,
+            vec![LifecycleCompletion {
+                topic_id: 1,
+                partition_id: 0,
+                partition_op: 1,
+            }],
+        )
+        .unwrap()
+        .to_bytes();
+        let header = RoutedRequestHeader {
+            client: message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+            ..header
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &header, Operation::CompleteLifecycle, &body),
+            consensus.retry_capacity(&md.client_table.borrow()),
+        );
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        md.on_replicate(prepare).await;
+        consensus.drain_loopback_into(&mut loopback);
+        let ack = loopback
+            .pop()
+            .unwrap()
+            .try_into_typed::<PrepareOkHeader>()
+            .unwrap();
+        md.on_ack(ack).await;
+        assert_eq!(consensus.commit_min(), 2, "the completion must commit");
+        assert!(
+            consensus.message_bus().client_sends.borrow().is_empty(),
+            "a completion without its in-process sender must never send a wire reply"
         );
     }
 
@@ -5727,6 +5848,64 @@ mod tests {
             Some(IggyError::PartitionsLimitReached.as_code()),
             "a new create past the cap must be denied"
         );
+    }
+
+    /// A normal backup names the primary of its view as the place to retry,
+    /// and a backup in transfer cannot. Neither admits the mutation.
+    #[compio::test]
+    async fn given_backup_when_mutation_is_submitted_should_refuse_by_role() {
+        const CLIENT: u128 = 1;
+        const USER: u32 = TOPIC_MANAGER;
+        const BACKUP_REPLICA: u8 = 1;
+        const REPLICA_COUNT: u8 = 3;
+        for (transferring, expected) in [
+            (false, IggyError::NotPrimary),
+            (true, IggyError::TransientNotAccepted),
+        ] {
+            let consensus = VsrConsensus::new(
+                1,
+                BACKUP_REPLICA,
+                REPLICA_COUNT,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            if transferring {
+                consensus.begin_state_transfer_await();
+            }
+            let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+                Some(consensus),
+                None,
+                None,
+                None,
+                TestMux::new((
+                    users_with_topic_manager(),
+                    (stream_with_one_partition().into(), ()),
+                )),
+                None,
+            );
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_register(CLIENT, USER, [0x5a; 32], register_reply(CLIENT, 1))
+                .unwrap();
+
+            let reply = metadata
+                .submit_request_in_process(create_topic_request(CLIENT, USER))
+                .await
+                .expect("a refusal is a reply, not a submit error");
+            assert_eq!(
+                iggy_binary_protocol::result_code(&reply.as_slice()[size_of::<ReplyHeader>()..]),
+                Some(expected.as_code()),
+                "transferring {transferring}"
+            );
+            assert_eq!(
+                metadata.consensus.as_ref().unwrap().pipeline_len(),
+                0,
+                "a backup must not prepare the mutation"
+            );
+        }
     }
 
     #[test]
@@ -6872,7 +7051,14 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER, [0x5a; 32])
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap()
             .epoch;
@@ -6900,7 +7086,14 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata
-            .submit_register_in_process(CLIENT, USER, [0x5a; 32])
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap()
             .epoch;
@@ -7006,7 +7199,14 @@ mod tests {
         let (_dir, metadata) = metadata_with_group_member(1).await;
         for client in 2..=8 {
             metadata
-                .submit_register_in_process(client, 7, [0x5a; 32])
+                .submit_register_in_process(
+                    client,
+                    7,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -7146,7 +7346,14 @@ mod tests {
         const USER: u32 = 7;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let new_session = metadata
-            .submit_register_in_process(CLIENT, USER, [0x5a; 32])
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap()
             .epoch;
@@ -7251,13 +7458,18 @@ mod tests {
         let epoch = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
         let request = RoutedRequestHeader {
             client: CLIENT,
+            user_id: GROUP_MEMBER_USER,
             ..Default::default()
         };
         let prepare = build_prepare_message(
             metadata.consensus.as_ref().unwrap(),
             &request,
             Operation::Register,
-            &[0x5a; 32],
+            &RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes(),
         );
         apply_committed_prepare(
             &*metadata.mux_stm,
@@ -7416,6 +7628,92 @@ mod tests {
         }
     }
 
+    /// All owner decisions of one revocation share its op as generation, and a
+    /// reconciler on another shard installs what it reads. A reader that holds
+    /// a guard across the revocation stalls any second publish, so a racing
+    /// reader would then see one removal alone.
+    #[compio::test]
+    async fn given_two_sessions_of_one_user_when_revoked_should_publish_both_removals_at_once() {
+        const FIRST: u128 = 1;
+        const SECOND: u128 = 2;
+        const PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+        let (_directory, metadata) = metadata_with_group_member(FIRST).await;
+        join_group_member(&metadata, SECOND).await;
+        let header = PrepareHeader {
+            op: metadata.consensus.as_ref().unwrap().commit_min() + 1,
+            operation: Operation::DeleteUser,
+            ..Default::default()
+        };
+        let factory = metadata.mux_stm.streams().factory();
+        // One guard for both members: two reads could straddle a publish.
+        let memberships = |streams: &Streams| {
+            streams.read(|inner| {
+                [FIRST, SECOND].map(|client_id| {
+                    inner
+                        .items
+                        .iter()
+                        .flat_map(|(_, stream)| stream.topics.iter())
+                        .flat_map(|(_, topic)| topic.consumer_groups.values())
+                        .filter(|group| {
+                            group
+                                .members
+                                .iter()
+                                .any(|(_, member)| member.client_id == client_id)
+                        })
+                        .count()
+                })
+            })
+        };
+        let (held_sender, held_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+
+        let seen = thread::scope(|scope| {
+            let holder_factory = factory.clone();
+            let holder = scope.spawn(move || {
+                Streams::from_factory(holder_factory)
+                    .read(|_| {
+                        held_sender.send(()).unwrap();
+                        release_receiver.recv()
+                    })
+                    .unwrap();
+            });
+            held_receiver.recv().unwrap();
+            let observer = scope.spawn(move || {
+                let streams = Streams::from_factory(factory);
+                let deadline = Instant::now() + PUBLISH_TIMEOUT;
+                let seen = loop {
+                    let seen = memberships(&streams);
+                    if seen != [1, 1] {
+                        break seen;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the revocation never reached readers"
+                    );
+                    thread::yield_now();
+                };
+                release_sender.send(()).unwrap();
+                seen
+            });
+            apply_user_revocation(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                GROUP_MEMBER_USER,
+                &header,
+            );
+            let seen = observer.join().unwrap();
+            holder.join().unwrap();
+            seen
+        });
+
+        assert_eq!(
+            seen,
+            [0, 0],
+            "a reader saw one member removal of the revocation without the other"
+        );
+    }
+
     #[test]
     fn given_rejected_or_older_user_deletion_when_applying_should_preserve_newer_sessions() {
         const CLIENT: u128 = 1;
@@ -7488,6 +7786,29 @@ mod tests {
         }
     }
 
+    fn session_users() -> Users {
+        const LAST_USER: u32 = 9;
+        let mut users = UsersInner::new();
+        for user_id in 0..=LAST_USER {
+            let created = StateHandler::apply(
+                &CreateUserRequest {
+                    username: WireName::new(format!("session-user-{user_id}")).unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                },
+                &mut users,
+                IggyTimestamp::from(1),
+            );
+            assert_eq!(created.code, 0);
+        }
+        users.into()
+    }
+
+    /// The user of every session that [`join_group_member`] registers.
+    const GROUP_MEMBER_USER: u32 = 7;
+
     #[allow(clippy::future_not_send)]
     async fn metadata_with_group_member(
         client_id: u128,
@@ -7495,7 +7816,6 @@ mod tests {
         tempfile::TempDir,
         IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
     ) {
-        const USER: u32 = 7;
         let mut inner = StreamsInner::new();
         let timestamp = IggyTimestamp::now();
         let _ = StateHandler::apply(
@@ -7540,12 +7860,30 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        metadata.mux_stm = Rc::new(TestMux::new((Users::default(), (inner.into(), ()))));
+        metadata.mux_stm = Rc::new(TestMux::new((session_users(), (inner.into(), ()))));
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        join_group_member(&metadata, client_id).await;
+        (dir, metadata)
+    }
+
+    /// Registers `client_id` as a session of `GROUP_MEMBER_USER` and commits
+    /// its join to the group of [`metadata_with_group_member`].
+    #[allow(clippy::future_not_send)]
+    async fn join_group_member(
+        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
+        client_id: u128,
+    ) {
         metadata
-            .submit_register_in_process(client_id, USER, [0x5a; 32])
+            .submit_register_in_process(
+                client_id,
+                GROUP_MEMBER_USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x5a; 32],
+                },
+            )
             .await
             .unwrap();
-        metadata.mux_stm.users().ensure_root_user("root", "hash");
         let consensus = metadata.consensus.as_ref().unwrap();
         let join = consensus::seal_prepare_capacity(
             build_prepare_message(
@@ -7584,7 +7922,6 @@ mod tests {
                 .len(),
             1
         );
-        (dir, metadata)
     }
 
     /// Register is the one op that still honors the catch-up gate (its
@@ -7627,7 +7964,7 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         let consensus = md.consensus.as_ref().unwrap();
@@ -7662,8 +7999,14 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed, not bounced.
-        let mut register =
-            Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER, [0x5a; 32]));
+        let mut register = Box::pin(md.submit_register_in_process(
+            CLIENT_C,
+            ACTING_USER,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        ));
         assert!(
             register.as_mut().poll(&mut cx).is_pending(),
             "mid-window register must park in the request queue, not error"
@@ -7741,7 +8084,14 @@ mod tests {
         );
         metadata.mux_stm.users().ensure_root_user("root", "hash");
         let original_session = metadata
-            .submit_register_in_process(CLIENT, USER, BIND_VERIFIER)
+            .submit_register_in_process(
+                CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: BIND_VERIFIER,
+                },
+            )
             .await
             .unwrap();
         let consensus = metadata.consensus.as_ref().unwrap();
@@ -7762,7 +8112,14 @@ mod tests {
             Some(0),
         );
         let new_session = metadata
-            .submit_register_in_process(NEW_CLIENT, USER, BIND_VERIFIER)
+            .submit_register_in_process(
+                NEW_CLIENT,
+                USER,
+                RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: BIND_VERIFIER,
+                },
+            )
             .await
             .unwrap();
         let local_applied = consensus.commit_min();
@@ -7800,14 +8157,28 @@ mod tests {
         );
         assert_eq!(
             metadata
-                .bound_session(CLIENT, USER, BIND_VERIFIER)
+                .bound_session(
+                    CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: BIND_VERIFIER
+                    }
+                )
                 .unwrap()
                 .epoch,
             original_session.epoch,
         );
         assert_eq!(
             metadata
-                .bound_session(NEW_CLIENT, USER, BIND_VERIFIER)
+                .bound_session(
+                    NEW_CLIENT,
+                    USER,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: BIND_VERIFIER
+                    }
+                )
                 .unwrap()
                 .epoch,
             new_session.epoch,
@@ -8197,7 +8568,7 @@ mod tests {
                 Some(journal),
                 None,
                 None,
-                TestMux::default(),
+                TestMux::new((session_users(), (Streams::default(), ()))),
                 None,
             );
         let consensus = md.consensus.as_ref().unwrap();
@@ -8233,8 +8604,14 @@ mod tests {
         assert_eq!(consensus.commit_min(), 0);
 
         // C's register lands in the window: absorbed into the request queue.
-        let mut register =
-            Box::pin(md.submit_register_in_process(CLIENT_C, ACTING_USER, [0x5a; 32]));
+        let mut register = Box::pin(md.submit_register_in_process(
+            CLIENT_C,
+            ACTING_USER,
+            RegisterRequest {
+                user_created_at: 1,
+                bind_verifier: [0x5a; 32],
+            },
+        ));
         assert!(register.as_mut().poll(&mut cx).is_pending());
         assert_eq!(consensus.request_queue_len(), 1);
 

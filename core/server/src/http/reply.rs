@@ -425,6 +425,14 @@ mod tests {
             transient_code(&not_accepted),
             Some(IggyError::TransientNotAccepted)
         );
+
+        let not_primary = consensus::build_result_rejection_reply(
+            request.header(),
+            9,
+            IggyError::NotPrimary.as_code(),
+        )
+        .into_generic();
+        assert_eq!(transient_code(&not_primary), Some(IggyError::NotPrimary));
     }
 
     /// Genuine committed outcomes must advance the gate, so neither a success

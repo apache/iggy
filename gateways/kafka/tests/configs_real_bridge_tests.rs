@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 use iggy_gateway_kafka::bridge::IggyBridge;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION,
-    ERROR_NONE, ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
+    ERROR_INVALID_CONFIG, ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::{alter_configs, describe_configs};
 
@@ -68,10 +68,8 @@ async fn connected_state(server: &TestServer) -> GatewayState {
         .await
         .expect("bridge connects");
     GatewayState::new(
-        BrokerAdvertise::default(),
         Some(Arc::new(bridge)),
         8 * 1024 * 1024,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )
@@ -152,7 +150,7 @@ fn entry<'a>(
 
 #[tokio::test]
 #[serial]
-async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_retention() {
+async fn describe_configs_returns_retention_without_cleanup_and_alter_persists_retention() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
@@ -168,7 +166,7 @@ async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_reten
     .await;
     let result = &described.results[0];
     assert_eq!(result.error_code, ERROR_NONE);
-    assert_eq!(result.configs.len(), 2);
+    assert_eq!(result.configs.len(), 1);
     let retention = entry(&result.configs, "retention.ms");
     assert_eq!(retention.value.as_ref().map(StrBytes::as_str), Some("-1"));
     assert!(!retention.read_only);
@@ -176,12 +174,6 @@ async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_reten
     assert_eq!(retention.config_source, SOURCE_DEFAULT);
     assert_eq!(retention.synonyms, [] as [DescribeConfigsSynonym; 0]);
     assert!(retention.documentation.is_some());
-    let cleanup = entry(&result.configs, "cleanup.policy");
-    assert_eq!(cleanup.value.as_ref().map(StrBytes::as_str), Some("delete"));
-    assert!(cleanup.read_only);
-    assert_eq!(cleanup.config_source, SOURCE_DEFAULT);
-    assert_eq!(cleanup.synonyms, [] as [DescribeConfigsSynonym; 0]);
-    assert!(cleanup.documentation.is_some());
 
     let without_docs = describe(
         &state,
@@ -206,11 +198,11 @@ async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_reten
         true,
     )
     .await;
+    // Kafka Connect starts when the entry is missing and refuses a topic that reports `delete`.
     assert_eq!(filtered.results[0].error_code, ERROR_NONE);
-    assert_eq!(filtered.results[0].configs.len(), 1);
     assert_eq!(
-        filtered.results[0].configs[0].name.as_str(),
-        "cleanup.policy"
+        filtered.results[0].configs,
+        [] as [DescribeConfigsResourceResult; 0]
     );
 
     let v1 = describe(
@@ -222,7 +214,7 @@ async fn describe_configs_returns_retention_and_cleanup_and_alter_persists_reten
     )
     .await;
     assert_eq!(v1.results[0].error_code, ERROR_NONE);
-    assert_eq!(v1.results[0].configs.len(), 2);
+    assert_eq!(v1.results[0].configs.len(), 1);
 
     let validated = alter(
         &state,
