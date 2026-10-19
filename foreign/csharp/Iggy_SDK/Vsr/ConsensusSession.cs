@@ -271,7 +271,8 @@ internal sealed class ConsensusSession
         Span<byte> bytes = stackalloc byte[16];
         RandomNumberGenerator.Fill(bytes);
         var lower = BinaryPrimitives.ReadUInt64LittleEndian(bytes[..8]);
-        var upper = BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]);
+        // Keep generated IDs outside the server-only range.
+        var upper = BinaryPrimitives.ReadUInt64LittleEndian(bytes[8..]) & (ulong)long.MaxValue;
         var clientId = new UInt128(upper, lower);
 
         return clientId == UInt128.Zero ? UInt128.One : clientId;

@@ -368,9 +368,10 @@ pub fn topic_cap_and_duplicates<R: TopicResource>(resources: &[R]) -> (bool, Has
 /// The denial every resource gets when `principal` may not alter topic configuration, or
 /// `None` when the alter may run.
 ///
-/// No principal means SASL is off, which this gateway treats as nothing to enforce against,
-/// the same choice the rest of it makes when authentication is not configured. Permissions
-/// that were never read deny: granting would authorize a write off a value nothing read.
+/// No principal means no listener of this gateway names principals, so there is nothing to
+/// enforce against. Once one does, a connection that proved no identity carries
+/// [`AuthenticatedPrincipal::anonymous`] instead and is denied here. Permissions that were never
+/// read deny: granting would authorize a write off a value nothing read.
 #[must_use]
 pub fn alter_denial(
     principal: Option<&AuthenticatedPrincipal>,

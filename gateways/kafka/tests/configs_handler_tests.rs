@@ -37,8 +37,8 @@ use iggy_gateway_kafka::auth::AuthenticatedPrincipal;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::acl::PrincipalPermissions;
 use iggy_gateway_kafka::protocol::api::{
-    BrokerAdvertise, ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION,
-    ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState, is_supported_version, supported_api_ranges,
+    ERROR_NOT_CONTROLLER, ERROR_POLICY_VIOLATION, ERROR_TOPIC_AUTHORIZATION_FAILED, GatewayState,
+    is_supported_version, supported_api_ranges,
 };
 use iggy_gateway_kafka::protocol::handlers::{
     alter_configs, describe_configs, incremental_alter_configs,
@@ -59,10 +59,8 @@ const OP_SET: i8 = 0;
 
 fn state_without_bridge() -> GatewayState {
     GatewayState::new(
-        BrokerAdvertise::default(),
         None,
         8 * 1024 * 1024,
-        false,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
     )

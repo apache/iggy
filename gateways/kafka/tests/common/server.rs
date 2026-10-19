@@ -19,14 +19,14 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::broadcast;
 
-use std::sync::Arc;
-
 use iggy_gateway_kafka::auth::SaslAuthenticator;
-use iggy_gateway_kafka::server::bind_listener;
+use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 /// Bind an ephemeral port, start `KafkaGateway`, return address + shutdown sender.
@@ -41,7 +41,10 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
     .await
 }
 
-/// Start `KafkaGateway` with explicit config (`bind_addr` overwritten with ephemeral port).
+/// Start `KafkaGateway` with explicit config, every listener rebound to an ephemeral port.
+///
+/// Returns the first listener's address: every suite but the TLS one runs a single listener.
+/// [`spawn_gateway`] hands back all of them.
 ///
 /// `bind_listener` is synchronous, so this function's own body has no `.await` left - kept
 /// `async` anyway (with the lint silenced) rather than churning every one of this suite's ~20
@@ -49,38 +52,51 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
 /// whose whole purpose is spawning an async task.
 #[allow(clippy::unused_async)]
 pub async fn spawn_test_server_with_config(
-    mut config: GatewayConfig,
+    config: GatewayConfig,
 ) -> (SocketAddr, broadcast::Sender<()>) {
-    // Routed through the same tuned bind path as `main` (deep accept backlog via socket2), not a
-    // bare `TcpListener::bind`, so integration tests actually exercise it.
-    let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-
-    config.bind_addr = addr.to_string();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let server = KafkaGateway::new(config);
-    tokio::spawn(async move {
-        let _ = server.run(listener, shutdown_rx).await;
-    });
-
-    (addr, shutdown_tx)
+    let (addrs, shutdown) = spawn_gateway(KafkaGateway::new, config);
+    (addrs[0], shutdown)
 }
 
 /// Same as [`spawn_test_server_with_config`], with a verifier attached for the SASL suites.
 #[allow(clippy::unused_async)]
 pub async fn spawn_test_server_with_authenticator(
-    mut config: GatewayConfig,
+    config: GatewayConfig,
     authenticator: Arc<dyn SaslAuthenticator>,
 ) -> (SocketAddr, broadcast::Sender<()>) {
-    let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
+    let (addrs, shutdown) = spawn_gateway(
+        |config| KafkaGateway::new(config).with_authenticator(authenticator),
+        config,
+    );
+    (addrs[0], shutdown)
+}
 
-    config.bind_addr = addr.to_string();
+/// Starts a gateway built by `build` from `config`, with every listener rebound to an ephemeral
+/// port. Returns the bound addresses in the order of `config.listeners`.
+pub fn spawn_gateway(
+    build: impl FnOnce(GatewayConfig) -> KafkaGateway,
+    mut config: GatewayConfig,
+) -> (Vec<SocketAddr>, broadcast::Sender<()>) {
+    // Routed through the same tuned bind path as `main` (deep accept backlog via socket2), not a
+    // bare `TcpListener::bind`, so integration tests actually exercise it.
+    let mut listeners = Vec::with_capacity(config.listeners.len());
+    let mut addrs = Vec::with_capacity(config.listeners.len());
+    for listener in &mut config.listeners {
+        let socket = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = socket.local_addr().expect("local addr");
+        listener.bind_addr = addr.to_string();
+        addrs.push(addr);
+        listeners.push(BoundListener::new(listener.clone(), socket));
+    }
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let server = KafkaGateway::new(config).with_authenticator(authenticator);
+    let server = build(config);
     tokio::spawn(async move {
-        let _ = server.run(listener, shutdown_rx).await;
+        let _ = server.run(listeners, shutdown_rx).await;
     });
+    (addrs, shutdown_tx)
+}
 
-    (addr, shutdown_tx)
+/// One listener of `protocol`, on a port [`spawn_gateway`] picks.
+pub fn listener(protocol: SecurityProtocol) -> ListenerConfig {
+    ListenerConfig::new(protocol, "127.0.0.1:0")
 }

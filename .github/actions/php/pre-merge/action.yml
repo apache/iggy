@@ -92,7 +92,7 @@ runs:
         "${PHP}" -r 'json_decode(file_get_contents("foreign/php/composer.json"), true, 512, JSON_THROW_ON_ERROR);'
         cargo fmt --manifest-path foreign/php/Cargo.toml -- --check
         cargo clippy --manifest-path foreign/php/Cargo.toml --all-targets --all-features -- -D warnings
-        cargo install cargo-php --locked --version 0.1.21
+        cargo install cargo-php --locked --version 0.2.1
         cargo build --manifest-path foreign/php/Cargo.toml
         extension="$(find "${CARGO_TARGET_DIR}/debug" -maxdepth 1 -name 'libiggy_php.so' -print -quit)"
         if [ -z "$extension" ]; then
@@ -153,12 +153,16 @@ runs:
       run: |
         "${PHP}" "${COMPOSER_BIN}" install --no-interaction --prefer-dist --no-progress
 
+    - name: Download runtime binaries
+      if: inputs.task == 'test'
+      uses: ./.github/actions/utils/download-runtime
+
     - name: Start Iggy server
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
 
     - name: Run PHP SDK tests
       if: inputs.task == 'test'
@@ -184,7 +188,7 @@ runs:
       id: iggy-tls
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:

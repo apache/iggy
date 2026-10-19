@@ -7244,6 +7244,7 @@ name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "bytes",
  "crc32c",
@@ -7253,6 +7254,10 @@ dependencies = [
  "kafka-protocol",
  "libc",
  "lz4",
+ "rcgen",
+ "regex",
+ "regex-syntax",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -7262,12 +7267,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
  "zstd 0.14.2",
 ]
 

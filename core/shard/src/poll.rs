@@ -60,6 +60,16 @@ pub struct ConsumerAttachment {
     pub metadata: PollMetadata,
 }
 
+#[derive(Debug)]
+pub enum PollAttachment {
+    Bound(ConsumerAttachment),
+    Unbound {
+        user_id: u32,
+        user_created_at: u64,
+        metadata: PollMetadata,
+    },
+}
+
 impl ConsumerAttachment {
     pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
         if !is_partition_receipt_operation(operation) {
@@ -87,7 +97,7 @@ pub struct PollCompleted {
     result: PollReadResult,
     /// Return path for the accepted read or a rejection.
     reply: Sender<PartitionReadReply>,
-    attachment: Option<ConsumerAttachment>,
+    attachment: Option<PollAttachment>,
     /// Inbox enqueue time for disk diagnostics, or `None` for resident completion.
     #[cfg(feature = "poll-diagnostics")]
     queued_at: Option<std::time::Instant>,
@@ -256,7 +266,25 @@ where
                     args,
                     metadata: None,
                 },
-                Some(attachment),
+                Some(PollAttachment::Bound(attachment)),
+            ),
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args,
+                user_id,
+                user_created_at,
+                metadata,
+            } => (
+                PartitionRead::Poll {
+                    consumer,
+                    args,
+                    metadata: None,
+                },
+                Some(PollAttachment::Unbound {
+                    user_id,
+                    user_created_at,
+                    metadata,
+                }),
             ),
             read => (read, None),
         };
@@ -418,16 +446,45 @@ where
         if reply.is_disconnected() {
             return;
         }
-        if attachment.is_some_and(|attachment| {
-            !attachment.session.is_valid()
-                || !attachment
-                    .metadata
-                    .is_valid(self.plane.metadata().mux_stm.streams(), namespace)
-        }) {
-            let _ = reply.try_send(PartitionReadReply::Rejected(
-                IggyError::TransientNotAccepted,
-            ));
-            return;
+        if let Some(attachment) = &attachment {
+            let authorization = self.plane.metadata().mux_stm.users().read(|users| {
+                let (user_id, metadata, account_valid) = match attachment {
+                    PollAttachment::Bound(attachment) => (
+                        attachment.session.user_id(),
+                        &attachment.metadata,
+                        attachment.session.is_valid(),
+                    ),
+                    PollAttachment::Unbound {
+                        user_id,
+                        user_created_at,
+                        metadata,
+                    } => (
+                        *user_id,
+                        metadata,
+                        users.is_active_account(*user_id, *user_created_at),
+                    ),
+                };
+                if !account_valid {
+                    Err(match attachment {
+                        PollAttachment::Bound(_) => IggyError::TransientNotAccepted,
+                        PollAttachment::Unbound { .. } => IggyError::Unauthenticated,
+                    })
+                } else if !metadata.is_valid(self.plane.metadata().mux_stm.streams(), namespace) {
+                    Err(IggyError::TransientNotAccepted)
+                } else {
+                    users.authorize(|permissioner| {
+                        permissioner.poll_messages(
+                            user_id,
+                            namespace.stream_id(),
+                            namespace.topic_id(),
+                        )
+                    })
+                }
+            });
+            if let Err(error) = authorization {
+                let _ = reply.try_send(PartitionReadReply::Rejected(error));
+                return;
+            }
         }
         let partitions = self.plane.partitions();
         let consumer_kind = result.consumer_kind();

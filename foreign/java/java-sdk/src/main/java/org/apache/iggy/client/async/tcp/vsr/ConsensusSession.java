@@ -219,7 +219,8 @@ public final class ConsensusSession {
         RANDOM.nextBytes(bindSecret);
         do {
             clientIdLow = RANDOM.nextLong();
-            clientIdHigh = RANDOM.nextLong();
+            // Keep generated IDs outside the server-only range.
+            clientIdHigh = RANDOM.nextLong() & Long.MAX_VALUE;
         } while (clientIdLow == 0 && clientIdHigh == 0);
     }
 }

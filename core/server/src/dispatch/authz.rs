@@ -28,6 +28,7 @@
 use std::rc::Rc;
 
 use consensus::MetadataHandle;
+use consensus::client_table::SessionAttachment;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
@@ -48,6 +49,22 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 
 use crate::shell::{ShellBus, ShellShard};
+
+/// Run a read's `rule` only while the connection's session is still attached.
+///
+/// The funnel resolves the acting user before the read starts, and the session
+/// can end during any await of the read. A read runs this before its first
+/// await and again after its last one, before it builds the reply.
+pub(in crate::dispatch) fn authorize_attached(
+    attachment: Option<&SessionAttachment>,
+    rule: impl FnOnce() -> Result<(), IggyError>,
+) -> Result<(), IggyError> {
+    match attachment {
+        Some(attachment) if attachment.is_valid() => rule(),
+        Some(_) => Err(IggyError::StaleClient),
+        None => Err(IggyError::Unauthenticated),
+    }
+}
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
 /// acting user, returning the deny status code or `None` to proceed. The

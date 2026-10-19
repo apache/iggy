@@ -48,10 +48,9 @@ const CONSUMER_GROUP_MEMBER_NOT_FOUND: u32 = 5006;
 
 // Every spec here pins a 60s server heartbeat because harness clients never
 // ping on their own: the SDK pinger is spawned by `IggyClient::connect`, which
-// the harness builder does not call. At the shipped 30s interval a group member
-// that idles through another client's setup is reaped by the server's verifier,
-// and the failure surfaces as a short member count instead of anything about
-// the scenario under test.
+// the harness builder does not call. With heartbeat checks on, the server logs
+// out a group member that stays silent too long, and the failure surfaces as a
+// short member count instead of anything about the scenario under test.
 
 // A consumer-group member holding zero partitions has the same empty client-side
 // assignment as a non-member; only membership tells them apart. When the group
