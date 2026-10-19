@@ -512,7 +512,7 @@ final class PollRouter {
             var timeout = coordinator
                     .get()
                     .eventLoop()
-                    .schedule(poll::expire, Math.max(0, poll.deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                    .schedule(poll::endPending, Math.max(0, poll.deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             poll.result.whenComplete((response, error) -> timeout.cancel(false));
             attempt(poll);
         } catch (RuntimeException error) {
@@ -529,7 +529,7 @@ final class PollRouter {
         topologyGeneration++;
         clear();
         for (Poll poll : Set.copyOf(pending)) {
-            poll.fail(uncommitted());
+            poll.endPending();
         }
         CompletableFuture<?>[] closing =
                 connections.values().stream().map(slot -> slot.close(keep)).toArray(CompletableFuture[]::new);
@@ -1226,7 +1226,7 @@ final class PollRouter {
                             : unwrap(error));
         }
 
-        private synchronized void expire() {
+        private synchronized void endPending() {
             fail(
                     state.ticket() != null && dataSent && !retryingRefusal && lifecycleRefusal == null
                             ? state.retainTicket()

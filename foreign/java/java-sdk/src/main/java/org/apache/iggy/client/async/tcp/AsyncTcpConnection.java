@@ -545,6 +545,7 @@ public class AsyncTcpConnection {
             TransientFailoverState failoverState,
             long requiredSessionGeneration) {
         failoverState.linkFailed = false;
+        failoverState.detachedSession = false;
         long deadline = requestDeadlineNanos == 0 ? System.nanoTime() + requestTimeoutNanos : requestDeadlineNanos;
         if (isLoginCode(commandCode) && authenticated) {
             return logoutThenLogin(commandCode, payload, deadline);
@@ -841,17 +842,15 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * Whether the request lost the link that carried it. A stale client
-     * eviction counts too: the server dropped the link but kept the session,
+     * Whether the request lost the link that carried it. A detached-session
+     * eviction counts too: the server can drop the link but keep the session,
      * so an attempt it admitted before can still commit. A reply with that
      * code answered the attempt, so it is no lost link.
      */
     private static boolean lostLink(TransientFailoverState state, Throwable error) {
         return error instanceof IggyConnectionException
                 || error instanceof java.io.IOException
-                || (state.linkFailed
-                        && error instanceof IggyServerException serverError
-                        && serverError.getRawErrorCode() == STALE_CLIENT);
+                || (state.linkFailed && state.detachedSession);
     }
 
     private static boolean shouldRecheckLeader(
@@ -923,7 +922,9 @@ public class AsyncTcpConnection {
                         IggyServerException serverError = findServerError(error);
                         // A stale client eviction drops the link and keeps the session, so the request
                         // binds it again on a new link.
-                        if (serverError != null && lostLink(bindState, serverError)) {
+                        if (serverError != null
+                                && serverError.getRawErrorCode() == STALE_CLIENT
+                                && lostLink(bindState, serverError)) {
                             payload.release();
                             return CompletableFuture.<ByteBuf>failedFuture(new IggyConnectionException(
                                     "The server dropped the link during BindSession", serverError));
@@ -1232,6 +1233,7 @@ public class AsyncTcpConnection {
         boolean committed = pending.isCommitted() && (error == null || serverError != null);
         exchange.failoverState().committed = committed;
         exchange.failoverState().linkFailed = pending.isFailedByLink();
+        exchange.failoverState().detachedSession = pending.isSessionDetached();
         closeIfDetached(exchange, pending, serverError);
         boolean wasUncertain = uncertain || exchange.failoverState().uncertain;
         // An eviction fails every request on its link and names none of them, so the server can have admitted
@@ -1818,6 +1820,7 @@ public class AsyncTcpConnection {
         private long requestId;
         private boolean committed;
         private boolean linkFailed;
+        private boolean detachedSession;
         private boolean uncertain;
         private boolean everUncertain;
         private ConsensusSession.LaneKey lane;

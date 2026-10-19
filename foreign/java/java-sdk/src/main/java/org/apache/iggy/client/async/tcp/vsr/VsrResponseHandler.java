@@ -58,7 +58,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final ConcurrentMap<Long, PendingRequest> pendingRequests = new ConcurrentHashMap<>();
     private final ConsensusSession session;
     private final IntConsumer onEviction;
-    private final AtomicReference<Throwable> closeCause = new AtomicReference<>();
+    private final AtomicReference<CloseCause> closeCause = new AtomicReference<>();
 
     public VsrResponseHandler(ConsensusSession session, IntConsumer onEviction) {
         this.session = session.owner();
@@ -108,16 +108,20 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
     }
 
     public void closeChannel(Channel channel, Throwable cause) {
-        closeCause.compareAndSet(null, cause);
+        closeChannel(channel, cause, false);
+    }
+
+    private void closeChannel(Channel channel, Throwable cause, boolean detachedSession) {
+        closeCause.compareAndSet(null, new CloseCause(cause, detachedSession));
         channel.close();
         failPendingRequests(closeCause.get());
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        Throwable cause = closeCause.get();
+        CloseCause cause = closeCause.get();
         if (cause == null) {
-            cause = new IggyConnectionException("Connection closed before a response arrived");
+            cause = new CloseCause(new IggyConnectionException("Connection closed before a response arrived"), false);
         }
         failPendingRequests(cause);
         ctx.fireChannelInactive();
@@ -164,6 +168,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private void handleEviction(ChannelHandlerContext ctx, ByteBuf frame) {
         IggyServerException error = VsrHeaders.evictionToException(frame);
+        int reason = frame.getUnsignedByte(frame.readerIndex() + VsrHeaders.EVICTION_REASON_OFFSET);
         try {
             // The reason travels with the notification so the listener can drop
             // what belonged to the evicted session and say which eviction it
@@ -176,7 +181,10 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         // The server has already unbound this transport. Closing it before
         // completing requests prevents the pool from recycling the channel
         // and assigning a late reply to a request from the next session.
-        closeChannel(ctx.channel(), error);
+        closeChannel(
+                ctx.channel(),
+                error,
+                reason == VsrHeaders.REASON_NO_SESSION || reason == VsrHeaders.REASON_STALE_CLIENT);
     }
 
     @SuppressWarnings("checkstyle:CyclomaticComplexity")
@@ -283,11 +291,12 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         return new IggyConnectionException("Malformed VSR reply: " + detail);
     }
 
-    private void failPendingRequests(Throwable cause) {
+    private void failPendingRequests(CloseCause cause) {
         pendingRequests.forEach((key, pending) -> {
             if (pendingRequests.remove(key, pending)) {
                 pending.failedByLink = true;
-                pending.future.completeExceptionally(cause);
+                pending.detachedSession = cause.detachedSession();
+                pending.future.completeExceptionally(cause.error());
             }
         });
     }
@@ -299,6 +308,7 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         private final RequestIdentity identity;
         private volatile boolean committed;
         private volatile boolean failedByLink;
+        private volatile boolean detachedSession;
 
         private PendingRequest(
                 CompletableFuture<ByteBuf> future, int operation, long requestId, RequestIdentity identity) {
@@ -315,6 +325,10 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         /** Whether the link failed this request, so no reply answered it. */
         public boolean isFailedByLink() {
             return failedByLink;
+        }
+
+        public boolean isSessionDetached() {
+            return detachedSession;
         }
     }
 
@@ -347,4 +361,6 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
                     && op == frame.getLongLE(base + VsrHeaders.REPLY_COMMIT_OFFSET);
         }
     }
+
+    private record CloseCause(Throwable error, boolean detachedSession) {}
 }

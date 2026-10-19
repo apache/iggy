@@ -22,6 +22,7 @@ package org.apache.iggy.client.async.tcp.vsr;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
@@ -245,17 +246,25 @@ class VsrResponseHandlerTest {
         assertThat(channel.isActive()).isFalse();
     }
 
-    @Test
-    void shouldFailEveryPendingRequestOnEviction() {
+    @ParameterizedTest
+    @ValueSource(ints = {VsrHeaders.REASON_STALE_CLIENT, VsrHeaders.REASON_NO_SESSION})
+    void shouldFailEveryPendingRequestOnEviction(int reason) {
         session.beginRegister();
         session.bind(42);
         CompletableFuture<ByteBuf> first = enqueue(VsrOperation.NON_REPLICATED, 7);
         CompletableFuture<ByteBuf> second = enqueue(VsrOperation.CREATE_STREAM, 8);
 
-        channel.writeInbound(evictionFrame(VsrHeaders.REASON_STALE_CLIENT));
+        channel.writeInbound(evictionFrame(reason));
 
-        assertThat(rawErrorCode(first)).isEqualTo(VsrHeaders.ERROR_STALE_CLIENT);
-        assertThat(rawErrorCode(second)).isEqualTo(VsrHeaders.ERROR_STALE_CLIENT);
+        int errorCode = reason == VsrHeaders.REASON_NO_SESSION
+                ? VsrHeaders.ERROR_UNAUTHENTICATED
+                : VsrHeaders.ERROR_STALE_CLIENT;
+        assertThat(rawErrorCode(first)).isEqualTo(errorCode);
+        assertThat(rawErrorCode(second)).isEqualTo(errorCode);
+        if (reason == VsrHeaders.REASON_NO_SESSION) {
+            assertThatThrownBy(first::join).hasCauseInstanceOf(IggyAuthenticationException.class);
+            assertThatThrownBy(second::join).hasCauseInstanceOf(IggyAuthenticationException.class);
+        }
         assertThat(evictions).hasValue(1);
         assertThat(channel.isActive()).isFalse();
     }

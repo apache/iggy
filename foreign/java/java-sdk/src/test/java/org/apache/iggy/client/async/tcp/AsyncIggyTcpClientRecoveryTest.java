@@ -151,9 +151,10 @@ class AsyncIggyTcpClientRecoveryTest {
         }
     }
 
-    @ParameterizedTest(name = "routed={0}")
-    @ValueSource(booleans = {false, true})
-    void shouldRetainAStaleEvictedMutationAndProveItOnTheSameSession(boolean routed) throws Exception {
+    @ParameterizedTest(name = "routed={0}, reason={1}")
+    @CsvSource({"false,NO_SESSION", "true,NO_SESSION", "false,STALE_CLIENT", "true,STALE_CLIENT"})
+    void shouldRetainADetachedMutationAndProveItOnTheSameSession(boolean routed, SessionEviction eviction)
+            throws Exception {
         try (ServerSocket socket = new ServerSocket(0, 2, InetAddress.getLoopbackAddress())) {
             List<Request> writes = new CopyOnWriteArrayList<>();
             List<Request> registers = new CopyOnWriteArrayList<>();
@@ -181,7 +182,7 @@ class AsyncIggyTcpClientRecoveryTest {
                         || request.operation() == VsrOperation.STORE_CONSUMER_OFFSET) {
                     writes.add(request);
                     if (writes.size() == 1) {
-                        return Response.eviction(EVICTION_STALE_CLIENT);
+                        return Response.eviction(eviction.reason);
                     }
                     return resolving.get()
                             ? Response.committed(
@@ -1459,6 +1460,7 @@ class AsyncIggyTcpClientRecoveryTest {
     /** The eviction reasons that the client reads as unauthenticated, with their wire codes. */
     private enum SessionEviction {
         NO_SESSION(1),
+        STALE_CLIENT(EVICTION_STALE_CLIENT),
         SESSION_TOO_LOW(7),
         SESSION_RELEASE_MISMATCH(8),
         USER_INACTIVE(11),
