@@ -179,12 +179,15 @@ public class MessagesTcpClient implements MessagesClient {
     public CompletableFuture<SendMessagesResponse> sendMessages(
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
         long deadline = pollRouter.operationDeadline();
+        byte[] batch = freezeMessages(messages);
+        Partitioning frozenPartitioning =
+                new Partitioning(partitioning.kind(), partitioning.value().clone());
         if (partitioning.kind() == PartitioningKind.PartitionId) {
-            return sendToPartition(streamId, topicId, partitioning, messages, deadline);
+            return sendToPartition(streamId, topicId, frozenPartitioning, batch, deadline);
         }
         CallCancellation cancellation = new CallCancellation();
         CompletableFuture<SendMessagesResponse> result =
-                sendResolved(streamId, topicId, partitioning, messages, deadline, false, cancellation);
+                sendResolved(streamId, topicId, frozenPartitioning, batch, deadline, false, cancellation);
         result.whenComplete((response, error) -> {
             if (result.isCancelled()) {
                 cancellation.cancel();
@@ -197,7 +200,7 @@ public class MessagesTcpClient implements MessagesClient {
             StreamId streamId,
             TopicId topicId,
             Partitioning partitioning,
-            List<Message> messages,
+            byte[] batch,
             long deadline,
             boolean refreshed,
             CallCancellation cancellation) {
@@ -206,7 +209,7 @@ public class MessagesTcpClient implements MessagesClient {
                     if (cancellation.isCancelled()) {
                         return CompletableFuture.failedFuture(new CancellationException());
                     }
-                    var sent = sendToPartition(streamId, topicId, resolved, messages, deadline);
+                    var sent = sendToPartition(streamId, topicId, resolved, batch, deadline);
                     cancellation.track(sent);
                     return sent;
                 })
@@ -217,19 +220,17 @@ public class MessagesTcpClient implements MessagesClient {
                             && cause instanceof IggyServerException server
                             && server.getRawErrorCode() == IggyErrorCode.PARTITION_NOT_FOUND.getCode()) {
                         pollRouter.invalidateTopic(streamId, topicId);
-                        return sendResolved(streamId, topicId, partitioning, messages, deadline, true, cancellation);
+                        return sendResolved(streamId, topicId, partitioning, batch, deadline, true, cancellation);
                     }
                     return CompletableFuture.failedFuture(error);
                 });
     }
 
     private CompletableFuture<SendMessagesResponse> sendToPartition(
-            StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages, long deadline) {
+            StreamId streamId, TopicId topicId, Partitioning partitioning, byte[] batch, long deadline) {
 
         var metadataLength = streamId.getSize() + topicId.getSize() + partitioning.getSize() + 4;
-        // The batch is encoded straight after the metadata rather than into its
-        // own buffer and copied over, which is the whole payload once per send.
-        var payload = Unpooled.buffer(4 + metadataLength);
+        var payload = Unpooled.buffer(metadataLength + batch.length);
 
         CompletableFuture<ByteBuf> sent;
         try {
@@ -237,8 +238,7 @@ public class MessagesTcpClient implements MessagesClient {
             writeAndRelease(payload, toBytes(streamId));
             writeAndRelease(payload, toBytes(topicId));
             writeAndRelease(payload, toBytes(partitioning));
-            payload.writeIntLE(messages.size());
-            encodeMessagesBatchInto(payload, messages);
+            payload.writeBytes(batch);
             var contextPayload = Unpooled.buffer();
             writeAndRelease(contextPayload, toBytes(streamId));
             writeAndRelease(contextPayload, toBytes(topicId));
@@ -261,6 +261,19 @@ public class MessagesTcpClient implements MessagesClient {
                 response.release();
             }
         });
+    }
+
+    private static byte[] freezeMessages(List<Message> messages) {
+        var batch = Unpooled.buffer();
+        try {
+            batch.writeIntLE(messages.size());
+            encodeMessagesBatchInto(batch, messages);
+            byte[] frozen = new byte[batch.readableBytes()];
+            batch.readBytes(frozen);
+            return frozen;
+        } finally {
+            batch.release();
+        }
     }
 
     private static void writeAndRelease(ByteBuf destination, ByteBuf source) {

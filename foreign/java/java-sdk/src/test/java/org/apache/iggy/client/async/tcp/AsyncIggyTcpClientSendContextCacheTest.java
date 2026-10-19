@@ -35,6 +35,7 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -241,6 +242,73 @@ class AsyncIggyTcpClientSendContextCacheTest {
                 client.close().get(5, TimeUnit.SECONDS);
             }
             server.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldFreezeMessagesAndKeyBeforeRefreshingAMissingPartition() throws Exception {
+        for (Partitioning partitioning : List.of(Partitioning.balanced(), Partitioning.messagesKey("frozen-key"))) {
+            try (ServerSocket socket = new ServerSocket(0, 4, InetAddress.getLoopbackAddress())) {
+                Message message = Message.of("original");
+                List<Message> messages = new CopyOnWriteArrayList<>(List.of(message));
+                List<Request> sends = new CopyOnWriteArrayList<>();
+                byte[] originalKey = partitioning.value().clone();
+                CompletableFuture<Void> server = serve(socket, request -> {
+                    if (request.operation() == OPERATION_REGISTER) {
+                        return Response.success(OPERATION_REGISTER, registerBody(1));
+                    }
+                    if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(socket.getLocalPort()));
+                    }
+                    if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                        return Response.success(
+                                OPERATION_NON_REPLICATED,
+                                Unpooled.buffer()
+                                        .writeLongLE(1)
+                                        .writeLongLE(0)
+                                        .writeIntLE(0)
+                                        .writeIntLE(4)
+                                        .writeByte(0));
+                    }
+                    if (request.operation() == OPERATION_SEND_MESSAGES) {
+                        sends.add(request);
+                        if (sends.size() == 1) {
+                            Arrays.fill(message.payload(), (byte) 0);
+                            Arrays.fill(partitioning.value(), (byte) 0);
+                            messages.clear();
+                            return Response.error(OPERATION_SEND_MESSAGES, IggyErrorCode.PARTITION_NOT_FOUND.getCode());
+                        }
+                        return Response.success(OPERATION_SEND_MESSAGES, Unpooled.EMPTY_BUFFER);
+                    }
+                    throw new IllegalStateException("Unexpected request: " + request);
+                });
+                AsyncIggyTcpClient client = client(socket);
+                try {
+                    client.connect().get(5, TimeUnit.SECONDS);
+                    client.login().get(5, TimeUnit.SECONDS);
+                    client.messages()
+                            .sendMessages(STREAM, TopicId.of(1L), partitioning, messages)
+                            .get(5, TimeUnit.SECONDS);
+                    assertThat(sends).hasSize(2);
+                    byte[] first = sends.get(0).body();
+                    byte[] retried = sends.get(1).body();
+                    int batchOffset = ByteBuffer.wrap(first)
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .getInt();
+                    assertThat(Arrays.copyOfRange(retried, batchOffset, retried.length))
+                            .containsExactly(Arrays.copyOfRange(first, batchOffset, first.length));
+                    if (originalKey.length > 0) {
+                        long expected = org.apache.iggy.hash.XxHash32.hashUnsigned(originalKey) % 4;
+                        assertThat(Integer.toUnsignedLong(ByteBuffer.wrap(retried)
+                                        .order(ByteOrder.LITTLE_ENDIAN)
+                                        .getInt(18)))
+                                .isEqualTo(expected);
+                    }
+                } finally {
+                    client.close().get(5, TimeUnit.SECONDS);
+                }
+                server.get(5, TimeUnit.SECONDS);
+            }
         }
     }
 
