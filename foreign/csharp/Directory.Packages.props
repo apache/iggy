@@ -23,7 +23,6 @@ under the License.
         <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
     </PropertyGroup>
     <ItemGroup>
-        <PackageVersion Include="FluentAssertions" Version="8.11.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
         <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />

@@ -694,8 +694,8 @@ const LIVENESS_OBSERVATION: Duration = Duration::from_secs(12);
 #[iggy_harness(server(
     metadata.clients_table_max = 4,
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_full_registry_when_new_clients_arrive_should_preserve_live_members_until_expiry(
@@ -904,7 +904,6 @@ async fn given_full_registry_when_new_clients_arrive_should_preserve_live_member
 #[iggy_harness(server(
     metadata.clients_table_max = "18",
     consumer_group.heartbeat_interval = "5s",
-    consumer_group.session_timeout = "30s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_ended_sessions_when_registry_is_full_should_retire_more_than_one_per_heartbeat(
@@ -938,8 +937,8 @@ async fn given_ended_sessions_when_registry_is_full_should_retire_more_than_one_
 
 #[iggy_harness(server(
     heartbeat.enabled = false,
+    heartbeat.interval = "18s",
     consumer_group.heartbeat_interval = "5s",
-    consumer_group.session_timeout = "22s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_many_recovered_members_when_expiring_should_drain_without_another_interval(
@@ -1004,8 +1003,8 @@ async fn given_many_recovered_members_when_expiring_should_drain_without_another
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_backup_member_when_primary_restarts_should_preserve_membership(
@@ -1036,8 +1035,8 @@ async fn given_backup_member_when_primary_restarts_should_preserve_membership(
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_backup_member_when_host_crashes_should_expire_membership(harness: &mut TestHarness) {
@@ -1058,8 +1057,8 @@ async fn given_backup_member_when_host_crashes_should_expire_membership(harness:
 
 #[iggy_harness(cluster_nodes = 3, server(
     heartbeat.enabled = false,
+    heartbeat.interval = "7s",
     consumer_group.heartbeat_interval = "500ms",
-    consumer_group.session_timeout = "8s",
     sharding.cpu_allocation = "0..1",
 ))]
 async fn given_primary_member_when_host_crashes_should_expire_membership(

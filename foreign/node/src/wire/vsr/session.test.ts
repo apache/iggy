@@ -27,6 +27,15 @@ describe('ConsensusSession', () => {
     assert.equal(session.currentRequestId(), 1n);
   });
 
+  it('generates client IDs with the top bit clear', () => {
+    const samples = 64;
+    const clientIdLimit = 1n << 127n;
+    for (let sample = 0; sample < samples; sample++) {
+      const session = new ConsensusSession();
+      assert.ok(session.clientId > 0n && session.clientId < clientIdLimit);
+    }
+  });
+
   it('binds once to a positive server session', () => {
     const session = new ConsensusSession(7n);
     session.beginRegister();

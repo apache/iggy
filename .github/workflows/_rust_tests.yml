@@ -1,0 +1,90 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _rust_tests
+on:
+  workflow_call:
+    inputs:
+      timeout-minutes:
+        type: number
+        default: 60
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: test (${{ matrix.partition }}/${{ strategy.job-total }})
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Download test artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: rust-test-build-${{ github.run_id }}
+          path: ${{ runner.temp }}/rust-test-build
+
+      - name: Run test shard
+        uses: ./.github/actions/rust/pre-merge
+        with:
+          task: test
+          partition: ${{ matrix.partition }}
+          partitions: ${{ strategy.job-total }}
+
+      - name: Generate coverage report
+        if: always() && !cancelled()
+        run: |
+          if compgen -G 'target/*.profraw' > /dev/null; then
+            cargo llvm-cov report --codecov --output-path codecov.json
+          else
+            echo "::notice::No coverage profiles found; skipping report"
+          fi
+        shell: bash
+
+      - name: Upload coverage to Codecov
+        if: always() && !cancelled() && hashFiles('codecov.json') != ''
+        uses: codecov/codecov-action@v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json
+          disable_search: true
+          flags: rust
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-test-${{ matrix.partition }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/**
+            target/llvm-cov/**
+            coverage.lcov
+            codecov.json
+          if-no-files-found: ignore
+          retention-days: 7

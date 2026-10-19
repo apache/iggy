@@ -470,7 +470,7 @@ async fn fetch_decodes_request_with_forgotten_topics_and_rack_id() {
 
 #[tokio::test]
 async fn list_offsets_stub_response_returns_retriable_not_leader() {
-    for version in 1i16..=6 {
+    for version in 1i16..=7 {
         let Some(body) = load_fixture_body_or_skip(2, "ListOffsets", version) else {
             continue;
         };

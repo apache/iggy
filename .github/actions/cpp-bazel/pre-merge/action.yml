@@ -78,12 +78,16 @@ runs:
       with:
         tool: cargo-llvm-cov
 
+    - name: Download runtime binaries
+      if: inputs.task == 'test'
+      uses: ./.github/actions/utils/download-runtime
+
     - name: Setup server for tests
       id: iggy
       if: inputs.task == 'test'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
 
     - name: Test with coverage
       if: inputs.task == 'test'

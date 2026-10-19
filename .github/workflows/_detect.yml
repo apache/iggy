@@ -20,12 +20,18 @@ name: _detect
 on:
   workflow_call:
     outputs:
+      runtime:
+        description: "Whether selected tests need shared runtime binaries"
+        value: ${{ jobs.detect.outputs.runtime }}
       third_party_licenses:
         description: "Whether third-party license inputs changed"
         value: ${{ jobs.detect.outputs.third_party_licenses }}
       rust_plan:
-        description: "Selected Rust checks and tests; empty when Rust is unaffected"
+        description: "Selected Rust checks that need no CI artifacts; empty when none run"
         value: ${{ jobs.detect.outputs.rust_plan }}
+      rust_runtime_plan:
+        description: "Selected Rust tests and storage-compat checks, which need CI artifacts; empty when none run"
+        value: ${{ jobs.detect.outputs.rust_runtime_plan }}
       python_matrix:
         description: "Matrix for Python SDK"
         value: ${{ jobs.detect.outputs.python_matrix }}
@@ -68,8 +74,10 @@ jobs:
     runs-on: ubuntu-slim
     timeout-minutes: 10
     outputs:
+      runtime: ${{ steps.mk.outputs.runtime }}
       third_party_licenses: ${{ github.event_name != 'pull_request' || steps.changed.outputs.third_party_licenses == 'true' }}
       rust_plan: ${{ steps.mk.outputs.rust_plan }}
+      rust_runtime_plan: ${{ steps.mk.outputs.rust_runtime_plan }}
       python_matrix: ${{ steps.mk.outputs.python_matrix }}
       php_matrix: ${{ steps.mk.outputs.php_matrix }}
       node_matrix: ${{ steps.mk.outputs.node_matrix }}
@@ -426,9 +434,22 @@ jobs:
               require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `${output}\n`);
             };
 
-            setOutput('rust_plan', groups.rust.length ? JSON.stringify({
-              checks: groups.rust.filter(entry => entry.task !== 'test'),
-              tests: groups.rust.some(entry => entry.task === 'test'),
+            const rustRuntime = groups.rust.filter(({task}) => task === 'test' || task === 'test-storage-compat');
+            const rustChecks = groups.rust.filter(entry => !rustRuntime.includes(entry));
+            const needsRuntime = rustRuntime.length > 0 ||
+              groups.bdd.length > 0 || groups.examples.length > 0 ||
+              ['python', 'php', 'java', 'cpp'].some(group => groups[group].some(({task}) => task === 'test')) ||
+              ['node', 'go', 'csharp', 'swift'].some(group => groups[group].some(({task}) => task.startsWith('e2e')));
+            setOutput('runtime', String(needsRuntime));
+            for (const group of ['bdd', 'examples']) {
+              groups[group] = groups[group].map(entry => ({...entry, name: entry.task.slice(group.length + 1)}));
+            }
+            groups.other = groups.other.map(entry => ({...entry, name: `${entry.component}/${entry.task}`}));
+
+            setOutput('rust_plan', rustChecks.length ? JSON.stringify({checks: rustChecks, tests: false}) : '');
+            setOutput('rust_runtime_plan', rustRuntime.length ? JSON.stringify({
+              checks: rustRuntime.filter(entry => entry.task !== 'test'),
+              tests: rustRuntime.some(entry => entry.task === 'test'),
             }) : '');
             setOutput('python_matrix', JSON.stringify(matrix(groups.python)));
             setOutput('php_matrix', JSON.stringify(matrix(groups.php)));
