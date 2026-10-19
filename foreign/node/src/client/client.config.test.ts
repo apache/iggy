@@ -140,7 +140,8 @@ describe('normalizeClientConfig', () => {
     assert.equal(bounded.maxPendingOperationBytes, 256);
     for (const maxPendingOperations of [0, -1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
       assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperations }), /maxPendingOperations/);
-    for (const maxPendingOperationBytes of [0, 255, -1, 256.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
+    assert.equal(normalizeClientConfig({ ...config(), maxPendingOperationBytes: 1 }).maxPendingOperationBytes, 1);
+    for (const maxPendingOperationBytes of [0, -1, 256.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])
       assert.throws(() => normalizeClientConfig({ ...config(), maxPendingOperationBytes }), /maxPendingOperationBytes/);
   });
 

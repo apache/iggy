@@ -49,6 +49,30 @@ describe('mutation admission and retained ownership', () => {
     lanes.complete(first);
   });
 
+  it('preserves FIFO when waiters at the head, middle and tail cancel', async () => {
+    const count = 512;
+    const lanes = new MutationLanes(1, frameSize);
+    const state = session();
+    const active = await enter(lanes, state, 'queued');
+    const controllers = Array.from({ length: count }, () => new AbortController());
+    const admitted: number[] = [];
+    const pending = controllers.map((controller, index) =>
+      enter(lanes, state, 'queued', controller.signal, Date.now() + 5_000).then((operation) => {
+        admitted.push(index);
+        lanes.complete(operation);
+      }, (error: unknown) => { assert.equal(controller.signal.aborted, true, String(error)); }));
+    const cancelled = new Set([0, Math.floor(count / 2), count - 1]);
+    for (const index of cancelled) controllers[index].abort();
+    lanes.complete(active);
+    await Promise.all(pending);
+    assert.deepEqual(admitted, controllers.map((_, index) => index).filter((index) => !cancelled.has(index)));
+  });
+
+  it('rejects a mutation that cannot fit a positive byte budget', async () => {
+    const lanes = new MutationLanes(1, 1);
+    await assert.rejects(enter(lanes, session(), 'metadata'), ResponseError);
+  });
+
   for (const limit of ['count', 'bytes'] as const) {
     it(`keeps progress polls ordered without consuming the full mutation ${limit} budget`, async () => {
       const lanes = new MutationLanes(limit === 'count' ? 1 : 3, (limit === 'bytes' ? 1 : 3) * frameSize);

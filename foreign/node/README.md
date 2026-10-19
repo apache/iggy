@@ -77,6 +77,8 @@ that its node advertises in the cluster roster. With a one-node roster, the
 link dials the configured endpoint instead. A single node behind a port
 mapping or a port-forward thus stays reachable. The legacy `poolSize` option
 accepts only one logical client; it does not limit replica links or concurrency.
+The public `Client._pool` property has been removed. Applications should use the
+client methods directly; the client owns its replica connections.
 
 VSR authentication translates password and personal-access-token login into the
 Register handshake. Replacement links bind the existing session. Confirmed
@@ -141,8 +143,10 @@ deadline. After uncertainty, only committed-result proof can release the lane.
 
 Configure `maxPendingOperations` (default 256) and `maxPendingOperationBytes`
 (default 64 MiB) on the client. Admission waits before allocating an ID or freezing
-a mutation frame. Oversized frames fail locally. Completion, abandonment and reset
-release the operation slot. Writer aliases keep bytes charged until they release
+a mutation frame. Both limits must be positive. The byte budget includes the
+256-byte header and body; smaller positive budgets reject mutations that cannot
+fit while reads and login remain available. Oversized frames fail locally.
+Completion, abandonment and reset release the operation slot. Writer aliases keep bytes charged until they release
 the frame. These limits cover admitted active/retained frames, not caller buffers,
 queued API input snapshots, or read/control bodies. `sendBinaryRequest` preserves
 its immediate payload snapshot before awaiting a custom provider.

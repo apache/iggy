@@ -36,7 +36,7 @@ import { serializeIdentifier } from '../wire/identifier.utils.js';
 import { PartitionKind } from '../wire/message/partitioning.utils.js';
 import { PollingStrategyKind } from '../wire/message/poll.utils.js';
 import {
-  HEADER_SIZE, REPLY_OFFSET, hasCommittedResult, type PartitionContext,
+  EvictionReason, HEADER_SIZE, REPLY_OFFSET, hasCommittedResult, type PartitionContext,
   EMPTY_PARTITION_CONTEXT, readReplyOperation
 } from '../wire/vsr/header.js';
 import { Operation, isMetadata, operationForCode } from '../wire/vsr/operation.js';
@@ -405,14 +405,25 @@ export class CommandResponseStream extends EventEmitter {
     const generation = this.routingGeneration;
     let request: Buffer | undefined;
     const attempt = await link.exchange(() => request = frame(), deadline, signal, operation?.frame);
-    if (attempt.error || !attempt.response)
-      return { error: attempt.error, committed: false, started: attempt.started };
+    if (attempt.error || !attempt.response) {
+      const error = this.isAuthenticated && command !== COMMAND_CODE.BindSession &&
+        isDetachedFailure(attempt.error)
+        ? new Error('replica link detached from its session', { cause: attempt.error }) : attempt.error;
+      return { error, committed: false, started: attempt.started };
+    }
     try {
       validateReplyForRequest(attempt.response, request!, command);
       const response = decodeVsrResponse(attempt.response, command);
       if (generation === this.routingGeneration) this.observeMetadata(attempt.response);
       return { response, raw: attempt.response, committed: hasCommittedResult(attempt.response), started: attempt.started };
     } catch (error) {
+      if (this.isAuthenticated && command !== COMMAND_CODE.BindSession && isDetachedFailure(error) &&
+          error instanceof ResponseError && error.errorCode === UNAUTHENTICATED) {
+        link._destroy();
+        const refusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
+        refusal.fromServer = true;
+        return { error: refusal, committed: false, started: attempt.started };
+      }
       if (error instanceof ResponseError && error.committed)
         if (generation === this.routingGeneration) this.observeMetadata(attempt.response);
       return { error, committed: error instanceof ResponseError && error.committed, started: attempt.started };
@@ -671,7 +682,7 @@ export class CommandResponseStream extends EventEmitter {
             this.changed.pulse();
           } catch (error) {
             slot.connection?._destroy();
-            if (isSessionFailure(error)) {
+            if (isSessionFailure(error, true)) {
               this.recoverSession(slot.generation);
               return;
             }
@@ -728,6 +739,7 @@ export class CommandResponseStream extends EventEmitter {
   private async connectBootstrap(deadline: number, signal: AbortSignal): Promise<IggyConnection> {
     if (this.bootstrap?.connected && !this.bootstrapPromise) return this.bootstrap;
     if (!this.bootstrapPromise) {
+      const generation = this.routingGeneration;
       const ownerSignal = AbortSignal.any([this.lifetime.signal, this.sessionLifetime.signal]);
       const pending = (async () => {
         const endpoints = [...new Map([this.configuredEndpoint, ...this.knownEndpoints].map((endpoint) => [endpointKey(endpoint), endpoint])).values()];
@@ -751,6 +763,10 @@ export class CommandResponseStream extends EventEmitter {
             } catch (error) {
               link._destroy();
               last = error;
+              if (this.isAuthenticated && isSessionFailure(error, true)) {
+                this.recoverSession(generation);
+                throw error;
+              }
               if (error instanceof TypeError || ownerSignal.aborted) throw error;
             }
           }
@@ -970,10 +986,16 @@ const isLoginCommand = (command: number): boolean =>
   command === COMMAND_CODE.LoginUser || command === COMMAND_CODE.LoginWithAccessToken;
 const isTransient = (code: number): boolean =>
   code === TRANSIENT_NOT_COMMITTED || code === TRANSIENT_NOT_ACCEPTED || code === NOT_PRIMARY;
-// A 30 refusal before commit fails only its link, so only a committed 30 ends the session.
-const isSessionFailure = (error: unknown): boolean =>
-  error instanceof VsrEvictionError || (error instanceof ResponseError && error.fromServer &&
-    (error.errorCode === UNAUTHENTICATED || (error.errorCode === STALE_CLIENT && error.committed)));
+const isDetachedFailure = (error: unknown): boolean =>
+  error instanceof VsrEvictionError
+    ? error.reason === EvictionReason.NoSession || error.reason === EvictionReason.StaleClient
+    : error instanceof ResponseError && error.fromServer && !error.committed &&
+      (error.errorCode === UNAUTHENTICATED || error.errorCode === STALE_CLIENT);
+const isSessionFailure = (error: unknown, binding = false): boolean =>
+  (error instanceof VsrEvictionError && (binding || !isDetachedFailure(error))) ||
+  (error instanceof ResponseError && error.fromServer &&
+    ((error.errorCode === UNAUTHENTICATED && (binding || error.committed)) ||
+      (error.errorCode === STALE_CLIENT && error.committed)));
 const groupKey = (context: PartitionContext, target: PartitionTarget): string =>
   `${context.incarnation}:${target.query.readUInt32LE(target.query.length - PARTITION_ID_SIZE)}`;
 

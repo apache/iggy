@@ -16,7 +16,6 @@
 // under the License.
 
 import { MAX_U32 } from '../constant.js';
-import { HEADER_SIZE } from '../wire/vsr/header.js';
 import {
   nanosecondsToMilliseconds,
   parseIggyDurationNanoseconds
@@ -217,9 +216,8 @@ const parseConnectionOptions = (
       case 'max_pending_operations':
       case 'max_pending_operation_bytes': {
         const limit = parseNumber(name, value);
-        const minimum = name === 'max_pending_operations' ? 1 : HEADER_SIZE;
-        if (!Number.isSafeInteger(limit) || limit < minimum)
-          throw new TypeError(`option "${name}" must be a safe integer of at least ${minimum}`);
+        if (!Number.isSafeInteger(limit) || limit <= 0)
+          throw new TypeError(`option "${name}" must be a positive safe integer`);
         parsed[name === 'max_pending_operations' ? 'maxPendingOperations' : 'maxPendingOperationBytes'] = limit;
         break;
       }

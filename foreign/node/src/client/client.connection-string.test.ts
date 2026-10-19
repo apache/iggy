@@ -108,7 +108,7 @@ describe('parseConnectionString', () => {
 
   for (const [option, field, minimum] of [
     ['max_pending_operations', 'maxPendingOperations', 1],
-    ['max_pending_operation_bytes', 'maxPendingOperationBytes', HEADER_SIZE]
+    ['max_pending_operation_bytes', 'maxPendingOperationBytes', 1]
   ] as const) {
     it(`accepts the minimum and safe-integer maximum for ${option}`, () => {
       for (const value of [minimum, Number.MAX_SAFE_INTEGER]) {
@@ -254,7 +254,6 @@ describe('parseConnectionString', () => {
       'iggy://iggy:hunter2@localhost:8090?tls=maybe',
       'iggy://iggy:hunter2@localhost:8090?reconnection_retries=three',
       'iggy://iggy:hunter2@localhost:8090?max_pending_operations=0',
-      'iggy://iggy:hunter2@localhost:8090?max_pending_operation_bytes=255',
       'iggy://iggy:hunter2@localhost:70000'
     ]) {
       try {

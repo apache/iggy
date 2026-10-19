@@ -933,7 +933,7 @@ describe('primary auto-commit polling', () => {
   });
 
   for (const failure of ['disconnect', 'not committed', 'timeout', 'partial reply', 'stale session', 'unauthenticated'] as const) {
-    it(`does not replay an uncertain primary poll after ${failure}`, async () => {
+    it(`replays only a refused primary poll after ${failure}`, async () => {
       let polls = 0;
       const cluster = await startPollCluster((frame, socket) => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages)
@@ -955,14 +955,21 @@ describe('primary auto-commit polling', () => {
       let resets = 0;
       cluster.client.on('sessionReset', () => { resets += 1; });
       try {
-        await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
-          { deadline: Date.now() + 300 }), (error: unknown) =>
-          failure === 'stale session' || failure === 'unauthenticated'
-            ? error instanceof ResponseError && error.errorCode === (failure === 'stale session' ? 30 : 40)
+        const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+          { deadline: Date.now() + 300 });
+        if (failure === 'unauthenticated') {
+          await first;
+          assert.equal(polls, 2);
+          assert.equal(resets, 0);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession), 2);
+          return;
+        }
+        await assert.rejects(first, (error: unknown) =>
+          failure === 'stale session'
+            ? error instanceof ResponseError && error.errorCode === STALE_CLIENT
             : error instanceof OperationUncertainError && error.operationId === undefined);
         assert.equal(polls, 1);
-        const sessionFailure = failure === 'unauthenticated';
-        assert.equal(resets, sessionFailure ? 1 : 0);
+        assert.equal(resets, 0);
         if (failure === 'partial reply') {
           await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
           assert.equal(polls, 1);
@@ -970,7 +977,7 @@ describe('primary auto-commit polling', () => {
           await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
           assert.equal(polls, 2);
           assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession),
-            sessionFailure || failure === 'disconnect' || failure === 'stale session' ? 2 : 1);
+            failure === 'disconnect' || failure === 'stale session' ? 2 : 1);
         }
       } finally {
         await cluster.close();
@@ -1004,7 +1011,7 @@ describe('primary auto-commit polling', () => {
       }
     });
 
-    it(`returns control session status ${status} without rerouting the lookup`, async () => {
+    it(`rebinds a detached control link after status ${status}`, async () => {
       const registered = new Set<Socket>();
       let routes = 0;
       const cluster = await startPollCluster(undefined, (frame, socket) => {
@@ -1022,18 +1029,23 @@ describe('primary auto-commit polling', () => {
       let resets = 0;
       cluster.client.on('sessionReset', () => { resets += 1; });
       try {
-        await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload()),
-          (error: unknown) => error instanceof ResponseError && error.errorCode === status);
-        assert.equal(routes, 1);
-        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
+        const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        if (status === STALE_CLIENT) {
+          await assert.rejects(first, (error: unknown) => error instanceof ResponseError && error.errorCode === status);
+          assert.equal(routes, 1);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
+        } else {
+          await first;
+        }
         // A lookup on the fake primary routes the poll to replica 0, so wait
         // until the metadata link is bound again on a new socket.
         const replicas = (cluster.client as unknown as { replicas: Map<number, { attached: boolean }> }).replicas;
         await waitUntil(() => registered.size === 2 && replicas.get(0)?.attached === true);
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         assert.equal(registered.size, 2);
-        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 1);
-        assert.equal(resets, status === STALE_CLIENT ? 0 : 1);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages) +
+          countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), status === STALE_CLIENT ? 1 : 2);
+        assert.equal(resets, 0);
       } finally {
         await cluster.close();
       }
@@ -1108,7 +1120,7 @@ describe('primary auto-commit polling', () => {
         await cluster.client.sendCommand(manual.command, manual.payload);
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         const reset = once(cluster.client, 'sessionReset');
-        coordinatorSocket.write(evictionFrame(EvictionReason.NoSession));
+        coordinatorSocket.write(evictionFrame(EvictionReason.SessionError));
         await reset;
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         for (const server of [cluster.coordinator]) {
@@ -1295,7 +1307,7 @@ describe('VSR client socket', () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_003) {
         socket.write(Buffer.concat([
-          evictionFrame(EvictionReason.NoSession),
+          evictionFrame(EvictionReason.InvalidCredentials),
           replyFrame(frame, Operation.NonReplicated, Buffer.from('stale'))
         ]));
         return;
@@ -1320,7 +1332,7 @@ describe('VSR client socket', () => {
           Buffer.alloc(0)
         ),
         (error: unknown) =>
-          error instanceof VsrEvictionError && error.errorCode === 40
+          error instanceof VsrEvictionError && error.errorCode === INVALID_CREDENTIALS
       );
       assert.ok(sessionResets >= 1);
       assert.equal(evictions, 1);
@@ -1901,7 +1913,7 @@ describe('VSR client socket', () => {
       );
       assert.equal(writes.length, 2);
       assert.deepEqual(writes[1], writes[0]);
-      assert.equal(sessionResets, refusal === 40 ? 1 : 0);
+      assert.equal(sessionResets, 0);
     } finally {
       Date.now = realNow;
       client.destroy();
@@ -1953,7 +1965,7 @@ describe('VSR client socket', () => {
   it('keeps an eviction during the send context query typed', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
-        socket.write(evictionFrame(EvictionReason.NoSession));
+        socket.write(evictionFrame(EvictionReason.InvalidCredentials));
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -1961,7 +1973,7 @@ describe('VSR client socket', () => {
     const client = new CommandResponseStream(vsrConfig(server.port));
     try {
       await assert.rejects(() => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
-        (error: unknown) => error instanceof VsrEvictionError && error.errorCode === 40);
+        (error: unknown) => error instanceof VsrEvictionError && error.errorCode === INVALID_CREDENTIALS);
     } finally {
       client.destroy();
       await server.close();
@@ -2637,7 +2649,7 @@ describe('native mutation recovery', () => {
     it(`ends a sent mutation uncertain after an eviction on ${bootstrapOnly ? 'the bootstrap link' : 'a replica link'}`, async () => {
       const server = await startVsrServer((frame, socket) => {
         if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
-          socket.write(evictionFrame(EvictionReason.NoSession));
+          socket.write(evictionFrame(EvictionReason.SessionError));
           return;
         }
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
@@ -2658,13 +2670,14 @@ describe('native mutation recovery', () => {
 
   for (const bootstrapOnly of [false, true]) {
     for (const written of ['in-flight', 'retained'] as const) {
-      it(`binds the same session and proves the ${written} mutation after a stale client eviction on ${bootstrapOnly ? 'the bootstrap link' : 'a replica link'}`, async () => {
+      for (const reason of [EvictionReason.StaleClient, EvictionReason.NoSession]) {
+      it(`binds the same session and proves the ${written} mutation after eviction ${reason} on ${bootstrapOnly ? 'the bootstrap link' : 'a replica link'}`, async () => {
         let link!: Socket;
         const server = await startVsrServer((frame, socket) => {
           if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
             link = socket;
             if (framesOf(server, Operation.CreateStream).length > 1) socket.write(provedReply(frame));
-            else if (written === 'in-flight') socket.write(evictionFrame(EvictionReason.StaleClient));
+            else if (written === 'in-flight') socket.write(evictionFrame(reason));
             else socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), 85));
             return;
           }
@@ -2688,7 +2701,7 @@ describe('native mutation recovery', () => {
               assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
             });
             const evicted = once(client, 'eviction');
-            link.write(evictionFrame(EvictionReason.StaleClient));
+            link.write(evictionFrame(reason));
             await evicted;
             await client.resolveOperation(id);
           } else await created;
@@ -2705,9 +2718,10 @@ describe('native mutation recovery', () => {
       });
     }
   }
+  }
 
-  for (const committed of [false, true]) {
-    const status = committed ? STALE_CLIENT : UNAUTHENTICATED;
+  for (const status of [STALE_CLIENT, UNAUTHENTICATED]) {
+    const committed = true;
     for (const attempt of ['first attempt', 'retry', 'resolve'] as const) {
       it(`drops the session at once after a ${committed ? 'committed' : 'denied'} ${status} reply to a ${attempt}`, async () => {
         const server = await startVsrServer((frame, socket) => {
@@ -2805,6 +2819,48 @@ describe('native mutation recovery', () => {
         } finally { client.destroy(); await server.close(); }
       });
     }
+  }
+
+  for (const live of [true, false]) {
+    it(`uses a bind to check an unauthenticated link on a ${live ? 'live' : 'lost'} session`, async () => {
+      let refuses = true;
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+          socket.write(framesOf(server, Operation.CreateStream).length === 1
+            ? replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), 85) : provedReply(frame));
+          return;
+        }
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if ((code === COMMAND_CODE.GetStats && refuses) || (!live && code === COMMAND_CODE.BindSession)) {
+          refuses = false;
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), UNAUTHENTICATED));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({
+        ...vsrConfig(server.port), heartbeatInterval: 0,
+        reconnect: { enabled: true, interval: 1, maxRetries: 1 }
+      });
+      try {
+        let id!: bigint;
+        await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+        });
+        await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0)).catch((error: unknown) => {
+          assert.equal(live, false, String(error));
+        });
+        if (live) {
+          await client.resolveOperation(id);
+          const [original, replay] = framesOf(server, Operation.CreateStream);
+          assert.deepEqual(replay, original);
+          assert.equal(framesOf(server, Operation.Register).length, 1);
+        } else {
+          await waitUntil(() => !client.isAuthenticated);
+          await assert.rejects(client.resolveOperation(id), OperationNotRetainedError);
+        }
+      } finally { client.destroy(); await server.close(); }
+    });
   }
 
   it('retains a canceled send, blocks its lane, and resolves the original frame', async () => {
@@ -2998,7 +3054,7 @@ describe('native mutation recovery', () => {
             error instanceof ResponseError && error.errorCode === INVALID_CREDENTIALS);
         else await resolved;
         const reset = once(client, 'sessionReset');
-        session.write(evictionFrame(EvictionReason.NoSession));
+        session.write(evictionFrame(EvictionReason.SessionError));
         await reset;
         await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
         const registers = framesOf(server, Operation.Register);
@@ -4116,7 +4172,7 @@ describe('consumer stream', () => {
     const cluster = await startPollCluster((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
       polls += 1;
-      socket.write(polls > 1 ? emptyPoll(frame) : replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), UNAUTHENTICATED));
+      socket.write(polls > 1 ? emptyPoll(frame) : evictionFrame(EvictionReason.SessionError));
       return true;
     });
     let stream: Readable | undefined;
@@ -4192,7 +4248,7 @@ describe('consumer stream', () => {
       // The client drops every link when its session ends, so the new sign-in has to dial.
       void cluster.coordinator.close();
       void cluster.primary.close();
-      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), UNAUTHENTICATED));
+      socket.write(evictionFrame(EvictionReason.SessionError));
       return true;
     });
     let stream: Readable | undefined;
@@ -4207,7 +4263,9 @@ describe('consumer stream', () => {
       await cluster.primary.reopen();
       assert.equal((await ended()).length, 1);
       assert.equal(polls, 2);
-      assert.equal((refusals[0] as ResponseError).errorCode, UNAUTHENTICATED);
+      assert.ok(refusals[0] instanceof OperationUncertainError &&
+        refusals[0].cause instanceof VsrEvictionError && refusals[0].cause.errorCode === UNAUTHENTICATED,
+      String(refusals[0]));
       for (const refusal of refusals.slice(1)) assert.ok(refusal instanceof NotConnectedError, String(refusal));
     } finally {
       cluster.client.destroy();

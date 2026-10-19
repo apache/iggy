@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { OperationUncertainError } from '../../client/client.operation.js';
+import { LaneBlockedError, OperationNotRetainedError, OperationUncertainError } from '../../client/client.operation.js';
 import { idKey, type Id } from '../identifier.utils.js';
 import type {
   CommandResponse,
@@ -58,6 +58,7 @@ type GroupCursor = {
 type GroupState = {
   cursors: Map<string, GroupCursor>,
   sessionGeneration: number,
+  pendingJoin?: bigint,
 };
 
 const groupStates = new WeakMap<RawClient, GroupState>();
@@ -74,6 +75,7 @@ const getGroupState = (client: RawClient): GroupState => {
   groupStates.set(client, state);
   client.on('sessionReset', () => {
     state.cursors.clear();
+    state.pendingJoin = undefined;
     state.sessionGeneration += 1;
   });
   client.on('heartbeat', () => {
@@ -143,6 +145,18 @@ const syncAssignment = async (
   request: PollMessages,
   state: GroupState,
 ): Promise<GroupCursor> => {
+  const generation = state.sessionGeneration;
+  const pendingJoin = state.pendingJoin;
+  if (pendingJoin !== undefined && client.resolveOperation) {
+    try {
+      await client.resolveOperation(pendingJoin);
+      if (state.pendingJoin === pendingJoin) state.pendingJoin = undefined;
+    } catch (error) {
+      if (state.pendingJoin === pendingJoin && (error instanceof OperationNotRetainedError ||
+          (error instanceof ResponseError && error.committed))) state.pendingJoin = undefined;
+      throw error;
+    }
+  }
   const target = {
     streamId: request.streamId,
     topicId: request.topicId,
@@ -162,10 +176,19 @@ const syncAssignment = async (
     assignment = null;
   }
   if (assignment === null) {
-    await client.sendCommand(
-      JOIN_GROUP.code,
-      JOIN_GROUP.serialize(target),
-    );
+    try {
+      await client.sendCommand(
+        JOIN_GROUP.code,
+        JOIN_GROUP.serialize(target),
+      );
+    } catch (error) {
+      if (error instanceof OperationUncertainError && error.operationId !== undefined &&
+          state.sessionGeneration === generation)
+        state.pendingJoin = error.operationId;
+      if (error instanceof LaneBlockedError && error.operationId === state.pendingJoin)
+        throw new OperationUncertainError(error.operationId, error);
+      throw error;
+    }
     const response = await client.sendCommand(
       SYNC_GROUP.code,
       SYNC_GROUP.serialize(target),

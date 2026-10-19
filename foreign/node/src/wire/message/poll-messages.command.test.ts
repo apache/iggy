@@ -27,6 +27,7 @@ import type {
 } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError } from '../error.utils.js';
+import { LaneBlockedError, OperationUncertainError } from '../../client/client.operation.js';
 import { Consumer } from '../offset/offset.utils.js';
 import {
   PollingStrategy
@@ -336,6 +337,39 @@ describe('VSR consumer-group polling', () => {
         .map(({ payload }) => payload.readUInt32LE(20)),
       [1, 2]
     );
+  });
+
+  it('resolves its uncertain join before synchronizing the group again', async () => {
+    const operationId = 17n;
+    const { client, commands } = stubClient([
+      response(Buffer.alloc(0)),
+      new OperationUncertainError(operationId, new Error('lost join reply')),
+      assignment(2n, [7]),
+      pollResponse(7)
+    ]);
+    const resolutions: bigint[] = [];
+    client.resolveOperation = async (id) => {
+      resolutions.push(id);
+      if (resolutions.length === 1)
+        throw new OperationUncertainError(id, new Error('lost resolve reply'));
+    };
+    const poll = pollMessages(async () => client);
+    await assert.rejects(poll(groupRequest), OperationUncertainError);
+    await assert.rejects(poll(groupRequest), OperationUncertainError);
+    assert.equal((await poll(groupRequest)).partitionId, 7);
+    assert.deepEqual(resolutions, [operationId, operationId]);
+    assert.deepEqual(commands.map(({ command }) => command), [
+      COMMAND_CODE.SyncGroup, COMMAND_CODE.JoinGroup,
+      COMMAND_CODE.SyncGroup, COMMAND_CODE.PollMessages
+    ]);
+  });
+
+  it('leaves a join blocked by an unrelated operation for the caller to resolve', async () => {
+    const { client } = stubClient([
+      response(Buffer.alloc(0)), new LaneBlockedError(18n)
+    ]);
+    client.resolveOperation = async () => { assert.fail('must not resolve an unrelated operation'); };
+    await assert.rejects(pollMessages(async () => client)(groupRequest), LaneBlockedError);
   });
 
   it('rejoins when a cached poll reports a missing member', async () => {

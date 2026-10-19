@@ -48,7 +48,7 @@ const RESULT_COUNT_LEN = 4;
 const RESULT_ENTRY_LEN = 8;
 
 export class VsrEvictionError extends ResponseError {
-  constructor(errorCode: number) {
+  constructor(errorCode: number, readonly reason?: number) {
     super(0, errorCode);
     this.name = 'VsrEvictionError';
     Object.setPrototypeOf(this, VsrEvictionError.prototype);
@@ -205,5 +205,5 @@ export const evictionError = (frame: Buffer): VsrEvictionError => {
     default:
       errorCode = UNAUTHENTICATED;
   }
-  return new VsrEvictionError(errorCode);
+  return new VsrEvictionError(errorCode, eviction.reason);
 };

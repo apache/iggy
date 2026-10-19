@@ -203,6 +203,12 @@ export type ClientOperation = {
   holdsSlot: boolean
 };
 
+type AdmissionWaiter = {
+  size: number, retainable: boolean, changed: ChangeSignal,
+  previous?: AdmissionWaiter, next?: AdmissionWaiter
+};
+type LaneWaiters = { head?: AdmissionWaiter, tail?: AdmissionWaiter };
+
 export class MutationLanes {
   private readonly lanes = new Map<string, ClientOperation>();
   private readonly operations = new Map<bigint, ClientOperation>();
@@ -212,7 +218,8 @@ export class MutationLanes {
    * operation ids never repeat within a client.
    */
   private readonly proved = new Map<bigint, unknown>();
-  private readonly waiting: { lane: string, size: number, retainable: boolean, changed: ChangeSignal }[] = [];
+  private readonly waiting = new Map<string, LaneWaiters>();
+  private readonly capacityWaiting = new Set<AdmissionWaiter>();
   private readonly changed = new ChangeSignal();
   private count = 0;
   private bytes = 0;
@@ -225,15 +232,24 @@ export class MutationLanes {
     const size = retainable ? HEADER_SIZE + body.length : 0;
     if (!Number.isSafeInteger(size) || size > this.maxBytes)
       throw responseError(command, INVALID_MESSAGE_LENGTH, 'request exceeds the mutation byte limit');
-    const waiting = { lane, size, retainable, changed: new ChangeSignal() };
-    this.waiting.push(waiting);
+    const waiting: AdmissionWaiter = { size, retainable, changed: new ChangeSignal() };
+    let queue = this.waiting.get(lane);
+    if (!queue) {
+      queue = {};
+      this.waiting.set(lane, queue);
+    }
+    waiting.previous = queue.tail;
+    if (queue.tail) queue.tail.next = waiting;
+    else queue.head = waiting;
+    queue.tail = waiting;
     try {
       for (;;) {
         signal.throwIfAborted();
         if (Date.now() >= deadline)
           throw responseError(command, TRANSIENT_NOT_ACCEPTED);
         this.throwIfRetained(lane);
-        if (!this.lanes.has(lane) && this.waiting.find((entry) => entry.lane === lane) === waiting &&
+        const head = !this.lanes.has(lane) && queue.head === waiting;
+        if (head &&
             (!retainable || this.count < this.maxOperations) && size <= this.maxBytes - this.bytes) {
           if (retainable) this.count += 1;
           this.bytes += size;
@@ -256,6 +272,7 @@ export class MutationLanes {
           this.operations.set(operation.id, operation);
           return operation;
         }
+        if (head) this.capacityWaiting.add(waiting);
         await waitWithin(waiting.changed.promise, deadline, signal);
       }
     } catch (error) {
@@ -263,7 +280,13 @@ export class MutationLanes {
         throw responseError(command, TRANSIENT_NOT_ACCEPTED);
       throw error;
     } finally {
-      this.waiting.splice(this.waiting.indexOf(waiting), 1);
+      if (waiting.previous) waiting.previous.next = waiting.next;
+      else queue.head = waiting.next;
+      if (waiting.next) waiting.next.previous = waiting.previous;
+      else queue.tail = waiting.previous;
+      this.capacityWaiting.delete(waiting);
+      if (!queue.head) this.waiting.delete(lane);
+      this.wakeLane(lane);
       this.wakeWaiting();
     }
   }
@@ -316,8 +339,8 @@ export class MutationLanes {
     // A replay keeps the state it has, which an abandon can have dropped.
     if (operation.retainable && this.owns(operation) && !operation.resolving) {
       operation.retained = true;
-      for (const waiter of this.waiting)
-        if (waiter.lane === operation.lane) waiter.changed.pulse();
+      for (let waiter = this.waiting.get(operation.lane)?.head; waiter; waiter = waiter.next)
+        waiter.changed.pulse();
       this.changed.pulse();
     }
   }
@@ -365,6 +388,7 @@ export class MutationLanes {
     this.releaseSlot(operation);
     operation.lifetime.abort(new OperationNotRetainedError(operation.id));
     operation.frame.releaseOwner();
+    this.wakeLane(operation.lane);
     this.wakeWaiting();
     this.changed.pulse();
   }
@@ -381,12 +405,14 @@ export class MutationLanes {
     this.count -= 1;
   }
 
+  private wakeLane(lane: string): void {
+    const head = this.waiting.get(lane)?.head;
+    if (head && !this.lanes.has(lane)) this.capacityWaiting.add(head);
+  }
+
   private wakeWaiting(): void {
-    const seenLanes = new Set<string>();
-    for (const waiter of this.waiting) {
-      if (seenLanes.has(waiter.lane)) continue;
-      seenLanes.add(waiter.lane);
-      if (this.lanes.has(waiter.lane) || (waiter.retainable && this.count >= this.maxOperations) ||
+    for (const waiter of this.capacityWaiting) {
+      if ((waiter.retainable && this.count >= this.maxOperations) ||
           waiter.size > this.maxBytes - this.bytes) continue;
       waiter.changed.pulse();
       return;

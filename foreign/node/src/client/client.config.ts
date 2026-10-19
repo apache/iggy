@@ -51,8 +51,8 @@ export const normalizeClientConfig = (
   const maxPendingOperationBytes = config.maxPendingOperationBytes ?? DEFAULT_MAX_PENDING_OPERATION_BYTES;
   if (!Number.isSafeInteger(maxPendingOperations) || maxPendingOperations <= 0)
     throw new TypeError('maxPendingOperations must be a positive safe integer');
-  if (!Number.isSafeInteger(maxPendingOperationBytes) || maxPendingOperationBytes < HEADER_SIZE)
-    throw new TypeError('maxPendingOperationBytes must be a safe integer of at least 256 bytes');
+  if (!Number.isSafeInteger(maxPendingOperationBytes) || maxPendingOperationBytes <= 0)
+    throw new TypeError('maxPendingOperationBytes must be a positive safe integer');
 
   if ((config.poolSize?.min ?? 1) > 1 || (config.poolSize?.max ?? 1) > 1)
     throw new TypeError(
