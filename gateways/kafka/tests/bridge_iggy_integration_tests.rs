@@ -28,10 +28,14 @@ use iggy::prelude::{
 };
 use secrecy::SecretString;
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use iggy_gateway_kafka::bridge::{
     BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
-    ProduceSessionLimits, TopicMapping, TopicOverride,
+    ProduceSessionLimits, TopicCreationOutcome, TopicMapping, TopicOverride,
 };
 
 #[path = "common/certs.rs"]
@@ -41,6 +45,97 @@ mod iggy_server;
 
 use certs::TestPki;
 use iggy_server::{PortGuard, TestServer, raw_client};
+
+#[tokio::test]
+#[serial]
+async fn given_a_timed_out_metadata_write_when_creating_another_topic_should_resolve_the_blocker() {
+    const RELAY_BUFFER_SIZE: usize = 8192;
+    const RECOVERY_CANCEL_DELAY: Duration = Duration::from_millis(100);
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay");
+    let mut config = server.test_config();
+    let upstream = config.address.clone();
+    config.address = listener.local_addr().expect("relay address").to_string();
+    let (replies, allowed) = watch::channel(true);
+    let mut relays = JoinSet::new();
+    relays.spawn(async move {
+        let mut connections = JoinSet::new();
+        while let Ok((inbound, _)) = listener.accept().await {
+            let outbound = TcpStream::connect(&upstream).await.expect("upstream");
+            let mut allowed = allowed.clone();
+            connections.spawn(async move {
+                let (mut requests, mut replies) = inbound.into_split();
+                let (mut responses, mut writes) = outbound.into_split();
+                tokio::select! {
+                    _ = copy(&mut requests, &mut writes) => {}
+                    () = async {
+                        let mut buffer = [0; RELAY_BUFFER_SIZE];
+                        while let Ok(count) = responses.read(&mut buffer).await {
+                            if count == 0 || allowed.wait_for(|allowed| *allowed).await.is_err() {
+                                break;
+                            }
+                            if replies.write_all(&buffer[..count]).await.is_err() {
+                                break;
+                            }
+                        }
+                    } => {}
+                }
+            });
+        }
+    });
+    let bridge = IggyBridge::connect(config).await.expect("bridge");
+    let raw = raw_client(&server).await;
+    let stream = Identifier::named("kafka").expect("stream name");
+    // The first stream write commits successfully; the second commits an already-exists rejection.
+    for (delayed, next) in [("delayed", "next"), ("rejected", "after_rejection")] {
+        replies.send(false).expect("hold replies");
+        let result = bridge.create_kafka_topic(delayed, 1).await;
+        assert!(matches!(result, Err(BridgeError::Timeout)), "{result:?}");
+        assert!(
+            raw.get_stream(&stream)
+                .await
+                .expect("stream lookup")
+                .is_some(),
+            "the canceled write committed before its reply was released"
+        );
+        assert!(
+            tokio::time::timeout(
+                RECOVERY_CANCEL_DELAY,
+                bridge.create_kafka_topic("blocked", 1)
+            )
+            .await
+            .is_err(),
+            "recovery must wait for proof while replies are withheld"
+        );
+        replies.send(true).expect("resume replies");
+        assert_eq!(
+            bridge
+                .create_kafka_topic(next, 1)
+                .await
+                .expect("next create"),
+            TopicCreationOutcome::Created
+        );
+        assert!(
+            bridge
+                .get_kafka_topic(next)
+                .await
+                .expect("next topic")
+                .is_some()
+        );
+        for unsent in [delayed, "blocked"] {
+            assert!(
+                bridge
+                    .get_kafka_topic(unsent)
+                    .await
+                    .expect("unsent topic")
+                    .is_none()
+            );
+        }
+    }
+    bridge.close().await.expect("close bridge");
+}
 
 /// The bridge's own hop to Iggy encrypted: a server that speaks only TLS on its TCP port, and
 /// a bridge told to trust the CA that signed it. Produce and Fetch go through this client, so

@@ -75,8 +75,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///
-/// On expiry, maps to [`BridgeError::Timeout`], not `IggyError::CannotEstablishConnection`: the
-/// SDK's write/read run in a detached task this timeout cannot abort, so the call may still land.
+/// On expiry, a sent mutation can still commit and remains retained by the SDK.
+/// Metadata writes recover such blockers through [`IggyBridge::metadata_write`].
 async fn with_request_timeout<T>(
     op: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, BridgeError> {
@@ -272,6 +272,31 @@ impl IggyBridge {
             .and(lookup_client)
             .and(offset_clients)
             .and(shared_client)
+    }
+
+    /// Recovers a canceled metadata write before submitting a later, unsent one.
+    /// A timeout keeps the SDK's retained request and never retries it as a new mutation.
+    async fn metadata_write<T, F: Future<Output = Result<T, IggyError>>>(
+        &self,
+        mut write: impl FnMut() -> F,
+    ) -> Result<T, BridgeError> {
+        let deadline = (Instant::now() + REQUEST_TIMEOUT).into_std();
+        with_request_timeout(async {
+            loop {
+                let operation = match write().await {
+                    Err(IggyError::LaneBlocked(operation)) => operation,
+                    result => return result,
+                };
+                // A proved rejection belongs to the earlier call and releases its lane too.
+                if let Err(
+                    error @ (IggyError::OperationUncertain(_) | IggyError::OperationNotRetained(_)),
+                ) = self.client.resolve_operation(operation, deadline).await
+                {
+                    return Err(error);
+                }
+            }
+        })
+        .await
     }
 }
 
