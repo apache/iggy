@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Runs producers and consumers against five nodes while killing and restarting
-//! one random node at a time. This is an opt-in test that takes several minutes.
+//! Runs producers and consumers against a cluster of real server processes
+//! while a scenario injects faults: kills, graceful stops, freezes, cut peer
+//! links, or the loss of every node at once. This is an opt-in test that takes
+//! several minutes.
 //!
 //! # What it checks
 //!
@@ -27,16 +29,24 @@
 //!
 //! The main topic uses small segments and expires old messages. A second topic
 //! keeps its full history so the final checks can cover sealed segments too.
-//! Both use the default `replicated` durability. After the kills stop, readers
-//! drain their partitions. The test compares each node's messages, stored
-//! offsets and group membership. It then stops every node and, if the online
-//! checks passed, compares the persisted segment files byte for byte.
+//! Both use the configured durability, `replicated` unless the scenario says
+//! otherwise. After the faults stop, readers drain their partitions. The test
+//! compares each node's topic stats and group membership, and reads every
+//! partition's log and stored offsets from its primary, the only replica that
+//! serves reads. It then disconnects its own clients, sends SIGTERM to every
+//! node at once and always compares the persisted segment files byte for byte
+//! and the consumer and group offset files by value across the replicas. That
+//! comparison counts only when the online checks passed, every node was still
+//! running and every node stopped cleanly; otherwise it is recorded as a
+//! diagnostic.
 //!
 //! Missing, corrupt, reordered, phantom or unexplained duplicate messages fail
 //! the test. So do partial batches, incorrect offset confirmations, missed
-//! deliveries, conflicting reads or group assignments, unexpected node exits
-//! or task panics, and replicas that disagree. Expiry must actually delete
-//! segments during the run. A short run that never exercises expiry fails.
+//! deliveries, conflicting reads or group assignments, unexpected node exits,
+//! panics or fatal shard errors in a node's logs, a graceful stop that needs
+//! SIGKILL or exits with a failure status, and replicas that disagree.
+//! Expiry must actually delete segments during the run. A short run that never
+//! exercises expiry fails.
 //!
 //! # Running it
 //!
@@ -44,22 +54,81 @@
 //!
 //! ```text
 //! cargo build --bin iggy-server
-//! IGGY_TEST_CHAOS_DURATION_SECS=120 IGGY_TEST_CHAOS_KILL_INTERVAL_SECS=15 \
-//! IGGY_TEST_CHAOS_DOWNTIME_SECS=5 IGGY_TEST_CHAOS_SEED=7 \
+//! IGGY_TEST_CHAOS_SCENARIO=crash-restart IGGY_TEST_CHAOS_SEED=7 \
 //!     cargo nextest run -p integration --run-ignored only --no-capture -E 'test(chaos_monkey)'
 //! ```
 //!
-//! Duration, kill interval and downtime default to 120, 15 and 5 seconds.
 //! Without `IGGY_TEST_CHAOS_SEED`, each run chooses and prints a random seed.
-//! Downtime must be shorter than the kill interval, and the duration must
-//! allow at least one kill and restart. These are chaos-phase durations;
-//! startup, draining and verification take additional time.
+//! The printed configuration line names every setting, so a run can be
+//! repeated from it. The seed repeats random choices, not thread scheduling,
+//! disk latency or recovery progress. A failure is still a failed invariant,
+//! not an expected consequence of choosing a random workload. To investigate
+//! a run-order effect, repeat the same configurations alone and in both
+//! orders, using the same server binary. Compare actual fault times and
+//! retained message ranges.
 //!
-//! The seed repeats random choices, not thread scheduling, disk latency or
-//! recovery progress. A failure is still a failed invariant, not an expected
-//! consequence of choosing a random workload. To investigate a run-order
-//! effect, repeat the same configurations alone and in both orders, using the
-//! same server binary. Compare actual fault times and retained message ranges.
+//! # Scenarios
+//!
+//! `IGGY_TEST_CHAOS_SCENARIO` picks the fault plan. Times are seconds from the
+//! start of the chaos phase; `g` is the kill interval, `d` the downtime, `n`
+//! the node count. Every plan restores what it broke before the drain; a plan
+//! cut short by a failed restart resumes, heals and restarts what is still
+//! broken before it returns.
+//!
+//! | Scenario | Faults | Reproduces, expected outcome |
+//! | --- | --- | --- |
+//! | `random-kill` (default) | every `g`, SIGKILL a random node, restart it after `d`; 5 nodes | pass |
+//! | `baseline` | none | pass; checks the workload itself |
+//! | `control` | none; 20% of sends resend an acknowledged batch | pass, and the logs hold a duplicate of every resent message, which shows the checks see every copy |
+//! | `crash-restart` | each node in turn: SIGKILL after `g`, restart from disk after `d` | pass. With `persisted`, a build with #4433 applied lost every acknowledged message here |
+//! | `rolling-restart` | each node in turn: graceful stop, start after `d` | fails on master with the producer stall described below: two producers got `disconnected` on every send after a stop, 1,435 times each, and never recovered. Expected: pass |
+//! | `pause` | each node in turn: SIGSTOP for `d`, then SIGCONT | fails on master like `isolate`: the cluster evicts the frozen node's client sessions and the standalone consumers stay at `unauthenticated` |
+//! | `isolate` | each node in turn: every replica-to-replica connection of the node reset and redials refused for `d`, then restored; clients still reach it | fails on master: session eviction leaves the standalone consumers at `unauthenticated` until the end (see below) |
+//! | `kill-storm` | four SIGKILL and restart cycles `g` apart, `d` down each | pass |
+//! | `cascading-crash` | for each node: SIGKILL it, SIGKILL its successor `SECOND_KILL_DELAY_SECS` later during the view change, restart both `d` after the second kill; `persisted` | fails on master with `persisted`: after the restarted pair elected a new view, the surviving node fenced partition 0 as divergent (`partition WAL append does not extend its history`, then a ShardFatal and a process exit) and the partition stayed frozen. With `replicated` on 3 nodes one node stays alive alone for `d`, so acknowledged writes held only by the killed pair are lost by design, the same mechanism as `full-outage`. #4476 and #4500 cover the fenced replica and the survivor election, not that loss |
+//! | `full-outage` | SIGKILL every node at once after `g`, restart all after `d`; `persisted` | fails on master with `persisted`: the cluster recovers and loses nothing, but every producer stays `disconnected` until the end, the producer stall described below. With `replicated`, unflushed acknowledged writes are lost by design, so that setting is expected to fail |
+//! | `rolling-crash` | `crash-restart` on 1 partition at 30k messages/s from 12 producers in batches of 100, `persisted`, a kill every 80 s and 40 s down, for 360 s | #4438: a restarted replica logs `needs state transfer`, never finishes the transfer and keeps serving a stale prefix. Timing dependent; the loss reaches millions of messages at this load. Expected: pass |
+//! | `split-primaries` | `crash-restart`, then a 60 s window without faults, opened once the replica mesh has formed, in which the p99 latency of an acknowledged batch and the longest gap between acknowledgements must stay under `IGGY_TEST_CHAOS_P99_LIMIT_MS` | #4436: once partition primaries sit on different nodes, the SDK moves its session on nearly every send. #4437 is the deterministic test. Expected: pass |
+//!
+//! `isolate` needs no privileges: the harness relays every replica link over
+//! loopback. A cut closes the node's relayed connections, so its peers see EOF
+//! or a reset at once and redial, and every redial is closed on accept. That
+//! is a connection-reset partition of the peer links, not a silent packet
+//! drop, and clients still reach the node. PR #4474's Docker disconnect
+//! dropped packets silently, for peers and clients alike, so the two
+//! scenarios exercise different failure detection.
+//!
+//! The scenario defaults below can be overridden one by one. PR #4474's
+//! variables map as `KILL_GAP` to `KILL_INTERVAL_SECS`, `DOWN_SECONDS` to
+//! `DOWNTIME_SECS`, `SECONDS_RUN` to `DURATION_SECS`, `MEASURE_SECONDS` to
+//! `MEASURE_SECS`, `P99_LIMIT_MS` to `P99_LIMIT_MS` and `SECOND_KILL_DELAY` to
+//! `SECOND_KILL_DELAY_SECS`. `SECONDS_RUN` excludes the measure phase, while
+//! `DURATION_SECS` includes the measure window: PR #4474's `split-primaries`
+//! (110 s plus 60 s) maps to `DURATION_SECS=170`, and the default here is 150,
+//! 90 s of faults plus the 60 s window.
+//!
+//! | Variable (`IGGY_TEST_CHAOS_` prefix) | Meaning | Default |
+//! | --- | --- | --- |
+//! | `SCENARIO` | fault plan | `random-kill` |
+//! | `NODES` | cluster size, at least 3 | 5 for `random-kill`, 3 otherwise |
+//! | `DURABILITY` | `replicated` or `persisted`, both topics | `replicated`; `persisted` for `cascading-crash`, `full-outage`, `rolling-crash` |
+//! | `DURATION_SECS` | chaos phase, faults plus measure window | 120; `rolling-crash` 360; `split-primaries` 150 |
+//! | `KILL_INTERVAL_SECS` | `random-kill`: period between kills; other plans: quiet time before each fault; also bounds the wait for a formed replica mesh before the measure window | 15; `kill-storm` 12; `full-outage` 20; `rolling-crash` 80 |
+//! | `DOWNTIME_SECS` | how long a fault lasts | 5; `crash-restart`, `full-outage`, `split-primaries` 15; `pause`, `isolate` 20; `kill-storm` 8; `rolling-crash` 40 |
+//! | `SECOND_KILL_DELAY_SECS` | `cascading-crash`: gap between the two kills | 6 |
+//! | `PARTITIONS` | partitions of both topics | 4; `rolling-crash` 1 |
+//! | `PRODUCERS` | main-topic producers, at least `PARTITIONS`; `producer % partitions` picks the partition | 8; `rolling-crash` 12 |
+//! | `BATCH` | messages per send | 10; `rolling-crash` 100 |
+//! | `RATE` | target new messages per second over all main-topic producers, 0 for a fixed pause between batches; the history producers are unpaced | 0; `rolling-crash` 30000 |
+//! | `PAYLOAD_BYTES` | pad each payload to this length, 0 for none | 0 |
+//! | `RESEND_RATE` | share of sends that resend an acknowledged batch. Keep it to `control`: elsewhere a resent copy satisfies the missing check for an acknowledged batch that got no offset confirmation, so its loss would go unseen (a confirmed original is still caught by the confirmation check) | 0; `control` 0.2 |
+//! | `MEASURE_SECS` | fault-free window at the end with the latency check, 0 for none | 0; `split-primaries` 60 |
+//! | `P99_LIMIT_MS` | allowed p99 of acknowledged-batch latency in that window | 1000 |
+//! | `SEED` | random choices | random |
+//!
+//! These are chaos-phase settings; startup, draining and verification take
+//! additional time, and the wait for a formed mesh can extend the chaos phase
+//! by up to one kill interval.
 //!
 //! # Reports and logs
 //!
@@ -74,7 +143,8 @@
 //! Events are written as they happen. A report without a `finished` event is
 //! incomplete, for example after a timeout or forced termination. A `panicked`
 //! verdict records an interrupted check, not a successful run. The final disk
-//! comparison is explicitly skipped when the online checks fail.
+//! comparison always runs. After failed online checks or an unclean stop it is
+//! recorded as a `diagnostic` check and adds no violations.
 //!
 //! Current captures are `server_<id>_stdout.log` and `server_<id>_stderr.log`.
 //! Earlier captures are saved in `server_<id>_incarnation_<n>/` before each
@@ -98,8 +168,49 @@
 //!   been applied there. The test counts these reads as redeliveries and checks
 //!   stored offsets at the end; it cannot distinguish them from a lost store
 //!   during the workload.
-//! - HTTP group-offset reads currently resolve a standalone consumer instead.
-//!   The test reads group offsets over TCP.
+//! - Only a partition's primary serves polls and offset reads; a backup
+//!   answers `not_primary`. The final reads therefore go through one TCP
+//!   client, which the server routes to each primary, and the replicas are
+//!   compared at rest instead of online.
+//! - In `isolate` and `pause`, clients connected to the cut-off node kept their
+//!   TCP connection while the cluster evicted their sessions (the other nodes
+//!   log `Eviction(NoSession)`). An evicted session's poll gets
+//!   `Unauthenticated`; the SDK's poll router treats that as a connection
+//!   failure and probes with a PING (`core/sdk/src/driver/poll_router.rs`,
+//!   `send_poll_control` and `poll_connection_failed`), and the server admits
+//!   PING without a bound session (`core/server/src/dispatch/mod.rs`, the
+//!   request classification). The probe succeeds, so the client never signs in
+//!   again, while sends and joins take the generic path that reconnects. The
+//!   standalone consumers then got `unauthenticated` on every poll until the
+//!   end and never drained; producers and group members recovered. The
+//!   drain violation names the stuck clients.
+//! - In `full-outage` with `persisted` every producer, and in
+//!   `rolling-restart` some of them, answered `disconnected` on every send
+//!   after their node came back and never recovered. The send that first
+//!   hits the dead connection does reconnect: `send_raw_with_context` in
+//!   `core/sdk/src/tcp/tcp_client.rs` retries the connection every second
+//!   without limit. Once that reconnect ends without the client signed in
+//!   again, the stall is permanent: `send_messages` checks the client state
+//!   first (`core/common/src/traits/binary_impls/messages.rs`, via
+//!   `fail_if_not_authenticated` in `core/common/src/traits/binary_auth.rs`)
+//!   and returns `Disconnected` before the transport's reconnect path can
+//!   run again. Which reconnect fails, gives up, or is abandoned when the
+//!   test's call timeout drops it is not traced yet. The harness connects
+//!   the TCP transport itself and wraps it with `IggyClient::create`
+//!   (`core/integration/src/harness/handle/client_builder.rs`), so
+//!   `IggyClient::connect` never runs and the SDK heartbeat, whose ungated
+//!   PING would take the reconnect path, never starts. Polls pass the same
+//!   state check, so why the consumers recovered here is not traced yet
+//!   either. The SDK fix belongs in its own issue.
+//! - In `cascading-crash` with `persisted`, the surviving node adopted the
+//!   restarted pair's new view, stalled repairing the ops above its commit,
+//!   then logged `partition WAL append does not extend its history`, fenced
+//!   partition 0 with a ShardFatal and exited. No acknowledged message was
+//!   lost, but the partition stayed frozen.
+//! - The final reads run after the drain and the convergence wait. An empty
+//!   poll below the end the nodes list there is a primary read-path anomaly:
+//!   the read retries it, and each topic with retries gets a failed
+//!   `settled_reads` check event, without a violation.
 //! - A committed send or retried duplicate can be acknowledged without offset
 //!   confirmation. The test checks the batch's messages but cannot verify its
 //!   acknowledged placement. It fails if a producer gets no confirmations.
@@ -109,11 +220,26 @@
 //!   `StartView` probe without canonical headers and commits a discarded-view
 //!   operation. This real-process test has not established that failure path.
 //!
+//! # Not ported from PR #4474, follow-ups
+//!
+//! - Counting `needs state transfer` log lines.
+//! - The `unacked_but_present` count of unacknowledged messages that landed.
+//! - Resends from a fresh session.
+//! - A key-based (`messages_key`) partitioning check.
+//! - A relay blackhole mode that drops packets silently instead of resetting
+//!   connections.
+//! - fsync and power-loss durability. SIGKILL keeps the page cache, so a
+//!   `persisted` pass proves the flush out of process memory, not the
+//!   stable-storage barrier.
+//! - `rolling-crash` scale: the per-id sets and the observed log are never
+//!   pruned, about 2 GB of test RSS at 10.8M messages. Per-producer sequence
+//!   bitsets would fix it.
+//!
 //! The `IGGY_TEST_` variables are test controls. They are forwarded to child
 //! processes, whose environment validation permits that prefix.
 
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs::File;
 use std::future::Future;
 use std::io::Read;
@@ -122,6 +248,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -129,8 +256,10 @@ use assert_cmd::cargo::CommandCargoExt;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
+use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
-    TestBinary, TestBinaryError, TestHarness, TestServerConfig, disk, resolve_config_paths,
+    ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness, TestServerConfig, disk,
+    resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -147,17 +276,10 @@ use self::report::Report;
 
 mod report;
 
-const CLUSTER_NODES: usize = 5;
 const STREAM_NAME: &str = "chaos-stream";
 const TOPIC_NAME: &str = "chaos-topic";
 const HISTORY_TOPIC_NAME: &str = "chaos-history";
 const GROUP_NAME: &str = "chaos-group";
-const PARTITIONS: u32 = 4;
-/// Two producers per partition, so their batches interleave.
-const PRODUCERS: u32 = 8;
-/// One per partition of the history topic. Their ids follow the main topic's
-/// producers, so every message id stays unique.
-const HISTORY_PRODUCERS: u32 = PARTITIONS;
 /// Low-level members that churn. The `IggyConsumer` comes on top.
 const GROUP_MEMBERS: u32 = 3;
 /// The smallest segment the server accepts, so segments rotate under the kills.
@@ -173,13 +295,29 @@ const FIRST_CONSUMER_ID: u32 = 10;
 const STANDALONE_ICONSUMER_NAME: &str = "chaos-consumer";
 const STANDALONE_ICONSUMER_PARTITION: u32 = 0;
 
+const SCENARIO_ENV: &str = "IGGY_TEST_CHAOS_SCENARIO";
+const NODES_ENV: &str = "IGGY_TEST_CHAOS_NODES";
+const DURABILITY_ENV: &str = "IGGY_TEST_CHAOS_DURABILITY";
 const DURATION_ENV: &str = "IGGY_TEST_CHAOS_DURATION_SECS";
 const KILL_INTERVAL_ENV: &str = "IGGY_TEST_CHAOS_KILL_INTERVAL_SECS";
 const DOWNTIME_ENV: &str = "IGGY_TEST_CHAOS_DOWNTIME_SECS";
+const SECOND_KILL_DELAY_ENV: &str = "IGGY_TEST_CHAOS_SECOND_KILL_DELAY_SECS";
+const PARTITIONS_ENV: &str = "IGGY_TEST_CHAOS_PARTITIONS";
+const PRODUCERS_ENV: &str = "IGGY_TEST_CHAOS_PRODUCERS";
+const BATCH_ENV: &str = "IGGY_TEST_CHAOS_BATCH";
+const RATE_ENV: &str = "IGGY_TEST_CHAOS_RATE";
+const PAYLOAD_BYTES_ENV: &str = "IGGY_TEST_CHAOS_PAYLOAD_BYTES";
+const RESEND_RATE_ENV: &str = "IGGY_TEST_CHAOS_RESEND_RATE";
+const MEASURE_ENV: &str = "IGGY_TEST_CHAOS_MEASURE_SECS";
+const P99_LIMIT_ENV: &str = "IGGY_TEST_CHAOS_P99_LIMIT_MS";
 const SEED_ENV: &str = "IGGY_TEST_CHAOS_SEED";
-const DEFAULT_DURATION: Duration = Duration::from_secs(120);
-const DEFAULT_KILL_INTERVAL: Duration = Duration::from_secs(15);
-const DEFAULT_DOWNTIME: Duration = Duration::from_secs(5);
+/// Every node must survive the loss of one peer, and `isolate` and
+/// `cascading-crash` need a third node to make that loss matter.
+const MIN_NODES: usize = 3;
+/// `kill-storm` runs this many kill and restart cycles.
+const KILL_STORM_CYCLES: usize = 4;
+/// A resend picks one of this many most recent acknowledged batches.
+const RESEND_HISTORY: u64 = 64;
 
 /// Every reconnect gives a client a new id, so a member whose node dies stays
 /// behind as a stale member until its lease expires. The lease lasts 1.2 x the
@@ -191,8 +329,16 @@ const CLIENT_HEARTBEAT_INTERVAL: &str = "7s";
 /// With the default one-minute interval, a node killed within a minute of its
 /// boot never cleans, so expiry would barely run during the chaos phase.
 const CLEANER_INTERVAL: &str = "1s";
+/// The server's own shutdown budget has to end inside the harness's SIGTERM
+/// grace, or a wedged shard reads as a SIGKILL instead of the server's
+/// `abandoning it` line and its failure exit. Shard 0 may wait the join
+/// budget plus one drain and one poll interval, 3.05 s here against the 5 s
+/// grace; the defaults (10 s drain, 30 s join) outlast it.
+const SHUTDOWN_DRAIN_TIMEOUT: &str = "1s";
+const SHUTDOWN_POLL_INTERVAL: &str = "50ms";
+const SHUTDOWN_JOIN_TIMEOUT: &str = "2s";
 
-const PRODUCER_BATCH: u32 = 10;
+/// Between batches when no rate is set.
 const PRODUCER_PAUSE: Duration = Duration::from_millis(50);
 const POLL_BATCH: u32 = 100;
 const POLL_PAUSE: Duration = Duration::from_millis(50);
@@ -216,6 +362,19 @@ const CONVERGENCE_RETRY: Duration = Duration::from_secs(1);
 
 const VERIFIER_CONSUMER_ID: u32 = 1;
 const VERIFY_BATCH: u32 = 1_000;
+/// The final reads run after the drain and the convergence wait, so an empty
+/// poll below the end the nodes list is a read-path anomaly of the primary,
+/// not recovery noise. It is retried this often so the read can still finish,
+/// and every retry is recorded as a failed `settled_reads` check.
+const SETTLE_RETRIES: u32 = 5;
+const SETTLE_PAUSE: Duration = Duration::from_millis(500);
+/// Log lines that mean a node gave up on part of its work, with or without
+/// exiting.
+const FATAL_LOG_PATTERNS: [&str; 3] = [
+    "shard thread returned error",
+    "is divergent and was fenced",
+    "abandoning it",
+];
 const STDERR_TAIL_LINES: usize = 20;
 const REPORTED_EXAMPLES: usize = 5;
 const FAILURE_SUMMARY_CHARS: usize = 240;
@@ -225,11 +384,11 @@ type SharedLog = Arc<Mutex<ObservedLog>>;
 
 #[tokio::test(flavor = "multi_thread")]
 #[parallel]
-#[ignore = "runs for minutes against a five-node cluster; run with --run-ignored only"]
-async fn given_five_nodes_when_one_is_killed_every_interval_should_keep_acked_messages() {
+#[ignore = "runs for minutes against a multi-node cluster; run with --run-ignored only"]
+async fn given_cluster_when_scenario_faults_hit_should_keep_acked_messages() {
     crate::use_saved_logs_on_failure();
     let config = ChaosConfig::from_env();
-    let mut harness = build_cluster();
+    let mut harness = build_cluster(&config);
     let mut report =
         Report::create(harness.test_dir(), Instant::now()).expect("create chaos report");
     println!("{config}\nartifacts: {}", harness.test_dir().display());
@@ -240,8 +399,8 @@ async fn given_five_nodes_when_one_is_killed_every_interval_should_keep_acked_me
     let result = AssertUnwindSafe(run_chaos(&mut harness, &config, &mut report))
         .catch_unwind()
         .await;
-    let violations = match result {
-        Ok(violations) => violations,
+    let run = match result {
+        Ok(run) => run,
         Err(payload) => {
             let message = payload
                 .downcast_ref::<String>()
@@ -259,6 +418,11 @@ async fn given_five_nodes_when_one_is_killed_every_interval_should_keep_acked_me
             resume_unwind(payload);
         }
     };
+    let violations = run.violations;
+    let rate = run
+        .achieved_rate
+        .map(|rate| format!("; {rate}"))
+        .unwrap_or_default();
     report
         .record(
             "finished",
@@ -284,39 +448,61 @@ async fn given_five_nodes_when_one_is_killed_every_interval_should_keep_acked_me
         .join("\n");
     assert!(
         violations.is_empty(),
-        "{} violations:\n{examples}\nreport: {}",
+        "{} violations:\n{examples}\nreport: {}{rate}",
         violations.len(),
         report.path().display()
     );
-    println!("all checks passed; report: {}", report.path().display());
+    println!(
+        "all checks passed; report: {}{rate}",
+        report.path().display()
+    );
+}
+
+/// The verdict of a run and the rate line its final message prints.
+struct ChaosRun {
+    violations: Vec<String>,
+    /// Achieved against target messages per second, when a rate was set.
+    achieved_rate: Option<String>,
 }
 
 async fn run_chaos(
     harness: &mut TestHarness,
     config: &ChaosConfig,
     report: &mut Report,
-) -> Vec<String> {
+) -> ChaosRun {
     report
         .record("metadata", run_metadata(config))
         .expect("write run metadata");
     harness.start().await.expect("start the cluster");
     report_nodes(harness, report, "cluster_started");
-    create_topic_and_group(harness).await;
+    create_topic_and_group(harness, config).await;
 
     let started = Instant::now();
     report
         .record("phase", json!({"name": "chaos"}))
         .expect("write chaos phase");
-    let workload = Workload::spawn(harness, config.seed, started).await;
+    let workload = Workload::spawn(harness, config, started).await;
+    let measuring = Arc::clone(&workload.measuring);
     let mut violations = Vec::new();
     // Kill and restart block the calling thread for seconds. The multi-thread
     // runtime keeps the workload running on its worker threads meanwhile.
-    let kills = run_monkey(harness, config, started, &mut violations, report).await;
+    let faults = run_monkey(
+        harness,
+        config,
+        started,
+        &measuring,
+        &mut violations,
+        report,
+    )
+    .await;
     report
         .record("phase", json!({"name": "drain"}))
         .expect("write drain phase");
     let mut outcomes = workload.finish().await;
     outcomes.check(&mut violations);
+    check_measure_window(config, &outcomes, &faults, &mut violations, report);
+    let mut exited = HashSet::new();
+    check_nodes_running(harness, "drain", &mut exited, &mut violations);
     report
         .record(
             "check",
@@ -331,30 +517,70 @@ async fn run_chaos(
     report
         .record("phase", json!({"name": "verify"}))
         .expect("write verification phase");
-    let verifiers = connect_verifiers(harness, &mut violations).await;
-    let view = wait_for_convergence(
+    let verifiers = connect_verifiers(harness, config.nodes, &mut violations).await;
+    let reader = match connect_reader(harness, config.nodes).await {
+        Ok(reader) => reader,
+        Err(error) => {
+            violations.push(format!("no TCP client for the final reads: {error}"));
+            let achieved_rate = record_summary(report, config, &faults, &outcomes, None, &[]);
+            return ChaosRun {
+                violations,
+                achieved_rate,
+            };
+        }
+    };
+    let convergence = wait_for_convergence(
         &verifiers,
+        &reader,
         &outcomes.readers,
+        config,
         started,
         &mut violations,
         report,
     )
     .await;
+    // A node that did not converge may lag, so its listed ranges cannot
+    // judge what the primaries returned.
+    let checked_view = if convergence.converged {
+        convergence.view.as_ref()
+    } else {
+        report
+            .record(
+                "check",
+                json!({
+                    "name": "listed_ranges",
+                    "outcome": "skipped",
+                    "reason": "the nodes did not converge, so the retained-range and \
+                               past-the-end checks have no trusted view",
+                }),
+            )
+            .expect("write skipped listed-range checks");
+        None
+    };
     let stats = verify_logs(
-        &verifiers,
-        view.as_ref(),
+        &reader,
+        checked_view,
+        config,
         &mut outcomes,
         &mut violations,
         report,
     )
     .await;
-    for node in 0..CLUSTER_NODES {
-        if let Some(stderr) = panic_report(harness, node) {
-            violations.push(format!("node {node} panicked:\n{stderr}"));
+    check_resends(config, &outcomes, &stats, &mut violations);
+    for node in 0..config.nodes {
+        if let Some(problem) = fatal_report(harness, node) {
+            violations.push(format!("node {node} {problem}"));
         }
     }
 
-    record_summary(report, &kills, &outcomes, view.as_ref(), &stats);
+    let achieved_rate = record_summary(
+        report,
+        config,
+        &faults,
+        &outcomes,
+        convergence.view.as_ref(),
+        &stats,
+    );
     report
         .record(
             "check",
@@ -366,6 +592,8 @@ async fn run_chaos(
         )
         .expect("write online checks");
 
+    check_nodes_running(harness, "verify", &mut exited, &mut violations);
+
     // A graceful stop flushes what each node still holds in memory, so the
     // segment files can be compared byte for byte at rest.
     let data_paths: Vec<PathBuf> = harness
@@ -376,78 +604,292 @@ async fn run_chaos(
     report
         .record("phase", json!({"name": "stop"}))
         .expect("write stop phase");
+    // With no test client connected, a node's shutdown has only the
+    // cluster's own work to drain.
+    shut_down_client("final-read", &reader).await;
+    drop(reader);
+    for (node, verifier) in &verifiers {
+        shut_down_client(&format!("verifier-{node}"), verifier).await;
+    }
+    drop(verifiers);
+    // Shutting the clients down took time, so a node that died meanwhile is
+    // reported as an exit rather than as a failed wait at the stop.
+    check_nodes_running(harness, "stop", &mut exited, &mut violations);
+    report
+        .record(
+            "cluster_stop",
+            json!({
+                "order": "SIGTERM to every node at once, then wait for each in node order",
+                "test_clients_shut_down": ["final-read", "verifiers"],
+                "grace_secs": SIGTERM_TIMEOUT.as_secs(),
+                "nodes_already_exited": exited.iter().collect::<Vec<_>>(),
+            }),
+        )
+        .expect("write cluster stop");
     harness
-        .stop()
+        .stop_all_at_once()
         .await
         .expect("stop the cluster for the at-rest comparison");
     report_nodes(harness, report, "cluster_stopped");
-    for node in 0..CLUSTER_NODES {
-        if let Some(stderr) = panic_report(harness, node) {
-            let violation = format!("node {node} panicked:\n{stderr}");
+    // A node that died before the stop already has its violation, and the
+    // status its stop collects says nothing about the shutdown.
+    let unclean_stops: Vec<String> = (0..config.nodes)
+        .filter(|node| !exited.contains(node))
+        .filter_map(|node| {
+            unclean_stop(harness.node(node))
+                .map(|problem| format!("node {node} {problem} at the final stop"))
+        })
+        .collect();
+    violations.extend(unclean_stops.iter().cloned());
+    for node in (0..config.nodes).filter(|node| !exited.contains(node)) {
+        if let Some(problem) = fatal_report(harness, node) {
+            let violation = format!("node {node} {problem}");
             if !violations.contains(&violation) {
                 violations.push(violation);
             }
         }
     }
-    if !violations.is_empty() {
+    // The comparison always runs, so a failed run still shows whether the
+    // replicas agree at rest, but it decides the verdict only after a clean
+    // run: a failure or a SIGKILLed shutdown explains divergent files.
+    let authoritative = violations.is_empty();
+    report
+        .record("phase", json!({"name": "replica_files"}))
+        .expect("write disk comparison phase");
+    let comparison = disk::compare_replica_data(&data_paths, false);
+    let offsets = disk::compare_replica_offsets(&data_paths);
+    let mut problems = comparison.problems;
+    problems.extend(offsets.problems);
+    if authoritative {
         report
             .record(
                 "check",
                 json!({
                     "name": "replica_files",
-                    "outcome": "skipped",
-                    "reason": "online or shutdown checks failed",
+                    "outcome": if problems.is_empty() { "passed" } else { "failed" },
+                    "files": comparison.files,
+                    "offset_files": offsets.offsets.len(),
+                    "violations": problems,
                 }),
             )
-            .expect("write skipped disk check");
-        return violations;
+            .expect("write disk comparison result");
+        violations.extend(problems);
+    } else {
+        let reason = if unclean_stops.is_empty() {
+            "online or shutdown checks failed".to_owned()
+        } else {
+            format!("a node did not stop cleanly: {}", unclean_stops.join("; "))
+        };
+        report
+            .record(
+                "check",
+                json!({
+                    "name": "replica_files",
+                    "outcome": "diagnostic",
+                    "reason": reason,
+                    "files": comparison.files,
+                    "offsets": offsets.offsets,
+                    "problems": problems,
+                }),
+            )
+            .expect("write diagnostic disk comparison");
     }
-    report
-        .record("phase", json!({"name": "replica_files"}))
-        .expect("write disk comparison phase");
-    let comparison = disk::compare_replica_data(&data_paths, false);
-    report
-        .record(
-            "check",
-            json!({
-                "name": "replica_files",
-                "outcome": if comparison.problems.is_empty() { "passed" } else { "failed" },
-                "files": comparison.files,
-                "violations": comparison.problems,
-            }),
-        )
-        .expect("write disk comparison result");
-    violations.extend(comparison.problems);
-    violations
+    ChaosRun {
+        violations,
+        achieved_rate,
+    }
+}
+
+/// Records a violation, once per node, for every node that is no longer
+/// running. Nothing stops a node after the chaos phase until the final stop,
+/// so any exit before it is unexpected.
+fn check_nodes_running(
+    harness: &TestHarness,
+    phase: &str,
+    exited: &mut HashSet<usize>,
+    violations: &mut Vec<String>,
+) {
+    for node in 0..harness.all_servers().len() {
+        if exited.contains(&node) || harness.node(node).is_running() {
+            continue;
+        }
+        exited.insert(node);
+        let problem =
+            fatal_report(harness, node).unwrap_or_else(|| "logged no fatal error".to_owned());
+        violations.push(format!(
+            "node {node} exited during the {phase} phase; it {problem}"
+        ));
+    }
+}
+
+/// Disconnects a test client before the final stop. A failure is printed,
+/// not a violation: the stop that follows is what the test checks.
+async fn shut_down_client(name: &str, client: &IggyClient) {
+    if let Err(failure) = call(client.shutdown()).await {
+        println!("{name} client did not shut down cleanly: {failure}");
+    }
+}
+
+/// Why the node's last graceful stop was not clean: it did not exit within
+/// the SIGTERM grace and the harness killed it, it exited with a failure
+/// status, or its exit status is unknown.
+fn unclean_stop(server: &ServerHandle) -> Option<String> {
+    let outcome = server.last_stop()?;
+    if outcome.killed_after_timeout {
+        return Some(format!(
+            "did not exit within {}s of SIGTERM and was killed ({}; {})",
+            SIGTERM_TIMEOUT.as_secs(),
+            describe_exit(&outcome),
+            shard_exits(server)
+        ));
+    }
+    if let Some(error) = outcome.wait_error {
+        return Some(format!(
+            "could not be waited for on a graceful stop ({error}); exit status unknown"
+        ));
+    }
+    match outcome.exit_status {
+        None => Some("stopped with exit status unknown".to_owned()),
+        Some(status) if !status.success() => Some(format!(
+            "exited with {status} on a graceful stop ({})",
+            shard_exits(server)
+        )),
+        Some(_) => None,
+    }
+}
+
+fn describe_exit(outcome: &StopOutcome) -> String {
+    outcome.exit_status.map_or_else(
+        || "exit status unknown".to_owned(),
+        |status| status.to_string(),
+    )
+}
+
+/// The shards the server's join loop reported at its last shutdown, from its
+/// per-shard `shard thread exited cleanly` and `abandoning it` lines.
+fn shard_exits(server: &ServerHandle) -> String {
+    let log = server.stdout_plain();
+    let shard_ids = |marker: &str| -> Vec<&str> {
+        log.lines()
+            .filter(|line| line.contains(marker))
+            .filter_map(|line| line.split("shard_id=").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect()
+    };
+    format!(
+        "shards exited cleanly: [{}], abandoned: [{}]",
+        shard_ids("shard thread exited cleanly").join(", "),
+        shard_ids("abandoning it").join(", ")
+    )
+}
+
+/// The fields a stop adds to its report event.
+fn stop_fields(outcome: Option<StopOutcome>) -> serde_json::Value {
+    json!({
+        "exit_status": outcome.and_then(|outcome| outcome.exit_status).map(|status| status.to_string()),
+        "killed_after_timeout": outcome.map(|outcome| outcome.killed_after_timeout),
+        "wait_error": outcome.and_then(|outcome| outcome.wait_error).map(|error| error.to_string()),
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ChaosConfig {
+    scenario: Scenario,
+    nodes: usize,
+    durability: Durability,
     duration: Duration,
     kill_interval: Duration,
     downtime: Duration,
+    second_kill_delay: Duration,
+    partitions: u32,
+    /// Main-topic producers. The history topic has one per partition on top.
+    producers: u32,
+    batch: u32,
+    /// New messages per second over all main-topic producers, 0 for a fixed
+    /// pause between batches.
+    rate: u64,
+    payload_bytes: usize,
+    resend_rate: f64,
+    /// Fault-free window at the end of the chaos phase, zero for none.
+    measure: Duration,
+    p99_limit: Duration,
     seed: u64,
 }
 
 impl ChaosConfig {
     fn from_env() -> Self {
+        let scenario = env_value(SCENARIO_ENV).unwrap_or(Scenario::RandomKill);
+        let defaults = scenario.defaults();
         let config = Self {
-            duration: env_value(DURATION_ENV).map_or(DEFAULT_DURATION, Duration::from_secs),
+            scenario,
+            nodes: env_value(NODES_ENV).unwrap_or(defaults.nodes),
+            durability: env_value(DURABILITY_ENV)
+                .map_or(defaults.durability, |DurabilityName(durability)| durability),
+            duration: env_value(DURATION_ENV).map_or(defaults.duration, Duration::from_secs),
             kill_interval: env_value(KILL_INTERVAL_ENV)
-                .map_or(DEFAULT_KILL_INTERVAL, Duration::from_secs),
-            downtime: env_value(DOWNTIME_ENV).map_or(DEFAULT_DOWNTIME, Duration::from_secs),
+                .map_or(defaults.kill_interval, Duration::from_secs),
+            downtime: env_value(DOWNTIME_ENV).map_or(defaults.downtime, Duration::from_secs),
+            second_kill_delay: env_value(SECOND_KILL_DELAY_ENV)
+                .map_or(defaults.second_kill_delay, Duration::from_secs),
+            partitions: env_value(PARTITIONS_ENV).unwrap_or(defaults.partitions),
+            producers: env_value(PRODUCERS_ENV).unwrap_or(defaults.producers),
+            batch: env_value(BATCH_ENV).unwrap_or(defaults.batch),
+            rate: env_value(RATE_ENV).unwrap_or(defaults.rate),
+            payload_bytes: env_value(PAYLOAD_BYTES_ENV).unwrap_or(0),
+            resend_rate: env_value(RESEND_RATE_ENV).unwrap_or(defaults.resend_rate),
+            measure: env_value(MEASURE_ENV).map_or(defaults.measure, Duration::from_secs),
+            p99_limit: env_value(P99_LIMIT_ENV).map_or(defaults.p99_limit, Duration::from_millis),
             seed: env_value(SEED_ENV).unwrap_or_else(rand::random),
         };
         assert!(
-            config.downtime < config.kill_interval,
-            "{DOWNTIME_ENV} must be below {KILL_INTERVAL_ENV}, so at most one node is down: \
-             {config}"
+            config.nodes >= MIN_NODES,
+            "{NODES_ENV} must be at least {MIN_NODES}: {config}"
         );
         assert!(
-            config.kill_interval + config.downtime <= config.duration,
-            "{DURATION_ENV} must leave room for at least one kill and restart: {config}"
+            config.partitions >= 1 && config.producers >= 1 && config.batch >= 1,
+            "{PARTITIONS_ENV}, {PRODUCERS_ENV} and {BATCH_ENV} must be at least 1: {config}"
+        );
+        assert!(
+            config.producers >= config.partitions,
+            "{PRODUCERS_ENV} must be at least {PARTITIONS_ENV}, or a partition without a \
+             producer fails the convergence check: {config}"
+        );
+        assert!(
+            (0.0..=1.0).contains(&config.resend_rate),
+            "{RESEND_RATE_ENV} must be between 0 and 1: {config}"
+        );
+        if config.scenario == Scenario::RandomKill {
+            assert!(
+                config.downtime < config.kill_interval,
+                "{DOWNTIME_ENV} must be below {KILL_INTERVAL_ENV}, so at most one node is down: \
+                 {config}"
+            );
+            assert!(
+                config.kill_interval + config.downtime <= config.duration,
+                "{DURATION_ENV} must leave room for at least one kill and restart: {config}"
+            );
+        }
+        let plan_end = config.plan().last().map_or(Duration::ZERO, |step| step.at);
+        assert!(
+            plan_end + config.measure <= config.duration,
+            "{DURATION_ENV} must cover the {} fault plan ({}s) and the measure window: {config}",
+            config.scenario,
+            plan_end.as_secs()
         );
         config
+    }
+
+    /// The scenario's fault steps, in order. Random choices come from the
+    /// seed, so the plan is the same every time it is built.
+    fn plan(&self) -> Vec<Step> {
+        self.scenario.plan(self)
+    }
+
+    fn durability_name(&self) -> &'static str {
+        match self.durability {
+            Durability::Replicated => "replicated",
+            Durability::Persisted => "persisted",
+        }
     }
 }
 
@@ -455,12 +897,330 @@ impl fmt::Display for ChaosConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{DURATION_ENV}={} {KILL_INTERVAL_ENV}={} {DOWNTIME_ENV}={} {SEED_ENV}={}",
+            "{SCENARIO_ENV}={} {NODES_ENV}={} {DURABILITY_ENV}={} {DURATION_ENV}={} \
+             {KILL_INTERVAL_ENV}={} {DOWNTIME_ENV}={} {SECOND_KILL_DELAY_ENV}={} \
+             {PARTITIONS_ENV}={} {PRODUCERS_ENV}={} {BATCH_ENV}={} {RATE_ENV}={} \
+             {PAYLOAD_BYTES_ENV}={} {RESEND_RATE_ENV}={} {MEASURE_ENV}={} {P99_LIMIT_ENV}={} \
+             {SEED_ENV}={}",
+            self.scenario,
+            self.nodes,
+            self.durability_name(),
             self.duration.as_secs(),
             self.kill_interval.as_secs(),
             self.downtime.as_secs(),
+            self.second_kill_delay.as_secs(),
+            self.partitions,
+            self.producers,
+            self.batch,
+            self.rate,
+            self.payload_bytes,
+            self.resend_rate,
+            self.measure.as_secs(),
+            self.p99_limit.as_millis(),
             self.seed
         )
+    }
+}
+
+/// `Durability` as the environment spells it.
+struct DurabilityName(Durability);
+
+impl FromStr for DurabilityName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "replicated" => Ok(Self(Durability::Replicated)),
+            "persisted" => Ok(Self(Durability::Persisted)),
+            other => Err(format!("{other} is neither replicated nor persisted")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scenario {
+    RandomKill,
+    Baseline,
+    Control,
+    CrashRestart,
+    RollingRestart,
+    Pause,
+    Isolate,
+    KillStorm,
+    CascadingCrash,
+    FullOutage,
+    RollingCrash,
+    SplitPrimaries,
+}
+
+impl Scenario {
+    const ALL: [Self; 12] = [
+        Self::RandomKill,
+        Self::Baseline,
+        Self::Control,
+        Self::CrashRestart,
+        Self::RollingRestart,
+        Self::Pause,
+        Self::Isolate,
+        Self::KillStorm,
+        Self::CascadingCrash,
+        Self::FullOutage,
+        Self::RollingCrash,
+        Self::SplitPrimaries,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::RandomKill => "random-kill",
+            Self::Baseline => "baseline",
+            Self::Control => "control",
+            Self::CrashRestart => "crash-restart",
+            Self::RollingRestart => "rolling-restart",
+            Self::Pause => "pause",
+            Self::Isolate => "isolate",
+            Self::KillStorm => "kill-storm",
+            Self::CascadingCrash => "cascading-crash",
+            Self::FullOutage => "full-outage",
+            Self::RollingCrash => "rolling-crash",
+            Self::SplitPrimaries => "split-primaries",
+        }
+    }
+
+    /// The settings each scenario starts from. They follow the schedules the
+    /// faults were first reproduced with, so the documented runs need only the
+    /// scenario name.
+    fn defaults(self) -> ScenarioDefaults {
+        let base = ScenarioDefaults {
+            nodes: 3,
+            durability: Durability::Replicated,
+            duration: Duration::from_secs(120),
+            kill_interval: Duration::from_secs(15),
+            downtime: Duration::from_secs(5),
+            second_kill_delay: Duration::from_secs(6),
+            partitions: 4,
+            producers: 8,
+            batch: 10,
+            rate: 0,
+            resend_rate: 0.0,
+            measure: Duration::ZERO,
+            p99_limit: Duration::from_secs(1),
+        };
+        match self {
+            Self::RandomKill => ScenarioDefaults { nodes: 5, ..base },
+            Self::Baseline | Self::RollingRestart => base,
+            Self::Isolate | Self::Pause => ScenarioDefaults {
+                downtime: Duration::from_secs(20),
+                ..base
+            },
+            Self::Control => ScenarioDefaults {
+                resend_rate: 0.2,
+                ..base
+            },
+            Self::CrashRestart => ScenarioDefaults {
+                downtime: Duration::from_secs(15),
+                ..base
+            },
+            Self::KillStorm => ScenarioDefaults {
+                kill_interval: Duration::from_secs(12),
+                downtime: Duration::from_secs(8),
+                ..base
+            },
+            Self::CascadingCrash => ScenarioDefaults {
+                durability: Durability::Persisted,
+                ..base
+            },
+            Self::FullOutage => ScenarioDefaults {
+                durability: Durability::Persisted,
+                kill_interval: Duration::from_secs(20),
+                downtime: Duration::from_secs(15),
+                ..base
+            },
+            Self::RollingCrash => ScenarioDefaults {
+                durability: Durability::Persisted,
+                duration: Duration::from_secs(360),
+                kill_interval: Duration::from_secs(80),
+                downtime: Duration::from_secs(40),
+                partitions: 1,
+                producers: 12,
+                batch: 100,
+                rate: 30_000,
+                ..base
+            },
+            Self::SplitPrimaries => ScenarioDefaults {
+                duration: Duration::from_secs(150),
+                downtime: Duration::from_secs(15),
+                measure: Duration::from_secs(60),
+                ..base
+            },
+        }
+    }
+
+    fn plan(self, config: &ChaosConfig) -> Vec<Step> {
+        let nodes = config.nodes;
+        let mut plan = Plan::default();
+        match self {
+            Self::RandomKill => {
+                let mut rng = StdRng::seed_from_u64(config.seed);
+                let mut next_kill = config.kill_interval;
+                while next_kill + config.downtime + config.measure <= config.duration {
+                    let victim = rng.random_range(0..nodes);
+                    plan.at = next_kill;
+                    plan.push(Action::Kill(victim));
+                    plan.after(config.downtime, Action::Restart(victim));
+                    next_kill += config.kill_interval;
+                }
+            }
+            Self::Baseline | Self::Control => {}
+            Self::CrashRestart | Self::RollingCrash | Self::SplitPrimaries => {
+                plan.each_node(config, Action::Kill, Action::Restart);
+            }
+            Self::RollingRestart => plan.each_node(config, Action::Stop, Action::Start),
+            Self::Pause => plan.each_node(config, Action::Pause, Action::Resume),
+            Self::Isolate => plan.each_node(config, Action::Isolate, Action::Heal),
+            Self::KillStorm => {
+                for cycle in 0..KILL_STORM_CYCLES {
+                    let victim = (cycle + nodes - 1) % nodes;
+                    plan.after(config.kill_interval, Action::Kill(victim));
+                    plan.after(config.downtime, Action::Restart(victim));
+                }
+            }
+            Self::CascadingCrash => {
+                for first in 0..nodes {
+                    let second = (first + 1) % nodes;
+                    plan.after(config.kill_interval, Action::Kill(first));
+                    plan.after(config.second_kill_delay, Action::Kill(second));
+                    plan.after(config.downtime, Action::Restart(first));
+                    plan.push(Action::Restart(second));
+                }
+            }
+            Self::FullOutage => {
+                plan.after(config.kill_interval, Action::KillAll);
+                plan.after(config.downtime, Action::RestartAll);
+            }
+        }
+        plan.steps
+    }
+}
+
+impl fmt::Display for Scenario {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for Scenario {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|scenario| scenario.name() == value)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(|scenario| scenario.name()).collect();
+                format!("{value} is not one of {}", names.join(", "))
+            })
+    }
+}
+
+struct ScenarioDefaults {
+    nodes: usize,
+    durability: Durability,
+    duration: Duration,
+    kill_interval: Duration,
+    downtime: Duration,
+    second_kill_delay: Duration,
+    partitions: u32,
+    producers: u32,
+    batch: u32,
+    rate: u64,
+    resend_rate: f64,
+    measure: Duration,
+    p99_limit: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Kill(usize),
+    Restart(usize),
+    Stop(usize),
+    Start(usize),
+    Pause(usize),
+    Resume(usize),
+    Isolate(usize),
+    Heal(usize),
+    KillAll,
+    RestartAll,
+}
+
+impl Action {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Kill(_) => "kill",
+            Self::Restart(_) => "restart",
+            Self::Stop(_) => "stop",
+            Self::Start(_) => "start",
+            Self::Pause(_) => "pause",
+            Self::Resume(_) => "resume",
+            Self::Isolate(_) => "isolate",
+            Self::Heal(_) => "heal",
+            Self::KillAll => "kill_all",
+            Self::RestartAll => "restart_all",
+        }
+    }
+
+    fn node(self) -> Option<usize> {
+        match self {
+            Self::Kill(node)
+            | Self::Restart(node)
+            | Self::Stop(node)
+            | Self::Start(node)
+            | Self::Pause(node)
+            | Self::Resume(node)
+            | Self::Isolate(node)
+            | Self::Heal(node) => Some(node),
+            Self::KillAll | Self::RestartAll => None,
+        }
+    }
+}
+
+/// A fault action at a time measured from the start of the chaos phase.
+#[derive(Debug, Clone, Copy)]
+struct Step {
+    at: Duration,
+    action: Action,
+}
+
+#[derive(Default)]
+struct Plan {
+    steps: Vec<Step>,
+    at: Duration,
+}
+
+impl Plan {
+    fn push(&mut self, action: Action) {
+        self.steps.push(Step {
+            at: self.at,
+            action,
+        });
+    }
+
+    fn after(&mut self, delay: Duration, action: Action) {
+        self.at += delay;
+        self.push(action);
+    }
+
+    /// Breaks each node in turn after the kill interval and restores it after
+    /// the downtime.
+    fn each_node(
+        &mut self,
+        config: &ChaosConfig,
+        fault: fn(usize) -> Action,
+        restore: fn(usize) -> Action,
+    ) {
+        for node in 0..config.nodes {
+            self.after(config.kill_interval, fault(node));
+            self.after(config.downtime, restore(node));
+        }
     }
 }
 
@@ -476,7 +1236,7 @@ where
     )
 }
 
-fn build_cluster() -> TestHarness {
+fn build_cluster(config: &ChaosConfig) -> TestHarness {
     let overrides = HashMap::from([
         (
             "consumer_group.heartbeat_interval".to_owned(),
@@ -490,9 +1250,21 @@ fn build_cluster() -> TestHarness {
             "data_maintenance.messages.interval".to_owned(),
             CLEANER_INTERVAL.to_owned(),
         ),
+        (
+            "sharding.shutdown_drain_timeout".to_owned(),
+            SHUTDOWN_DRAIN_TIMEOUT.to_owned(),
+        ),
+        (
+            "sharding.shutdown_poll_interval".to_owned(),
+            SHUTDOWN_POLL_INTERVAL.to_owned(),
+        ),
+        (
+            "sharding.shutdown_join_timeout".to_owned(),
+            SHUTDOWN_JOIN_TIMEOUT.to_owned(),
+        ),
     ]);
     let extra_envs = resolve_config_paths(&overrides).expect("valid server config paths");
-    TestHarness::builder()
+    let mut builder = TestHarness::builder()
         .server(
             TestServerConfig::builder()
                 .extra_envs(extra_envs)
@@ -500,13 +1272,16 @@ fn build_cluster() -> TestHarness {
                 .dump_logs_on_failure(false)
                 .build(),
         )
-        .cluster_nodes(CLUSTER_NODES)
-        .cleanup(false)
-        .build()
-        .expect("build the harness")
+        .cluster_nodes(config.nodes)
+        .cleanup(false);
+    // Only the scenario that cuts links pays for the relay hop.
+    if config.scenario == Scenario::Isolate {
+        builder = builder.peer_relays();
+    }
+    builder.build().expect("build the harness")
 }
 
-async fn create_topic_and_group(harness: &TestHarness) {
+async fn create_topic_and_group(harness: &TestHarness, config: &ChaosConfig) {
     let target = Target::new();
     let client = harness.tcp_root_client().await.expect("root client");
     client
@@ -514,11 +1289,12 @@ async fn create_topic_and_group(harness: &TestHarness) {
         .await
         .expect("create the stream");
     let options = TopicCreateOptions {
-        partitions_count: Some(PARTITIONS),
+        partitions_count: Some(config.partitions),
         message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(
             MESSAGE_EXPIRY,
         ))),
         segment_size: Some(IggyByteSize::from(SEGMENT_SIZE_BYTES)),
+        durability: config.durability,
         ..TopicCreateOptions::default()
     };
     client
@@ -526,8 +1302,9 @@ async fn create_topic_and_group(harness: &TestHarness) {
         .await
         .expect("create the topic");
     let history = TopicCreateOptions {
-        partitions_count: Some(PARTITIONS),
+        partitions_count: Some(config.partitions),
         segment_size: Some(IggyByteSize::from(SEGMENT_SIZE_BYTES)),
+        durability: config.durability,
         ..TopicCreateOptions::default()
     };
     client
@@ -544,12 +1321,13 @@ async fn create_topic_and_group(harness: &TestHarness) {
 /// leader after sign-in anyway.
 struct Dialer<'a> {
     harness: &'a TestHarness,
+    nodes: usize,
     dialed: usize,
 }
 
 impl Dialer<'_> {
     async fn connect(&mut self) -> IggyClient {
-        let node = self.dialed % CLUSTER_NODES;
+        let node = self.dialed % self.nodes;
         self.dialed += 1;
         self.harness
             .node(node)
@@ -596,6 +1374,9 @@ struct TaskContext {
     target: Target,
     log: SharedLog,
     started: Instant,
+    config: ChaosConfig,
+    /// Set while the fault-free measure window is open.
+    measuring: Arc<AtomicBool>,
 }
 
 /// A consumer identity with stored offsets of its own: the group, or a
@@ -632,6 +1413,16 @@ impl Reader {
     /// `acked` holds the acknowledged ids of each partition.
     fn received_all(&self, acked: &[HashSet<u128>]) -> bool {
         let received = self.received.lock().expect("received ids lock");
+        // Too few ids cannot cover every acknowledged one, so the drain loop
+        // skips the subset scan until the count could match.
+        let acked_count: usize = (0u32..)
+            .zip(acked)
+            .filter(|(partition, _)| self.reads(*partition))
+            .map(|(_, ids)| ids.len())
+            .sum();
+        if received.ids.len() < acked_count {
+            return false;
+        }
         (0u32..)
             .zip(acked)
             .all(|(partition, ids)| !self.reads(partition) || ids.is_subset(&received.ids))
@@ -645,20 +1436,19 @@ struct ObservedLog {
     conflicts: Vec<String>,
 }
 
-impl Default for ObservedLog {
-    fn default() -> Self {
+impl ObservedLog {
+    fn new(partitions: u32) -> Self {
         Self {
-            partitions: (0..PARTITIONS).map(|_| BTreeMap::new()).collect(),
+            partitions: (0..partitions).map(|_| BTreeMap::new()).collect(),
             conflicts: Vec::new(),
         }
     }
-}
 
-impl ObservedLog {
     fn observe(&mut self, source: &str, partition: u32, entry: LogEntry) {
         let Some(entries) = self.partitions.get_mut(partition as usize) else {
             self.conflicts.push(format!(
-                "{source} read partition {partition} of a {PARTITIONS}-partition topic"
+                "{source} read partition {partition} of a {}-partition topic",
+                self.partitions.len()
             ));
             return;
         };
@@ -719,15 +1509,20 @@ struct Workload {
     log: SharedLog,
     /// Reads the stored offsets that end the drain.
     observer: IggyClient,
+    /// Producers sample batch latencies while this is set.
+    measuring: Arc<AtomicBool>,
+    config: ChaosConfig,
     started: Instant,
 }
 
 impl Workload {
-    async fn spawn(harness: &TestHarness, seed: u64, started: Instant) -> Self {
+    async fn spawn(harness: &TestHarness, config: &ChaosConfig, started: Instant) -> Self {
         let context = TaskContext {
             target: Target::new(),
-            log: SharedLog::default(),
+            log: Arc::new(Mutex::new(ObservedLog::new(config.partitions))),
             started,
+            config: *config,
+            measuring: Arc::new(AtomicBool::new(false)),
         };
         let history = TaskContext {
             target: Target::history(),
@@ -736,11 +1531,18 @@ impl Workload {
         let (producer_phase, producer_rx) = watch::channel(ProducerPhase::Send);
         let (consumer_phase, consumer_rx) = watch::channel(ConsumerPhase::Consume);
         let (group_iconsumer_phase, group_iconsumer_rx) = watch::channel(ConsumerPhase::Consume);
-        let mut dialer = Dialer { harness, dialed: 0 };
+        let mut dialer = Dialer {
+            harness,
+            nodes: config.nodes,
+            dialed: 0,
+        };
 
-        let mut producers = Vec::with_capacity((PRODUCERS + HISTORY_PRODUCERS) as usize);
-        for producer in 0..PRODUCERS + HISTORY_PRODUCERS {
-            let producer_context = if producer < PRODUCERS {
+        // One history producer per partition. Their ids follow the main
+        // topic's producers, so every message id stays unique.
+        let history_producers = config.partitions;
+        let mut producers = Vec::with_capacity((config.producers + history_producers) as usize);
+        for producer in 0..config.producers + history_producers {
+            let producer_context = if producer < config.producers {
                 &context
             } else {
                 &history
@@ -761,7 +1563,7 @@ impl Workload {
         );
         for member in 0..GROUP_MEMBERS {
             // Offset from the monkey's own stream of numbers.
-            let rng = StdRng::seed_from_u64(seed.wrapping_add(u64::from(member) + 1));
+            let rng = StdRng::seed_from_u64(config.seed.wrapping_add(u64::from(member) + 1));
             consumers.push(tokio::spawn(run_member(
                 dialer.connect().await,
                 member,
@@ -785,7 +1587,7 @@ impl Workload {
         ));
         let mut readers = vec![group];
 
-        for partition in 0..PARTITIONS {
+        for partition in 0..config.partitions {
             let id = FIRST_CONSUMER_ID + partition;
             let reader = Reader::new(
                 format!("consumer {id}"),
@@ -841,6 +1643,8 @@ impl Workload {
             readers,
             log: context.log,
             observer: dialer.connect().await,
+            measuring: context.measuring,
+            config: *config,
             started,
         }
     }
@@ -859,12 +1663,15 @@ impl Workload {
             readers,
             log,
             observer,
+            measuring: _,
+            config,
             started,
         } = self;
         println!(
             "{} chaos phase over, stopping the producers",
             stamp(started)
         );
+        let chaos_end = Instant::now();
         producer_phase.send_replace(ProducerPhase::Finish);
         consumer_phase.send_replace(ConsumerPhase::Drain);
 
@@ -878,12 +1685,14 @@ impl Workload {
                     handle.await
                 }
             };
-            producer_outcomes.push(joined.expect("producer task panicked"));
+            let mut outcome = joined.expect("producer task panicked");
+            outcome.sending = chaos_end.saturating_duration_since(outcome.sending_since);
+            producer_outcomes.push(outcome);
         }
         // `spawn` starts the history topic's producers after the main topic's.
-        let history_producers = producer_outcomes.split_off(PRODUCERS as usize);
+        let history_producers = producer_outcomes.split_off(config.producers as usize);
 
-        let mut acked = vec![HashSet::new(); PARTITIONS as usize];
+        let mut acked = vec![HashSet::new(); config.partitions as usize];
         for producer in &producer_outcomes {
             acked[producer.partition as usize].extend(producer.acked_keys().map(u128::from));
         }
@@ -916,8 +1725,11 @@ impl Workload {
             consumers: consumer_outcomes,
             sampler: sampler.await.expect("sampler task panicked"),
             readers,
-            log: std::mem::take(&mut *log.lock().expect("observed log lock")),
-            history_log: ObservedLog::default(),
+            log: std::mem::replace(
+                &mut *log.lock().expect("observed log lock"),
+                ObservedLog::new(0),
+            ),
+            history_log: ObservedLog::new(config.partitions),
             undrained,
         }
     }
@@ -926,8 +1738,7 @@ impl Workload {
 /// Ok once every reader received every acknowledged message of its
 /// partitions and stored the highest offset read there, otherwise what is
 /// still missing. That offset comes from the readers, not from a node, so a
-/// node that lags behind cannot end the drain early. This is also the only
-/// check of the group's stored offsets, see `http_readers`.
+/// node that lags behind cannot end the drain early.
 async fn drain_progress(
     observer: &IggyClient,
     readers: &[Arc<Reader>],
@@ -961,9 +1772,10 @@ async fn drain_progress(
                         stored.map(|offset| offset.stored_offset)
                     ));
                 }
-                Err(_) => {
+                Err(failure) => {
                     return Err(format!(
-                        "partition {partition}: the stored offset of {} cannot be read",
+                        "partition {partition}: the stored offset of {} cannot be read: \
+                         {failure}",
                         reader.name
                     ));
                 }
@@ -992,9 +1804,14 @@ impl Outcomes {
     fn check(&self, violations: &mut Vec<String>) {
         for producer in self.producers.iter().chain(&self.history_producers) {
             if producer.sent_batches() > producer.acked_batches {
+                let streak = producer
+                    .errors
+                    .stuck()
+                    .map(|streak| format!("; {streak}"))
+                    .unwrap_or_default();
                 violations.push(format!(
                     "producer {} got no ack for batch {} within {RECOVERY_TIMEOUT:?} after the \
-                     chaos phase",
+                     chaos phase{streak}",
                     producer.producer, producer.acked_batches
                 ));
             }
@@ -1017,8 +1834,29 @@ impl Outcomes {
         self.sampler.errors.check("the group sampler", violations);
         violations.extend(self.sampler.violations.iter().cloned());
         if let Some(problem) = &self.undrained {
+            let producers = self
+                .producers
+                .iter()
+                .chain(&self.history_producers)
+                .map(|producer| (format!("producer {}", producer.producer), &producer.errors));
+            let consumers = self
+                .consumers
+                .iter()
+                .map(|consumer| (consumer.name.clone(), &consumer.errors));
+            let stuck: Vec<String> = producers
+                .chain(consumers)
+                .filter_map(|(name, errors)| {
+                    errors.stuck().map(|streak| format!("{name}: {streak}"))
+                })
+                .collect();
             violations.push(format!(
-                "the readers did not drain within {DRAIN_TIMEOUT:?}: {problem}"
+                "the readers did not drain within {DRAIN_TIMEOUT:?}: {problem}{}{}",
+                if stuck.is_empty() {
+                    ""
+                } else {
+                    "; stuck clients: "
+                },
+                stuck.join("; ")
             ));
         }
     }
@@ -1033,12 +1871,42 @@ struct MessageKey {
 }
 
 impl MessageKey {
-    fn batch(self) -> u64 {
-        self.seq / u64::from(PRODUCER_BATCH)
+    fn batch(self, batch_size: u32) -> u64 {
+        self.seq / u64::from(batch_size)
     }
 
-    fn payload(self) -> Bytes {
-        Bytes::from(format!("{self}"))
+    /// The key's text, padded with `x` up to `payload_bytes`.
+    fn payload(self, payload_bytes: usize) -> Bytes {
+        let mut text = String::with_capacity(payload_bytes);
+        write!(text, "{self}").expect("writing to a String cannot fail");
+        let padding = payload_bytes.saturating_sub(text.len());
+        text.extend(std::iter::repeat_n('x', padding));
+        Bytes::from(text)
+    }
+
+    /// Whether `payload` is what [`Self::payload`] builds, checked without
+    /// building it: the readers see every message, so this runs per delivery.
+    fn payload_matches(self, payload: &[u8], payload_bytes: usize) -> bool {
+        let mut prefix = PrefixMatch { rest: payload };
+        if fmt::write(&mut prefix, format_args!("{self}")).is_err() {
+            return false;
+        }
+        let text_len = payload.len() - prefix.rest.len();
+        payload.len() == text_len.max(payload_bytes) && prefix.rest.iter().all(|&byte| byte == b'x')
+    }
+}
+
+/// Consumes the bytes that formatted text must match, failing on the first
+/// difference.
+struct PrefixMatch<'a> {
+    rest: &'a [u8],
+}
+
+impl fmt::Write for PrefixMatch<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let rest = self.rest.strip_prefix(text.as_bytes()).ok_or(fmt::Error)?;
+        self.rest = rest;
+        Ok(())
     }
 }
 
@@ -1069,9 +1937,9 @@ impl TryFrom<u128> for MessageKey {
     }
 }
 
-fn batch_keys(producer: u32, batch: u64) -> impl Iterator<Item = MessageKey> {
-    let first = batch * u64::from(PRODUCER_BATCH);
-    (first..first + u64::from(PRODUCER_BATCH)).map(move |seq| MessageKey { producer, seq })
+fn batch_keys(producer: u32, batch: u64, batch_size: u32) -> impl Iterator<Item = MessageKey> {
+    let first = batch * u64::from(batch_size);
+    (first..first + u64::from(batch_size)).map(move |seq| MessageKey { producer, seq })
 }
 
 /// Why a client call returned no value.
@@ -1103,6 +1971,15 @@ struct ErrorTally {
     started: Instant,
     counts: BTreeMap<&'static str, u64>,
     forbidden: Vec<String>,
+    /// The failures since the last success: how many, since when, and the
+    /// kind of the latest. A long streak names a client that never recovered.
+    streak: Option<Streak>,
+}
+
+struct Streak {
+    failures: u64,
+    since: Instant,
+    last: &'static str,
 }
 
 impl ErrorTally {
@@ -1111,6 +1988,7 @@ impl ErrorTally {
             started,
             counts: BTreeMap::new(),
             forbidden: Vec::new(),
+            streak: None,
         }
     }
 
@@ -1126,6 +2004,33 @@ impl ErrorTally {
             self.forbidden
                 .push(format!("{} {error}", stamp(self.started)));
         }
+        let streak = self.streak.get_or_insert(Streak {
+            failures: 0,
+            since: Instant::now(),
+            last: kind,
+        });
+        streak.failures += 1;
+        streak.last = kind;
+    }
+
+    fn succeeded(&mut self) {
+        self.streak = None;
+    }
+
+    /// The current streak, when it has gone on for long enough to mean the
+    /// client is stuck rather than riding out a fault.
+    fn stuck(&self) -> Option<String> {
+        self.streak
+            .as_ref()
+            .filter(|streak| streak.since.elapsed() >= RECOVERY_TIMEOUT)
+            .map(|streak| {
+                format!(
+                    "{} failures in a row since {}, the last one {}",
+                    streak.failures,
+                    stamp_at(self.started, streak.since),
+                    streak.last
+                )
+            })
     }
 
     fn check(&self, name: &str, violations: &mut Vec<String>) {
@@ -1154,15 +2059,34 @@ fn is_forbidden(error: &IggyError) -> bool {
 struct ProducerOutcome {
     producer: u32,
     partition: u32,
+    batch_size: u32,
     /// Batches `0..acked_batches` were acknowledged, in order.
     acked_batches: u64,
     /// The send attempts of every batch that was sent, by batch. One entry
     /// more than `acked_batches` only when the producer gave up on its last
     /// batch. Every attempt can land, so a batch can appear in the log once
-    /// per attempt.
+    /// per attempt. A resend adds its attempts to the batch it repeats.
     attempts: Vec<usize>,
+    /// Acknowledged sends that repeated an earlier acknowledged batch.
+    resent_batches: u64,
     confirmations: Vec<Confirmation>,
     longest_wait: Duration,
+    /// Latency of every main-topic batch that started inside the measure
+    /// window. A paced producer measures from the batch's scheduled start and
+    /// keeps its schedule through the window, so every batch that fell due
+    /// during a stall counts the wait. Without a rate the window is
+    /// closed-loop and measures from the first attempt: a stall yields one
+    /// long sample per producer, and the ack-gap check is what catches it.
+    measured_latencies: Vec<Duration>,
+    /// When each acknowledgement inside the measure window arrived.
+    measured_acks: Vec<Instant>,
+    /// New messages per second this producer was paced at, `None` unpaced.
+    target_rate: Option<f64>,
+    /// When the producer started its pacing schedule.
+    sending_since: Instant,
+    /// From `sending_since` to the end of the chaos phase, when every
+    /// producer leaves the send phase. Set once the producer finished.
+    sending: Duration,
     errors: ErrorTally,
 }
 
@@ -1171,8 +2095,20 @@ impl ProducerOutcome {
         self.attempts.len() as u64
     }
 
+    fn acked_messages(&self) -> u64 {
+        self.acked_batches * u64::from(self.batch_size)
+    }
+
+    /// New messages per second acknowledged while it was sending.
+    fn achieved_rate(&self) -> f64 {
+        if self.sending.is_zero() {
+            return 0.0;
+        }
+        self.acked_messages() as f64 / self.sending.as_secs_f64()
+    }
+
     fn acked_keys(&self) -> impl Iterator<Item = MessageKey> {
-        (0..self.acked_batches).flat_map(|batch| batch_keys(self.producer, batch))
+        (0..self.acked_batches).flat_map(|batch| batch_keys(self.producer, batch, self.batch_size))
     }
 }
 
@@ -1184,37 +2120,73 @@ struct Confirmation {
 
 /// Sends fixed-size batches to one partition. A failed batch is sent again
 /// with the same message ids until it is acknowledged, so a duplicate can
-/// only come from a batch with a failed attempt.
+/// only come from a batch with a failed attempt, or from a deliberate resend
+/// of an acknowledged batch when `IGGY_TEST_CHAOS_RESEND_RATE` is set.
 async fn run_producer(
     client: IggyClient,
     producer: u32,
     phase: watch::Receiver<ProducerPhase>,
     context: TaskContext,
 ) -> ProducerOutcome {
+    let config = context.config;
     let target = context.target;
-    let partition = producer % PARTITIONS;
+    let partition = producer % config.partitions;
     let partitioning = Partitioning::partition_id(partition);
+    // Away from the members' seeds, which follow the run's seed directly.
+    let mut rng = StdRng::seed_from_u64(config.seed.wrapping_add(1_000 + u64::from(producer)));
+    // The rate and the measure window cover the main topic's producers only,
+    // so the history producers keep the fixed pause and record no latencies.
+    let main_topic = target.name == TOPIC_NAME;
+    // `(messages per second, time per batch)` of this producer's share.
+    let pacing = (config.rate > 0 && main_topic).then(|| {
+        let share = config.rate as f64 / f64::from(config.producers);
+        (
+            share,
+            Duration::from_secs_f64(f64::from(config.batch) / share),
+        )
+    });
     let mut outcome = ProducerOutcome {
         producer,
         partition,
+        batch_size: config.batch,
         acked_batches: 0,
         attempts: Vec::new(),
+        resent_batches: 0,
         confirmations: Vec::new(),
         longest_wait: Duration::ZERO,
+        measured_latencies: Vec::new(),
+        measured_acks: Vec::new(),
+        target_rate: pacing.map(|(share, _)| share),
+        sending_since: Instant::now(),
+        sending: Duration::ZERO,
         errors: ErrorTally::new(context.started),
     };
+    let mut pace_start = outcome.sending_since;
+    let mut paced_messages = 0u64;
+    // When the next batch was scheduled to start, for a paced producer.
+    let mut due: Option<Instant> = None;
     while *phase.borrow() == ProducerPhase::Send {
-        let batch = outcome.sent_batches();
-        let mut messages: Vec<IggyMessage> = batch_keys(producer, batch)
+        let resend = config.resend_rate > 0.0
+            && outcome.acked_batches > 0
+            && rng.random_bool(config.resend_rate);
+        let batch = if resend {
+            let recent = outcome.acked_batches.min(RESEND_HISTORY);
+            outcome.acked_batches - 1 - rng.random_range(0..recent)
+        } else {
+            outcome.sent_batches()
+        };
+        let mut messages: Vec<IggyMessage> = batch_keys(producer, batch, config.batch)
             .map(|key| {
                 IggyMessage::builder()
                     .id(u128::from(key))
-                    .payload(key.payload())
+                    .payload(key.payload(config.payload_bytes))
                     .build()
                     .expect("valid message")
             })
             .collect();
+        let measured = main_topic && context.measuring.load(Ordering::Relaxed);
         let first_attempt = Instant::now();
+        let latency_start = due.map_or(first_attempt, |due| due.min(first_attempt));
         let mut attempts = 0;
         let acked =
             loop {
@@ -1228,6 +2200,7 @@ async fn run_producer(
                 .await;
                 match sent {
                     Ok(response) => {
+                        outcome.errors.succeeded();
                         outcome
                             .confirmations
                             .extend(response.confirmations.iter().map(|confirmation| {
@@ -1248,13 +2221,46 @@ async fn run_producer(
                     }
                 }
             };
-        outcome.attempts.push(attempts);
+        if resend {
+            outcome.attempts[batch as usize] += attempts;
+        } else {
+            outcome.attempts.push(attempts);
+        }
         if !acked {
             return outcome;
         }
-        outcome.acked_batches += 1;
-        outcome.longest_wait = outcome.longest_wait.max(first_attempt.elapsed());
-        sleep(PRODUCER_PAUSE).await;
+        let acked_at = Instant::now();
+        if resend {
+            outcome.resent_batches += 1;
+        } else {
+            outcome.acked_batches += 1;
+            paced_messages += u64::from(config.batch);
+        }
+        outcome.longest_wait = outcome.longest_wait.max(acked_at - first_attempt);
+        if measured {
+            outcome.measured_latencies.push(acked_at - latency_start);
+        }
+        let measuring = main_topic && context.measuring.load(Ordering::Relaxed);
+        if measuring {
+            outcome.measured_acks.push(acked_at);
+        }
+        if let Some((share, batch_interval)) = pacing {
+            // Pace new messages at this producer's share of the rate.
+            let mut next_due = pace_start + Duration::from_secs_f64(paced_messages as f64 / share);
+            if !measuring && next_due + batch_interval < acked_at {
+                // More than a batch behind: start the schedule over instead
+                // of bursting the backlog right after a fault. Inside the
+                // measure window the backlog keeps its schedule, so a stall
+                // shows in the latency of every batch that was due during it.
+                pace_start = acked_at;
+                paced_messages = 0;
+                next_due = acked_at;
+            }
+            due = Some(next_due);
+            sleep(next_due.saturating_duration_since(Instant::now())).await;
+        } else {
+            sleep(PRODUCER_PAUSE).await;
+        }
     }
     outcome
 }
@@ -1291,15 +2297,19 @@ impl ConsumerOutcome {
         reader: &Reader,
         partition: u32,
         messages: impl IntoIterator<Item = &'a IggyMessage>,
-        log: &SharedLog,
+        context: &TaskContext,
     ) {
         let mut received = reader.received.lock().expect("received ids lock");
-        let mut log = log.lock().expect("observed log lock");
+        let mut log = context.log.lock().expect("observed log lock");
         for message in messages {
             self.deliveries += 1;
             received.deliveries += 1;
             received.ids.insert(message.header.id);
-            log.observe(&self.name, partition, LogEntry::from(message));
+            log.observe(
+                &self.name,
+                partition,
+                LogEntry::new(message, context.config.payload_bytes),
+            );
         }
     }
 }
@@ -1322,11 +2332,12 @@ async fn poll_and_commit(
         false,
     ))
     .await?;
+    outcome.errors.succeeded();
     let Some(last) = polled.messages.last().map(|message| message.header.offset) else {
         sleep(POLL_PAUSE).await;
         return Ok(());
     };
-    outcome.record(reader, polled.partition_id, &polled.messages, &context.log);
+    outcome.record(reader, polled.partition_id, &polled.messages, context);
     let stored = call(client.store_consumer_offset(
         &reader.consumer,
         &target.stream,
@@ -1457,11 +2468,12 @@ async fn run_iggy_consumer(
             }
             next = consumer.next() => match next {
                 Some(Ok(received)) => {
+                    outcome.errors.succeeded();
                     outcome.record(
                         &reader,
                         received.partition_id,
                         [&received.message],
-                        &context.log,
+                        &context,
                     );
                 }
                 Some(Err(error)) => outcome.errors.record(&Failure::Iggy(error)),
@@ -1490,7 +2502,10 @@ async fn sample_group(
     context: TaskContext,
 ) -> SamplerOutcome {
     let TaskContext {
-        target, started, ..
+        target,
+        started,
+        config,
+        ..
     } = context;
     let mut outcome = SamplerOutcome {
         samples: 0,
@@ -1501,7 +2516,7 @@ async fn sample_group(
         match call(client.get_consumer_group(&target.stream, &target.topic, &target.group)).await {
             Ok(Some(group)) => {
                 outcome.samples += 1;
-                if let Err(problem) = check_assignment(&group) {
+                if let Err(problem) = check_assignment(&group, config.partitions) {
                     outcome
                         .violations
                         .push(format!("{} {problem}", stamp(started)));
@@ -1518,13 +2533,13 @@ async fn sample_group(
     outcome
 }
 
-fn check_assignment(group: &ConsumerGroupDetails) -> Result<(), String> {
+fn check_assignment(group: &ConsumerGroupDetails, partitions: u32) -> Result<(), String> {
     let mut owners = HashMap::new();
     for member in &group.members {
         for &partition in &member.partitions {
-            if partition >= PARTITIONS {
+            if partition >= partitions {
                 return Err(format!(
-                    "member {} holds partition {partition} of a {PARTITIONS}-partition topic",
+                    "member {} holds partition {partition} of a {partitions}-partition topic",
                     member.id
                 ));
             }
@@ -1540,115 +2555,457 @@ fn check_assignment(group: &ConsumerGroupDetails) -> Result<(), String> {
 }
 
 #[derive(Default)]
-struct KillStats {
+struct FaultStats {
     kills: u32,
     /// Kills of a node that named itself leader right before it died.
     leader_kills: u32,
+    stops: u32,
+    pauses: u32,
+    isolations: u32,
+    /// Times every node was killed at once.
+    outages: u32,
+    /// When the measure window opened and closed, if it ran.
+    measure_window: Option<(Instant, Instant)>,
 }
 
-/// Kills a random node every kill interval and restarts it after the
-/// downtime. Prints each kill and restart as it happens, so a hung run shows
-/// where it stopped.
+/// What the plan has broken and not yet restored.
+#[derive(Default)]
+struct Broken {
+    /// Killed or stopped nodes. A paused or isolated node still runs.
+    down: HashSet<usize>,
+    paused: HashSet<usize>,
+    isolated: HashSet<usize>,
+}
+
+/// Applies the scenario's fault plan step by step, then keeps the fault-free
+/// measure window if one is configured. Prints each action as it happens, so
+/// a hung run shows where it stopped. A plan that ends early restores what it
+/// left broken before it returns.
 async fn run_monkey(
     harness: &mut TestHarness,
     config: &ChaosConfig,
     started: Instant,
+    measuring: &AtomicBool,
     violations: &mut Vec<String>,
     report: &mut Report,
-) -> KillStats {
-    let mut rng = StdRng::seed_from_u64(config.seed);
+) -> FaultStats {
     let chaos_end = started + config.duration;
-    let mut stats = KillStats::default();
-    let mut next_kill = started + config.kill_interval;
-    while next_kill + config.downtime <= chaos_end {
-        if !watch_nodes(harness, next_kill, None, started, violations, report).await {
-            return stats;
-        }
-        let victim = rng.random_range(0..CLUSTER_NODES);
-        let leader = leader_seen_by(harness, victim).await;
-        let pid = harness.node(victim).pid();
-        report
-            .record(
-                "kill_requested",
-                json!({
-                    "node": victim, "pid": pid,
-                    "scheduled_elapsed_ms": next_kill.duration_since(started).as_millis(),
-                    "chaos_elapsed_ms": started.elapsed().as_millis(),
-                    "leader": leader.as_ref().ok(), "leader_error": leader.as_ref().err(),
-                }),
+    let mut stats = FaultStats::default();
+    let mut broken = Broken::default();
+    for step in config.plan() {
+        let due = started + step.at;
+        let healthy = watch_nodes(
+            harness,
+            due,
+            &broken.down,
+            config.nodes,
+            started,
+            violations,
+            report,
+        )
+        .await;
+        if !healthy
+            || !apply(
+                harness,
+                config,
+                step,
+                &mut broken,
+                &mut stats,
+                started,
+                violations,
+                report,
             )
-            .expect("write kill request");
-        harness.kill_node(victim).expect("SIGKILL a node");
-        report
-            .record("killed", json!({"node": victim, "pid": pid}))
-            .expect("write kill result");
-        stats.kills += 1;
-        if leader == Ok(victim) {
-            stats.leader_kills += 1;
-        }
-        println!(
-            "{} kill node {victim} ({})",
-            stamp(started),
-            describe_leader(victim, &leader)
-        );
-        let back_at = Instant::now() + config.downtime;
-        if !watch_nodes(harness, back_at, Some(victim), started, violations, report).await {
+            .await
+        {
+            restore_outstanding(harness, &mut broken, started, violations, report);
             return stats;
         }
-        // A panic before the kill shows only in this incarnation's stderr,
-        // which the restart truncates.
-        if let Some(stderr) = panic_report(harness, victim) {
-            violations.push(format!(
-                "{} node {victim} panicked before it was killed:\n{stderr}",
-                stamp(started)
-            ));
-        }
-        let restarting = Instant::now();
-        if !restart(harness, victim, started, violations, report) {
-            return stats;
-        }
-        println!(
-            "{} restart node {victim} (up after {:.1}s)",
-            stamp(started),
-            restarting.elapsed().as_secs_f64()
-        );
-        next_kill += config.kill_interval;
     }
-    watch_nodes(harness, chaos_end, None, started, violations, report).await;
+    if !config.measure.is_zero() {
+        report
+            .record("phase", json!({"name": "measure"}))
+            .expect("write measure phase");
+        wait_for_mesh(harness, config, started, report).await;
+        println!(
+            "{} faults over, measuring sends for {}s",
+            stamp(started),
+            config.measure.as_secs()
+        );
+        let window_start = Instant::now();
+        let window_end = window_start + config.measure;
+        measuring.store(true, Ordering::Relaxed);
+        let healthy = watch_nodes(
+            harness,
+            window_end,
+            &broken.down,
+            config.nodes,
+            started,
+            violations,
+            report,
+        )
+        .await;
+        measuring.store(false, Ordering::Relaxed);
+        stats.measure_window = Some((window_start, Instant::now()));
+        if !healthy {
+            restore_outstanding(harness, &mut broken, started, violations, report);
+            return stats;
+        }
+    }
+    watch_nodes(
+        harness,
+        chaos_end,
+        &broken.down,
+        config.nodes,
+        started,
+        violations,
+        report,
+    )
+    .await;
     stats
 }
 
-/// Sleeps until `until`, checking every node except `down` once a second. A
+/// Waits, at most one kill interval, until every node runs and has logged a
+/// complete replica mesh, so the measure window starts on a formed cluster
+/// rather than on the tail of the last restart.
+async fn wait_for_mesh(
+    harness: &TestHarness,
+    config: &ChaosConfig,
+    started: Instant,
+    report: &mut Report,
+) {
+    let waiting = Instant::now();
+    let deadline = waiting + config.kill_interval;
+    let settled = loop {
+        let formed = harness
+            .all_servers()
+            .iter()
+            .all(|server| server.is_running() && server.replica_mesh_complete());
+        if formed || Instant::now() >= deadline {
+            break formed;
+        }
+        sleep(HEALTH_CHECK_INTERVAL).await;
+    };
+    report
+        .record(
+            "measure_settled",
+            json!({"waited_ms": waiting.elapsed().as_millis(), "settled": settled}),
+        )
+        .expect("write measure settle");
+    if !settled {
+        println!(
+            "{} the replica mesh did not form within {}s, measuring anyway",
+            stamp(started),
+            config.kill_interval.as_secs()
+        );
+    }
+}
+
+/// Resumes paused nodes, heals isolated ones and tries to restart the ones
+/// down, so a plan that ends early still hands the drain a whole cluster.
+/// Best effort: a failed restart is recorded and the rest go on.
+fn restore_outstanding(
+    harness: &mut TestHarness,
+    broken: &mut Broken,
+    started: Instant,
+    violations: &mut Vec<String>,
+    report: &mut Report,
+) {
+    for node in std::mem::take(&mut broken.paused) {
+        let pid = signal_node(harness, node, libc::SIGCONT, started, violations);
+        report
+            .record(
+                "resumed",
+                json!({"node": node, "pid": pid, "plan_aborted": true}),
+            )
+            .expect("write resume");
+        println!("{} resume node {node} after the plan ended", stamp(started));
+    }
+    for node in std::mem::take(&mut broken.isolated) {
+        let healed = harness.heal_node(node);
+        report
+            .record(
+                "healed",
+                json!({
+                    "node": node, "plan_aborted": true,
+                    "error": healed.as_ref().err().map(ToString::to_string),
+                }),
+            )
+            .expect("write heal");
+        if let Err(error) = healed {
+            violations.push(format!(
+                "{} node {node} could not be healed after the plan ended: {error}",
+                stamp(started)
+            ));
+        }
+        println!("{} heal node {node} after the plan ended", stamp(started));
+    }
+    let mut down: Vec<usize> = std::mem::take(&mut broken.down).into_iter().collect();
+    down.sort_unstable();
+    for node in down {
+        // As in `apply`: the restart truncates the logs that show a fatal
+        // error from before the fault.
+        if let Some(problem) = fatal_report(harness, node) {
+            violations.push(format!(
+                "{} node {node} {problem} before it was restarted",
+                stamp(started)
+            ));
+        }
+        if !restart(harness, node, started, violations, report) {
+            broken.down.insert(node);
+        }
+    }
+}
+
+/// Applies one fault action and tracks what is broken. Returns false when a
+/// node cannot be restarted, which ends the plan.
+#[allow(clippy::too_many_arguments)]
+async fn apply(
+    harness: &mut TestHarness,
+    config: &ChaosConfig,
+    step: Step,
+    broken: &mut Broken,
+    stats: &mut FaultStats,
+    started: Instant,
+    violations: &mut Vec<String>,
+    report: &mut Report,
+) -> bool {
+    match step.action {
+        Action::Kill(victim) => {
+            let leader = leader_seen_by(harness, victim, config.nodes).await;
+            let pid = harness.node(victim).pid();
+            report
+                .record(
+                    "kill_requested",
+                    json!({
+                        "node": victim, "pid": pid,
+                        "scheduled_elapsed_ms": step.at.as_millis(),
+                        "chaos_elapsed_ms": started.elapsed().as_millis(),
+                        "leader": leader.as_ref().ok(), "leader_error": leader.as_ref().err(),
+                    }),
+                )
+                .expect("write kill request");
+            harness.kill_node(victim).expect("SIGKILL a node");
+            report
+                .record("killed", json!({"node": victim, "pid": pid}))
+                .expect("write kill result");
+            broken.down.insert(victim);
+            stats.kills += 1;
+            if leader == Ok(victim) {
+                stats.leader_kills += 1;
+            }
+            println!(
+                "{} kill node {victim} ({})",
+                stamp(started),
+                describe_leader(victim, &leader)
+            );
+        }
+        Action::Restart(node) | Action::Start(node) => {
+            // A fatal error before the fault shows only in this incarnation's
+            // logs, which the restart truncates.
+            if let Some(problem) = fatal_report(harness, node) {
+                violations.push(format!(
+                    "{} node {node} {problem} before it was restarted",
+                    stamp(started)
+                ));
+            }
+            let restarting = Instant::now();
+            if !restart(harness, node, started, violations, report) {
+                return false;
+            }
+            broken.down.remove(&node);
+            println!(
+                "{} restart node {node} (up after {:.1}s)",
+                stamp(started),
+                restarting.elapsed().as_secs_f64()
+            );
+        }
+        Action::Stop(node) => {
+            let pid = harness.node(node).pid();
+            report
+                .record("stop_requested", json!({"node": node, "pid": pid}))
+                .expect("write stop request");
+            harness.stop_node(node).expect("stop a node gracefully");
+            let outcome = harness.node(node).last_stop();
+            let mut stopped = stop_fields(outcome);
+            stopped["node"] = json!(node);
+            stopped["pid"] = json!(pid);
+            report
+                .record("stopped", stopped)
+                .expect("write stop result");
+            if let Some(problem) = unclean_stop(harness.node(node)) {
+                violations.push(format!("{} node {node} {problem}", stamp(started)));
+            }
+            broken.down.insert(node);
+            stats.stops += 1;
+            println!("{} stop node {node}", stamp(started));
+        }
+        Action::Pause(node) => {
+            let Some(pid) = signal_node(harness, node, libc::SIGSTOP, started, violations) else {
+                return true;
+            };
+            report
+                .record("paused", json!({"node": node, "pid": pid}))
+                .expect("write pause");
+            broken.paused.insert(node);
+            stats.pauses += 1;
+            println!("{} pause node {node}", stamp(started));
+        }
+        Action::Resume(node) => {
+            if !broken.paused.remove(&node) {
+                return true;
+            }
+            let pid = signal_node(harness, node, libc::SIGCONT, started, violations);
+            report
+                .record("resumed", json!({"node": node, "pid": pid}))
+                .expect("write resume");
+            println!("{} resume node {node}", stamp(started));
+        }
+        Action::Isolate(node) => {
+            harness
+                .isolate_node(node)
+                .expect("cut the node's peer links");
+            report
+                .record("isolated", json!({"node": node}))
+                .expect("write isolation");
+            broken.isolated.insert(node);
+            stats.isolations += 1;
+            println!("{} isolate node {node} from its peers", stamp(started));
+        }
+        Action::Heal(node) => {
+            harness
+                .heal_node(node)
+                .expect("restore the node's peer links");
+            report
+                .record("healed", json!({"node": node}))
+                .expect("write heal");
+            broken.isolated.remove(&node);
+            println!("{} heal node {node}", stamp(started));
+        }
+        Action::KillAll => {
+            let pids = node_pids(harness, config.nodes);
+            report
+                .record("kill_all_requested", json!({"pids": pids}))
+                .expect("write outage request");
+            harness.kill_cluster().expect("SIGKILL every node");
+            report
+                .record("killed_all", json!({"pids": pids}))
+                .expect("write outage result");
+            broken.down.extend(0..config.nodes);
+            stats.outages += 1;
+            println!("{} kill every node", stamp(started));
+        }
+        Action::RestartAll => {
+            for node in 0..config.nodes {
+                if let Some(problem) = fatal_report(harness, node) {
+                    violations.push(format!(
+                        "{} node {node} {problem} before it was restarted",
+                        stamp(started)
+                    ));
+                }
+            }
+            report
+                .record("restart_all_requested", json!({}))
+                .expect("write cluster restart request");
+            let restarting = Instant::now();
+            if let Err(error) = harness.restart_cluster().await {
+                report
+                    .record(
+                        "restart_failed",
+                        json!({"nodes": "all", "error": error.to_string()}),
+                    )
+                    .expect("write cluster restart failure");
+                violations.push(format!(
+                    "{} the cluster failed to restart: {error}",
+                    stamp(started)
+                ));
+                return false;
+            }
+            report
+                .record(
+                    "restarted_all",
+                    json!({"pids": node_pids(harness, config.nodes)}),
+                )
+                .expect("write cluster restart result");
+            broken.down.clear();
+            println!(
+                "{} restart every node (up after {:.1}s)",
+                stamp(started),
+                restarting.elapsed().as_secs_f64()
+            );
+        }
+    }
+    true
+}
+
+fn node_pids(harness: &TestHarness, nodes: usize) -> Vec<Option<u32>> {
+    (0..nodes).map(|node| harness.node(node).pid()).collect()
+}
+
+/// Sends `signal` to the node's process and returns the pid, or records a
+/// violation and returns `None` when the signal cannot be delivered.
+fn signal_node(
+    harness: &TestHarness,
+    node: usize,
+    signal: libc::c_int,
+    started: Instant,
+    violations: &mut Vec<String>,
+) -> Option<u32> {
+    let Some(pid) = harness.node(node).pid() else {
+        violations.push(format!(
+            "{} signal {signal} to node {node}: the node has no process",
+            stamp(started)
+        ));
+        return None;
+    };
+    // SAFETY: plain syscall on a pid from the harness's child handle. If the
+    // child already exited and the watchdog reaped it, the pid is gone and
+    // `kill` fails with ESRCH, which is handled below.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } != 0 {
+        let error = std::io::Error::last_os_error();
+        violations.push(format!(
+            "{} signal {signal} to node {node} (pid {pid}) failed: {error}",
+            stamp(started)
+        ));
+        return None;
+    }
+    Some(pid)
+}
+
+/// Sleeps until `until`, checking every node not in `down` once a second. A
 /// node that died on its own is a violation. It is restarted, so the run
 /// keeps its fault budget. Returns false when a node cannot be restarted.
 async fn watch_nodes(
     harness: &mut TestHarness,
     until: Instant,
-    down: Option<usize>,
+    down: &HashSet<usize>,
+    nodes: usize,
     started: Instant,
     violations: &mut Vec<String>,
     report: &mut Report,
 ) -> bool {
     loop {
-        for node in (0..CLUSTER_NODES).filter(|&node| Some(node) != down) {
+        for node in (0..nodes).filter(|node| !down.contains(node)) {
             if harness.node(node).is_running() {
                 continue;
             }
+            // Read before the restart truncates this incarnation's logs.
             let (_, stderr) = harness.node(node).collect_logs();
+            let fatal = fatal_report(harness, node);
             report
                 .record(
                     "unexpected_exit",
                     json!({
                         "node": node,
                         "pid": harness.node(node).pid(),
+                        "fatal": fatal,
                         "stderr_tail": tail(&stderr),
                     }),
                 )
                 .expect("write unexpected exit");
+            let detail = fatal.unwrap_or_else(|| format!("stderr tail:\n{}", tail(&stderr)));
             violations.push(format!(
-                "{} node {node} exited without being killed:\n{}",
-                stamp(started),
-                tail(&stderr)
+                "{} node {node} exited without being killed: {detail}",
+                stamp(started)
             ));
             if !restart(harness, node, started, violations, report) {
                 return false;
@@ -1701,7 +3058,7 @@ fn restart(
 /// The leader as `node` sees it, asked over a fresh HTTP client. A long-lived
 /// TCP client does not work here: the SDK never reconnects for a metadata
 /// call, so the client stays disconnected once its node dies.
-async fn leader_seen_by(harness: &TestHarness, node: usize) -> Result<usize, String> {
+async fn leader_seen_by(harness: &TestHarness, node: usize, nodes: usize) -> Result<usize, String> {
     let lookup = async {
         let client = connect_http(harness, node)
             .await
@@ -1719,7 +3076,7 @@ async fn leader_seen_by(harness: &TestHarness, node: usize) -> Result<usize, Str
         .iter()
         .find(|node| node.role == ClusterNodeRole::Leader)
         .ok_or_else(|| "no node is marked leader".to_owned())?;
-    (0..CLUSTER_NODES)
+    (0..nodes)
         .find(|&index| {
             harness
                 .node(index)
@@ -1743,10 +3100,11 @@ fn describe_leader(victim: usize, leader: &Result<usize, String>) -> String {
 /// the checks go on with the other nodes, so the report still prints.
 async fn connect_verifiers(
     harness: &TestHarness,
+    nodes: usize,
     violations: &mut Vec<String>,
 ) -> Vec<(usize, IggyClient)> {
-    let mut verifiers = Vec::with_capacity(CLUSTER_NODES);
-    for node in 0..CLUSTER_NODES {
+    let mut verifiers = Vec::with_capacity(nodes);
+    for node in 0..nodes {
         match timeout(CALL_TIMEOUT, connect_http(harness, node)).await {
             Ok(Ok(client)) => verifiers.push((node, client)),
             Ok(Err(error)) => violations.push(format!("node {node}: no HTTP verifier: {error}")),
@@ -1767,7 +3125,34 @@ async fn connect_http(harness: &TestHarness, node: usize) -> Result<IggyClient, 
         .await
 }
 
-/// A node's own answer about the topic, the stored offsets and the group.
+/// A TCP client for the partition reads of the verification: polls and
+/// stored offsets are served by each partition's primary only, and the
+/// server routes a TCP client there. Tries every node once.
+async fn connect_reader(harness: &TestHarness, nodes: usize) -> Result<IggyClient, String> {
+    let mut problems = Vec::with_capacity(nodes);
+    for node in 0..nodes {
+        let connect = async {
+            harness
+                .node(node)
+                .tcp_client()
+                .map_err(|error| error.to_string())?
+                .with_reconnecting_root_login()
+                .connect()
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match timeout(CALL_TIMEOUT, connect).await {
+            Ok(Ok(client)) => return Ok(client),
+            Ok(Err(error)) => problems.push(format!("node {node}: {error}")),
+            Err(_) => problems.push(format!(
+                "node {node}: no connection within {CALL_TIMEOUT:?}"
+            )),
+        }
+    }
+    Err(problems.join("; "))
+}
+
+/// A node's own answer about the topic and the group.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct NodeView {
     /// `None` when the node does not know the topic.
@@ -1784,21 +3169,37 @@ struct PartitionView {
     current_offset: u64,
     messages_count: u64,
     segments_count: u32,
-    /// What each of the partition's `http_readers` stored, in reader order.
-    stored_offsets: Vec<Option<u64>>,
 }
 
-/// The readers of `partition` whose stored offset a node reports over HTTP.
-/// The group is not one of them: HTTP drops `Consumer::kind`, so the read
-/// would name a standalone consumer called like the group. The drain reads
-/// the group's offsets over TCP instead.
-fn http_readers(readers: &[Arc<Reader>], partition: u32) -> impl Iterator<Item = &Arc<Reader>> {
-    readers.iter().filter(move |reader| {
-        reader.consumer.kind == ConsumerKind::Consumer && reader.reads(partition)
-    })
+/// What each reader stored in each partition it reads, as the partition's
+/// primary answers: `stored[partition][reader]`, in reader order.
+type StoredOffsets = Vec<Vec<Option<u64>>>;
+
+async fn stored_offsets(
+    reader: &IggyClient,
+    readers: &[Arc<Reader>],
+    partitions: u32,
+) -> Result<StoredOffsets, Failure> {
+    let target = Target::new();
+    let mut stored = Vec::with_capacity(partitions as usize);
+    for partition in 0..partitions {
+        let mut offsets = Vec::with_capacity(readers.len());
+        for owner in readers.iter().filter(|owner| owner.reads(partition)) {
+            let offset = call(reader.get_consumer_offset(
+                &owner.consumer,
+                &target.stream,
+                &target.topic,
+                Some(partition),
+            ))
+            .await?;
+            offsets.push(offset.map(|offset| offset.stored_offset));
+        }
+        stored.push(offsets);
+    }
+    Ok(stored)
 }
 
-async fn node_view(client: &IggyClient, readers: &[Arc<Reader>]) -> Result<NodeView, Failure> {
+async fn node_view(client: &IggyClient) -> Result<NodeView, Failure> {
     let target = Target::new();
     let members = call(client.get_consumer_group(&target.stream, &target.topic, &target.group))
         .await?
@@ -1816,63 +3217,56 @@ async fn node_view(client: &IggyClient, readers: &[Arc<Reader>]) -> Result<NodeV
             members
         });
     Ok(NodeView {
-        partitions: partition_views(client, &target, readers).await?,
-        history: partition_views(client, &Target::history(), &[]).await?,
+        partitions: partition_views(client, &target).await?,
+        history: partition_views(client, &Target::history()).await?,
         members,
     })
 }
 
-/// A node's own answer about one topic and the stored offsets of the readers
-/// of each partition.
+/// A node's own answer about one topic.
 async fn partition_views(
     client: &IggyClient,
     target: &Target,
-    readers: &[Arc<Reader>],
 ) -> Result<Option<Vec<PartitionView>>, Failure> {
     let Some(topic) = call(client.get_topic(&target.stream, &target.topic)).await? else {
         return Ok(None);
     };
-    let mut partitions = Vec::with_capacity(topic.partitions.len());
-    for partition in topic.partitions {
-        let mut stored_offsets = Vec::new();
-        for reader in http_readers(readers, partition.id) {
-            let stored = call(client.get_consumer_offset(
-                &reader.consumer,
-                &target.stream,
-                &target.topic,
-                Some(partition.id),
-            ))
-            .await?;
-            stored_offsets.push(stored.map(|offset| offset.stored_offset));
-        }
-        partitions.push(PartitionView {
+    let partitions = topic
+        .partitions
+        .into_iter()
+        .map(|partition| PartitionView {
             current_offset: partition.current_offset,
             messages_count: partition.messages_count,
             segments_count: partition.segments_count,
-            stored_offsets,
-        });
-    }
+        })
+        .collect();
     Ok(Some(partitions))
 }
 
 /// Waits until the nodes reach the end state that `end_state_problems`
-/// describes. Returns the first node's view for the log checks.
+/// describes. Returns the first readable node's view, and whether the nodes
+/// converged, so the log checks trust that view only then.
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_convergence(
     verifiers: &[(usize, IggyClient)],
+    reader: &IggyClient,
     readers: &[Arc<Reader>],
+    config: &ChaosConfig,
     started: Instant,
     violations: &mut Vec<String>,
     report: &mut Report,
-) -> Option<NodeView> {
+) -> Convergence {
+    let nodes = config.nodes;
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let mut views = Vec::with_capacity(verifiers.len());
         for (node, verifier) in verifiers {
-            views.push((*node, node_view(verifier, readers).await));
+            views.push((*node, node_view(verifier).await));
         }
-        let mut problems = end_state_problems(&views, readers);
+        let stored = stored_offsets(reader, readers, config.partitions).await;
+        let mut problems = end_state_problems(&views, &stored, readers);
         if problems.is_empty() {
-            if verifiers.len() == CLUSTER_NODES {
+            if verifiers.len() == nodes {
                 println!("{} nodes converged", stamp(started));
             }
         } else if Instant::now() >= deadline {
@@ -1884,9 +3278,9 @@ async fn wait_for_convergence(
             sleep(CONVERGENCE_RETRY).await;
             continue;
         }
-        if verifiers.len() != CLUSTER_NODES {
+        if verifiers.len() != nodes {
             problems.push(format!(
-                "only {} of {CLUSTER_NODES} nodes have HTTP verifiers",
+                "only {} of {nodes} nodes have HTTP verifiers",
                 verifiers.len()
             ));
         }
@@ -1904,27 +3298,45 @@ async fn wait_for_convergence(
         }
         report
             .record(
+                "stored_offsets",
+                json!({
+                    "offsets": stored.as_ref().ok(),
+                    "error": stored.as_ref().err().map(ToString::to_string),
+                }),
+            )
+            .expect("write stored offsets");
+        report
+            .record(
                 "check",
                 json!({
                     "name": "convergence",
                     "outcome": if problems.is_empty() { "passed" } else { "failed" },
                     "nodes": verifiers.len(),
-                    "expected_nodes": CLUSTER_NODES,
+                    "expected_nodes": nodes,
                     "violations": problems,
                 }),
             )
             .expect("write convergence result");
-        return views.into_iter().find_map(|(_, view)| view.ok());
+        return Convergence {
+            converged: problems.is_empty(),
+            view: views.into_iter().find_map(|(_, view)| view.ok()),
+        };
     }
+}
+
+struct Convergence {
+    view: Option<NodeView>,
+    converged: bool,
 }
 
 /// What keeps the nodes from the end state. Every node answers the same, and
 /// both topics exist. The group is empty: every member left, and the members
-/// stranded on killed nodes expired. Every standalone reader stored the end
-/// of its partitions. Each partition of the main topic keeps only its active
+/// stranded on killed nodes expired. Every reader stored the end of its
+/// partitions. Each partition of the main topic keeps only its active
 /// segment, because every sealed one expired.
 fn end_state_problems(
     views: &[(usize, Result<NodeView, Failure>)],
+    stored: &Result<StoredOffsets, Failure>,
     readers: &[Arc<Reader>],
 ) -> Vec<String> {
     let mut problems = Vec::new();
@@ -1940,6 +3352,13 @@ fn end_state_problems(
             }
         }
     }
+    let stored = match stored {
+        Ok(stored) => Some(stored),
+        Err(failure) => {
+            problems.push(format!("the stored offsets cannot be read: {failure}"));
+            None
+        }
+    };
     let Some((_, view)) = reference else {
         return problems;
     };
@@ -1958,7 +3377,12 @@ fn end_state_problems(
         return problems;
     };
     for (partition, view) in (0u32..).zip(partitions) {
-        for (reader, stored) in http_readers(readers, partition).zip(&view.stored_offsets) {
+        let owners = readers.iter().filter(|reader| reader.reads(partition));
+        let offsets = stored
+            .and_then(|stored| stored.get(partition as usize))
+            .into_iter()
+            .flatten();
+        for (reader, stored) in owners.zip(offsets) {
             if *stored != Some(view.current_offset) {
                 problems.push(format!(
                     "partition {partition}: {} stored offset {stored:?}, the partition ends at {}",
@@ -1976,32 +3400,50 @@ fn end_state_problems(
     problems
 }
 
+/// A message as read at one offset. Only whether the payload matched its id
+/// is kept, so the observed log stays small at high rates.
 #[derive(Debug, PartialEq, Eq)]
 struct LogEntry {
     offset: u64,
     id: u128,
-    payload: Bytes,
+    payload_ok: bool,
 }
 
-impl From<&IggyMessage> for LogEntry {
-    fn from(message: &IggyMessage) -> Self {
+impl LogEntry {
+    fn new(message: &IggyMessage, payload_bytes: usize) -> Self {
+        let id = message.header.id;
         Self {
             offset: message.header.offset,
-            id: message.header.id,
-            payload: message.payload.clone(),
+            id,
+            payload_ok: MessageKey::try_from(id)
+                .is_ok_and(|key| key.payload_matches(&message.payload, payload_bytes)),
         }
     }
 }
 
-/// Reads what a node retains of each partition. The read from offset 0
-/// starts at the oldest message that expiry left.
-async fn read_log(client: &IggyClient, target: &Target) -> Result<Vec<Vec<LogEntry>>, Failure> {
+/// Reads what the partition primaries retain of each partition. The read
+/// from offset 0 starts at the oldest message that expiry left. An empty poll
+/// at an offset the nodes still list is retried before it ends the read, and
+/// those retries are counted per partition.
+async fn read_log(
+    client: &IggyClient,
+    target: &Target,
+    partitions: u32,
+    views: Option<&[PartitionView]>,
+    payload_bytes: usize,
+) -> Result<(Vec<Vec<LogEntry>>, Vec<u32>), Failure> {
     let consumer = Consumer::new(
         Identifier::numeric(VERIFIER_CONSUMER_ID).expect("valid verifier consumer id"),
     );
-    let mut log = Vec::with_capacity(PARTITIONS as usize);
-    for partition in 0..PARTITIONS {
+    let mut log = Vec::with_capacity(partitions as usize);
+    let mut empty_polls = Vec::with_capacity(partitions as usize);
+    for partition in 0..partitions {
+        let listed_end = views
+            .and_then(|views| views.get(partition as usize))
+            .filter(|view| view.messages_count > 0)
+            .map(|view| view.current_offset);
         let mut entries: Vec<LogEntry> = Vec::new();
+        let mut retries = 0;
         loop {
             let next = entries.last().map_or(0, |entry| entry.offset + 1);
             let polled = call(client.poll_messages(
@@ -2014,47 +3456,65 @@ async fn read_log(client: &IggyClient, target: &Target) -> Result<Vec<Vec<LogEnt
                 false,
             ))
             .await?;
+            if polled.messages.is_empty() {
+                if listed_end.is_some_and(|end| next <= end) && retries < SETTLE_RETRIES {
+                    retries += 1;
+                    sleep(SETTLE_PAUSE).await;
+                    continue;
+                }
+                break;
+            }
             // A reply that does not move forward ends the read. The offset
             // check reports what it returned.
             let progressed = polled
                 .messages
                 .last()
                 .is_some_and(|message| message.header.offset >= next);
-            entries.extend(polled.messages.iter().map(LogEntry::from));
+            entries.extend(
+                polled
+                    .messages
+                    .iter()
+                    .map(|message| LogEntry::new(message, payload_bytes)),
+            );
             if !progressed {
                 break;
             }
         }
         log.push(entries);
+        empty_polls.push(retries);
     }
-    Ok(log)
+    Ok((log, empty_polls))
 }
 
-/// Reads both topics from every node and requires the nodes to agree. What
-/// they retain joins each topic's observed log, which is then checked against
-/// what the producers sent and what every reader received.
+/// Reads both topics from their partition primaries. What they retain joins
+/// each topic's observed log, which is then checked against what the
+/// producers sent and what every reader received. The replicas themselves
+/// are compared at rest, after the stop.
 async fn verify_logs(
-    verifiers: &[(usize, IggyClient)],
+    reader: &IggyClient,
     view: Option<&NodeView>,
+    config: &ChaosConfig,
     outcomes: &mut Outcomes,
     violations: &mut Vec<String>,
     report: &mut Report,
 ) -> [LogStats; 2] {
     let partitions = view.and_then(|view| view.partitions.as_deref());
     let history = view.and_then(|view| view.history.as_deref());
-    read_retained(
-        verifiers,
+    let empty_polls = read_retained(
+        reader,
         &Target::new(),
         partitions,
+        config,
         &mut outcomes.log,
         violations,
         report,
     )
     .await;
-    read_retained(
-        verifiers,
+    let history_empty_polls = read_retained(
+        reader,
         &Target::history(),
         history,
+        config,
         &mut outcomes.history_log,
         violations,
         report,
@@ -2069,67 +3529,86 @@ async fn verify_logs(
             "expiry deleted no segment of {TOPIC_NAME}, so the run did not test expiry"
         ));
     }
-    [
-        check_log(
-            TOPIC_NAME,
-            &outcomes.log,
-            &outcomes.producers,
-            &outcomes.readers,
-            partitions,
-            violations,
-        ),
-        check_log(
-            HISTORY_TOPIC_NAME,
-            &outcomes.history_log,
-            &outcomes.history_producers,
-            &[],
-            history,
-            violations,
-        ),
-    ]
+    let mut stats = check_log(
+        TOPIC_NAME,
+        &outcomes.log,
+        &outcomes.producers,
+        &outcomes.readers,
+        partitions,
+        config,
+        violations,
+    );
+    stats.empty_polls_mid_log = empty_polls;
+    let mut history_stats = check_log(
+        HISTORY_TOPIC_NAME,
+        &outcomes.history_log,
+        &outcomes.history_producers,
+        &[],
+        history,
+        config,
+        violations,
+    );
+    history_stats.empty_polls_mid_log = history_empty_polls;
+    [stats, history_stats]
 }
 
-/// Reads what every node retains of one topic and requires the nodes to
-/// agree. The first copy that a node returned joins the topic's observed log.
+/// Reads what the partition primaries retain of one topic. It joins the
+/// topic's observed log. Returns how many empty polls below a listed end the
+/// read retried.
 async fn read_retained(
-    verifiers: &[(usize, IggyClient)],
+    reader: &IggyClient,
     target: &Target,
     partitions: Option<&[PartitionView]>,
+    config: &ChaosConfig,
     log: &mut ObservedLog,
     violations: &mut Vec<String>,
     report: &mut Report,
-) {
+) -> u64 {
     let topic = target.name;
-    let mut reference = None;
-    for (node, verifier) in verifiers {
-        let retained = match read_log(verifier, target).await {
-            Ok(retained) => retained,
-            Err(failure) => {
-                violations.push(format!("node {node}: cannot read {topic}: {failure}"));
-                continue;
-            }
-        };
-        for (partition, entries) in retained.iter().enumerate() {
-            report
-                .record(
-                    "retained_range",
-                    json!({
-                        "node": node, "topic": topic, "partition": partition,
-                        "messages_count": entries.len(),
-                        "first_offset": entries.first().map(|entry| entry.offset),
-                        "last_offset": entries.last().map(|entry| entry.offset),
-                    }),
-                )
-                .expect("write retained range");
+    let read = read_log(
+        reader,
+        target,
+        config.partitions,
+        partitions,
+        config.payload_bytes,
+    )
+    .await;
+    let (retained, empty_polls) = match read {
+        Ok(read) => read,
+        Err(failure) => {
+            violations.push(format!("cannot read {topic}: {failure}"));
+            return 0;
         }
-        match &reference {
-            None => reference = Some(retained),
-            Some(reference) => compare_logs(topic, *node, reference, &retained, violations),
-        }
-    }
-    let Some(retained) = reference else {
-        return;
     };
+    let mut empty_polls_total = 0;
+    for (partition, (entries, empty_polls)) in retained.iter().zip(&empty_polls).enumerate() {
+        empty_polls_total += u64::from(*empty_polls);
+        report
+            .record(
+                "retained_range",
+                json!({
+                    "topic": topic, "partition": partition,
+                    "messages_count": entries.len(),
+                    "first_offset": entries.first().map(|entry| entry.offset),
+                    "last_offset": entries.last().map(|entry| entry.offset),
+                    "empty_polls_mid_log": empty_polls,
+                }),
+            )
+            .expect("write retained range");
+    }
+    if empty_polls_total > 0 {
+        report
+            .record(
+                "check",
+                json!({
+                    "name": "settled_reads",
+                    "outcome": "failed",
+                    "topic": topic,
+                    "empty_polls_mid_log": empty_polls,
+                }),
+            )
+            .expect("write settled-read anomaly");
+    }
     if let Some(partitions) = partitions {
         check_retained(topic, &retained, partitions, violations);
     }
@@ -2138,28 +3617,7 @@ async fn read_retained(
             log.observe("the final read", partition, entry);
         }
     }
-}
-
-fn compare_logs(
-    topic: &str,
-    node: usize,
-    reference: &[Vec<LogEntry>],
-    log: &[Vec<LogEntry>],
-    violations: &mut Vec<String>,
-) {
-    for (partition, (expected, actual)) in reference.iter().zip(log).enumerate() {
-        let longest = expected.len().max(actual.len());
-        if let Some(position) = (0..longest).find(|&i| expected.get(i) != actual.get(i)) {
-            violations.push(format!(
-                "{topic} partition {partition}: node {node} holds {} messages, the first node \
-                 read holds {}; first difference at position {position}: {:?} vs {:?}",
-                actual.len(),
-                expected.len(),
-                actual.get(position),
-                expected.get(position)
-            ));
-        }
-    }
+    empty_polls_total
 }
 
 /// After expiry a node keeps the messages from its oldest retained one
@@ -2193,6 +3651,8 @@ struct LogStats {
     topic: &'static str,
     messages: usize,
     duplicates: usize,
+    /// Empty polls below a listed end that the final reads retried.
+    empty_polls_mid_log: u64,
 }
 
 fn check_log(
@@ -2201,6 +3661,7 @@ fn check_log(
     producers: &[ProducerOutcome],
     readers: &[Arc<Reader>],
     partitions: Option<&[PartitionView]>,
+    config: &ChaosConfig,
     violations: &mut Vec<String>,
 ) -> LogStats {
     report(
@@ -2239,6 +3700,7 @@ fn check_log(
                 *occurrence,
                 producers,
                 &mut last_first_seq,
+                config,
             ) {
                 broken.push(problem);
             }
@@ -2265,7 +3727,7 @@ fn check_log(
     let mut partial = Vec::new();
     for producer in producers {
         for batch in 0..producer.sent_batches() {
-            let copies: Vec<usize> = batch_keys(producer.producer, batch)
+            let copies: Vec<usize> = batch_keys(producer.producer, batch, config.batch)
                 .map(|key| {
                     occurrences
                         .get(&u128::from(key))
@@ -2305,7 +3767,9 @@ fn check_log(
             producer
                 .confirmations
                 .iter()
-                .filter(|confirmation| !confirmation_matches(log, producer.producer, confirmation))
+                .filter(|confirmation| {
+                    !confirmation_matches(log, producer.producer, confirmation, config.batch)
+                })
                 .map(|confirmation| {
                     format!(
                         "producer {} batch {} acked at partition {} offset {}",
@@ -2347,6 +3811,7 @@ fn check_log(
         topic,
         messages,
         duplicates: messages - occurrences.len(),
+        empty_polls_mid_log: 0,
     }
 }
 
@@ -2361,6 +3826,7 @@ fn check_entry(
     occurrence: usize,
     producers: &[ProducerOutcome],
     last_first_seq: &mut HashMap<u32, u64>,
+    config: &ChaosConfig,
 ) -> Result<(), String> {
     let key = MessageKey::try_from(entry.id)
         .map_err(|id| format!("partition {partition}: unknown message id {id:#x}"))?;
@@ -2368,7 +3834,7 @@ fn check_entry(
         .iter()
         .find(|producer| producer.producer == key.producer)
         .ok_or_else(|| format!("partition {partition}: {key} has no producer"))?;
-    let Some(&attempts) = producer.attempts.get(key.batch() as usize) else {
+    let Some(&attempts) = producer.attempts.get(key.batch(config.batch) as usize) else {
         return Err(format!("partition {partition}: {key} was never sent"));
     };
     if partition != producer.partition {
@@ -2377,7 +3843,7 @@ fn check_entry(
             producer.partition
         ));
     }
-    if entry.payload != key.payload() {
+    if !entry.payload_ok {
         return Err(format!("partition {partition}: {key} has a wrong payload"));
     }
     if occurrence > attempts {
@@ -2399,9 +3865,14 @@ fn check_entry(
 
 /// An acknowledgement names where its batch landed, so the batch's messages
 /// must sit at consecutive offsets from there.
-fn confirmation_matches(log: &ObservedLog, producer: u32, confirmation: &Confirmation) -> bool {
+fn confirmation_matches(
+    log: &ObservedLog,
+    producer: u32,
+    confirmation: &Confirmation,
+    batch_size: u32,
+) -> bool {
     (confirmation.base_offset..)
-        .zip(batch_keys(producer, confirmation.batch))
+        .zip(batch_keys(producer, confirmation.batch, batch_size))
         .all(|(offset, key)| entry_id(log, confirmation.partition, offset) == Some(u128::from(key)))
 }
 
@@ -2430,11 +3901,160 @@ fn report(violations: &mut Vec<String>, what: &str, problems: &[String]) {
     ));
 }
 
-fn panic_report(harness: &TestHarness, node: usize) -> Option<String> {
-    harness
-        .node(node)
-        .stderr_panic_report()
-        .map(|stderr| tail(&stderr))
+/// Fails the run when a producer that was told to resend never did, or when
+/// the logs hold fewer duplicates than resent messages, which would mean the
+/// checks miss copies.
+fn check_resends(
+    config: &ChaosConfig,
+    outcomes: &Outcomes,
+    stats: &[LogStats],
+    violations: &mut Vec<String>,
+) {
+    if config.resend_rate == 0.0 {
+        return;
+    }
+    let resent_batches: u64 = outcomes
+        .producers
+        .iter()
+        .chain(&outcomes.history_producers)
+        .map(|producer| producer.resent_batches)
+        .sum();
+    if resent_batches == 0 {
+        violations.push(format!(
+            "no batch was resent at {RESEND_RATE_ENV}={}, so the resend check tested nothing",
+            config.resend_rate
+        ));
+        return;
+    }
+    let resent_messages = resent_batches * u64::from(config.batch);
+    let duplicates: usize = stats.iter().map(|stats| stats.duplicates).sum();
+    if (duplicates as u64) < resent_messages {
+        violations.push(format!(
+            "{resent_messages} messages were resent but the logs hold only {duplicates} duplicates"
+        ));
+    }
+}
+
+/// The latency of acknowledged batches that started inside the measure
+/// window, pooled over the main topic's producers, and the longest stretch of
+/// the window in which none of them got an acknowledgement. A p99 under the
+/// limit can hide a stall that only a few batches waited through; the gap
+/// cannot.
+fn check_measure_window(
+    config: &ChaosConfig,
+    outcomes: &Outcomes,
+    faults: &FaultStats,
+    violations: &mut Vec<String>,
+    report: &mut Report,
+) {
+    if config.measure.is_zero() {
+        return;
+    }
+    let mut samples: Vec<Duration> = outcomes
+        .producers
+        .iter()
+        .flat_map(|producer| producer.measured_latencies.iter().copied())
+        .collect();
+    samples.sort_unstable();
+    let percentile = |quantile: f64| -> Option<Duration> {
+        let rank = ((samples.len().checked_sub(1)? as f64) * quantile).round() as usize;
+        samples.get(rank).copied()
+    };
+    let p99 = percentile(0.99);
+    let max = samples.last().copied();
+    let over_limit = samples
+        .iter()
+        .filter(|latency| **latency > config.p99_limit)
+        .count();
+    let longest_ack_gap = faults.measure_window.map(|(window_start, window_end)| {
+        let mut acks: Vec<Instant> = outcomes
+            .producers
+            .iter()
+            .flat_map(|producer| producer.measured_acks.iter().copied())
+            .filter(|ack| (window_start..=window_end).contains(ack))
+            .collect();
+        acks.sort_unstable();
+        std::iter::once(window_start)
+            .chain(acks)
+            .chain(std::iter::once(window_end))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap_or_default()
+    });
+    // At a low rate the producers' own schedule leaves gaps longer than the
+    // latency limit, so the gap limit allows two batch intervals.
+    let ack_gap_limit = if config.rate > 0 {
+        let batch_interval = Duration::from_secs_f64(
+            f64::from(config.batch) * f64::from(config.producers) / config.rate as f64,
+        );
+        config.p99_limit.max(2 * batch_interval)
+    } else {
+        config.p99_limit
+    };
+    let millis = |latency: Duration| latency.as_secs_f64() * 1000.0;
+    report
+        .record(
+            "measure",
+            json!({
+                "window_secs": config.measure.as_secs(),
+                "batches": samples.len(),
+                "batches_per_second": samples.len() as f64 / config.measure.as_secs_f64(),
+                "latency_ms": {
+                    "p50": percentile(0.5).map(millis),
+                    "p90": percentile(0.9).map(millis),
+                    "p99": p99.map(millis),
+                    "max": max.map(millis),
+                },
+                "max_ms": max.map(millis),
+                "over_limit": over_limit,
+                "longest_ack_gap_ms": longest_ack_gap.map(millis),
+                "ack_gap_limit_ms": millis(ack_gap_limit),
+                "p99_limit_ms": config.p99_limit.as_millis(),
+            }),
+        )
+        .expect("write measure window result");
+    match p99 {
+        None => violations.push(format!(
+            "the {}s measure window saw no acknowledged batch",
+            config.measure.as_secs()
+        )),
+        Some(p99) if p99 > config.p99_limit => violations.push(format!(
+            "acknowledged-batch p99 of {:.0} ms in the measure window is above {} ms \
+             ({} batches)",
+            millis(p99),
+            config.p99_limit.as_millis(),
+            samples.len()
+        )),
+        Some(_) => {}
+    }
+    if let Some(gap) = longest_ack_gap.filter(|gap| *gap > ack_gap_limit) {
+        violations.push(format!(
+            "no batch was acknowledged for {:.0} ms inside the measure window, above the {:.0} ms \
+             limit",
+            millis(gap),
+            millis(ack_gap_limit)
+        ));
+    }
+}
+
+/// A panic, or a log line that says the node gave up on part of its work
+/// without exiting.
+fn fatal_report(harness: &TestHarness, node: usize) -> Option<String> {
+    if let Some(stderr) = harness.node(node).stderr_panic_report() {
+        return Some(format!("panicked:\n{}", tail(&stderr)));
+    }
+    let (stdout, stderr) = harness.node(node).collect_logs();
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .find(|line| {
+            FATAL_LOG_PATTERNS
+                .iter()
+                .any(|pattern| line.contains(pattern))
+        })
+        .map(|line| format!("logged a fatal error: {line}"))
 }
 
 fn tail(text: &str) -> String {
@@ -2443,16 +4063,23 @@ fn tail(text: &str) -> String {
 }
 
 fn stamp(started: Instant) -> String {
-    format!("[{:>6.1}s]", started.elapsed().as_secs_f64())
+    stamp_at(started, Instant::now())
 }
 
+fn stamp_at(started: Instant, at: Instant) -> String {
+    format!("[{:>6.1}s]", at.duration_since(started).as_secs_f64())
+}
+
+/// Records the run's outcome and returns the achieved-rate line for the
+/// final message when a rate was set.
 fn record_summary(
     report: &mut Report,
-    kills: &KillStats,
+    config: &ChaosConfig,
+    faults: &FaultStats,
     outcomes: &Outcomes,
     view: Option<&NodeView>,
     stats: &[LogStats],
-) {
+) -> Option<String> {
     let producers = [
         (TOPIC_NAME, &outcomes.producers),
         (HISTORY_TOPIC_NAME, &outcomes.history_producers),
@@ -2467,6 +4094,8 @@ fn record_summary(
                         "producer": producer.producer,
                         "partition": producer.partition,
                         "acked_batches": producer.acked_batches,
+                        "resent_batches": producer.resent_batches,
+                        "measured_batches": producer.measured_latencies.len(),
                         "retried_batches": producer
                             .attempts
                             .iter()
@@ -2476,6 +4105,8 @@ fn record_summary(
                             .acked_batches
                             .saturating_sub(producer.confirmations.len() as u64),
                         "longest_wait_secs": producer.longest_wait.as_secs_f64(),
+                        "achieved_rate": producer.achieved_rate(),
+                        "target_rate": producer.target_rate,
                         "errors": producer.errors.counts,
                     }),
                 )
@@ -2517,21 +4148,49 @@ fn record_summary(
                     "topic": stats.topic,
                     "messages": stats.messages,
                     "duplicates": stats.duplicates,
+                    "empty_polls_mid_log": stats.empty_polls_mid_log,
                 }),
             )
             .expect("write log outcome");
     }
+    let resent_batches: u64 = outcomes
+        .producers
+        .iter()
+        .chain(&outcomes.history_producers)
+        .map(|producer| producer.resent_batches)
+        .sum();
+    let measured_batches: usize = outcomes
+        .producers
+        .iter()
+        .map(|producer| producer.measured_latencies.len())
+        .sum();
+    let achieved_rate: f64 = outcomes
+        .producers
+        .iter()
+        .map(ProducerOutcome::achieved_rate)
+        .sum();
+    let target_rate = (config.rate > 0).then_some(config.rate);
     report
         .record(
             "summary",
             json!({
-                "kills": kills.kills, "leader_kills": kills.leader_kills,
+                "kills": faults.kills, "leader_kills": faults.leader_kills,
+                "stops": faults.stops, "pauses": faults.pauses,
+                "isolations": faults.isolations, "outages": faults.outages,
+                "resent_batches": resent_batches,
+                "measured_batches": measured_batches,
+                "achieved_rate": achieved_rate,
+                "target_rate": target_rate,
+                "empty_polls_mid_log": stats.iter().map(|stats| stats.empty_polls_mid_log).sum::<u64>(),
                 "group_samples": outcomes.sampler.samples,
                 "group_sample_errors": outcomes.sampler.errors.counts,
                 "view": view,
             }),
         )
         .expect("write run summary");
+    target_rate.map(|target| {
+        format!("main-topic producers achieved {achieved_rate:.0} of {target} messages/s")
+    })
 }
 
 fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
@@ -2543,18 +4202,35 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
         .as_millis();
     json!({
         "recorded_unix_ms": recorded_unix_ms,
+        "scenario": config.scenario.name(),
         "seed": config.seed,
         "duration_secs": config.duration.as_secs(),
         "kill_interval_secs": config.kill_interval.as_secs(),
         "downtime_secs": config.downtime.as_secs(),
+        "second_kill_delay_secs": config.second_kill_delay.as_secs(),
+        "measure_secs": config.measure.as_secs(),
+        "p99_limit_ms": config.p99_limit.as_millis(),
         "command_env": config.to_string(),
+        "plan": config
+            .plan()
+            .iter()
+            .map(|step| json!({
+                "at_secs": step.at.as_secs(),
+                "action": step.action.name(),
+                "node": step.action.node(),
+            }))
+            .collect::<Vec<_>>(),
         "workload": {
-            "nodes": CLUSTER_NODES, "partitions": PARTITIONS,
-            "producers": PRODUCERS, "history_producers": HISTORY_PRODUCERS,
+            "nodes": config.nodes, "partitions": config.partitions,
+            "durability": config.durability_name(),
+            "producers": config.producers, "history_producers": config.partitions,
             "group_members": GROUP_MEMBERS,
             "segment_size_bytes": SEGMENT_SIZE_BYTES,
             "message_expiry_secs": MESSAGE_EXPIRY.as_secs(),
-            "producer_batch": PRODUCER_BATCH,
+            "producer_batch": config.batch,
+            "rate": config.rate,
+            "payload_bytes": config.payload_bytes,
+            "resend_rate": config.resend_rate,
             "producer_pause_ms": PRODUCER_PAUSE.as_millis(),
             "heartbeat_interval": GROUP_HEARTBEAT_INTERVAL,
             "client_heartbeat_interval": CLIENT_HEARTBEAT_INTERVAL,
@@ -2607,6 +4283,7 @@ fn report_nodes(harness: &TestHarness, report: &mut Report, event: &str) {
                     "effective_config_path": data_path.join("runtime/current_config.toml"),
                     "tcp_addr": server.tcp_addr().map(|address| address.to_string()),
                     "http_addr": server.http_addr().map(|address| address.to_string()),
+                    "last_stop": server.last_stop().map(|outcome| stop_fields(Some(outcome))),
                 }),
             )
             .expect("write node state");
