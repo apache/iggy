@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::{Instant, sleep, timeout_at};
@@ -747,6 +747,7 @@ pub struct IggyConsumer {
     consumer: Arc<Consumer>,
     is_consumer_group: bool,
     joined_consumer_group: Arc<AtomicBool>,
+    uncertain_consumer_group_operation: Arc<Mutex<Option<u64>>>,
     stream_id: Arc<Identifier>,
     topic_id: Arc<Identifier>,
     partition_id: Option<u32>,
@@ -832,6 +833,7 @@ impl IggyConsumer {
             shutdown: Arc::new(AtomicBool::new(false)),
             is_consumer_group,
             joined_consumer_group: Arc::new(AtomicBool::new(false)),
+            uncertain_consumer_group_operation: Arc::new(Mutex::new(None)),
             can_poll: Arc::new(AtomicBool::new(true)),
             client,
             consumer_name,
@@ -1297,6 +1299,7 @@ impl IggyConsumer {
             self.topic_id.clone(),
             &self.consumer_name,
             self.joined_consumer_group.clone(),
+            self.uncertain_consumer_group_operation.clone(),
         )
         .await
     }
@@ -1372,6 +1375,7 @@ impl IggyConsumer {
         let create_consumer_group_if_not_exists = self.create_consumer_group_if_not_exists;
         let joined_consumer_group = self.joined_consumer_group.clone();
         let consumer_name = self.consumer_name.clone();
+        let uncertain_consumer_group_operation = self.uncertain_consumer_group_operation.clone();
 
         async move {
             if interval > 0 {
@@ -1396,6 +1400,7 @@ impl IggyConsumer {
                     topic_id.clone(),
                     &consumer_name,
                     joined_consumer_group.clone(),
+                    uncertain_consumer_group_operation,
                 )
                 .await
             {
@@ -1548,12 +1553,30 @@ impl IggyConsumer {
         topic_id: Arc<Identifier>,
         consumer_name: &str,
         joined_consumer_group: Arc<AtomicBool>,
+        uncertain_consumer_group_operation: Arc<Mutex<Option<u64>>>,
     ) -> Result<(), IggyError> {
         if joined_consumer_group.load(ORDERING) {
             return Ok(());
         }
 
+        let mut uncertain_operation = uncertain_consumer_group_operation.lock().await;
         let client = client.read().await;
+        if let Some(op) = *uncertain_operation {
+            let result = client
+                .resolve_operation(op, operation_deadline().into_std())
+                .await;
+            if matches!(result, Err(IggyError::OperationUncertain(_))) {
+                return result;
+            }
+            *uncertain_operation = None;
+            match result {
+                Ok(())
+                | Err(IggyError::OperationNotRetained(_))
+                | Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // A proved join can belong to an earlier session, so establish membership again.
         let consumer_group_id = Identifier::named(consumer_name)?;
         trace!(
             "Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
@@ -1582,6 +1605,9 @@ impl IggyConsumer {
                 Ok(_) => {}
                 Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => {}
                 Err(error) => {
+                    if let IggyError::OperationUncertain(op) = &error {
+                        *uncertain_operation = Some(*op);
+                    }
                     error!(
                         "Failed to create consumer group {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
                     );
@@ -1598,6 +1624,9 @@ impl IggyConsumer {
             .await
         {
             joined_consumer_group.store(false, ORDERING);
+            if let IggyError::OperationUncertain(op) = &error {
+                *uncertain_operation = Some(*op);
+            }
             error!(
                 "Failed to join consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
             );
@@ -1998,9 +2027,9 @@ mod tests {
     };
     use crate::tcp::tcp_client::TcpClient;
     use iggy_binary_protocol::codes::{
-        DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_GROUP_CODE, JOIN_CONSUMER_GROUP_CODE,
-        LOGIN_REGISTER_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
-        SYNC_CONSUMER_GROUP_CODE,
+        CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_GROUP_CODE,
+        JOIN_CONSUMER_GROUP_CODE, LOGIN_REGISTER_CODE, POLL_MESSAGES_CODE,
+        STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_binary_protocol::consensus::EvictionReason;
     use iggy_binary_protocol::requests::consumer_offsets::{
@@ -3036,6 +3065,188 @@ mod tests {
             context: PartitionContext::default(),
         };
         Answer::CommitBody(1, header.to_bytes().to_vec())
+    }
+
+    fn existing_consumer_group() -> Answer {
+        Answer::Body(
+            ConsumerGroupDetailsResponse {
+                group: ConsumerGroupResponse {
+                    id: 1,
+                    partitions_count: POLLED_PARTITION + 1,
+                    members_count: 0,
+                    name: WireName::new("consumer").unwrap(),
+                },
+                members: Vec::new(),
+            }
+            .to_bytes()
+            .to_vec(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_group_mutation_when_polling_again_should_resolve_and_join() {
+        for mutation in [CREATE_CONSUMER_GROUP_CODE, JOIN_CONSUMER_GROUP_CODE] {
+            let (client, cluster) = connect_to_three_replicas().await;
+            let consumer =
+                polling_consumer(client, Consumer::group(Identifier::numeric(1).unwrap())).await;
+            let first_group = if mutation == CREATE_CONSUMER_GROUP_CODE {
+                Answer::Body(Vec::new())
+            } else {
+                existing_consumer_group()
+            };
+            cluster.script(
+                &endpoint(0),
+                GET_CONSUMER_GROUP_CODE,
+                [first_group, existing_consumer_group()],
+            );
+            cluster.script(&endpoint(0), mutation, [Answer::Silence, Answer::Commit(1)]);
+            cluster.script(
+                &endpoint(0),
+                SYNC_CONSUMER_GROUP_CODE,
+                [Answer::Body(
+                    SyncConsumerGroupResponse {
+                        generation: 1,
+                        partitions: vec![POLLED_PARTITION],
+                    }
+                    .to_bytes()
+                    .to_vec(),
+                )],
+            );
+            cluster.script(
+                &endpoint(PARTITION_PRIMARY),
+                POLL_MESSAGES_CODE,
+                [empty_poll()],
+            );
+
+            let first = consumer.create_poll_messages_future().await;
+            let op = cluster.received(mutation)[0].header.request;
+            assert_eq!(first.unwrap_err(), IggyError::OperationUncertain(op));
+
+            let polled = consumer.create_poll_messages_future().await;
+            assert!(polled.is_ok(), "mutation {mutation}: {polled:?}");
+
+            let requests = cluster.received(mutation);
+            assert_eq!(requests[0].header.request, requests[1].header.request);
+            assert_eq!(requests[0].body, requests[1].body);
+            assert_eq!(cluster.count(POLL_MESSAGES_CODE), 1);
+            assert!(consumer.joined_consumer_group.load(ORDERING));
+            assert_eq!(
+                consumer
+                    .client
+                    .read()
+                    .await
+                    .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
+                    .await,
+                Ok(())
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_join_when_resolution_is_uncertain_should_keep_the_operation() {
+        let (client, cluster) = connect_to_three_replicas().await;
+        let consumer =
+            polling_consumer(client, Consumer::group(Identifier::numeric(1).unwrap())).await;
+        cluster.script(
+            &endpoint(0),
+            GET_CONSUMER_GROUP_CODE,
+            repeat_n(existing_consumer_group(), 2),
+        );
+        cluster.script(
+            &endpoint(0),
+            JOIN_CONSUMER_GROUP_CODE,
+            [Answer::Silence, Answer::Silence, Answer::Commit(1)],
+        );
+        let first = consumer.init_consumer_group().await;
+        let op = cluster.received(JOIN_CONSUMER_GROUP_CODE)[0].header.request;
+        assert_eq!(first, Err(IggyError::OperationUncertain(op)));
+
+        assert_eq!(
+            consumer.init_consumer_group().await,
+            Err(IggyError::OperationUncertain(op))
+        );
+        assert_eq!(cluster.count(GET_CONSUMER_GROUP_CODE), 1);
+        assert!(!consumer.joined_consumer_group.load(ORDERING));
+
+        consumer.init_consumer_group().await.unwrap();
+        let joins = cluster.received(JOIN_CONSUMER_GROUP_CODE);
+        assert_eq!(joins.len(), 4);
+        assert_eq!(joins[1].header.request, op);
+        assert_eq!(joins[2].header.request, op);
+        assert_ne!(joins[3].header.request, op);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_uncertain_join_when_resolution_is_rejected_should_report_and_allow_a_new_join()
+     {
+        let (client, cluster) = connect_to_three_replicas().await;
+        let consumer =
+            polling_consumer(client, Consumer::group(Identifier::numeric(1).unwrap())).await;
+        cluster.script(
+            &endpoint(0),
+            GET_CONSUMER_GROUP_CODE,
+            repeat_n(existing_consumer_group(), 2),
+        );
+        cluster.script(
+            &endpoint(0),
+            JOIN_CONSUMER_GROUP_CODE,
+            [
+                Answer::Silence,
+                Answer::CommitRejected(1, IggyError::Unauthorized),
+            ],
+        );
+        assert!(matches!(
+            consumer.init_consumer_group().await,
+            Err(IggyError::OperationUncertain(_))
+        ));
+
+        assert_eq!(
+            consumer.init_consumer_group().await,
+            Err(IggyError::Unauthorized)
+        );
+        assert!(!consumer.joined_consumer_group.load(ORDERING));
+
+        consumer.init_consumer_group().await.unwrap();
+        assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_another_callers_uncertain_join_when_initializing_a_group_should_leave_it_retained()
+     {
+        let (client, cluster) = connect_to_three_replicas().await;
+        cluster.script(&endpoint(0), JOIN_CONSUMER_GROUP_CODE, [Answer::Silence]);
+        let first = client
+            .join_consumer_group(
+                &Identifier::numeric(1).unwrap(),
+                &Identifier::numeric(1).unwrap(),
+                &Identifier::numeric(2).unwrap(),
+            )
+            .await;
+        let op = cluster.received(JOIN_CONSUMER_GROUP_CODE)[0].header.request;
+        assert_eq!(first, Err(IggyError::OperationUncertain(op)));
+        let consumer =
+            polling_consumer(client, Consumer::group(Identifier::numeric(1).unwrap())).await;
+        cluster.script(
+            &endpoint(0),
+            GET_CONSUMER_GROUP_CODE,
+            [existing_consumer_group()],
+        );
+
+        assert_eq!(
+            consumer.init_consumer_group().await,
+            Err(IggyError::LaneBlocked(op))
+        );
+
+        assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 1);
+        assert!(!consumer.joined_consumer_group.load(ORDERING));
+        consumer
+            .client
+            .read()
+            .await
+            .resolve_operation(op, (Instant::now() + OPERATION_TIMEOUT).into_std())
+            .await
+            .unwrap();
+        assert_eq!(cluster.count(JOIN_CONSUMER_GROUP_CODE), 2);
     }
 
     /// Polls one poll after another, as the consumer stream does, until one
