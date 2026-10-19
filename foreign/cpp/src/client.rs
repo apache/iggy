@@ -30,11 +30,13 @@ use iggy::prelude::{
     TopicCreateOptions as RustTopicCreateOptions, TopicUpdateOptions as RustTopicUpdateOptions,
     UserClient, UserStatus as RustUserStatus, UserUpdateOptions,
 };
-use iggy_common::Credentials as RustCredentials;
+use iggy_common::{Credentials as RustCredentials, IggyError, PendingOperationsConfig};
 use std::collections::HashSet;
 use std::convert::TryFrom;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Sentinel value passed from C++ to mean "no partition specified" — the server picks the
 /// partition based on the consumer/strategy. Cxx FFI does not support `Option<u32>`, so we
@@ -76,6 +78,21 @@ fn polling_strategy(
     })
 }
 
+impl ffi::ErrorInfo {
+    fn record(&mut self, error: &IggyError) {
+        self.code = error.as_code();
+        self.kind = error.as_string().to_owned();
+        let operation = match error {
+            IggyError::OperationUncertain(op)
+            | IggyError::LaneBlocked(op)
+            | IggyError::OperationNotRetained(op) => Some(*op),
+            _ => None,
+        };
+        self.has_operation_id = operation.is_some();
+        self.operation_id = operation.unwrap_or_default();
+    }
+}
+
 pub struct Client {
     pub inner: Arc<RustIggyClient>,
 }
@@ -94,8 +111,7 @@ pub struct Client {
 ///   (double-free).
 /// - Using the pointer after [`delete_connection`] has been called is undefined behaviour
 ///   (use-after-free).
-/// - This function does not provide synchronisation. The pointer must not be used concurrently
-///   from multiple threads unless the caller serialises access externally.
+/// - The pointer must remain valid until every concurrent call has returned.
 pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, String> {
     let mut builder = RustIggyClientBuilder::new().with_tcp();
     if !config.server_address.is_empty() {
@@ -150,6 +166,20 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
     if config.no_delay {
         builder = builder.with_no_delay();
     }
+    if config.has_pending_operations {
+        let max_operations = usize::try_from(config.pending_max_operations)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or("Pending operation count must be positive and fit usize")?;
+        let max_bytes = usize::try_from(config.pending_max_bytes)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or("Pending operation bytes must be positive and fit usize")?;
+        builder = builder.with_pending_operations(PendingOperationsConfig {
+            max_operations,
+            max_bytes,
+        });
+    }
     let client = builder
         .build()
         .map_err(|error| format!("Could not build configured connection: {error}"))?;
@@ -171,22 +201,59 @@ pub fn from_connection_string(connection_string: String) -> Result<*mut Client, 
 }
 
 impl Client {
-    pub fn login_user(&self, username: String, password: String) -> Result<ffi::LoginInfo, String> {
+    pub fn resolve_operation(
+        &self,
+        op: u64,
+        timeout_micros: u64,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
+        let deadline = Instant::now()
+            .checked_add(Duration::from_micros(timeout_micros))
+            .ok_or("Resolution timeout is too large")?;
+        RUNTIME
+            .block_on(self.inner.resolve_operation(op, deadline))
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn abandon_operation(
+        &self,
+        op: u64,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
+        RUNTIME
+            .block_on(self.inner.abandon_operation(op))
+            .inspect_err(|error| error_info.record(error))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn login_user(
+        &self,
+        username: String,
+        password: String,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::LoginInfo, String> {
+        *error_info = ffi::ErrorInfo::default();
         RUNTIME.block_on(async {
             let identity = self
                 .inner
                 .login_user(&username, &password)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not login user '{username}': {error}"))?;
             Ok(ffi::LoginInfo::from(identity))
         })
     }
 
-    pub fn logout_user(&self) -> Result<(), String> {
+    pub fn logout_user(&self, error_info: &mut ffi::ErrorInfo) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         RUNTIME.block_on(async {
             self.inner
                 .logout_user()
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not logout user: {error}"))?;
             Ok(())
         })
@@ -233,12 +300,18 @@ impl Client {
         })
     }
 
-    pub fn create_stream(&self, stream_name: String) -> Result<ffi::StreamDetails, String> {
+    pub fn create_stream(
+        &self,
+        stream_name: String,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<ffi::StreamDetails, String> {
+        *error_info = ffi::ErrorInfo::default();
         RUNTIME.block_on(async {
             let stream_details = self
                 .inner
                 .create_stream(&stream_name)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not create stream '{stream_name}': {error}"))?;
             Ok(ffi::StreamDetails::from(stream_details))
         })
@@ -249,7 +322,9 @@ impl Client {
         stream_id: ffi::Identifier,
         stream_name: String,
         options: Vec<ffi::HeaderEntry>,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?;
         let update_options = StreamUpdateOptions {
@@ -261,6 +336,7 @@ impl Client {
             self.inner
                 .update_stream(&rust_stream_id, &stream_name, &update_options)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not update stream '{rust_stream_id}' to '{stream_name}': {error}"
@@ -286,7 +362,12 @@ impl Client {
         })
     }
 
-    pub fn delete_stream(&self, stream_id: ffi::Identifier) -> Result<(), String> {
+    pub fn delete_stream(
+        &self,
+        stream_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not delete stream: {error}"))?;
 
@@ -294,6 +375,7 @@ impl Client {
             self.inner
                 .delete_stream(&rust_stream_id)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not delete stream '{rust_stream_id}': {error}"))?;
             Ok(())
         })
@@ -307,7 +389,9 @@ impl Client {
         partitioning_kind: String,
         partitioning_value: Vec<u8>,
         messages: Vec<ffi::IggyMessageToSend>,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::SendMessagesResponse, String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not send messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -361,6 +445,7 @@ impl Client {
                     &mut iggy_messages,
                 )
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not send messages: {error}"))?;
             Ok(ffi::SendMessagesResponse::from(response))
         })
@@ -378,7 +463,9 @@ impl Client {
         polling_strategy_value: u64,
         count: u32,
         auto_commit: bool,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
+        *error_info = ffi::ErrorInfo::default();
         self.poll(
             stream_id,
             topic_id,
@@ -390,6 +477,7 @@ impl Client {
             count,
             auto_commit,
             None,
+            error_info,
         )
     }
 
@@ -406,7 +494,9 @@ impl Client {
         count: u32,
         auto_commit: bool,
         context: ffi::PartitionContext,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
+        *error_info = ffi::ErrorInfo::default();
         self.poll(
             stream_id,
             topic_id,
@@ -418,6 +508,7 @@ impl Client {
             count,
             auto_commit,
             Some(context.into()),
+            error_info,
         )
     }
 
@@ -434,7 +525,9 @@ impl Client {
         count: u32,
         auto_commit: bool,
         context: Option<PartitionContext>,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::PolledMessages, String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not poll messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -459,6 +552,7 @@ impl Client {
                     auto_commit,
                 )
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not poll messages: {error}"))?;
             Ok(ffi::PolledMessages::from(polled))
         })
@@ -469,7 +563,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_name: String,
         options: ffi::TopicCreateOptions,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::TopicDetails, String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
         let options = RustTopicCreateOptions::try_from(options)
@@ -479,7 +575,7 @@ impl Client {
             let topic_details = self
                 .inner
                 .create_topic(&rust_stream_id, &topic_name, &options)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not create topic '{topic_name}' on stream '{rust_stream_id}': {error}"
@@ -540,7 +636,9 @@ impl Client {
         topic_id: ffi::Identifier,
         topic_name: String,
         options: ffi::TopicUpdateOptions,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -551,7 +649,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .update_topic(&rust_stream_id, &rust_topic_id, &topic_name, &update_options)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not update topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -565,7 +663,9 @@ impl Client {
         &self,
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not delete topic: invalid stream identifier: {error}")
         })?;
@@ -576,7 +676,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_topic(&rust_stream_id, &rust_topic_id)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -591,7 +691,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partitions_count: u32,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not create partitions: invalid stream identifier: {error}")
         })?;
@@ -602,7 +704,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .create_partitions(&rust_stream_id, &rust_topic_id, partitions_count)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not create {partitions_count} partitions for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -617,7 +719,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partitions_count: u32,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not delete partitions: invalid stream identifier: {error}")
         })?;
@@ -628,7 +732,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_partitions(&rust_stream_id, &rust_topic_id, partitions_count)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete {partitions_count} partitions for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -644,7 +748,9 @@ impl Client {
         topic_id: ffi::Identifier,
         partition_id: u32,
         segments_count: u32,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not delete segments: invalid stream identifier: {error}")
         })?;
@@ -655,7 +761,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_segments(&rust_stream_id, &rust_topic_id, partition_id, segments_count)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete {segments_count} segments for topic '{rust_topic_id}' on stream '{rust_stream_id}', partition '{partition_id}': {error}"
@@ -670,7 +776,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         name: String,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::ConsumerGroupDetails, String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not create consumer group '{name}': invalid stream identifier: {error}")
         })?;
@@ -682,7 +790,7 @@ impl Client {
             let group = self
                 .inner
                 .create_consumer_group(&rust_stream_id, &rust_topic_id, &name)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not create consumer group '{name}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -758,7 +866,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         group_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not delete consumer group: invalid stream identifier: {error}")
         })?;
@@ -772,7 +882,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .delete_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -787,7 +897,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         group_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not join consumer group: invalid stream identifier: {error}")
         })?;
@@ -801,7 +913,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .join_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not join consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -811,6 +923,7 @@ impl Client {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn store_consumer_offset(
         &self,
         stream_id: ffi::Identifier,
@@ -819,7 +932,9 @@ impl Client {
         consumer_kind: String,
         consumer_id: ffi::Identifier,
         offset: u64,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not store consumer offset: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -838,7 +953,7 @@ impl Client {
                     opt_partition(partition_id),
                     offset,
                 )
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not store consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
@@ -858,7 +973,9 @@ impl Client {
         consumer_id: ffi::Identifier,
         offset: u64,
         context: ffi::PartitionContext,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not store consumer position: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -876,7 +993,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .store_consumer_position(&consumer, &rust_stream_id, &rust_topic_id, position)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not store consumer position for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
@@ -932,7 +1049,9 @@ impl Client {
         partition_id: u32,
         consumer_kind: String,
         consumer_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -950,7 +1069,7 @@ impl Client {
                     &rust_topic_id,
                     opt_partition(partition_id),
                 )
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not delete consumer offset for stream '{rust_stream_id}', topic '{rust_topic_id}': {error}"
@@ -1048,7 +1167,9 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         group_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
             format!("Could not leave consumer group: invalid stream identifier: {error}")
         })?;
@@ -1062,7 +1183,7 @@ impl Client {
         RUNTIME.block_on(async {
             self.inner
                 .leave_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await
+                .await.inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!(
                         "Could not leave consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
@@ -1166,7 +1287,9 @@ impl Client {
         status: ffi::UserStatus,
         has_permissions: bool,
         permissions: ffi::Permissions,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<ffi::UserInfoDetails, String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_status = RustUserStatus::try_from(status)
             .map_err(|error| format!("Could not create user '{username}': {error}"))?;
         let rust_permissions = has_permissions
@@ -1179,12 +1302,18 @@ impl Client {
                 .inner
                 .create_user(&username, &password, rust_status, rust_permissions)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not create user '{username}': {error}"))?;
             Ok(ffi::UserInfoDetails::from(user))
         })
     }
 
-    pub fn delete_user(&self, user_id: ffi::Identifier) -> Result<(), String> {
+    pub fn delete_user(
+        &self,
+        user_id: ffi::Identifier,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not delete user: invalid user identifier: {error}"))?;
 
@@ -1192,11 +1321,13 @@ impl Client {
             self.inner
                 .delete_user(&rust_user_id)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not delete user '{rust_user_id}': {error}"))?;
             Ok(())
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_user(
         &self,
         user_id: ffi::Identifier,
@@ -1205,7 +1336,9 @@ impl Client {
         has_status: bool,
         status: ffi::UserStatus,
         options: Vec<ffi::HeaderEntry>,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
         let rust_status = has_status
@@ -1225,6 +1358,7 @@ impl Client {
                     &rust_options,
                 )
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
             Ok(())
         })
@@ -1235,7 +1369,9 @@ impl Client {
         user_id: ffi::Identifier,
         has_permissions: bool,
         permissions: ffi::Permissions,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_user_id = RustIdentifier::try_from(user_id).map_err(|error| {
             format!("Could not update permissions: invalid user identifier: {error}")
         })?;
@@ -1248,6 +1384,7 @@ impl Client {
             self.inner
                 .update_permissions(&rust_user_id, rust_permissions)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!("Could not update permissions for user '{rust_user_id}': {error}")
                 })?;
@@ -1260,7 +1397,9 @@ impl Client {
         user_id: ffi::Identifier,
         current_password: String,
         new_password: String,
+        error_info: &mut ffi::ErrorInfo,
     ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
         let rust_user_id = RustIdentifier::try_from(user_id).map_err(|error| {
             format!("Could not change password: invalid user identifier: {error}")
         })?;
@@ -1269,6 +1408,7 @@ impl Client {
             self.inner
                 .change_password(&rust_user_id, &current_password, &new_password)
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| {
                     format!("Could not change password for user '{rust_user_id}': {error}")
                 })?;
@@ -1278,12 +1418,19 @@ impl Client {
 
     /// Sends a command code and payload and returns the raw response bytes.
     /// Session-control codes return an invalid-command error.
-    pub fn send_binary_request(&self, code: u32, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+    pub fn send_binary_request(
+        &self,
+        code: u32,
+        payload: Vec<u8>,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<Vec<u8>, String> {
+        *error_info = ffi::ErrorInfo::default();
         RUNTIME.block_on(async {
             let response = self
                 .inner
                 .send_binary_request(code, Bytes::from(payload))
                 .await
+                .inspect_err(|error| error_info.record(error))
                 .map_err(|error| format!("Could not send raw command '{code}': {error}"))?;
             Ok(Vec::from(response))
         })
@@ -1301,6 +1448,7 @@ pub unsafe fn delete_connection(client: *mut Client) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     const POLLING_STRATEGY_KINDS: [&str; 5] = ["offset", "timestamp", "first", "last", "next"];
     const CONTEXT: PartitionContext = PartitionContext {
@@ -1308,6 +1456,49 @@ mod tests {
         owner_generation: 5,
         metadata_op: 7,
     };
+
+    #[test]
+    fn concurrent_recovery_preserves_each_calls_exact_operation_identity() {
+        let client = Arc::new(Client {
+            inner: Arc::new(RustIggyClient::default()),
+        });
+        let handles: Vec<_> = [(1u64 << 53) + 7, u64::MAX]
+            .into_iter()
+            .map(|op| {
+                let client = Arc::clone(&client);
+                thread::spawn(move || {
+                    let mut info = ffi::ErrorInfo::default();
+                    assert!(client.resolve_operation(op, 1000, &mut info).is_err());
+                    assert_eq!(info.code, IggyError::OperationNotRetained(op).as_code());
+                    assert_eq!(info.kind, "operation_not_retained");
+                    assert!(info.has_operation_id);
+                    assert_eq!(info.operation_id, op);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_details_distinguish_uncertain_blocked_and_missing_operations() {
+        let mut info = ffi::ErrorInfo::default();
+        for error in [
+            IggyError::OperationUncertain(u64::MAX),
+            IggyError::LaneBlocked(u64::MAX),
+            IggyError::OperationNotRetained(u64::MAX),
+        ] {
+            info.record(&error);
+            assert_eq!(info.code, error.as_code());
+            assert_eq!(info.kind, error.as_string());
+            assert!(info.has_operation_id);
+            assert_eq!(info.operation_id, u64::MAX);
+        }
+        info.record(&IggyError::InvalidCommand);
+        assert!(!info.has_operation_id);
+        assert_eq!(info.operation_id, 0);
+    }
 
     #[test]
     fn should_leave_the_context_unset_on_a_poll_without_one() {

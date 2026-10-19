@@ -247,7 +247,7 @@ impl UsersInner {
 
     /// Count of live personal access tokens for one user.
     ///
-    /// Single-map read for the ingress-side create cap; the sibling
+    /// Single-map read for the primary's create cap; the sibling
     /// `personal_access_tokens_of` allocates and sorts, too heavy for a
     /// per-request check.
     #[must_use]

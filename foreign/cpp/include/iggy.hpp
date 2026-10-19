@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -98,11 +99,35 @@ class StringTag {
 
 /**
  * @brief Exception thrown when an Iggy client operation fails.
+ *
+ * Code() and Kind() are available only when a call forwards a typed Rust SDK
+ * error. IggyBlockingClient documents the covered methods. Other calls and
+ * C++ or bridge-local argument errors leave Code() empty and Kind() empty.
+ * OperationId() is present only for operation_uncertain, lane_blocked, and
+ * operation_not_retained errors and preserves the full unsigned 64-bit ID.
  */
 class IggyException : public std::runtime_error {
   public:
     explicit IggyException(const char *message) : std::runtime_error(message) {}
     explicit IggyException(const std::string &message) : std::runtime_error(message) {}
+    IggyException(const std::string &message, const ffi::ErrorInfo &error)
+        : std::runtime_error(message), kind_(error.kind) {
+        if (!kind_.empty()) {
+            code_ = error.code;
+        }
+        if (error.has_operation_id) {
+            operation_id_ = error.operation_id;
+        }
+    }
+
+    [[nodiscard]] std::optional<std::uint32_t> Code() const noexcept { return code_; }
+    [[nodiscard]] const std::string &Kind() const noexcept { return kind_; }
+    [[nodiscard]] std::optional<std::uint64_t> OperationId() const noexcept { return operation_id_; }
+
+  private:
+    std::optional<std::uint32_t> code_;
+    std::string kind_;
+    std::optional<std::uint64_t> operation_id_;
 };
 
 /**
@@ -3300,6 +3325,25 @@ class PollingStrategy final {
  * Builder initializes a TCP client. To use QUIC, HTTP, or WebSocket, create the
  * client with FromConnectionString().
  *
+ * Concurrent calls on the same client are safe. The object must remain alive
+ * and must not be moved while any call is in progress. Moving, assigning, or
+ * destroying a client concurrently with a call on it is undefined behavior.
+ *
+ * Rust SDK errors populate IggyException::Code() and IggyException::Kind() for:
+ *
+ * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
+ * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - CreateStream(), UpdateStream(), and DeleteStream().
+ * - CreateTopic(), UpdateTopic(), and DeleteTopic().
+ * - CreatePartitions(), DeletePartitions(), and DeleteSegments().
+ * - CreateConsumerGroup(), DeleteConsumerGroup(), JoinConsumerGroup(), and
+ *   LeaveConsumerGroup().
+ * - StoreConsumerOffset(), StoreConsumerPosition(), and DeleteConsumerOffset().
+ *
+ * Other methods report errors through the exception message only. C++ and
+ * bridge-local argument validation failures also have no structured error
+ * details, even for the methods listed above.
+ *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
  *                 .WithServerAddress("127.0.0.1:8090")
@@ -3312,6 +3356,7 @@ class PollingStrategy final {
 class IggyBlockingClient final {
   public:
     class Builder;
+    static constexpr std::chrono::seconds kDefaultResolutionTimeout{30};
 
     /** @brief IggyBlockingClient is move-only. */
     IggyBlockingClient(const IggyBlockingClient &)            = delete;
@@ -3378,6 +3423,8 @@ class IggyBlockingClient final {
      * - `reestablish_after=<duration>`
      * - `heartbeat_interval=<duration>`
      * - `nodelay=<bool>`
+     * - `max_pending_operations=<positive integer>`
+     * - `max_pending_operation_bytes=<positive integer>`
      *
      * QUIC accepts these query parameters:
      *
@@ -3394,6 +3441,8 @@ class IggyBlockingClient final {
      * - `reconnection_max_retries=<uint32|unlimited>`
      * - `reconnection_interval=<duration>`
      * - `reconnection_reestablish_after=<duration>`
+     * - `max_pending_operations=<positive integer>`
+     * - `max_pending_operation_bytes=<positive integer>`
      *
      * HTTP accepts these query parameters:
      *
@@ -3416,6 +3465,8 @@ class IggyBlockingClient final {
      * - `tls_domain=<string>`
      * - `tls_ca_file=<path>`
      * - `tls_validate_certificate=<bool>`
+     * - `max_pending_operations=<positive integer>`
+     * - `max_pending_operation_bytes=<positive integer>`
      *
      * Durations use Iggy duration syntax, such as `500ms`, `5s`, or `1min`.
      * Boolean values are `true` or `false`.
@@ -3457,6 +3508,8 @@ class IggyBlockingClient final {
      * changes the client state to disconnected, but keeps the client reusable.
      * Call Connect() to establish a new connection. Configured automatic login
      * is applied when reconnecting.
+     * For binary transports, disconnect also drops all retained operations
+     * without settling their outcomes. They cannot be resolved after reconnecting.
      *
      * @note The disconnect holds until the next Connect(): requests fail and
      *       nothing reconnects the client in the background, even with
@@ -3965,12 +4018,13 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition whose offset is stored, or `std::nullopt`
-     *        to omit the partition from the request. The maximum
-     *        `std::uint32_t` value is rejected because it is reserved by the
-     *        FFI representation.
+     * @param partition_id Partition whose offset is stored. TCP, QUIC, and
+     *        WebSocket require a value. Only HTTP permits `std::nullopt` to
+     *        omit the partition. The maximum `std::uint32_t` value is rejected
+     *        because it is reserved by the FFI representation.
      * @param offset Message offset to store.
      * @throws IggyException if an identifier, partition, or offset is invalid;
+     *         the partition is absent on a binary transport (invalid_identifier);
      *         the resource does not exist; the client is unauthenticated; the
      *         caller lacks permission; or the request fails.
      */
@@ -4056,11 +4110,13 @@ class IggyBlockingClient final {
      * @param consumer Consumer identity that owns the offset.
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
-     * @param partition_id Partition whose offset is deleted, or `std::nullopt`
-     *        to omit the partition from the request. The maximum
+     * @param partition_id Partition whose offset is deleted. TCP, QUIC, and
+     *        WebSocket require a value. The `std::nullopt` default is for HTTP
+     *        only and omits the partition from its request. The maximum
      *        `std::uint32_t` value is rejected because it is reserved by the
      *        FFI representation.
      * @throws IggyException if an identifier or partition is invalid; the
+     *         partition is absent on a binary transport (invalid_identifier); the
      *         resource or stored offset does not exist; the client is
      *         unauthenticated; the caller lacks permission; or the request
      *         fails.
@@ -4127,15 +4183,58 @@ class IggyBlockingClient final {
      */
     Stats GetStats();
 
+    /**
+     * @brief Replays a retained operation with its original identity and bytes.
+     *
+     * Success proves a successful commit without returning the original response
+     * payload. A proved committed business rejection throws its original error.
+     * Both outcomes release the retained operation and its lane.
+     * An operation_uncertain result keeps the original frame and lane for a later
+     * resolve. operation_not_retained does not prove that the original command
+     * failed or make resending it safe. Disconnect() and session reset drop
+     * retained operations without settling them or allowing later recovery.
+     * The client keeps the proved outcomes of its last max_operations replays,
+     * also across a session reset. A later resolve of a proved operation returns
+     * the same outcome without a request.
+     * TCP, QUIC, and WebSocket support recovery; HTTP reports feature_unavailable.
+     *
+     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @param timeout Positive retry budget; defaults to kDefaultResolutionTimeout.
+     * @throws IggyException if @p timeout is not positive or cannot form a deadline;
+     *         the result is a committed rejection or remains uncertain; the
+     *         operation is not retained; recovery is unsupported; or resolution
+     *         otherwise fails.
+     */
+    void ResolveOperation(std::uint64_t operation_id, std::chrono::microseconds timeout = kDefaultResolutionTimeout);
+
+    /**
+     * @brief Releases a retained operation and its local lane.
+     *
+     * Abandonment does not undo or determine the server result. HTTP reports
+     * feature_unavailable because it does not retain operations.
+     *
+     * @param operation_id ID carried by operation_uncertain or lane_blocked.
+     * @throws IggyException if the operation is not retained, recovery is
+     *         unsupported, or the client handle is unavailable.
+     */
+    void AbandonOperation(std::uint64_t operation_id);
+
   private:
     explicit IggyBlockingClient(ffi::Client *client);
 
     template <typename Operation>
     static decltype(auto) RethrowAsIggyException(Operation &&operation) {
+        ffi::ErrorInfo error_info{};
         try {
-            return std::forward<Operation>(operation)();
+            if constexpr (std::is_invocable_v<Operation, ffi::ErrorInfo &>) {
+                return std::forward<Operation>(operation)(error_info);
+            } else {
+                return std::forward<Operation>(operation)();
+            }
+        } catch (const IggyException &) {
+            throw;
         } catch (const std::exception &error) {
-            throw IggyException(error.what());
+            throw IggyException(error.what(), error_info);
         }
     }
 
@@ -4315,6 +4414,21 @@ class IggyBlockingClient::Builder final {
     Builder &WithNoDelay();
 
     /**
+     * @brief Bounds active and retained mutations across this client session.
+     *
+     * Defaults are 256 operations and 64 MiB. Frozen headers and bodies count
+     * toward the byte limit while an outstanding writer still holds them, even
+     * after completion or abandonment. Build() validates that both limits fit
+     * the platform's size type.
+     *
+     * @param max_operations Positive maximum number of active or retained mutations.
+     * @param max_bytes Positive maximum number of frozen request bytes.
+     * @return Reference to this builder.
+     * @throws IggyException immediately if either limit is zero.
+     */
+    Builder &WithPendingOperations(std::uint64_t max_operations, std::uint64_t max_bytes);
+
+    /**
      * @brief Builds an owning Iggy blocking client.
      *
      * Build() validates the TCP configuration and creates an independent
@@ -4341,6 +4455,9 @@ class IggyBlockingClient::Builder final {
     std::string tls_ca_file_;
     std::optional<bool> tls_validate_certificate_;
     bool no_delay_{};
+    bool has_pending_operations_{};
+    std::uint64_t pending_max_operations_{};
+    std::uint64_t pending_max_bytes_{};
 };
 
 }  // namespace iggy

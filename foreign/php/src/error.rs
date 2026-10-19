@@ -15,7 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use ext_php_rs::{error::Error, exception::PhpException, php_class, zend::ce};
+use std::ptr;
+
+use ext_php_rs::{
+    convert::IntoZval,
+    error::Error,
+    exception::PhpException,
+    ffi::zend_call_known_function,
+    php_class, php_impl,
+    types::Zval,
+    zend::{ExecutorGlobals, ce},
+};
 use iggy::prelude::IggyError;
 
 #[php_class]
@@ -48,6 +58,57 @@ pub struct NotFoundException;
 #[derive(Default)]
 pub struct TransientException;
 
+#[php_class]
+#[php(name = "Iggy\\Exception\\PendingOperationException")]
+#[php(extends(IggyException))]
+#[derive(Default)]
+pub struct PendingOperationException {
+    operation_id: String,
+    kind: String,
+}
+
+#[php_impl]
+impl PendingOperationException {
+    /// Exact unsigned 64-bit operation ID, represented as a decimal string.
+    #[php(getter, change_case = "snake_case")]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    #[php(getter)]
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+}
+
+impl PendingOperationException {
+    fn into_exception_object(self, message: &str, code: i32) -> Result<Zval, Error> {
+        let mut object = self.into_zval(false)?;
+        let mut arguments = [message.into_zval(false)?, code.into_zval(false)?];
+        let mut result = Zval::new();
+        let receiver = object.object_mut().ok_or(Error::Object)?;
+
+        // SAFETY: The initialized object extends Exception, and the argument and result
+        // zvals remain live for the call. Its native constructor initializes inherited
+        // fields that the generated Rust constructor leaves untouched.
+        unsafe {
+            zend_call_known_function(
+                ce::exception().constructor,
+                receiver,
+                receiver.ce,
+                &raw mut result,
+                arguments.len().try_into()?,
+                arguments.as_mut_ptr(),
+                ptr::null_mut(),
+            );
+        }
+        if let Some(class) = ExecutorGlobals::pending_exception_class() {
+            return Err(Error::ExceptionPending { class });
+        }
+        Ok(object)
+    }
+}
+
 pub(crate) trait IntoPhpException {
     fn into_php_exception(self) -> PhpException;
 }
@@ -59,6 +120,23 @@ pub(crate) fn to_php_exception(error: impl IntoPhpException) -> PhpException {
 impl IntoPhpException for IggyError {
     fn into_php_exception(self) -> PhpException {
         let message = self.to_string();
+
+        let pending = match &self {
+            IggyError::OperationUncertain(operation_id) => Some((*operation_id, "uncertain")),
+            IggyError::LaneBlocked(operation_id) => Some((*operation_id, "lane_blocked")),
+            IggyError::OperationNotRetained(operation_id) => Some((*operation_id, "not_retained")),
+            _ => None,
+        };
+        if let Some((operation_id, kind)) = pending {
+            let exception = PendingOperationException {
+                operation_id: operation_id.to_string(),
+                kind: kind.to_owned(),
+            };
+            return match exception.into_exception_object(&message, self.as_code() as i32) {
+                Ok(object) => PhpException::from_message(String::new()).with_object(object),
+                Err(error) => error.into_php_exception(),
+            };
+        }
 
         match PhpExceptionKind::from(&self) {
             PhpExceptionKind::Connection => {

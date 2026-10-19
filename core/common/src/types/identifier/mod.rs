@@ -19,6 +19,7 @@ use crate::Sizeable;
 use crate::Validatable;
 use crate::error::IggyError;
 use crate::utils::byte_size::IggyByteSize;
+use iggy_binary_protocol::WireIdentifier;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::serde_as;
@@ -256,6 +257,17 @@ impl TryFrom<u32> for Identifier {
     type Error = IggyError;
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         Identifier::numeric(value)
+    }
+}
+
+impl TryFrom<&WireIdentifier> for Identifier {
+    type Error = IggyError;
+
+    fn try_from(value: &WireIdentifier) -> Result<Self, Self::Error> {
+        match value {
+            WireIdentifier::Numeric(id) => Self::numeric(*id),
+            WireIdentifier::String(name) => Self::named(name),
+        }
     }
 }
 

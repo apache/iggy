@@ -799,6 +799,15 @@ impl Workload {
                 == InFlightOutcome::CreatePersonalAccessToken(
                     ops::create_personal_access_token::Outcome::AlreadyExists,
                 ) {
+            // Without the commit proof a client cannot settle its uncertain
+            // create, and its metadata requests stay blocked behind it.
+            assert!(
+                header.has_committed_result(),
+                "a refused PAT replay must prove that the original create committed \
+                 (client={}, request={})",
+                header.client,
+                header.request,
+            );
             entry.outcome
         } else {
             classified

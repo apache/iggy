@@ -23,8 +23,9 @@ namespace Apache.Iggy.Exceptions;
 ///     still have committed.
 /// </summary>
 /// <remarks>
-///     The server emits evictions off its own heartbeat timer rather than as an answer, so the frame carries no
-///     correlation with the request it interrupts and that request's real reply is never read.
+///     The frame carries no correlation with the request it interrupts, so that request's real reply is never
+///     read. A stale client eviction does not raise this exception: it drops only the link, which then fails as a
+///     lost connection and binds the same session again.
 /// </remarks>
 internal sealed class VsrSessionEvictedException(Exception verdict)
     : Exception("The consensus session was evicted by the server.", verdict)

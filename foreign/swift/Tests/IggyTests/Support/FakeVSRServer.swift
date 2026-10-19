@@ -100,7 +100,7 @@ final class FakeVSRServer: @unchecked Sendable {
             .childChannelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(FrameDecoder()))
-                    try channel.pipeline.syncOperations.addHandler(FakeServerHandler(state: state))
+                    try channel.pipeline.syncOperations.addHandler(FakeServerHandler(state: state, channel: channel))
                 }
             }
         let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
@@ -163,18 +163,6 @@ final class FakeVSRServer: @unchecked Sendable {
         writer.write(UInt32(1))
         writer.write(partitionsCount)
         writer.write(primaryReplica)
-        return writer.bytes
-    }
-
-    /// The reply to `GetPollRouting` and `GetConsumerOffsetRouting`: the
-    /// session of `request` and a primary at `primary`.
-    static func pollRouteBody(for request: Request, context: PartitionContext, primary: String, watermark: UInt64 = 0) -> [UInt8] {
-        var writer = ByteWriter()
-        writer.write(request.clientID)
-        writer.write(request.session)
-        writer.write(watermark)
-        context.encode(into: &writer)
-        writeNode(primary, replicaID: 0, leader: true, into: &writer)
         return writer.bytes
     }
 
@@ -296,9 +284,7 @@ final class FakeVSRServer: @unchecked Sendable {
             return .ok(registerBody(session: request.session))
         case .getPartitionRoute:
             return .ok(partitionRouteBody(routeContext))
-        case .getPollRouting, .getConsumerOffsetRouting:
-            return .ok(pollRouteBody(for: request, context: routeContext, primary: address))
-        case .pollMessagesOnPrimary:
+        case .pollMessages:
             return .ok(polledBody(partitionID: 0, context: routeContext))
         default:
             return .ok([])
@@ -349,33 +335,34 @@ actor FakeServerState {
     }
 }
 
-final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
+final class FakeServerHandler: ChannelInboundHandler {
     typealias InboundIn = RawFrame
 
     private let state: FakeServerState
-    private var connection = 0
+    /// The number the server gives this connection. Unstructured tasks run in
+    /// no set order, so every task for the connection awaits it first: the
+    /// client must not see a reply or a close before the connection is
+    /// counted, and its close must not be recorded before its open.
+    private let connection: Task<Int, Never>
 
-    init(state: FakeServerState) {
+    init(state: FakeServerState, channel: Channel) {
         self.state = state
-    }
-
-    func channelActive(context: ChannelHandlerContext) {
-        let channel = context.channel
-        Task { [self] in
-            connection = await state.connectionOpened(channel)
-        }
+        connection = Task { await state.connectionOpened(channel) }
     }
 
     func channelInactive(context: ChannelHandlerContext) {
         let channel = context.channel
-        Task { await state.connectionClosed(channel) }
+        Task { [state, connection] in
+            _ = await connection.value
+            await state.connectionClosed(channel)
+        }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let frame = unwrapInboundIn(data)
         let channel = context.channel
-        Task { [self] in
-            let request = FakeVSRServer.decodeRequest(connection: connection, frame: frame)
+        Task { [state, connection] in
+            let request = FakeVSRServer.decodeRequest(connection: await connection.value, frame: frame)
             let reply = await state.handle(request)
             let operation = request.operation
             func write(_ bytes: [UInt8]) {
