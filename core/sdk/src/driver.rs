@@ -354,14 +354,22 @@ impl OperationDriver {
             Ok(reply) => match decode_reply_for(&request, &reply.header, reply.body) {
                 Ok(outcome) => {
                     self.session.observe_metadata_reply(&reply.header);
-                    close_if_detached(&hop.link, &outcome.result);
+                    let bound = self.session.epoch().bound;
+                    close_if_detached(&hop.link, &outcome.result, bound);
                     if outcome.committed && call.uncertain {
                         return match outcome.result {
                             Ok(body) => self.signed_in(call, &hop, body),
                             Err(error) => Err(Next::Committed(error)),
                         };
                     }
-                    if call.uncertain
+                    if bound
+                        && request.operation == Operation::NonReplicated
+                        && !is_sign_in(call.code)
+                        && outcome.result == Err(IggyError::Unauthenticated)
+                    {
+                        // A detached link refused the read before admission.
+                        Err(IggyError::TransientNotAccepted)
+                    } else if call.uncertain
                         && !matches!(
                             request.operation,
                             Operation::NonReplicated | Operation::Register | Operation::Logout
@@ -704,7 +712,11 @@ impl OperationDriver {
         let frame = ticket.freeze(code, body, self.read_context(), None)?;
         let reply = link.send(frame, deadline, ticket.sent_flag()).await?;
         let result = read_reply(&self.session, reply);
-        close_if_detached(link, &result);
+        let bound = self.session.epoch().bound;
+        close_if_detached(link, &result, bound);
+        if bound && result == Err(IggyError::Unauthenticated) {
+            return Err(IggyError::TransientNotAccepted);
+        }
         result
     }
 
@@ -946,13 +958,12 @@ fn retries_lookup(error: &IggyError) -> bool {
     ) || lost_link(error)
 }
 
-/// A reply with `StaleClient` means that the server no longer attaches
-/// `link` to the session, for example because the session ended. The slot
-/// of a closed link binds the session again, as after an eviction. That
-/// bind resumes a session that the server still knows, and drops an ended
-/// one, so the slot signs in again.
-fn close_if_detached(link: &Link, result: &Result<Bytes, IggyError>) {
-    if matches!(result, Err(IggyError::StaleClient)) {
+/// State transfer can detach a link while its session remains live.
+/// Rebinding distinguishes that case from an ended session that needs sign-in.
+fn close_if_detached(link: &Link, result: &Result<Bytes, IggyError>, bound: bool) {
+    if matches!(result, Err(IggyError::StaleClient))
+        || (bound && matches!(result, Err(IggyError::Unauthenticated)))
+    {
         link.close();
     }
 }
@@ -2165,6 +2176,65 @@ mod tests {
                 f.call(code, target).await.unwrap();
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_detached_replica_when_polling_should_rebind_and_continue_the_same_session() {
+        for (auto_commit, strategy) in [
+            (false, WirePollingStrategy::first()),
+            (true, WirePollingStrategy::first()),
+            (false, WirePollingStrategy::next()),
+        ] {
+            let fixture = Fixture::new().await;
+            let fence = fixture.driver.session.fence();
+            let binds = fixture.cluster.count(BIND_SESSION_CODE);
+            fixture.cluster.script(
+                &endpoint(PRIMARY),
+                POLL_MESSAGES_CODE,
+                [Answer::Refuse(IggyError::Unauthenticated)],
+            );
+
+            fixture
+                .driver
+                .poll(&fixture.poll(auto_commit, strategy), None)
+                .await
+                .unwrap();
+
+            eventually("the detached replica binds the same session", || {
+                fixture.cluster.count(BIND_SESSION_CODE) > binds
+            })
+            .await;
+            assert_eq!(fixture.cluster.count(POLL_MESSAGES_CODE), 2);
+            assert_eq!(fixture.driver.session.fence(), fence);
+            assert_eq!(fixture.cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_detached_replica_when_looking_up_a_route_should_try_another_ready_replica() {
+        let fixture = Fixture::new().await;
+        let fence = fixture.driver.session.fence();
+        let binds = fixture.cluster.count(BIND_SESSION_CODE);
+        fixture.cluster.script(
+            &endpoint(0),
+            GET_PARTITION_ROUTE_CODE,
+            [Answer::Refuse(IggyError::Unauthenticated)],
+        );
+
+        fixture
+            .driver
+            .poll(&fixture.poll(false, WirePollingStrategy::first()), None)
+            .await
+            .unwrap();
+
+        eventually("the detached lookup link binds again", || {
+            fixture.cluster.count(BIND_SESSION_CODE) > binds
+        })
+        .await;
+        assert_eq!(fixture.cluster.count(POLL_MESSAGES_CODE), 1);
+        assert!(fixture.cluster.count(GET_PARTITION_ROUTE_CODE) > 1);
+        assert_eq!(fixture.driver.session.fence(), fence);
+        assert_eq!(fixture.cluster.count(LOGIN_REGISTER_CODE), 1);
     }
 
     #[tokio::test(start_paused = true)]
