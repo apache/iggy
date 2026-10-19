@@ -312,6 +312,8 @@ impl LaneTicket {
         {
             return Ok(());
         }
+        self.operation = None;
+        self.reservation = None;
         self.reservation = Some(self.owner.pending.reserve(bytes, deadline).await?);
         Ok(())
     }
@@ -519,6 +521,46 @@ mod tests {
 
     fn lane_count(owner: &SessionOwner) -> usize {
         owner.lanes().len()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refused_write_when_its_session_is_replaced_should_release_its_old_byte_budget()
+    {
+        let owner = owner_with_limits(1, HEADER_SIZE);
+        let mut ticket = owner
+            .enter_lane(Some(LaneKey::Metadata), deadline())
+            .await
+            .unwrap();
+        ticket
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        let frame = ticket
+            .freeze(
+                CREATE_STREAM_CODE,
+                Bytes::new(),
+                PartitionContext::default(),
+                None,
+            )
+            .unwrap();
+        owner.reset().unwrap();
+        owner.bind(NEXT_SESSION).unwrap();
+        drop(frame);
+
+        ticket
+            .reserve(CREATE_STREAM_CODE, 0, deadline())
+            .await
+            .unwrap();
+        let retried = ticket
+            .freeze(
+                CREATE_STREAM_CODE,
+                Bytes::new(),
+                PartitionContext::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(retried.header.session, NEXT_SESSION);
+        ticket.complete();
     }
 
     #[tokio::test(start_paused = true)]

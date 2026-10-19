@@ -252,6 +252,10 @@ impl ReplicaLinks {
     /// link restarts with its initial reconnect jitter.
     pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         let shared = &self.shared;
+        let disconnected = shared.table().state == ClientState::Disconnected;
+        if disconnected {
+            shared.coordinator.wait_until_inactive().await;
+        }
         shared
             .coordinator
             .run(|abandoned| shared.sweep(abandoned, true))
@@ -782,6 +786,7 @@ impl LinksShared {
     /// rejected credential is forgotten, because it stays rejected, and each
     /// replay costs the server a password hash.
     async fn sign_in(&self, link: &Arc<Link>) -> Result<(), SignInFailure> {
+        let fence = self.session.fence();
         let Some(credentials) = self.session.sign_in_credentials() else {
             info!("No credentials to sign in with.");
             return Ok(());
@@ -789,9 +794,7 @@ impl LinksShared {
         self.set_state_on(link, ClientState::Authenticating);
         let error = match self.register(link, &credentials).await {
             Ok(user_id) => {
-                self.set_state_on(link, ClientState::Authenticated);
-                self.session.remember(credentials, user_id);
-                self.publish(DiagnosticEvent::SignedIn);
+                self.finish_sign_in(link, fence, credentials, user_id)?;
                 info!("Signed in.");
                 return Ok(());
             }
@@ -811,6 +814,34 @@ impl LinksShared {
             self.session.forget();
         }
         Err(failure)
+    }
+
+    fn finish_sign_in(
+        &self,
+        link: &Arc<Link>,
+        fence: u64,
+        credentials: Credentials,
+        user_id: u32,
+    ) -> Result<(), SignInFailure> {
+        let remembered = self.session.remember_unless(
+            || {
+                let current_fence = self.session.fence();
+                let mut table = self.table();
+                if current_fence != fence || table.find(link).is_none() {
+                    return true;
+                }
+                table.state = ClientState::Authenticated;
+                self.publish(DiagnosticEvent::SignedIn);
+                false
+            },
+            credentials,
+            user_id,
+        );
+        if remembered {
+            Ok(())
+        } else {
+            Err(IggyError::Disconnected.into())
+        }
     }
 
     /// Registers a new session on `link` and binds it. A Register that the
@@ -1217,9 +1248,14 @@ impl LinksShared {
     /// Sets the state for a sign-in on `link`, unless a disconnect or a
     /// roster change took the link away.
     fn set_state_on(&self, link: &Arc<Link>, state: ClientState) {
+        let signing_in_again =
+            state == ClientState::Authenticating && self.session.epoch().sign_in_owed;
         let mut table = self.table();
         if table.find(link).is_some() {
             table.state = state;
+            if signing_in_again {
+                self.publish(DiagnosticEvent::SignedOut);
+            }
         }
     }
 }
@@ -1892,6 +1928,60 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_completed_disconnect_when_automatic_sign_in_finishes_should_keep_credentials_forgotten()
+     {
+        let cluster = FakeCluster::new(1);
+        let session = Arc::new(SessionOwner::new(iggy_common::AutoLogin::Disabled));
+        let credentials = Credentials::UsernamePassword("iggy".to_owned(), "iggy".into());
+        session.remember(credentials.clone(), 1);
+        let links = ReplicaLinks::new(
+            cluster.dialer(),
+            endpoint(0),
+            policy(),
+            Arc::clone(&session),
+        );
+        links.connect().await.unwrap();
+        let link = links.link(Target::MetadataPrimary).unwrap();
+        let fence = session.fence();
+        let mut events = links.subscribe();
+        while events.try_recv().is_ok() {}
+        links.disconnect();
+        session.forget();
+        session.reset().unwrap();
+
+        assert!(
+            links
+                .shared
+                .finish_sign_in(&link, fence, credentials, 1)
+                .is_err()
+        );
+
+        assert!(session.sign_in_credentials().is_none());
+        assert_eq!(events.try_recv().unwrap(), DiagnosticEvent::Disconnected);
+        assert!(events.try_recv().is_err());
+        links.connect().await.unwrap();
+        assert_eq!(links.state(), ClientState::Connected);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_interrupted_dial_when_connecting_after_disconnect_should_start_a_new_dial() {
+        let cluster = FakeCluster::new(1);
+        cluster.silent.lock().unwrap().insert(endpoint(0));
+        let links = links(&cluster, &endpoint(0), policy());
+        let mut first = Box::pin(links.connect());
+        assert!(futures_util::poll!(&mut first).is_pending());
+        links.disconnect();
+        cluster.silent.lock().unwrap().clear();
+
+        let (interrupted, reconnected) = tokio::join!(first, links.connect());
+
+        assert!(interrupted.is_err());
+        assert_eq!(reconnected, Ok(()));
+        assert_eq!(links.state(), ClientState::Authenticated);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_disconnect_when_late_sign_in_steps_run_should_keep_the_client_disconnected() {
         let cluster = FakeCluster::new(2);
         let links = connected(&cluster, 2).await;
@@ -2007,6 +2097,7 @@ mod tests {
             [
                 DiagnosticEvent::Disconnected,
                 DiagnosticEvent::Connected,
+                DiagnosticEvent::SignedOut,
                 DiagnosticEvent::SignedIn
             ]
         );

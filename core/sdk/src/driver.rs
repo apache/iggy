@@ -554,12 +554,14 @@ impl OperationDriver {
             }
             IggyError::TransientNotAccepted => {
                 call.refusal = error;
+                call.settle_sent();
                 self.refresh(call, hop, Failure::Refused).await;
                 Err(Next::Pause)
             }
             IggyError::NotPrimary => {
                 // Neither was admitted, so the deadline reports both as 58.
                 call.refusal = IggyError::TransientNotAccepted;
+                call.settle_sent();
                 self.refresh(call, hop, Failure::NotPrimary).await;
                 Err(if repeated { Next::Pause } else { Next::Again })
             }
@@ -1334,6 +1336,38 @@ mod tests {
             incarnation: request.header.partition_incarnation,
             owner_generation: request.header.owner_generation,
             metadata_op: request.header.minimum_metadata_op,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_refused_metadata_write_when_cancelled_during_roster_refresh_should_retain_only_prior_uncertainty()
+     {
+        for uncertain in [false, true] {
+            for refusal in [IggyError::TransientNotAccepted, IggyError::NotPrimary] {
+                let f = Fixture::new().await;
+                let mut answers = Vec::new();
+                if uncertain {
+                    answers.push(Answer::Refuse(IggyError::TransientNotCommitted));
+                }
+                answers.push(Answer::Refuse(refusal));
+                f.cluster.script(&endpoint(0), CREATE_STREAM_CODE, answers);
+                f.cluster
+                    .script(&endpoint(0), GET_CLUSTER_METADATA_CODE, [Answer::Silence]);
+                let roster_count = f.cluster.count(GET_CLUSTER_METADATA_CODE);
+
+                assert!(
+                    timeout(
+                        CALLER_TIMEOUT,
+                        f.call(CREATE_STREAM_CODE, RequestTarget::Metadata)
+                    )
+                    .await
+                    .is_err()
+                );
+
+                assert_eq!(f.cluster.count(GET_CLUSTER_METADATA_CODE), roster_count + 1);
+                let op = f.cluster.received(CREATE_STREAM_CODE)[0].header.request;
+                assert_eq!(f.driver.session.retains_operation(op), uncertain);
+            }
         }
     }
 

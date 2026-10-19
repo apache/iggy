@@ -1505,12 +1505,7 @@ impl IggyConsumer {
             {
                 joined_consumer_group.store(false, ORDERING);
             }
-            // Only an error that an event always follows can stop polling: the
-            // sign-in that an unauthenticated client waits for publishes
-            // SignedIn. A link can come back, or bind the same session again,
-            // with no event while other links stay up, so other errors retry.
             if matches!(error, IggyError::Unauthenticated) {
-                can_poll.store(false, ORDERING);
                 return Err(error);
             }
             trace!("Retrying to poll messages in {retry_interval}...");
@@ -2022,6 +2017,7 @@ mod tests {
     use super::*;
     use crate::client_wrappers::client_wrapper::ClientWrapper;
     use crate::clients::consumer_builder::IggyConsumerBuilder;
+    use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
     use crate::links::fake_cluster::{
         Answer, FakeCluster, TEST_BUDGET, connected, endpoint, eventually,
     };
@@ -2055,6 +2051,30 @@ mod tests {
 
     const POLL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
     const POLL_TIMEOUT: Duration = Duration::from_secs(2);
+
+    struct RejectMessages;
+
+    impl MessageConsumer for RejectMessages {
+        async fn consume(&self, _message: ReceivedMessage) -> Result<(), IggyError> {
+            panic!("a blocked poll must not deliver a message")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_blocked_poll_when_consuming_callbacks_should_return_the_retained_operation() {
+        const OPERATION: u64 = 42;
+        let mut consumer = builder().auto_commit(AutoCommit::Disabled).build();
+        consumer.poll_future = Some(Box::pin(async { Err(IggyError::LaneBlocked(OPERATION)) }));
+        let (_shutdown, receiver) = tokio::sync::oneshot::channel();
+
+        let result = timeout(
+            POLL_TIMEOUT,
+            consumer.consume_messages(&RejectMessages, receiver),
+        )
+        .await;
+
+        assert_eq!(result, Ok(Err(IggyError::LaneBlocked(OPERATION))));
+    }
 
     fn builder_for(consumer: Consumer) -> IggyConsumerBuilder {
         builder_on(TcpClient::default(), consumer)
@@ -3302,6 +3322,55 @@ mod tests {
         cluster.script(&primary, POLL_MESSAGES_CODE, [empty_poll()]);
         assert!(poll_until_success(&consumer).await.is_some());
         assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_delayed_poll_error_when_sign_in_has_completed_should_keep_polling_enabled() {
+        let (client, cluster) = connect_to_three_replicas().await;
+        let consumer =
+            polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
+        *cluster.session.lock().unwrap() = None;
+        cluster
+            .held_registers
+            .lock()
+            .unwrap()
+            .insert("iggy".to_owned());
+        cluster.script(
+            &endpoint(PARTITION_PRIMARY),
+            POLL_MESSAGES_CODE,
+            [Answer::Evict(EvictionReason::NoSession), empty_poll()],
+        );
+        let mut poll = Box::pin(consumer.create_poll_messages_future());
+        timeout(TEST_BUDGET, async {
+            while cluster.count(POLL_MESSAGES_CODE) == 0 {
+                assert!(
+                    poll.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        eventually("the failed poll triggers sign-in", || {
+            cluster.count(LOGIN_REGISTER_CODE) == 2
+        })
+        .await;
+        eventually("the consumer processes SignedOut", || {
+            !consumer.can_poll.load(ORDERING)
+        })
+        .await;
+        cluster.held_registers.lock().unwrap().clear();
+        eventually("the consumer processes SignedIn", || {
+            consumer.can_poll.load(ORDERING)
+        })
+        .await;
+
+        assert!(matches!(poll.await, Err(IggyError::Unauthenticated)));
+
+        assert!(consumer.can_poll.load(ORDERING));
+        assert!(poll_until_success(&consumer).await.is_some());
     }
 
     #[tokio::test(start_paused = true)]

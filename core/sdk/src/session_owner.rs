@@ -223,11 +223,12 @@ impl SessionOwner {
         crate::vsr::observe_metadata_reply(&self.metadata_watermark, header);
     }
 
+    #[cfg(test)]
     pub(crate) fn remember(&self, credentials: Credentials, user_id: u32) {
         self.remember_unless(|| false, credentials, user_id);
     }
 
-    /// [`Self::remember`], unless `withdrawn` returns true. It runs under the
+    /// Remembers credentials unless `withdrawn` returns true. It runs under the
     /// sign-in lock, so a caller that marks the sign-in withdrawn and then
     /// calls [`Self::forget`] cannot have a later sign-in undo that forget.
     /// Returns whether the credentials were kept.

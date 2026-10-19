@@ -214,6 +214,16 @@ impl ConnectCoordinator {
         }
     }
 
+    pub(crate) async fn wait_until_inactive(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if !self.active.load(Ordering::SeqCst) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     fn result_for(&self, generation: u64) -> Result<(), IggyError> {
         self.result
             .lock()
