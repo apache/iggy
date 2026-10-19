@@ -251,8 +251,10 @@ impl OperationDriver {
     }
 
     async fn drive(&self, mut call: Call) -> Result<Bytes, IggyError> {
+        let epoch = self.session.epoch();
+        let requires_session = epoch.bound || epoch.sign_in_owed;
         loop {
-            let next = match self.attempt(&mut call).await {
+            let next = match self.attempt(&mut call, requires_session).await {
                 Ok(body) => {
                     self.refresh_sign_in(&call);
                     call.complete(Ok(()));
@@ -310,7 +312,7 @@ impl OperationDriver {
     }
 
     /// One attempt of `call`, from the choice of its replica to its reply.
-    async fn attempt(&self, call: &mut Call) -> Result<Bytes, Next> {
+    async fn attempt(&self, call: &mut Call, requires_session: bool) -> Result<Bytes, Next> {
         if let Some(error) = self.stopped() {
             return Err(Next::Fail(error));
         }
@@ -323,7 +325,7 @@ impl OperationDriver {
             call.frame = None;
         }
         if call.frame.is_none() {
-            self.wait_for_session(call).await?;
+            self.wait_for_session(call, requires_session).await?;
         }
         let route = self.route_for(call).await?;
         let context = self.context(call, route.as_ref());
@@ -410,19 +412,25 @@ impl OperationDriver {
         }
     }
 
-    /// Waits for a bound session while the links sign in again. Without
-    /// credentials nothing signs in, so the call goes on unbound.
-    async fn wait_for_session(&self, call: &Call) -> Result<(), Next> {
-        if is_sign_in(call.code)
-            || self.session.epoch().bound
-            || self.session.sign_in_credentials().is_none()
-        {
+    /// A call that started with a session must not continue unbound after
+    /// automatic sign-in is rejected.
+    async fn wait_for_session(&self, call: &Call, requires_session: bool) -> Result<(), Next> {
+        if is_sign_in(call.code) || self.session.epoch().bound {
             return Ok(());
         }
+        if self.session.sign_in_credentials().is_none() {
+            return if requires_session {
+                Err(Next::Fail(IggyError::Unauthenticated))
+            } else {
+                Ok(())
+            };
+        }
         let mut epoch = self.session.subscribe_epoch();
-        match timeout_at(call.deadline, epoch.wait_for(|epoch| epoch.bound)).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(_)) | Err(_) => Err(Next::Fail(IggyError::Unauthenticated)),
+        let ready =
+            epoch.wait_for(|epoch| epoch.bound || (requires_session && !epoch.sign_in_owed));
+        match timeout_at(call.deadline, ready).await {
+            Ok(Ok(epoch)) if epoch.bound => Ok(()),
+            _ => Err(Next::Fail(IggyError::Unauthenticated)),
         }
     }
 
@@ -2235,6 +2243,96 @@ mod tests {
         assert!(fixture.cluster.count(GET_PARTITION_ROUTE_CODE) > 1);
         assert_eq!(fixture.driver.session.fence(), fence);
         assert_eq!(fixture.cluster.count(LOGIN_REGISTER_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_ended_session_when_a_read_reauthenticates_should_continue() {
+        let fixture = Fixture::new().await;
+        *fixture.cluster.session.lock().unwrap() = None;
+        fixture.cluster.script(
+            &endpoint(0),
+            GET_STREAMS_CODE,
+            [Answer::Refuse(IggyError::Unauthenticated)],
+        );
+
+        fixture
+            .driver
+            .send(GET_STREAMS_CODE, Bytes::new(), RequestTarget::Metadata)
+            .await
+            .unwrap();
+
+        assert!(fixture.driver.session.epoch().bound);
+        assert_eq!(fixture.cluster.count(LOGIN_REGISTER_CODE), 2);
+        assert_eq!(fixture.cluster.count(GET_STREAMS_CODE), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_deleted_user_when_a_read_reauthenticates_should_fail_before_the_deadline() {
+        const USER_ID: u32 = 1;
+        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+        for configured in [false, true] {
+            for delayed in [false, true] {
+                let cluster = FakeCluster::new(REPLICAS);
+                let credentials = Credentials::UsernamePassword("iggy".to_owned(), "iggy".into());
+                let auto_login = if configured {
+                    AutoLogin::Enabled(credentials.clone())
+                } else {
+                    AutoLogin::Disabled
+                };
+                let session = Arc::new(SessionOwner::new(auto_login));
+                session.remember(credentials, USER_ID);
+                let links = ReplicaLinks::new(
+                    cluster.dialer(),
+                    endpoint(0),
+                    policy(),
+                    Arc::clone(&session),
+                );
+                links.connect().await.unwrap();
+                eventually("every replica is bound", || {
+                    links.ready_replicas().len() == usize::from(REPLICAS)
+                })
+                .await;
+                let driver = OperationDriver::new(links);
+                *cluster.session.lock().unwrap() = None;
+                *cluster.reject_credentials.lock().unwrap() = true;
+                for replica in 0..REPLICAS {
+                    for code in [GET_STREAMS_CODE, GET_CLUSTER_METADATA_CODE] {
+                        cluster.script(
+                            &endpoint(replica),
+                            code,
+                            repeat_n(Answer::Refuse(IggyError::Unauthenticated), ENDLESS),
+                        );
+                    }
+                }
+                if delayed {
+                    cluster.held_registers.lock().unwrap().insert("iggy".into());
+                }
+                let release = async {
+                    if delayed {
+                        eventually("reauthentication reaches the server", || {
+                            cluster.count(LOGIN_REGISTER_CODE) == 2
+                        })
+                        .await;
+                        sleep(RETRY_BACKOFF_MAX).await;
+                        cluster.held_registers.lock().unwrap().clear();
+                    }
+                };
+                let read = driver.send(GET_STREAMS_CODE, Bytes::new(), RequestTarget::Metadata);
+
+                let (result, ()) = timeout(RECOVERY_TIMEOUT, async { tokio::join!(read, release) })
+                    .await
+                    .expect("a rejected sign-in must end the read before its deadline");
+
+                assert_eq!(
+                    result,
+                    Err(IggyError::Unauthenticated),
+                    "configured={configured}, delayed={delayed}"
+                );
+                assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 2);
+                assert!(!session.epoch().bound);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
