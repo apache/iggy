@@ -298,21 +298,18 @@ pub(crate) fn peek_command(header_bytes: &[u8; HEADER_SIZE]) -> Command {
     }
 }
 
-/// Map a session-terminal Eviction frame to a typed error. Fields are read
+/// Map an Eviction frame to its public error. Fields are read
 /// by wire offset instead of an `EvictionHeader` struct cast: the response
 /// buffers are not 16-aligned (the header holds `u128`s, so the cast would
 /// fail on an unlucky buffer placement), and reading raw lets the SDK apply
 /// the same window sanity check as `EvictionHeader::validate` rather than
 /// trusting the remote frame.
 pub(crate) fn decode_eviction(header_bytes: &[u8; HEADER_SIZE]) -> IggyError {
-    const REASON_OFFSET: usize = std::mem::offset_of!(EvictionHeader, reason);
     const VERSION_OFFSET: usize = std::mem::offset_of!(EvictionHeader, server_protocol_version);
     const VERSION_MIN_OFFSET: usize =
         std::mem::offset_of!(EvictionHeader, server_protocol_version_min);
 
-    let Ok(&reason) = bytemuck::checked::try_from_bytes::<EvictionReason>(
-        &header_bytes[REASON_OFFSET..=REASON_OFFSET],
-    ) else {
+    let Some(reason) = eviction_reason(header_bytes) else {
         return IggyError::Unauthenticated;
     };
     eviction_reason_to_error(
@@ -320,6 +317,13 @@ pub(crate) fn decode_eviction(header_bytes: &[u8; HEADER_SIZE]) -> IggyError {
         read_window_field(header_bytes, VERSION_OFFSET),
         read_window_field(header_bytes, VERSION_MIN_OFFSET),
     )
+}
+
+pub(crate) fn eviction_reason(header: &[u8; HEADER_SIZE]) -> Option<EvictionReason> {
+    const REASON_OFFSET: usize = std::mem::offset_of!(EvictionHeader, reason);
+    bytemuck::checked::try_from_bytes::<EvictionReason>(&header[REASON_OFFSET..=REASON_OFFSET])
+        .ok()
+        .copied()
 }
 
 fn read_window_field(header_bytes: &[u8; HEADER_SIZE], offset: usize) -> u32 {

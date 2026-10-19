@@ -341,7 +341,7 @@ impl ReplicaLinks {
     }
 
     /// Pings every link that serves the session, all at once. A failed ping
-    /// only logs, because a link that lost its connection redials on its own.
+    /// retires the link so its owner can rebind even when TCP remains open.
     ///
     /// Before the pings, while reconnection is on and the session is bound,
     /// or a link reset it and still owes the sign-in, it runs
@@ -385,10 +385,13 @@ impl ReplicaLinks {
             )
         });
         let mut succeeded = false;
-        for result in join_all(pings).await {
+        for (link, result) in links.iter().zip(join_all(pings).await) {
             match result {
                 Ok(_) => succeeded = true,
-                Err(error) => warn!("A keepalive ping failed: {error}"),
+                Err(error) => {
+                    link.close();
+                    warn!("A keepalive ping failed: {error}");
+                }
             }
         }
         Ok(succeeded)
@@ -1804,15 +1807,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_failed_pings_when_keepalive_ticks_should_report_no_success_and_keep_links() {
+    async fn given_silent_links_when_keepalive_expires_should_rebind_the_same_session() {
         let cluster = FakeCluster::new(2);
         let links = connected(&cluster, 2).await;
+        let fence = links.shared.session.fence();
         for id in 0..2 {
             cluster.script(&endpoint(id), PING_CODE, [Answer::Silence]);
         }
 
         assert!(!links.keepalive().await.unwrap());
-        assert_eq!(links.ready_replicas().len(), 2);
+        eventually("both silent links rebind", || {
+            (0..2).all(|id| cluster.dials_to(&endpoint(id)).len() == 2)
+                && links.ready_replicas().len() == 2
+        })
+        .await;
+        assert_eq!(links.shared.session.fence(), fence);
+        assert_eq!(cluster.count(LOGIN_REGISTER_CODE), 1);
         assert!(links.keepalive().await.unwrap());
 
         // As `Client::disconnect` does, so the keepalive does not reconnect.

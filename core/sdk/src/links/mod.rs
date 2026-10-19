@@ -61,6 +61,13 @@ pub(crate) enum Link {
 }
 
 impl Link {
+    pub(crate) fn no_session_eviction(&self) -> bool {
+        match self {
+            Self::Mux(link) => link.no_session_eviction(),
+            Self::Quic(link) => link.no_session_eviction(),
+        }
+    }
+
     /// Sends `frame` and waits for its reply until `deadline`. `sent` turns
     /// true when the frame can reach the server, and `NotConnected` means
     /// that it cannot have. A frame never leaves at or after its deadline,

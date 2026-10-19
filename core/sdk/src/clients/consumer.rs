@@ -3367,15 +3367,14 @@ mod tests {
         })
         .await;
 
-        assert!(matches!(poll.await, Err(IggyError::Unauthenticated)));
+        assert!(matches!(poll.await, Err(IggyError::TransientNotCommitted)));
 
         assert!(consumer.can_poll.load(ORDERING));
         assert!(poll_until_success(&consumer).await.is_some());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn given_an_unauthenticated_poll_when_the_client_signs_in_again_should_wait_for_signed_in()
-     {
+    async fn given_an_evicted_poll_when_the_client_signs_in_again_should_wait_for_signed_in() {
         let (client, cluster) = connect_to_three_replicas().await;
         let consumer =
             polling_consumer(client, Consumer::new(Identifier::numeric(1).unwrap())).await;
@@ -3394,7 +3393,7 @@ mod tests {
         let evicted = consumer.create_poll_messages_future().await;
 
         assert!(
-            matches!(evicted, Err(IggyError::Unauthenticated)),
+            matches!(evicted, Err(IggyError::TransientNotCommitted)),
             "{evicted:?}"
         );
         eventually("the client signs in again", || {

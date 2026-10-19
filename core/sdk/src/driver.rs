@@ -388,9 +388,13 @@ impl OperationDriver {
                     Err(IggyError::Disconnected)
                 }
             },
-            // An eviction closes the link for every request on it, so it does
-            // not tell whether the server admitted this one. A call that takes
-            // no lane, such as a read or a sign-in, ends with the eviction.
+            // A detached link can still belong to a live session. Its next bind
+            // decides whether the frozen request can be replayed safely.
+            Err(IggyError::Unauthenticated)
+                if request.session != 0 && hop.link.no_session_eviction() =>
+            {
+                Err(IggyError::Disconnected)
+            }
             Err(error) => {
                 call.uncertain |= sent
                     && !lost_link(&error)
@@ -2221,6 +2225,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_live_session_when_evicted_for_no_session_should_replay_the_frozen_mutation() {
+        for code in [SEND_MESSAGES_CODE, CREATE_STREAM_CODE] {
+            let fixture = Fixture::new().await;
+            let fence = fixture.driver.session.fence();
+            let (replica, target) = if code == SEND_MESSAGES_CODE {
+                (PRIMARY, fixture.partition(None))
+            } else {
+                (0, RequestTarget::Metadata)
+            };
+            fixture.cluster.script(
+                &endpoint(replica),
+                code,
+                [Answer::Evict(EvictionReason::NoSession)],
+            );
+
+            fixture.call(code, target).await.unwrap();
+
+            let sent = fixture.cluster.received(code);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0].header.request, sent[1].header.request);
+            assert_eq!(sent[0].header.session, sent[1].header.session);
+            assert_eq!(sent[0].body, sent[1].body);
+            assert_eq!(fixture.driver.session.fence(), fence);
+            assert_eq!(fixture.cluster.count(LOGIN_REGISTER_CODE), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_detached_replica_when_polling_should_rebind_and_continue_the_same_session() {
         for (auto_commit, strategy) in [
             (false, WirePollingStrategy::first()),
@@ -2590,14 +2622,14 @@ mod tests {
                 )
                 .await;
 
-            let expected = if progress {
-                IggyError::TransientNotCommitted
-            } else {
-                IggyError::Unauthenticated
-            };
-            assert_eq!(result, Err(expected), "progress={progress}");
             let polls = f.cluster.received(POLL_MESSAGES_CODE);
-            assert_eq!(polls.len(), 1, "progress={progress}");
+            if progress {
+                assert_eq!(result, Err(IggyError::TransientNotCommitted));
+                assert_eq!(polls.len(), 1);
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(polls.len(), 2);
+            }
             let op = polls[0].header.request;
             assert_eq!(
                 f.driver.abandon(op),

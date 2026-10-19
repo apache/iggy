@@ -22,11 +22,12 @@
 //! still match before its result can settle that request.
 
 use crate::links::{Frame, Reply};
-use crate::vsr::{decode_eviction, peek_command, reply_request_id};
+use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id};
 use bytes::Bytes;
-use iggy_binary_protocol::consensus::{Command, HEADER_SIZE};
+use iggy_binary_protocol::consensus::{Command, EvictionReason, HEADER_SIZE};
 use iggy_common::IggyError;
 use quinn::{Connection, VarInt, WriteError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Instant, timeout_at};
 use tracing::error;
 
@@ -37,14 +38,20 @@ const CLIENT_CLOSE_CODE: VarInt = VarInt::from_u32(0);
 #[derive(Debug)]
 pub(crate) struct QuicLink {
     connection: Connection,
+    no_session_eviction: AtomicBool,
     /// A longer reply fails its request.
     response_buffer_size: usize,
 }
 
 impl QuicLink {
+    pub(crate) fn no_session_eviction(&self) -> bool {
+        self.no_session_eviction.load(Ordering::Acquire)
+    }
+
     pub(crate) fn new(connection: Connection, response_buffer_size: usize) -> Self {
         Self {
             connection,
+            no_session_eviction: AtomicBool::new(false),
             response_buffer_size,
         }
     }
@@ -125,9 +132,12 @@ impl QuicLink {
         let Some(&header) = reply.first_chunk::<HEADER_SIZE>() else {
             return Err(IggyError::EmptyResponse);
         };
-        // An eviction ends the session, so it ends every request on the
-        // connection.
+        // An eviction detaches the connection, including its other streams.
         if peek_command(&header) == Command::Eviction {
+            self.no_session_eviction.store(
+                eviction_reason(&header) == Some(EvictionReason::NoSession),
+                Ordering::Release,
+            );
             self.close();
             return Err(decode_eviction(&header));
         }
