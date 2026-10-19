@@ -1478,6 +1478,34 @@ func TestPartitionRouteFromRetiredSessionCannotPopulateCachesOrWatermark(t *test
 	require.Equal(t, "iggy", credentials.username)
 }
 
+func TestUncachedPartitionLookupSkipsSilentMetadataReplica(t *testing.T) {
+	for _, shortFirstCall := range []bool{false, true} {
+		t.Run(fmt.Sprint(shortFirstCall), func(t *testing.T) {
+			fixture := newPrimaryPollFixture(t, func(primary, _ int, read request) ([]byte, bool) {
+				if read.code() == uint32(command.GetPartitionRouteCode) {
+					return pollRoutingReply(t, read, uint8(primary+1), 1), true
+				}
+				return nil, false
+			}, func(_ int, read request) ([]byte, bool) {
+				return []byte{}, read.code() == uint32(command.GetPartitionRouteCode)
+			})
+			require.Eventually(t, func() bool { return fixture.client.links.replica(1) != nil }, time.Second, time.Millisecond)
+			if shortFirstCall {
+				ctx, cancel := context.WithTimeout(context.Background(), managedLinkHeartbeat)
+				_, err := pollPrimaryPartition(ctx, fixture.client, 0)
+				cancel()
+				require.Error(t, err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), partitionLookupTimeout+time.Second)
+			defer cancel()
+			_, err := pollPrimaryPartition(ctx, fixture.client, 0)
+			require.NoError(t, err)
+			require.Equal(t, 1, requestCount(fixture.coordinator.recorded(), command.GetPartitionRouteCode))
+			require.True(t, linkReady(fixture.client.links.metadata()))
+		})
+	}
+}
+
 func TestPartitionLookupUsesReadyReplicaWhenMetadataCannotAnswer(t *testing.T) {
 	var requests atomic.Uint32
 	fixture := newPrimaryPollFixture(t, func(primary, _ int, read request) ([]byte, bool) {

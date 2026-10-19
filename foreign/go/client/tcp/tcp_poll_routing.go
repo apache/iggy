@@ -23,6 +23,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -34,6 +35,7 @@ const (
 	pollParametersSize     = 1 + 8 + 4 + 1
 	storeOffsetSuffixSize  = 8 + 1
 	deleteOffsetSuffixSize = 1
+	partitionLookupTimeout = 2 * time.Second
 )
 
 type capturedPartitionContext struct{}
@@ -57,10 +59,12 @@ type routeHint struct {
 	hasFailed    bool
 }
 type pollRouter struct {
-	mu     sync.Mutex
-	routes map[string]pollRoute
-	hints  map[laneKey]routeHint
-	clock  uint64
+	mu                sync.Mutex
+	routes            map[string]pollRoute
+	hints             map[laneKey]routeHint
+	clock             uint64
+	lastLookupFailure uint8
+	hasLookupFailure  bool
 }
 
 func (p *pollRouter) clearRoutes() {
@@ -71,7 +75,13 @@ func (p *pollRouter) clearRoutes() {
 		p.routes[key] = route
 	}
 }
-func (p *pollRouter) reset()               { p.mu.Lock(); clear(p.routes); clear(p.hints); p.mu.Unlock() }
+func (p *pollRouter) reset() {
+	p.mu.Lock()
+	clear(p.routes)
+	clear(p.hints)
+	p.hasLookupFailure = false
+	p.mu.Unlock()
+}
 func (p *pollRouter) dropRoute(key string) { p.mu.Lock(); delete(p.routes, key); p.mu.Unlock() }
 func (p *pollRouter) invalidate(route pollRoute, refused bool) {
 	p.mu.Lock()
@@ -131,6 +141,10 @@ func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRo
 		return cached, nil
 	}
 	var preferred, after *uint8
+	if c.polls.hasLookupFailure {
+		replica := c.polls.lastLookupFailure
+		after = &replica
+	}
 	if found {
 		if hint, ok := c.polls.hints[cached.key]; ok {
 			if hint.hasPreferred {
@@ -148,7 +162,12 @@ func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRo
 	c.polls.mu.Unlock()
 	metadataPrimary := c.links.metadata()
 	for _, link := range c.links.lookupCandidates(preferred, after) {
-		if err := c.bindLink(ctx, link); err != nil {
+		if ctx.Err() != nil {
+			return pollRoute{}, ierror.ErrTransientNotAccepted
+		}
+		attempt, cancel := context.WithTimeout(ctx, partitionLookupTimeout)
+		if err := c.bindLink(attempt, link); err != nil {
+			cancel()
 			if isSessionError(err) {
 				c.recoverSession(fence)
 				return pollRoute{}, err
@@ -159,7 +178,8 @@ func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRo
 			}
 			return pollRoute{}, err
 		}
-		body, err := c.readOnLink(ctx, link, command.GetPartitionRouteCode, query, &iggcon.PartitionContext{MetadataOp: watermark})
+		body, err := c.readOnLink(attempt, link, command.GetPartitionRouteCode, query, &iggcon.PartitionContext{MetadataOp: watermark})
+		cancel()
 		if err != nil {
 			// A deny with StaleClient closed only this link, and its bind decides.
 			if isSessionError(err) && !errors.Is(err, ierror.ErrStaleClient) {
@@ -200,9 +220,6 @@ func (c *IggyTcpClient) consumerRoute(ctx context.Context, query []byte) (pollRo
 }
 
 func (c *IggyTcpClient) recordLookupFailure(fence uint64, cached pollRoute, found bool, link *tcpLink) {
-	if !found {
-		return
-	}
 	replica, known := c.links.replicaID(link)
 	if !known {
 		return
@@ -214,6 +231,10 @@ func (c *IggyTcpClient) recordLookupFailure(fence uint64, cached pollRoute, foun
 	}
 	c.polls.mu.Lock()
 	defer c.polls.mu.Unlock()
+	c.polls.lastLookupFailure, c.polls.hasLookupFailure = replica, true
+	if !found {
+		return
+	}
 	if hint, ok := c.polls.hints[cached.key]; ok {
 		hint.lastFailed, hint.hasFailed = replica, true
 		c.polls.hints[cached.key] = hint
