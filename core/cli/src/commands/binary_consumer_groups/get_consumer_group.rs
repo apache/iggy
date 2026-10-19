@@ -226,3 +226,568 @@ impl CliCommand for GetConsumerGroupCmd {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CliCommand, GetConsumerGroupCmd};
+    use async_broadcast::Receiver;
+    use async_trait::async_trait;
+    use iggy_common::{
+        Client, ClientInfo, ClientInfoDetails, ClusterClient, ClusterMetadata,
+        CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails,
+        ConsumerOffsetClient, ConsumerOffsetInfo, ConsumerPosition, DiagnosticEvent, Identifier,
+        IdentityInfo, IggyByteSize, IggyError, IggyExpiry, IggyMessage, IggyTimestamp,
+        MAX_PARTITIONS_COUNT, MaxTopicSize, MessageClient, NonZeroIggyDuration, OptionSpec,
+        OptionsScope, Partition, PartitionClient, PartitionContext, Partitioning, Permissions,
+        PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
+        PolledMessages, PollingStrategy, RawPersonalAccessToken, SegmentClient,
+        SendMessagesResponse, Snapshot, SnapshotCompression, Stats, Stream, StreamClient,
+        StreamDetails, StreamUpdateOptions, SystemClient, SystemSnapshotType, Topic, TopicClient,
+        TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient, UserInfo,
+        UserInfoDetails, UserStatus, UserUpdateOptions,
+    };
+
+    #[derive(Debug, Clone, Copy)]
+    enum TopicReply {
+        Error,
+        Missing,
+        Empty,
+        OnePartition,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedClient {
+        partitions_count: u32,
+        topic: TopicReply,
+        offset_fails: bool,
+    }
+
+    fn fail<T>() -> Result<T, IggyError> {
+        Err(IggyError::Error)
+    }
+
+    fn group(partitions_count: u32) -> ConsumerGroupDetails {
+        ConsumerGroupDetails {
+            id: 3,
+            name: "group".to_owned(),
+            partitions_count,
+            members_count: 0,
+            members: Vec::new(),
+        }
+    }
+
+    fn topic_details(partitions: Vec<Partition>) -> TopicDetails {
+        TopicDetails {
+            id: 2,
+            created_at: IggyTimestamp::zero(),
+            name: "topic".to_owned(),
+            size: IggyByteSize::default(),
+            message_expiry: IggyExpiry::NeverExpire,
+            compression_algorithm: CompressionAlgorithm::None,
+            max_topic_size: MaxTopicSize::Unlimited,
+            messages_count: 0,
+            partitions_count: u32::try_from(partitions.len()).unwrap(),
+            partitions,
+            options: Default::default(),
+        }
+    }
+
+    fn partition_zero() -> Partition {
+        Partition {
+            id: 0,
+            created_at: IggyTimestamp::zero(),
+            segments_count: 1,
+            current_offset: 0,
+            size: IggyByteSize::default(),
+            messages_count: 0,
+            context: PartitionContext::default(),
+        }
+    }
+
+    fn command() -> GetConsumerGroupCmd {
+        GetConsumerGroupCmd::new(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+            Identifier::numeric(3).unwrap(),
+        )
+    }
+
+    async fn error_from(client: &ScriptedClient) -> anyhow::Error {
+        let mut cmd = command();
+        cmd.execute_cmd(client)
+            .await
+            .expect_err("consumer group get should fail")
+    }
+
+    #[async_trait]
+    impl ClusterClient for ScriptedClient {
+        async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl SystemClient for ScriptedClient {
+        async fn get_stats(&self) -> Result<Stats, IggyError> {
+            fail()
+        }
+
+        async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
+            fail()
+        }
+
+        async fn get_client(
+            &self,
+            _client_id: u32,
+        ) -> Result<Option<ClientInfoDetails>, IggyError> {
+            fail()
+        }
+
+        async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError> {
+            fail()
+        }
+
+        async fn describe_options(
+            &self,
+            _scope: OptionsScope,
+        ) -> Result<Vec<OptionSpec>, IggyError> {
+            fail()
+        }
+
+        async fn ping(&self) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
+            NonZeroIggyDuration::ONE_SECOND
+        }
+
+        async fn snapshot(
+            &self,
+            _compression: SnapshotCompression,
+            _snapshot_types: Vec<SystemSnapshotType>,
+        ) -> Result<Snapshot, IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl UserClient for ScriptedClient {
+        async fn get_user(
+            &self,
+            _user_id: &Identifier,
+        ) -> Result<Option<UserInfoDetails>, IggyError> {
+            fail()
+        }
+
+        async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
+            fail()
+        }
+
+        async fn create_user(
+            &self,
+            _username: &str,
+            _password: &str,
+            _status: UserStatus,
+            _permissions: Option<Permissions>,
+        ) -> Result<UserInfoDetails, IggyError> {
+            fail()
+        }
+
+        async fn delete_user(&self, _user_id: &Identifier) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn update_user(
+            &self,
+            _user_id: &Identifier,
+            _username: Option<&str>,
+            _status: Option<UserStatus>,
+            _options: &UserUpdateOptions,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn update_permissions(
+            &self,
+            _user_id: &Identifier,
+            _permissions: Option<Permissions>,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn change_password(
+            &self,
+            _user_id: &Identifier,
+            _current_password: &str,
+            _new_password: &str,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn login_user(
+            &self,
+            _username: &str,
+            _password: &str,
+        ) -> Result<IdentityInfo, IggyError> {
+            fail()
+        }
+
+        async fn logout_user(&self) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl PersonalAccessTokenClient for ScriptedClient {
+        async fn get_personal_access_tokens(
+            &self,
+        ) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
+            fail()
+        }
+
+        async fn create_personal_access_token(
+            &self,
+            _name: &str,
+            _expiry: PersonalAccessTokenExpiry,
+        ) -> Result<RawPersonalAccessToken, IggyError> {
+            fail()
+        }
+
+        async fn delete_personal_access_token(&self, _name: &str) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn login_with_personal_access_token(
+            &self,
+            _token: &str,
+        ) -> Result<IdentityInfo, IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl StreamClient for ScriptedClient {
+        async fn get_stream(
+            &self,
+            _stream_id: &Identifier,
+        ) -> Result<Option<StreamDetails>, IggyError> {
+            fail()
+        }
+
+        async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
+            fail()
+        }
+
+        async fn create_stream(&self, _name: &str) -> Result<StreamDetails, IggyError> {
+            fail()
+        }
+
+        async fn update_stream(
+            &self,
+            _stream_id: &Identifier,
+            _name: &str,
+            _options: &StreamUpdateOptions,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn delete_stream(&self, _stream_id: &Identifier) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl TopicClient for ScriptedClient {
+        async fn get_topic(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+        ) -> Result<Option<TopicDetails>, IggyError> {
+            match self.topic {
+                TopicReply::Error => Err(IggyError::Error),
+                TopicReply::Missing => Ok(None),
+                TopicReply::Empty => Ok(Some(topic_details(Vec::new()))),
+                TopicReply::OnePartition => Ok(Some(topic_details(vec![partition_zero()]))),
+            }
+        }
+
+        async fn get_topics(&self, _stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
+            fail()
+        }
+
+        async fn create_topic(
+            &self,
+            _stream_id: &Identifier,
+            _name: &str,
+            _options: &TopicCreateOptions,
+        ) -> Result<TopicDetails, IggyError> {
+            fail()
+        }
+
+        async fn update_topic(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _name: &str,
+            _options: &TopicUpdateOptions,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn delete_topic(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl PartitionClient for ScriptedClient {
+        async fn create_partitions(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partitions_count: u32,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn delete_partitions(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partitions_count: u32,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl SegmentClient for ScriptedClient {
+        async fn delete_segments(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partition_id: u32,
+            _segments_count: u32,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl MessageClient for ScriptedClient {
+        async fn poll_messages(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partition_id: Option<u32>,
+            _consumer: &Consumer,
+            _strategy: &PollingStrategy,
+            _count: u32,
+            _auto_commit: bool,
+        ) -> Result<PolledMessages, IggyError> {
+            fail()
+        }
+
+        async fn send_messages(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partitioning: &Partitioning,
+            _messages: &mut [IggyMessage],
+        ) -> Result<SendMessagesResponse, IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl ConsumerOffsetClient for ScriptedClient {
+        async fn store_consumer_position(
+            &self,
+            _consumer: &Consumer,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _position: ConsumerPosition,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn store_consumer_offset(
+            &self,
+            _consumer: &Consumer,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partition_id: Option<u32>,
+            _offset: u64,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn get_consumer_offset(
+            &self,
+            _consumer: &Consumer,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partition_id: Option<u32>,
+        ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
+            if self.offset_fails {
+                Err(IggyError::Error)
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn delete_consumer_offset(
+            &self,
+            _consumer: &Consumer,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _partition_id: Option<u32>,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl ConsumerGroupClient for ScriptedClient {
+        async fn get_consumer_group(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _group_id: &Identifier,
+        ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
+            Ok(Some(group(self.partitions_count)))
+        }
+
+        async fn get_consumer_groups(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+        ) -> Result<Vec<ConsumerGroup>, IggyError> {
+            fail()
+        }
+
+        async fn create_consumer_group(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _name: &str,
+        ) -> Result<ConsumerGroupDetails, IggyError> {
+            fail()
+        }
+
+        async fn delete_consumer_group(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn join_consumer_group(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn leave_consumer_group(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            fail()
+        }
+    }
+
+    #[async_trait]
+    impl Client for ScriptedClient {
+        async fn connect(&self) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            fail()
+        }
+
+        async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            async_broadcast::broadcast(1).1
+        }
+    }
+
+    #[tokio::test]
+    async fn should_report_topic_fetch_failure() {
+        let error = error_from(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::Error,
+            offset_fails: false,
+        })
+        .await;
+
+        assert!(error.to_string().contains("Problem getting topic"));
+    }
+
+    #[tokio::test]
+    async fn should_report_missing_topic() {
+        let error = error_from(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::Missing,
+            offset_fails: false,
+        })
+        .await;
+
+        assert!(error.to_string().contains("was not found"));
+    }
+
+    #[tokio::test]
+    async fn should_report_missing_partition() {
+        let error = error_from(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::Empty,
+            offset_fails: false,
+        })
+        .await;
+
+        assert!(error.to_string().contains("Partition with ID: 0"));
+    }
+
+    #[tokio::test]
+    async fn should_report_offset_fetch_failure() {
+        let error = error_from(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::OnePartition,
+            offset_fails: true,
+        })
+        .await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("Problem getting consumer offset")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_reject_partitions_count_above_the_limit() {
+        let error = error_from(&ScriptedClient {
+            partitions_count: MAX_PARTITIONS_COUNT + 1,
+            topic: TopicReply::Empty,
+            offset_fails: false,
+        })
+        .await;
+
+        assert!(error.to_string().contains("above the limit"));
+    }
+}
