@@ -378,8 +378,14 @@ pub async fn persist_offset_retained(
 /// Opens the offset file at `path` for writing, creating it when absent. Only a
 /// file this call creates is charged: its first record allocates a block, while
 /// an existing file already owns one. Hold the charge until that record is
-/// written.
+/// written. Commits reopen existing files far more often than they create
+/// new ones, so the plain open goes first.
 async fn open_offset_file(path: &str) -> io::Result<(compio::fs::File, Option<Charge<'static>>)> {
+    match OpenOptions::new().write(true).open(path).await {
+        Ok(file) => return Ok((file, None)),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -387,10 +393,9 @@ async fn open_offset_file(path: &str) -> io::Result<(compio::fs::File, Option<Ch
         .await
     {
         Ok(file) => Ok((file, Some(DISK_USAGE.charge(OFFSET_FILE_BLOCK_BYTES)))),
+        // Created by another writer between the two opens, so it owns its block.
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(false)
             .open(path)
             .await
             .map(|file| (file, None)),
@@ -408,9 +413,12 @@ async fn write_in_place<S: DurableStorage, const N: usize>(
         .open(Path::new(path), OpenMode::CreateWriteOnly)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    file.write(0, record.to_vec())
-        .await
-        .map_err(|_| IggyError::CannotWriteToFile)
+    // The open truncates, so the record allocates a block whether or not the
+    // file existed. The truncate freed the previous one, which the next sample sees.
+    let charge = storage.charge_allocation(OFFSET_FILE_BLOCK_BYTES);
+    let written = file.write(0, record.to_vec()).await;
+    drop(charge);
+    written.map_err(|_| IggyError::CannotWriteToFile)
 }
 
 async fn create_parent_dir(path: &str) -> Result<(), IggyError> {
@@ -481,13 +489,18 @@ async fn write_replacement<S: DurableStorage, const N: usize>(
     // file that boot discards. The fixed sibling is safe because writes to one
     // consumer key are serialized by the partition pump.
     let temporary = replacement_path(path);
+    // The replacement is a fresh inode, so its record allocates a block. Renamed
+    // over an existing file, it takes the place of the block the rename frees,
+    // so only a replacement that creates the file grows the volume. A failed
+    // probe charges, erring towards a fuller disk.
+    let creates = !storage.exists(Path::new(path)).await.unwrap_or(false);
     let mut file = storage
         .open(Path::new(&temporary), OpenMode::CreateWriteOnly)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    // The replacement is a fresh inode, so its record allocates a block. The
-    // rename frees the previous file's block, which the next sample sees.
-    let charge = storage.charge_allocation(OFFSET_FILE_BLOCK_BYTES);
+    let charge = creates
+        .then(|| storage.charge_allocation(OFFSET_FILE_BLOCK_BYTES))
+        .flatten();
     let written = file.write(0, record.to_vec()).await;
     drop(charge);
     if written.is_err() {
@@ -812,6 +825,39 @@ mod tests {
                 offset: 114,
                 checksummed: false
             }
+        );
+    }
+
+    #[compio::test]
+    async fn given_an_absent_offset_file_when_opening_should_create_and_charge_it() {
+        let path = unique_temp_dir().join("7");
+        let path = path.to_str().unwrap();
+
+        let (_file, charge) = open_offset_file(path).await.unwrap();
+
+        assert!(
+            charge.is_some(),
+            "a created file must be charged for its block"
+        );
+        assert!(Path::new(path).exists());
+    }
+
+    #[compio::test]
+    async fn given_an_existing_offset_file_when_opening_should_keep_its_record_and_not_charge() {
+        let path = unique_temp_dir().join("7");
+        std::fs::write(&path, encode_offset_record(114)).unwrap();
+        let path = path.to_str().unwrap();
+
+        let (_file, charge) = open_offset_file(path).await.unwrap();
+
+        assert!(charge.is_none(), "an existing file already owns its block");
+        assert_eq!(
+            read_offset_record(path).await.unwrap(),
+            Some(OffsetRecord::Value {
+                offset: 114,
+                checksummed: true,
+            }),
+            "opening must not truncate the record"
         );
     }
 
