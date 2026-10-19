@@ -86,7 +86,7 @@ const (
 	resultEntryLength = 8
 )
 
-// EvictionError is a session-terminal eviction frame. The mapped IggyError is
+// EvictionError is an eviction frame. The mapped IggyError is
 // what callers match on. The protocol window is kept for diagnostics on a
 // version mismatch.
 type EvictionError struct {

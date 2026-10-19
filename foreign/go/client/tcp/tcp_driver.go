@@ -309,7 +309,9 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			if sent {
 				uncertain = true
 			}
-			if isSessionError(reply.err) {
+			if bound && isDetachedError(reply.err) {
+				reply.err = ierror.ErrTransientNotCommitted
+			} else if isSessionError(reply.err) {
 				c.recoverSession(operation.fence)
 			}
 			if progress && sent {
@@ -417,7 +419,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			}
 			return nil, err
 		default:
-			if !closeIfDetached(link, outcome) && isSessionError(err) {
+			if closeIfDetached(link, outcome, bound) {
+				if errors.Is(err, ierror.ErrUnauthenticated) {
+					err = nil
+					continue
+				}
+			} else if isSessionError(err) {
 				c.recoverSession(operation.fence)
 			}
 			if operation.query != nil && (errors.Is(err, ierror.ErrHistoryUnavailable) || errors.Is(err, ierror.ErrLifecycleBusy) || errors.Is(err, ierror.ErrConsumerGroupPartitionNotOwned)) {
@@ -468,6 +475,7 @@ func (c *IggyTcpClient) readOnLink(ctx context.Context, link *tcpLink, code comm
 	frame := append(reserveHeader(nil), body...)
 	c.mtx.Lock()
 	fence := c.sessionFence
+	bound := c.session.Bound() && code != command.BindSessionCode
 	err := vsr.StampRequestHeader(c.session, uint32(code), frame)
 	if captured == nil {
 		captured = &iggcon.PartitionContext{MetadataOp: c.metadataWatermark.Load()}
@@ -489,6 +497,9 @@ func (c *IggyTcpClient) readOnLink(ctx context.Context, link *tcpLink, code comm
 		return nil, ierror.ErrUnauthenticated
 	}
 	if reply.err != nil {
+		if bound && isDetachedError(reply.err) {
+			return nil, ierror.ErrTransientNotCommitted
+		}
 		return nil, reply.err
 	}
 	outcome, err := vsr.DecodeReplyFor((*[vsr.HeaderSize]byte)(frame), &reply.header, reply.body)
@@ -498,21 +509,25 @@ func (c *IggyTcpClient) readOnLink(ctx context.Context, link *tcpLink, code comm
 	if !c.observeMetadataFor(fence, &reply.header) {
 		return nil, ierror.ErrUnauthenticated
 	}
-	closeIfDetached(link, outcome)
+	if code != command.BindSessionCode && closeIfDetached(link, outcome, bound) && errors.Is(outcome.Err, ierror.ErrUnauthenticated) {
+		return nil, ierror.ErrTransientNotAccepted
+	}
 	return outcome.Body, outcome.Err
 }
 
-// closeIfDetached closes link after a deny with StaleClient and reports
-// whether it did. The deny says that the server no longer attaches link to the
-// session. A replica that replaced its client table denies so for a live
-// session too. So the slot of link binds the session again, and that bind
-// tells whether the session ended.
-func closeIfDetached(link *tcpLink, outcome vsr.ReplyOutcome) bool {
-	if outcome.Committed || !errors.Is(outcome.Err, ierror.ErrStaleClient) {
+// A detached connection can still belong to a live session. Only its next
+// bind can decide whether to discard the session's retained operations.
+func closeIfDetached(link *tcpLink, outcome vsr.ReplyOutcome, bound bool) bool {
+	if outcome.Committed || !(errors.Is(outcome.Err, ierror.ErrStaleClient) || bound && errors.Is(outcome.Err, ierror.ErrUnauthenticated)) {
 		return false
 	}
 	link.close(ierror.ErrTransientNotCommitted)
 	return true
+}
+
+func isDetachedError(err error) bool {
+	var eviction *vsr.EvictionError
+	return errors.As(err, &eviction) && (eviction.Reason == vsr.EvictionNoSession || eviction.Reason == vsr.EvictionStaleClient)
 }
 
 func (c *IggyTcpClient) observeMetadataFor(fence uint64, header *[vsr.HeaderSize]byte) bool {

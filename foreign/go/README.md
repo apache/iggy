@@ -92,6 +92,11 @@ keeps the last `maxOperations` outcomes that its replays proved, also across a
 session reset. So a later `ResolveOperation` of the same ID returns that outcome
 without a request, also after another caller resolved the operation first.
 
+Adding these two methods to `contracts.Client` requires external implementations,
+wrappers, and mocks to implement them. The exported
+`IggyTcpClient.HandleLeaderRedirection` method has been removed; replica routing
+and reconnection are managed by the client.
+
 If the application accepts the uncertainty, call
 `AbandonOperation(ctx, operationID)` to release local recovery ownership.
 Abandoning does not cancel server execution or make a new application send safe

@@ -440,7 +440,7 @@ func newOfflinePipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 }
 
 func TestExchange_SessionEvictionLeavesASentWriteUncertainUntilTheResetDropsIt(t *testing.T) {
-	for _, reason := range []vsr.EvictionReason{vsr.EvictionNoSession, vsr.EvictionSessionTooLow,
+	for _, reason := range []vsr.EvictionReason{vsr.EvictionSessionTooLow,
 		vsr.EvictionSessionReleaseMismatch, vsr.EvictionUserInactive, vsr.EvictionSessionError} {
 		for _, write := range sentWrites(t) {
 			t.Run(fmt.Sprintf("%s/reason_%d", write.name, reason), func(t *testing.T) {
@@ -469,6 +469,7 @@ func TestExchange_LostLinkKeepsTheSessionAndTheSentWrite(t *testing.T) {
 		name   string
 		answer func(attempt int, read request) []byte
 	}{
+		{"no_session_eviction", func(int, request) []byte { return evictionFrame(vsr.EvictionNoSession, 0, 0) }},
 		{"stale_client_eviction", func(int, request) []byte { return evictionFrame(vsr.EvictionStaleClient, 0, 0) }},
 		{"mismatched_reply", func(int, request) []byte { return replyFrame(vsr.OperationDeleteStream, resultSection()) }},
 		{"unproved_reply", uncertainAnswer},
@@ -538,7 +539,7 @@ func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) 
 	}{
 		{"no_session/auto_commit", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), true, ierror.ErrTransientNotCommitted},
 		{"no_session/next", vsr.EvictionNoSession, iggcon.NextPollingStrategy(), false, ierror.ErrTransientNotCommitted},
-		{"no_session/read_only", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), false, ierror.ErrUnauthenticated},
+		{"no_session/read_only", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), false, ierror.ErrTransientNotCommitted},
 		{"stale_client/next", vsr.EvictionStaleClient, iggcon.NextPollingStrategy(), true, ierror.ErrTransientNotCommitted},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -567,7 +568,7 @@ func TestExchange_DenyReplyToASentWriteStaysDefinitive(t *testing.T) {
 
 			err := write.send(context.Background(), client)
 
-			require.ErrorIs(t, err, ierror.ErrUnauthenticated)
+			require.ErrorIs(t, err, ierror.ErrNotConnected)
 			require.NotErrorIs(t, err, ierror.ErrUncertainOutcome)
 			written := requestsFor(server.recorded(), write.operation)
 			require.Len(t, written, 1)

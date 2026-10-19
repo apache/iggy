@@ -110,7 +110,7 @@ func credentialServer(t *testing.T, change func(attempt int, read request) []byt
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			return clusterMetadataFrame(t, 0, server.address())
 		case read.code() == uint32(command.PingCode) && evict.CompareAndSwap(true, false):
-			return evictionFrame(vsr.EvictionNoSession, 0, 0)
+			return evictionFrame(vsr.EvictionSessionError, 0, 0)
 		case read.operation() == vsr.OperationChangePassword || read.operation() == vsr.OperationUpdateUser:
 			mtx.Lock()
 			attempt := attempts[read.requestID()]

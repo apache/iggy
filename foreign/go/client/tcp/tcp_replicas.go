@@ -45,9 +45,10 @@ type connectAttempt struct {
 	err  error
 }
 type replicaSlot struct {
-	endpoint string
-	link     *tcpLink
-	cancel   context.CancelFunc
+	endpoint         string
+	link             *tcpLink
+	cancel           context.CancelFunc
+	retriesExhausted bool
 }
 
 type replicaLinks struct {
@@ -267,16 +268,13 @@ func (r *replicaLinks) install(metadata *iggcon.ClusterMetadata) error {
 		if r.slots[id] != nil {
 			continue
 		}
-		ctx, cancel := context.WithCancel(r.ctx)
-		slot := &replicaSlot{endpoint: endpoint, cancel: cancel}
+		slot := &replicaSlot{endpoint: endpoint}
 		if linkReady(r.bootstrap) && (len(endpoints) == 1 || r.bootstrap.endpoint == endpoint) {
 			slot.link = r.bootstrap
 			r.bootstrap = nil
 		}
 		r.slots[id] = slot
-		tasks := r.tasks
-		tasks.Add(1)
-		go func() { defer tasks.Done(); r.runSlot(ctx, id, slot) }()
+		r.startSlotLocked(id, slot)
 	}
 	r.retireBootstrapLocked()
 	r.notifyLocked()
@@ -293,6 +291,15 @@ func (r *replicaLinks) retireBootstrapLocked() {
 }
 
 func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot) {
+	exhausted := false
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.slots[id] == slot && ctx.Err() == nil {
+			slot.retriesExhausted = exhausted
+			r.notifyLocked()
+		}
+	}()
 	failures := uint32(0)
 	initial := true
 	for {
@@ -313,6 +320,7 @@ func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot)
 		}
 		configuration := r.client.config.reconnection
 		if !initial && (!configuration.enabled || configuration.maxRetries > 0 && failures > configuration.maxRetries) {
+			exhausted = configuration.enabled
 			return
 		}
 		if err := r.client.pause(ctx, reconnectDelay(configuration.interval, failures)); err != nil {
@@ -353,6 +361,18 @@ func (r *replicaLinks) runSlot(ctx context.Context, id uint8, slot *replicaSlot)
 		r.notifyLocked()
 		r.mu.Unlock()
 	}
+}
+
+func (r *replicaLinks) startSlotLocked(id uint8, slot *replicaSlot) {
+	if slot.cancel != nil {
+		slot.cancel()
+	}
+	ctx, cancel := context.WithCancel(r.ctx)
+	slot.cancel = cancel
+	slot.retriesExhausted = false
+	tasks := r.tasks
+	tasks.Add(1)
+	go func() { defer tasks.Done(); r.runSlot(ctx, id, slot) }()
 }
 
 func (r *replicaLinks) anyLocked() *tcpLink {
@@ -493,11 +513,18 @@ func (r *replicaLinks) startHeartbeat() {
 			case <-ticker.C:
 			}
 			r.mu.Lock()
+			if ctx.Err() != nil {
+				r.mu.Unlock()
+				return
+			}
 			ready := make([]*tcpLink, 0, len(r.slots)+1)
 			if linkReady(r.bootstrap) {
 				ready = append(ready, r.bootstrap)
 			}
-			for _, slot := range r.slots {
+			for id, slot := range r.slots {
+				if slot.retriesExhausted && r.client.config.reconnection.enabled {
+					r.startSlotLocked(id, slot)
+				}
 				if linkReady(slot.link) {
 					ready = append(ready, slot.link)
 				}

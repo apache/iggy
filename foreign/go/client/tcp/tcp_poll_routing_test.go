@@ -381,14 +381,14 @@ func TestPrimaryPoll_InvalidReplyFrameDropsTheDataConnectionWithoutReplay(t *tes
 	assert.Equal(t, 2, fixture.primaries[0].connections())
 }
 
-func TestPrimaryPoll_SessionFailureReplacesDataConnectionWithoutReplay(t *testing.T) {
+func TestPrimaryPoll_DetachedLinkPreservesTheSessionAndReplaysOnlyARefusedPoll(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		reply []byte
 		want  error
 	}{
 		{"evicted", evictionFrame(vsr.EvictionNoSession, 0, 0), ierror.ErrTransientNotCommitted},
-		{"unauthenticated", statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil), ierror.ErrUnauthenticated},
+		{"unauthenticated", statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.ErrUnauthenticated.Code()), nil), nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var polls atomic.Int32
@@ -405,11 +405,15 @@ func TestPrimaryPoll_SessionFailureReplacesDataConnectionWithoutReplay(t *testin
 				defer fixture.client.mtx.Unlock()
 				return fixture.client.session.Bound()
 			}, time.Second, time.Millisecond)
-			require.Equal(t, int32(1), polls.Load())
+			if test.want == nil {
+				require.Equal(t, int32(2), polls.Load())
+			} else {
+				require.Equal(t, int32(1), polls.Load())
+			}
 			_, err = pollPrimaryPartition(context.Background(), fixture.client, 0)
 			require.NoError(t, err)
 			assert.Equal(t, 2, fixture.primaries[0].connections())
-			assert.Equal(t, 2, fixture.coordinator.connections())
+			assert.Equal(t, 1, fixture.coordinator.connections())
 		})
 	}
 }

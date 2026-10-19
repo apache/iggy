@@ -728,3 +728,42 @@ func TestDriverAfterSilentMetadataReplicaDiscoversThroughAnotherLink(t *testing.
 	require.True(t, linkReady(oldLink))
 	require.Equal(t, uint64(100), client.session.SessionID())
 }
+
+func TestDetachedLinkPreservesRetainedMutation(t *testing.T) {
+	for _, evicted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("evicted_%t", evicted), func(t *testing.T) {
+			var attempts atomic.Int32
+			var detach atomic.Bool
+			var server *testListener
+			server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				if read.operation() == vsr.OperationCreateStream {
+					if attempt := int(attempts.Add(1)) - 1; attempt < 2 {
+						return uncertainAnswer(attempt, read)
+					}
+					return committedReply(read, 0)
+				}
+				if read.code() == uint32(command.PingCode) && detach.CompareAndSwap(true, false) {
+					if evicted {
+						return evictionFrame(vsr.EvictionNoSession, 0, 0)
+					}
+					return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
+				}
+				return singleNodeHandler(t, func() string { return server.address() })(connection, index, read)
+			})
+			client := newDialingClient(t, server.address(),
+				WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")), WithHeartbeatInterval(time.Hour))
+			ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+			defer cancel()
+			require.NoError(t, client.Connect(ctx))
+			operationID := uncertainWrite(t, client)
+			detach.Store(true)
+			require.NoError(t, client.Ping(ctx))
+			require.NoError(t, client.ResolveOperation(ctx, operationID))
+			writes := createStreams(server.recorded())
+			require.Len(t, writes, 3)
+			require.Equal(t, writes[0].header, writes[2].header)
+			require.Equal(t, writes[0].payload, writes[2].payload)
+			require.Len(t, registerRequests(server), 1)
+		})
+	}
+}

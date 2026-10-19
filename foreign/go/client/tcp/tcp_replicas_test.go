@@ -192,17 +192,21 @@ func TestManagedLinks_StopHeartbeatAndReconnectOnSessionEnd(t *testing.T) {
 
 func TestManagedHeartbeatTerminalRefusalResetsSessionAndAssignments(t *testing.T) {
 	var refuse atomic.Bool
+	var ended atomic.Uint64
 	var registers atomic.Uint64
 	var server *testListener
 	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		switch {
 		case read.operation() == vsr.OperationRegister:
 			return registerReplyFrame(7, managedLinkSession+registers.Add(1))
+		case read.code() == uint32(command.BindSessionCode) && read.sessionID() == ended.Load():
+			return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
 		case read.code() == uint32(command.BindSessionCode):
 			return bindReplyFrame(7, read.sessionID())
 		case read.code() == uint32(command.GetClusterMetadataCode):
 			return clusterMetadataFrame(t, 0, server.address())
 		case read.code() == uint32(command.PingCode) && refuse.CompareAndSwap(true, false):
+			ended.Store(read.sessionID())
 			return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
 		default:
 			return replyFrame(read.operation(), nil)
@@ -387,13 +391,18 @@ func sessionBound(client *IggyTcpClient) bool {
 func lostSessionServer(t *testing.T, register func(number int, read request) []byte) (*testListener, *atomic.Bool) {
 	t.Helper()
 	var lost atomic.Bool
+	var ended atomic.Pointer[vsr.ClientID]
 	var count atomic.Int32
 	var server *testListener
 	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
 		switch {
 		case read.operation() == vsr.OperationRegister:
 			return register(int(count.Add(1)), read)
+		case read.code() == uint32(command.BindSessionCode) && ended.Load() != nil && read.clientID() == *ended.Load():
+			return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
 		case read.code() == uint32(command.PingCode) && lost.CompareAndSwap(true, false):
+			identity := read.clientID()
+			ended.Store(&identity)
 			return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
 		default:
 			return singleNodeHandler(t, func() string { return server.address() })(connection, index, read)
@@ -603,4 +612,30 @@ func TestManagedLinksIgnoreDisabledTransportEndpoints(t *testing.T) {
 	require.NoError(t, client.links.install(&metadata))
 	require.False(t, client.links.contains(1))
 	require.Len(t, client.links.slots, 1)
+}
+
+func TestManagedHeartbeatRestartsExhaustedReplicaRetries(t *testing.T) {
+	var down atomic.Bool
+	var server *testListener
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+		if down.Load() {
+			return nil
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(connection, index, read)
+	})
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")),
+		WithHeartbeatInterval(managedLinkHeartbeat))
+	client.config.reconnection.maxRetries = 1
+	ctx, cancel := context.WithTimeout(context.Background(), managedLinkTestBudget)
+	defer cancel()
+	require.NoError(t, client.Connect(ctx))
+	down.Store(true)
+	require.Eventually(t, func() bool { return server.connections() >= 4 },
+		managedLinkTestBudget, managedLinkPoll, "heartbeats restart exhausted slots")
+	down.Store(false)
+	require.Eventually(t, func() bool { return client.links.replica(0) != nil },
+		managedLinkTestBudget, managedLinkPoll)
+	require.NoError(t, client.Ping(ctx))
+	require.Len(t, registerRequests(server), 1)
 }

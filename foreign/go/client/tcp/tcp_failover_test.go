@@ -230,7 +230,7 @@ func TestFailover_ServerEvictionReplaysTheRememberedSignIn(t *testing.T) {
 	registersBefore := registers.Load()
 
 	evict.Store(true)
-	require.ErrorIs(t, client.Ping(ctx), ierror.ErrUnauthenticated)
+	require.ErrorIs(t, client.Ping(ctx), ierror.ErrTransientNotAccepted)
 	_, remembered := client.signInCredentials()
 	require.True(t, remembered)
 	require.Eventually(t, func() bool {
@@ -327,13 +327,9 @@ func boundSessions(reads []request) []uint64 {
 }
 
 // A committed result with status 30 means that the replicated metadata ended
-// the session. A deny with status 40 is a session error too. So the client
-// registers a new session at once, without a bind of the old one.
+// the session, so the client registers again without binding the old one.
 func TestFailover_SessionEndingReplyRegistersANewSessionWithoutABind(t *testing.T) {
 	committed := func(read request) []byte { return committedReply(read, ierror.StaleClientCode) }
-	unauthenticated := func(read request) []byte {
-		return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
-	}
 	notCommitted := func(read request) []byte { return uncertainAnswer(0, read) }
 	unproved := func(read request) []byte { return uncertainAnswer(1, read) }
 	for _, test := range []struct {
@@ -345,7 +341,6 @@ func TestFailover_SessionEndingReplyRegistersANewSessionWithoutABind(t *testing.
 		{"committed/first_attempt", []func(request) []byte{committed}, ierror.ErrStaleClient, ierror.ErrOperationNotRetained},
 		{"committed/after_uncertain", []func(request) []byte{notCommitted, committed}, ierror.ErrStaleClient, ierror.ErrOperationNotRetained},
 		{"committed/resolve", []func(request) []byte{notCommitted, unproved, committed}, ierror.ErrUncertainOutcome, ierror.ErrStaleClient},
-		{"unauthenticated", []func(request) []byte{unauthenticated}, ierror.ErrUnauthenticated, ierror.ErrOperationNotRetained},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := scriptedWrites(t, test.answers, false)
