@@ -38,6 +38,25 @@ impl RequestBudget {
         REQUEST_BUDGET.try_with(|budget| budget.deadline).ok()
     }
 
+    /// Waits for work owned by another caller under the current budget.
+    /// A timeout while waiting must not clean up that caller's resources.
+    pub async fn wait_for_shared<T>(
+        future: impl Future<Output = Result<T, IggyError>>,
+    ) -> Result<T, IggyError> {
+        let mut wait = SharedWait {
+            budget: REQUEST_BUDGET.try_with(Clone::clone).ok(),
+            completed: false,
+        };
+        let result = future.await;
+        if matches!(result, Err(IggyError::RequestTimeoutOutcomeUnknown))
+            && let Some(budget) = &wait.budget
+        {
+            budget.cleanup_started.store(true, Ordering::SeqCst);
+        }
+        wait.completed = true;
+        result
+    }
+
     /// Runs the operation under its caller's deadline, or starts a new one.
     pub async fn run<T>(
         timeout: Option<NonZeroIggyDuration>,
@@ -81,12 +100,111 @@ impl RequestBudget {
     }
 }
 
+struct SharedWait {
+    budget: Option<RequestBudget>,
+    completed: bool,
+}
+
+impl Drop for SharedWait {
+    fn drop(&mut self) {
+        // The enclosing timeout can cancel the wait before it returns an error.
+        if !self.completed
+            && let Some(budget) = &self.budget
+            && Instant::now() >= budget.deadline
+        {
+            budget.cleanup_started.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_shared_wait_when_the_budget_expires_should_skip_transport_cleanup() {
+        let cleanup = AtomicUsize::new(0);
+        let timeout = NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap();
+        let result: Result<(), IggyError> = RequestBudget::run(
+            Some(timeout),
+            || {
+                cleanup.fetch_add(1, Ordering::SeqCst);
+            },
+            RequestBudget::run(
+                None,
+                || {
+                    cleanup.fetch_add(1, Ordering::SeqCst);
+                },
+                RequestBudget::wait_for_shared(std::future::pending()),
+            ),
+        )
+        .await;
+        assert_eq!(result, Err(IggyError::RequestTimeoutOutcomeUnknown));
+        assert_eq!(cleanup.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_finished_shared_wait_when_later_work_expires_should_run_cleanup() {
+        let cleanup = AtomicUsize::new(0);
+        let timeout = NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap();
+        let result: Result<(), IggyError> = RequestBudget::run(
+            Some(timeout),
+            || {
+                cleanup.fetch_add(1, Ordering::SeqCst);
+            },
+            async {
+                RequestBudget::wait_for_shared(async { Ok(()) }).await?;
+                std::future::pending().await
+            },
+        )
+        .await;
+        assert_eq!(result, Err(IggyError::RequestTimeoutOutcomeUnknown));
+        assert_eq!(cleanup.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_an_early_cancelled_wait_when_later_work_expires_should_run_cleanup() {
+        let cleanup = AtomicUsize::new(0);
+        let timeout = NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap();
+        let result: Result<(), IggyError> = RequestBudget::run(
+            Some(timeout),
+            || {
+                cleanup.fetch_add(1, Ordering::SeqCst);
+            },
+            async {
+                let wait =
+                    RequestBudget::wait_for_shared(std::future::pending::<Result<(), IggyError>>());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), wait)
+                        .await
+                        .is_err()
+                );
+                std::future::pending().await
+            },
+        )
+        .await;
+        assert_eq!(result, Err(IggyError::RequestTimeoutOutcomeUnknown));
+        assert_eq!(cleanup.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn given_a_shared_timeout_result_when_propagated_should_skip_transport_cleanup() {
+        let cleanup = AtomicUsize::new(0);
+        let timeout = NonZeroIggyDuration::new(Duration::from_secs(1)).unwrap();
+        let result: Result<(), IggyError> = RequestBudget::run(
+            Some(timeout),
+            || {
+                cleanup.fetch_add(1, Ordering::SeqCst);
+            },
+            RequestBudget::wait_for_shared(async { Err(IggyError::RequestTimeoutOutcomeUnknown) }),
+        )
+        .await;
+        assert_eq!(result, Err(IggyError::RequestTimeoutOutcomeUnknown));
+        assert_eq!(cleanup.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn nested_operation_inherits_request_deadline() {

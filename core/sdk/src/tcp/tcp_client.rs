@@ -212,15 +212,22 @@ impl Default for TcpClient {
 #[async_trait]
 impl Client for TcpClient {
     async fn connect(&self) -> Result<(), IggyError> {
-        // A sweep that started before the last disconnect ends at its next
-        // read of the flag. Joined, it would go on with the session that the
-        // disconnect reset, and hand its failure to this connect. Once
-        // another connect cleared the flag, its sweep is the one to join.
-        self.connect_coordinator
-            .wait_until_inactive(|| self.caller_disconnected())
-            .await;
-        self.disconnected_by_caller.store(false, Ordering::SeqCst);
-        TcpClient::connect(self).await
+        let timeout = self
+            .timeout_handle()
+            .should_budget_connect()
+            .then_some(self.config.request_timeout);
+        RequestBudget::run(timeout, || self.expire_request(), async {
+            // A sweep that started before the last disconnect ends at its next
+            // read of the flag. Joined, it would go on with the session that the
+            // disconnect reset, and hand its failure to this connect. Once
+            // another connect cleared the flag, its sweep is the one to join.
+            self.connect_coordinator
+                .wait_until_inactive(|| self.caller_disconnected())
+                .await?;
+            self.disconnected_by_caller.store(false, Ordering::SeqCst);
+            TcpClient::connect(self).await
+        })
+        .await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
@@ -251,6 +258,15 @@ impl BinaryTransport for TcpClient {
 
     fn expire_request(&self) {
         self.timeout_control.invalidate();
+    }
+
+    async fn wait_for_connect(&self) -> Result<(), IggyError> {
+        if self.connect_coordinator.current_owner_context().is_none()
+            && self.connect_coordinator.is_active()
+        {
+            self.connect().await?;
+        }
+        Ok(())
     }
 
     async fn send_offset_write_with_response(
@@ -336,6 +352,9 @@ impl TcpClient {
                 ClientState::Shutdown => IggyError::ClientShutdown,
                 _ => IggyError::NotConnected,
             });
+        }
+        if is_login_register_code(code) {
+            self.wait_for_connect().await?;
         }
         if is_poll_routing_code(code) {
             return self
@@ -3066,6 +3085,125 @@ mod tests {
         assert!(client.link.lock().await.is_none());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn given_a_disconnected_connect_owner_when_connect_waits_should_observe_its_budget() {
+        let client = Arc::new(
+            TcpClient::create(Arc::new(TcpClientConfig {
+                auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                    "iggy".to_owned(),
+                    "iggy".into(),
+                )),
+                request_timeout: NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap(),
+                ..TcpClientConfig::default()
+            }))
+            .unwrap(),
+        );
+        Client::disconnect(&*client).await.unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .connect_coordinator
+                    .run(|_, _| async {
+                        released.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        while !client.connect_coordinator.is_active() {
+            tokio::task::yield_now().await;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(1), Client::connect(&*client)).await;
+        release.send(()).unwrap();
+        owner.await.unwrap().unwrap();
+        assert!(
+            matches!(result, Ok(Err(IggyError::RequestTimeoutOutcomeUnknown))),
+            "{result:?}"
+        );
+        assert!(client.caller_disconnected());
+        assert!(!client.timeout_control.invalidated.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn given_a_connect_owner_when_a_waiter_times_out_should_finish_authentication() {
+        for credentials in [
+            None,
+            Some(Credentials::UsernamePassword(
+                "iggy".to_owned(),
+                "iggy".into(),
+            )),
+            Some(Credentials::PersonalAccessToken("token".into())),
+        ] {
+            let (listener, address) = live_endpoint().await;
+            let client = Arc::new(
+                TcpClient::create(Arc::new(TcpClientConfig {
+                    server_address: address,
+                    auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                        "iggy".to_owned(),
+                        "iggy".into(),
+                    )),
+                    request_timeout: NonZeroIggyDuration::new(Duration::from_millis(100)).unwrap(),
+                    ..TcpClientConfig::default()
+                }))
+                .unwrap(),
+            );
+            let owner = tokio::spawn({
+                let client = Arc::clone(&client);
+                async move {
+                    RequestBudget::run(
+                        Some(NonZeroIggyDuration::new(Duration::from_secs(5)).unwrap()),
+                        || client.expire_request(),
+                        Client::connect(&*client),
+                    )
+                    .await
+                }
+            });
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let (request, _) = read_test_request(&mut peer).await;
+            let waiter = async {
+                match credentials {
+                    None => Client::connect(&*client).await,
+                    Some(Credentials::UsernamePassword(username, password)) => client
+                        .login_user(&username, password.expose_secret())
+                        .await
+                        .map(|_| ()),
+                    Some(Credentials::PersonalAccessToken(token)) => client
+                        .login_with_personal_access_token(token.expose_secret())
+                        .await
+                        .map(|_| ()),
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap();
+            assert_eq!(result, Err(IggyError::RequestTimeoutOutcomeUnknown));
+            assert!(!client.timeout_control.invalidated.load(Ordering::SeqCst));
+            answer_test_request(&mut peer, &request, 0, &register_reply(1)).await;
+            let responder = tokio::spawn(async move {
+                loop {
+                    let (request, _) = read_test_request(&mut peer).await;
+                    answer_test_request(
+                        &mut peer,
+                        &request,
+                        IggyError::InvalidCommand.as_code(),
+                        &[],
+                    )
+                    .await;
+                }
+            });
+            let result = tokio::time::timeout(Duration::from_secs(1), owner)
+                .await
+                .unwrap()
+                .unwrap();
+            responder.abort();
+            assert_eq!(result, Ok(()));
+            assert_eq!(client.get_state().await, ClientState::Authenticated);
+            assert!(client.link.lock().await.is_some());
+        }
+    }
+
     #[tokio::test]
     async fn login_budget_covers_waiting_for_another_connect_owner() {
         let (_listener, address) = live_endpoint().await;
@@ -3097,6 +3235,8 @@ mod tests {
             result,
             Err(IggyError::RequestTimeoutOutcomeUnknown)
         ));
+        assert_eq!(client.get_state().await, ClientState::Connecting);
+        assert!(!client.timeout_control.invalidated.load(Ordering::SeqCst));
         owner.abort();
     }
 

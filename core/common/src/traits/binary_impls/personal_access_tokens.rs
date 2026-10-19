@@ -92,6 +92,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
         RequestBudget::run(self.request_timeout(), || self.expire_request(), async {
+            self.wait_for_connect().await?;
             super::logout_before_relogin(self).await?;
             super::validate_token(token)?;
             let credentials =

@@ -131,7 +131,7 @@ impl Client for WebSocketClient {
         // another connect cleared the flag, its sweep is the one to join.
         self.connect_coordinator
             .wait_until_inactive(|| self.caller_disconnected())
-            .await;
+            .await?;
         self.disconnected_by_caller.store(false, Ordering::SeqCst);
         WebSocketClient::connect(self).await
     }

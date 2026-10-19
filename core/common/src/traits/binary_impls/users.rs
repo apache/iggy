@@ -184,6 +184,7 @@ impl<B: BinaryClient> UserClient for B {
         RequestBudget::run(self.request_timeout(), || self.expire_request(), async {
             super::validate_username(username)?;
             super::validate_password(password)?;
+            self.wait_for_connect().await?;
             super::logout_before_relogin(self).await?;
             let credentials = Credentials::UsernamePassword(
                 username.to_owned(),

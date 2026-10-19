@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::request_budget::RequestBudget;
 use iggy_common::{ClientState, ClusterNode, IggyError, TransportProtocol};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -195,14 +196,20 @@ impl ConnectCoordinator {
 
     /// Returns once no connect runs or `while_held` is false. Both are read
     /// at the call and after each connect ends.
-    pub(crate) async fn wait_until_inactive(&self, while_held: impl Fn() -> bool) {
-        loop {
-            let changed = self.changed.notified();
-            if !self.is_active() || !while_held() {
-                return;
+    pub(crate) async fn wait_until_inactive(
+        &self,
+        while_held: impl Fn() -> bool,
+    ) -> Result<(), IggyError> {
+        RequestBudget::wait_for_shared(async {
+            loop {
+                let changed = self.changed.notified();
+                if !self.is_active() || !while_held() {
+                    return Ok(());
+                }
+                changed.await;
             }
-            changed.await;
-        }
+        })
+        .await
     }
 
     pub(crate) fn current_owner_context(&self) -> Option<ConnectOwnerContext> {
@@ -257,14 +264,17 @@ impl ConnectCoordinator {
             return result;
         }
 
-        loop {
-            let changed = self.changed.notified();
-            let generation = self.generation.load(Ordering::SeqCst);
-            if generation > observed_generation {
-                return self.result_for(generation);
+        RequestBudget::wait_for_shared(async {
+            loop {
+                let changed = self.changed.notified();
+                let generation = self.generation.load(Ordering::SeqCst);
+                if generation > observed_generation {
+                    return self.result_for(generation);
+                }
+                changed.await;
             }
-            changed.await;
-        }
+        })
+        .await
     }
 
     fn result_for(&self, generation: u64) -> Result<(), IggyError> {
