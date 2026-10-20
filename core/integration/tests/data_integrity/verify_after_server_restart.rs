@@ -91,6 +91,9 @@ async fn should_fill_data_and_verify_after_restart() {
     let expected_clients_count = stats.clients_count;
     let expected_consumer_groups_count = stats.consumer_groups_count;
 
+    // Keep this handle from reconnecting alongside the replacement after restart.
+    client.disconnect().await.unwrap();
+
     // Restart server
     harness.restart_server().await.unwrap();
     let server_addr = harness.server().raw_tcp_addr().unwrap();
@@ -170,10 +173,7 @@ async fn should_fill_data_and_verify_after_restart() {
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
-    drop(client_after_restart);
-
-    // Connect and login to server
-    let client = harness.tcp_root_client().await.unwrap();
+    let client = client_after_restart;
 
     // Save stats from the second server (should have double the data)
     let stats = client.get_stats().await.unwrap();

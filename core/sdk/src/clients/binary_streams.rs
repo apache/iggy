@@ -25,15 +25,15 @@ use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
 #[async_trait]
 impl StreamClient for IggyClient {
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError> {
-        self.client.read().await.get_stream(stream_id).await
+        super::with_client!(self, client => client.get_stream(stream_id).await)
     }
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
-        self.client.read().await.get_streams().await
+        super::with_client!(self, client => client.get_streams().await)
     }
 
     async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
-        self.client.read().await.create_stream(name).await
+        super::with_client!(self, client => client.create_stream(name).await)
     }
 
     async fn update_stream(
@@ -42,14 +42,10 @@ impl StreamClient for IggyClient {
         name: &str,
         options: &StreamUpdateOptions,
     ) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .update_stream(stream_id, name, options)
-            .await
+        super::with_client!(self, client => client.update_stream(stream_id, name, options).await)
     }
 
     async fn delete_stream(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.client.read().await.delete_stream(stream_id).await
+        super::with_client!(self, client => client.delete_stream(stream_id).await)
     }
 }

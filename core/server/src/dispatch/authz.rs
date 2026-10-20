@@ -411,11 +411,10 @@ mod tests {
     use iggy_binary_protocol::COMMAND_TABLE;
     use iggy_binary_protocol::codes::{
         BIND_SESSION_CODE, CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-        GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE, GET_ME_CODE,
-        GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE, GET_SNAPSHOT_FILE_CODE,
+        GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_SNAPSHOT_FILE_CODE,
         LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGIN_USER_CODE,
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
     };
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 
@@ -484,18 +483,7 @@ mod tests {
             ),
             (POLL_MESSAGES_CODE, invalid_command, invalid_command),
             (BIND_SESSION_CODE, invalid_command, invalid_command),
-            (GET_POLL_ROUTING_CODE, invalid_command, invalid_command),
             (GET_PARTITION_ROUTE_CODE, invalid_command, invalid_command),
-            (
-                POLL_MESSAGES_ON_PRIMARY_CODE,
-                invalid_command,
-                invalid_command,
-            ),
-            (
-                GET_CONSUMER_OFFSET_ROUTING_CODE,
-                invalid_command,
-                invalid_command,
-            ),
             (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
             (GET_STREAM_CODE, allow, allow),
             (GET_STREAMS_CODE, unauthenticated, allow),

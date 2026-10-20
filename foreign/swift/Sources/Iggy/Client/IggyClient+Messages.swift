@@ -95,7 +95,7 @@ extension IggyClient {
         let strategy = strategyFor(partitionID ?? 0)
         let payload = try Requests.pollMessages(
             consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count, autoCommit: autoCommit)
-        return try Responses.polledMessages(try await routedPoll(payload, context: strategy.context)[...])
+        return try Responses.polledMessages(try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context)[...])
     }
 
     // MARK: Partition contexts
@@ -114,7 +114,7 @@ extension IggyClient {
                 captured = context
             } else {
                 let body = try await send(.getPartitionRoute, Requests.partitionRoute(streamID: streamID, topicID: topicID, partitionID: partitionID))
-                captured = try Responses.partitionRoute(body[...])
+                captured = try Responses.partitionRoute(body[...]).context
                 state.setPartitionContext(key, partitionID: partitionID, captured)
             }
             do {
@@ -130,18 +130,22 @@ extension IggyClient {
         }
     }
 
-    /// A poll on its route. The route key is the poll without its strategy,
-    /// count, and auto-commit flag, which do not change where it goes.
-    func routedPoll(_ payload: [UInt8], context: PartitionContext?) async throws -> [UInt8] {
-        let key = PollRouter.RouteKey(code: .getPollRouting, prefix: payload.dropLast(RawRequest.pollParametersSize))
-        return try await core.pollRouter.send(.pollMessagesOnPrimary, payload: payload, key: key, routePayload: payload, context: context, coordinator: core)
-    }
-
-    /// An offset write on its route. `routePayload` is the consumer, stream,
-    /// topic, and partition the write names.
-    func routedOffsetWrite(_ code: CommandCode, payload: [UInt8], routePayload: [UInt8], context: PartitionContext?) async throws {
-        let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: routePayload[...])
-        _ = try await core.pollRouter.send(code, payload: payload, key: key, routePayload: routePayload, context: context, coordinator: core)
+    /// A poll or a consumer-offset request on the route of the partition its
+    /// payload names, as `OperationDriver::send_raw` in the Rust SDK picks
+    /// it. A plain consumer's poll and an offset read without a partition go
+    /// to partition 0. A group poll, a store, and a delete must name one.
+    func routedPartitionRequest(_ code: CommandCode, payload: [UInt8], context: PartitionContext?) async throws -> [UInt8] {
+        let target = try RawRequest.consumerTarget(payload)
+        let partitionID: UInt32
+        if let named = target.partitionID {
+            partitionID = named
+        } else if code == .getConsumerOffset || (code == .pollMessages && target.consumerKind == Consumer.Kind.consumer.rawValue) {
+            partitionID = 0
+        } else {
+            throw IggyError(.invalidIdentifier, context: "command \(code.rawValue) needs a partition id")
+        }
+        let key = PollRouter.RouteKey(stream: target.stream, topic: target.topic, partitionID: partitionID)
+        return try await core.pollRouter.send(code, payload: payload, key: key, context: context, coordinator: core)
     }
 
     // MARK: Client-side partitioning
@@ -232,7 +236,8 @@ extension IggyClient {
             let payload = try Requests.pollMessages(
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, strategy: strategy, count: count, autoCommit: autoCommit)
             do {
-                let polled = try Responses.polledMessages(try await routedPoll(payload, context: strategy.context)[...])
+                let polled = try Responses.polledMessages(
+                    try await routedPartitionRequest(.pollMessages, payload: payload, context: strategy.context)[...])
                 if polled.messages.isEmpty, polled.partitionID == PolledMessages.resyncRequiredPartition {
                     // The coordinator fences a stale assignment through the
                     // empty poll, for want of a typed error.
@@ -262,18 +267,19 @@ extension IggyClient {
 
 extension IggyClient {
     /// Stores the offset of a consumer on a partition. A consumer-group
-    /// consumer stores it for the group.
+    /// consumer stores it for the group. A nil `partitionID` fails with
+    /// ``IggyErrorCode/invalidIdentifier`` before anything is sent.
     public func storeConsumerOffset(
         consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, partitionID: UInt32?, offset: UInt64
     )
         async throws
     {
         try await requireAuthenticated()
-        try await routedOffsetWrite(
+        _ = try await routedPartitionRequest(
             .storeConsumerOffset,
             payload: Requests.storeConsumerOffset(
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, offset: offset, ack: .quorum),
-            routePayload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID), context: nil)
+            context: nil)
     }
 
     /// Stores a checkpoint under the partition context of the poll that
@@ -281,34 +287,36 @@ extension IggyClient {
     /// consumer group, reassigned since.
     public func storeConsumerPosition(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, position: ConsumerPosition) async throws {
         try await requireAuthenticated()
-        try await routedOffsetWrite(
+        _ = try await routedPartitionRequest(
             .storeConsumerOffset,
             payload: Requests.storeConsumerOffset(
                 consumer: consumer, streamID: streamID, topicID: topicID, partitionID: position.partitionID, offset: position.offset, ack: .quorum),
-            routePayload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: position.partitionID),
             context: position.context)
     }
 
     /// The stored offset of a consumer on a partition, or nil when none is
-    /// stored.
+    /// stored. A nil `partitionID` reads partition 0.
     public func getConsumerOffset(
         consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, partitionID: UInt32?
     ) async throws
         -> ConsumerOffsetInfo?
     {
         try await requireAuthenticated()
-        let body = try await send(
-            .getConsumerOffset, Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID))
+        let body = try await routedPartitionRequest(
+            .getConsumerOffset, payload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID),
+            context: nil)
         return body.isEmpty ? nil : try Responses.consumerOffset(body[...])
     }
 
-    /// Deletes the stored offset of a consumer on a partition.
+    /// Deletes the stored offset of a consumer on a partition. A nil
+    /// `partitionID` fails with ``IggyErrorCode/invalidIdentifier`` before
+    /// anything is sent.
     public func deleteConsumerOffset(consumer: Consumer = .default, streamID: Identifier, topicID: Identifier, partitionID: UInt32?) async throws {
         try await requireAuthenticated()
-        try await routedOffsetWrite(
+        _ = try await routedPartitionRequest(
             .deleteConsumerOffset,
             payload: Requests.deleteConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID, ack: .quorum),
-            routePayload: Requests.getConsumerOffset(consumer: consumer, streamID: streamID, topicID: topicID, partitionID: partitionID), context: nil)
+            context: nil)
     }
 }
 
@@ -319,24 +327,18 @@ extension IggyClient {
     /// carries the partition context the server requires. Nil for any other
     /// code.
     func sendRawPartitionRequest(code: UInt32, payload: [UInt8]) async throws -> [UInt8]? {
-        switch CommandCode(rawValue: code) {
+        guard let command = CommandCode(rawValue: code) else {
+            return nil
+        }
+        switch command {
         case .sendMessages:
             let target = try RawRequest.sendTarget(payload)
             return try await sendWithPartitionContext(streamID: target.stream, topicID: target.topic, partitionID: target.partitionID, payload: payload)
         case .pollMessages:
             try RawRequest.validatePoll(payload)
-            return try await routedPoll(payload, context: nil)
-        case .storeConsumerOffset, .deleteConsumerOffset:
-            let prefix = try RawRequest.consumerTargetPrefix(payload)
-            let command: CommandCode = code == CommandCode.storeConsumerOffset.rawValue ? .storeConsumerOffset : .deleteConsumerOffset
-            let key = PollRouter.RouteKey(code: .getConsumerOffsetRouting, prefix: prefix[...])
-            return try await core.pollRouter.send(command, payload: payload, key: key, routePayload: prefix, context: nil, coordinator: core)
-        case .getPollRouting, .pollMessagesOnPrimary, .getConsumerOffsetRouting:
-            // The routing protocol itself, sent once as the Rust client sends
-            // it: a replay after a reconnect could run under another session.
-            // A dropped client reconnects first, as for a typed call.
-            try await requireAuthenticated()
-            return try await core.exchangeOnce(code: code, payload: payload, context: .empty)
+            return try await routedPartitionRequest(.pollMessages, payload: payload, context: nil)
+        case .getConsumerOffset, .storeConsumerOffset, .deleteConsumerOffset:
+            return try await routedPartitionRequest(command, payload: payload, context: nil)
         default:
             return nil
         }
@@ -353,6 +355,14 @@ private enum RawRequest {
         let stream: Identifier
         let topic: Identifier
         let partitionID: UInt32
+    }
+
+    struct ConsumerTarget {
+        let consumerKind: UInt8
+        let stream: Identifier
+        let topic: Identifier
+        /// Nil when the request names no partition.
+        let partitionID: UInt32?
     }
 
     /// `[metadata_len:u32][stream][topic][partitioning][messages_count:u32]`
@@ -375,29 +385,27 @@ private enum RawRequest {
         return SendTarget(stream: stream, topic: topic, partitionID: partitionID)
     }
 
-    /// The consumer, stream, topic, and partition that lead a poll and an
-    /// offset request, which is the payload of the offset route lookup.
-    static func consumerTargetPrefix(_ payload: [UInt8]) throws -> [UInt8] {
-        let length = try decode(payload) { reader in
-            try skipConsumerTarget(&reader)
-            return reader.position
-        }
-        return Array(payload[..<length])
+    /// `[consumer kind:1][consumer][stream][topic][has partition:1][partition:4]`
+    /// leads a poll and every consumer-offset request.
+    static func consumerTarget(_ payload: [UInt8]) throws -> ConsumerTarget {
+        try decode(payload) { reader in try readConsumerTarget(&reader) }
     }
 
     static func validatePoll(_ payload: [UInt8]) throws {
         try decode(payload) { reader in
-            try skipConsumerTarget(&reader)
+            _ = try readConsumerTarget(&reader)
             try reader.skip(pollParametersSize)
         }
     }
 
-    private static func skipConsumerTarget(_ reader: inout ByteReader) throws {
-        _ = try reader.readUInt8()
+    private static func readConsumerTarget(_ reader: inout ByteReader) throws -> ConsumerTarget {
+        let consumerKind = try reader.readUInt8()
         _ = try Identifier.decode(from: &reader)
-        _ = try Identifier.decode(from: &reader)
-        _ = try Identifier.decode(from: &reader)
-        try reader.skip(1 + 4)
+        let stream = try Identifier.decode(from: &reader)
+        let topic = try Identifier.decode(from: &reader)
+        let hasPartition = try reader.readUInt8() != 0
+        let partitionID = try reader.readUInt32()
+        return ConsumerTarget(consumerKind: consumerKind, stream: stream, topic: topic, partitionID: hasPartition ? partitionID : nil)
     }
 
     private static func decode<T>(_ payload: [UInt8], _ body: (inout ByteReader) throws -> T) throws -> T {

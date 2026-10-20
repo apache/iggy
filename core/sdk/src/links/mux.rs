@@ -22,17 +22,18 @@
 //! never leaves a frame half written or half read on the connection.
 
 use crate::links::{Frame, Reply};
-use crate::vsr::{decode_eviction, peek_command, reply_request_id, response_size};
+use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id, response_size};
 use bytes::{BufMut, BytesMut};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use iggy_binary_protocol::consensus::{Command, HEADER_SIZE};
+use iggy_binary_protocol::consensus::{Command, EvictionReason, HEADER_SIZE};
 use iggy_common::IggyError;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -69,6 +70,7 @@ pub(crate) struct MuxLink {
 #[derive(Debug)]
 struct MuxShared {
     peer: SocketAddr,
+    no_session_eviction: AtomicBool,
     pending: StdMutex<Pending>,
     permits: Semaphore,
     /// Before bind, request ids repeat, so one such exchange runs at a time.
@@ -107,6 +109,10 @@ struct PendingEntry<'a> {
 }
 
 impl MuxLink {
+    pub(crate) fn no_session_eviction(&self) -> bool {
+        self.shared.no_session_eviction.load(Ordering::Acquire)
+    }
+
     /// A link over the two halves of a TCP connection, plain or TLS.
     pub(crate) fn tcp<R, W>(reader: R, writer: W, peer: SocketAddr) -> Self
     where
@@ -219,6 +225,7 @@ impl MuxLink {
     {
         let shared = Arc::new(MuxShared {
             peer,
+            no_session_eviction: AtomicBool::new(false),
             pending: StdMutex::new(Pending {
                 open: true,
                 waiters: HashMap::new(),
@@ -285,9 +292,8 @@ impl MuxShared {
         Ok(())
     }
 
-    /// Gives a reply to the request that waits for it. An error is the reason
-    /// to close the link: an eviction ends the session, so it ends every
-    /// request.
+    /// Gives a reply to the request that waits for it. An error closes the link,
+    /// so an eviction interrupts every request sharing that connection.
     fn dispatch(&self, reply: Reply) -> Result<(), IggyError> {
         match peek_command(&reply.header) {
             Command::Reply => {
@@ -304,7 +310,13 @@ impl MuxShared {
                 }
                 Ok(())
             }
-            Command::Eviction => Err(decode_eviction(&reply.header)),
+            Command::Eviction => {
+                self.no_session_eviction.store(
+                    eviction_reason(&reply.header) == Some(EvictionReason::NoSession),
+                    Ordering::Release,
+                );
+                Err(decode_eviction(&reply.header))
+            }
             _ => {
                 error!(
                     "Received a frame that is neither a reply nor an eviction from {}.",

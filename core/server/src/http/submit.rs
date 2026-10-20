@@ -98,12 +98,10 @@ pub(in crate::http) async fn submit_committed(
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
     let watermarks = Rc::clone(&state.metadata_watermarks);
-    let max_tokens_per_user = state.max_tokens_per_user;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
     // the write runs to completion regardless of handler liveness.
     compio::runtime::spawn(async move {
-        let result =
-            submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
+        let result = submit_gated(&shard, &task_session, operation, &body).await;
         // Recorded here rather than after the await below, for the same reason
         // the submit is detached: a caller that disconnected mid-write still
         // committed the op, and its next request as this user must not be
@@ -170,8 +168,7 @@ pub(in crate::http) async fn submit_committed(
 /// re-registers cleanly.
 ///
 /// Both shard-0 request rewrites run here before consensus, mirroring the TCP
-/// dispatch path: the PAT rewrite enforces the per-user token cap, then mints
-/// a raw token and replicates only its hash
+/// dispatch path: the PAT rewrite mints a raw token and replicates only its hash
 /// (`CreatePersonalAccessToken`), and the user-password rewrite hashes the new
 /// password and, for `ChangePassword`, strips the current one and verifies it
 /// against the stored hash (`CreateUser` / `ChangePassword`). Both are no-ops
@@ -179,17 +176,15 @@ pub(in crate::http) async fn submit_committed(
 /// write. A third resolution handles `DeleteSegments`, which is not itself a
 /// consensus op: it is rewritten to the metadata `TruncatePartition` that commits
 /// the trim (see [`resolve_delete_segments_truncate`]), so the truncate rides
-/// this session's gate id. A rejection (a malformed body, a caller at the
-/// personal-access-token cap, or an unresolved delete-segments namespace) still
-/// spends the id like any other exit. A failed current-password check is not a
-/// rejection here: the op still commits with an emptied new-password sentinel
-/// that the replicated apply grades to `InvalidCredentials` (see
-/// `verify_and_rewrite_change_password`).
+/// this session's gate id. A rejection (a malformed body or an unresolved
+/// delete-segments namespace) still spends the id like any other exit. A failed
+/// current-password check is not a rejection here: the op still commits with an
+/// emptied new-password sentinel that the replicated apply grades to
+/// `InvalidCredentials` (see `verify_and_rewrite_change_password`).
 async fn submit_gated(
     shard: &Rc<ServerShard>,
     session: &HttpSession,
     operation: Operation,
-    max_tokens_per_user: u32,
     body: &[u8],
 ) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
@@ -208,8 +203,8 @@ async fn submit_gated(
         request_id,
         body,
     );
-    let (message, raw_token) = http_chain(shard, session.user_id, max_tokens_per_user, message)
-        .map_err(WriteError::Rejected)?;
+    let (message, raw_token) =
+        http_chain(shard, session.user_id, message).map_err(WriteError::Rejected)?;
     // `DeleteSegments` is not itself a consensus op: resolve it to the metadata
     // `TruncatePartition` that commits the trim before it reaches consensus,
     // mirroring the TCP dispatch. The truncate rides this session's burned

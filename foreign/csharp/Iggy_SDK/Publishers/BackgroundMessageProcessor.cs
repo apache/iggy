@@ -19,8 +19,10 @@ using System.Threading.Channels;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Publishers;
@@ -32,6 +34,8 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 {
+    private const int OperationTimeoutMs = 30_000;
+
     private readonly EventAggregator<PublisherErrorEventArgs> _backgroundErrorAggregator;
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly IIggyClient _client;
@@ -43,6 +47,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     private readonly int _payloadBufferCapacityLimit;
     private readonly ChannelReader<SendUnit> _reader;
     private readonly List<SendUnit> _units;
+    private readonly HashSet<ulong> _uncertainOperations = [];
     private readonly List<Message> _wire;
     private readonly ChannelWriter<SendUnit> _writer;
     private Task? _backgroundTask;
@@ -483,7 +488,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             try
             {
-                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, wire, ct);
+                await SendWithRecovery(wire, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -521,7 +526,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             try
             {
-                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, wire, ct);
+                await SendWithRecovery(wire, ct);
                 return;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -530,10 +535,9 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                 // remaining attempts instantly and publish a misleading "failed after N attempts" event.
                 throw;
             }
-            catch (VsrRequestOutcomeUnknownException ex)
+            catch (Exception ex) when (ex is VsrRequestOutcomeUnknownException or VsrLaneBlockedException)
             {
-                // The send may already have committed. A retry takes a fresh request id, so the dedup window
-                // cannot match it to the original, and the batch would be appended twice. Report it instead.
+                // Unknown batches must not get a fresh identity. A blocker needs ownership-based recovery.
                 LogFailedToSendBatch(ex, wire.Count);
                 if (_messageBatchErrorAggregator.HasSubscribers)
                 {
@@ -573,6 +577,72 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         {
             _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(lastException!,
                 SnapshotForFailure(wire), maxAttempts));
+        }
+    }
+
+    private async Task SendWithRecovery(List<Message> wire, CancellationToken ct)
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cancellation.CancelAfter(OperationTimeoutMs);
+        var deadline = Environment.TickCount64 + OperationTimeoutMs;
+        if (_client is TcpMessageStream tcp)
+        {
+            _uncertainOperations.RemoveWhere(operationId => !tcp.RetainsOperation(operationId));
+        }
+        try
+        {
+            try
+            {
+                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, wire,
+                    cancellation.Token);
+            }
+            catch (VsrLaneBlockedException blocked) when (_uncertainOperations.Contains(blocked.OperationId))
+            {
+                ct.ThrowIfCancellationRequested();
+                var remaining = deadline - Environment.TickCount64;
+                if (remaining <= 0)
+                {
+                    throw;
+                }
+                try
+                {
+                    await _client.ResolveOperationAsync(blocked.OperationId, TimeSpan.FromMilliseconds(remaining),
+                        cancellation.Token);
+                }
+                catch (VsrRequestOutcomeUnknownException)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    throw blocked;
+                }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
+                {
+                    throw blocked;
+                }
+                catch (Exception error) when (error is VsrOperationNotRetainedException
+                    or IggyInvalidStatusCodeException { Committed: true })
+                {
+                    // The lane is free either way. The client keeps a proved rejection for ResolveOperationAsync, so
+                    // the receiver of the earlier batch-failed event can still read it.
+                }
+                _uncertainOperations.Remove(blocked.OperationId);
+                cancellation.Token.ThrowIfCancellationRequested();
+                if (Environment.TickCount64 >= deadline)
+                {
+                    throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The background send deadline expired.");
+                }
+                // Only the current unsent batch is submitted again; the earlier batch kept its frozen identity.
+                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, wire,
+                    cancellation.Token);
+            }
+        }
+        catch (VsrRequestOutcomeUnknownException error) when (error.OperationId is { } operationId)
+        {
+            _uncertainOperations.Add(operationId);
+            throw;
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The background send deadline expired.");
         }
     }
 

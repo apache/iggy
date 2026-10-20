@@ -18,15 +18,16 @@
 //! One QUIC connection that carries each request on its own stream.
 //!
 //! A stream carries one request and its reply. So a caller that goes away
-//! leaves nothing half read on the connection, and a reply needs no request
-//! id to find its caller.
+//! leaves nothing half read on the connection. The echoed request id must
+//! still match before its result can settle that request.
 
 use crate::links::{Frame, Reply};
-use crate::vsr::{decode_eviction, peek_command};
+use crate::vsr::{decode_eviction, eviction_reason, peek_command, reply_request_id};
 use bytes::Bytes;
-use iggy_binary_protocol::consensus::{Command, HEADER_SIZE};
+use iggy_binary_protocol::consensus::{Command, EvictionReason, HEADER_SIZE};
 use iggy_common::IggyError;
 use quinn::{Connection, VarInt, WriteError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{Instant, timeout_at};
 use tracing::error;
 
@@ -37,14 +38,20 @@ const CLIENT_CLOSE_CODE: VarInt = VarInt::from_u32(0);
 #[derive(Debug)]
 pub(crate) struct QuicLink {
     connection: Connection,
+    no_session_eviction: AtomicBool,
     /// A longer reply fails its request.
     response_buffer_size: usize,
 }
 
 impl QuicLink {
+    pub(crate) fn no_session_eviction(&self) -> bool {
+        self.no_session_eviction.load(Ordering::Acquire)
+    }
+
     pub(crate) fn new(connection: Connection, response_buffer_size: usize) -> Self {
         Self {
             connection,
+            no_session_eviction: AtomicBool::new(false),
             response_buffer_size,
         }
     }
@@ -125,11 +132,18 @@ impl QuicLink {
         let Some(&header) = reply.first_chunk::<HEADER_SIZE>() else {
             return Err(IggyError::EmptyResponse);
         };
-        // An eviction ends the session, so it ends every request on the
-        // connection.
+        // An eviction detaches the connection, including its other streams.
         if peek_command(&header) == Command::Eviction {
+            self.no_session_eviction.store(
+                eviction_reason(&header) == Some(EvictionReason::NoSession),
+                Ordering::Release,
+            );
             self.close();
             return Err(decode_eviction(&header));
+        }
+        if peek_command(&header) != Command::Reply || reply_request_id(&header) != request {
+            self.close();
+            return Err(IggyError::Disconnected);
         }
         Ok(Reply {
             header,
@@ -331,5 +345,27 @@ mod tests {
         let after = send(&link, request(2, BOUND_SESSION), deadline).await;
 
         assert_eq!(after.unwrap_err(), IggyError::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn given_a_reply_for_another_request_when_received_should_fail_and_close_the_connection()
+    {
+        let (link, peer) = quic_link().await;
+        let mismatched = async {
+            let (stream, request) = peer.read_request().await;
+            answer(stream, &reply(request.request + 1, &[])).await;
+        };
+        let deadline = Instant::now() + TEST_BUDGET;
+
+        let (result, ()) =
+            tokio::join!(send(&link, request(1, BOUND_SESSION), deadline), mismatched);
+
+        assert_eq!(result.unwrap_err(), IggyError::Disconnected);
+        assert_eq!(
+            send(&link, request(2, BOUND_SESSION), deadline)
+                .await
+                .unwrap_err(),
+            IggyError::NotConnected
+        );
     }
 }

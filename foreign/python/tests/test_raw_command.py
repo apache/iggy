@@ -15,9 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from datetime import timedelta
+
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, PendingOperationError
 
 
 @pytest.mark.asyncio
@@ -45,3 +47,49 @@ async def test_raw_session_control_code_is_rejected(iggy_client: IggyClient, cod
 async def test_raw_unknown_code_is_rejected_by_server(iggy_client: IggyClient):
     with pytest.raises(RuntimeError, match="(?i)invalid command"):
         await iggy_client.send_binary_request(60_000, b"")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation_id", [2**53 + 17, 2**64 - 1])
+@pytest.mark.parametrize("method", ["resolve_operation", "abandon_operation"])
+async def test_missing_retained_operation_preserves_exact_identity(
+    operation_id, method
+):
+    client = IggyClient("127.0.0.1:1")
+    with pytest.raises(PendingOperationError) as raised:
+        await getattr(client, method)(operation_id)
+    assert raised.value.operation_id == operation_id
+    assert raised.value.kind == "not_retained"
+    assert raised.value.code == 14008
+    assert isinstance(raised.value, RuntimeError)
+    with pytest.raises(AttributeError):
+        # pyrefly: ignore  # read-only
+        raised.value.operation_id = 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("timeout", [timedelta(0), timedelta(microseconds=-1)])
+def test_resolve_rejects_nonpositive_timeout(timeout):
+    client = IggyClient("127.0.0.1:1")
+    with pytest.raises(ValueError):
+        client.resolve_operation(1, timeout=timeout)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("method", ["resolve_operation", "abandon_operation"])
+@pytest.mark.parametrize("operation_id", [-1, 2**64])
+def test_recovery_rejects_ids_outside_u64(method, operation_id):
+    client = IggyClient("127.0.0.1:1")
+    with pytest.raises(OverflowError):
+        getattr(client, method)(operation_id)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "kwargs", [{"send_retries": 3}, {"send_retry_interval": timedelta(seconds=1)}]
+)
+def test_removed_producer_retry_parameters_fail_clearly(kwargs):
+    client = IggyClient("127.0.0.1:1")
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        client.producer("stream", "topic", **kwargs)

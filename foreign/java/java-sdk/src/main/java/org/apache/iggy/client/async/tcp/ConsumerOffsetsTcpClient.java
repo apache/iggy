@@ -98,9 +98,9 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 partitionId,
                 consumer);
 
-        return pollRouter
-                .partitionRequest(CommandCode.ConsumerOffset.GET.getValue(), payload, Optional.empty())
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                pollRouter.partitionRequest(CommandCode.ConsumerOffset.GET.getValue(), payload, Optional.empty()),
+                response -> {
                     try {
                         if (response.isReadable()) {
                             return Optional.of(BytesDeserializer.readConsumerOffsetInfo(response));
@@ -124,7 +124,10 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
         int targetLength = payload.readableBytes();
         payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
         payload.writeByte(ACK_QUORUM);
-        return write(STORE, payload, targetLength, context).thenAccept(ByteBuf::release);
+        return AsyncTcpConnection.mapResponse(write(STORE, payload, targetLength, context), response -> {
+            response.release();
+            return null;
+        });
     }
 
     /**

@@ -208,7 +208,9 @@ public partial class IggyConsumer
             LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
             throw;
         }
-        catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
+        // Without an operation id nothing is retained to resolve, so the next poll can run.
+        catch (Exception ex) when (ex is not (MalformedResponseException
+            or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
             ForgetRefusedPollingStrategy(ex, polledPartition);
             LogFailedToPollMessages(ex);

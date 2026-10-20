@@ -73,7 +73,6 @@ where
     /// Paces the partition completions that shard 0 of a backup relays.
     completion_relays: Rc<RefCell<CompletionRelays>>,
     server_config: Arc<ServerConfig>,
-    max_tokens_per_user: u32,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
 }
@@ -94,7 +93,6 @@ where
         bus: &B,
         shard_handle: &ShellShardHandle<B, MJ, S, SB>,
         server_config: Arc<ServerConfig>,
-        max_tokens_per_user: u32,
     ) -> Self {
         let shard_handle = Rc::clone(shard_handle);
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
@@ -126,7 +124,6 @@ where
                     .get_duration(),
             ))),
             server_config,
-            max_tokens_per_user,
             queues,
             active: Rc::new(RefCell::new(AHashMap::new())),
         }
@@ -167,7 +164,6 @@ where
             &self.shard_handle,
             &self.sessions,
             &self.server_config,
-            self.max_tokens_per_user,
             &self.queues,
             &self.active,
             client_id,

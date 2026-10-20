@@ -223,8 +223,9 @@ API. For detailed producer semantics and configuration guidance, see the
 Use `IggyClient.producer()` when an application repeatedly publishes to one
 stream and topic. Producer creation is asynchronous because it initializes the
 destination before returning. By default, it creates a missing stream and topic,
-uses balanced partitioning, sends directly in batches of up to 1,000 messages,
-and retries failed sends up to three times with a one-second retry interval.
+uses balanced partitioning and sends directly in batches of up to 1,000 messages.
+The binary driver retries each chunk within one 30-second deadline, preserving
+its request identity. The producer adds no retry under a new identity.
 
 The default mode is direct. Pass `BackgroundProducerConfig` to queue sends on
 background workers instead.
@@ -253,8 +254,6 @@ async def main():
         topic_partitions_count=3,
         topic_message_expiry=None,
         topic_max_size=None,
-        send_retries=3,
-        send_retry_interval=timedelta(seconds=1),
     )
 
     async with producer:
@@ -277,26 +276,45 @@ exchange. Persisted sends also provide crash-safe retry receipts; weaker topic
 policies can lose data and receipts on a crash. HTTP NoAck confirms dispatch
 only. An application resend creates a new request and can duplicate messages.
 
-Producer retries start a new attempt after an explicit `TransientNotAccepted`
-refusal or a connection failure before submission (`NotConnected` or
-`CannotEstablishConnection`). Missing destinations and other terminal errors
-stop immediately. `send_retries` counts retries after the initial attempt. The
-first permitted retry runs immediately, and `send_retry_interval` delays only
-later retries. Set `send_retries` to `None` or `0` to disable producer retries.
-Set `send_retry_interval` to `None` to run permitted retries without a delay.
-A zero interval raises `ValueError`.
+Mutation retries belong to the shared client driver. The producer no longer accepts
+`send_retries` or `send_retry_interval`; passing either raises `TypeError`. HTTP
+keeps its configured HTTP retry policy and does not support operation recovery.
 
-HTTP send errors stop producer retries immediately, so `send_retries` does not
-retry a failed HTTP send. Transport retries are separate from producer retries.
-For example, the default
-`HttpConfig(retries=3)` gives each producer attempt up to four HTTP attempts.
+`PendingOperationError` exposes the exact integer `operation_id`, the numeric
+`code`, and `kind` (`"uncertain"`, `"lane_blocked"`, or `"not_retained"`). On the
+same live client, `await client.resolve_operation(operation_id,
+timeout=timedelta(seconds=30))` replays the original operation. A committed
+business rejection raises its original error and releases the lane; uncertainty
+keeps the operation retained. The default timeout is 30 seconds; it must be a
+positive `timedelta`. `await client.abandon_operation(operation_id)` releases the
+lane without establishing whether the operation committed. A session reset
+forgets retained operations, so recovery must use the original session.
+The client keeps the proved outcomes of its last `max_operations` replays, also
+across a session reset. A later `resolve_operation` of a proved operation
+returns the same outcome without a request.
+
+`TcpConfig`, `QuicConfig`, and `WebSocketConfig` accept `pending_operations=
+PendingOperationsConfig(max_operations=256, max_bytes=64 * 1024 * 1024)`. These
+client-wide defaults bound active and retained mutations across every partition.
+Admission waits before allocating a request ID. Queued writer frames keep their
+bytes charged until their last reference is released, even after abandonment.
+TCP, QUIC and WebSocket connection strings accept `max_pending_operations` and
+`max_pending_operation_bytes` as positive integers, for example
+`iggy+tcp://iggy:iggy@localhost:8090?max_pending_operations=256&max_pending_operation_bytes=67108864`.
 
 A failed direct send raises `ProducerSendError`, which is a `RuntimeError`
-subclass. Its `cause` property contains the underlying error text. Its
+subclass. Its `cause` property contains the underlying error text, and its
+`__cause__` preserves a structured `PendingOperationError` when applicable. The
+optional `operation_id` identifies the retained send to resolve or abandon. Its
 `committed` property contains confirmations from completed chunks, and `failed`
-contains the remaining unconfirmed messages. If encryption is enabled, the
-failed messages contain encrypted payloads. Restore the original payloads
-before submitting them to the same producer again.
+contains the remaining messages without usable confirmations. For an `uncertain`
+cause, the first chunk of `failed` may already have committed. Resolve its
+`operation_id` without submitting that chunk as a new send. For `lane_blocked`,
+none of `failed` was sent: the ID names an earlier operation to resolve before
+retrying. Abandonment or a session reset discards retained results, and
+`not_retained` does not prove non-commit. Resubmitting an uncertain chunk can
+duplicate messages. Before any safe resubmission, restore payloads changed by
+encryption.
 
 ### Background Mode
 
@@ -354,10 +372,11 @@ batch larger than the whole budget always fails. A zero byte budget is
 unlimited. `max_in_flight` separately bounds concurrent write requests across
 all shards; zero uses the runtime maximum.
 
-Producer retries and transport reconnection happen inside background workers.
+Binary driver retries and transport reconnection happen inside background workers.
 The Python API does not currently expose a background error callback, so a write
-that still fails after its retries is logged by the Rust SDK and its unconfirmed
-messages are dropped.
+that fails at its operation deadline is logged by the Rust SDK and its messages
+are dropped from the worker queue. An uncertain chunk remains retained by the
+client for recovery; it may already have committed.
 
 See the complete runnable
 [`background_producer.py`](../../examples/python/high-level/background_producer.py)

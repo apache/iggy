@@ -26,7 +26,8 @@
 import { ResponseError, responseError } from '../error.utils.js';
 import {
   Command, EvictionReason, HEADER_SIZE,
-  peekCommand, readEviction, readReplyOperation, readSize, readStatus
+  peekCommand, readEviction, readReplyOperation, readSize, readStatus, hasCommittedResult,
+  REQUEST_OFFSET, REPLY_OFFSET
 } from './header.js';
 import { Operation, isKnownOperation, isResultFramed } from './operation.js';
 
@@ -39,17 +40,48 @@ const STALE_CLIENT = 30;
 const INVALID_FORMAT = 4;
 const EMPTY_RESPONSE = 304;
 const INCOMPATIBLE_PROTOCOL_VERSION = 14003;
+const TRANSIENT_NOT_COMMITTED = 57;
+const TRANSIENT_NOT_ACCEPTED = 58;
+const NOT_PRIMARY = 89;
 
 const RESULT_COUNT_LEN = 4;
 const RESULT_ENTRY_LEN = 8;
 
 export class VsrEvictionError extends ResponseError {
-  constructor(errorCode: number) {
+  constructor(errorCode: number, readonly reason?: number) {
     super(0, errorCode);
     this.name = 'VsrEvictionError';
     Object.setPrototypeOf(this, VsrEvictionError.prototype);
   }
 }
+
+const serverError = (command: number, code: number): ResponseError => {
+  const error = responseError(command, code);
+  error.fromServer = true;
+  return error;
+};
+
+/** Validate correlation before a marked receipt can affect operation or session state. */
+export const validateReplyForRequest = (reply: Buffer, request: Buffer, command: number): void => {
+  const operation = request[REQUEST_OFFSET.operation];
+  const actual = readReplyOperation(reply);
+  const matches = actual === operation ||
+    (operation === Operation.CreateTopic && actual === Operation.CreateTopicWithAssignments) ||
+    (operation === Operation.CreatePartitions && actual === Operation.CreatePartitionsWithAssignments) ||
+    (operation === Operation.DeleteSegments && actual === Operation.TruncatePartition);
+  if (reply.readBigUInt64LE(REPLY_OFFSET.request) !== request.readBigUInt64LE(REQUEST_OFFSET.request) || !matches)
+    throw responseError(command, INVALID_COMMAND, 'reply does not match request');
+  if (!hasCommittedResult(reply))
+    return;
+  const op = reply.readBigUInt64LE(REPLY_OFFSET.op);
+  if (!reply.subarray(REPLY_OFFSET.client, REPLY_OFFSET.client + 16)
+      .equals(request.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)) ||
+      !reply.subarray(REPLY_OFFSET.requestChecksum, REPLY_OFFSET.requestChecksum + 16)
+        .equals(request.subarray(REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16)) ||
+      reply.readBigUInt64LE(REPLY_OFFSET.partitionIncarnation) !== request.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation) ||
+      op === 0n || op !== reply.readBigUInt64LE(REPLY_OFFSET.commit))
+    throw responseError(command, INVALID_COMMAND, 'committed receipt does not match original request');
+};
 
 /**
  * Decodes one complete consensus frame into the reply body, stripping the
@@ -80,13 +112,19 @@ export const decodeResponse = (
   // A pre-commit denial always ships an empty body; the status channel and
   // the committed result section are mutually exclusive.
   if (status !== 0)
-    throw responseError(commandCode, status);
+    throw serverError(commandCode, status);
 
   const operation = readReplyOperation(frame);
   if (!isKnownOperation(operation))
     throw responseError(commandCode, INVALID_COMMAND);
   const body = frame.subarray(HEADER_SIZE, size);
-  return splitMetadataResult(operation, body, commandCode);
+  try {
+    return splitMetadataResult(operation, body, commandCode);
+  } catch (error) {
+    if (error instanceof ResponseError && error.fromServer)
+      error.committed = hasCommittedResult(frame) && ![TRANSIENT_NOT_COMMITTED, TRANSIENT_NOT_ACCEPTED, NOT_PRIMARY].includes(error.errorCode);
+    throw error;
+  }
 };
 
 /**
@@ -116,7 +154,7 @@ export const splitMetadataResult = (
     // IggyError space.
     const code = body.readUInt32LE(RESULT_COUNT_LEN + 4);
     if (code !== 0)
-      throw responseError(commandCode, code);
+      throw serverError(commandCode, code);
   }
   return body.subarray(sectionLength);
 };
@@ -167,5 +205,5 @@ export const evictionError = (frame: Buffer): VsrEvictionError => {
     default:
       errorCode = UNAUTHENTICATED;
   }
-  return new VsrEvictionError(errorCode);
+  return new VsrEvictionError(errorCode, eviction.reason);
 };

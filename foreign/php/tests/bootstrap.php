@@ -191,4 +191,6 @@ if (!extension_loaded('iggy-php')) {
     Assert::fail('The iggy-php extension is not loaded.');
 }
 
-wait_for_server(server_host(), server_port());
+if (getenv('IGGY_SKIP_SERVER_WAIT') !== '1') {
+    wait_for_server(server_host(), server_port());
+}

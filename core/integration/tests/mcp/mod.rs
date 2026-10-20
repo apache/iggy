@@ -88,13 +88,31 @@ async fn should_list_tools(harness: &TestHarness) {
         .expect("Failed to list tools");
 
     assert!(!tools.tools.is_empty());
-    assert_eq!(tools.tools.len(), 39);
+    assert_eq!(tools.tools.len(), 41);
 }
 
 #[iggy_harness(server(mcp))]
 async fn should_handle_ping(harness: &TestHarness) {
     let mcp_client = harness.mcp_client().await.expect("MCP client required");
     invoke_empty(&mcp_client, "ping", None).await;
+}
+
+#[iggy_harness(server(mcp))]
+async fn should_report_unknown_recovery_operations_without_losing_the_operation_id(
+    harness: &TestHarness,
+) {
+    let client = harness.mcp_client().await.expect("MCP client required");
+    for method in ["resolve_operation", "abandon_operation"] {
+        let operation_id = u64::MAX.to_string();
+        let arguments = json!({"operation_id": operation_id});
+        let params = CallToolRequestParams::new(method.to_owned())
+            .with_arguments(arguments.as_object().unwrap().clone());
+        let result = client.call_tool(params).await;
+        let Err(ServiceError::McpError(error)) = result else {
+            panic!("Expected an operation-not-retained error from {method}, got {result:?}");
+        };
+        assert_eq!(error.data.unwrap()["operation_id"], operation_id);
+    }
 }
 
 // Pins two nodes: the default vsr harness spawns three, but this test asserts a
@@ -720,6 +738,16 @@ async fn should_reject_mutating_tools_with_read_only_permissions() {
         ("delete_consumer_offset", partition.clone(), "delete"),
         ("poll_messages", auto_commit, "update"),
         ("poll_messages", next, "update"),
+        (
+            "resolve_operation",
+            json!({"operation_id": "1"}),
+            "write recovery",
+        ),
+        (
+            "abandon_operation",
+            json!({"operation_id": "1"}),
+            "write recovery",
+        ),
     ] {
         let params = CallToolRequestParams::new(method.to_owned())
             .with_arguments(arguments.as_object_mut().expect("Tool arguments").clone());

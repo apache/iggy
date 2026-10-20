@@ -17,17 +17,19 @@
 
 import NIOConcurrencyHelpers
 
-/// Routes polls and consumer-offset writes to the primary of their
-/// partition, a port of `PollRouter` in `core/sdk/src/driver/poll_router.rs`.
+/// Routes polls and consumer-offset requests to the primary of their
+/// partition, as `OperationDriver` in `core/sdk/src/driver.rs` routes its
+/// partition calls.
 ///
 /// A request first asks the coordinator, the connection the client signed in
-/// on, for its route (`GetPollRouting` or `GetConsumerOffsetRouting`): the
-/// partition primary and the partition context the request carries. On a
-/// single node the request then goes over the coordinator connection. In a
-/// cluster it goes over a data connection to the primary, bound to the
-/// coordinator's session with `BindSession`, so consumer-group membership
-/// stays with the coordinator. Routes are cached until a request on them
-/// fails or the session is replaced.
+/// on, for the route of its partition (`GetPartitionRoute`): the partition
+/// context the request carries and the replica id of the partition primary,
+/// which the cluster roster maps to an endpoint. On a single node the request
+/// then goes over the coordinator connection. In a cluster it goes over a
+/// data connection to the primary, bound to the client's session with
+/// `BindSession`, so consumer-group membership stays with that session.
+/// Routes are cached until a request on them fails or the session is
+/// replaced.
 final class PollRouter: Sendable {
     /// Bounds one routed request across its lookups, attempts, and pauses.
     static let pollTimeout: Duration = .seconds(30)
@@ -37,17 +39,20 @@ final class PollRouter: Sendable {
     static let maxCachedRoutes = 4096
     static let maxDataConnections = 256
 
-    /// A route is cached per lookup code and the request prefix that names
-    /// the partition and the consumer.
+    /// A partition as its caller spelled it. A stream or topic named by
+    /// number and the same one named by name are two keys.
     struct RouteKey: Hashable, Sendable {
-        let code: CommandCode
-        let prefix: ArraySlice<UInt8>
+        let stream: Identifier
+        let topic: Identifier
+        let partitionID: UInt32
     }
 
     private struct Route: Sendable {
         /// The fence of the session the route was read under.
         let fence: UInt128Value
-        let endpoint: String
+        let primaryReplica: UInt8
+        /// The client's session, with the route's metadata op as the
+        /// watermark a data connection binds at.
         let consumerSession: Responses.SessionIdentity
         let context: PartitionContext
     }
@@ -70,8 +75,8 @@ final class PollRouter: Sendable {
         /// route or a connection of a replaced session is never published
         /// or used.
         var fence: UInt128Value
-        /// Nodes in the roster; zero until a roster read succeeded.
-        var rosterSize = 0
+        /// The roster by replica id; empty until a roster read succeeded.
+        var nodes: [UInt8: ClusterNode] = [:]
         var routes: [RouteKey: Route] = [:]
         var slots: [String: Slot] = [:]
         var nextHeartbeat: ContinuousClock.Instant?
@@ -83,9 +88,16 @@ final class PollRouter: Sendable {
         state = NIOLockedValueBox(State(fence: fence))
     }
 
-    /// Records the roster size a leader check or a roster read reported.
-    func learnRosterSize(_ size: Int) {
-        state.withLockedValue { $0.rosterSize = size }
+    /// Records the roster a leader check or a roster read reported, which
+    /// tells whether requests go to data connections and where each replica
+    /// listens. An empty roster says nothing about the cluster, so the router
+    /// keeps asking. A replica id the roster repeats keeps its first node.
+    func learnRoster(_ metadata: ClusterMetadata) {
+        guard !metadata.nodes.isEmpty else {
+            return
+        }
+        let nodes = Dictionary(metadata.nodes.map { ($0.replicaID, $0) }, uniquingKeysWith: { first, _ in first })
+        state.withLockedValue { $0.nodes = nodes }
     }
 
     /// Drops every route and data connection of the session that ended and
@@ -101,7 +113,7 @@ final class PollRouter: Sendable {
         }
     }
 
-    /// Sends a poll or an offset write on its route. `context` is the
+    /// Sends a poll or an offset request on its route. `context` is the
     /// partition context the caller captured, else the route's is taken and
     /// kept for every retry.
     ///
@@ -109,7 +121,7 @@ final class PollRouter: Sendable {
     /// of cancelling one in flight, which would take the coordinator
     /// connection, and the session's group membership, with it.
     func send(
-        _ code: CommandCode, payload: [UInt8], key: RouteKey, routePayload: [UInt8], context: PartitionContext?, coordinator: ClientCore
+        _ code: CommandCode, payload: [UInt8], key: RouteKey, context: PartitionContext?, coordinator: ClientCore
     ) async throws -> [UInt8] {
         let clock = ContinuousClock()
         let now = clock.now
@@ -120,7 +132,7 @@ final class PollRouter: Sendable {
             // pinged here once per heartbeat interval too.
             _ = try await control(.ping, [], coordinator: coordinator, deadline: deadline)
         }
-        let request = Request(code: code, payload: payload, key: key, routePayload: routePayload, deadline: deadline)
+        let request = Request(code: code, payload: payload, key: key, deadline: deadline)
         var captured = context
         var interval = Self.retryInterval
         while clock.now < deadline {
@@ -146,23 +158,44 @@ final class PollRouter: Sendable {
         let code: CommandCode
         let payload: [UInt8]
         let key: RouteKey
-        let routePayload: [UInt8]
         let deadline: ContinuousClock.Instant
     }
 
     /// Whether the roster has more than one node, reading it once when no
     /// leader check reported it yet.
     private func isClustered(_ coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> Bool {
-        if state.withLockedValue({ $0.rosterSize }) == 0 {
-            let readDeadline = min(deadline, ContinuousClock.now + Self.rosterReadTimeout)
-            let body = try await control(.getClusterMetadata, [], coordinator: coordinator, deadline: readDeadline)
-            let metadata = try Responses.clusterMetadata(body[...])
-            guard !metadata.nodes.isEmpty else {
-                throw IggyError(.transientNotAccepted, context: "the cluster roster is empty")
-            }
-            learnRosterSize(metadata.nodes.count)
+        if state.withLockedValue({ $0.nodes.isEmpty }) {
+            try await readRoster(coordinator, deadline: deadline)
         }
-        return state.withLockedValue { $0.rosterSize } > 1
+        return state.withLockedValue { $0.nodes.count } > 1
+    }
+
+    private func readRoster(_ coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws {
+        let readDeadline = min(deadline, ContinuousClock.now + Self.rosterReadTimeout)
+        let body = try await control(.getClusterMetadata, [], coordinator: coordinator, deadline: readDeadline)
+        let metadata = try Responses.clusterMetadata(body[...])
+        guard !metadata.nodes.isEmpty else {
+            throw IggyError(.transientNotAccepted, context: "the cluster roster is empty")
+        }
+        learnRoster(metadata)
+    }
+
+    /// The TCP address of `replica`. A roster that does not list it is read
+    /// once more before the route is refused.
+    private func endpoint(of replica: UInt8, coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> String {
+        var node = state.withLockedValue { $0.nodes[replica] }
+        if node == nil {
+            try await readRoster(coordinator, deadline: deadline)
+            node = state.withLockedValue { $0.nodes[replica] }
+        }
+        guard let node else {
+            throw IggyError(.transientNotAccepted, context: "the cluster roster does not list replica \(replica)")
+        }
+        guard node.endpoints.tcp != 0 else {
+            coordinator.logger.error("The partition primary \(node.name) does not expose TCP")
+            throw IggyError(.featureUnavailable, context: "the partition primary \(node.name) does not expose TCP")
+        }
+        return node.tcpAddress
     }
 
     private func heartbeatDue(at now: ContinuousClock.Instant, interval: Duration) -> Bool {
@@ -190,11 +223,11 @@ final class PollRouter: Sendable {
     /// The single-node path: the request goes over the coordinator connection
     /// with the context of its route.
     private func sendOnCoordinator(_ request: Request, context: inout PartitionContext?, coordinator: ClientCore) async throws -> [UInt8] {
-        let route = try await route(request.key, routePayload: request.routePayload, coordinator: coordinator, deadline: request.deadline)
+        let route = try await route(request.key, coordinator: coordinator, deadline: request.deadline)
         let captured = context ?? route.context
         context = captured
         do {
-            if request.code == .pollMessagesOnPrimary {
+            if request.code == .pollMessages {
                 return try await coordinator.exchangeOnce(
                     code: request.code.rawValue, payload: request.payload, context: captured, deadline: request.deadline)
             }
@@ -206,14 +239,15 @@ final class PollRouter: Sendable {
     }
 
     /// The cluster path: the request goes over a data connection to the
-    /// partition primary, bound to the coordinator's session first. Every
+    /// partition primary, bound to the client's session first. Every
     /// frame is stamped under a check that the route's session is still the
     /// client's, so nothing is written for a session that was replaced.
     private func sendOnPrimary(_ request: Request, context: inout PartitionContext?, coordinator: ClientCore) async throws -> [UInt8] {
-        let route = try await route(request.key, routePayload: request.routePayload, coordinator: coordinator, deadline: request.deadline)
+        let route = try await route(request.key, coordinator: coordinator, deadline: request.deadline)
         let captured = context ?? route.context
         context = captured
-        let slot = try slot(for: route)
+        let endpoint = try await endpoint(of: route.primaryReplica, coordinator: coordinator, deadline: request.deadline)
+        let slot = try slot(for: route, at: endpoint)
         try await slot.lock.lock()
         defer { slot.lock.unlock() }
 
@@ -224,9 +258,9 @@ final class PollRouter: Sendable {
         if data == nil {
             let connection: any IggyConnection
             do {
-                connection = try await coordinator.dial(route.endpoint)
+                connection = try await coordinator.dial(endpoint)
             } catch let error as IggyError where error.isReconnectable {
-                throw IggyError(.transientNotAccepted, context: "cannot reach the partition primary at \(route.endpoint): \(error)")
+                throw IggyError(.transientNotAccepted, context: "cannot reach the partition primary at \(endpoint): \(error)")
             }
             data = DataConnection(connection: connection, consumerSession: nil, usable: true)
         }
@@ -242,7 +276,7 @@ final class PollRouter: Sendable {
             do {
                 try await bind(data.connection, to: route.consumerSession, coordinator: coordinator, deadline: request.deadline)
             } catch let error as IggyError where error.isReconnectable {
-                throw IggyError(.transientNotAccepted, context: "binding the session on \(route.endpoint) failed: \(error)")
+                throw IggyError(.transientNotAccepted, context: "binding the session on \(endpoint) failed: \(error)")
             }
             data.consumerSession = route.consumerSession
             slot.connection.withLockedValue { $0 = data }
@@ -262,7 +296,7 @@ final class PollRouter: Sendable {
             }
             slot.connection.withLockedValue { $0 = data }
             removeRoute(request.key)
-            throw Self.gradedLoss(error, on: route.endpoint)
+            throw Self.gradedLoss(error, on: endpoint)
         }
     }
 
@@ -331,20 +365,19 @@ final class PollRouter: Sendable {
 
     /// The cached route of `key` if the session still holds it, else a new
     /// lookup on the coordinator.
-    private func route(_ key: RouteKey, routePayload: [UInt8], coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> Route {
+    private func route(_ key: RouteKey, coordinator: ClientCore, deadline: ContinuousClock.Instant) async throws -> Route {
         let watermark = await coordinator.metadataWatermark
         let (fence, cached) = state.withLockedValue { ($0.fence, $0.routes[key]) }
-        if let cached, cached.fence == fence, cached.consumerSession.metadataWatermark >= watermark {
+        if let cached, cached.fence == fence, cached.context.metadataOp >= watermark {
             return cached
         }
-        let body = try await control(key.code, routePayload, coordinator: coordinator, deadline: deadline)
-        var response = try Responses.pollRoute(body[...])
-        response.consumerSession.metadataWatermark = max(response.consumerSession.metadataWatermark, watermark)
-        guard response.primary.endpoints.tcp != 0 else {
-            coordinator.logger.error("The partition primary \(response.primary.name) does not expose TCP")
-            throw IggyError(.featureUnavailable, context: "the partition primary \(response.primary.name) does not expose TCP")
+        let payload = try Requests.partitionRoute(streamID: key.stream, topicID: key.topic, partitionID: key.partitionID)
+        let body = try await control(.getPartitionRoute, payload, coordinator: coordinator, deadline: deadline)
+        let response = try Responses.partitionRoute(body[...])
+        guard let session = await coordinator.sessionIdentity(at: response.context.metadataOp) else {
+            throw IggyError(.transientNotAccepted, context: "no session is bound to route partition \(key.partitionID)")
         }
-        let route = Route(fence: fence, endpoint: response.primary.tcpAddress, consumerSession: response.consumerSession, context: response.context)
+        let route = Route(fence: fence, primaryReplica: response.primaryReplica, consumerSession: session, context: response.context)
         try await validate(route, coordinator: coordinator)
         try state.withLockedValue { state in
             try Self.checkFence(of: route, in: state)
@@ -361,7 +394,7 @@ final class PollRouter: Sendable {
     private func validate(_ route: Route, coordinator: ClientCore) async throws {
         let watermark = await coordinator.metadataWatermark
         try state.withLockedValue { try Self.checkFence(of: route, in: $0) }
-        guard route.consumerSession.metadataWatermark >= watermark else {
+        guard route.context.metadataOp >= watermark else {
             throw IggyError(.transientNotAccepted, context: "the route predates metadata commit \(watermark)")
         }
     }
@@ -372,10 +405,9 @@ final class PollRouter: Sendable {
         }
     }
 
-    private func slot(for route: Route) throws -> Slot {
+    private func slot(for route: Route, at endpoint: String) throws -> Slot {
         try state.withLockedValue { state in
             try Self.checkFence(of: route, in: state)
-            let endpoint = route.endpoint
             if let slot = state.slots[endpoint] {
                 return slot
             }

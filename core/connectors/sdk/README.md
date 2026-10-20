@@ -16,6 +16,8 @@ Source connectors use a one-in-flight-batch contract between the plugin and the 
 
 An empty batch follows the same handshake. A source should return `state: None` when an empty poll made no progress; this avoids an unnecessary state write and cannot persist state left over from a failed batch. Producer errors, including request timeouts, report a NACK. A successful send from the legacy Iggy server is still an ACK even though that server returns an empty confirmation list.
 
+The runtime resolves a send request with an unknown outcome before it sends anything again. When the resolve proves that the request committed, the runtime resends only the messages after that request. Otherwise it reports a NACK, so a replay of the batch can deliver the messages of that request again.
+
 The crash behavior is intentionally at-least-once:
 
 | Crash point | Recovery behavior |
