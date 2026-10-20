@@ -211,6 +211,15 @@ mod tests {
     }
 
     #[test]
+    fn should_succeed_with_bracketed_ipv6_address_and_port() {
+        let connection_string =
+            ConnectionString::<TcpConnectionStringOptions>::new("iggy://user:secret@[::1]:8090")
+                .unwrap();
+
+        assert_eq!(connection_string.server_address(), "[::1]:8090");
+    }
+
+    #[test]
     fn should_succeed_with_ipv6_address_and_pat() {
         let value = "iggy://iggypat-1234567890abcdef@[::1]:8090";
         let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(value).unwrap();
