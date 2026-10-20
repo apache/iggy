@@ -125,7 +125,7 @@ export const SEND_MESSAGES = {
 /** Rust `calculate_32` hashes message keys with XXH32 under this seed. */
 const MESSAGE_KEY_SEED = 0;
 const TOPIC_ID_NOT_FOUND = 2010;
-const PARTITION_NOT_FOUND = 4000;
+const PARTITION_NOT_FOUND = 3007;
 const SEND_TIMEOUT_MS = 30_000;
 const ROUTE_RETRY_INTERVAL_MS = 50;
 const TRANSIENT_NOT_ACCEPTED = 58;

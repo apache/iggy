@@ -133,7 +133,7 @@ public final class VsrOperation {
      * (they select {@link #REGISTER}); everything unmapped is forwarded as
      * {@link #NON_REPLICATED}.
      */
-    static int operationForCode(int commandCode) {
+    public static int operationForCode(int commandCode) {
         if (commandCode == LOGOUT_USER_CODE) {
             return LOGOUT;
         }

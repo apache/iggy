@@ -57,6 +57,7 @@ use iggy_gateway_kafka::bridge::{
     TopicMapping,
 };
 use iggy_gateway_kafka::listener::{ListenerConfig, SecurityProtocol};
+use iggy_gateway_kafka::protocol::auto_topic_creation::AutoTopicCreationConfig;
 use iggy_gateway_kafka::server::{BoundListener, bind_listener};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
@@ -338,7 +339,17 @@ impl BridgedGateway {
 
 /// As [`spawn_bridged_gateway`], creating each `(topic, partitions)` first.
 async fn start_bridged_gateway(server: &TestServer, topics: &[(&str, u32)]) -> BridgedGateway {
-    start_gateway(server, topics, false).await
+    start_bridged_gateway_with(server, topics, GatewayConfig::default()).await
+}
+
+/// [`start_bridged_gateway`] with `gateway_config` instead of the defaults. Its listeners are
+/// replaced by one plaintext listener on an ephemeral port.
+async fn start_bridged_gateway_with(
+    server: &TestServer,
+    topics: &[(&str, u32)],
+    gateway_config: GatewayConfig,
+) -> BridgedGateway {
+    start_gateway(server, topics, false, gateway_config).await
 }
 
 /// A bridge to `server` as the root user, with the default topic mapping.
@@ -358,8 +369,14 @@ async fn root_bridge(server: &TestServer) -> IggyBridge {
         .expect("the bridge connects to a ready server")
 }
 
-/// A bridged gateway, with SASL on when `sasl` is set, creating each `(topic, partitions)` first.
-async fn start_gateway(server: &TestServer, topics: &[(&str, u32)], sasl: bool) -> BridgedGateway {
+/// A bridged gateway on `gateway_config`, with SASL on when `sasl` is set, creating each
+/// `(topic, partitions)` first. Its listeners are replaced by one on an ephemeral port.
+async fn start_gateway(
+    server: &TestServer,
+    topics: &[(&str, u32)],
+    sasl: bool,
+    gateway_config: GatewayConfig,
+) -> BridgedGateway {
     let bridge = root_bridge(server).await;
     for &(topic, partitions) in topics {
         bridge
@@ -375,8 +392,7 @@ async fn start_gateway(server: &TestServer, topics: &[(&str, u32)], sasl: bool) 
         SecurityProtocol::Plaintext
     };
     let listener = BoundListener::new(ListenerConfig::new(protocol, addr.to_string()), listener);
-    let mut gateway =
-        KafkaGateway::new(GatewayConfig::default()).with_bridge(Some(Arc::new(bridge)));
+    let mut gateway = KafkaGateway::new(gateway_config).with_bridge(Some(Arc::new(bridge)));
     if sasl {
         gateway =
             gateway.with_authenticator(Arc::new(IggyAuthenticator::new(server.address.clone())));
@@ -703,7 +719,7 @@ async fn bridged_stack() -> Option<(TestServer, SocketAddr)> {
 /// serves it.
 async fn sasl_bridged_stack() -> Option<(TestServer, SocketAddr)> {
     let server = ready_server()?;
-    let gateway = start_gateway(&server, &[(TOPIC, 1)], true).await;
+    let gateway = start_gateway(&server, &[(TOPIC, 1)], true, GatewayConfig::default()).await;
     // Held for the test's lifetime: dropping the sender shuts the gateway down mid-exchange.
     std::mem::forget(gateway.shutdown);
     Some((server, gateway.addr))
@@ -1319,6 +1335,73 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
         &[],
     )
     .expect_ran("java console consumer in a group")
+}
+
+/// With auto topic creation on, a stock Java producer sends to a topic nobody created and succeeds.
+/// Its first `Metadata` is answered `UNKNOWN_TOPIC_OR_PARTITION` while the gateway creates the
+/// topic, and it retries until the topic appears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_auto_topic_creation_when_the_java_producer_sends_to_a_new_topic_should_succeed() {
+    const NEW_TOPIC: &str = "auto-created";
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway_with(
+        &server,
+        &[],
+        GatewayConfig {
+            auto_topic_creation: AutoTopicCreationConfig {
+                enabled: true,
+                partitions: 1,
+            },
+            ..GatewayConfig::default()
+        },
+    )
+    .await;
+    let bootstrap = gateway.addr.to_string();
+
+    let produce = format!(
+        "printf 'k1:alpha\\n' | /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server \
+         {bootstrap} --topic {NEW_TOPIC} --property parse.key=true --property key.separator=: \
+         --producer-property max.block.ms=20000"
+    );
+    let produced =
+        run_client(KAFKA_IMAGE, &["sh", "-c", &produce], &[]).expect_ran("java console producer");
+    assert!(
+        !produced.contains("ERROR"),
+        "the producer must send to the new topic, got: {produced}"
+    );
+
+    let consumed = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server",
+            &bootstrap,
+            "--topic",
+            NEW_TOPIC,
+            "--partition",
+            "0",
+            "--offset",
+            "earliest",
+            "--max-messages",
+            "1",
+            "--timeout-ms",
+            "20000",
+            "--property",
+            "print.offset=true",
+            "--property",
+            "print.key=true",
+        ],
+        &[],
+    )
+    .expect_ran("java console consumer");
+    assert_eq!(
+        records_read(&consumed),
+        vec!["Offset:0\tk1\talpha"],
+        "the auto-created topic must hold the record, got: {consumed}"
+    );
+    gateway.stop().await;
 }
 
 /// The records a console consumer printed, as `Offset:<offset>\t<key>\t<value>`.

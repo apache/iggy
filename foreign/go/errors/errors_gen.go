@@ -2761,6 +2761,45 @@ func (e RequestIdExhausted) Is(target error) bool {
 	return ok
 }
 
+type UncertainOutcome struct {
+	OperationID uint64
+}
+
+func (e UncertainOutcome) Error() string {
+	return fmt.Sprintf("operation %d has an uncertain outcome", e.OperationID)
+}
+func (e UncertainOutcome) Code() Code { return 14006 }
+func (e UncertainOutcome) Is(target error) bool {
+	_, ok := target.(UncertainOutcome)
+	return ok
+}
+
+type LaneBlocked struct {
+	OperationID uint64
+}
+
+func (e LaneBlocked) Error() string {
+	return fmt.Sprintf("lane blocked by operation %d", e.OperationID)
+}
+func (e LaneBlocked) Code() Code { return 14007 }
+func (e LaneBlocked) Is(target error) bool {
+	_, ok := target.(LaneBlocked)
+	return ok
+}
+
+type OperationNotRetained struct {
+	OperationID uint64
+}
+
+func (e OperationNotRetained) Error() string {
+	return fmt.Sprintf("operation %d is not retained", e.OperationID)
+}
+func (e OperationNotRetained) Code() Code { return 14008 }
+func (e OperationNotRetained) Is(target error) bool {
+	_, ok := target.(OperationNotRetained)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -3011,6 +3050,9 @@ var (
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 	ErrSessionMismatch                            = SessionMismatch{}
 	ErrRequestIdExhausted                         = RequestIdExhausted{}
+	ErrUncertainOutcome                           = UncertainOutcome{}
+	ErrLaneBlocked                                = LaneBlocked{}
+	ErrOperationNotRetained                       = OperationNotRetained{}
 )
 
 type Code uint32
@@ -3265,6 +3307,9 @@ const (
 	IncompatibleProtocolVersionCode                Code = 14003
 	SessionMismatchCode                            Code = 14004
 	RequestIdExhaustedCode                         Code = 14005
+	UncertainOutcomeCode                           Code = 14006
+	LaneBlockedCode                                Code = 14007
+	OperationNotRetainedCode                       Code = 14008
 )
 
 func (c Code) String() string {
@@ -3767,6 +3812,12 @@ func (c Code) String() string {
 		return "SessionMismatch"
 	case RequestIdExhaustedCode:
 		return "RequestIdExhausted"
+	case UncertainOutcomeCode:
+		return "UncertainOutcome"
+	case LaneBlockedCode:
+		return "LaneBlocked"
+	case OperationNotRetainedCode:
+		return "OperationNotRetained"
 	default:
 		return "Unknown error code"
 	}
@@ -4272,6 +4323,12 @@ func FromCode(code Code) IggyError {
 		return ErrSessionMismatch
 	case RequestIdExhaustedCode:
 		return ErrRequestIdExhausted
+	case UncertainOutcomeCode:
+		return ErrUncertainOutcome
+	case LaneBlockedCode:
+		return ErrLaneBlocked
+	case OperationNotRetainedCode:
+		return ErrOperationNotRetained
 	default:
 		return ErrError
 	}

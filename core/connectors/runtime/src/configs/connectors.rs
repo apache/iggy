@@ -176,8 +176,11 @@ impl CreateSinkConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SinkConfig {
+    // Identity comes from the file: an env KEY would rename the sink and move its consumer group.
+    #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
+    #[config_env(skip)]
     pub version: u64,
     pub name: String,
     pub path: String,
@@ -229,8 +232,11 @@ impl CreateSourceConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ConfigEnv)]
 pub struct SourceConfig {
+    // Identity comes from the file: an env KEY would orphan saved state.
+    #[config_env(skip)]
     pub key: String,
     pub enabled: bool,
+    #[config_env(skip)]
     pub version: u64,
     pub name: String,
     pub path: String,
@@ -488,6 +494,26 @@ impl ConnectorsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::ConfigEnvMappings;
+
+    #[test]
+    fn given_sink_and_source_configs_when_mapped_should_exclude_key_and_version() {
+        for (name, mappings) in [
+            ("sink", SinkConfig::env_mappings()),
+            ("source", SourceConfig::env_mappings()),
+        ] {
+            assert!(
+                mappings.iter().any(|mapping| mapping.env_name == "ENABLED"),
+                "{name} should map ENABLED from the environment"
+            );
+            assert!(
+                mappings
+                    .iter()
+                    .all(|mapping| !matches!(mapping.env_name, "KEY" | "VERSION")),
+                "{name} maps key or version from the environment"
+            );
+        }
+    }
 
     #[test]
     fn given_single_component_key_when_parsed_should_succeed() {

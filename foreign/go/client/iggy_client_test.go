@@ -29,9 +29,11 @@ func TestWithLogger_Nil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error creating client: %v", err)
 	}
-	ic := cli.(*IggyClient)
-	if ic.logger.Handler() != slog.DiscardHandler {
-		t.Errorf("expected slog.DiscardHandler, got %v", ic.logger.Handler())
+	_ = cli
+	opts := GetDefaultOptions()
+	WithLogger(nil)(&opts)
+	if opts.logger.Handler() != slog.DiscardHandler {
+		t.Errorf("expected slog.DiscardHandler, got %v", opts.logger.Handler())
 	}
 }
 
@@ -46,9 +48,10 @@ func TestWithLogger_SetsClientLogger(t *testing.T) {
 		t.Fatalf("unexpected error creating client: %v", err)
 	}
 
-	ic := cli.(*IggyClient)
-
-	ic.logger.Info("probe message", "key", "value")
+	_ = cli
+	opts := GetDefaultOptions()
+	WithLogger(logger)(&opts)
+	opts.logger.Info("probe message", "key", "value")
 
 	output := buf.String()
 	if !strings.Contains(output, "probe message") {

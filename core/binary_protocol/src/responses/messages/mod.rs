@@ -17,10 +17,8 @@
 
 pub mod partition_route;
 pub mod poll_messages;
-pub mod poll_routing;
 pub mod send_messages;
 
 pub use partition_route::PartitionRouteResponse;
 pub use poll_messages::{PollMessagesResponse, PollMessagesResponseHeader};
-pub use poll_routing::PollRoutingResponse;
 pub use send_messages::{SendMessagesConfirmationResponse, SendMessagesResponse};

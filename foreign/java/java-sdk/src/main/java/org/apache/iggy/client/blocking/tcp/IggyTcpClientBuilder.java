@@ -128,7 +128,8 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
-     * Sets the retry policy.
+     * Sets the retry policy for the redials after a connection loss, see
+     * {@link AsyncIggyTcpClientBuilder#retryPolicy(RetryPolicy)}.
      *
      * @param retryPolicy the retry policy to use
      * @return this builder
@@ -208,6 +209,15 @@ public final class IggyTcpClientBuilder {
      */
     public IggyTcpClientBuilder tlsCertificate(String tlsCertificatePath) {
         asyncBuilder.tlsCertificate(tlsCertificatePath);
+        return this;
+    }
+
+    /**
+     * Bounds active and retained mutations; admission waits within each call's deadline. The count also bounds
+     * the proved replay outcomes that the client keeps for later resolves.
+     */
+    public IggyTcpClientBuilder pendingOperations(int count, long bytes) {
+        asyncBuilder.pendingOperations(count, bytes);
         return this;
     }
 

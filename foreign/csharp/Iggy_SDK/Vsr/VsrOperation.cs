@@ -97,9 +97,7 @@ internal static class VsrOperations
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,
-        CommandCodes.GET_POLL_ROUTING_CODE,
         CommandCodes.GET_PARTITION_ROUTE_CODE,
-        CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE
     ];
 
     /// <summary>
@@ -171,7 +169,7 @@ internal static class VsrOperations
 
         // A poll that auto-commits moves the consumer offset server-side, so a reply lost after the commit
         // would make the replay start past a batch the caller never saw. auto_commit is the last body byte.
-        if (code is CommandCodes.POLL_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_ON_PRIMARY_CODE)
+        if (code is CommandCodes.POLL_MESSAGES_CODE)
         {
             return body.Length > 0 && body[^1] == 0;
         }

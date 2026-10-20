@@ -16578,12 +16578,13 @@ mod tests {
                 .restore_retry_checkpoint(recovered.checkpoint_op())
                 .await
                 .unwrap();
-            assert!(matches!(
-                reopened
-                    .dedup
-                    .check_request(1, 1, 1, Operation::SendMessages),
-                consensus::client_table::RequestStatus::Duplicate(_)
-            ));
+            let consensus::client_table::RequestStatus::Duplicate(reply) = reopened
+                .dedup
+                .check_request(1, 1, 1, Operation::SendMessages)
+            else {
+                panic!("checkpoint must retain the committed result for a retry");
+            };
+            assert!(reply.header().has_committed_result());
         }
     }
 
