@@ -856,6 +856,108 @@ impl TestFixture for MySqlSourceMarkFixture {
     }
 }
 
+/// MySQL source fixture that marks by a natural key whose unique index can be dropped.
+///
+/// `sku` is the `primary_key_column` and `seq` the tracking column. The table is
+/// created after the runtime starts, so the first poll verifies `sku` as unique and
+/// caches that, which a later `DROP INDEX` leaves stale.
+pub struct MySqlSourceDroppedUniqueKeyFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceDroppedUniqueKeyFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceDroppedUniqueKeyFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceDroppedUniqueKeyFixture {
+    const TABLE: &'static str = "test_dropped_unique_key";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                seq INT AUTO_INCREMENT PRIMARY KEY,
+                sku VARCHAR(64) NOT NULL,
+                is_processed BOOLEAN NOT NULL DEFAULT FALSE,
+                UNIQUE KEY sku_unique (sku)
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn drop_unique_key(&self, pool: &Pool<MySql>) {
+        let query = format!("ALTER TABLE `{}` DROP INDEX sku_unique", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to drop unique key: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, sku: &str) {
+        let query = format!("INSERT INTO `{}` (sku) VALUES (?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(sku)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn is_processed(&self, pool: &Pool<MySql>, sku: &str) -> bool {
+        let query = format!(
+            "SELECT COUNT(*) FROM `{}` WHERE sku = ? AND is_processed = TRUE",
+            Self::TABLE
+        );
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
+            .bind(sku)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
+        count.0 > 0
+    }
+
+    pub async fn count_processed(&self, pool: &Pool<MySql>) -> i64 {
+        let query = format!(
+            "SELECT COUNT(*) FROM `{}` WHERE is_processed = TRUE",
+            Self::TABLE
+        );
+        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(query))
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to count rows: {e}"));
+        count.0
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceDroppedUniqueKeyFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = base_envs(&self.container, Self::TABLE, "json");
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "seq".to_string());
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "sku".to_string());
+        envs.insert(
+            ENV_SOURCE_PROCESSED_COLUMN.to_string(),
+            "is_processed".to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture tracking a `VARCHAR` column that holds digit-like values.
 ///
 /// MySQL orders this column by collation, so `'100'` sorts before `'2'`. If the

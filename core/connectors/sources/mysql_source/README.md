@@ -442,6 +442,14 @@ published or deleted. A composite index does not count. `primary_key_column`
 defaults to `tracking_column`, so set it explicitly when the tracking column is
 not unique.
 
+The check is repeated at most once a minute while rows keep arriving, so a
+unique index dropped while the connector runs is noticed within about a minute.
+Independently, a mark or delete that hits more rows than the keys it was given
+disables the table at once. The batch that trips it may already have marked or
+deleted a row it never read, limited to rows at or below that batch's highest
+tracking value. Restore the index before restarting, since `open()` refuses the
+table without it.
+
 Mark/delete only touches rows up to the batch's highest tracking value, so a row
 that reuses a delivered key (for example via `REPLACE INTO`) is never deleted or
 marked before it is read. For this, `tracking_column` must be a real column of

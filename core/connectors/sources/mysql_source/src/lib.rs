@@ -36,6 +36,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -67,6 +68,13 @@ const ACK_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// the mark/delete binds one per row of the batch.
 const MAX_CLEANUP_BATCH_SIZE: u32 = 65_535;
 
+/// How long a passed uniqueness check on the mark/delete key is trusted. A unique index
+/// dropped while the connector runs is caught by the next check after this, and the
+/// rows-affected guard on each mark/delete covers the batches in between. Checking on
+/// every batch would cost a round trip per batch and still leave a gap between the
+/// check and the statement.
+const CLEANUP_KEY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How many mark/delete statements in a row may fail before the connector stops. The
 /// operations stay in the persisted state and run again on restart.
 const MAX_CONSECUTIVE_CLEANUP_FAILURES: u32 = 3;
@@ -79,7 +87,8 @@ pub struct MySqlSource {
     state: Mutex<State>,
     pending_batch: Mutex<Option<PendingBatch>>,
     consecutive_cleanup_failures: AtomicU32,
-    verified_cleanup_keys: Mutex<HashSet<String>>,
+    /// When each table's mark/delete key was last confirmed unique.
+    verified_cleanup_keys: Mutex<HashMap<String, Instant>>,
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
@@ -774,7 +783,7 @@ impl Source for MySqlSource {
 
         let operations = std::mem::take(&mut state.pending_operations);
         let had_operations = !operations.is_empty();
-        let deadline = tokio::time::Instant::now() + ACK_BATCH_TIMEOUT;
+        let deadline = Instant::now() + ACK_BATCH_TIMEOUT;
         let failed_operations = self.apply_pending_operations(operations, deadline).await?;
 
         if failed_operations.is_empty() {
@@ -856,7 +865,7 @@ impl MySqlSource {
             state: Mutex::new(state),
             pending_batch: Mutex::new(pending_batch),
             consecutive_cleanup_failures: AtomicU32::new(0),
-            verified_cleanup_keys: Mutex::new(HashSet::new()),
+            verified_cleanup_keys: Mutex::new(HashMap::new()),
             verbose,
             retry_delay,
             poll_interval,
@@ -1148,7 +1157,7 @@ impl MySqlSource {
         };
         let pool = self.get_pool()?;
         let tracking_column = self.tracking_column();
-        let mut verified = HashSet::with_capacity(self.config.tables.len());
+        let mut verified = HashMap::with_capacity(self.config.tables.len());
         for table in &self.config.tables {
             let check = cleanup_key_check(pool, table, &target.key_column, tracking_column)
                 .await
@@ -1160,7 +1169,7 @@ impl MySqlSource {
                 })?;
             match check {
                 CleanupKeyCheck::Unique => {
-                    verified.insert(table.clone());
+                    verified.insert(table.clone(), Instant::now());
                 }
                 CleanupKeyCheck::NotUnique => {
                     return Err(Error::InitError(not_unique_key_message(
@@ -1188,7 +1197,13 @@ impl MySqlSource {
         table: &str,
         key_column: &str,
     ) -> Result<Option<String>, Error> {
-        if self.verified_cleanup_keys.lock().await.contains(table) {
+        if self
+            .verified_cleanup_keys
+            .lock()
+            .await
+            .get(table)
+            .is_some_and(|checked_at| checked_at.elapsed() < CLEANUP_KEY_RECHECK_INTERVAL)
+        {
             return Ok(None);
         }
         let check = cleanup_key_check(pool, table, key_column, self.tracking_column())
@@ -1203,7 +1218,7 @@ impl MySqlSource {
                 self.verified_cleanup_keys
                     .lock()
                     .await
-                    .insert(table.to_string());
+                    .insert(table.to_string(), Instant::now());
                 Ok(None)
             }
             CleanupKeyCheck::NotUnique => Ok(Some(not_unique_key_message(table, key_column))),
@@ -1452,12 +1467,12 @@ impl MySqlSource {
     async fn apply_pending_operations(
         &self,
         operations: Vec<PendingOperation>,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<Vec<PendingOperation>, Error> {
         let mut failed_operations = Vec::new();
         let mut operations = operations.into_iter();
         while let Some(operation) = operations.next() {
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 failed_operations.push(operation);
                 failed_operations.extend(operations);
                 break;
@@ -1468,9 +1483,19 @@ impl MySqlSource {
             })
             .await;
             match result {
-                Ok(Ok(())) => {
+                Ok(Ok(rows_affected)) => {
                     self.consecutive_cleanup_failures
                         .store(0, Ordering::Relaxed);
+                    // The statement has committed, so retrying it would only repeat the
+                    // overreach. It retires like any other and the table stops here.
+                    if let Some(reason) = cleanup_overreach(&operation, rows_affected) {
+                        error!(
+                            "{reason}. Table disabled until restart for {CONNECTOR_NAME} \
+                             connector ID: {}",
+                            self.id
+                        );
+                        self.poisoned_tables.lock().await.insert(operation.table);
+                    }
                 }
                 Ok(Err(error)) => {
                     self.record_cleanup_failure(&operation, &error)?;
@@ -1516,11 +1541,12 @@ impl MySqlSource {
         Ok(())
     }
 
+    /// Returns how many rows the statement matched.
     async fn mark_or_delete_processed_rows(
         &self,
         pool: &Pool<MySql>,
         operation: &PendingOperation,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let PendingOperation {
             table,
             ids,
@@ -1528,7 +1554,7 @@ impl MySqlSource {
             tracking_bound,
         } = operation;
         if ids.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let quoted_table = quote_qualified_identifier(table)?;
@@ -1589,7 +1615,7 @@ impl MySqlSource {
             self.retry_delay.as_millis() as u64,
         )
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected())
     }
 
     async fn poll_tables(&self) -> Result<PolledBatch, Error> {
@@ -2494,6 +2520,23 @@ async fn cleanup_key_check(
     })
 }
 
+/// Why a finished mark/delete shows its key is no longer unique, or `None` when it
+/// stayed within the rows it was given. sqlx connects with `CLIENT_FOUND_ROWS`, so an
+/// `UPDATE` reports rows matched rather than changed and an already-marked repeat still
+/// counts. Fewer rows than ids is a normal replay.
+fn cleanup_overreach(operation: &PendingOperation, rows_affected: u64) -> Option<String> {
+    (rows_affected > operation.ids.len() as u64).then(|| {
+        format!(
+            "mark/delete by primary_key_column '{}' on table '{}' hit {rows_affected} row(s) \
+             for {} key(s), so the key is no longer unique (was its unique index dropped?) \
+             and rows that were never read may have been marked or deleted",
+            operation.target.key_column,
+            operation.table,
+            operation.ids.len()
+        )
+    })
+}
+
 fn not_unique_key_message(table: &str, key_column: &str) -> String {
     format!(
         "primary_key_column '{key_column}' on table '{table}' is not backed by a single-column \
@@ -2927,6 +2970,76 @@ mod tests {
         assert!(pending.acknowledged);
         assert!(!pending.retiring);
         assert_eq!(pending.state.pending_operations, state.pending_operations);
+    }
+
+    #[test]
+    fn given_cleanup_within_its_keys_should_not_report_overreach() {
+        let operation = delete_operation(
+            "users",
+            vec![
+                PkValue::Text("1".to_string()),
+                PkValue::Text("2".to_string()),
+            ],
+        );
+
+        assert_eq!(cleanup_overreach(&operation, 2), None);
+        assert_eq!(cleanup_overreach(&operation, 0), None);
+    }
+
+    #[test]
+    fn given_cleanup_hitting_more_rows_than_keys_should_report_overreach() {
+        let operation = delete_operation("users", vec![PkValue::Text("1".to_string())]);
+
+        let reason = cleanup_overreach(&operation, 2).expect("overreach should be reported");
+
+        assert!(reason.contains("'users'"));
+        assert!(reason.contains("hit 2 row(s) for 1 key(s)"));
+    }
+
+    #[tokio::test]
+    async fn given_recently_verified_cleanup_key_should_trust_it_without_querying() {
+        let source = MySqlSource::new(1, test_config(), None);
+        source
+            .verified_cleanup_keys
+            .lock()
+            .await
+            .insert("users".to_string(), Instant::now());
+
+        let reason = source
+            .unusable_cleanup_reason(&unreachable_pool(), "users", "id")
+            .await;
+
+        assert!(matches!(reason, Ok(None)), "got {reason:?}");
+    }
+
+    #[tokio::test]
+    async fn given_cleanup_key_verified_before_the_recheck_interval_should_query_again() {
+        let source = MySqlSource::new(1, test_config(), None);
+        let stale = Instant::now()
+            .checked_sub(CLEANUP_KEY_RECHECK_INTERVAL + Duration::from_secs(1))
+            .expect("clock should be past the recheck interval");
+        source
+            .verified_cleanup_keys
+            .lock()
+            .await
+            .insert("users".to_string(), stale);
+
+        let reason = source
+            .unusable_cleanup_reason(&unreachable_pool(), "users", "id")
+            .await;
+
+        assert!(
+            matches!(reason, Err(Error::Connection(_))),
+            "got {reason:?}"
+        );
+    }
+
+    /// A pool whose every query fails, so reaching it proves a check was not skipped.
+    fn unreachable_pool() -> Pool<MySql> {
+        MySqlPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("mysql://127.0.0.1:1/unreachable")
+            .expect("lazy pool should build without connecting")
     }
 
     #[test]

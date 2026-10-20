@@ -24,9 +24,9 @@ use crate::connectors::fixtures::{
     MySqlSourceComputedBinaryTrackingFixture, MySqlSourceComputedTrackingDeleteAtPollFixture,
     MySqlSourceComputedTrackingDeleteAtStartupFixture, MySqlSourceComputedTrackingFixture,
     MySqlSourceDecimalTrackingFixture, MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture,
-    MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture,
-    MySqlSourceLateBinaryTrackingFixture, MySqlSourceLateSetTrackingFixture,
-    MySqlSourceLateTrackingTypeFixture, MySqlSourceMarkFixture,
+    MySqlSourceDroppedUniqueKeyFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
+    MySqlSourceJsonTrackingFixture, MySqlSourceLateBinaryTrackingFixture,
+    MySqlSourceLateSetTrackingFixture, MySqlSourceLateTrackingTypeFixture, MySqlSourceMarkFixture,
     MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNonUniqueKeyDeleteFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
     MySqlSourceRawFixture, MySqlSourceReusedKeyDeleteFixture, MySqlSourceReusedKeyFixture,
@@ -1962,6 +1962,88 @@ async fn non_unique_primary_key_column_publishes_and_deletes_nothing(
     assert_eq!(
         remaining, TEST_MESSAGE_COUNT as i64,
         "Expected every row to survive, {remaining} of {TEST_MESSAGE_COUNT} remain"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn dropped_unique_index_on_primary_key_column_disables_the_table(
+    harness: &TestHarness,
+    fixture: MySqlSourceDroppedUniqueKeyFixture,
+) {
+    // The first poll verifies `sku` as unique and the repeat arrives well inside the
+    // re-check interval, so only the rows-affected guard can notice. Marking the
+    // repeated `sku` matches more rows than keys it was given, which has to stop the
+    // table before a later row is published.
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+    fixture.insert_row(&pool, "sku-a").await;
+
+    let mut first_marked = false;
+    for _ in 0..POLL_ATTEMPTS {
+        if fixture.is_processed(&pool, "sku-a").await {
+            first_marked = true;
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert!(first_marked, "Expected the first row to be marked");
+
+    fixture.drop_unique_key(&pool).await;
+    fixture.insert_row(&pool, "sku-a").await;
+    let mut processed = 0;
+    for _ in 0..POLL_ATTEMPTS {
+        processed = fixture.count_processed(&pool).await;
+        if processed >= 2 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert_eq!(
+        processed, 2,
+        "Expected the repeated sku to be read and its mark to match both rows"
+    );
+
+    fixture.insert_row(&pool, "sku-c").await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer = Consumer::new("dropped_unique_key_consumer".try_into().unwrap());
+    let client = harness.root_client().await.unwrap();
+    let mut published_after_drop = false;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &consumer,
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            published_after_drop |= polled
+                .messages
+                .iter()
+                .any(|message| String::from_utf8_lossy(&message.payload).contains("sku-c"));
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let later_row_marked = fixture.is_processed(&pool, "sku-c").await;
+    pool.close().await;
+
+    assert!(
+        !published_after_drop,
+        "Expected the table to be disabled before the row inserted after the drop was published"
+    );
+    assert!(
+        !later_row_marked,
+        "Expected the row inserted after the drop to stay unmarked"
     );
 }
 
