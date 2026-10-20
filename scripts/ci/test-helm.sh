@@ -255,10 +255,23 @@ validate() {
     --set server.users.root.existingSecret.name=supersecret \
     > "$HELM_RENDER_DIR/existing-secret.yaml"
   if grep -q 'root-credentials' "$HELM_RENDER_DIR/existing-secret.yaml"; then
-    echo "Error: existing-secret render should not include generated root credentials" >&2
+    echo "Error: existing-secret render must not include a root Secret created by the chart" >&2
     exit 1
   fi
   grep -q 'name: supersecret' "$HELM_RENDER_DIR/existing-secret.yaml"
+
+  helm template iggy "$CHART_DIR" \
+    --set server.users.root.createSecret=false \
+    --set 'server.extraArgs={--with-default-root-credentials}' \
+    > "$HELM_RENDER_DIR/default-root-credentials.yaml"
+  grep -q -- '- "--with-default-root-credentials"' "$HELM_RENDER_DIR/default-root-credentials.yaml"
+
+  helm template iggy "$CHART_DIR" \
+    --set server.users.root.createSecret=false \
+    --set 'server.env[0].name=IGGY_ROOT_USERNAME,server.env[0].value=iggy' \
+    --set 'server.env[1].name=IGGY_ROOT_PASSWORD,server.env[1].value=test-password' \
+    > "$HELM_RENDER_DIR/env-root-credentials.yaml"
+  grep -q 'name: IGGY_ROOT_PASSWORD' "$HELM_RENDER_DIR/env-root-credentials.yaml"
 
   helm template iggy "$CHART_DIR" \
     -f "$CHART_DIR/examples/cluster-3-node.yaml" \
@@ -334,6 +347,12 @@ validate() {
     --set server.encryption.existingSecret.name=shared-key
 
   assert_render_rejected "server.replicaCount=3" --set server.replicaCount=3
+  assert_render_rejected "a single node without root credentials" \
+    --set server.users.root.createSecret=false
+  assert_render_rejected "a cluster without root credentials" \
+    -f "$CHART_DIR/examples/cluster-3-node.yaml" \
+    --set server.users.root.createSecret=false \
+    --set server.users.root.existingSecret.name=
   assert_render_rejected "encryption without a key" --set server.encryption.enabled=true
   assert_render_rejected "an encryption key that is not 32 bytes" \
     --set server.encryption.enabled=true \

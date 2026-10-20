@@ -34,14 +34,11 @@ mod threads;
 mod topology;
 
 pub use crate::dispatch::host::ServerHost;
-pub use credentials::apply_default_root_credentials;
+pub use credentials::{apply_default_root_credentials, initialize_root_user};
 pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
-use crate::boot::credentials::{
-    ensure_default_root_user, load_replica_auth, load_replica_tls_ctx,
-    validate_root_credentials_env,
-};
+use crate::boot::credentials::{load_replica_auth, load_replica_tls_ctx, resolve_root_credentials};
 use crate::boot::fd_limit::client_connection_cap;
 use crate::boot::handoff::{
     BootstrapBarrier, MetadataHandoff, await_bootstrap_complete, await_metadata_bundle,
@@ -90,7 +87,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-3\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-4\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -296,7 +293,7 @@ pub fn bootstrap(
     // own idempotent install in its TLS listeners for embedders that never
     // run this bootstrap; after this line those are no-ops.
     install_default_crypto_provider();
-    validate_root_credentials_env(&config)?;
+    let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
@@ -402,6 +399,7 @@ pub fn bootstrap(
         let metadata_handoff_for_shard = if shard_id == 0 {
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
+                root_credentials: root_credentials.take(),
             }
         } else {
             MetadataHandoff::Waiter {
@@ -564,11 +562,11 @@ async fn shard_main(
     // so the writer must first be parked in a binding that outlives the peer
     // wait armed below. A `recover()` failure inside the arm is safe for the
     // same reason -- no peer holds a handle yet.
-    let (mux_stm, pending_bundle_tx, owner_state) = match metadata_handoff {
-        MetadataHandoff::Owner { bundle_tx } => {
-            // Root is created locally at boot (never journaled), so replay
-            // must start from the same baseline or every WAL-created user
-            // shifts one slab id and root is lost after the first restart.
+    let (mux_stm, pending_bundle_tx, owner_state, root_credentials) = match metadata_handoff {
+        MetadataHandoff::Owner {
+            bundle_tx,
+            root_credentials,
+        } => {
             let recovered = recover::<ServerMuxStateMachine>(
                 data_dir,
                 ReplicaIdentity {
@@ -578,9 +576,7 @@ async fn shard_main(
                 },
                 config.metadata.journal_slots,
                 config.metadata.clients_table_max,
-                |mux_stm| {
-                    ensure_default_root_user(mux_stm);
-                },
+                |_| {},
                 |mux_stm, header| {
                     if header.operation == iggy_binary_protocol::Operation::Register {
                         mux_stm.streams().refresh_consumer_group_session(
@@ -600,7 +596,6 @@ async fn shard_main(
             )
             .await
             .map_err(ServerError::MetadataRecovery)?;
-            ensure_default_root_user(&recovered.mux_stm);
             (
                 Rc::new(recovered.mux_stm),
                 Some(bundle_tx),
@@ -614,6 +609,7 @@ async fn shard_main(
                     recovered_state: recovered.recovered_state,
                     snapshot_checkpoint: recovered.snapshot_checkpoint,
                 }),
+                root_credentials,
             )
         }
         MetadataHandoff::Waiter { bundle_rx } => {
@@ -626,6 +622,7 @@ async fn shard_main(
             .await?;
             (
                 Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle)),
+                None,
                 None,
                 None,
             )
@@ -1018,6 +1015,7 @@ async fn shard_main(
             accepted_client,
             &connections,
             &shard_metrics_all,
+            root_credentials.as_ref(),
         )
         .await
         {
@@ -1037,7 +1035,9 @@ async fn shard_main(
         // Every enabled client transport is bound and accepting by here, so
         // this is the first point at which a unit ordered after us may dial.
         #[cfg(feature = "systemd")]
-        systemd::notify_ready();
+        if !bus.token().is_triggered() {
+            systemd::notify_ready();
+        }
     }
 
     if shard_id == 0 {
@@ -1239,6 +1239,7 @@ mod tests {
             b"IGGY-OWNERSHIP-HISTORY-4\n",
             b"IGGY-OWNERSHIP-HISTORY-5\n",
             b"IGGY-BOUND-GRANTS-2\n",
+            b"IGGY-BOUND-GRANTS-3\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
@@ -1265,6 +1266,17 @@ mod tests {
         }
         std::fs::write(&marker, STORAGE_FORMAT).unwrap();
         assert!(validate_storage_format(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn given_different_root_bootstrap_formats_when_identifying_replicas_should_reject_mixing() {
+        assert_ne!(
+            message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
+            message_bus::replica::handshake::binary_identity(
+                crate::VERSION,
+                b"IGGY-BOUND-GRANTS-3\n"
+            ),
+        );
     }
 
     #[test]

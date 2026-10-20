@@ -18,6 +18,7 @@
 //! Stream and topic provisioning.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use iggy::prelude::{
     Identifier, IggyClient, IggyError, IggyExpiry, StreamClient, Topic, TopicClient,
@@ -27,10 +28,24 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
-use super::{IggyBridge, with_request_timeout};
+use super::{IggyBridge, REQUEST_TIMEOUT, metadata_write_on, with_request_timeout};
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::protocol::handlers::topic_config::message_expiry_is_explicit;
+
+/// Partitions of a topic whose creator leaves the count to the broker: Kafka's own
+/// `num.partitions` default.
+pub const DEFAULT_TOPIC_PARTITIONS: u32 = 1;
+
+/// Iggy's own server-side per-topic partition cap (`IggyError::TooManyPartitions`).
+///
+/// Not exported by `iggy::prelude`. Checked before a create so a count Iggy can never create is
+/// refused the same way on every path, including `CreateTopics`' `validate_only`.
+pub const MAX_TOPIC_PARTITIONS: u32 = 1000;
+
+/// How long one auto topic creation may take: a connect, `create_topic`, and for a missing stream
+/// `create_stream` and `create_topic` again, each bounded by [`REQUEST_TIMEOUT`] on its own.
+const AUTO_CREATE_LIMIT: std::time::Duration = REQUEST_TIMEOUT.saturating_mul(4);
 
 /// Outcome of [`IggyBridge::create_kafka_topic`].
 ///
@@ -84,7 +99,7 @@ impl IggyBridge {
     /// already accepts that sentinel at the wire-validation layer). The broker default is for
     /// the first caller with a real Kafka request (`Metadata` or `CreateTopics`) to decide.
     ///
-    /// No caching: every call pays a stream-create attempt (`Self::ensure_stream`) and a
+    /// No caching: every call pays a stream-create attempt (`ensure_stream`) and a
     /// `get_topic` (two round trips once both already exist), even for a topic this same bridge
     /// already confirmed a moment ago. A cache keyed on `kafka_topic` would remove that cost, but
     /// would also have to answer "how does a cache entry ever get invalidated" - the topic being
@@ -115,57 +130,16 @@ impl IggyBridge {
             });
         }
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = self.ensure_stream(stream_name).await?;
+        let stream_id = ensure_stream(&self.client, stream_name).await?;
         self.ensure_topic(&stream_id, topic_name, kafka_topic, partition_count)
             .await?;
         Ok(())
     }
 
-    /// Ensures the stream named `stream_name` exists, creating it if missing.
-    ///
-    /// `Identifier::named` - never `Identifier::try_from`/`FromStr` - because the latter parses
-    /// an all-digit string as a numeric Iggy ID rather than a name. A stream or topic named e.g.
-    /// `"42"` would otherwise resolve against the wrong resource on every call after the first:
-    /// the first `ensure_stream_and_topic("42", ...)` creates a stream *named* `"42"`, but a
-    /// second call would look it up *by ID* `42` instead, almost certainly finding nothing and
-    /// breaking the "idempotent on repeated calls" guarantee.
-    ///
-    /// Returns the same *named* `Identifier` it was given, not the numeric id the SDK hands back
-    /// from `get`/`create` - streams are backed by a recycled slab (`core/metadata`'s
-    /// `stm/stream.rs`: freed keys are reused by the next created stream), so a numeric id
-    /// captured here could point at a *different* stream by the time `ensure_topic` uses it, if
-    /// this stream is deleted and recreated in between. The name has no such window.
-    ///
-    /// Attempts the create directly rather than probing existence first: `get_stream` answers
-    /// with `StreamDetails`, which embeds every topic header in the stream (`iggy_common`'s
-    /// `StreamDetails.topics: Vec<Topic>`), not just the stream's own metadata - a probe paid on
-    /// every call, including the steady-state case where the stream (almost always) already
-    /// exists, could cost one full per-stream topic listing per topic in a `CreateTopics` batch
-    /// (up to 100 today). `StreamNameAlreadyExists` on the create attempt is exactly as
-    /// informative as a prior `get_stream` would have been - the stream exists either way - so
-    /// this pays one round trip in every case instead of up to two in the common one.
-    async fn ensure_stream(&self, stream_name: &str) -> Result<Identifier, BridgeError> {
-        let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
-        match self
-            .metadata_write(|| self.client.create_stream(stream_name))
-            .await
-        {
-            Ok(_created) => {
-                info!("created Iggy stream '{stream_name}'");
-                Ok(identifier)
-            }
-            Err(BridgeError::Iggy(IggyError::StreamNameAlreadyExists(_))) => {
-                debug!("Iggy stream '{stream_name}' already exists");
-                Ok(identifier)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     /// Looks up (or creates) the topic named `topic_name` under `stream_id`.
     ///
     /// `Identifier::named`, not `Identifier::try_from` - the same numeric-name ambiguity
-    /// [`Self::ensure_stream`]'s doc comment describes for stream names applies to topic names.
+    /// [`ensure_stream`]'s doc comment describes for stream names applies to topic names.
     ///
     /// `partition_count == 0` is unreachable here: [`IggyBridge::ensure_stream_and_topic`] rejects
     /// it with [`BridgeError::InvalidPartitionCount`] before calling this method. The server
@@ -450,6 +424,49 @@ impl IggyBridge {
         kafka_topic: &str,
         partition_count: u32,
     ) -> Result<TopicCreationOutcome, BridgeError> {
+        self.create_kafka_topic_on(&self.client, kafka_topic, partition_count)
+            .await
+    }
+
+    /// [`Self::create_kafka_topic`] on a client of its own, for `Metadata`'s auto topic creation.
+    ///
+    /// Not the admin client: the SDK runs one request at a time per client, so creations queued
+    /// behind a slow Iggy would hold every Metadata lookup and `CreateTopics` behind them. A call
+    /// that times out drops this client, so the next creation dials a new one instead of queueing
+    /// behind the exchange that is still pending.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::create_kafka_topic`].
+    pub(crate) async fn auto_create_kafka_topic(
+        &self,
+        kafka_topic: &str,
+        partition_count: u32,
+    ) -> Result<TopicCreationOutcome, BridgeError> {
+        let create = |connected: Arc<IggyClient>| async move {
+            self.create_kafka_topic_on(&connected, kafka_topic, partition_count)
+                .await
+        };
+        self.auto_create_client
+            .until(&self.config, Instant::now() + AUTO_CREATE_LIMIT, create)
+            .await
+    }
+
+    /// [`Self::create_kafka_topic`] on `client`.
+    ///
+    /// Creates the topic first, and the stream only when Iggy reports it missing, which costs one
+    /// refused `create_topic` for each stream that has to be created. Iggy refuses a
+    /// `create_stream` of a stream that exists, or one the bridge user may not create, only after
+    /// journaling and replicating it, so creating the stream first would cost every creation, and
+    /// every retry of a refused one, a metadata write. It would also lock out a bridge user that
+    /// holds `manage_topics` on the stream alone: `create_topic` accepts that grant, while
+    /// `create_stream` needs the global `manage_streams`.
+    async fn create_kafka_topic_on(
+        &self,
+        client: &IggyClient,
+        kafka_topic: &str,
+        partition_count: u32,
+    ) -> Result<TopicCreationOutcome, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
         if partition_count == 0 {
             return Err(BridgeError::InvalidPartitionCount {
@@ -457,16 +474,27 @@ impl IggyBridge {
             });
         }
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = self.ensure_stream(stream_name).await?;
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
 
         let options = TopicCreateOptions {
             partitions_count: Some(partition_count),
             ..TopicCreateOptions::default()
         };
-        match self
-            .metadata_write(|| self.client.create_topic(&stream_id, topic_name, &options))
-            .await
-        {
+        let create_topic = || {
+            metadata_write_on(client, || {
+                client.create_topic(&stream_id, topic_name, &options)
+            })
+        };
+        let created = match create_topic().await {
+            Err(BridgeError::Iggy(
+                IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_),
+            )) => {
+                ensure_stream(client, stream_name).await?;
+                create_topic().await
+            }
+            created => created,
+        };
+        match created {
             Ok(created) => {
                 info!("created Iggy topic '{topic_name}' with {partition_count} partitions");
                 // Same postcondition check ensure_topic's own create branch makes: partitions_count
@@ -583,6 +611,59 @@ impl IggyBridge {
         }
 
         Ok(results)
+    }
+}
+
+/// Ensures the stream named `stream_name` exists, creating it if missing.
+///
+/// `Identifier::named` - never `Identifier::try_from`/`FromStr` - because the latter parses
+/// an all-digit string as a numeric Iggy ID rather than a name. A stream or topic named e.g.
+/// `"42"` would otherwise resolve against the wrong resource on every call after the first:
+/// the first `ensure_stream_and_topic("42", ...)` creates a stream *named* `"42"`, but a
+/// second call would look it up *by ID* `42` instead, almost certainly finding nothing and
+/// breaking the "idempotent on repeated calls" guarantee.
+///
+/// Returns the same *named* `Identifier` it was given, not the numeric id the SDK hands back
+/// from `get`/`create` - streams are backed by a recycled slab (`core/metadata`'s
+/// `stm/stream.rs`: freed keys are reused by the next created stream), so a numeric id
+/// captured here could point at a *different* stream by the time `ensure_topic` uses it, if
+/// this stream is deleted and recreated in between. The name has no such window.
+///
+/// Attempts the create directly rather than probing existence first: `get_stream` answers
+/// with `StreamDetails`, which embeds every topic header in the stream (`iggy_common`'s
+/// `StreamDetails.topics: Vec<Topic>`), not just the stream's own metadata - a probe paid on
+/// every call, including the steady-state case where the stream (almost always) already
+/// exists, could cost one full per-stream topic listing per topic in a `CreateTopics` batch
+/// (up to 100 today). `StreamNameAlreadyExists` on the create attempt is exactly as
+/// informative as a prior `get_stream` would have been - the stream exists either way - so
+/// this pays one round trip in every case instead of up to two in the common one.
+async fn ensure_stream(client: &IggyClient, stream_name: &str) -> Result<Identifier, BridgeError> {
+    let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
+    stream_ensured(
+        stream_name,
+        metadata_write_on(client, || client.create_stream(stream_name)).await,
+    )?;
+    Ok(identifier)
+}
+
+/// Whether a `create_stream` left the stream in place: it created it, another caller had, or the
+/// SDK replayed a create that had already landed (`RequestAlreadyApplied`).
+fn stream_ensured<T>(
+    stream_name: &str,
+    created: Result<T, BridgeError>,
+) -> Result<(), BridgeError> {
+    match created {
+        Ok(_created) => {
+            info!("created Iggy stream '{stream_name}'");
+            Ok(())
+        }
+        Err(BridgeError::Iggy(
+            IggyError::StreamNameAlreadyExists(_) | IggyError::RequestAlreadyApplied,
+        )) => {
+            debug!("Iggy stream '{stream_name}' already exists");
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -704,5 +785,23 @@ async fn load_stream(
             );
             StreamLoad::TimedOut
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_a_replayed_stream_create_that_already_landed_should_treat_the_stream_as_present() {
+        assert!(stream_ensured("kafka", Ok(())).is_ok());
+        let exists = IggyError::StreamNameAlreadyExists("kafka".to_string());
+        assert!(stream_ensured::<()>("kafka", Err(BridgeError::Iggy(exists))).is_ok());
+        let replayed = IggyError::RequestAlreadyApplied;
+        assert!(stream_ensured::<()>("kafka", Err(BridgeError::Iggy(replayed))).is_ok());
+        assert!(matches!(
+            stream_ensured::<()>("kafka", Err(BridgeError::Timeout)),
+            Err(BridgeError::Timeout)
+        ));
     }
 }
