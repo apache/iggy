@@ -21,6 +21,11 @@ fix runs in a separate background agent while the conversation moves on. Never f
 without the user's explicit go-ahead on that specific comment. Never silently skip, reorder, or bundle
 comments unless the user asks you to.
 
+Tool names in this skill are Claude Code names. On Codex, use the equivalents from
+[execution instructions](../team-review/references/execution.md): `spawn_agent` for `Agent`, `send_message` and
+`followup_task` for `SendMessage`, `wait_agent` to see which fix agents are still running in place of `ListAgents`,
+and the client's own question tool in place of `AskUserQuestion`.
+
 ## 1. Fetch the review
 
 ```bash
@@ -89,6 +94,8 @@ cold, so its prompt must be self-contained:
   context.
 - "Apply exactly this and nothing else. No drive-by cleanup." The repo's own rules apply (read the project's
   CLAUDE.md or AGENTS.md; follow its style, verification order, and prohibitions).
+- "Re-read the target lines before editing. Another fix may have changed them since the user approved this one. Apply
+  the change only if its intent still fits. If it does not, stop and report the conflict as a question."
 - The verification to run afterward for the file types touched (`cargo check -p <crate>`,
   `cargo test -p <crate>`, `./scripts/ci/markdownlint.sh <file>`, `./scripts/ci/taplo.sh --check`,
   `./scripts/ci/license-headers.sh`, etc., in the project's order).
@@ -105,13 +112,14 @@ conversation and call ListAgents to confirm which are still active.
 
 - If none is running, launch the new agent now.
 - If one is running, do not launch. Put the approved fix in a queue, in the order the user approved it, and
-  tell the user it is queued. Keep the full approved change in your own notes so the agent prompt can be
-  written later.
+  tell the user it is queued. Write the full approved change to a scratch file in the session scratchpad
+  directory, so that context compaction cannot drop it. Read that file when the agent prompt is written.
 - When the running agent reports (done, failed, or blocked and answered), launch the next queued fix. Do this
   as soon as the report arrives, before moving on to anything else, and then give the user the report.
 - If an agent is blocked waiting on the user, it still counts as running. Do not launch another until it
   finishes or the user tells you to abandon it.
-- Only a fix agent counts for this rule. Read-only work does not need to wait.
+- Only a fix agent counts for this rule. Read-only work does not need to wait. If the next item touches a file that a
+  running fix agent is editing, re-read that file after the agent reports, before you quote code or give a verdict.
 
 **Talking to the user while agents run:**
 
@@ -177,3 +185,7 @@ only, no restating full explanations already given). Also list, with the reason 
 - anything an agent reported as failed or left unverified.
 
 Don't re-run every verification command again at the end unless something was left unverified mid-flow.
+
+After the summary, suggest replying on the review threads. Do not post anything until the user chooses. Offer
+three ways to choose: reply on all comments, reply on the item numbers the user lists, or follow a custom prompt
+from the user. Draft each reply and get approval before posting, as in section 5.
