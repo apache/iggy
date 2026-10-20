@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::binary_impls::send_raw_messages;
 use crate::{
     ClientState, Credentials, DiagnosticEvent, Identifier, IggyError, NonZeroIggyDuration,
     PartitionContext,
@@ -25,13 +24,38 @@ use bytes::Bytes;
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::{
-    DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
+    DELETE_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// Default budget shared by a binary call's lookups, admission and retries.
+#[doc(hidden)]
+pub const BINARY_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+tokio::task_local! {
+    static OPERATION_DEADLINE: Instant;
+}
+
+#[doc(hidden)]
+pub async fn with_binary_deadline<F: Future>(deadline: Instant, future: F) -> F::Output {
+    let deadline = OPERATION_DEADLINE
+        .try_with(|current| deadline.min(*current))
+        .unwrap_or(deadline);
+    OPERATION_DEADLINE.scope(deadline, future).await
+}
+
+#[doc(hidden)]
+pub fn binary_operation_deadline() -> Instant {
+    OPERATION_DEADLINE
+        .try_with(|deadline| *deadline)
+        .unwrap_or_else(|_| Instant::now() + BINARY_OPERATION_TIMEOUT)
+}
 
 #[async_trait]
 pub trait BinaryTransport {
@@ -43,31 +67,20 @@ pub trait BinaryTransport {
     /// Low-level raw API: send `code` with an encoded `payload` and return the
     /// raw reply body.
     ///
-    /// Partition commands carry the partition context the typed API would send:
-    /// - `SendMessages` with an explicit partition id uses the cached send
-    ///   context, or captures one from `GetPartitionRoute`. After a
-    ///   `HistoryUnavailable` refusal the topic's cached contexts are dropped and
-    ///   one fresh capture is tried. `Balanced` and `MessagesKey` partitioning
-    ///   fail with [`IggyError::FeatureUnavailable`] before anything is sent:
-    ///   use [`MessageClient::send_messages`](crate::MessageClient::send_messages)
-    ///   or an explicit partition id.
-    /// - `PollMessages` takes the routed path of a typed poll (`GetPollRouting`),
-    ///   and `StoreConsumerOffset` and `DeleteConsumerOffset` that of a typed
-    ///   offset write (`GetConsumerOffsetRouting`). Each takes the context its
-    ///   route reports, so after another client deleted and recreated the
-    ///   partition, one call can fail with `HistoryUnavailable`
-    ///   (`ConsumerGroupPartitionNotOwned` for a consumer group). The failed
-    ///   route is dropped and the next call routes again.
+    /// The transport routes partition commands to their primary and captures
+    /// context when the caller supplies none. Raw `SendMessages` requires an
+    /// explicit partition id; raw `Balanced` and `MessagesKey` sends return
+    /// [`IggyError::FeatureUnavailable`]. Use [`MessageClient::send_messages`](crate::MessageClient::send_messages)
+    /// for balanced or keyed selection.
     ///
-    /// A partition command payload that does not decode fails with
-    /// [`IggyError::InvalidCommand`] before anything is sent. Every other code
-    /// is sent unchanged, without a partition context.
+    /// Retries keep their request identity and first context. A definitive
+    /// history refusal lets a send capture once again; an uncertain operation
+    /// stays retained under its original context for explicit recovery.
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>
     where
         Self: Sync,
     {
         match code {
-            SEND_MESSAGES_CODE => send_raw_messages(self, payload).await,
             POLL_MESSAGES_CODE => {
                 let request = PollMessagesRequest::decode_from(&payload)
                     .map_err(|_| IggyError::InvalidCommand)?;
@@ -84,8 +97,8 @@ pub trait BinaryTransport {
         }
     }
     /// Send with a captured partition incarnation and owner. Every retry must retain it.
-    /// A history refusal after an uncertain attempt must return
-    /// `TransientNotCommitted`, so callers cannot refresh and repeat that write.
+    /// A history refusal after an uncertain attempt returns `OperationUncertain`,
+    /// so callers cannot refresh and repeat that write under a new identity.
     async fn send_raw_with_context(
         &self,
         code: u32,
@@ -113,6 +126,16 @@ pub trait BinaryTransport {
     ) -> Result<Bytes, IggyError>
     where
         Self: Sync;
+    /// The partition count from the newest usable route for this topic.
+    #[doc(hidden)]
+    fn routed_partition_count(
+        &self,
+        _stream_id: &Identifier,
+        _topic_id: &Identifier,
+    ) -> Option<u32> {
+        None
+    }
+
     fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
@@ -132,6 +155,22 @@ mod vsr_session_sealed {
 /// mutation corrupts the dedup counter or silently breaks at-most-once.
 #[async_trait]
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
+    /// Establish a connection for explicit credentials before capturing the
+    /// sign-in fence. Binary SDK transports suppress automatic sign-in here.
+    #[doc(hidden)]
+    async fn prepare_sign_in(&self) -> Result<(), IggyError>
+    where
+        Self: crate::Client,
+    {
+        if matches!(
+            self.get_state().await,
+            ClientState::Disconnected | ClientState::Connecting
+        ) {
+            self.connect().await?;
+        }
+        Ok(())
+    }
+
     /// Internal bearer proof. Never log or expose this value to application users.
     #[doc(hidden)]
     async fn session_bind_secret(&self) -> Result<BindSecret, IggyError>;
@@ -193,18 +232,6 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// Drop them: after an explicit logout there is no session to restore,
     /// and a reconnect must not resurrect one.
     async fn forget_session_credentials(&self) {}
-    /// A committed password change for `user`: when it is the signed-in user,
-    /// the credentials the next reconnect signs in with switch to the new
-    /// password, or that reconnect would replay the old one and fail an
-    /// unrelated request with `InvalidCredentials`. Other users' changes are
-    /// ignored.
-    ///
-    /// This covers a configured `AutoLogin` as well as a sign-in the caller
-    /// ran: the configured credentials still decide *who* the client signs in
-    /// as, and a committed change decides what that user's password is.
-    async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
-    /// Keep auxiliary logins and reconnects working after the session user is renamed.
-    async fn refresh_session_username(&self, _user: &Identifier, _new_username: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
@@ -236,17 +263,11 @@ mod tests {
     use super::*;
     use crate::ConsumerGroupClientState;
     use bytes::BytesMut;
-    use iggy_binary_protocol::codes::{
-        GET_CONSUMER_OFFSET_ROUTING_CODE, GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE,
-        PING_CODE, POLL_MESSAGES_ON_PRIMARY_CODE,
-    };
+    use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, PING_CODE, SEND_MESSAGES_CODE};
     use iggy_binary_protocol::requests::consumer_offsets::{
         DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
     };
-    use iggy_binary_protocol::requests::messages::{
-        GetPartitionRouteRequest, RawMessage, SendMessagesEncoder,
-    };
-    use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+    use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
     use iggy_binary_protocol::{
         AckLevel, WireConsumer, WireIdentifier, WirePartitioning, WirePollingStrategy,
     };
@@ -256,12 +277,6 @@ mod tests {
     const TOPIC: &str = "orders";
     const PARTITION: u32 = 3;
     const RECEIPT: &[u8] = b"receipt";
-    const CAPTURED: PartitionContext = PartitionContext {
-        incarnation: 7,
-        owner_generation: 0,
-        metadata_op: 9,
-    };
-
     #[derive(Debug, PartialEq)]
     enum Call {
         Raw(u32, Bytes, PartitionContext),
@@ -303,16 +318,6 @@ mod tests {
             context: PartitionContext,
         ) -> Result<Bytes, IggyError> {
             self.record(Call::Raw(code, payload, context));
-            if code == GET_PARTITION_ROUTE_CODE {
-                return Ok(PartitionRouteResponse {
-                    incarnation: CAPTURED.incarnation,
-                    metadata_op: CAPTURED.metadata_op,
-                    view: 0,
-                    partitions_count: PARTITION + 1,
-                    primary_replica: 0,
-                }
-                .to_bytes());
-            }
             Ok(Bytes::from_static(RECEIPT))
         }
 
@@ -372,61 +377,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_raw_send_to_partition_id_when_repeated_should_capture_context_once() {
+    async fn given_raw_send_to_partition_id_when_sent_should_leave_routing_to_transport() {
         let transport = Recorder::default();
         let payload = send_payload(&WirePartitioning::PartitionId(PARTITION));
-        for _ in 0..2 {
-            let response = transport
-                .send_raw_with_response(SEND_MESSAGES_CODE, payload.clone())
-                .await
-                .unwrap();
-            assert_eq!(response, Bytes::from_static(RECEIPT));
-        }
-        let capture = GetPartitionRouteRequest {
-            stream_id: WireIdentifier::numeric(STREAM),
-            topic_id: wire_topic(),
-            partition_id: PARTITION,
-        };
+        let response = transport
+            .send_raw_with_response(SEND_MESSAGES_CODE, payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(response, Bytes::from_static(RECEIPT));
         assert_eq!(
             transport.take_calls(),
-            vec![
-                Call::Raw(
-                    GET_PARTITION_ROUTE_CODE,
-                    capture.to_bytes(),
-                    PartitionContext::default()
-                ),
-                Call::Raw(SEND_MESSAGES_CODE, payload.clone(), CAPTURED),
-                Call::Raw(SEND_MESSAGES_CODE, payload, CAPTURED),
-            ]
+            vec![Call::Raw(
+                SEND_MESSAGES_CODE,
+                payload,
+                PartitionContext::default()
+            )]
         );
-        // Typed sends key the same cache by domain identifiers.
-        assert_eq!(
-            transport.state.partition_context(
-                &Identifier::numeric(STREAM).unwrap(),
-                &Identifier::named(TOPIC).unwrap(),
-                PARTITION
-            ),
-            Some(CAPTURED)
-        );
-    }
-
-    #[tokio::test]
-    async fn given_raw_send_without_partition_id_when_sent_should_fail_before_sending() {
-        let transport = Recorder::default();
-        for partitioning in [
-            WirePartitioning::Balanced,
-            WirePartitioning::MessagesKey(b"key".to_vec()),
-        ] {
-            let result = transport
-                .send_raw_with_response(SEND_MESSAGES_CODE, send_payload(&partitioning))
-                .await;
-            assert_eq!(
-                result,
-                Err(IggyError::FeatureUnavailable),
-                "{partitioning:?}"
-            );
-        }
-        assert!(transport.take_calls().is_empty());
     }
 
     #[tokio::test]
@@ -485,13 +451,7 @@ mod tests {
     async fn given_non_partition_code_when_sent_should_pass_through_with_default_context() {
         let transport = Recorder::default();
         let payload = Bytes::from_static(b"opaque");
-        for code in [
-            PING_CODE,
-            GET_PARTITION_ROUTE_CODE,
-            GET_POLL_ROUTING_CODE,
-            POLL_MESSAGES_ON_PRIMARY_CODE,
-            GET_CONSUMER_OFFSET_ROUTING_CODE,
-        ] {
+        for code in [PING_CODE, GET_PARTITION_ROUTE_CODE] {
             transport
                 .send_raw_with_response(code, payload.clone())
                 .await
@@ -510,14 +470,7 @@ mod tests {
     #[tokio::test]
     async fn given_undecodable_partition_payload_when_sent_should_fail_before_sending() {
         let transport = Recorder::default();
-        let mut metadata_past_end =
-            send_payload(&WirePartitioning::PartitionId(PARTITION)).to_vec();
-        metadata_past_end[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        for (code, payload) in [
-            (SEND_MESSAGES_CODE, Bytes::new()),
-            (SEND_MESSAGES_CODE, Bytes::from(metadata_past_end)),
-            (POLL_MESSAGES_CODE, Bytes::from_static(b"lost-poll")),
-        ] {
+        for (code, payload) in [(POLL_MESSAGES_CODE, Bytes::from_static(b"lost-poll"))] {
             let result = transport.send_raw_with_response(code, payload).await;
             assert_eq!(result, Err(IggyError::InvalidCommand), "code {code}");
         }

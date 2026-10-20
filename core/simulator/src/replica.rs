@@ -309,6 +309,9 @@ pub fn new_shard(
     if let Some(coordinator) = metadata.coordinator.as_mut() {
         coordinator.use_synchronous_io();
     }
+    // Default-config PAT cap, so the sim admits exactly what a
+    // default-configured server does.
+    metadata.set_max_tokens_per_user(PersonalAccessTokenConfig::default().max_tokens_per_user);
 
     // Both halves are load-bearing: the pairing keeps a later view-change superblock
     // write from regressing to `(0, 0)`, and the folded table is the floor the replayed
@@ -419,9 +422,6 @@ pub fn new_shard(
         &SharedSimOutbox(Rc::clone(bus)),
         &shard_handle,
         Arc::new(ServerConfig::default()),
-        // Default-config PAT cap, like the system config above, so sim
-        // ingress admits exactly what a default-configured server does.
-        PersonalAccessTokenConfig::default().max_tokens_per_user,
     ));
 
     let shard = Rc::new(

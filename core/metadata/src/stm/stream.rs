@@ -26,8 +26,8 @@ use crate::stm::lifecycle::{
 };
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
-    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, TruncatePartitionResult,
-    UpdateStreamResult, UpdateTopicResult,
+    DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, DeletedResource,
+    TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
 use crate::stm::snapshot::Snapshotable;
 use crate::stm::{ApplyContext, StateHandler};
@@ -2203,7 +2203,10 @@ impl StateHandler for DeleteStreamRequest {
         state.namespace_revision = state.revision;
         // The dropped stream may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            deleted_resource: Some(DeletedResource::Stream(stream_id)),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 
@@ -2528,7 +2531,13 @@ impl StateHandler for DeleteTopicRequest {
         state.namespace_revision = state.revision;
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
-        ApplyReply::ok(Bytes::new())
+        ApplyReply {
+            deleted_resource: Some(DeletedResource::Topic {
+                stream_id,
+                topic_id,
+            }),
+            ..ApplyReply::ok(Bytes::new())
+        }
     }
 }
 

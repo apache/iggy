@@ -195,6 +195,16 @@ struct ResponseVectorTests {
         #expect(stats.totalDiskSpace == 512_110_190_592)
     }
 
+    @Test func routes() async throws {
+        let route = try Responses.partitionRoute(body("response.partition_route"))
+        #expect(route.context == PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10))
+        // The view and the partition count sit between the context and the
+        // primary.
+        #expect(route.primaryReplica == 2)
+        // A route of any other length comes from a mismatched build.
+        await expectCode(.invalidCommand) { _ = try Responses.partitionRoute(body("response.partition_route") + [0]) }
+    }
+
     @Test func clusterMetadata() throws {
         let metadata = try Responses.clusterMetadata(body("response.cluster_metadata"))
         #expect(metadata.name == "prod-cluster")

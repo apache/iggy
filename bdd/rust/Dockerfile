@@ -18,22 +18,44 @@
 ARG RUST_VERSION=1.99
 FROM rust:${RUST_VERSION}-slim-trixie
 
+ARG COVERAGE=false
+ARG BDD_RUST_FEATURES=bdd
+ARG LLVM_COV_VERSION=0.9.1
+
+ENV RUSTFLAGS="-C linker=gcc" \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_TEST_DEBUG=0
+
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
     libhwloc-dev \
     libudev-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy everything
+RUN if [[ "$COVERAGE" == true ]]; then \
+        rustup component add llvm-tools-preview; \
+        host=$(rustc -vV | sed -n 's/^host: //p'); \
+        curl -fsSL --retry 5 --retry-all-errors \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${LLVM_COV_VERSION}/cargo-llvm-cov-${host}.tar.gz" \
+            -o /tmp/llvm-cov.tar.gz; \
+        tar -xzf /tmp/llvm-cov.tar.gz -C /usr/local/cargo/bin; \
+        rm /tmp/llvm-cov.tar.gz; \
+    fi
+
 COPY . .
+# The shared Docker context includes host server binaries for other images.
+# Their coverage mappings belong in the host report, not the BDD report.
+RUN rm -rf target && mkdir -p /app/features
+RUN if [[ "$COVERAGE" == true ]]; then \
+        coverage_env=$(cargo llvm-cov show-env --sh --remap-path-prefix); \
+        eval "$coverage_env"; \
+    fi; \
+    cargo test --locked --no-run -p bdd --features "$BDD_RUST_FEATURES"
 
-# Create features directory for BDD feature files
-RUN mkdir -p /app/features
-
-# Build tests
-RUN cargo test --no-run -p bdd
-
-# Default command will be overridden by docker-compose
-CMD ["cargo", "test", "-p", "bdd", "--features", "bdd"]
+CMD ["cargo", "test", "--locked", "-p", "bdd", "--features", "bdd"]

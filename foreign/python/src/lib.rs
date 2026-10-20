@@ -33,10 +33,10 @@ mod topic;
 mod user;
 mod user_headers;
 
-use client::IggyClient;
+use client::{IggyClient, PendingOperationError};
 use config::{
-    AutoLogin, HttpConfig, QuicConfig, QuicReconnectionConfig, TcpConfig, TcpReconnectionConfig,
-    WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
+    AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
+    TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
 };
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
@@ -69,6 +69,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PartitionContext>()?;
     m.add_class::<ConsumerPosition>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<PendingOperationError>()?;
     m.add_class::<IggyProducer>()?;
     m.add_class::<ProducerSendError>()?;
     m.add_class::<DirectProducerConfig>()?;
@@ -76,6 +77,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ProducerSharding>()?;
     m.add_class::<BackpressureMode>()?;
     m.add_class::<AutoLogin>()?;
+    m.add_class::<PendingOperationsConfig>()?;
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;
     m.add_class::<QuicConfig>()?;

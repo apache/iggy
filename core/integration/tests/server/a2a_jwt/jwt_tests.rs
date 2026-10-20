@@ -19,9 +19,11 @@ use std::sync::Arc;
 
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
-    GlobalPermissions, HttpClientConfig, IggyClientBuilder, Permissions, UserStatus,
+    GlobalPermissions, HttpClientConfig, Identifier, IggyClientBuilder, IggyError, Permissions,
+    UserStatus, UserUpdateOptions,
 };
 use iggy_common::{StreamClient, UserClient};
+use integration::harness::config::JWKS_ISSUER_USERNAME;
 use integration::iggy_harness;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
@@ -30,28 +32,19 @@ const TEST_ISSUER: &str = "https://test-issuer.com";
 const TEST_AUDIENCE: &str = "iggy";
 const TEST_KEY_ID: &str = "iggy-jwt-key-1";
 const TEST_PRIVATE_KEY: &[u8] = include_bytes!("../../../../certs/iggy_key.pem");
+const A2A_PASSWORD: &str = "a2a-test-password";
 
 /// Seed function to create the A2A user with proper permissions
 async fn seed_a2a_user(
     client: &iggy::prelude::IggyClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Create a user that will be used for A2A JWT authentication.
-    // The first user created after root will have user_id = 1.
     // Grant read_streams permission so the user can call get_streams().
-    let permissions = Permissions {
-        global: GlobalPermissions {
-            read_streams: true,
-            ..GlobalPermissions::default()
-        },
-        streams: None,
-    };
-
     match client
         .create_user(
-            "a2a-test-user",
-            "a2a-test-password",
+            JWKS_ISSUER_USERNAME,
+            A2A_PASSWORD,
             UserStatus::Active,
-            Some(permissions),
+            Some(streams_permissions(false)),
         )
         .await
     {
@@ -237,6 +230,17 @@ async fn create_client_with_jwt(http_addr: &str, token: String) -> iggy::prelude
         .with_jwt(token)
         .build()
         .expect("failed to build client")
+}
+
+fn streams_permissions(manage_streams: bool) -> Permissions {
+    Permissions {
+        global: GlobalPermissions {
+            manage_streams,
+            read_streams: true,
+            ..GlobalPermissions::default()
+        },
+        streams: None,
+    }
 }
 
 /// Test that valid A2A JWT token allows access to API
@@ -528,4 +532,109 @@ async fn test_a2a_jwt_unknown_kid_does_not_amplify_jwks_fetch(harness: &TestHarn
         fetches, 1,
         "unknown-kid replay must collapse to a single JWKS fetch, got {fetches}"
     );
+}
+
+/// The issuer maps onto a username, not a user id: once that user is deleted,
+/// its tokens must stop working, also after another account takes the freed id.
+#[iggy_harness(
+    server(config_path = "tests/server/a2a_jwt/config.toml"),
+    jwks_server(store_path = "tests/server/a2a_jwt/wiremock/__files/jwks.json"),
+    seed = seed_a2a_user
+)]
+async fn test_a2a_jwt_rejected_after_mapped_user_deleted(harness: &TestHarness) {
+    let http_addr = harness
+        .all_servers()
+        .first()
+        .expect("server should be available")
+        .http_addr()
+        .expect("http address should be available");
+    let client = create_client_with_jwt(&http_addr.to_string(), create_valid_jwt(3600)).await;
+    assert!(
+        client.get_streams().await.is_ok(),
+        "A2A token must authenticate before the delete"
+    );
+
+    let root = harness.tcp_root_client().await.expect("TCP root client");
+    let mapped = Identifier::named(JWKS_ISSUER_USERNAME).expect("valid username");
+    let mapped_id = root
+        .get_user(&mapped)
+        .await
+        .expect("get user")
+        .expect("seeded user")
+        .id;
+    root.delete_user(&mapped).await.expect("delete user");
+    let successor = root
+        .create_user(
+            "a2a-successor",
+            A2A_PASSWORD,
+            UserStatus::Active,
+            Some(streams_permissions(false)),
+        )
+        .await
+        .expect("create successor");
+    assert_eq!(
+        successor.id, mapped_id,
+        "the successor must take the freed id, or this test proves nothing"
+    );
+
+    let error = client
+        .get_streams()
+        .await
+        .expect_err("an A2A token must not act as the account that took the id");
+    assert_eq!(error.as_code(), IggyError::Unauthenticated.as_code());
+}
+
+/// A write runs on a session cached per credential. After a rename moves the
+/// username to another account, the token's writes must act as that account,
+/// not as the renamed one its first write registered a session for.
+#[iggy_harness(
+    server(config_path = "tests/server/a2a_jwt/config.toml"),
+    jwks_server(store_path = "tests/server/a2a_jwt/wiremock/__files/jwks.json"),
+    seed = seed_a2a_user
+)]
+async fn test_a2a_jwt_writes_follow_username_after_rename(harness: &TestHarness) {
+    let http_addr = harness
+        .all_servers()
+        .first()
+        .expect("server should be available")
+        .http_addr()
+        .expect("http address should be available");
+    let root = harness.tcp_root_client().await.expect("TCP root client");
+    let mapped = Identifier::named(JWKS_ISSUER_USERNAME).expect("valid username");
+    root.update_permissions(&mapped, Some(streams_permissions(true)))
+        .await
+        .expect("grant manage_streams");
+
+    let client = create_client_with_jwt(&http_addr.to_string(), create_valid_jwt(3600)).await;
+    client
+        .create_stream("a2a-before-rename")
+        .await
+        .expect("A2A token must write as the mapped user");
+
+    root.update_user(
+        &mapped,
+        Some("a2a-renamed"),
+        None,
+        &UserUpdateOptions::default(),
+    )
+    .await
+    .expect("rename the mapped user");
+    root.create_user(
+        JWKS_ISSUER_USERNAME,
+        A2A_PASSWORD,
+        UserStatus::Active,
+        Some(streams_permissions(false)),
+    )
+    .await
+    .expect("create a new account under the mapped username");
+
+    assert!(
+        client.get_streams().await.is_ok(),
+        "reads must act as the account that holds the username now"
+    );
+    let error = client
+        .create_stream("a2a-after-rename")
+        .await
+        .expect_err("writes must not act as the renamed account");
+    assert_eq!(error.as_code(), IggyError::Unauthorized.as_code());
 }

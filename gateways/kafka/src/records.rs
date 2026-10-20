@@ -280,28 +280,53 @@ pub fn from_iggy(message: &IggyMessage, offset: i64) -> Result<Record> {
         ));
     }
     let stored = user_headers(message)?;
-    let Some(version) = stored.get(&VERSION_KEY) else {
+    let timestamp = stored_timestamp(message, &stored)?;
+    if !stored.contains_key(&VERSION_KEY) {
         let (key, value, headers) = foreign_fields(message, &stored);
-        return Ok(record(key, value, headers, offset, timestamp_out(message)));
-    };
-    if version.as_bytes() != [MAPPING_VERSION] {
-        let version = version.as_bytes().first().copied().unwrap_or_default();
-        return Err(RecordCodecError::MappingVersion(version));
+        return Ok(record(key, value, headers, offset, timestamp));
     }
 
     let (key, value, headers) = match stored.get(&ENVELOPE_KEY) {
         Some(envelope) => decode_envelope(envelope.as_bytes(), &message.payload)?,
         None => gateway_fields(message, &stored)?,
     };
-    let timestamp = match stored.get(&TIMESTAMP_KEY) {
-        None => timestamp_out(message),
-        Some(header) => match header.as_int64() {
-            Ok(NO_TIMESTAMP) => server_timestamp(message),
-            Ok(millis) if millis >= EPOCH_TIMESTAMP => millis,
-            _ => return Err(RecordCodecError::TimestampHeader(header.value())),
-        },
-    };
     Ok(record(key, value, headers, offset, timestamp))
+}
+
+/// The timestamp [`from_iggy`] reports for `message`, read from its headers alone.
+///
+/// # Errors
+///
+/// Fails where `from_iggy` fails before it reaches the key, the value or the envelope: unreadable
+/// user headers, an unknown `kafka.v`, or a `kafka.ts` that is not a Kafka timestamp. A malformed
+/// envelope or value marker does not fail here.
+pub fn record_timestamp(message: &IggyMessage) -> Result<i64> {
+    if message.user_headers.as_deref() == Some(version_only()) {
+        return Ok(timestamp_out(message));
+    }
+    stored_timestamp(message, &user_headers(message)?)
+}
+
+/// Checks `kafka.v` and reads `kafka.ts`, which only a gateway-written message has.
+fn stored_timestamp(
+    message: &IggyMessage,
+    stored: &BTreeMap<HeaderKey, HeaderValue>,
+) -> Result<i64> {
+    let Some(version) = stored.get(&VERSION_KEY) else {
+        return Ok(timestamp_out(message));
+    };
+    if version.as_bytes() != [MAPPING_VERSION] {
+        let version = version.as_bytes().first().copied().unwrap_or_default();
+        return Err(RecordCodecError::MappingVersion(version));
+    }
+    stored.get(&TIMESTAMP_KEY).map_or_else(
+        || Ok(timestamp_out(message)),
+        |header| match header.as_int64() {
+            Ok(NO_TIMESTAMP) => Ok(server_timestamp(message)),
+            Ok(millis) if millis >= EPOCH_TIMESTAMP => Ok(millis),
+            _ => Err(RecordCodecError::TimestampHeader(header.value())),
+        },
+    )
 }
 
 /// The stored user headers, with an unreadable block told apart from an absent one.
@@ -1671,6 +1696,60 @@ mod tests {
         assert!(is_enveloped(&message));
         message.header.timestamp = 5_000_000;
         assert_eq!(from_iggy(&message, 0).unwrap().timestamp, EPOCH_TIMESTAMP);
+    }
+
+    #[test]
+    fn given_every_record_shape_when_its_timestamp_is_read_alone_should_match_from_iggy() {
+        let later = CREATE_TIME + 72 * 60 * 1000;
+        let clamped = [record_at(CREATE_TIME), record_at(later)];
+        let unset_among_real = [record_at(CREATE_TIME), record_at(NO_TIMESTAMP)];
+        let epoch_among_real = [record_at(CREATE_TIME), record_at(EPOCH_TIMESTAMP)];
+        let enveloped = |timestamp| {
+            record(
+                Some(Bytes::new()),
+                Some(Bytes::from_static(b"v")),
+                IndexMap::new(),
+                0,
+                timestamp,
+            )
+        };
+        let mut unreadable = to_iggy_alone(&record_at(CREATE_TIME)).unwrap();
+        unreadable.user_headers = Some(Bytes::from_static(b"not a header block"));
+        let mut foreign_with_ts = BTreeMap::new();
+        foreign_with_ts.insert(header_key(TIMESTAMP_HEADER), HeaderValue::from(CREATE_TIME));
+        let foreign_with_ts = IggyMessage::builder()
+            .payload(Bytes::from_static(b"v"))
+            .user_headers(foreign_with_ts)
+            .build()
+            .unwrap();
+        let mut messages = vec![
+            to_iggy_alone(&record_with(None, Some(b"v"), &[])).unwrap(),
+            to_iggy_alone(&record_with(Some(b"k"), Some(b"v"), &[("h", Some(b"x"))])).unwrap(),
+            to_iggy_alone(&record_at(NO_TIMESTAMP)).unwrap(),
+            to_iggy_alone(&record_at(EPOCH_TIMESTAMP)).unwrap(),
+            to_iggy_alone(&enveloped(CREATE_TIME)).unwrap(),
+            to_iggy_alone(&enveloped(EPOCH_TIMESTAMP)).unwrap(),
+            to_iggy_alone(&enveloped(NO_TIMESTAMP)).unwrap(),
+            to_iggy(&clamped[1], TimestampWindow::of(&clamped)).unwrap(),
+            to_iggy(&unset_among_real[1], TimestampWindow::of(&unset_among_real)).unwrap(),
+            to_iggy(&epoch_among_real[1], TimestampWindow::of(&epoch_among_real)).unwrap(),
+            message_with(b"v", &[]),
+            message_with(b"v", &[("trace", b"abc")]),
+            foreign_with_ts,
+            gateway_message(b"v", &[(TIMESTAMP_HEADER, b"epoch")]),
+            message_with(b"v", &[(VERSION_HEADER, &[MAPPING_VERSION + 1])]),
+            unreadable,
+        ];
+        for (index, message) in messages.iter_mut().enumerate() {
+            message.header.timestamp = 5_000_000;
+            let expected = from_iggy(message, 0).map(|record| record.timestamp);
+            let actual = record_timestamp(message);
+            match (&expected, &actual) {
+                (Ok(expected), Ok(actual)) => assert_eq!(actual, expected, "fixture {index}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("fixture {index}: from_iggy {expected:?}, alone {actual:?}"),
+            }
+        }
     }
 
     #[test]

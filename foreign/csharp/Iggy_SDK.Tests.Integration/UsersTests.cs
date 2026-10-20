@@ -123,7 +123,13 @@ public class UsersTests
         var username = $"perm-{Guid.NewGuid():N}"[..20];
         await client.CreateUserAsync(username, "test1", UserStatus.Active);
 
-        var permissions = CreatePermissions();
+        // The server refuses a grant on a stream or topic that does not exist.
+        var stream = await client.CreateStreamAsync($"perm-{Guid.NewGuid():N}");
+        stream.ShouldNotBeNull();
+        var topic = await client.CreateTopicAsync(Identifier.Numeric(stream.Id), "perm-topic", 1);
+        topic.ShouldNotBeNull();
+
+        var permissions = CreatePermissions(stream.Id, topic.Id);
         await Should.NotThrowAsync(client.UpdatePermissionsAsync(Identifier.String(username), permissions));
 
         var user = await client.GetUserAsync(Identifier.String(username));
@@ -142,19 +148,21 @@ public class UsersTests
         user.Permissions.Global.ReadUsers.ShouldBeTrue();
         user.Permissions.Global.SendMessages.ShouldBeTrue();
         user.Permissions.Streams.ShouldNotBeNull();
-        user.Permissions.Streams.ShouldContainKey(1u);
-        user.Permissions.Streams[1].ManageStream.ShouldBeTrue();
-        user.Permissions.Streams[1].ManageTopics.ShouldBeTrue();
-        user.Permissions.Streams[1].ReadStream.ShouldBeTrue();
-        user.Permissions.Streams[1].SendMessages.ShouldBeTrue();
-        user.Permissions.Streams[1].ReadTopics.ShouldBeTrue();
-        user.Permissions.Streams[1].PollMessages.ShouldBeTrue();
-        user.Permissions.Streams[1].Topics.ShouldNotBeNull();
-        user.Permissions.Streams[1].Topics!.ShouldContainKey(1u);
-        user.Permissions.Streams[1].Topics![1].ManageTopic.ShouldBeTrue();
-        user.Permissions.Streams[1].Topics![1].PollMessages.ShouldBeTrue();
-        user.Permissions.Streams[1].Topics![1].ReadTopic.ShouldBeTrue();
-        user.Permissions.Streams[1].Topics![1].SendMessages.ShouldBeTrue();
+        user.Permissions.Streams.ShouldContainKey(stream.Id);
+        user.Permissions.Streams[stream.Id].ManageStream.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].ManageTopics.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].ReadStream.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].SendMessages.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].ReadTopics.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].PollMessages.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].Topics.ShouldNotBeNull();
+        user.Permissions.Streams[stream.Id].Topics!.ShouldContainKey(topic.Id);
+        user.Permissions.Streams[stream.Id].Topics![topic.Id].ManageTopic.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].Topics![topic.Id].PollMessages.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].Topics![topic.Id].ReadTopic.ShouldBeTrue();
+        user.Permissions.Streams[stream.Id].Topics![topic.Id].SendMessages.ShouldBeTrue();
+
+        await client.DeleteStreamAsync(Identifier.Numeric(stream.Id));
     }
 
     [Test]
@@ -236,7 +244,60 @@ public class UsersTests
         await Should.NotThrowAsync(client.LogoutUserAsync());
     }
 
-    private static Permissions CreatePermissions()
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Permissions_Should_RejectDanglingGrants_And_PruneDeletedResources(Protocol protocol)
+    {
+        const uint missingResourceId = uint.MaxValue;
+        const int streamNotFound = 1009;
+        const int topicNotFound = 2010;
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var username = $"grants-{Guid.NewGuid():N}"[..20];
+        var stream = await client.CreateStreamAsync($"grants-{Guid.NewGuid():N}");
+        stream.ShouldNotBeNull();
+        var streamId = Identifier.Numeric(stream.Id);
+        var topic = await client.CreateTopicAsync(streamId, "grants-topic", 1);
+        topic.ShouldNotBeNull();
+        var permissions = CreatePermissions(stream.Id, topic.Id);
+        var user = await client.CreateUserAsync(username, "test-password", UserStatus.Active, permissions);
+        user.ShouldNotBeNull();
+        var userId = Identifier.Numeric(user.Id);
+
+        foreach (var (grantStream, grantTopic, code) in new[]
+                 {
+                     (missingResourceId, topic.Id, streamNotFound),
+                     (stream.Id, missingResourceId, topicNotFound)
+                 })
+        {
+            var dangling = CreatePermissions(grantStream, grantTopic);
+            var createError = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+                client.CreateUserAsync($"missing-{Guid.NewGuid():N}"[..20], "test-password", UserStatus.Active, dangling));
+            createError.StatusCode.ShouldBe(code);
+            var updateError = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
+                client.UpdatePermissionsAsync(userId, dangling));
+            updateError.StatusCode.ShouldBe(code);
+            var unchanged = await client.GetUserAsync(userId);
+            unchanged.ShouldNotBeNull();
+            unchanged.Permissions.ShouldNotBeNull();
+            unchanged.Permissions.Streams![stream.Id].Topics!.ShouldContainKey(topic.Id);
+        }
+
+        await client.DeleteTopicAsync(streamId, Identifier.Numeric(topic.Id));
+        var afterTopic = await client.GetUserAsync(userId);
+        afterTopic.ShouldNotBeNull();
+        afterTopic.Permissions.ShouldNotBeNull();
+        (afterTopic.Permissions.Streams![stream.Id].Topics?.Count ?? 0).ShouldBe(0);
+        afterTopic.Permissions.Streams[stream.Id].PollMessages.ShouldBeTrue();
+        await client.DeleteStreamAsync(streamId);
+        var afterStream = await client.GetUserAsync(userId);
+        afterStream.ShouldNotBeNull();
+        afterStream.Permissions.ShouldNotBeNull();
+        (afterStream.Permissions.Streams?.Count ?? 0).ShouldBe(0);
+        afterStream.Permissions.Global.PollMessages.ShouldBeTrue();
+        await client.DeleteUserAsync(userId);
+    }
+
+    private static Permissions CreatePermissions(uint streamId, uint topicId)
     {
         return new Permissions
         {
@@ -256,7 +317,7 @@ public class UsersTests
             Streams = new Dictionary<uint, StreamPermissions>
             {
                 {
-                    1, new StreamPermissions
+                    streamId, new StreamPermissions
                     {
                         ManageStream = true,
                         ManageTopics = true,
@@ -267,7 +328,7 @@ public class UsersTests
                         Topics = new Dictionary<uint, TopicPermissions>
                         {
                             {
-                                1, new TopicPermissions
+                                topicId, new TopicPermissions
                                 {
                                     ManageTopic = true,
                                     PollMessages = true,

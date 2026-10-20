@@ -36,6 +36,7 @@ import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.io.Closeable;
+import java.time.Duration;
 
 public class IggyTcpClient implements IggyBaseClient, Closeable {
 
@@ -109,6 +110,23 @@ public class IggyTcpClient implements IggyBaseClient, Closeable {
     @Override
     public byte[] sendBinaryRequest(int code, byte[] payload) {
         return FutureUtil.resolve(asyncClient.sendBinaryRequest(code, payload));
+    }
+
+    /**
+     * Resolves the retained operation under its original identity and returns its response body. A later resolve
+     * returns the same outcome without a request, see {@link AsyncIggyTcpClient#resolveOperation(long, Duration)}.
+     */
+    public byte[] resolveOperation(long operationId, Duration timeout) {
+        return FutureUtil.resolve(asyncClient.resolveOperation(operationId, timeout));
+    }
+
+    /**
+     * Releases local retention without cancelling or reversing server-side work. A replay of the operation that
+     * is already running keeps its lane until the replay ends, and it still keeps the outcome it proves for
+     * {@link #resolveOperation(long, Duration)}.
+     */
+    public void abandonOperation(long operationId) {
+        FutureUtil.resolve(asyncClient.abandonOperation(operationId));
     }
 
     @Override

@@ -125,18 +125,18 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
             shard::MetadataSubmit::Register {
                 vsr_client_id,
                 user_id,
-                verifier,
+                registration,
                 reply,
             } => {
                 let bound =
-                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, verifier)
+                    submit_register_local_or_forward(&shard, vsr_client_id, user_id, registration)
                         .await;
                 let _ = reply.try_send(bound);
             }
             shard::MetadataSubmit::ForwardedRegister {
                 vsr_client_id,
                 user_id,
-                verifier,
+                registration,
                 nonce,
                 origin_replica,
             } => {
@@ -144,7 +144,7 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
                     &shard,
                     vsr_client_id,
                     user_id,
-                    verifier,
+                    registration,
                     nonce,
                     origin_replica,
                 )
@@ -1339,7 +1339,7 @@ mod tests {
         bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, BACKUP, REPLICAS, FIRST_BOOT));
         let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
-        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config), 1);
+        let host = ServerHost::new(&bus, &shard_handle, Arc::new(server_config));
         let (reply, answer) = shard::channel::<bool>(1);
         host.on_metadata_submit(shard::MetadataSubmit::CompleteLifecycle {
             request: lifecycle_batch(pending_delete_intent(&shard)),

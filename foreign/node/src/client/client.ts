@@ -15,130 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { createPool, type Pool } from 'generic-pool';
-import type { RawClient, ClientConfig, ClientConfigOrString } from "./client.type.js"
-import { getRawClient } from '../client/client.socket.js';
+import type { RawClient, ClientConfig, ClientConfigOrString } from './client.type.js';
+import { getRawClient } from './client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
-import { debug } from './client.debug.js';
 import { normalizeClientConfig } from './client.config.js';
 
-
-/**
- * Creates a client provider that uses connection pooling.
- * Automatically acquires and releases clients from the pool.
- *
- * @param config - Client configuration including pool size options
- * @returns Client provider and its connection pool
- */
-const createPooledClientProvider = (config: ClientConfig) => {
-  // Constructed eagerly rather than inside the factory: generic-pool never
-  // rejects waiting acquires when a create fails, and keeps re-dispatching
-  // the doomed factory, which hangs every command. Normalization already
-  // pins this pool to exactly one pooled connection, so there is nothing
-  // lazy to preserve.
-  const client = getRawClient(config);
-  const minPoolSize = config.poolSize?.min || 1;
-  const maxPoolSize = config.poolSize?.max || 4;
-  const pool = createPool({
-    create: async function () {
-      return client;
-    },
-    destroy: async function () {
-      return client.destroy();
-    }
-  }, {
-    min: minPoolSize,
-    max: maxPoolSize
-  });
-  const clientProvider = async () => {
-    const pooled = await pool.acquire();
-    debug('client acquired from pool. pool size is', pool.size);
-    pooled.once('finishQueue', () => {
-      pool.release(pooled)
-      debug('client released to pool. pool size is', pool.size);
-    });
-    return pooled;
-  }
-  return { clientProvider, pool };
-};
-
-
-/**
- * Iggy client with connection pooling support.
- * Manages a pool of connections for efficient resource utilization.
- */
+/** Every facade call shares one session and its independently multiplexed replica links. */
 export class Client extends CommandAPI {
-  /** Client configuration */
-  _config: ClientConfig
-  /** Connection pool instance */
-  _pool: Pool<RawClient>
+  readonly _config: ClientConfig;
 
-  /**
-   * Creates a new pooled client.
-   *
-  * @param config - Client configuration or connection string
-  */
   constructor(config: ClientConfigOrString) {
-    const normalizedConfig = normalizeClientConfig(config);
-    const { clientProvider, pool } =
-      createPooledClientProvider(normalizedConfig);
-    super(clientProvider);
-    this._config = normalizedConfig;
-    this._pool = pool;
+    const normalized = normalizeClientConfig(config);
+    const client = getRawClient(normalized);
+    super(async () => client);
+    this._config = normalized;
   }
 
-  /**
-   * Destroys the client and drains all connections from the pool.
-   */
-  async destroy() {
-    debug('destroying client pool. pool size is', this._pool.size);
-    await this._pool.drain();
-    await this._pool.clear();
-    debug('destroyed client pool. pool size is', this._pool.size);
+  async destroy(): Promise<void> {
+    (await this.clientProvider()).destroy();
   }
 }
 
-/**
- * Creates a client provider that reuses a single connection.
- *
- * @param config - Client configuration
- * @returns Client provider function that always returns the same client
- */
-const createSingleClientProvider = (config: ClientConfig) => {
-  const client = getRawClient(config);
-  return async function clientProvider() {
-    return client;
-  }
-}
-
-/**
- * Iggy client that uses a single persistent connection.
- * Suitable for applications that don't need connection pooling.
- */
-export class SingleClient extends CommandAPI {
-  /** Client configuration */
-  _config: ClientConfig
-
-  /**
-   * Creates a new single-connection client.
-   *
-  * @param config - Client configuration or connection string
-  */
-  constructor(config: ClientConfigOrString) {
-    const normalizedConfig = normalizeClientConfig(config);
-    super(createSingleClientProvider(normalizedConfig));
-    this._config = normalizedConfig;
-  }
-
-  /**
-   * Destroys the client connection.
-   */
-  async destroy() {
-    const client = await this.clientProvider();
-    client.destroy();
-  }
-}
-
+export class SingleClient extends Client {}
 
 /**
  * Simple Iggy client wrapper around an existing RawClient.
