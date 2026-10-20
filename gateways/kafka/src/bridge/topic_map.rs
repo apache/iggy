@@ -80,51 +80,64 @@ pub(crate) fn validate_identifier_name(field: &str, value: &str) -> Result<(), B
 /// `field` is `"topic mapping key"` or `"kafka_topic"` in current callers, not a generic template -
 /// kept as a parameter (like [`validate_identifier_name`]) so the message names the actual site.
 pub(crate) fn validate_kafka_topic_name(field: &str, value: &str) -> Result<(), BridgeError> {
+    let Some(violation) = kafka_topic_name_violation(value) else {
+        return Ok(());
+    };
+    let reason = match violation {
+        KafkaTopicNameViolation::Empty => format!("{field} must not be empty"),
+        KafkaTopicNameViolation::Padded => {
+            format!("{field} must not have leading or trailing whitespace")
+        }
+        KafkaTopicNameViolation::TooLong => format!(
+            "{field} is {} bytes, over Kafka's {MAX_KAFKA_TOPIC_NAME_LEN}-byte topic name limit",
+            value.len()
+        ),
+        KafkaTopicNameViolation::DotName => format!("{field} cannot be \".\" or \"..\""),
+        KafkaTopicNameViolation::IllegalByte(illegal) => format!(
+            "{field} contains {:?}, outside Kafka's legal topic-name characters \
+             (letters, digits, '.', '_', '-')",
+            illegal as char
+        ),
+    };
+    Err(BridgeError::InvalidKafkaTopicName {
+        kafka_topic: value.to_string(),
+        reason,
+    })
+}
+
+/// Whether `value` passes [`validate_kafka_topic_name`], without building its error.
+pub(crate) fn is_valid_kafka_topic_name(value: &str) -> bool {
+    kafka_topic_name_violation(value).is_none()
+}
+
+/// The first of Kafka's topic-name rules `value` breaks.
+enum KafkaTopicNameViolation {
+    Empty,
+    Padded,
+    TooLong,
+    DotName,
+    IllegalByte(u8),
+}
+
+fn kafka_topic_name_violation(value: &str) -> Option<KafkaTopicNameViolation> {
     if value.is_empty() {
-        return Err(BridgeError::InvalidKafkaTopicName {
-            kafka_topic: value.to_string(),
-            reason: format!("{field} must not be empty"),
-        });
+        return Some(KafkaTopicNameViolation::Empty);
     }
     if value.trim() != value {
-        return Err(BridgeError::InvalidKafkaTopicName {
-            kafka_topic: value.to_string(),
-            reason: format!("{field} must not have leading or trailing whitespace"),
-        });
+        return Some(KafkaTopicNameViolation::Padded);
     }
     if value.len() > MAX_KAFKA_TOPIC_NAME_LEN {
-        return Err(BridgeError::InvalidKafkaTopicName {
-            kafka_topic: value.to_string(),
-            reason: format!(
-                "{field} is {} bytes, over Kafka's {MAX_KAFKA_TOPIC_NAME_LEN}-byte topic name limit",
-                value.len()
-            ),
-        });
+        return Some(KafkaTopicNameViolation::TooLong);
     }
     // Kafka's own `Topic.validate` special-cases these two names as invalid even though every
-    // byte in them is otherwise legal (`.` is itself an allowed character) - not a traversal risk
-    // here, since Iggy builds on-disk paths from numeric ids rather than the topic name, but the
-    // doc above claims this function applies Kafka's own rules, and these are two of them.
+    // byte in them is otherwise legal (`.` is itself an allowed character).
     if value == "." || value == ".." {
-        return Err(BridgeError::InvalidKafkaTopicName {
-            kafka_topic: value.to_string(),
-            reason: format!("{field} cannot be \".\" or \"..\""),
-        });
+        return Some(KafkaTopicNameViolation::DotName);
     }
-    if let Some(illegal) = value
+    value
         .bytes()
         .find(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
-    {
-        return Err(BridgeError::InvalidKafkaTopicName {
-            kafka_topic: value.to_string(),
-            reason: format!(
-                "{field} contains {:?}, outside Kafka's legal topic-name characters \
-                 (letters, digits, '.', '_', '-')",
-                illegal as char
-            ),
-        });
-    }
-    Ok(())
+        .map(KafkaTopicNameViolation::IllegalByte)
 }
 
 /// Explicit Kafka-topic → Iggy stream/topic override. Absent entries fall back to
@@ -269,6 +282,19 @@ impl TopicMapping {
             || (self.default_stream.as_str(), kafka_topic),
             |over| (over.stream.as_str(), over.topic.as_str()),
         )
+    }
+
+    /// Whether `kafka_topic` is no override's key yet resolves to the Iggy stream and topic an
+    /// override targets, so writing through it would land in that override's data.
+    #[must_use]
+    pub fn aliases_an_override(&self, kafka_topic: &str) -> bool {
+        if self.topics.contains_key(kafka_topic) {
+            return false;
+        }
+        let target = self.resolve(kafka_topic);
+        self.topics
+            .values()
+            .any(|over| (over.stream.as_str(), over.topic.as_str()) == target)
     }
 
     /// Parses a `TopicMapping` from a TOML document.
@@ -568,5 +594,63 @@ mod tests {
     #[test]
     fn validate_kafka_topic_name_accepts_every_legal_character_class() {
         validate_kafka_topic_name("kafka_topic", "Order.Events_2024-v2").unwrap();
+    }
+
+    #[test]
+    fn is_valid_kafka_topic_name_agrees_with_validate_kafka_topic_name() {
+        let too_long = "a".repeat(MAX_KAFKA_TOPIC_NAME_LEN + 1);
+        for name in [
+            "orders",
+            "Order.Events_2024-v2",
+            "",
+            " orders",
+            ".",
+            "..",
+            "has a space",
+            "orders/2024",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                is_valid_kafka_topic_name(name),
+                validate_kafka_topic_name("kafka_topic", name).is_ok(),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_override_key_or_an_unrelated_name_should_not_report_an_alias() {
+        let mut topics = HashMap::new();
+        topics.insert(
+            "orders".to_string(),
+            TopicOverride {
+                stream: "billing".to_string(),
+                topic: "orders_v2".to_string(),
+            },
+        );
+        let mapping = mapping_with("kafka", topics);
+        assert!(!mapping.aliases_an_override("orders"));
+        assert!(!mapping.aliases_an_override("orders_v2"));
+        assert!(!mapping.aliases_an_override("payments"));
+    }
+
+    /// `new` refuses this shape, so the mapping is built by hand: the predicate must not rely on
+    /// that check to keep a name from writing into an override's topic.
+    #[test]
+    fn given_a_name_resolving_onto_an_override_target_should_report_an_alias() {
+        let mut topics = HashMap::new();
+        topics.insert(
+            "orders".to_string(),
+            TopicOverride {
+                stream: "kafka".to_string(),
+                topic: "orders_v2".to_string(),
+            },
+        );
+        let mapping = TopicMapping {
+            default_stream: "kafka".to_string(),
+            topics,
+        };
+        assert!(mapping.aliases_an_override("orders_v2"));
+        assert!(!mapping.aliases_an_override("orders"));
     }
 }
