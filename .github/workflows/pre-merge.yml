@@ -214,7 +214,7 @@ jobs:
 
   # Final status check
   finalize_pr:
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     needs: [common, detect, runtime, rust-test-build, test-rust, test-rust-runtime, test-rust-runtime-checks, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-swift, test-bdd, test-examples, test-other]
     if: ${{ !cancelled() }}

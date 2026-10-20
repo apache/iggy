@@ -1495,7 +1495,7 @@ jobs:
         summary,
       ]
     if: failure() && inputs.dry_run == false
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-slim
     steps:
       - name: Notify failure
         run: |
