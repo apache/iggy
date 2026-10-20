@@ -51,7 +51,7 @@ use iggy_common::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep, timeout_at};
 use tracing::{info, warn};
@@ -143,6 +143,9 @@ struct LinksShared {
     table: Mutex<Table>,
     dial_permits: Semaphore,
     coordinator: ConnectCoordinator,
+    /// Wakes a sweep in the pause between two passes when a disconnect or a
+    /// shutdown stops it.
+    stopped: Notify,
     events: Sender<DiagnosticEvent>,
     /// Never read. Each subscriber is a clone, so it replays the backlog.
     subscribers: Receiver<DiagnosticEvent>,
@@ -241,6 +244,7 @@ impl ReplicaLinks {
                 table: Mutex::new(table),
                 dial_permits: Semaphore::new(MAX_CONCURRENT_DIALS),
                 coordinator: ConnectCoordinator::new(),
+                stopped: Notify::new(),
                 events,
                 subscribers,
             }),
@@ -330,6 +334,7 @@ impl ReplicaLinks {
             table.state = ClientState::Shutdown;
             table.clear()
         };
+        self.shared.stopped.notify_waiters();
         join_all(links.into_iter().map(Link::shutdown)).await;
         self.shared.dialer.shutdown().await;
         let mut table = self.shared.table();
@@ -523,6 +528,7 @@ impl LinksShared {
                 std::mem::replace(&mut table.state, ClientState::Disconnected),
             )
         };
+        self.stopped.notify_waiters();
         links.iter().for_each(|link| link.close());
         if previous != ClientState::Disconnected {
             self.publish(DiagnosticEvent::Disconnected);
@@ -592,11 +598,27 @@ impl LinksShared {
                 self.fail_sweep();
                 return Err(error);
             }
-            sweeping(self.table().state)?;
-            let pause = self.policy.pause(pass);
-            info!("No endpoint signed in. Pass {pass} starts in {pause:?}.");
-            sleep(pause).await;
+            self.pause_before_pass(pass).await?;
         }
+    }
+
+    /// Waits out the pause before the next pass, or less when a disconnect or
+    /// a shutdown stops the sweep.
+    async fn pause_before_pass(&self, pass: u32) -> Result<(), IggyError> {
+        let stopped = self.stopped.notified();
+        tokio::pin!(stopped);
+        // `notify_waiters` wakes only the waiters registered at that moment.
+        // Registered before the state is read, this pause sees every stop:
+        // one before the read changes the state, one after it wakes the pause.
+        stopped.as_mut().enable();
+        sweeping(self.table().state)?;
+        let pause = self.policy.pause(pass);
+        info!("No endpoint signed in. Pass {pass} starts in {pause:?}.");
+        tokio::select! {
+            () = sleep(pause) => {}
+            () = stopped => {}
+        }
+        sweeping(self.table().state)
     }
 
     /// The configured endpoint, then the endpoints of the last roster, each
@@ -2029,6 +2051,74 @@ mod tests {
         assert_eq!(links.state(), ClientState::Shutdown);
         assert_eq!(cluster.dials_to(&endpoint(0)).len(), 1);
         assert!(links.ready_replicas().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_sweep_in_its_pause_when_disconnecting_should_end_it_at_once() {
+        let cluster = FakeCluster::new(1);
+        cluster.down.lock().unwrap().insert(endpoint(0));
+        let links = links(
+            &cluster,
+            &endpoint(0),
+            ReconnectPolicy {
+                interval: RECONNECT_BACKOFF_MAX,
+                ..policy()
+            },
+        );
+
+        let (interrupted, (waited, reconnected)) = tokio::join!(links.connect(), async {
+            eventually("the first dial fails", || {
+                cluster.dials_to(&endpoint(0)).len() == 1
+            })
+            .await;
+            // Well inside the pause before the next pass.
+            sleep(Duration::from_secs(1)).await;
+            links.disconnect();
+            cluster.down.lock().unwrap().clear();
+            let started = Instant::now();
+            let reconnected = links.connect().await;
+            (started.elapsed(), reconnected)
+        });
+
+        assert_eq!(interrupted.unwrap_err(), IggyError::Disconnected);
+        assert_eq!(reconnected, Ok(()));
+        assert_eq!(
+            waited,
+            Duration::ZERO,
+            "a connect after the disconnect waited out the pause of the old sweep"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_sweep_in_its_pause_when_shutting_down_should_end_it_at_once() {
+        let cluster = FakeCluster::new(1);
+        cluster.down.lock().unwrap().insert(endpoint(0));
+        let links = links(
+            &cluster,
+            &endpoint(0),
+            ReconnectPolicy {
+                interval: RECONNECT_BACKOFF_MAX,
+                ..policy()
+            },
+        );
+
+        let (result, stopped_at) = tokio::join!(links.connect(), async {
+            eventually("the first dial fails", || {
+                cluster.dials_to(&endpoint(0)).len() == 1
+            })
+            .await;
+            // Well inside the pause before the next pass.
+            sleep(Duration::from_secs(1)).await;
+            links.shutdown().await;
+            Instant::now()
+        });
+
+        assert_eq!(result.unwrap_err(), IggyError::ClientShutdown);
+        assert_eq!(
+            stopped_at.elapsed(),
+            Duration::ZERO,
+            "the sweep waited out its pause after the shutdown"
+        );
     }
 
     #[tokio::test(start_paused = true)]
