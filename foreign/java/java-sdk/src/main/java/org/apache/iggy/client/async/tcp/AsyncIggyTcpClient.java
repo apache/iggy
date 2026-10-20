@@ -39,11 +39,14 @@ import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.slf4j.Logger;
@@ -56,6 +59,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -63,6 +67,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.LongFunction;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
@@ -148,13 +153,17 @@ public class AsyncIggyTcpClient {
     private final boolean enableTls;
     private final Optional<File> tlsCertificate;
     private final Optional<IoEventLoopGroup> sharedEventLoopGroup;
+    private IoEventLoopGroup eventLoopGroup;
+    private final org.apache.iggy.client.async.tcp.vsr.ConsensusSession session =
+            new org.apache.iggy.client.async.tcp.vsr.ConsensusSession();
     private final int ioThreads;
     private final TcpConnectionPoolConfig poolConfig;
     private final ClientRoutingState routingState = new ClientRoutingState();
     private final LoginRoutingHook loginRoutingHook = new LoginRoutingHook() {
 
         @Override
-        public CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt) {
+        public CompletableFuture<IdentityInfo> loginOnLeader(
+                LongFunction<CompletableFuture<IdentityInfo>> loginAttempt) {
             return AsyncIggyTcpClient.this.loginOnLeader(loginAttempt);
         }
 
@@ -162,16 +171,7 @@ public class AsyncIggyTcpClient {
         public void forgetLogin() {
             rememberedLogin = null;
             routingState.clearAssignments();
-            pollRouter.clearSession();
-        }
-
-        @Override
-        public void refreshLogin(String oldUsername, Optional<String> nextUsername, Optional<String> nextPassword) {
-            if (username.filter(oldUsername::equals).isPresent()) {
-                nextUsername.ifPresent(value -> username = Optional.of(value));
-                nextPassword.ifPresent(value -> password = Optional.of(value));
-            }
-            rememberCurrentLogin();
+            pollRouter.clearSession(connection.get());
         }
     };
     private final AtomicReference<AsyncTcpConnection> connection = new AtomicReference<>();
@@ -188,13 +188,22 @@ public class AsyncIggyTcpClient {
     private volatile List<ConnectionInfo> rosterTargets = List.of();
 
     /**
-     * The login a successful sign-in ran, replayed after a redial so the
-     * session is re-established on whichever node answers. The supplier
-     * already carries the credentials it signed in with, so nothing new is
-     * stored. Cleared on an explicit sign-out, which leaves no session to
-     * restore.
+     * The login the last explicit sign-in ran, replayed after a redial and by
+     * a heartbeat that finds the session lost, so the session is
+     * re-established on whichever node answers. The supplier already carries
+     * the credentials it signed in with, so nothing new is stored. A sign-out,
+     * a close and a rejected replay clear it, because they leave no session to
+     * restore, and so does an explicit sign-in as it starts, because it
+     * replaces the session.
      */
-    private volatile Supplier<CompletableFuture<IdentityInfo>> rememberedLogin;
+    private volatile LongFunction<CompletableFuture<IdentityInfo>> rememberedLogin;
+
+    /**
+     * The Register of the last automatic sign-in. While it runs, it holds the
+     * sign-in gate, and an explicit sign-in ends it instead of waiting for its
+     * reply. Guarded by this client.
+     */
+    private CompletableFuture<IdentityInfo> pendingReplay;
 
     private volatile boolean closed;
     private MessagesClient messagesClient;
@@ -259,6 +268,8 @@ public class AsyncIggyTcpClient {
         this.requestTimeout = Optional.ofNullable(requestTimeout);
         this.pollRouter = new PollRouter(
                 connection::get, this::openPollConnection, this.requestTimeout.orElse(PollRouter.POLL_TIMEOUT));
+        this.pollRouter.coordinatorEndpoint(() -> connectionInfo);
+        this.pollRouter.configuredEndpoint(seedConnectionInfo);
         this.heartbeatInterval = heartbeatInterval;
         this.maxVsrFrameSize = maxVsrFrameSize;
         this.retryPolicy = Optional.ofNullable(retryPolicy);
@@ -292,6 +303,7 @@ public class AsyncIggyTcpClient {
      */
     public CompletableFuture<Void> connect() {
         closed = false;
+        session.reset();
         pollRouter.clearSession();
         ConnectionInfo target = connectionInfo;
         AsyncTcpConnection newConnection = openConnection(target);
@@ -380,7 +392,7 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
 
-        return raw.send(code, payload).thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(raw.send(code, payload), response -> {
             try {
                 if (response.readableBytes() <= 1) {
                     return new byte[0];
@@ -392,6 +404,72 @@ public class AsyncIggyTcpClient {
                 response.release();
             }
         });
+    }
+
+    /**
+     * Replays a retained mutation with its original identity, context and bytes. While another resolve of it
+     * replays, this one waits for that replay within {@code timeout}. A wait that runs out fails with
+     * {@code OPERATION_UNCERTAIN}.
+     *
+     * <p>The client keeps the proved outcomes of its last {@code count} replays of
+     * {@code pendingOperations(count, bytes)}, also across a session reset. A later resolve of the operation
+     * returns the same response body or committed rejection without a request. {@code OPERATION_NOT_RETAINED}
+     * means that the outcome is unknown and this client can no longer recover it. A session reset or an abandon
+     * dropped the operation before a replay proved its outcome, or that outcome aged out.
+     */
+    public CompletableFuture<byte[]> resolveOperation(long operationId, Duration timeout) {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isZero() || timeout.isNegative()) {
+            throw new IggyInvalidArgumentException("Resolution timeout must be positive");
+        }
+        long timeoutNanos;
+        try {
+            timeoutNanos = timeout.toNanos();
+        } catch (ArithmeticException ignored) {
+            timeoutNanos = Long.MAX_VALUE;
+        }
+        if (connection.get() == null) {
+            throw new IggyNotConnectedException();
+        }
+        try {
+            return AsyncTcpConnection.mapResponse(
+                    pollRouter.resolve(operationId, Duration.ofNanos(timeoutNanos)), response -> {
+                        try {
+                            byte[] body = new byte[response.readableBytes()];
+                            response.readBytes(body);
+                            return body;
+                        } finally {
+                            response.release();
+                        }
+                    });
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    /**
+     * Releases local recovery state and frees the pending operation slot at once. This does not prove that the
+     * operation was uncommitted. A replay of the operation that is already running keeps its lane until the replay
+     * ends, so a later mutation of that lane waits for it. That replay still keeps the outcome it proves for
+     * {@link #resolveOperation}.
+     */
+    public CompletableFuture<Void> abandonOperation(long operationId) {
+        if (connection.get() == null) {
+            throw new IggyNotConnectedException();
+        }
+        try {
+            connection.get().sessionOwner().abandon(operationId);
+            return CompletableFuture.completedFuture(null);
+        } catch (RuntimeException error) {
+            return CompletableFuture.failedFuture(error);
+        }
+    }
+
+    void configurePendingOperations(int count, long bytes) {
+        if (count <= 0 || bytes <= 0) {
+            throw new IllegalArgumentException("Pending operation limits must be positive");
+        }
+        session.configurePendingOperations(count, bytes);
     }
 
     /**
@@ -532,10 +610,30 @@ public class AsyncIggyTcpClient {
         }
         AsyncTcpConnection currentConnection = connection.get();
         CompletableFuture<Void> dataClosed = pollRouter.clearSession();
-        if (currentConnection != null) {
-            return dataClosed.thenCompose(ignored -> currentConnection.close());
-        }
-        return CompletableFuture.completedFuture(null);
+        session.reset();
+        CompletableFuture<Void> linksClosed =
+                currentConnection == null ? dataClosed : dataClosed.thenCompose(ignored -> currentConnection.close());
+        return linksClosed.thenCompose(ignored -> {
+            IoEventLoopGroup owned;
+            synchronized (this) {
+                owned = sharedEventLoopGroup.isEmpty() ? eventLoopGroup : null;
+                if (owned != null) {
+                    eventLoopGroup = null;
+                }
+            }
+            if (owned == null) {
+                return CompletableFuture.completedFuture(null);
+            }
+            CompletableFuture<Void> stopped = new CompletableFuture<>();
+            owned.shutdownGracefully().addListener(done -> {
+                if (done.isSuccess()) {
+                    stopped.complete(null);
+                } else {
+                    stopped.completeExceptionally(done.cause());
+                }
+            });
+            return stopped;
+        });
     }
 
     /**
@@ -549,14 +647,21 @@ public class AsyncIggyTcpClient {
         return connectionInfo;
     }
 
+    private synchronized IoEventLoopGroup eventLoopGroup() {
+        if (eventLoopGroup == null) {
+            eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> AsyncTcpConnection.newEventLoopGroup(ioThreads));
+        }
+        return eventLoopGroup;
+    }
+
     private AsyncTcpConnection openConnection(ConnectionInfo target) {
-        return new AsyncTcpConnection(
+        AsyncTcpConnection opened = new AsyncTcpConnection(
                 target.host(),
                 target.port(),
                 enableTls,
                 tlsCertificate,
                 poolConfig,
-                sharedEventLoopGroup,
+                Optional.of(eventLoopGroup()),
                 ioThreads,
                 dialTimeout(),
                 requestTimeout,
@@ -564,11 +669,21 @@ public class AsyncIggyTcpClient {
                 maxVsrFrameSize,
                 this::retryTransientOnLeader,
                 this::onSessionReset,
-                this::onConnectionFailure);
+                // Closing a replaced connection fails its pending requests as lost links. A redial for them would
+                // dial again and sign in again behind the connection that replaced it.
+                (source, cause) -> {
+                    if (connection.get() == source) {
+                        onConnectionFailure(cause);
+                    }
+                });
+        opened.followSession(session);
+        opened.onHeartbeat(() -> signInIfOwed(opened));
+        opened.onCredentialsRefreshed(this::refreshLogin);
+        return opened;
     }
 
     private AsyncTcpConnection openPollConnection(ConnectionInfo target) {
-        return new AsyncTcpConnection(
+        AsyncTcpConnection opened = new AsyncTcpConnection(
                 target.host(),
                 target.port(),
                 enableTls,
@@ -580,9 +695,16 @@ public class AsyncIggyTcpClient {
                 requestTimeout,
                 heartbeatInterval,
                 maxVsrFrameSize,
-                null,
-                ignored -> {},
-                ignored -> {});
+                this::retryTransientOnLeader,
+                this::onSessionReset,
+                (source, cause) -> {
+                    if (LeaderAwareness.isSameSpelling(connectionInfo, target)) {
+                        onConnectionFailure(cause);
+                    }
+                });
+        // A poll connection becomes the coordinator when the leader moves to its node.
+        opened.onCredentialsRefreshed(this::refreshLogin);
+        return opened;
     }
 
     /**
@@ -619,24 +741,26 @@ public class AsyncIggyTcpClient {
      * sign-out or close ends a session for good.
      */
     private void onSessionReset(int errorCode) {
-        routingState.clearAssignments();
-        pollRouter.clearSession();
+        pollRouter.clearBindings();
+        if (!connection.get().sessionOwner().isBound()) {
+            routingState.clearAssignments();
+            pollRouter.clear();
+        }
         if (errorCode == IggyErrorCode.STALE_CLIENT.getCode()) {
             log.debug("The server evicted this session as stale; the next request re-establishes it");
         }
     }
 
     /**
-     * A not-accepted request was never admitted, so it is safe to recheck the
-     * leader, restore authentication on a new connection, and retry it within
-     * the original request deadline.
+     * Rechecks the leader after non-admission or connection loss. Retained
+     * mutation state preserves the frozen identity and any earlier uncertainty.
      */
     private CompletableFuture<ByteBuf> retryTransientOnLeader(
             AsyncTcpConnection source,
             int commandCode,
             ByteBuf payload,
             long requestDeadlineNanos,
-            IggyServerException rejection,
+            Throwable rejection,
             AsyncTcpConnection.TransientFailoverState failoverState) {
         AtomicReference<ByteBuf> requestPayload = new AtomicReference<>(payload);
         Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication = source.authenticationSnapshot();
@@ -644,9 +768,14 @@ public class AsyncIggyTcpClient {
                 .map(AsyncTcpConnection.AuthenticationSnapshot::payload)
                 .orElse(null));
 
+        CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        AtomicReference<CompletableFuture<ByteBuf>> active = new AtomicReference<>();
         CompletableFuture<Void> ready = prepareTransientFailover(
                 source, authentication, authenticationPayload, requestDeadlineNanos, rejection, failoverState);
         CompletableFuture<ByteBuf> retried = ready.thenCompose(ignored -> {
+            if (result.isDone()) {
+                return CompletableFuture.failedFuture(new java.util.concurrent.CancellationException());
+            }
             if (requestDeadlineNanos - System.nanoTime() <= 0) {
                 return CompletableFuture.failedFuture(rejection);
             }
@@ -654,26 +783,49 @@ public class AsyncIggyTcpClient {
             if (currentConnection == null) {
                 return CompletableFuture.failedFuture(new IggyNotConnectedException());
             }
-            return currentConnection.send(
-                    commandCode, takePayload(requestPayload), requestDeadlineNanos, failoverState);
+            synchronized (active) {
+                if (result.isDone()) {
+                    return CompletableFuture.failedFuture(new java.util.concurrent.CancellationException());
+                }
+                var sent = currentConnection.send(
+                        commandCode, takePayload(requestPayload), requestDeadlineNanos, failoverState);
+                active.set(sent);
+                return sent;
+            }
         });
-        return retried.whenComplete((response, error) -> {
+        result.whenComplete((response, error) -> {
+            synchronized (active) {
+                var sent = active.get();
+                if (result.isCancelled() && sent != null) {
+                    sent.cancel(false);
+                }
+            }
+        });
+        retried.whenComplete((response, error) -> {
             releasePayload(requestPayload);
             releasePayload(authenticationPayload);
+            if (error != null) {
+                result.completeExceptionally(error);
+            } else if (!result.complete(response)) {
+                response.release();
+            }
         });
+        return result;
     }
 
-    @SuppressWarnings("checkstyle:NPathComplexity")
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private CompletableFuture<Void> prepareTransientFailover(
             AsyncTcpConnection source,
             Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication,
             AtomicReference<ByteBuf> authenticationPayload,
             long requestDeadlineNanos,
-            IggyServerException rejection,
+            Throwable rejection,
             AsyncTcpConnection.TransientFailoverState failoverState) {
         CompletableFuture<Void> gate = new CompletableFuture<>();
         CompletableFuture<Void> previous = loginChain.getAndSet(gate);
-        CompletableFuture<Void> transaction = previous.thenCompose(ignored -> {
+        CompletableFuture<Void> queued = previous.thenApply(ignored -> null);
+        queued.orTimeout(Math.max(0, requestDeadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+        CompletableFuture<Void> transaction = queued.thenCompose(ignored -> {
             if (closed) {
                 return CompletableFuture.failedFuture(new IggyNotConnectedException());
             }
@@ -683,15 +835,19 @@ public class AsyncIggyTcpClient {
             if (connection.get() != source) {
                 return CompletableFuture.completedFuture(null);
             }
-            CompletableFuture<Void> recheck = rejection.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY
-                    ? findLeaderElsewhere(connectionInfo)
+            CompletableFuture<Void> recheck = rejection instanceof IggyServerException serverError
+                            && serverError.getRawErrorCode() == AsyncTcpConnection.NOT_PRIMARY
+                    ? findLeaderElsewhere(connectionInfo, requestDeadlineNanos)
                             .thenCompose(target -> target.isPresent()
-                                    ? retarget(target.get())
+                                    ? retarget(target.get(), requestDeadlineNanos)
                                     : CompletableFuture.completedFuture(null))
                     : walkRoster(requestDeadlineNanos, failoverState);
             return recheck.thenCompose(ignoredWalk -> {
                 AsyncTcpConnection currentConnection = connection.get();
-                if (currentConnection == null || currentConnection == source || authentication.isEmpty()) {
+                if (currentConnection == null
+                        || currentConnection == source
+                        || currentConnection.isAuthenticated()
+                        || authentication.isEmpty()) {
                     return CompletableFuture.completedFuture(null);
                 }
                 if (requestDeadlineNanos - System.nanoTime() <= 0) {
@@ -705,7 +861,7 @@ public class AsyncIggyTcpClient {
                         .thenAccept(ByteBuf::release);
             });
         });
-        transaction.whenComplete((ignored, error) -> gate.complete(null));
+        transaction.whenComplete((ignored, error) -> previous.whenComplete((prior, priorError) -> gate.complete(null)));
         return transaction;
     }
 
@@ -731,9 +887,8 @@ public class AsyncIggyTcpClient {
      * Each rotation sweeps every endpoint the client knows -- where it was,
      * the configured seed, then the roster it learned -- and only a rotation
      * that reaches none of them waits out the retry policy's delay. The
-     * sign-in is replayed on whichever endpoint answers, whether it was
-     * configured on the builder or run by the caller, personal access tokens
-     * included.
+     * sign-in that last succeeded is replayed on whichever endpoint answers,
+     * personal access tokens included.
      */
     private void onConnectionFailure(Throwable cause) {
         if (closed || !isConnectionLoss(cause)) {
@@ -747,8 +902,37 @@ public class AsyncIggyTcpClient {
         redialAttempt(1, policy).whenComplete((ignored, error) -> reconnecting.set(false));
     }
 
+    /**
+     * Signs in again on a connection that answers heartbeats but carries no
+     * sign-in while one is remembered. A burst leaves that state when the
+     * session was lost and every sign-in it replayed lost its link, and
+     * nothing else restores the session: a ping needs no session, and a
+     * request without one fails before it is sent.
+     *
+     * The sign-in on the live connection is the first step of a new burst
+     * with a fresh budget, so a budget bounds one burst, not the session. A
+     * policy without retries restarts nothing.
+     */
+    private void signInIfOwed(AsyncTcpConnection source) {
+        RetryPolicy policy = retryPolicy.orElse(DEFAULT_RECONNECT_POLICY);
+        if (closed
+                || policy.getMaxRetries() == 0
+                || connection.get() != source
+                || source.isAuthenticated()
+                || rememberedLogin == null) {
+            return;
+        }
+        if (!reconnecting.compareAndSet(false, true)) {
+            return;
+        }
+        log.warn("The session on {} was lost, signing in again", connectionInfo.serverAddress());
+        replaySignInOn(connectionInfo, redialCandidates(), 0, 1, policy)
+                .whenComplete((ignored, error) -> reconnecting.set(false));
+    }
+
     private static boolean isConnectionLoss(Throwable cause) {
         return cause instanceof ConnectTimeoutException
+                || cause instanceof IggyConnectionException
                 || cause instanceof IOException
                 || cause instanceof IggyTimeoutException;
     }
@@ -808,11 +992,15 @@ public class AsyncIggyTcpClient {
                 target.serverAddress(),
                 index + 1,
                 candidates.size());
+        boolean bound = session.isBound();
         return retarget(target)
                 .handle((retargeted, dialError) -> {
                     if (dialError != null) {
                         log.warn("Redial to {} failed: {}", target.serverAddress(), dialError.getMessage());
-                        return sweepCandidates(candidates, index + 1, attempt, policy);
+                        // A refused bind ended the session on a node that is up, so the node gets one more try,
+                        // which signs in instead of binding.
+                        int next = bound && !session.isBound() ? index : index + 1;
+                        return sweepCandidates(candidates, next, attempt, policy);
                     }
                     return replaySignInOn(target, candidates, index, attempt, policy);
                 })
@@ -830,10 +1018,17 @@ public class AsyncIggyTcpClient {
      */
     private CompletableFuture<Void> replaySignInOn(
             ConnectionInfo target, List<ConnectionInfo> candidates, int index, int attempt, RetryPolicy policy) {
-        return replayLogin()
-                .handle((ok, loginError) -> {
+        LongFunction<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
+        CompletableFuture<Void> restored =
+                connection.get().isAuthenticated() ? CompletableFuture.completedFuture(null) : replayLogin(replay);
+        return restored.handle((ok, loginError) -> {
                     if (loginError == null) {
                         log.info("Reconnected to {}", target.serverAddress());
+                        return CompletableFuture.<Void>completedFuture(null);
+                    }
+                    // An explicit sign-in, a sign-out or a close ended this sign-in, so nothing is left to restore.
+                    if (rememberedLogin != replay) {
+                        log.info("The caller ended the sign-in on {}, so the redial stops", target.serverAddress());
                         return CompletableFuture.<Void>completedFuture(null);
                     }
                     if (!isSignInRejection(unwrap(loginError))) {
@@ -878,59 +1073,86 @@ public class AsyncIggyTcpClient {
 
     /**
      * Re-establishes the session on the freshly published connection with the
-     * sign-in that last succeeded, falling back to the credentials configured
-     * on the builder when no login has run yet.
-     *
-     * The last sign-in outranks the configured credentials, the same rule as in
-     * every other SDK: a client is whoever it last signed in as. The connection
-     * also re-authenticates a replacement channel from the login payload it
+     * sign-in that last succeeded, the same rule as in every other SDK: a
+     * client is whoever it last signed in as. The connection also
+     * re-authenticates a replacement channel from the login payload it
      * captured, which is that same last sign-in, so replaying a different user
      * here would make one eviction land on a different session depending on
-     * whether the channel or the redial got there first. A client that only ever
-     * used its configured credentials remembers exactly those, so nothing
-     * changes for it.
+     * whether the channel or the redial got there first.
      *
-     * The login runs through the users client, so leader discovery retargets
-     * again before Register when the redialed node is not the leader.
+     * The credentials configured on the builder are no fallback. Without a
+     * remembered sign-in, the caller signed out, closed the client, had the
+     * sign-in rejected or never signed in, and a sign-in here would undo that.
      */
-    private CompletableFuture<Void> replayLogin() {
-        Supplier<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
+    private CompletableFuture<Void> replayLogin(LongFunction<CompletableFuture<IdentityInfo>> replay) {
         if (replay != null) {
             // Runs through loginOnLeader, so a redial that landed on a backup
             // still settles on the leader before the session is used.
-            return loginOnLeader(replay).thenApply(identity -> null);
-        }
-        if (username.isPresent() && password.isPresent() && usersClient != null) {
-            return usersClient.login(username.get(), password.get()).thenApply(identity -> null);
+            return loginOnLeader(replay, false).thenApply(identity -> null);
         }
         return CompletableFuture.completedFuture(null);
     }
 
     /**
      * Serializes Register and authenticated leader settlement across concurrent
-     * logins. A queued login waits for the entire in-flight transaction. Each
-     * redirect drops the bound session, so the login is replayed before the next
-     * roster read. Each transaction has a fresh redirection budget.
+     * logins. Queueing, Register, and roster settlement share one deadline.
+     * A leader change attaches the authenticated session to the managed link.
      */
-    CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt) {
-        pollRouter.clearSession();
-        routingState.clearAssignments();
+    CompletableFuture<IdentityInfo> loginOnLeader(LongFunction<CompletableFuture<IdentityInfo>> loginAttempt) {
+        endAutomaticSignIn();
+        return loginOnLeader(loginAttempt, true);
+    }
+
+    /**
+     * An explicit sign-in ends the automatic sign-in as it starts and again
+     * at its turn, so a rejected one leaves the client signed out instead of
+     * signed in as the last user. A replay runs only while it is still the
+     * remembered sign-in, so an explicit sign-in, a sign-out or a close that
+     * came first stays in effect. Only an explicit sign-in is remembered, and
+     * before the next login takes its turn, which must find what this one
+     * left.
+     */
+    private CompletableFuture<IdentityInfo> loginOnLeader(
+            LongFunction<CompletableFuture<IdentityInfo>> loginAttempt, boolean explicit) {
+        long deadline = System.nanoTime()
+                + requestTimeout.orElse(PollRouter.POLL_TIMEOUT).toNanos();
         CompletableFuture<Void> gate = new CompletableFuture<>();
         CompletableFuture<Void> previous = loginChain.getAndSet(gate);
         LeaderRedirectionState redirectionState = new LeaderRedirectionState();
-        CompletableFuture<IdentityInfo> transaction =
-                previous.thenCompose(ignored -> loginAndSettleOnLeader(loginAttempt, redirectionState));
+        CompletableFuture<Void> queued = previous.thenApply(ignored -> null);
+        queued.orTimeout(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        CompletableFuture<IdentityInfo> transaction = queued.thenCompose(ignored -> {
+            if (!takeTurn(loginAttempt, explicit)) {
+                return CompletableFuture.completedFuture(null);
+            }
+            // The server keeps the user of each client id, also after its
+            // session ended, and refuses another user on it. A sign-in that a
+            // lost session owed can register this client id without its reply
+            // arriving. Over a live sign-in, the logout before Register
+            // replaces the session instead.
+            AsyncTcpConnection current = connection.get();
+            if (explicit && (current == null || !current.isAuthenticated())) {
+                session.reset();
+            }
+            routingState.clearAssignments();
+            return pollRouter
+                    .clearSession(current)
+                    .thenCompose(cleared -> loginAndSettleOnLeader(
+                            explicit ? loginAttempt : replayDeadline -> replay(loginAttempt, replayDeadline),
+                            redirectionState,
+                            deadline));
+        });
         CompletableFuture<IdentityInfo> callerFuture = new CompletableFuture<>();
         transaction.whenComplete((identity, error) -> {
-            gate.complete(null);
             // Not after a close: a login still in flight when `close()` cleared
             // this would set it again, and `connect()` clears `closed`, so the
             // next loss would replay a sign-in the caller had ended.
             synchronized (this) {
-                if (error == null && !closed) {
+                if (explicit && error == null && !closed) {
                     rememberedLogin = loginAttempt;
                 }
             }
+            previous.whenComplete((prior, priorError) -> gate.complete(null));
             if (error != null) {
                 callerFuture.completeExceptionally(error);
             } else {
@@ -940,11 +1162,56 @@ public class AsyncIggyTcpClient {
         return callerFuture;
     }
 
+    private synchronized boolean takeTurn(
+            LongFunction<CompletableFuture<IdentityInfo>> loginAttempt, boolean explicit) {
+        if (!explicit) {
+            return rememberedLogin == loginAttempt;
+        }
+        rememberedLogin = null;
+        return true;
+    }
+
+    /**
+     * An automatic sign-in can hold the gate until the deadline of its
+     * Register, and its reply can be lost. An explicit sign-in ends it
+     * instead of waiting behind it. The late reply binds nothing, because
+     * the explicit sign-in registers a new client id.
+     */
+    private void endAutomaticSignIn() {
+        CompletableFuture<IdentityInfo> replay;
+        synchronized (this) {
+            rememberedLogin = null;
+            replay = pendingReplay;
+        }
+        AsyncTcpConnection current = connection.get();
+        if (replay != null && current != null) {
+            current.abortSignIn(replay);
+        }
+    }
+
+    /**
+     * Sends the Register of an automatic sign-in while it is still the
+     * remembered one. The check and the send share the lock with
+     * {@link #endAutomaticSignIn()}, so an explicit sign-in either finds
+     * this Register or keeps it from being sent.
+     */
+    private synchronized CompletableFuture<IdentityInfo> replay(
+            LongFunction<CompletableFuture<IdentityInfo>> loginAttempt, long deadline) {
+        if (rememberedLogin != loginAttempt) {
+            return CompletableFuture.failedFuture(
+                    new CancellationException("This sign-in is no longer the one to replay"));
+        }
+        pendingReplay = loginAttempt.apply(deadline);
+        return pendingReplay;
+    }
+
     private CompletableFuture<IdentityInfo> loginAndSettleOnLeader(
-            Supplier<CompletableFuture<IdentityInfo>> loginAttempt, LeaderRedirectionState redirectionState) {
-        return loginAttempt.get().thenCompose(identity -> {
+            LongFunction<CompletableFuture<IdentityInfo>> loginAttempt,
+            LeaderRedirectionState redirectionState,
+            long deadline) {
+        return loginAttempt.apply(deadline).thenCompose(identity -> {
             ConnectionInfo currentTarget = connectionInfo;
-            return findLeaderElsewhere(currentTarget).thenCompose(leaderTarget -> {
+            return findLeaderElsewhere(currentTarget, deadline).thenCompose(leaderTarget -> {
                 if (leaderTarget.isEmpty()) {
                     return CompletableFuture.completedFuture(identity);
                 }
@@ -955,7 +1222,7 @@ public class AsyncIggyTcpClient {
                             currentTarget.serverAddress());
                     return CompletableFuture.completedFuture(identity);
                 }
-                return retarget(leaderTarget.get())
+                return retarget(leaderTarget.get(), deadline)
                         .handle((ignored, error) -> {
                             if (error != null) {
                                 log.warn(
@@ -967,7 +1234,7 @@ public class AsyncIggyTcpClient {
                                 return CompletableFuture.completedFuture(identity);
                             }
                             redirectionState.recordRedirect();
-                            return loginAndSettleOnLeader(loginAttempt, redirectionState);
+                            return CompletableFuture.completedFuture(identity);
                         })
                         .thenCompose(Function.identity());
             });
@@ -1004,7 +1271,7 @@ public class AsyncIggyTcpClient {
                 "The request was refused on {}, walking the roster to {}",
                 originalTarget.serverAddress(),
                 target.serverAddress());
-        return retarget(target)
+        return retarget(target, requestDeadlineNanos)
                 .handle((ignored, error) -> {
                     if (error == null) {
                         return CompletableFuture.<Void>completedFuture(null);
@@ -1022,18 +1289,45 @@ public class AsyncIggyTcpClient {
      * the login that triggered it.
      */
     CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(ConnectionInfo currentTarget) {
-        SystemClient currentSystemClient = systemClient;
-        if (currentSystemClient == null) {
+        return findLeaderElsewhere(
+                currentTarget,
+                System.nanoTime()
+                        + requestTimeout.orElse(PollRouter.POLL_TIMEOUT).toNanos());
+    }
+
+    CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(ConnectionInfo currentTarget, long deadline) {
+        if (systemClient == null || deadline - System.nanoTime() <= 0) {
             return CompletableFuture.completedFuture(Optional.empty());
         }
+        Duration remaining = Duration.ofNanos(Math.max(0, deadline - System.nanoTime()));
+        Duration pause = remaining.compareTo(LeaderAwareness.LEADERLESS_POLL_INTERVAL) < 0
+                ? remaining
+                : LeaderAwareness.LEADERLESS_POLL_INTERVAL;
         return LeaderAwareness.findLeaderElsewhere(
-                        () -> currentSystemClient.getClusterMetadata().thenApply(this::observeTopology), currentTarget)
+                        () -> AsyncTcpConnection.mapResponse(
+                                connection
+                                        .get()
+                                        .send(
+                                                CommandCode.System.GET_CLUSTER_METADATA.getValue(),
+                                                Unpooled.EMPTY_BUFFER,
+                                                deadline),
+                                response -> {
+                                    try {
+                                        return observeTopology(BytesDeserializer.readClusterMetadata(response));
+                                    } finally {
+                                        response.release();
+                                    }
+                                }),
+                        currentTarget,
+                        remaining,
+                        pause)
                 .thenApply(LeaderAwareness.LeaderLookup::redirect);
     }
 
     private ClusterMetadata observeTopology(ClusterMetadata metadata) {
         if (!metadata.nodes().isEmpty()) {
-            rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), LeaderAwareness.nodeTargets(metadata)));
+            rememberRoster(new LeaderAwareness.LeaderLookup(
+                    Optional.empty(), LeaderAwareness.nodeTargets(metadata, seedConnectionInfo)));
             pollRouter.observeTopology(metadata);
         }
         return metadata;
@@ -1086,7 +1380,19 @@ public class AsyncIggyTcpClient {
     }
 
     CompletableFuture<Void> retarget(ConnectionInfo newTarget) {
+        return retarget(
+                newTarget,
+                System.nanoTime()
+                        + requestTimeout.orElse(PollRouter.POLL_TIMEOUT).toNanos());
+    }
+
+    CompletableFuture<Void> retarget(ConnectionInfo newTarget, long deadline) {
         AsyncTcpConnection oldConnection = connection.get();
+        if (oldConnection != null && oldConnection.sessionOwner().isBound()) {
+            return pollRouter
+                    .connectionFor(newTarget, deadline)
+                    .thenCompose(managed -> publishConnection(oldConnection, managed, newTarget));
+        }
         AsyncTcpConnection newConnection;
         try {
             newConnection = openConnection(newTarget);
@@ -1116,8 +1422,13 @@ public class AsyncIggyTcpClient {
                     new IggyNotConnectedException("Client closed during leader redirection"));
         }
         connectionInfo = newTarget;
-        routingState.clearAssignments();
-        pollRouter.clearSession();
+        if (oldConnection == newConnection || pollRouter.ownsConnection(oldConnection)) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (oldConnection.sessionOwner() != newConnection.sessionOwner()) {
+            routingState.clearAssignments();
+            pollRouter.clearSession();
+        }
         oldConnection.close().whenComplete((ignored, closeError) -> {
             if (closeError != null) {
                 log.warn("Failed to close previous connection: {}", closeError.getMessage());
@@ -1134,12 +1445,31 @@ public class AsyncIggyTcpClient {
                 || code == CommandCode.PersonalAccessToken.LOGIN_REGISTER.getValue();
     }
 
-    private synchronized void rememberCurrentLogin() {
-        if (closed) {
+    /**
+     * Follows a committed password change or rename of the signed-in user: the configured credentials of that user
+     * and the remembered sign-in take the new values.
+     */
+    private void refreshLogin(
+            AsyncTcpConnection source,
+            String oldUsername,
+            Optional<String> nextUsername,
+            Optional<String> nextPassword) {
+        if (username.filter(oldUsername::equals).isPresent()) {
+            nextUsername.ifPresent(value -> username = Optional.of(value));
+            nextPassword.ifPresent(value -> password = Optional.of(value));
+        }
+        rememberLoginOf(source);
+    }
+
+    /**
+     * Replays the login of {@code source} from now on. Only a sign-in that is still remembered follows it, so an
+     * explicit sign-in that took its turn, a sign-out and a close stay in effect.
+     */
+    private synchronized void rememberLoginOf(AsyncTcpConnection source) {
+        if (closed || rememberedLogin == null) {
             return;
         }
-        AsyncTcpConnection current = connection.get();
-        var snapshot = current.authenticationSnapshot();
+        var snapshot = source.authenticationSnapshot();
         if (snapshot.isEmpty()) {
             return;
         }
@@ -1151,10 +1481,10 @@ public class AsyncIggyTcpClient {
         } finally {
             authentication.payload().release();
         }
-        rememberedLogin = () -> connection
-                .get()
-                .send(authentication.commandCode(), Unpooled.wrappedBuffer(payload))
-                .thenApply(response -> {
+        // mapResponse passes a cancel on to the send, which endAutomaticSignIn relies on.
+        rememberedLogin = deadline -> AsyncTcpConnection.mapResponse(
+                connection.get().send(authentication.commandCode(), Unpooled.wrappedBuffer(payload), deadline),
+                response -> {
                     try {
                         return new IdentityInfo(response.readUnsignedIntLE(), Optional.empty());
                     } finally {

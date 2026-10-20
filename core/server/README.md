@@ -44,10 +44,11 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-BOUND-GRANTS-2` storage gate also
-rejects older data directories without modifying them. Existing data requires a
-separately validated offline migration or restore procedure before this release
-can use it.
+complete partition view changes. The `IGGY-BOUND-GRANTS-3` storage gate
+requires fresh storage and rejects older data directories without modifying them.
+Cached replies now preserve a committed-result marker, which older receipts lack.
+No in-place upgrade or implicit migration is supported. A separately validated
+offline migration or restore procedure would be required to reuse existing data.
 
 All existing self-issued JWT access and refresh tokens are rejected after this
 upgrade. HTTP clients and the web UI must log in again. In
@@ -79,8 +80,8 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
 Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
-share a logical session across connections. Command 14 is retired. Primary
-polling uses commands 103 and 104; offset routing uses 123. Disconnecting a
+share a logical session across connections. Commands 14, 103, 104 and 123 are
+retired. Partition routing uses 105, polling uses 100 and offset reads use 120. Disconnecting a
 connection does not log out its logical session. Server-observed activity renews
 the session lease, and expiry or explicit logout retires it before capacity is
 reused.
@@ -210,7 +211,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-BOUND-GRANTS-2` requires this initialization contract;
+Storage format `IGGY-BOUND-GRANTS-3` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

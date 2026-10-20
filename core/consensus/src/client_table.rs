@@ -1936,7 +1936,10 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command, Operation};
+    use iggy_binary_protocol::{
+        Command, Operation, PrepareHeader, REJECTION_SECTION_LEN, RoutedRequestHeader, result_code,
+        write_rejection_section,
+    };
 
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
@@ -2291,6 +2294,57 @@ mod tests {
             .unwrap();
         let epoch = table.get_epoch(1).expect("just registered");
         (table, epoch)
+    }
+
+    #[test]
+    fn given_committed_rejection_when_receipt_is_restored_should_preserve_final_result_proof() {
+        const CLIENT: u128 = 1;
+        const REQUEST: u64 = 1;
+        const COMMIT: u64 = 11;
+        let (mut table, epoch) = table_with_client();
+        let request = RoutedRequestHeader {
+            client: CLIENT,
+            session: epoch,
+            request: REQUEST,
+            operation: Operation::CreateUser,
+            ..Default::default()
+        };
+        let code = IggyError::UserAlreadyExists.as_code();
+        let uncommitted = crate::build_result_rejection_reply(&request, COMMIT, code);
+        assert!(!uncommitted.header().has_committed_result());
+        let prepare = PrepareHeader {
+            client: CLIENT,
+            request: REQUEST,
+            op: COMMIT,
+            operation: request.operation,
+            ..Default::default()
+        };
+        let committed = crate::build_reply_message_with(&prepare, REJECTION_SECTION_LEN, |body| {
+            write_rejection_section(body, code);
+        });
+        assert_eq!(uncommitted.header().op, committed.header().op);
+        assert_eq!(uncommitted.header().commit, committed.header().commit);
+        assert_eq!(uncommitted.body(), committed.body());
+        assert!(committed.header().has_committed_result());
+        assert_eq!(
+            table.commit_reply(CLIENT, TEST_USER_ID, committed.clone()),
+            CommitReply::Cached
+        );
+
+        for restored in [
+            ClientTable::from_snapshot(table.to_snapshot()).unwrap(),
+            ClientTable::decode(&table.encode()).unwrap(),
+        ] {
+            let RequestStatus::Duplicate(reply) =
+                restored.check_request(CLIENT, epoch, REQUEST, request.operation)
+            else {
+                panic!("restored committed rejection must remain available to a retry");
+            };
+            assert_eq!(reply.as_bytes(), committed.as_slice());
+            let reply = reply.into_message();
+            assert!(reply.header().has_committed_result());
+            assert_eq!(result_code(reply.body()), Some(code));
+        }
     }
 
     // Registration tests

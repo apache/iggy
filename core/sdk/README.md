@@ -36,7 +36,7 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 - **Consumer**: standalone or consumer-group over binary transports; HTTP supports standalone consumers only. Consumed as an async `Stream`. Polling strategies: `next`, `offset`, `timestamp`, `first`, `last`.
 - **Auto-commit** offset policies: `Interval`, `When`, `After`, `IntervalOrWhen`, `IntervalOrAfter`, or disabled.
 - **Stream builder** (`IggyStream`, `IggyStreamProducer`, `IggyStreamConsumer`) for declarative producer + consumer setup on shared or separate stream/topic.
-- **Reliability**: automatic reconnection with retries, heartbeat, send retries, and offset auto-commit handled by the high-level API.
+- **Reliability**: managed replica connections, heartbeat, ordered mutation lanes, explicit recovery of uncertain mutations, and offset auto-commit.
 - **Message features**: optional headers (`HeaderKey` / `HeaderValue`), client-side AES-256-GCM encryption (via `Aes256GcmEncryptor`), topic compression metadata (`None` and `Gzip`; no runtime compression yet), server-honored message expiry, and server-side deduplication.
 - **Admin**: stream/topic/partition CRUD, consumer-group management, server-side consumer offsets, system stats.
 
@@ -45,16 +45,13 @@ Official Rust client SDK for [Apache Iggy](https://iggy.apache.org), the persist
 Run from your application crate. Use a release compatible with your server; for
 unreleased changes, build the SDK and server from the same source checkout.
 
-Cluster auto-commit polling requires servers that support consumer session
-attachment and primary poll routing (binary commands 15, 103 and 104).
-Rust manual and interval offset writes also require command 123. It discovers
-the primary while allowing final commits for partitions awaiting handoff;
-stores and deletes retain their existing wire formats and deduplication keys. Pause
-binary auto-commit consumers during this upgrade, upgrade every server first,
-then upgrade the SDKs and restart the consumers so they join their groups again.
-Older SDKs can lose group membership when a backup refuses an offset commit;
-the new SDK does not fall back to that path on an older server.
-HTTP clients use server-side forwarding and need no new routing commands.
+This checkout requires matching servers and SDKs with fresh storage. Older data
+directories are refused without modification; `--fresh` deletes existing data
+in the configured directory. See the [server recovery guide](../server/README.md#upgrade-recovery).
+Mixed versions and rolling upgrades are unsupported. Binary clients share one
+logical session across replica links using BindSession (15) and discover
+partition primaries with GetPartitionRoute (105). Commands 14, 103, 104 and 123
+are retired. HTTP clients use server-side forwarding.
 
 ```bash
 cargo add iggy
@@ -68,10 +65,60 @@ them, retain their logical identity and bind proof across transport reconnects,
 and clear them on explicit logout. `VsrSessionSealed` is an implementation marker,
 not a restriction on external implementations. The bind proof is a bearer
 credential for internal session control and must never be logged or exposed.
+`refresh_session_password` and `refresh_session_username` are removed. A
+transport that signs in again applies a committed credential change where its
+calls complete.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
 session and prevent its bind proof from restoring it.
+
+## Mutation recovery
+
+TCP, QUIC and WebSocket serialize mutations within each partition history and
+within the metadata lane. Different lanes can progress concurrently. An
+`IggyError::OperationUncertain(operation_id)` retains the exact request for
+recovery. A later mutation on the same lane returns
+`IggyError::LaneBlocked(operation_id)` until that operation is resolved or abandoned.
+
+Call `client.resolve_operation(operation_id, deadline).await`, where `deadline`
+is a `std::time::Instant`. A proved success returns `Ok(())`; a proved committed
+business rejection returns its original error. Both release the lane. Another
+`OperationUncertain` keeps the request available for a later recovery attempt.
+The client keeps the proved outcomes of its last `max_pending_operations`
+replays, also across a session reset. So a later resolve returns the same
+outcome without a request, also after a producer or a consumer of the client
+resolved the operation first.
+`client.abandon_operation(operation_id).await` releases the lane while leaving
+the outcome unknown. A session reset drops retained requests. An
+`OperationNotRetained` error does not establish the outcome. A reset or an
+abandon came before a proved outcome, or the proved outcome aged out.
+Recovery is unavailable over HTTP.
+
+A committed password change or rename of the signed-in user updates the
+credentials that the client signs in with again. This holds for a typed call, a
+raw request and a change that `resolve_operation` proves. A committed rejection,
+such as a wrong current password, leaves them unchanged.
+
+The client defaults to 256 active or retained mutations and 64 MiB of frozen
+request frames. Configure positive limits through `PendingOperationsConfig`
+on the binary transport builder, or through connection-string options:
+
+```text
+iggy://iggy:iggy@localhost:8090?max_pending_operations=256&max_pending_operation_bytes=67108864
+```
+
+Admission waits within the call deadline before allocating a request ID or
+sending. A frame larger than the byte limit fails locally. Completion,
+abandonment and session reset release operation capacity; bytes remain charged
+while a writer still holds the frame. Replaying a retained request reuses its
+reservation.
+
+Auto-commit and `Next` polls share their partition's mutation barrier while the
+call is active. They retain their weak acknowledgement: cancellation or failover
+can leave progress unknown. Error 57 or a lost reply after send ends the call
+immediately without replay; errors 58/89 still retry known non-admission.
+These polls are not retained for recovery.
 
 ## Quick start
 

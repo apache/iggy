@@ -242,6 +242,7 @@ TEST_F(E2E_Stream, UpdateDeletedStreamThrows) {
 }
 
 TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty(
         "description",
         "Changes only the stream name and leaves stream, topic, message, partition, and segment data intact.");
@@ -274,7 +275,7 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
         messages.push_back(std::move(message));
     }
     ASSERT_NO_THROW(ffi_client->send_messages(make_numeric_identifier(stream_id), make_numeric_identifier(0),
-                                              "partition_id", partition_id_bytes(0), std::move(messages)));
+                                              "partition_id", partition_id_bytes(0), std::move(messages), error_info));
 
     auto stream_before_update      = client.GetStream(iggy::Identifier::Numeric(stream_id));
     const auto stats_before_update = client.GetStats();
@@ -471,6 +472,7 @@ TEST_F(E2E_Stream, GetStreamsReturnsStreamAfterCreation) {
 }
 
 TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
+    iggy::ffi::ErrorInfo error_info{};
     RecordProperty("description",
                    "Verifies get_streams returns correct field values after creating stream with topic and messages.");
     const std::string stream_name = GetRandomName();
@@ -493,7 +495,7 @@ TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
         messages.push_back(std::move(msg));
     }
     ffi_client->send_messages(make_numeric_identifier(stream.Id()), make_numeric_identifier(0), "partition_id",
-                              partition_id_bytes(0), std::move(messages));
+                              partition_id_bytes(0), std::move(messages), error_info);
 
     auto streams = client.GetStreams();
     ASSERT_GE(streams.size(), 1u);

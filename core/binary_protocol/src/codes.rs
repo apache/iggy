@@ -55,8 +55,8 @@ pub const LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE: u32 = 44;
 pub const POLL_MESSAGES_CODE: u32 = 100;
 pub const SEND_MESSAGES_CODE: u32 = 101;
 // 102 was FLUSH_UNSAVED_BUFFER. Never reuse it: older clients still send it.
-pub const GET_POLL_ROUTING_CODE: u32 = 103;
-pub const POLL_MESSAGES_ON_PRIMARY_CODE: u32 = 104;
+// 103 was GET_POLL_ROUTING. Never reuse it: released clients still send it.
+// 104 was POLL_MESSAGES_ON_PRIMARY. Never reuse it: released clients still send it.
 /// The route of one partition: its incarnation, the group view and the primary
 /// of that view. Sends, polls and consumer offsets all route with it.
 pub const GET_PARTITION_ROUTE_CODE: u32 = 105;
@@ -65,9 +65,7 @@ pub const GET_PARTITION_ROUTE_CODE: u32 = 105;
 pub const GET_CONSUMER_OFFSET_CODE: u32 = 120;
 pub const STORE_CONSUMER_OFFSET_CODE: u32 = 121;
 pub const DELETE_CONSUMER_OFFSET_CODE: u32 = 122;
-/// Primary and parent session for offset writes; uses `GetConsumerOffsetRequest`
-/// and `PollRoutingResponse`, with the offset ownership fence (revocations may drain).
-pub const GET_CONSUMER_OFFSET_ROUTING_CODE: u32 = 123;
+// 123 was GET_CONSUMER_OFFSET_ROUTING. Never reuse it: released clients still send it.
 
 // -- Streams --
 pub const GET_STREAM_CODE: u32 = 200;
@@ -116,7 +114,7 @@ pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
 mod tests {
     use super::*;
 
-    const RETIRED_CODES: &[u32] = &[14, 102, 205, 305];
+    const RETIRED_CODES: &[u32] = &[14, 102, 103, 104, 123, 205, 305];
 
     const ALL_CODES: &[u32] = &[
         PING_CODE,
@@ -144,14 +142,11 @@ mod tests {
         DELETE_PERSONAL_ACCESS_TOKEN_CODE,
         LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
         POLL_MESSAGES_CODE,
-        GET_POLL_ROUTING_CODE,
-        POLL_MESSAGES_ON_PRIMARY_CODE,
         GET_PARTITION_ROUTE_CODE,
         SEND_MESSAGES_CODE,
         GET_CONSUMER_OFFSET_CODE,
         STORE_CONSUMER_OFFSET_CODE,
         DELETE_CONSUMER_OFFSET_CODE,
-        GET_CONSUMER_OFFSET_ROUTING_CODE,
         GET_STREAM_CODE,
         GET_STREAMS_CODE,
         CREATE_STREAM_CODE,

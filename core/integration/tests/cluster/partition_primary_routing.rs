@@ -25,19 +25,21 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use super::register_forwarding::connect_without_login;
+use bytes::Bytes;
 use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_PARTITION_ROUTE_CODE, GET_POLL_ROUTING_CODE,
-    POLL_MESSAGES_ON_PRIMARY_CODE, STORE_CONSUMER_OFFSET_CODE,
+    BIND_SESSION_CODE, GET_CONSUMER_GROUP_CODE, GET_PARTITION_ROUTE_CODE, POLL_MESSAGES_CODE,
+    STORE_CONSUMER_OFFSET_CODE,
 };
+use iggy_binary_protocol::consensus::{RequestHeader, result_code, result_section_len};
 use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupDetailsResponse;
-use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollRoutingResponse};
+use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireDecode, WireEncode, WireName,
 };
@@ -58,9 +60,11 @@ use integration::iggy_harness;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use reqwest::StatusCode;
 use reqwest::header::RETRY_AFTER;
+use tokio::net::TcpStream;
 use tokio::time::{Instant, sleep, timeout};
 
 use crate::server::http_client::{HttpClient, applied_op, node_url, until_primary_resolved};
+use crate::server::raw_tcp;
 
 const STREAM_NAME: &str = "partition-routing-stream";
 const TOPIC_NAME: &str = "partition-routing-topic";
@@ -82,6 +86,8 @@ const GROUP_POLL_BUDGET: Duration = Duration::from_secs(20);
 const DATA_FAILOVER_BUDGET: Duration = Duration::from_secs(60);
 const INITIAL_VIEW: u32 = 0;
 const METADATA_CHECKPOINT_REQUESTS: usize = 256;
+// Keep handcrafted requests distinct from the parent SDK session's low IDs.
+const RAW_REQUEST_START: u64 = 1 << 63;
 
 /// Long enough for the backups to miss `cluster.heartbeat_timeout` (5s by
 /// default) and conclude an election.
@@ -308,21 +314,35 @@ async fn given_any_node_when_routing_a_partition_should_name_the_same_primary(
             identity: member.session_identity().await.unwrap(),
             bind_secret: member.session_bind_secret().await.unwrap(),
         };
+        let mut request = RequestHeader {
+            client: binding.identity.client_id,
+            session: binding.identity.session,
+            request: RAW_REQUEST_START,
+            ..Default::default()
+        };
         for node in 0..harness.cluster_size() {
-            let data = connect_without_login(harness.node(node).tcp_addr().unwrap()).await;
-            data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
-                .await
-                .unwrap();
-            data.bind_vsr_session(binding.identity.session)
-                .await
-                .unwrap();
+            let mut data = raw_tcp::connect_to(harness.node(node).tcp_addr().unwrap()).await;
+            data_request(
+                &mut data,
+                &mut request,
+                BIND_SESSION_CODE,
+                &binding.to_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
             // A node creates its replica of a new partition after it applies
             // the topic, and answers transient until then.
             let route = timeout(PRECONDITION_BUDGET, async {
                 loop {
-                    match data
-                        .send_raw_with_response(GET_PARTITION_ROUTE_CODE, route_request.clone())
-                        .await
+                    match data_request(
+                        &mut data,
+                        &mut request,
+                        GET_PARTITION_ROUTE_CODE,
+                        &route_request,
+                        None,
+                    )
+                    .await
                     {
                         Ok(reply) => break PartitionRouteResponse::decode_from(&reply).unwrap(),
                         Err(IggyError::TransientNotAccepted) => sleep(PRECONDITION_POLL).await,
@@ -436,7 +456,12 @@ async fn given_split_primaries_when_http_auto_commits_on_a_backup_should_replica
     for (message, expected) in response.messages.iter().zip(GROUP_PAYLOADS) {
         assert_eq!(message.payload.as_ref(), expected.as_bytes());
     }
-    assert_replicated_offset(harness, &consumer, Some((GROUP_PAYLOADS.len() - 1) as u64)).await;
+    assert_routed_offset_from_each_node(
+        harness,
+        &consumer,
+        Some((GROUP_PAYLOADS.len() - 1) as u64),
+    )
+    .await;
 }
 
 /// Every partition request an HTTP caller sends to a backup runs on the
@@ -898,7 +923,7 @@ async fn assert_group_offset_routing(
         assert_eq!(member.get_me().await.unwrap().client_id, before.client_id);
     }
     let expected_offset = (GROUP_PAYLOADS.len() - 1) as u64;
-    assert_replicated_offset(harness, &consumer, Some(expected_offset)).await;
+    assert_routed_offset_from_each_node(harness, &consumer, Some(expected_offset)).await;
     member
         .delete_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
         .await
@@ -918,7 +943,7 @@ async fn assert_group_offset_routing(
         .leave_consumer_group(&stream, &topic, &group)
         .await
         .unwrap();
-    assert_replicated_offset(harness, &consumer, None).await;
+    assert_routed_offset_from_each_node(harness, &consumer, None).await;
     for (group_name, policy) in [
         (
             "interval-offset-group",
@@ -947,7 +972,7 @@ async fn assert_group_offset_routing(
                 .unwrap();
         }
         let consumer = Consumer::group(Identifier::named(group_name).unwrap());
-        assert_replicated_offset(harness, &consumer, Some(expected_offset)).await;
+        assert_routed_offset_from_each_node(harness, &consumer, Some(expected_offset)).await;
         assert_eq!(
             member.get_connection_info().await.server_address,
             metadata_address
@@ -957,7 +982,7 @@ async fn assert_group_offset_routing(
     }
 }
 
-async fn assert_replicated_offset(
+async fn assert_routed_offset_from_each_node(
     harness: &TestHarness,
     consumer: &Consumer,
     expected: Option<u64>,
@@ -984,14 +1009,11 @@ async fn assert_replicated_offset(
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("node {node} must observe replicated offset {expected:?}"));
-        assert_eq!(
-            ClientWrapper::Tcp(replica)
-                .get_connection_info()
-                .await
-                .server_address,
-            address.to_string()
-        );
+        .unwrap_or_else(|_| {
+            panic!(
+                "a client starting on node {node} must read offset {expected:?} from the primary"
+            )
+        });
     }
 }
 
@@ -1194,7 +1216,7 @@ async fn assert_group_auto_commit_routing(harness: &mut TestHarness, transport: 
     }
 
     let expected_offset = u64::try_from(GROUP_PAYLOADS.len() - 1).unwrap();
-    assert_replicated_offset(harness, &consumer, Some(expected_offset)).await;
+    assert_routed_offset_from_each_node(harness, &consumer, Some(expected_offset)).await;
     let partition_primary = assert_cached_route_after_primary_loss(
         harness,
         &member,
@@ -1254,29 +1276,22 @@ async fn assert_cached_route_after_primary_loss(
         .unwrap();
     let coordinator = member.get_connection_info().await.server_address;
     harness.kill_node(previous_primary).unwrap();
-    let poll = PollMessagesRequest {
-        consumer: consumer_to_wire(consumer).unwrap(),
+    let route_request = GetPartitionRouteRequest {
         stream_id: identifier_to_wire(stream).unwrap(),
         topic_id: identifier_to_wire(topic).unwrap(),
-        partition_id: Some(PARTITION_ID),
-        strategy: polling_strategy_to_wire(&PollingStrategy::next()),
-        count: 1,
-        auto_commit: true,
+        partition_id: PARTITION_ID,
     }
     .to_bytes();
     let primary = timeout(PRECONDITION_BUDGET, async {
         loop {
             match member
-                .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+                .send_binary_request(GET_PARTITION_ROUTE_CODE, route_request.clone())
                 .await
             {
                 Ok(response) => {
-                    let route = PollRoutingResponse::decode_from(&response).unwrap();
-                    let node = (0..harness.cluster_size())
-                        .find(|&node| {
-                            harness.node(node).tcp_addr().unwrap().port() == route.primary.tcp_port
-                        })
-                        .unwrap();
+                    let route = PartitionRouteResponse::decode_from(&response).unwrap();
+                    let node = usize::from(route.primary_replica);
+                    assert!(node < harness.cluster_size());
                     if node != previous_primary {
                         break node;
                     }
@@ -1351,20 +1366,35 @@ async fn assert_data_session_fences(
         auto_commit: true,
     }
     .to_bytes();
+    let route_request = GetPartitionRouteRequest {
+        stream_id: identifier_to_wire(stream).unwrap(),
+        topic_id: identifier_to_wire(topic).unwrap(),
+        partition_id: PARTITION_ID,
+    }
+    .to_bytes();
     let response = member
-        .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+        .send_binary_request(GET_PARTITION_ROUTE_CODE, route_request)
         .await
         .unwrap();
-    let route = PollRoutingResponse::decode_from(&response).unwrap();
+    let route = PartitionRouteResponse::decode_from(&response).unwrap();
     let address = harness.node(partition_primary).tcp_addr().unwrap();
-    let data = connect_without_login(address).await;
+    let mut data = raw_tcp::connect_to(address).await;
     let mut binding = {
         let client = member.client();
         let client = client.read().await;
-        let bind_secret = match &*client {
-            ClientWrapper::Tcp(client) => client.session_bind_secret().await,
-            ClientWrapper::Quic(client) => client.session_bind_secret().await,
-            ClientWrapper::WebSocket(client) => client.session_bind_secret().await,
+        let (identity, bind_secret) = match &*client {
+            ClientWrapper::Tcp(client) => (
+                client.session_identity().await.unwrap(),
+                client.session_bind_secret().await,
+            ),
+            ClientWrapper::Quic(client) => (
+                client.session_identity().await.unwrap(),
+                client.session_bind_secret().await,
+            ),
+            ClientWrapper::WebSocket(client) => (
+                client.session_identity().await.unwrap(),
+                client.session_bind_secret().await,
+            ),
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => {
                 panic!("fixture requires a binary transport");
             }
@@ -1375,9 +1405,15 @@ async fn assert_data_session_fences(
                 sdk_name: WireName::new("routing-test").unwrap(),
                 sdk_version: WireName::new("1.0.0").unwrap(),
             },
-            identity: route.consumer_session,
+            identity,
             bind_secret: bind_secret.unwrap(),
         }
+    };
+    let mut request = RequestHeader {
+        client: binding.identity.client_id,
+        session: binding.identity.session,
+        request: RAW_REQUEST_START,
+        ..Default::default()
     };
     member
         .create_user(OTHER_USER, OTHER_PASSWORD, UserStatus::Active, None)
@@ -1420,31 +1456,51 @@ async fn assert_data_session_fences(
     wrong_epoch.identity.session += 1;
     assert!(
         matches!(
-            data.send_raw_with_response(BIND_SESSION_CODE, wrong_epoch.to_bytes())
-                .await,
+            data_request(
+                &mut data,
+                &mut request,
+                BIND_SESSION_CODE,
+                &wrong_epoch.to_bytes(),
+                None
+            )
+            .await,
             Err(IggyError::InvalidSession(_))
         ),
         "attachment must require the exact parent epoch"
     );
-    data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
-        .await
-        .unwrap();
-    // Raw Bind authenticates the server connection, but the SDK encoder still
-    // needs its epoch before it can issue the explicit offset request below.
-    data.bind_vsr_session(binding.identity.session)
-        .await
-        .unwrap();
-    data.send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
-        .await
-        .unwrap();
+    data_request(
+        &mut data,
+        &mut request,
+        BIND_SESSION_CODE,
+        &binding.to_bytes(),
+        None,
+    )
+    .await
+    .unwrap();
+    let first_poll = data_request(
+        &mut data,
+        &mut request,
+        POLL_MESSAGES_CODE,
+        &poll,
+        Some(route.context()),
+    )
+    .await
+    .unwrap();
+    let context = PolledMessages::from_bytes(first_poll).unwrap().context;
+    assert_ne!(context.owner_generation, 0);
     // A caller without the owner generation sends 0, and the primary binds it
     // to the owner it installed for this session.
-    let mut unbound = route.context;
+    let mut unbound = context;
     unbound.owner_generation = 0;
-    let response = data
-        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), unbound)
-        .await
-        .expect("owner 0 must bind to the owner installed for this session");
+    let response = data_request(
+        &mut data,
+        &mut request,
+        POLL_MESSAGES_CODE,
+        &poll,
+        Some(unbound),
+    )
+    .await
+    .expect("owner 0 must bind to the owner installed for this session");
     assert_eq!(
         PolledMessages::from_bytes(response).unwrap().partition_id,
         PARTITION_ID
@@ -1462,10 +1518,15 @@ async fn assert_data_session_fences(
     .to_bytes();
     timeout(PRECONDITION_BUDGET, async {
         loop {
-            let response = data
-                .send_raw_with_response(GET_CONSUMER_GROUP_CODE, membership_query.clone())
-                .await
-                .unwrap();
+            let response = data_request(
+                &mut data,
+                &mut request,
+                GET_CONSUMER_GROUP_CODE,
+                &membership_query,
+                None,
+            )
+            .await
+            .unwrap();
             let membership = ConsumerGroupDetailsResponse::decode_from(&response).unwrap();
             if membership.group.members_count == 0 {
                 break;
@@ -1475,20 +1536,30 @@ async fn assert_data_session_fences(
     })
     .await
     .expect("the data node must observe the member leaving");
-    let response = data
-        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
-        .await
-        .unwrap();
+    let response = data_request(
+        &mut data,
+        &mut request,
+        POLL_MESSAGES_CODE,
+        &poll,
+        Some(context),
+    )
+    .await
+    .unwrap();
     let polled = PolledMessages::from_bytes(response).unwrap();
     assert_eq!(
         polled.partition_id, RESYNC_REQUIRED_PARTITION_SENTINEL,
         "the attached session must respect the member leaving"
     );
     assert!(polled.messages.is_empty());
-    let response = data
-        .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), unbound)
-        .await
-        .unwrap();
+    let response = data_request(
+        &mut data,
+        &mut request,
+        POLL_MESSAGES_CODE,
+        &poll,
+        Some(unbound),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         PolledMessages::from_bytes(response).unwrap().partition_id,
         RESYNC_REQUIRED_PARTITION_SENTINEL,
@@ -1505,10 +1576,12 @@ async fn assert_data_session_fences(
     .to_bytes();
     assert!(
         matches!(
-            data.send_raw_with_context(
+            data_request(
+                &mut data,
+                &mut request,
                 STORE_CONSUMER_OFFSET_CODE,
-                offset_write.clone(),
-                route.context
+                &offset_write,
+                Some(context)
             )
             .await,
             Err(IggyError::ConsumerGroupPartitionNotOwned(..))
@@ -1529,36 +1602,57 @@ async fn assert_data_session_fences(
         PRECONDITION_BUDGET,
     )
     .await;
-    // The rejoining session can still appear as the draining old owner.
-    let replacement_route = timeout(PRECONDITION_BUDGET, async {
+    let replacement_context = timeout(PRECONDITION_BUDGET, async {
         loop {
             match member
-                .send_binary_request(GET_POLL_ROUTING_CODE, poll.clone())
+                .poll_messages(
+                    stream,
+                    topic,
+                    Some(PARTITION_ID),
+                    consumer,
+                    &PollingStrategy::first(),
+                    1,
+                    false,
+                )
                 .await
             {
-                Ok(response) => break PollRoutingResponse::decode_from(&response).unwrap(),
-                Err(
+                Ok(polled) if polled.context.owner_generation > context.owner_generation => {
+                    break polled.context;
+                }
+                Ok(_)
+                | Err(
                     IggyError::ConsumerGroupPartitionNotOwned(..) | IggyError::TransientNotAccepted,
                 ) => {}
-                Err(error) => panic!("route discovery failed after rejoining: {error:?}"),
+                Err(error) => panic!("poll failed after rejoining: {error:?}"),
             }
             sleep(PRECONDITION_POLL).await;
         }
     })
     .await
     .expect("rejoining must install a pollable owner within the routing budget");
-    assert!(replacement_route.context.owner_generation > route.context.owner_generation);
-    let route = replacement_route;
-    binding.identity = route.consumer_session;
-    data.send_raw_with_response(BIND_SESSION_CODE, binding.to_bytes())
-        .await
-        .unwrap();
+    let context = replacement_context;
+    binding.identity.metadata_watermark =
+        binding.identity.metadata_watermark.max(context.metadata_op);
+    data_request(
+        &mut data,
+        &mut request,
+        BIND_SESSION_CODE,
+        &binding.to_bytes(),
+        None,
+    )
+    .await
+    .unwrap();
     member.logout_user().await.unwrap();
     timeout(PRECONDITION_BUDGET, async {
         loop {
-            let result = data
-                .send_raw_with_context(POLL_MESSAGES_ON_PRIMARY_CODE, poll.clone(), route.context)
-                .await;
+            let result = data_request(
+                &mut data,
+                &mut request,
+                POLL_MESSAGES_CODE,
+                &poll,
+                Some(context),
+            )
+            .await;
             if matches!(result, Err(IggyError::Unauthenticated)) {
                 break;
             }
@@ -1571,13 +1665,7 @@ async fn assert_data_session_fences(
     })
     .await
     .expect("parent logout must fence the independent data session");
-    assert_eq!(
-        ClientWrapper::Tcp(data)
-            .get_connection_info()
-            .await
-            .server_address,
-        address.to_string()
-    );
+    assert_eq!(data.peer_addr().unwrap(), address);
 }
 
 fn advance_backup_metadata_view(harness: &mut TestHarness, backup: usize) {
@@ -1626,5 +1714,40 @@ async fn send_once(
         Err(_) => Err(format!(
             "no answer within {SEND_BUDGET:?} (client livelocked)"
         )),
+    }
+}
+
+// Session-fence probes must reach the selected socket without client routing or retries.
+async fn data_request(
+    data: &mut TcpStream,
+    request: &mut RequestHeader,
+    code: u32,
+    body: &[u8],
+    context: Option<PartitionContext>,
+) -> Result<Bytes, IggyError> {
+    *request = RequestHeader::for_request(
+        code,
+        request.client,
+        request.request.checked_add(1).unwrap(),
+        request.session,
+        body,
+    )
+    .unwrap();
+    if let Some(context) = context {
+        context.stamp(request);
+    }
+    let (reply, body) = raw_tcp::exchange(data, request, body).await;
+    let status = raw_tcp::reply_status(&reply);
+    if status != 0 {
+        return Err(IggyError::from_code(status));
+    }
+    let body = Bytes::from(body);
+    if request.operation.is_result_framed() {
+        match result_code(&body).expect("complete result section") {
+            0 => Ok(body.slice(result_section_len(&body).unwrap()..)),
+            code => Err(IggyError::from_code(code)),
+        }
+    } else {
+        Ok(body)
     }
 }

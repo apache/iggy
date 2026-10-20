@@ -71,6 +71,10 @@ async fn create_stale_tcp_client(server_addr: &str) -> IggyClient {
     let config = TcpClientConfig {
         server_address: server_addr.to_string(),
         heartbeat_interval: NonZeroIggyDuration::from_str("1h").unwrap(),
+        reconnection: TcpClientReconnectionConfig {
+            enabled: false,
+            ..TcpClientReconnectionConfig::default()
+        },
         nodelay: true,
         ..TcpClientConfig::default()
     };

@@ -109,7 +109,6 @@ pub fn tcp_chain<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
-    max_tokens_per_user: u32,
     request: Message<RoutedRequestHeader>,
 ) -> Result<(Message<RoutedRequestHeader>, Option<String>), RewriteDeny>
 where
@@ -119,25 +118,13 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let (request, raw_pat_token) = maybe_rewrite_pat_request(
-        sessions,
-        transport_client_id,
-        max_tokens_per_user,
-        |user_id| {
-            shard
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| users.pat_count_of(user_id))
-        },
-        request,
-    )
-    // Token cap reached, malformed body, or a lost session binding.
-    .map_err(|error| RewriteDeny {
-        stage: RewriteStage::PersonalAccessToken,
-        error,
-    })?;
+    let (request, raw_pat_token) =
+        maybe_rewrite_pat_request(sessions, transport_client_id, request)
+            // Malformed body or a lost session binding.
+            .map_err(|error| RewriteDeny {
+                stage: RewriteStage::PersonalAccessToken,
+                error,
+            })?;
     // Hash raw passwords and, for ChangePassword, verify the current password
     // on the primary before replication; see `crate::users`. Replicas store the
     // hash directly. A wrong current password is not denied here: it rides
@@ -171,7 +158,6 @@ where
 pub fn http_chain<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: u32,
-    max_tokens_per_user: u32,
     request: Message<RoutedRequestHeader>,
 ) -> Result<(Message<RoutedRequestHeader>, Option<String>), IggyError>
 where
@@ -181,19 +167,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let (request, raw_token) = rewrite_pat_request_for_user(
-        user_id,
-        max_tokens_per_user,
-        |user_id| {
-            shard
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| users.pat_count_of(user_id))
-        },
-        request,
-    )?;
+    let (request, raw_token) = rewrite_pat_request_for_user(user_id, request)?;
     let request = maybe_rewrite_user_password_request(shard, request)?;
     Ok((request, raw_token))
 }

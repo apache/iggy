@@ -19,10 +19,6 @@ package tcp
 
 import (
 	"context"
-	"fmt"
-	"net"
-	"strconv"
-	"strings"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -30,38 +26,50 @@ import (
 )
 
 func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.ClusterMetadata, error) {
-	response, err := c.do(ctx, &command.GetClusterMetadata{})
+	c.mtx.Lock()
+	fence := c.sessionFence
+	c.mtx.Unlock()
+	body, err := c.do(ctx, &command.GetClusterMetadata{})
 	if err != nil {
 		return nil, err
 	}
 	var metadata iggcon.ClusterMetadata
-	err = metadata.UnmarshalBinary(response)
-	if err != nil {
+	if err = metadata.UnmarshalBinary(body); err != nil {
 		return nil, err
 	}
-	if len(metadata.Nodes) == 0 {
-		return nil, fmt.Errorf("%w: empty cluster roster", ierror.ErrTransientNotAccepted)
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != fence {
+		return nil, ierror.ErrUnauthenticated
 	}
-	endpoints := make(map[uint8]string, len(metadata.Nodes))
-	for _, node := range metadata.Nodes {
-		if node.Endpoints.Tcp != 0 {
-			endpoints[node.ReplicaID] = net.JoinHostPort(strings.Trim(node.IP, "[]"), strconv.Itoa(int(node.Endpoints.Tcp)))
-		}
+	if err = c.links.install(&metadata); err != nil {
+		return nil, err
 	}
-	c.polls.mu.Lock()
-	c.polls.endpoints = endpoints
-	c.polls.mu.Unlock()
-	c.clustered.Store(len(metadata.Nodes) > 1)
-	c.topologyKnown.Store(true)
 	return &metadata, nil
 }
 
-// ensureTopology reads the roster once, so a partition request knows whether
-// it must go to the partition primary.
-func (c *IggyTcpClient) ensureTopology(ctx context.Context) error {
-	if c.topologyKnown.Load() {
-		return nil
+func (c *IggyTcpClient) refreshRoster(ctx context.Context, link *tcpLink) error {
+	if link == nil {
+		link = c.links.any()
 	}
-	_, err := c.GetClusterMetadata(ctx)
-	return err
+	if link == nil {
+		return ierror.ErrTransientNotAccepted
+	}
+	c.mtx.Lock()
+	fence := c.sessionFence
+	c.mtx.Unlock()
+	body, err := c.readOnLink(ctx, link, command.GetClusterMetadataCode, nil, nil)
+	if err != nil {
+		return err
+	}
+	var metadata iggcon.ClusterMetadata
+	if err = metadata.UnmarshalBinary(body); err != nil {
+		return err
+	}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.sessionFence != fence {
+		return ierror.ErrUnauthenticated
+	}
+	return c.links.install(&metadata)
 }
