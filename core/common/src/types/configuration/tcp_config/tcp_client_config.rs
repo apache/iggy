@@ -18,7 +18,7 @@
 use crate::types::configuration::auth_config::connection_string::ConnectionString;
 use crate::types::configuration::auth_config::connection_string_options::ConnectionStringOptions;
 use crate::types::configuration::tcp_config::tcp_connection_string_options::TcpConnectionStringOptions;
-use crate::{AutoLogin, NonZeroIggyDuration, TcpClientReconnectionConfig};
+use crate::{AutoLogin, NonZeroIggyDuration, PendingOperationsConfig, TcpClientReconnectionConfig};
 use std::str::FromStr;
 
 /// Configuration for the TCP client.
@@ -37,6 +37,8 @@ pub struct TcpClientConfig {
     pub tls_validate_certificate: bool,
     /// Whether to automatically login user after establishing connection.
     pub auto_login: AutoLogin,
+    /// Shared limits across this client's mutation lanes.
+    pub pending_operations: PendingOperationsConfig,
     /// Whether to automatically reconnect when disconnected.
     pub reconnection: TcpClientReconnectionConfig,
     /// Interval of heartbeats sent by the client
@@ -55,6 +57,7 @@ impl Default for TcpClientConfig {
             tls_validate_certificate: true,
             heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             auto_login: AutoLogin::Disabled,
+            pending_operations: PendingOperationsConfig::default(),
             reconnection: TcpClientReconnectionConfig::default(),
             nodelay: false,
         }
@@ -66,6 +69,7 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
         TcpClientConfig {
             server_address: connection_string.server_address().into(),
             auto_login: connection_string.auto_login().to_owned(),
+            pending_operations: connection_string.options().pending_operations(),
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),
             tls_ca_file: connection_string.options().tls_ca_file().to_owned(),

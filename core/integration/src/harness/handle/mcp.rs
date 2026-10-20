@@ -209,7 +209,7 @@ impl TestBinary for McpHandle {
 
     fn stop(&mut self) -> Result<(), TestBinaryError> {
         if let Some(child) = self.child_handle.take() {
-            let child = common::graceful_kill(child);
+            let child = common::graceful_kill(child).child;
             let _ = child.wait_with_output();
         }
         Ok(())

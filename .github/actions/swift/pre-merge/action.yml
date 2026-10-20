@@ -105,10 +105,6 @@ runs:
         fi
         echo "✅ golden.json matches the Rust crates"
 
-    - name: Setup Rust for e2e
-      if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust
-
     - name: Build the end-to-end suite
       shell: bash
       if: inputs.task == 'e2e'
@@ -116,14 +112,18 @@ runs:
         cd foreign/swift
         swift build --build-tests
 
-    # The SDK speaks the VSR wire protocol, so every e2e lane runs against a
-    # locally built VSR server.
+    - name: Download runtime binaries
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/download-runtime
+
+    # The SDK speaks the VSR wire protocol, so every e2e lane runs against the
+    # VSR server from the shared runtime archive.
     - name: Start Iggy server (plain)
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-e2e.pid
         log-file: ${{ runner.temp }}/iggy-swift-e2e.log
@@ -155,7 +155,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-e2e-tls.pid
         log-file: ${{ runner.temp }}/iggy-swift-e2e-tls.log
@@ -196,7 +196,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-swift-cluster-0.pid
         log-file: ${{ runner.temp }}/iggy-swift-cluster-0.log
@@ -210,7 +210,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "1"
         tcp_address: 127.0.0.1:8091
         http_address: 127.0.0.1:3001

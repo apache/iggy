@@ -199,12 +199,12 @@ struct ConcurrencyTests {
         #expect(outcome.isUncertain)
         for refusal: IggyErrorCode in [
             .transientNotAccepted, .historyUnavailable, .unauthorized, .unauthenticated, .staleClient, .notConnected, .cannotEstablishConnection,
+            .topicIdNotFound, .streamNameNotFound, .disconnected, .streamNameAlreadyExists,
         ] {
             #expect(outcome.observe(IggyError(refusal)).code == .transientNotCommitted)
         }
-        // Anything else is reported as it is.
-        #expect(outcome.observe(IggyError(.disconnected)).code == .disconnected)
-        #expect(outcome.observe(IggyError(.streamNameAlreadyExists)).code == .streamNameAlreadyExists)
+        #expect(outcome.observe(IggyError(.streamNameAlreadyExists), committed: true).code == .streamNameAlreadyExists)
+        #expect(!outcome.isUncertain)
     }
 
     /// The server took a later request of the session first, so an earlier

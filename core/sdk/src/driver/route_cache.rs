@@ -84,6 +84,26 @@ pub(crate) struct RouteCache {
 }
 
 impl RouteCache {
+    pub(crate) fn partition_count(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        fence: u64,
+        watermark: u64,
+    ) -> Option<u32> {
+        self.entries
+            .iter()
+            .filter(|(key, entry)| {
+                key.stream_id == *stream_id
+                    && key.topic_id == *topic_id
+                    && !entry.stale
+                    && entry.fence == fence
+                    && entry.route.metadata_op >= watermark
+            })
+            .max_by_key(|(_, entry)| (entry.route.metadata_op, entry.lookup))
+            .map(|(_, entry)| entry.route.partitions_count)
+    }
+
     /// The route of `key`, unless it is stale, from another session, or
     /// older than the metadata `watermark` that the session saw.
     pub(crate) fn usable(
@@ -344,6 +364,36 @@ mod tests {
         assert_eq!(cache.usable(&partition, FENCE, METADATA_OP), Some(route));
         assert_eq!(cache.usable(&partition, FENCE + 1, METADATA_OP), None);
         assert_eq!(cache.usable(&partition, FENCE, METADATA_OP + 1), None);
+    }
+
+    #[test]
+    fn given_routes_for_one_topic_when_selecting_should_use_the_newest_usable_partition_count() {
+        let (mut cache, old) = cached(1, 0);
+        let newest = PartitionRouteResponse {
+            partitions_count: PARTITIONS_COUNT + 2,
+            metadata_op: METADATA_OP + 1,
+            ..old
+        };
+        let other = key(PARTITION_ID + 1);
+        cache.merge(&other, newest, FENCE).unwrap();
+        let topic = key(PARTITION_ID);
+        assert_eq!(
+            cache.partition_count(&topic.stream_id, &topic.topic_id, FENCE, METADATA_OP),
+            Some(newest.partitions_count)
+        );
+        cache.failed(&newest, other.partition_id, 0);
+        assert_eq!(
+            cache.partition_count(&topic.stream_id, &topic.topic_id, FENCE, METADATA_OP),
+            Some(PARTITIONS_COUNT)
+        );
+        assert_eq!(
+            cache.partition_count(&topic.stream_id, &topic.topic_id, FENCE, METADATA_OP + 1),
+            None
+        );
+        assert_eq!(
+            cache.partition_count(&topic.stream_id, &topic.topic_id, FENCE + 1, METADATA_OP),
+            None
+        );
     }
 
     #[test]

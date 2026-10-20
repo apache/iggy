@@ -27,8 +27,7 @@ mod system;
 mod topics;
 mod users;
 
-pub use messages::decode_send_confirmations;
-pub(crate) use messages::send_raw_messages;
+pub use messages::{BinarySendPartitioning, decode_send_confirmations, send_binary_messages};
 
 use crate::IggyError;
 use crate::http::users::defaults::{
@@ -44,6 +43,7 @@ use iggy_binary_protocol::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, MAX_WIRE_NAME_LENGTH, WireDecode, WireName,
 };
 use secrecy::ExposeSecret;
+use tokio::time::timeout_at;
 
 /// SDK identifier sent in the login-register version prefix. Foreign SDKs
 /// send their own (e.g. `go-sdk`) once they adopt VSR framing.
@@ -95,7 +95,7 @@ pub fn sign_in_request(
     }
 }
 
-/// Release a live session before a fresh login on the same connection.
+/// Prepare the connection before login, then release any existing session.
 ///
 /// The server binds a connection to one `(client, session)` and resolves the
 /// acting user from that binding, not the wire header. A re-login on a still-
@@ -103,8 +103,12 @@ pub fn sign_in_request(
 /// identity, so switching users on a live connection requires logging out
 /// first: the committed Logout unbinds the connection cluster-wide, so the
 /// following Register takes the full register path and rebinds the newly
-/// authenticated user. No-op when the client is not authenticated.
+/// authenticated user. Connection establishment shares the login deadline and
+/// finishes before the caller captures the session fence.
 pub(crate) async fn logout_before_relogin<B: BinaryClient>(client: &B) -> Result<(), IggyError> {
+    timeout_at(crate::binary_operation_deadline(), client.prepare_sign_in())
+        .await
+        .map_err(|_| IggyError::TransientNotAccepted)??;
     if client.get_state().await == ClientState::Authenticated {
         client.logout_user().await?;
     }

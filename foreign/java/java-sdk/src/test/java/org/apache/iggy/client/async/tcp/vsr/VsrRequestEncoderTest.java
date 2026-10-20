@@ -45,6 +45,16 @@ class VsrRequestEncoderTest {
     private final ByteBufAllocator alloc = ByteBufAllocator.DEFAULT;
 
     @Test
+    void shouldKeepGeneratedClientIdsOutsideServerRangeAfterReset() {
+        int samples = 64;
+        for (int sample = 0; sample < samples; sample++) {
+            assertThat(session.clientIdHigh()).isNotNegative();
+            assertThat(session.clientIdLow() | session.clientIdHigh()).isNotZero();
+            session.reset();
+        }
+    }
+
+    @Test
     void shouldBuildRegisterFrameForLogin() {
         ByteBuf payload = loginUserPayload();
         ByteBuf frame = encoder.encode(alloc, LOGIN_USER_CODE, payload);
@@ -217,14 +227,15 @@ class VsrRequestEncoderTest {
 
     @Test
     void shouldKeepUnsignedSharedEpochInEncodedRequest() {
-        byte[] secret = session.bindSecret();
         ConsensusSession parent = new ConsensusSession();
         parent.bind(Long.MIN_VALUE);
-        session.bindShared(parent, 1, 2, Long.MIN_VALUE, secret);
+        byte[] secret = parent.bindSecret();
+        session.bindShared(parent, parent.clientIdLow(), parent.clientIdHigh(), Long.MIN_VALUE, secret);
         ByteBuf frame = encoder.encode(alloc, PING_CODE, Unpooled.EMPTY_BUFFER);
         try {
             assertThat(frame.getLongLE(VsrHeaders.REQUEST_SESSION_OFFSET)).isEqualTo(Long.MIN_VALUE);
-            assertThat(session.bindSecret(1, 2, Long.MIN_VALUE)).isEqualTo(secret);
+            assertThat(session.bindSecret(parent.clientIdLow(), parent.clientIdHigh(), Long.MIN_VALUE))
+                    .isEqualTo(secret);
         } finally {
             frame.release();
         }

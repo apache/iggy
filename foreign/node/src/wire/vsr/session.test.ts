@@ -27,6 +27,15 @@ describe('ConsensusSession', () => {
     assert.equal(session.currentRequestId(), 1n);
   });
 
+  it('generates client IDs with the top bit clear', () => {
+    const samples = 64;
+    const clientIdLimit = 1n << 127n;
+    for (let sample = 0; sample < samples; sample++) {
+      const session = new ConsensusSession();
+      assert.ok(session.clientId > 0n && session.clientId < clientIdLimit);
+    }
+  });
+
   it('binds once to a positive server session', () => {
     const session = new ConsensusSession(7n);
     session.beginRegister();
@@ -44,6 +53,18 @@ describe('ConsensusSession', () => {
     assert.equal(session.nextRequestId(), 1n);
     assert.equal(session.nextRequestId(), 2n);
     assert.equal(session.currentRequestId(), 3n);
+  });
+
+  it('resets activity and identity while preserving the shared request counter', () => {
+    const session = new ConsensusSession(7n);
+    assert.equal(session.hasActivity, false);
+    assert.equal(session.nextRequestId(false), 1n);
+    assert.equal(session.hasActivity, true);
+    session.reset();
+    assert.equal(session.hasActivity, false);
+    assert.notEqual(session.clientId, 7n);
+    assert.equal(session.nextRequestId(false), 2n);
+    assert.equal(session.hasActivity, true);
   });
 
   it('rejects request IDs before binding and after exhaustion', () => {

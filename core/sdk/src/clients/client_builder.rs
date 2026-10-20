@@ -20,8 +20,8 @@ use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
     AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError,
-    NonZeroIggyDuration, Partitioner, QuicClientConfigBuilder, TcpClientConfigBuilder,
-    WebSocketClientConfigBuilder,
+    NonZeroIggyDuration, Partitioner, PendingOperationsConfig, QuicClientConfigBuilder,
+    TcpClientConfigBuilder, WebSocketClientConfigBuilder,
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
@@ -160,6 +160,12 @@ impl TcpClientBuilder {
         self
     }
 
+    /// Sets the shared capacity for active and retained mutation frames.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config = self.config.with_pending_operations(pending_operations);
+        self
+    }
+
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config = self.config.with_auto_sign_in(auto_sign_in);
@@ -244,6 +250,12 @@ impl QuicClientBuilder {
     /// Sets the server address for the QUIC client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
         self.config = self.config.with_server_address(server_address);
+        self
+    }
+
+    /// Sets the shared capacity for active and retained mutation frames.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config = self.config.with_pending_operations(pending_operations);
         self
     }
 
@@ -340,6 +352,12 @@ impl WebSocketClientBuilder {
     /// Sets the server address for the WebSocket client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
         self.config = self.config.with_server_address(server_address);
+        self
+    }
+
+    /// Sets the shared capacity for active and retained mutation frames.
+    pub fn with_pending_operations(mut self, pending_operations: PendingOperationsConfig) -> Self {
+        self.config = self.config.with_pending_operations(pending_operations);
         self
     }
 

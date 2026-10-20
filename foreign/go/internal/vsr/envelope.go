@@ -17,7 +17,11 @@
 
 package vsr
 
-import ierror "github.com/apache/iggy/foreign/go/errors"
+import (
+	"encoding/binary"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/zeebo/xxh3"
+)
 
 // EncodeRequest returns the complete request frame for a command code and its
 // already-encoded payload.
@@ -37,7 +41,7 @@ func EncodeRequest(session *Session, code uint32, payload []byte) ([]byte, error
 //
 // frame must be at least HeaderSize bytes long.
 func StampRequestHeader(session *Session, code uint32, frame []byte) error {
-	if len(frame) > MaxFrameSize {
+	if len(frame) < HeaderSize || len(frame) > MaxFrameSize {
 		return ierror.ErrInvalidConfiguration
 	}
 	operation := OperationForCode(code)
@@ -55,13 +59,9 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 	case OperationRegister:
 		request = session.BeginRegister()
 	case OperationNonReplicated:
-		// Non-replicated operations bypass server-side dedup and are routed by
-		// transport identity, so they travel sessionless before Register.
-		request = session.CurrentRequestID()
-		if session.Bound() {
-			if request, err = session.NextRequestID(); err != nil {
-				return err
-			}
+		request, err = session.NextReadRequestID()
+		if err != nil {
+			return err
 		}
 		sessionID = session.SessionID()
 	default:
@@ -85,5 +85,8 @@ func StampRequestHeader(session *Session, code uint32, frame []byte) error {
 		fields.NonReplicatedCode = code
 	}
 	EncodeRequestHeader((*[HeaderSize]byte)(frame[:HeaderSize]), fields)
+	if operation != OperationNonReplicated && operation < OperationSendMessages {
+		binary.LittleEndian.PutUint64(frame[requestOffsetChecksum:], xxh3.Hash(frame[HeaderSize:]))
+	}
 	return nil
 }
