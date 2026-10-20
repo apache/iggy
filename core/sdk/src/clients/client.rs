@@ -278,8 +278,10 @@ impl IggyClient {
     /// Protected requests require authentication. The credential field is required
     /// by the parser; HTTP callers must still log in explicitly. Binary transports
     /// apply these credentials during `connect()`.
-    /// - user + password: `<user>:<password>@<host>:<port>`
-    /// - personal access token: `<personal_access_token>@host:port`
+    /// - user + password: `<user>:<password>@<host>:<port>` or
+    ///   `<user>:<password>@[<ipv6>]:<port>`
+    /// - personal access token: `<personal_access_token>@<host>:<port>` or
+    ///   `<personal_access_token>@[<ipv6>]:<port>`
     ///
     /// Optional `?key=value&key=value` queries carry transport specific
     /// configuration. The query is parsed per transport, so the accepted keys differ

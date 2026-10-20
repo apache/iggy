@@ -89,7 +89,7 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
             let (host, port) = server_address
                 .split_once(':')
                 .ok_or(IggyError::InvalidConnectionString)?;
-            if host.is_empty() || port.parse::<u16>().is_err() {
+            if host.is_empty() || !port.parse::<u16>().is_ok_and(|port| port != 0) {
                 return Err(IggyError::InvalidConnectionString);
             }
         }
@@ -183,7 +183,6 @@ mod tests {
     #[test]
     fn should_succeed_with_ipv6_address() {
         for server_address in [
-            "[::1]:8090",
             "[2001:db8::1]:8090",
             "[2001:db8:0:0:0:0:0:1]:65535",
             "[::ffff:192.0.2.1]:8090",
@@ -280,6 +279,8 @@ mod tests {
             "[localhost]:8090",
             "[gggg::1]:8090",
             "localhost",
+            "localhost:0",
+            "127.0.0.1:0",
         ] {
             let value = format!("iggy://user:secret@{server_address}");
             assert!(
