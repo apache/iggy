@@ -223,6 +223,14 @@ jobs:
           fi
           echo "components_b64=$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)" >> "$GITHUB_OUTPUT"
 
+      - name: Cache Cargo metadata
+        if: inputs.create_edge_docker_tag && !inputs.skip_tag_creation && inputs.publish_crates != ''
+        env:
+          IGGY_CARGO_METADATA_FILE: ${{ runner.temp }}/iggy-cargo-metadata.json
+        run: |
+          cargo metadata --format-version 1 --no-deps > "$IGGY_CARGO_METADATA_FILE"
+          echo "IGGY_CARGO_METADATA_FILE=$IGGY_CARGO_METADATA_FILE" >> "$GITHUB_ENV"
+
       - name: Build matrix from inputs
         id: mk
         uses: actions/github-script@v9
