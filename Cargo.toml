@@ -53,6 +53,7 @@ members = [
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/http_source",
     "core/connectors/sources/influxdb_source",
+    "core/connectors/sources/mqtt_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
@@ -292,6 +293,7 @@ rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 rcgen = "0.14.10"
 regex = "1.13.1"
+regex-syntax = "0.8.11"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }
 reqwest-retry = "0.9.1"
@@ -302,9 +304,11 @@ rmcp = "3.5.1"
 rmp = "0.8.15"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
+rumqttc = { version = "0.25.1", features = ["url"] }
 rust-embed = "8.13.0"
 rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.46", features = ["ring"] }
+rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
 sd-notify = "0.5"
@@ -391,12 +395,16 @@ web-sys = { version = "0.3", features = [
 webpki-roots = "1.0.9"
 windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
+x509-parser = "0.18.1"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 zeroize = "1.9.1"
 zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 zstd = "0.14.2"
+
+[workspace.metadata.cargo-machete]
+ignored = ["prost"]
 
 [profile.release]
 lto = true

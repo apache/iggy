@@ -167,8 +167,8 @@ func (s *Session) reset() {
 	s.registerConsumed = false
 }
 
-// newClientID draws an ephemeral u128, retrying the one value the server
-// rejects during header validation. crypto/rand.Read does not report an error
+// newClientID keeps the top bit clear to avoid server-only IDs and retries zero.
+// crypto/rand.Read does not report an error
 // as of Go 1.24. It panics if the system entropy source is unavailable.
 func newClientID() ClientID {
 	var buf [16]byte
@@ -176,7 +176,7 @@ func newClientID() ClientID {
 		_, _ = rand.Read(buf[:])
 		client := ClientID{
 			Lo: binary.LittleEndian.Uint64(buf[0:8]),
-			Hi: binary.LittleEndian.Uint64(buf[8:16]),
+			Hi: binary.LittleEndian.Uint64(buf[8:16]) & math.MaxInt64,
 		}
 		if !client.IsZero() {
 			return client

@@ -8178,6 +8178,8 @@ mod view_change_data_loss_tests {
     use super::*;
     use crate::executor::yield_once;
     use consensus::{Sequencer, Status};
+    use iggy_binary_protocol::WireDecode;
+    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
     use journal::Journal;
     use message_bus::MessageBus;
 
@@ -8231,11 +8233,8 @@ mod view_change_data_loss_tests {
         // next primary's journal, then the old primary dies before the commit
         // makes it back.
         let straggler = SimClient::new(straggler_client);
-        let straggler_verifier = straggler
-            .register()
-            .body()
-            .try_into()
-            .expect("registration carries a verifier");
+        let registration = RegisterRequest::decode_from(straggler.register().body())
+            .expect("registration carries a verified account and verifier");
         sim.submit_request(straggler_client, 0, straggler.register().into_generic());
         let mut staged = None;
         for _ in 0..200 {
@@ -8273,7 +8272,7 @@ mod view_change_data_loss_tests {
                     match submit_shard
                         .plane
                         .metadata()
-                        .submit_register_in_process(straggler_client, 0, straggler_verifier)
+                        .submit_register_in_process(straggler_client, 0, registration)
                         .await
                     {
                         Ok(_) => {

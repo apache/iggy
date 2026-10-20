@@ -30,14 +30,46 @@ use secrecy::SecretString;
 use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, ProduceSessionLimits,
-    TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
+    ProduceSessionLimits, TopicMapping, TopicOverride,
 };
 
+#[path = "common/certs.rs"]
+mod certs;
 #[path = "common/iggy_server.rs"]
 mod iggy_server;
 
+use certs::TestPki;
 use iggy_server::{PortGuard, TestServer, raw_client};
+
+/// The bridge's own hop to Iggy encrypted: a server that speaks only TLS on its TCP port, and
+/// a bridge told to trust the CA that signed it. Produce and Fetch go through this client, so
+/// a bridge that silently stayed in the clear would fail to connect at all.
+#[tokio::test]
+#[serial]
+async fn given_a_tls_only_server_when_the_bridge_dials_over_tls_should_provision_topics() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let certs_dir = tempfile::tempdir().expect("certs dir");
+    let pki = TestPki::new();
+    let (cert_file, key_file) = pki.server_cert("iggy").write(certs_dir.path(), "server");
+    let ca_file = pki.write_ca(certs_dir.path());
+    let server = TestServer::spawn_with_tls(data_dir.path(), &cert_file, &key_file).await;
+
+    let mut config = server.test_config();
+    config.tls = IggyTls {
+        enabled: true,
+        domain: String::new(),
+        ca_file: Some(ca_file.display().to_string()),
+    };
+    let bridge = IggyBridge::connect(config)
+        .await
+        .expect("the bridge connects to a TLS-only server over TLS");
+    bridge
+        .ensure_stream_and_topic("orders", 2)
+        .await
+        .expect("a call on the TLS session succeeds");
+    bridge.close().await.expect("clean close");
+}
 
 #[tokio::test]
 #[serial]
@@ -394,6 +426,7 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
     };
 
@@ -419,6 +452,7 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new())
             .expect("valid mapping for this test's fixture data"),
         max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+        tls: IggyTls::default(),
         produce_sessions: ProduceSessionLimits::default(),
     };
 

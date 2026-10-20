@@ -117,9 +117,9 @@ runs:
         # Build the module
         go build -v ./...
 
-    - name: Setup Rust for e2e
+    - name: Download runtime binaries for e2e
       if: inputs.task == 'e2e'
-      uses: ./.github/actions/utils/setup-rust
+      uses: ./.github/actions/utils/download-runtime
 
     # The Go SDK speaks the VSR wire protocol, so every e2e lane runs against
     # a locally built VSR server rather than a container of the legacy one.
@@ -128,7 +128,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e.pid
         log-file: ${{ runner.temp }}/iggy-go-e2e.log
@@ -184,7 +184,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-e2e-tls.pid
         log-file: ${{ runner.temp }}/iggy-go-e2e-tls.log
@@ -222,7 +222,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "0"
         pid-file: ${{ runner.temp }}/iggy-go-cluster-0.pid
         log-file: ${{ runner.temp }}/iggy-go-cluster-0.log
@@ -236,7 +236,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
       with:
-        cargo-bin: iggy-server
+        bin: target/debug/iggy-server
         replica-id: "1"
         tcp_address: 127.0.0.1:8091
         http_address: 127.0.0.1:3001

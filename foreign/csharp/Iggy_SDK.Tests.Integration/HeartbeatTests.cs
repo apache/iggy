@@ -34,9 +34,9 @@ public class HeartbeatTests
     private const string TopicName = "heartbeat-topic";
     private const string GroupName = "heartbeat-group";
 
-    // Transport eviction removes the binding; committed lease expiry removes membership.
-    private static readonly TimeSpan IdleFor = IggyServerFixture.SessionTimeout +
-                                              IggyServerFixture.ServerHeartbeatInterval * 3;
+    // Transport eviction removes the binding; committed lease expiry removes membership. A silent session stops
+    // renewing after 1.2 intervals and ends 1.2 intervals later. The rest covers the report and expiry passes.
+    private static readonly TimeSpan IdleFor = IggyServerFixture.ServerHeartbeatInterval * 3;
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture Fixture { get; init; }

@@ -25,9 +25,13 @@ use tokio::sync::{Semaphore, broadcast};
 use tracing::{info, warn};
 
 use iggy_gateway_kafka::auth::IggyAuthenticator;
-use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig};
+use iggy_gateway_kafka::bridge::{IggyBridge, IggyBridgeConfig, IggyTls};
 use iggy_gateway_kafka::env::parse_bool;
-use iggy_gateway_kafka::server::{bind_listener, init_tracing};
+use iggy_gateway_kafka::listener::{
+    ListenerConfig, SecurityProtocol, apply_advertised_listeners, parse_listeners,
+};
+use iggy_gateway_kafka::server::{bind_listeners, init_tracing};
+use iggy_gateway_kafka::tls::{ClientAuth, TlsConfig};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[tokio::main]
@@ -38,26 +42,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _tracing_guard = init_tracing();
 
     let config = load_config()?;
-    let sasl_enabled = config.sasl_enabled;
+    let sasl_enabled = config.sasl_enabled();
+    let plaintext_sasl = config
+        .listeners
+        .iter()
+        .any(|listener| listener.protocol == SecurityProtocol::SaslPlaintext);
     let bridge = connect_bridge(sasl_enabled).await?;
 
-    let listener = bind_listener(&config.bind_addr)
-        .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
+    let listeners = bind_listeners(&config).map_err(|e| e.to_string())?;
     let mut server = KafkaGateway::new(config).with_bridge(bridge.clone());
     if sasl_enabled {
         let authenticator = IggyAuthenticator::from_env()?;
-        // Unconditional, because the Kafka listener has no TLS at any setting. This is the hop the
-        // Kafka client's password actually crosses, and gating the warning on the Iggy hop meant
-        // encrypting that one silenced the only notice about this one.
-        warn!(
-            "SASL/PLAIN sends the password in the clear and the Kafka listener has no TLS; only \
-             run this on a trusted network until listener TLS lands"
-        );
+        if plaintext_sasl {
+            // This is the hop the Kafka client's password actually crosses. The warning is tied
+            // to the listener that exposes it, not to the Iggy hop, so encrypting the Iggy side
+            // does not silence the only notice about this one.
+            warn!(
+                "SASL/PLAIN on the SASL_PLAINTEXT listener sends the password in the clear; use \
+                 a SASL_SSL listener outside a trusted network"
+            );
+        }
         if !authenticator.is_tls_enabled() {
             warn!(
-                "the credential check's link to Iggy is also unencrypted; set \
-                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it. The bridge's own connection has \
-                 no TLS at any setting"
+                "the credential check's link to Iggy is unencrypted; set \
+                 IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it"
             );
         }
         info!("SASL/PLAIN enabled; credentials verified against {authenticator}");
@@ -65,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (tx, rx) = broadcast::channel(1);
-    let mut server_task = tokio::spawn(async move { server.run(listener, rx).await });
+    let mut server_task = tokio::spawn(async move { server.run(listeners, rx).await });
 
     let stopped_alone = tokio::select! {
         result = &mut server_task => Some(result),
@@ -114,6 +122,14 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_BIND_ADDR",
     "IGGY_KAFKA_ADVERTISED_HOST",
     "IGGY_KAFKA_ADVERTISED_PORT",
+    "IGGY_KAFKA_LISTENERS",
+    "IGGY_KAFKA_ADVERTISED_LISTENERS",
+    "IGGY_KAFKA_TLS_CERT_FILE",
+    "IGGY_KAFKA_TLS_KEY_FILE",
+    "IGGY_KAFKA_TLS_CLIENT_AUTH",
+    "IGGY_KAFKA_TLS_CLIENT_CA_FILE",
+    "IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES",
+    "IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS",
     "IGGY_KAFKA_MAX_CONNECTIONS",
     "IGGY_KAFKA_MAX_FRAME_SIZE",
     "IGGY_KAFKA_IDLE_TIMEOUT_SECS",
@@ -125,6 +141,24 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
+];
+
+/// The variables of the single-listener form, which `IGGY_KAFKA_LISTENERS` replaces as a whole.
+const SINGLE_LISTENER_ENV_VARS: &[&str] = &[
+    "IGGY_KAFKA_BIND_ADDR",
+    "IGGY_KAFKA_ADVERTISED_HOST",
+    "IGGY_KAFKA_ADVERTISED_PORT",
+    "IGGY_KAFKA_SASL_ENABLED",
+];
+
+/// The variables only a TLS listener reads.
+const TLS_ENV_VARS: &[&str] = &[
+    "IGGY_KAFKA_TLS_CERT_FILE",
+    "IGGY_KAFKA_TLS_KEY_FILE",
+    "IGGY_KAFKA_TLS_CLIENT_AUTH",
+    "IGGY_KAFKA_TLS_CLIENT_CA_FILE",
+    "IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES",
+    "IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS",
 ];
 
 /// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] or
@@ -161,11 +195,14 @@ async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, S
         let set: Vec<&str> = IggyBridgeConfig::KNOWN_ENV_VARS
             .iter()
             .copied()
-            // With SASL on, the address is the one bridge variable that is genuinely read, since
-            // it names the server credentials are verified against. Warning that nothing reads it
-            // would be false, and suppressing the whole list instead would hide a set credential
-            // that really does go nowhere.
-            .filter(|var| !(sasl_enabled && *var == "IGGY_KAFKA_IGGY_ADDR"))
+            // With SASL on, the address and the TLS switches are the bridge variables that are
+            // genuinely read, since they name and secure the server credentials are verified
+            // against. Warning that nothing reads them would be false, and suppressing the whole
+            // list instead would hide a set credential that really does go nowhere.
+            .filter(|var| {
+                !(sasl_enabled
+                    && (*var == "IGGY_KAFKA_IGGY_ADDR" || IggyTls::KNOWN_ENV_VARS.contains(var)))
+            })
             .filter(|var| std::env::var(var).is_ok())
             .collect();
         if !set.is_empty() {
@@ -178,6 +215,12 @@ async fn connect_bridge(sasl_enabled: bool) -> Result<Option<Arc<IggyBridge>>, S
         return Ok(None);
     }
     let config = IggyBridgeConfig::from_env().map_err(|e| format!("invalid bridge config: {e}"))?;
+    if !config.tls.enabled {
+        warn!(
+            "the bridge's connection to Iggy is unencrypted and carries IGGY_KAFKA_IGGY_PASSWORD \
+             in the clear; set IGGY_KAFKA_IGGY_TLS_ENABLED=true to encrypt it"
+        );
+    }
     let bridge = IggyBridge::connect(config)
         .await
         .map_err(|e| format!("failed to connect the Iggy bridge: {e}"))?;
@@ -202,15 +245,8 @@ fn load_config() -> Result<GatewayConfig, String> {
     reject_unknown_kafka_env_vars()?;
     let mut config = GatewayConfig::default();
 
-    if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
-        config.bind_addr = bind_addr;
-    }
-    if let Some(advertised_host) = env_var("IGGY_KAFKA_ADVERTISED_HOST") {
-        config.advertised_host = Some(advertised_host);
-    }
-    if let Some(raw) = env_var("IGGY_KAFKA_ADVERTISED_PORT") {
-        config.advertised_port = Some(parse_positive("IGGY_KAFKA_ADVERTISED_PORT", &raw)?);
-    }
+    config.listeners = load_listeners()?;
+    config.tls = load_tls(&config.listeners)?;
     if let Some(raw) = env_var("IGGY_KAFKA_MAX_CONNECTIONS") {
         let max_connections: usize = parse_positive("IGGY_KAFKA_MAX_CONNECTIONS", &raw)?;
         if max_connections > Semaphore::MAX_PERMITS {
@@ -235,9 +271,6 @@ fn load_config() -> Result<GatewayConfig, String> {
     if let Some(raw) = env_var("IGGY_KAFKA_WRITE_TIMEOUT_SECS") {
         config.write_timeout =
             Duration::from_secs(parse_positive("IGGY_KAFKA_WRITE_TIMEOUT_SECS", &raw)?);
-    }
-    if let Some(raw) = env_var("IGGY_KAFKA_SASL_ENABLED") {
-        config.sasl_enabled = parse_bool("IGGY_KAFKA_SASL_ENABLED", &raw)?;
     }
     if let Some(raw) = env_var("IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS") {
         config.pre_auth_timeout =
@@ -279,32 +312,200 @@ fn load_config() -> Result<GatewayConfig, String> {
              Iggy cluster needs its own value, or they hand out colliding producer ids"
         );
     }
-    reject_iggy_tls_without_sasl(config.sasl_enabled)?;
+    reject_unread_iggy_tls(
+        config.sasl_enabled(),
+        bridge_enabled()?,
+        env_var("IGGY_KAFKA_LISTENERS").is_some(),
+    )?;
 
     Ok(config)
 }
 
-/// Refuses `IGGY_KAFKA_IGGY_TLS_*` while SASL is off.
+/// The listeners, from `IGGY_KAFKA_LISTENERS` or from the single-listener variables.
 ///
-/// Only the credential verifier reads them, and it is built only with SASL on. Accepting them
-/// otherwise lets an operator believe the link to Iggy is encrypted when nothing reads the switch,
-/// the same mistake `IggyAuthenticator::from_env` refuses to start for.
-fn reject_iggy_tls_without_sasl(sasl_enabled: bool) -> Result<(), String> {
-    if sasl_enabled {
-        return Ok(());
+/// With a listener list, `IGGY_KAFKA_BIND_ADDR` is ignored with a warning rather than refused:
+/// the gateway's own image bakes `IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093` in, and refusing it would
+/// make `IGGY_KAFKA_LISTENERS` unusable there. Every other single-listener variable is refused
+/// beside a list, since ignoring it would advertise or authenticate differently from what its
+/// operator set.
+fn load_listeners() -> Result<Vec<ListenerConfig>, String> {
+    let advertised = env_var("IGGY_KAFKA_ADVERTISED_LISTENERS");
+    if let Some(raw) = env_var("IGGY_KAFKA_LISTENERS") {
+        let refused: Vec<&str> = SINGLE_LISTENER_ENV_VARS
+            .iter()
+            .copied()
+            .filter(|var| *var != "IGGY_KAFKA_BIND_ADDR" && env_var(var).is_some())
+            .collect();
+        if !refused.is_empty() {
+            return Err(format!(
+                "IGGY_KAFKA_LISTENERS is set together with {}, which belong to the \
+                 single-listener form; advertise through IGGY_KAFKA_ADVERTISED_LISTENERS, and \
+                 turn SASL on with a SASL_PLAINTEXT or SASL_SSL listener",
+                refused.join(", ")
+            ));
+        }
+        if env_var("IGGY_KAFKA_BIND_ADDR").is_some() {
+            warn!(
+                "IGGY_KAFKA_BIND_ADDR set but IGGY_KAFKA_LISTENERS takes precedence; it is \
+                 ignored (bind through IGGY_KAFKA_LISTENERS)"
+            );
+        }
+        let mut listeners = parse_listeners(&raw).map_err(|e| e.to_string())?;
+        if let Some(advertised) = advertised {
+            apply_advertised_listeners(&mut listeners, &advertised).map_err(|e| e.to_string())?;
+        }
+        return Ok(listeners);
     }
-    let set: Vec<&str> = IggyAuthenticator::KNOWN_ENV_VARS
+    if advertised.is_some() {
+        return Err(
+            "IGGY_KAFKA_ADVERTISED_LISTENERS is set but IGGY_KAFKA_LISTENERS is not; the \
+             single-listener form advertises through IGGY_KAFKA_ADVERTISED_HOST and \
+             IGGY_KAFKA_ADVERTISED_PORT"
+                .to_string(),
+        );
+    }
+    let sasl_enabled = match env_var("IGGY_KAFKA_SASL_ENABLED") {
+        Some(raw) => parse_bool("IGGY_KAFKA_SASL_ENABLED", &raw)?,
+        None => false,
+    };
+    let protocol = if sasl_enabled {
+        SecurityProtocol::SaslPlaintext
+    } else {
+        SecurityProtocol::Plaintext
+    };
+    let bind_addr = env_var("IGGY_KAFKA_BIND_ADDR")
+        .unwrap_or_else(|| GatewayConfig::default().listeners[0].bind_addr.clone());
+    let mut listener = ListenerConfig::new(protocol, bind_addr);
+    listener.advertised_host = env_var("IGGY_KAFKA_ADVERTISED_HOST");
+    if let Some(raw) = env_var("IGGY_KAFKA_ADVERTISED_PORT") {
+        listener.advertised_port = Some(parse_positive("IGGY_KAFKA_ADVERTISED_PORT", &raw)?);
+    }
+    Ok(vec![listener])
+}
+
+/// The TLS material, required exactly when a listener speaks TLS.
+///
+/// Every combination in which something set would go unread is refused, the way the SASL and
+/// Iggy-hop switches are: material without a TLS listener, a client CA without client
+/// authentication, mapping rules without an `SSL` listener to apply them on. Each reads to whoever
+/// set it as a protection that is on.
+fn load_tls(listeners: &[ListenerConfig]) -> Result<Option<TlsConfig>, String> {
+    let set: Vec<&str> = TLS_ENV_VARS
         .iter()
         .copied()
-        .filter(|var| var.starts_with("IGGY_KAFKA_IGGY_TLS_"))
+        .filter(|var| env_var(var).is_some())
+        .collect();
+    if !listeners
+        .iter()
+        .any(|listener| listener.protocol.uses_tls())
+    {
+        if set.is_empty() {
+            return Ok(None);
+        }
+        return Err(format!(
+            "{} set but no listener uses TLS; add an SSL or SASL_SSL listener to \
+             IGGY_KAFKA_LISTENERS, or unset them",
+            set.join(", ")
+        ));
+    }
+    let cert_file = env_var("IGGY_KAFKA_TLS_CERT_FILE").ok_or(
+        "IGGY_KAFKA_TLS_CERT_FILE must name a PEM certificate for an SSL or SASL_SSL listener",
+    )?;
+    let key_file = env_var("IGGY_KAFKA_TLS_KEY_FILE").ok_or(
+        "IGGY_KAFKA_TLS_KEY_FILE must name a PEM private key for an SSL or SASL_SSL listener",
+    )?;
+    let mut tls = TlsConfig::new(cert_file, key_file);
+
+    let client_auth = match env_var("IGGY_KAFKA_TLS_CLIENT_AUTH") {
+        Some(raw) => raw
+            .parse::<ClientAuth>()
+            .map_err(|e| format!("invalid IGGY_KAFKA_TLS_CLIENT_AUTH `{raw}`: {e}"))?,
+        None => ClientAuth::None,
+    };
+    let has_ssl_listener = listeners
+        .iter()
+        .any(|listener| listener.protocol.authenticates_by_certificate());
+    if client_auth.is_enabled() && !has_ssl_listener {
+        return Err(format!(
+            "IGGY_KAFKA_TLS_CLIENT_AUTH is {client_auth} but no SSL listener is configured; it \
+             applies to SSL listeners only, and a SASL_SSL listener asks for no client \
+             certificate"
+        ));
+    }
+    match (
+        client_auth.is_enabled(),
+        env_var("IGGY_KAFKA_TLS_CLIENT_CA_FILE"),
+    ) {
+        (true, Some(ca_file)) => tls = tls.with_client_auth(client_auth, ca_file),
+        (true, None) => {
+            return Err(format!(
+                "IGGY_KAFKA_TLS_CLIENT_AUTH is {client_auth} but IGGY_KAFKA_TLS_CLIENT_CA_FILE is \
+                 not set; nothing could verify a client certificate"
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(
+                "IGGY_KAFKA_TLS_CLIENT_CA_FILE is set but IGGY_KAFKA_TLS_CLIENT_AUTH is not \
+                 requested or required; no client would be asked for a certificate"
+                    .to_string(),
+            );
+        }
+        (false, None) => {}
+    }
+    if let Some(raw) = env_var("IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES") {
+        if !client_auth.is_enabled() {
+            return Err(
+                "IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES is set but no SSL listener verifies \
+                 client certificates; the rules apply to an SSL listener with \
+                 IGGY_KAFKA_TLS_CLIENT_AUTH requested or required, and on SASL_SSL the \
+                 principal comes from SASL"
+                    .to_string(),
+            );
+        }
+        let rules = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES: {e}"))?;
+        tls = tls.with_principal_mapping(rules);
+    }
+    // Zero is valid: never re-read the files.
+    if let Some(raw) = env_var("IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS") {
+        let secs: u64 = raw
+            .parse()
+            .map_err(|e| format!("invalid IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS `{raw}`: {e}"))?;
+        tls = tls.with_reload_interval(Duration::from_secs(secs));
+    }
+    Ok(Some(tls))
+}
+
+/// Refuses `IGGY_KAFKA_IGGY_TLS_*` while nothing would read them.
+///
+/// The bridge and the SASL credential check are the two things that dial Iggy. With both off,
+/// accepting the switches lets an operator believe the link to Iggy is encrypted when there is no
+/// link, the same mistake `IggyTls::from_env` refuses to start for.
+fn reject_unread_iggy_tls(
+    sasl_enabled: bool,
+    bridge_enabled: bool,
+    listener_list: bool,
+) -> Result<(), String> {
+    if sasl_enabled || bridge_enabled {
+        return Ok(());
+    }
+    let set: Vec<&str> = IggyTls::KNOWN_ENV_VARS
+        .iter()
+        .copied()
         .filter(|var| std::env::var(var).is_ok())
         .collect();
     if set.is_empty() {
         return Ok(());
     }
+    let sasl_switch = if listener_list {
+        "no listener in IGGY_KAFKA_LISTENERS runs SASL"
+    } else {
+        "IGGY_KAFKA_SASL_ENABLED is not true"
+    };
     Err(format!(
-        "{} set but IGGY_KAFKA_SASL_ENABLED is not true; only the SASL credential check reads them, \
-         so nothing would be encrypted",
+        "{} set but {sasl_switch} and IGGY_KAFKA_BRIDGE_ENABLED is not true; only the SASL \
+         credential check and the bridge dial Iggy, so nothing would be encrypted",
         set.join(", ")
     ))
 }
@@ -358,9 +559,39 @@ async fn shutdown_signal() {
 mod tests {
     use serial_test::serial;
 
+    use iggy_gateway_kafka::listener::SecurityProtocol;
+    use iggy_gateway_kafka::tls::ClientAuth;
+
     use super::{
-        load_config, parse_positive, reject_iggy_tls_without_sasl, reject_unknown_kafka_env_vars,
+        KNOWN_KAFKA_ENV_VARS, load_config, parse_positive, reject_unknown_kafka_env_vars,
+        reject_unread_iggy_tls,
     };
+
+    /// Leaves every variable `load_config` reads unset, so one test's value cannot decide
+    /// another's result.
+    ///
+    /// # Safety
+    /// Only sound under `#[serial]`, see the note on the first test below.
+    fn clear_gateway_env() {
+        for key in KNOWN_KAFKA_ENV_VARS {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    /// Runs `load_config` with exactly `vars` set, then clears them again.
+    fn load_with(vars: &[(&str, &str)]) -> Result<super::GatewayConfig, String> {
+        clear_gateway_env();
+        for (key, value) in vars {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        let loaded = load_config();
+        clear_gateway_env();
+        loaded
+    }
 
     /// Sequential (not two separate `#[test]` fns), and `#[serial]` (unkeyed - this binary's
     /// default group), shared with the instance-id and TLS tests below since all of them touch the
@@ -428,21 +659,9 @@ mod tests {
     #[test]
     #[serial]
     fn given_an_instance_id_env_var_when_loading_config_should_accept_and_parse_it() {
-        unsafe {
-            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "7");
-        }
-        let seven = load_config();
-        unsafe {
-            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "0");
-        }
-        let zero = load_config();
-        unsafe {
-            std::env::set_var("IGGY_KAFKA_INSTANCE_ID", "65536");
-        }
-        let overflow = load_config();
-        unsafe {
-            std::env::remove_var("IGGY_KAFKA_INSTANCE_ID");
-        }
+        let seven = load_with(&[("IGGY_KAFKA_INSTANCE_ID", "7")]);
+        let zero = load_with(&[("IGGY_KAFKA_INSTANCE_ID", "0")]);
+        let overflow = load_with(&[("IGGY_KAFKA_INSTANCE_ID", "65536")]);
 
         assert_eq!(seven.expect("instance id 7 must load").instance_id, 7);
         assert_eq!(zero.expect("instance id 0 must load").instance_id, 0);
@@ -460,13 +679,7 @@ mod tests {
     #[serial]
     fn given_an_unparsable_instance_id_when_loading_config_should_reject_and_name_it() {
         for raw in ["abc", "-1", "", " 7", "7.0"] {
-            unsafe {
-                std::env::set_var("IGGY_KAFKA_INSTANCE_ID", raw);
-            }
-            let loaded = load_config();
-            unsafe {
-                std::env::remove_var("IGGY_KAFKA_INSTANCE_ID");
-            }
+            let loaded = load_with(&[("IGGY_KAFKA_INSTANCE_ID", raw)]);
             let error = loaded.err().unwrap_or_else(|| {
                 panic!("instance id `{raw}` must be rejected, not silently defaulted to 0")
             });
@@ -484,20 +697,245 @@ mod tests {
     /// `#[serial]` for the same reason as the test above: it mutates process-wide env state.
     #[test]
     #[serial]
-    fn given_iggy_tls_without_sasl_should_refuse_to_start() {
+    fn given_iggy_tls_with_nothing_dialing_iggy_should_refuse_to_start() {
         unsafe {
             std::env::set_var("IGGY_KAFKA_IGGY_TLS_ENABLED", "true");
         }
-        let without_sasl = reject_iggy_tls_without_sasl(false);
-        let with_sasl = reject_iggy_tls_without_sasl(true);
+        let nothing_reads_it = reject_unread_iggy_tls(false, false, false);
+        let nothing_reads_it_in_a_list = reject_unread_iggy_tls(false, false, true);
+        let sasl_reads_it = reject_unread_iggy_tls(true, false, false);
+        let bridge_reads_it = reject_unread_iggy_tls(false, true, false);
         unsafe {
             std::env::remove_var("IGGY_KAFKA_IGGY_TLS_ENABLED");
         }
         assert!(
-            without_sasl.is_err(),
-            "nothing reads the TLS switch with SASL off, so accepting it hides that"
+            nothing_reads_it
+                .expect_err(
+                    "nothing reads the TLS switch with SASL and the bridge off, so accepting it \
+                     hides that"
+                )
+                .contains("IGGY_KAFKA_SASL_ENABLED")
         );
-        assert!(with_sasl.is_ok());
+        let in_a_list = nothing_reads_it_in_a_list.expect_err("refused with a listener list too");
+        assert!(
+            !in_a_list.contains("IGGY_KAFKA_SASL_ENABLED"),
+            "a listener list refuses that switch, so naming it misleads, got: {in_a_list}"
+        );
+        assert!(sasl_reads_it.is_ok());
+        assert!(bridge_reads_it.is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn given_the_single_listener_form_should_build_one_listener_from_its_variables() {
+        let plain = load_with(&[("IGGY_KAFKA_BIND_ADDR", "0.0.0.0:19093")])
+            .expect("a bind address alone is valid");
+        assert_eq!(plain.listeners.len(), 1);
+        assert_eq!(plain.listeners[0].protocol, SecurityProtocol::Plaintext);
+        assert_eq!(plain.listeners[0].bind_addr, "0.0.0.0:19093");
+        assert!(plain.tls.is_none());
+
+        let sasl = load_with(&[
+            ("IGGY_KAFKA_SASL_ENABLED", "true"),
+            ("IGGY_KAFKA_ADVERTISED_HOST", "kafka.example.com"),
+            ("IGGY_KAFKA_ADVERTISED_PORT", "9093"),
+        ])
+        .expect("the SASL switch selects the listener's protocol");
+        assert_eq!(sasl.listeners[0].protocol, SecurityProtocol::SaslPlaintext);
+        assert_eq!(
+            sasl.listeners[0].advertised_host.as_deref(),
+            Some("kafka.example.com")
+        );
+        assert_eq!(sasl.listeners[0].advertised_port, Some(9093));
+        assert!(sasl.sasl_enabled());
+
+        let unset = load_with(&[]).expect("an empty environment is valid");
+        assert_eq!(unset.listeners[0].bind_addr, "127.0.0.1:9093");
+    }
+
+    #[test]
+    #[serial]
+    fn given_both_listener_forms_should_refuse_all_but_the_bind_address() {
+        for var in [
+            "IGGY_KAFKA_SASL_ENABLED",
+            "IGGY_KAFKA_ADVERTISED_HOST",
+            "IGGY_KAFKA_ADVERTISED_PORT",
+        ] {
+            let value = if var == "IGGY_KAFKA_SASL_ENABLED" {
+                "true"
+            } else {
+                "9093"
+            };
+            let error = load_with(&[
+                ("IGGY_KAFKA_LISTENERS", "PLAINTEXT://127.0.0.1:9093"),
+                (var, value),
+            ])
+            .unwrap_err();
+            assert!(error.contains("IGGY_KAFKA_LISTENERS"), "got: {error}");
+            assert!(error.contains(var), "got: {error}");
+            if var != "IGGY_KAFKA_SASL_ENABLED" {
+                assert!(
+                    error.contains("IGGY_KAFKA_ADVERTISED_LISTENERS"),
+                    "got: {error}"
+                );
+            }
+        }
+
+        // The image bakes a bind address in, so a listener list has to win over it.
+        let config = load_with(&[
+            ("IGGY_KAFKA_LISTENERS", "SSL://127.0.0.1:9094"),
+            ("IGGY_KAFKA_BIND_ADDR", "0.0.0.0:9093"),
+            ("IGGY_KAFKA_TLS_CERT_FILE", "/etc/iggy/kafka.pem"),
+            ("IGGY_KAFKA_TLS_KEY_FILE", "/etc/iggy/kafka.key"),
+        ])
+        .expect("the list takes precedence over the baked bind address");
+        assert_eq!(config.listeners.len(), 1);
+        assert_eq!(config.listeners[0].bind_addr, "127.0.0.1:9094");
+
+        let error = load_with(&[(
+            "IGGY_KAFKA_ADVERTISED_LISTENERS",
+            "PLAINTEXT://kafka.example.com:9093",
+        )])
+        .unwrap_err();
+        assert!(
+            error.contains("IGGY_KAFKA_ADVERTISED_LISTENERS"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn given_kafka_style_listeners_with_tls_should_require_and_carry_the_material() {
+        let missing = load_with(&[("IGGY_KAFKA_LISTENERS", "SSL://0.0.0.0:9094")]).unwrap_err();
+        assert!(
+            missing.contains("IGGY_KAFKA_TLS_CERT_FILE"),
+            "got: {missing}"
+        );
+
+        let config = load_with(&[
+            (
+                "IGGY_KAFKA_LISTENERS",
+                "PLAINTEXT://127.0.0.1:9093,SASL_SSL://0.0.0.0:9095",
+            ),
+            (
+                "IGGY_KAFKA_ADVERTISED_LISTENERS",
+                "SASL_SSL://kafka.example.com:9095",
+            ),
+            ("IGGY_KAFKA_TLS_CERT_FILE", "/etc/iggy/kafka.pem"),
+            ("IGGY_KAFKA_TLS_KEY_FILE", "/etc/iggy/kafka.key"),
+            ("IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS", "0"),
+        ])
+        .expect("a TLS listener with its material is valid");
+        assert_eq!(config.listeners.len(), 2);
+        assert_eq!(config.listeners[1].protocol, SecurityProtocol::SaslSsl);
+        assert_eq!(
+            config.listeners[1].advertised_host.as_deref(),
+            Some("kafka.example.com")
+        );
+        let tls = config.tls.as_ref().expect("material carried through");
+        assert_eq!(tls.cert_file.to_str(), Some("/etc/iggy/kafka.pem"));
+        assert_eq!(tls.client_auth, ClientAuth::None);
+        assert!(tls.reload_interval.is_zero());
+        assert!(config.sasl_enabled());
+        assert!(config.tls_enabled());
+        assert!(!config.maps_certificate_identities());
+    }
+
+    #[test]
+    #[serial]
+    fn given_tls_variables_without_a_tls_listener_should_refuse() {
+        let error = load_with(&[
+            ("IGGY_KAFKA_LISTENERS", "PLAINTEXT://127.0.0.1:9093"),
+            ("IGGY_KAFKA_TLS_CERT_FILE", "/etc/iggy/kafka.pem"),
+        ])
+        .unwrap_err();
+        assert!(error.contains("IGGY_KAFKA_TLS_CERT_FILE"), "got: {error}");
+        assert!(error.contains("no listener uses TLS"), "got: {error}");
+    }
+
+    #[test]
+    #[serial]
+    fn given_client_auth_settings_should_refuse_the_half_configured_combinations() {
+        let base = [
+            ("IGGY_KAFKA_LISTENERS", "SSL://0.0.0.0:9094"),
+            ("IGGY_KAFKA_TLS_CERT_FILE", "/etc/iggy/kafka.pem"),
+            ("IGGY_KAFKA_TLS_KEY_FILE", "/etc/iggy/kafka.key"),
+        ];
+        let with = |extra: &[(&str, &str)]| {
+            let mut vars = base.to_vec();
+            vars.extend_from_slice(extra);
+            load_with(&vars)
+        };
+
+        let no_ca = with(&[("IGGY_KAFKA_TLS_CLIENT_AUTH", "required")]).unwrap_err();
+        assert!(
+            no_ca.contains("IGGY_KAFKA_TLS_CLIENT_CA_FILE"),
+            "got: {no_ca}"
+        );
+
+        let no_auth = with(&[("IGGY_KAFKA_TLS_CLIENT_CA_FILE", "/etc/iggy/ca.pem")]).unwrap_err();
+        assert!(
+            no_auth.contains("IGGY_KAFKA_TLS_CLIENT_AUTH"),
+            "got: {no_auth}"
+        );
+
+        let auth_without_ssl = load_with(&[
+            ("IGGY_KAFKA_LISTENERS", "SASL_SSL://0.0.0.0:9095"),
+            ("IGGY_KAFKA_TLS_CERT_FILE", "/etc/iggy/kafka.pem"),
+            ("IGGY_KAFKA_TLS_KEY_FILE", "/etc/iggy/kafka.key"),
+            ("IGGY_KAFKA_TLS_CLIENT_AUTH", "required"),
+            ("IGGY_KAFKA_TLS_CLIENT_CA_FILE", "/etc/iggy/ca.pem"),
+        ])
+        .unwrap_err();
+        assert!(
+            auth_without_ssl.contains("no SSL listener"),
+            "client authentication applies to SSL listeners only, got: {auth_without_ssl}"
+        );
+
+        let rules_without_auth =
+            with(&[("IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES", "DEFAULT")]).unwrap_err();
+        assert!(
+            rules_without_auth.contains("IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES"),
+            "got: {rules_without_auth}"
+        );
+
+        let bad_mode = with(&[
+            ("IGGY_KAFKA_TLS_CLIENT_AUTH", "Required"),
+            ("IGGY_KAFKA_TLS_CLIENT_CA_FILE", "/etc/iggy/ca.pem"),
+        ])
+        .unwrap_err();
+        assert!(
+            bad_mode.contains("IGGY_KAFKA_TLS_CLIENT_AUTH"),
+            "got: {bad_mode}"
+        );
+
+        let bad_rules = with(&[
+            ("IGGY_KAFKA_TLS_CLIENT_AUTH", "required"),
+            ("IGGY_KAFKA_TLS_CLIENT_CA_FILE", "/etc/iggy/ca.pem"),
+            ("IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES", "RULE:broken"),
+        ])
+        .unwrap_err();
+        assert!(
+            bad_rules.contains("IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES"),
+            "got: {bad_rules}"
+        );
+
+        let complete = with(&[
+            ("IGGY_KAFKA_TLS_CLIENT_AUTH", "required"),
+            ("IGGY_KAFKA_TLS_CLIENT_CA_FILE", "/etc/iggy/ca.pem"),
+            (
+                "IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES",
+                "RULE:^CN=([^,]+).*$/$1/L",
+            ),
+        ])
+        .expect("a complete mTLS configuration is valid");
+        let tls = complete.tls.as_ref().expect("material carried through");
+        assert_eq!(tls.client_auth, ClientAuth::Required);
+        assert_eq!(
+            tls.principal_mapping.map("CN=Alice,O=Example").as_deref(),
+            Some("alice")
+        );
+        assert!(complete.maps_certificate_identities());
     }
 
     #[test]

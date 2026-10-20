@@ -18,24 +18,11 @@
 name: server-start
 description: Start Iggy server and wait for readiness
 inputs:
-  mode:
-    description: "How to run the server: cargo|bin"
-    required: false
-    default: "cargo"
-  cargo-bin:
-    description: "Cargo binary name (when mode=cargo)"
-    required: false
-    default: "iggy-server"
-  cargo-profile:
-    description: "Cargo profile: release|debug"
-    required: false
-    default: "debug"
   bin:
-    description: "Path to server binary (when mode=bin)"
-    required: false
-    default: ""
+    description: "Path to server binary"
+    required: true
   working-directory:
-    description: "Working directory for building/running"
+    description: "Working directory for running the server"
     required: false
     default: "."
   tcp_address:
@@ -97,35 +84,6 @@ runs:
         echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
         echo "PID_FILE=$PID_FILE" >> "$GITHUB_ENV"
 
-    - id: resolve-bin
-      shell: bash
-      working-directory: ${{ inputs.working-directory }}
-      run: |
-        set -euo pipefail
-        MODE="${{ inputs.mode }}"
-        BIN_PATH=""
-        if [[ "$MODE" == "cargo" ]]; then
-          PROFILE="${{ inputs.cargo-profile }}"
-          NAME="${{ inputs.cargo-bin }}"
-          if [[ "$PROFILE" == "release" ]]; then
-            OUT="target/release/$NAME"
-          else
-            OUT="target/debug/$NAME"
-          fi
-          # An existing executable may belong to a different checkout or feature set.
-          echo "Building $NAME with cargo ($PROFILE)..."
-          CARGO_ARGS=(build --locked --bin "$NAME")
-          if [[ "$PROFILE" == "release" ]]; then
-            CARGO_ARGS+=(--release)
-          fi
-          cargo "${CARGO_ARGS[@]}"
-          BIN_PATH="$OUT"
-        else
-          BIN_PATH="${{ inputs.bin }}"
-          [[ -x "$BIN_PATH" ]] || { echo "Binary not found or not executable: $BIN_PATH"; exit 1; }
-        fi
-        echo "bin=$BIN_PATH" >> "$GITHUB_OUTPUT"
-
     - id: busy
       shell: bash
       run: |
@@ -152,6 +110,8 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: |
         set -euo pipefail
+        [[ -n "${{ inputs.bin }}" ]] || { echo "::error::Input required and not supplied: bin"; exit 1; }
+        [[ -x "${{ inputs.bin }}" ]] || { echo "::error::Binary not found or not executable: ${{ inputs.bin }}"; exit 1; }
         export IGGY_TCP_ADDRESS="${{ inputs.tcp_address }}"
         export IGGY_HTTP_ADDRESS="${{ inputs.http_address }}"
         export IGGY_ROOT_USERNAME="iggy"
@@ -160,7 +120,8 @@ runs:
         if [[ -n "${{ inputs.replica-id }}" ]]; then
           CLI_ARGS+=(--replica-id "${{ inputs.replica-id }}")
         fi
-        nohup "${{ steps.resolve-bin.outputs.bin }}" "${CLI_ARGS[@]}" >"$LOG_FILE" 2>&1 &
+        export LLVM_PROFILE_FILE="$RUNNER_TEMP/iggy-server-%h-%p-%m.profraw"
+        nohup "${{ inputs.bin }}" "${CLI_ARGS[@]}" >"$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "Started server PID $(cat "$PID_FILE") → logs: $LOG_FILE"
         echo "Server configured with TCP=$IGGY_TCP_ADDRESS, HTTP=$IGGY_HTTP_ADDRESS"

@@ -55,7 +55,7 @@ Key new minimums:
 | :---: | ---------- | :---------: | :---------: | :-------------: | :--------------: |
 | 0 | **Produce** | 3 † | 12 | v9 | 🔴 Bridge |
 | 1 | **Fetch** | 4 | 17 | v12 | 🔴 Bridge |
-| 2 | **ListOffsets** | 1 | 9 | v6 | 🟠 Required Stub |
+| 2 | **ListOffsets** | 1 | 9 | v6 | 🔴 Bridge |
 | 3 | **Metadata** | 1 | 12 | v9 | 🔴 Bridge |
 
 † See KAFKA-18659 librdkafka workaround above — advertise min=0 in ApiVersions response.
@@ -270,8 +270,8 @@ Key new minimums:
 
 | Category | Count | Notes |
 | ---------- | :-----: | ------- |
-| 🔴 Bridge (data path) | 9 | Produce, Fetch, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
-| 🟠 Required Stub (client state machine) | 13 | ListOffsets, consumer group (8-14), CreateTopics, InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
+| 🔴 Bridge (data path) | 10 | Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, SaslHandshake, ApiVersions, SaslAuthenticate, ShareFetch |
+| 🟠 Required Stub (client state machine) | 10 | Consumer group (10-14), CreateTopics (19), InitProducerId (22), ConsumerGroupHeartbeat (68), ShareGroupHeartbeat (77), ShareAcknowledge (80) |
 | Implemented | 2 | DescribeGroups (15), ListGroups (16) |
 | 🟡 Optional Stub (admin/observability) | 39 | Can return `UNSUPPORTED_VERSION` or `NOT_CONTROLLER` safely |
 | ❌ Unadvertised | 5 | AddPartitionsToTxn (24), AddOffsetsToTxn (25), EndTxn (26), TxnOffsetCommit (28), and DeleteRecords (21). Absent from ApiVersions, so a conforming client never sends one |
@@ -288,7 +288,7 @@ Key new minimums:
 | ----- | :---: | :---: | :---: |
 | Produce | v3-v9 | v12 | 3 versions behind |
 | Fetch | v4-v12 | v17 | 5 versions behind |
-| ListOffsets | v1-v6 | v9 | 3 versions behind |
+| ListOffsets | v1-v7 | v9 | 2 versions behind |
 | Metadata | v0-v9 | v12 | 3 versions behind |
 | ApiVersions | v0-v3 | v4 | 1 version behind |
 | CreateTopics | v2-v5 | v7 | 2 versions behind |

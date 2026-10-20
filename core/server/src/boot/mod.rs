@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-OWNERSHIP-HISTORY-5\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -867,19 +867,21 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
-    // Per-shard heartbeat verifier: evicts connections that stop pinging,
-    // releasing their consumer-group membership. Gated on config so a
-    // deployment without heartbeats never reaps live sessions.
+    // Per-shard heartbeat verifier: evicts group-member connections that stop
+    // pinging. Lease expiry, not eviction, ends their sessions. Gated on
+    // config so a deployment without heartbeats never evicts a live client.
     let heartbeat_stop_tx = if config.heartbeat.enabled {
         let (hb_stop_tx, hb_stop_rx) = channel::<()>(1);
         let hb_shard = Rc::clone(&shard);
         let hb_sessions = Rc::clone(&sessions);
         let hb_interval = config.heartbeat.interval.get_duration();
+        let hb_max_age = config.heartbeat.session_timeout();
         let hb_handle = compio::runtime::spawn(async move {
             crate::dispatch::session_ops::run_heartbeat_verifier(
                 hb_shard,
                 hb_sessions,
                 hb_interval,
+                hb_max_age,
                 hb_stop_rx,
             )
             .await;
@@ -1041,7 +1043,7 @@ async fn shard_main(
         let (stop_tx, stop_rx) = channel(1);
         let cleaner_shard = Rc::clone(&shard);
         let interval = config.consumer_group.heartbeat_interval.get_duration();
-        let timeout = config.consumer_group.session_timeout.get_duration();
+        let timeout = config.heartbeat.session_timeout();
         let system_path = config.get_system_path();
         let handle = compio::runtime::spawn(async move {
             crate::consumer_group::liveness::run(
@@ -1234,6 +1236,7 @@ mod tests {
             b"IGGY-NO-PURGE-1\n",
             b"IGGY-OWNERSHIP-HISTORY-3\n",
             b"IGGY-OWNERSHIP-HISTORY-4\n",
+            b"IGGY-OWNERSHIP-HISTORY-5\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
