@@ -19,7 +19,7 @@ name: Issue Labeler / Assigner
 
 # Add-only triage steps that run when a reporter opens or edits an issue:
 #
-# 1. Label: scripts/ci/issue-labeler.mjs maps the "Affected area / component"
+# 1. Label: scripts/ci/issue-labeler.sh maps the "Affected area / component"
 #    dropdown from the bug/feature issue forms (.github/ISSUE_TEMPLATE/) onto
 #    real repo labels, so reporters who lack triage permission still get their
 #    issue categorized at creation. When the form gives no area, such as on a
@@ -51,8 +51,8 @@ name: Issue Labeler / Assigner
 # good-first-issue steps use the body only as a boolean gate; the assignee
 # comes from the trusted `payload.issue.user.login` and the label is a fixed
 # constant, never body-derived, so the body cannot inject either. The only
-# checkout is the labeler script from the default branch, without persisted
-# credentials. Issue contents are never executed.
+# checkout is the labeler script and lib/init.sh, from the default branch,
+# without persisted credentials. Issue contents are never executed.
 
 on:
   issues:
@@ -69,7 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          sparse-checkout: scripts/ci/issue-labeler.mjs
+          sparse-checkout: |
+            scripts/ci/issue-labeler.sh
+            scripts/ci/lib/init.sh
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -80,7 +82,7 @@ jobs:
           LLMAO_BASE_URL: ${{ vars.LLMAO_BASE_URL }}
           LLMAO_MODEL: ${{ vars.LLMAO_MODEL }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: node scripts/ci/issue-labeler.mjs --issue "$ISSUE_NUMBER"
+        run: scripts/ci/issue-labeler.sh --issue "$ISSUE_NUMBER"
 
       - name: Assign author who volunteered to contribute
         uses: actions/github-script@v9

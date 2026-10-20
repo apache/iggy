@@ -20,16 +20,16 @@ name: PR Description
 # Flags a contributor PR whose description leaves out a linked issue, a
 # description of the change, or how it was tested, the three things
 # PULL_REQUEST_TEMPLATE.md asks for. The check is
-# scripts/ci/pr-description-check.mjs, which maintainers can also run by hand
+# scripts/ci/pr-description-check.sh, which maintainers can also run by hand
 # on any PR. A gap fails this check and the job summary names each missing
 # part. Plain pattern checks, no model.
 #
 # Skipped for bots, drafts, and authors with write access (OWNER, MEMBER,
 # COLLABORATOR).
 #
-# SECURITY: checks out only the check script, from the base commit, without
-# persisted credentials. PR code is never checked out or executed. Read-only
-# token.
+# SECURITY: checks out only the check script and lib/init.sh, from the base
+# commit, without persisted credentials. PR code is never checked out or
+# executed. Read-only token.
 
 on:
   pull_request:
@@ -53,7 +53,9 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
-          sparse-checkout: scripts/ci/pr-description-check.mjs
+          sparse-checkout: |
+            scripts/ci/pr-description-check.sh
+            scripts/ci/lib/init.sh
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -61,4 +63,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: node scripts/ci/pr-description-check.mjs --pr "$PR_NUMBER"
+        run: scripts/ci/pr-description-check.sh --pr "$PR_NUMBER"
