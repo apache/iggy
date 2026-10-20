@@ -45,6 +45,8 @@ pub struct TestServerConfig {
     pub ip_kind: IpAddrKind,
     #[builder(default)]
     pub extra_envs: HashMap<String, String>,
+    #[builder(default)]
+    pub removed_envs: Vec<String>,
     #[builder(into)]
     pub executable_path: Option<String>,
     /// Working directory of the server process. Unset, the server inherits

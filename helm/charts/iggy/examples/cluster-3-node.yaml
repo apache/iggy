@@ -29,14 +29,14 @@
 # The server binds this address verbatim for replica traffic, so with
 # hostNetwork it must be the node's own IP.
 #
-# Every secret below has to be byte-identical on every node, so they live in one
-# Secret that all three releases reference rather than in this file. Create it
-# once, in the release namespace, before the first install:
+# Share initial root credentials and cluster keys through one Secret.
+# Set IGGY_ROOT_PASSWORD to the chosen root password, then create the Secret
+# once in the release namespace before the first install:
 #
 #   JWT="$(head -c 32 /dev/urandom | base64)"
 #   kubectl create secret generic iggy-cluster-secrets \
 #     --from-literal=username=iggy \
-#     --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
+#     --from-literal=password="${IGGY_ROOT_PASSWORD:?set IGGY_ROOT_PASSWORD}" \
 #     --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
 #     --from-literal=jwtEncodingSecret="$JWT" \
 #     --from-literal=jwtDecodingSecret="$JWT" \
@@ -52,9 +52,8 @@ ui:
 server:
   hostNetwork: true
 
-  # The root user is created locally on each node out of that node's own
-  # IGGY_ROOT_* environment, so the credentials have to match across the
-  # releases the same way the keys below do.
+  # The pinned image creates root independently on each replica. Every node
+  # must use the same Secret so root credentials agree across the cluster.
   users:
     root:
       createSecret: false

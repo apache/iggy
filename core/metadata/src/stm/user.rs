@@ -28,7 +28,10 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
+#[cfg(any(test, feature = "simulator"))]
+use iggy_binary_protocol::WireOptions;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+#[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
@@ -36,7 +39,7 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
-use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
+use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::defaults::{DEFAULT_ROOT_USER_ID, MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use iggy_common::wire_conversions::resource_options_from_wire;
 use iggy_common::{
@@ -47,7 +50,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// Bootstrap runs independently on each replica, so root needs a fixed timestamp.
+/// Fixed timestamp for root fixtures in tests and the simulator.
+#[cfg(any(test, feature = "simulator"))]
 pub const ROOT_USER_CREATED_AT_MICROS: u64 = 1;
 
 // ============================================================================
@@ -364,40 +368,29 @@ impl Users {
         }
     }
 
-    /// Ensures a root user exists in an empty user set.
+    /// Insert a root fixture into an empty user set for tests and the simulator.
     ///
     /// # Panics
     ///
     /// Panics if `username` is not a valid wire-format username or its length is
-    /// outside `MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH`, failing bootstrap fast
-    /// rather than letting the replicated apply reject it as a committed no-op
-    /// that would leave the server with no root user.
+    /// outside `MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH`.
+    #[cfg(any(test, feature = "simulator"))]
     pub fn ensure_root_user(&self, username: &str, password_hash: &str) {
         if self.read(|users| !users.items.is_empty()) {
             return;
         }
 
-        // Fail fast on a misconfigured `IGGY_ROOT_USERNAME`: the replicated apply
-        // enforces this same length bound and would otherwise reject the
-        // bootstrap as a committed no-op (try_apply still returns Ok), leaving the
-        // server running with no root user.
         let length = username.len();
         assert!(
             (MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&length),
-            "root username length {length} outside {MIN_USERNAME_LENGTH}..={MAX_USERNAME_LENGTH}; fix IGGY_ROOT_USERNAME"
+            "root fixture username length {length} outside {MIN_USERNAME_LENGTH}..={MAX_USERNAME_LENGTH}"
         );
 
-        // Boot-only invariant: the server calls this before listeners and
-        // consensus traffic start, on shard 0 initialization. The read/apply
-        // split cannot race another user creation in that phase.
+        // Fixture setup runs before simulated traffic, so the read/apply split
+        // cannot race another user creation.
         let username = WireName::new(username).expect("root username must be valid");
-        // Bootstrap path is intentionally unreplicated (every replica calls
-        // this locally on shard 0). A fresh `IggyTimestamp::now()` per replica
-        // would make `root.created_at` differ across the cluster and break
-        // any future snapshot/state-hash equality check. Stamp a fixed
-        // non-zero sentinel instead: deterministic across replicas (every
-        // replica reads the same value) while remaining a valid `> 0`
-        // creation timestamp for clients that assert one.
+        // Fixtures bypass replication and need a fixed non-zero timestamp
+        // so snapshots remain deterministic across simulated replicas.
         self.inner
             .try_apply(UsersCommand::CreateUser(
                 CreateUserRequest {
@@ -1442,8 +1435,8 @@ mod tests {
 
     #[test]
     fn given_root_user_when_apply_delete_user_should_reject_and_keep_root() {
-        // Production seeds root at slab id 0 (`ensure_root_user`), so the first
-        // slab slot is the root user. Deleting it must be rejected in-apply, or
+        // Replicated root creation takes the first slab slot, id 0.
+        // Deleting it must be rejected in-apply, or
         // a later `CreateUser` would reclaim slot 0 and inherit the RBAC gate's
         // `user_id == 0` root short-circuit.
         let mut users = UsersInner::new();
@@ -1474,7 +1467,7 @@ mod tests {
 
     #[test]
     fn given_root_user_when_apply_update_permissions_should_reject_and_keep_grants() {
-        // Root occupies slab id 0 (production `ensure_root_user`). Its
+        // Replicated root creation occupies slab id 0. Its
         // permissions must be immutable in-apply, or a delegated manage_users
         // admin could tamper with root's grants.
         let mut users = UsersInner::new();

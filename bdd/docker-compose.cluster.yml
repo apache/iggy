@@ -23,8 +23,8 @@
 # Server constraints that shape this file:
 #   - `--replica-id <N>` is the only CLI arg each node needs; there is no
 #     `--follower`, and a new container per run makes `--fresh` redundant.
-#   - root credentials are mandatory once the cluster is enabled and come
-#     from IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD.
+#   - the first leader creates root from IGGY_ROOT_USERNAME / IGGY_ROOT_PASSWORD
+#     and journals and replicates the account.
 #   - `cluster.nodes[*].ip` is parsed as a strict IpAddr (no hostnames) and
 #     cluster listeners bind to that roster IP, so nodes need static IPs and
 #     healthchecks must ping the roster address rather than loopback.

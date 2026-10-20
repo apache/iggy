@@ -244,6 +244,7 @@ pub struct Simulator {
     /// [`shard::IggyShard::deliver_client_request`]) instead of raw `dispatch`
     /// routing. Set at construction by [`Simulator::with_shards_shell`].
     shell: bool,
+    seed_root: bool,
     consumer_offsets_max: usize,
 }
 
@@ -339,6 +340,7 @@ impl Simulator {
             network_options,
             shell,
             Some(data_dir_root),
+            true,
         )
     }
 
@@ -365,6 +367,7 @@ impl Simulator {
             network_options,
             shell,
             None,
+            true,
         )
     }
 
@@ -376,6 +379,7 @@ impl Simulator {
         network_options: PacketSimulatorOptions,
         shell: bool,
         data_dir_root: Option<&std::path::Path>,
+        seed_root: bool,
     ) -> Self {
         assert!(
             shards_per_replica >= 1,
@@ -483,6 +487,7 @@ impl Simulator {
                     reply_inbox,
                     consensus_clock.clone(),
                     shell,
+                    seed_root,
                     metadata_bundle.clone(),
                     shard_superblock,
                     shard_journal,
@@ -551,6 +556,7 @@ impl Simulator {
             deferred_client_replies: Vec::new(),
             seed,
             shell,
+            seed_root,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
         }
     }
@@ -1429,6 +1435,7 @@ impl Simulator {
                 reply_inbox,
                 consensus_clock.clone(),
                 self.shell,
+                self.seed_root,
                 metadata_bundle.clone(),
                 shard_superblock,
                 shard_journal,
@@ -1955,17 +1962,407 @@ mod tests {
     use consensus::{Consensus, Project, Sequencer, Status, client_table::COMMITTED_WINDOW_BITS};
     use futures::FutureExt;
     use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+    use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::{
         AckLevel, ConsensusHeader, Operation, PrepareOkHeader, RoutedRequestHeader, WireEncode,
-        WireIdentifier,
+        WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
     };
     use iggy_common::{ConsumerKind, IggyError};
     use journal::{Journal, JournalHandle};
     use message_bus::AUTO_COMMIT_CLIENT_ID;
+    use message_bus::lifecycle::Shutdown;
     use metadata::stm::stream::Streams;
     use server_common::MessageBag;
     use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, METADATA_GROUP};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct RootInitialization {
+        shutdown: Shutdown,
+        result: Rc<RefCell<Option<Result<(), server::server_error::ServerError>>>>,
+    }
+
+    fn start_root_initialization(
+        sim: &mut Simulator,
+        node: usize,
+        with_credentials: bool,
+    ) -> RootInitialization {
+        let shard = Rc::clone(&sim.replicas[node].shards[0]);
+        let timer = sim.executor.timer();
+        let (shutdown, token) = Shutdown::new();
+        let result = Rc::new(RefCell::new(None));
+        let completed = Rc::clone(&result);
+        let task = sim.executor.spawn(async move {
+            let credentials = with_credentials.then(|| CreateUserRequest {
+                username: WireName::new(replica::SHELL_ROOT_USERNAME).unwrap(),
+                password: server_common::crypto::hash_with_fixed_salt(replica::SHELL_ROOT_PASSWORD),
+                status: iggy_common::UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: true,
+                        read_servers: true,
+                        manage_users: true,
+                        read_users: true,
+                        manage_streams: true,
+                        read_streams: true,
+                        manage_topics: true,
+                        read_topics: true,
+                        poll_messages: true,
+                        send_messages: true,
+                    },
+                    streams: Vec::new(),
+                }),
+                options: WireOptions::empty(),
+            });
+            let outcome = server::boot::initialize_root_user(
+                &shard,
+                credentials.as_ref(),
+                token,
+                |duration| timer.sleep(duration),
+            )
+            .await;
+            *completed.borrow_mut() = Some(outcome);
+        });
+        sim.replicas[node].pump_tasks.push(task);
+        RootInitialization { shutdown, result }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_uncommitted_root_when_primary_crashes_should_recover_or_replace_the_prepare() {
+        for replicated in [true, false] {
+            let mut sim = Simulator::build_inner(
+                3,
+                2,
+                std::iter::once(1),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    client_count: 1,
+                    seed: 4585,
+                    ..Default::default()
+                },
+                true,
+                None,
+                false,
+            );
+            for node in &sim.replicas {
+                assert!(
+                    node.shards[0]
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .users()
+                        .read(|users| users.items.is_empty())
+                );
+            }
+            let client = SimClient::new(1);
+            sim.outboxes[1].insert_client_meta(ClientConnMeta::new(
+                client.client_id(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                ClientTransportKind::Tcp,
+            ));
+            let reply = submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                1,
+                client.login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD),
+            );
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::TransientNotAccepted.as_code())
+            );
+            for backup in [1, 2] {
+                if replicated {
+                    sim.network
+                        .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                        .remove(Command::PrepareOk);
+                } else {
+                    sim.network
+                        .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(backup))
+                        .remove(Command::Prepare);
+                }
+            }
+            let _primary = start_root_initialization(&mut sim, 0, true);
+            let backups = [
+                start_root_initialization(&mut sim, 1, !replicated),
+                start_root_initialization(&mut sim, 2, !replicated),
+            ];
+            for _ in 0..200 {
+                sim.step();
+                if sim.replicas[0].metadata_journal.last_op() == Some(1)
+                    && (!replicated
+                        || sim
+                            .replicas
+                            .iter()
+                            .all(|node| node.metadata_journal.last_op() == Some(1)))
+                {
+                    break;
+                }
+            }
+            let original_checksum = sim.replicas[0].metadata_journal.header(1).unwrap().checksum;
+            for (index, node) in sim.replicas.iter().enumerate() {
+                assert_eq!(
+                    node.metadata_journal.last_op(),
+                    (index == 0 || replicated).then_some(1)
+                );
+                assert!(
+                    node.shards[0]
+                        .plane
+                        .metadata()
+                        .mux_stm
+                        .users()
+                        .read(|users| users.items.is_empty())
+                );
+            }
+            sim.replica_crash(0);
+            if !replicated {
+                for backup in [1, 2] {
+                    sim.network
+                        .link_clear(ProcessId::Replica(0), ProcessId::Replica(backup));
+                }
+            }
+            sim.network.clear_partition();
+            for _ in 0..2_000 {
+                sim.step();
+                if backups
+                    .iter()
+                    .all(|initialization| initialization.result.borrow().is_some())
+                {
+                    break;
+                }
+            }
+            sim.shell_login_via(&client, 1);
+            assert_ne!(client.session_id(), 0);
+            for initialization in &backups {
+                assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
+            }
+            if !replicated {
+                let primary = [1u8, 2]
+                    .into_iter()
+                    .find(|&node| {
+                        sim.replicas[usize::from(node)].shards[0]
+                            .plane
+                            .metadata()
+                            .consensus
+                            .as_ref()
+                            .unwrap()
+                            .is_primary()
+                    })
+                    .unwrap();
+                let repaired = sim.replicas[usize::from(primary)]
+                    .metadata_journal
+                    .entry_sync(client.session_id())
+                    .unwrap();
+                assert!(repaired.header().op > 1);
+                sim.replicas[0]
+                    .metadata_journal
+                    .append(repaired)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+            }
+            sim.replica_restart(0);
+            let restarted = start_root_initialization(&mut sim, 0, false);
+            for _ in 0..2_000 {
+                sim.step();
+                if restarted.result.borrow().is_some() {
+                    break;
+                }
+            }
+            assert!(matches!(*restarted.result.borrow(), Some(Ok(()))));
+            for node in &sim.replicas {
+                let header = node.metadata_journal.header(1).unwrap();
+                assert_eq!(header.operation, Operation::CreateUser);
+                assert_eq!(header.client, consensus::RESERVED_CLIENT_ID);
+                assert_eq!(header.user_id, 0);
+                if !replicated {
+                    assert_ne!(
+                        header.checksum, original_checksum,
+                        "the discarded root prepare must be replaced on every replica"
+                    );
+                }
+                for shard in &node.shards {
+                    assert!(shard.plane.metadata().mux_stm.users().read(|users| {
+                        let root = users.items.get(0).unwrap();
+                        root.username.as_ref() == replica::SHELL_ROOT_USERNAME
+                            && server_common::crypto::verify_password(
+                                replica::SHELL_ROOT_PASSWORD,
+                                &root.password_hash,
+                            )
+                            && users.items.len() == 1
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_solo_replica_without_credentials_when_initializing_root_should_fail_without_waiting()
+    {
+        let mut sim = Simulator::build_inner(
+            1,
+            1,
+            std::iter::empty(),
+            PacketSimulatorOptions::default(),
+            true,
+            None,
+            false,
+        );
+        let initialization = start_root_initialization(&mut sim, 0, false);
+        sim.step();
+        assert!(matches!(
+            *initialization.result.borrow(),
+            Some(Err(
+                server::server_error::ServerError::RootCredentialsRequired { .. }
+            ))
+        ));
+        assert_eq!(sim.replicas[0].metadata_journal.last_op(), None);
+    }
+
+    #[test]
+    fn given_root_initialization_when_shutdown_before_commit_should_exit_cleanly() {
+        for with_credentials in [false, true] {
+            let mut sim = Simulator::build_inner(
+                3,
+                1,
+                std::iter::empty(),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    ..Default::default()
+                },
+                true,
+                None,
+                false,
+            );
+            for backup in [1, 2] {
+                sim.network
+                    .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                    .remove(Command::PrepareOk);
+            }
+            let initialization = start_root_initialization(&mut sim, 0, with_credentials);
+            for _ in 0..20 {
+                sim.step();
+            }
+            assert!(initialization.result.borrow().is_none());
+            assert_eq!(
+                sim.replicas[0].metadata_journal.last_op(),
+                with_credentials.then_some(1)
+            );
+            initialization.shutdown.trigger();
+            sim.step();
+            assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_journaled_root_when_a_fresh_replica_needs_state_transfer_should_recover_without_credentials()
+     {
+        for chunk in [2, 128] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut sim = Simulator::build_inner(
+                3,
+                1,
+                std::iter::once(1),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    client_count: 1,
+                    seed: 4586,
+                    ..Default::default()
+                },
+                true,
+                Some(directory.path()),
+                false,
+            );
+            for node in &sim.replicas {
+                for shard in &node.shards {
+                    shard.set_repair_chunk_max(chunk);
+                }
+            }
+            sim.replica_crash(2);
+            let initializations = [
+                start_root_initialization(&mut sim, 0, true),
+                start_root_initialization(&mut sim, 1, false),
+            ];
+            for _ in 0..200 {
+                sim.step();
+                if initializations
+                    .iter()
+                    .all(|initialization| initialization.result.borrow().is_some())
+                {
+                    break;
+                }
+            }
+            for initialization in &initializations {
+                assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
+            }
+            sim.set_metadata_journal_slots(80);
+            let client = SimClient::new(1);
+            sim.shell_login(&client);
+            for sequence in 0..40 {
+                let reply = submit_and_wait_for_reply(
+                    &mut sim,
+                    client.client_id(),
+                    0,
+                    client.create_stream(&format!("root-recovery-{sequence}")),
+                );
+                assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+                for _ in 0..40 {
+                    sim.step();
+                }
+            }
+            assert!(snapshot_floor(&sim, 0) > 1);
+            assert!(sim.replicas[0].metadata_journal.header(1).is_none());
+            sim.replica_restart(2);
+            for shard in &sim.replicas[2].shards {
+                shard.set_repair_chunk_max(chunk);
+            }
+            let rejoined = start_root_initialization(&mut sim, 2, false);
+            for _ in 0..8_000 {
+                sim.step();
+                let checkpoint = directory.path().join("replica-2/metadata/snapshot.bin");
+                if checkpoint.exists() {
+                    assert!(
+                        metadata::impls::metadata::IggySnapshot::load(&checkpoint)
+                            .unwrap()
+                            .0
+                            .snapshot()
+                            .sequence_number
+                            > 0
+                    );
+                }
+                if rejoined.result.borrow().is_some()
+                    && committed_stream_names(&sim, 2) == committed_stream_names(&sim, 0)
+                {
+                    break;
+                }
+            }
+            assert!(matches!(*rejoined.result.borrow(), Some(Ok(()))));
+            assert!(sim.network.delivered_any(Command::RequestStateChunk));
+            assert!(sim.network.delivered_any(Command::StateChunk));
+            assert_eq!(
+                committed_stream_names(&sim, 2),
+                committed_stream_names(&sim, 0)
+            );
+            let root_identity = |node: usize| {
+                sim.replicas[node].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .users()
+                    .read(|users| {
+                        assert_eq!(users.items.len(), 1);
+                        let root = users.items.get(0).unwrap();
+                        (
+                            root.username.clone(),
+                            root.password_hash.clone(),
+                            root.created_at,
+                        )
+                    })
+            };
+            assert_eq!(root_identity(2), root_identity(0));
+            sim.shell_login_via(&client, 2);
+        }
+    }
 
     const DISCONNECT_STREAM: &str = "sim-stream-0";
     const DISCONNECT_TOPIC: &str = "sim-topic-0-0";
@@ -9879,7 +10276,8 @@ mod metadata_repair_driver_tests {
         cluster, is_commit_for, is_repair_done_for, is_request_prepares_for, prepare_for,
     };
     use super::*;
-    use consensus::Status;
+    use consensus::{Sequencer, Status};
+    use futures::FutureExt;
     use journal::Journal;
     use packet::Packet;
     use server_common::sharding::METADATA_GROUP;
@@ -10030,6 +10428,166 @@ mod metadata_repair_driver_tests {
                 sim.step();
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_an_acked_prepare_above_a_hole_when_restarting_and_losing_primary_should_keep_it() {
+        let (mut sim, client) = cluster(0x5EED_4585);
+        sim.register_client_with_primary(&client);
+        for index in 0..3 {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.create_stream(&format!("before-hole-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        for _ in 0..STEPS_PER_SEND {
+            sim.step();
+        }
+        let floor = sim.replicas[2].metadata_journal.last_op().unwrap();
+        assert_eq!(sim.replicas[0].metadata_journal.last_op(), Some(floor));
+        sim.network.process_disable(ProcessId::Replica(LAGGING));
+        for index in 0..6 {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.create_stream(&format!("repair-tail-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        let repaired_head = sim.replicas[0].metadata_journal.last_op().unwrap();
+        // Backward repair can persist later entries before it fills the first hole.
+        for op in floor + 2..=repaired_head {
+            let repaired = sim.replicas[0].metadata_journal.entry_sync(op).unwrap();
+            sim.replicas[2]
+                .metadata_journal
+                .append(repaired)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        }
+        sim.replica_crash(1);
+        sim.network.process_enable(ProcessId::Replica(LAGGING));
+        sim.network
+            .link_filter_mut(ProcessId::Replica(LAGGING), ProcessId::Replica(0))
+            .remove(Command::RequestPrepares);
+        sim.network
+            .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(LAGGING))
+            .remove(Command::Commit);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            0,
+            client.create_stream("acked-above-hole"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        let acked_op = reply.header().op;
+        assert_eq!(acked_op, repaired_head + 1);
+        let acked_stream_id = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == "acked-above-hole")
+                    .map(|(id, _)| id)
+                    .unwrap()
+            });
+        let checksum = sim.replicas[2]
+            .metadata_journal
+            .header(usize::try_from(acked_op).unwrap())
+            .unwrap()
+            .checksum;
+        assert!(!journal_holds(&sim, LAGGING, floor + 1));
+        sim.replica_crash(LAGGING);
+        sim.replica_restart(LAGGING);
+        assert!(
+            journal_holds(&sim, LAGGING, acked_op),
+            "restart discarded an acknowledged prepare"
+        );
+        let consensus = sim.replicas[2].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap();
+        assert_eq!(consensus.sequencer().current_sequence(), acked_op);
+        sim.replica_crash(0);
+        sim.replica_restart(1);
+        for _ in 0..5_000 {
+            sim.step();
+            if [1, 2]
+                .iter()
+                .all(|&node| metadata_state(&sim, node).2 >= acked_op)
+            {
+                break;
+            }
+        }
+        for node in [1, 2] {
+            assert!(metadata_state(&sim, node).2 >= acked_op);
+            assert_eq!(
+                sim.replicas[usize::from(node)]
+                    .metadata_journal
+                    .header(usize::try_from(acked_op).unwrap())
+                    .unwrap()
+                    .checksum,
+                checksum
+            );
+            assert_eq!(
+                sim.replicas[usize::from(node)].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams
+                        .items
+                        .iter()
+                        .find(|(_, stream)| &*stream.name == "acked-above-hole")
+                        .map(|(id, _)| id)),
+                Some(acked_stream_id)
+            );
+        }
+        let primary = [1, 2]
+            .into_iter()
+            .find(|&node| {
+                sim.replicas[usize::from(node)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .unwrap()
+                    .is_primary()
+            })
+            .unwrap();
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            primary,
+            client.create_stream("after-hole-recovery"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        assert!(reply.header().op > acked_op);
+        let next_stream_id = sim.replicas[usize::from(primary)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == "after-hole-recovery")
+                    .map(|(id, _)| id)
+                    .unwrap()
+            });
+        assert_ne!(next_stream_id, acked_stream_id);
     }
 
     #[test]
