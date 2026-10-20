@@ -22,8 +22,10 @@
 //! delete a partition from disk.
 
 use crate::offset_recovery::{
-    RecoveredOffsets, load_consumer_offsets_with_storage, load_group_offsets_with_storage,
+    RecoveredOffsets, load_consumer_offsets_with_storage, load_emptied_marker_with_storage,
+    load_group_offsets_with_storage,
 };
+use crate::offset_storage::persist_emptied_marker_with_storage;
 use crate::segment_recovery::{PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment};
 use crate::{IggyIndexWriter, IggyPartition, MessagesWriter, PartitionsConfig, Segment};
 use compio::fs::create_dir_all;
@@ -184,12 +186,13 @@ pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Resul
 ///
 /// # Errors
 ///
-/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] when an existing offset
-/// directory cannot be enumerated, and
+/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] when an offset directory
+/// cannot be checked or an existing one cannot be enumerated,
 /// [`PartitionRecoveryError::CreateOffsetsDirectory`] when the external group one
-/// cannot be created. A stored offset past the offset space is clamped to
-/// `current_offset` (with a warning), not an error. External group offsets are
-/// never clamped.
+/// cannot be created, and [`PartitionRecoveryError::Iggy`] when an unreadable or
+/// stale emptied-table marker cannot be removed. A stored offset past the offset
+/// space is clamped to `current_offset` (with a warning), not an error. External
+/// group offsets are never clamped.
 pub async fn configure_consumer_offsets<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     config: &PartitionsConfig,
@@ -221,10 +224,13 @@ pub async fn configure_consumer_offsets<B: MessageBus>(
 /// read from storage. External group offsets are never clamped.
 ///
 /// # Errors
-/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] if an existing offset directory
-/// cannot be enumerated, and [`PartitionRecoveryError::CreateOffsetsDirectory`] if the
-/// external group one cannot be created. Consumer recovery may already have seeded the
-/// partition when group recovery fails, so callers must discard a failed recovery.
+/// Returns [`PartitionRecoveryError::ConsumerOffsetsLoad`] if an offset directory cannot
+/// be checked or an existing one cannot be enumerated,
+/// [`PartitionRecoveryError::CreateOffsetsDirectory`] if the external group one
+/// cannot be created, and [`PartitionRecoveryError::Iggy`] if an
+/// unreadable or stale emptied-table marker cannot be removed. Consumer recovery may
+/// already have seeded the partition when group recovery fails, so callers must
+/// discard a failed recovery.
 #[allow(clippy::too_many_lines)]
 pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: MessageBus>(
     storage: &S,
@@ -374,6 +380,7 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
             }
         }
     }
+    restore_emptied_marker(storage, partition).await?;
     for kind in ConsumerKind::ALL {
         let count = partition.occupied_consumer_offset_count(kind);
         let limit = partition.consumer_offset_capacity_for(kind).limit();
@@ -389,6 +396,31 @@ pub async fn configure_consumer_offsets_with_storage<S: DurableStorage, B: Messa
             );
         }
     }
+    Ok(())
+}
+
+/// Load the emptied-table marker, or remove it when the recovered table is not
+/// empty.
+async fn restore_emptied_marker<S: DurableStorage, B: MessageBus>(
+    storage: &S,
+    partition: &IggyPartition<B>,
+) -> Result<(), IggyError> {
+    let Some(path) = partition.emptied_marker_path() else {
+        return Ok(());
+    };
+    let emptied_at = load_emptied_marker_with_storage(storage, &path).await?;
+    if emptied_at == 0 {
+        return Ok(());
+    }
+    // A crash that beats the directory sync can revive a file the emptying
+    // delete unlinked, so a loaded or stranded offset makes the marker stale.
+    if ConsumerKind::ALL
+        .into_iter()
+        .any(|kind| partition.occupied_consumer_offset_count(kind) > 0)
+    {
+        return persist_emptied_marker_with_storage(storage, &path, 0).await;
+    }
+    partition.seed_offsets_emptied_at(emptied_at);
     Ok(())
 }
 
@@ -789,21 +821,21 @@ async fn load_partition_consumer_offsets<S: DurableStorage>(
     topic_id: usize,
     partition_id: usize,
 ) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, PartitionRecoveryError> {
-    if !storage
-        .exists_following_links(Path::new(path))
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(RecoveredOffsets::default());
-    }
-
-    match load_consumer_offsets_with_storage(storage, path).await {
+    let loaded = match storage.exists_following_links(Path::new(path)).await {
+        Ok(true) => load_consumer_offsets_with_storage(storage, path).await,
+        Ok(false) => return Ok(RecoveredOffsets::default()),
+        Err(error) => {
+            warn!(path, %error, "failed to check offset directory");
+            Err(IggyError::CannotReadConsumerOffsets(path.to_owned()))
+        }
+    };
+    match loaded {
         Ok(offsets) => Ok(offsets),
         Err(IggyError::CannotReadConsumerOffsets(_))
-            if !storage
-                .exists_following_links(Path::new(path))
-                .await
-                .unwrap_or(false) =>
+            if matches!(
+                storage.exists_following_links(Path::new(path)).await,
+                Ok(false)
+            ) =>
         {
             Ok(RecoveredOffsets::default())
         }
@@ -829,21 +861,21 @@ async fn load_partition_group_offsets<S: DurableStorage>(
     RecoveredOffsets<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>,
     PartitionRecoveryError,
 > {
-    if !storage
-        .exists_following_links(Path::new(path))
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(RecoveredOffsets::default());
-    }
-
-    match load_group_offsets_with_storage(storage, path, kind).await {
+    let loaded = match storage.exists_following_links(Path::new(path)).await {
+        Ok(true) => load_group_offsets_with_storage(storage, path, kind).await,
+        Ok(false) => return Ok(RecoveredOffsets::default()),
+        Err(error) => {
+            warn!(path, %error, "failed to check offset directory");
+            Err(IggyError::CannotReadConsumerOffsets(path.to_owned()))
+        }
+    };
+    match loaded {
         Ok(offsets) => Ok(offsets),
         Err(IggyError::CannotReadConsumerOffsets(_))
-            if !storage
-                .exists_following_links(Path::new(path))
-                .await
-                .unwrap_or(false) =>
+            if matches!(
+                storage.exists_following_links(Path::new(path)).await,
+                Ok(false)
+            ) =>
         {
             Ok(RecoveredOffsets::default())
         }

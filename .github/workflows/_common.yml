@@ -124,7 +124,7 @@ jobs:
         run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
 
       - name: Install HawkEye
-        uses: taiki-e/install-action@v2.87.22
+        uses: taiki-e/install-action@v2.87.26
         with:
           tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
 
@@ -151,6 +151,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "23"
+          package-manager-cache: false
 
       - name: Install markdownlint-cli
         run: npm install -g markdownlint-cli
@@ -253,7 +254,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.50.3
+        uses: crate-ci/typos@v1.51.1
 
   summary:
     name: Common checks summary

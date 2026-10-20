@@ -51,9 +51,13 @@ use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 /// [`HttpInner::not_primary_read_error`]).
 ///
 /// Every read route reaches this through [`gate_local_read`], which is what
-/// pairs it with the two waits a local read must serve behind. Callable on its
-/// own only for a read that is NOT served from local state.
-fn authorize_read(
+/// pairs it with the two waits a local read must serve behind. A route that
+/// awaits again after that gate (a cross-shard gather, the snapshot
+/// collection, or a local partition read) calls it once more before building
+/// its reply: the account behind the token can be replaced, and its grants can
+/// change, during any await. Relayed partition reads are authorized by the
+/// serving node, which verifies the forwarded bearer itself.
+pub(in crate::http) fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
@@ -65,7 +69,12 @@ fn authorize_read(
         .metadata()
         .mux_stm
         .users()
-        .authorize(|permissioner| rule(permissioner, identity.user_id))
+        .read(|users| {
+            if !users.is_active_account(identity.user_id, identity.user_created_at.as_micros()) {
+                return Err(IggyError::Unauthenticated);
+            }
+            users.authorize(|permissioner| rule(permissioner, identity.user_id))
+        })
         .map_err(ReadError::Rejected)?;
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
         return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));
@@ -83,9 +92,10 @@ fn authorize_read(
 /// Reads never touch consensus or a VSR session: `build_non_replicated_response`
 /// is a pure STM read, with one exception - the stats read's cross-shard
 /// connected-client gather, an async broadcast run here (under `SendWrapper`,
-/// same as `/metrics`) before the sync builder. An absent entity surfaces as
-/// [`NonReplicatedResponse::Empty`], mapped to 404 here because every REST read
-/// whose entity can be missing shares that not-found shape.
+/// same as `/metrics`) and gated again before the sync builder. An absent
+/// entity surfaces as [`NonReplicatedResponse::Empty`], mapped to 404 here
+/// because every REST read whose entity can be missing shares that not-found
+/// shape.
 pub(in crate::http) async fn read_local(
     state: &HttpInner,
     identity: &Identity,
@@ -94,9 +104,11 @@ pub(in crate::http) async fn read_local(
     body: &[u8],
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
-    gate_local_read(state, identity, consistency, code, rule).await?;
+    gate_local_read(state, identity, consistency, code, &rule).await?;
     let clients_count = if code == GET_STATS_CODE {
-        u32::try_from(SendWrapper::new(state.shard.count_all_clients()).await).unwrap_or(u32::MAX)
+        let clients_count = SendWrapper::new(state.shard.count_all_clients()).await;
+        authorize_read(state, identity, consistency, &rule)?;
+        u32::try_from(clients_count).unwrap_or(u32::MAX)
     } else {
         0
     };
@@ -480,12 +492,22 @@ pub(in crate::http) fn topic_durability(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BarrierWait, FrontierWait, ReadError, barrier_state, hold_for_frontier,
-        read_needs_metadata_frontier,
-    };
-    use crate::http::state::MetadataWatermarks;
-    use crate::http::wire::encode_send_messages;
+    use std::cell::{Cell, RefCell};
+    use std::future::pending;
+    use std::net::Ipv4Addr;
+    use std::pin::pin;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::extract::{FromRequestParts, Path, Query, State};
+    use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+    use axum::response::IntoResponse;
+    use configs::server::ServerConfig;
+    use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
+    use futures::poll;
+    use hyper::service::Service as _;
+    use hyper_util::service::TowerToHyperService;
     use iggy_binary_protocol::codes::{
         DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
         GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
@@ -493,19 +515,412 @@ mod tests {
     };
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
-    use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
+    use iggy_binary_protocol::requests::streams::{
+        CreateStreamRequest, DeleteStreamRequest, UpdateStreamRequest,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicRequest,
     };
+    use iggy_binary_protocol::requests::users::{
+        CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
+    };
     use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
-    use iggy_binary_protocol::{WireDecode, WireIdentifier, WireName, WireOptions};
-    use iggy_common::IggyTimestamp;
+    use iggy_binary_protocol::{
+        Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
+    };
+    use iggy_common::{IggyByteSize, IggyTimestamp, UserStatus};
+    use message_bus::IggyMessageBus;
+    use message_bus::installer::conn_info::ClientTransportKind;
+    use message_bus::transports::tls::install_default_crypto_provider;
     use metadata::AppliedFrontier;
+    use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateHandler;
+    use metadata::stm::authz::GatedApply;
     use metadata::stm::stream::StreamsInner;
-    use std::future::pending;
-    use std::sync::Arc;
+    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
+    use send_wrapper::SendWrapper;
+    use server_common::sharding::{METADATA_GROUP, PartitionLocation, ShardId};
+    use shard::shards_table::{PapayaShardsTable, ShardsTable};
+    use shard::{
+        ConnectedClientInfo, LifecycleFrame, ListClientsReply, PartitionConsensusConfig,
+        PartitionRead, PartitionReadReply, ReplicaTopology, ShardFrame, ShardIdentity,
+        TaggedSender, shard_channel,
+    };
+
+    use super::{
+        BarrierWait, FrontierWait, ReadError, barrier_state, hold_for_frontier,
+        read_needs_metadata_frontier,
+    };
+    use crate::cluster_meta::ClusterRoster;
+    use crate::dispatch::test_support::{
+        create_one_partition_in, create_reader_request, prepare_message,
+    };
+    use crate::http::error::ConsistencyQuery;
+    use crate::http::extractor::Identity;
+    use crate::http::handlers::{get_client, get_clients, get_metrics, get_stats, get_user};
+    use crate::http::metrics::HttpMetrics;
+    use crate::http::router;
+    use crate::http::session::RegistrationBarrier;
+    use crate::http::state::{HttpInner, HttpState, MetadataWatermarks};
+    use crate::http::wire::encode_send_messages;
+    use crate::shell::{ServerMetadata, ServerMuxStateMachine, ServerShard};
+
+    #[compio::test]
+    async fn given_authenticated_read_when_account_replaced_while_held_should_reject() {
+        const ACCOUNT_ID: u32 = 1;
+        const CREATED_AT: u64 = 10;
+        const DELETED_AT: u64 = 20;
+        const REPLACED_AT: u64 = 30;
+        const READ_FLOOR: u64 = 1;
+
+        // The metrics scrape waits on the recovery barrier only.
+        for (recovery_barrier, scrape_metrics) in [(true, false), (false, false), (true, true)] {
+            let state = read_state();
+            let mut account = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            commit_user_request(
+                &state,
+                CREATED_AT,
+                Operation::CreateUser,
+                &account.to_bytes(),
+            );
+            let identity = authenticated_identity(&state, ACCOUNT_ID, CREATED_AT).await;
+            let metadata = state.shard.plane.metadata();
+            let consensus = metadata.consensus.as_ref().unwrap();
+            if recovery_barrier {
+                consensus.set_recovery_deadline(metadata.applied_frontier().read_budget());
+                consensus.set_recovery_barrier(READ_FLOOR);
+            } else {
+                state.metadata_watermarks.record(ACCOUNT_ID, READ_FLOOR);
+            }
+            let handler_state = state.clone();
+            let mut read = pin!(async move {
+                if scrape_metrics {
+                    get_metrics(State(handler_state), identity)
+                        .await
+                        .into_response()
+                } else {
+                    get_user(
+                        State(handler_state),
+                        identity,
+                        Path("me".to_owned()),
+                        Query(ConsistencyQuery::default()),
+                    )
+                    .await
+                    .into_response()
+                }
+            });
+            assert!(
+                poll!(read.as_mut()).is_pending(),
+                "the authenticated read must wait before account replacement"
+            );
+
+            commit_user_request(
+                &state,
+                DELETED_AT,
+                Operation::DeleteUser,
+                &DeleteUserRequest {
+                    user_id: WireIdentifier::numeric(ACCOUNT_ID),
+                }
+                .to_bytes(),
+            );
+            account.username = WireName::new("replacement").unwrap();
+            commit_user_request(
+                &state,
+                REPLACED_AT,
+                Operation::CreateUser,
+                &account.to_bytes(),
+            );
+            assert_eq!(
+                metadata
+                    .mux_stm
+                    .users()
+                    .read(|users| { users.user_by_name("replacement").unwrap().id }),
+                ACCOUNT_ID,
+                "the replacement must reuse the authenticated account's ID"
+            );
+            consensus.set_recovery_barrier(0);
+            metadata.applied_frontier().advance(READ_FLOOR);
+
+            assert_eq!(
+                read.await.status(),
+                StatusCode::UNAUTHORIZED,
+                "a read held at recovery={recovery_barrier}, metrics={scrape_metrics} must reject a replacement account"
+            );
+            let identity = authenticated_identity(&state, ACCOUNT_ID, REPLACED_AT).await;
+            assert_eq!(
+                get_user(
+                    State(state.clone()),
+                    identity,
+                    Path("me".to_owned()),
+                    Query(ConsistencyQuery::default()),
+                )
+                .await
+                .into_response()
+                .status(),
+                StatusCode::OK,
+                "the replacement account must retain self access with its own token"
+            );
+        }
+    }
+
+    /// The client reads gather from every shard after their gate, and the
+    /// account behind the token can change during the gather.
+    #[compio::test]
+    async fn given_a_client_read_in_its_gather_when_the_account_changes_should_reject() {
+        const CLIENT_ID: u32 = 7;
+        for route in ["/stats", "/clients", "/clients/{client_id}"] {
+            for replace in [true, false] {
+                let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+                let state = read_state_on(Some(sender));
+                commit_user_request(
+                    &state,
+                    READER_CREATED_AT,
+                    Operation::CreateUser,
+                    &create_reader_request().to_bytes(),
+                );
+                let identity = authenticated_identity(&state, READER_ID, READER_CREATED_AT).await;
+                let handler_state = state.clone();
+                let mut read = pin!(async move {
+                    let consistency = Query(ConsistencyQuery::default());
+                    match route {
+                        "/stats" => get_stats(State(handler_state), identity, consistency)
+                            .await
+                            .into_response(),
+                        "/clients" => get_clients(State(handler_state), identity, consistency)
+                            .await
+                            .into_response(),
+                        _ => {
+                            get_client(State(handler_state), identity, Path(CLIENT_ID), consistency)
+                                .await
+                                .into_response()
+                        }
+                    }
+                });
+                assert!(poll!(read.as_mut()).is_pending());
+                let Ok(ShardFrame::Lifecycle(LifecycleFrame::ListClients { reply })) =
+                    shard_inbox.try_recv()
+                else {
+                    panic!("{route} must gather from every shard");
+                };
+
+                let rejection = change_reader(&state, replace);
+                match reply {
+                    ListClientsReply::Clients(reply) => reply
+                        .try_send(vec![ConnectedClientInfo {
+                            client_id: u128::from(CLIENT_ID),
+                            vsr_client_id: None,
+                            user_id: Some(READER_ID),
+                            transport: ClientTransportKind::Tcp,
+                            address: (Ipv4Addr::LOCALHOST, 0).into(),
+                            sdk_name: None,
+                            sdk_version: None,
+                            protocol_version: None,
+                        }])
+                        .unwrap(),
+                    ListClientsReply::Count(reply) => reply.try_send(1).unwrap(),
+                    ListClientsReply::Sessions(_) => panic!("{route} must not gather sessions"),
+                }
+
+                assert_eq!(
+                    read.await.status(),
+                    rejection,
+                    "{route} with the account replaced: {replace}"
+                );
+            }
+        }
+    }
+
+    /// Account and path changes must not bypass either partition wait's gate.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_partition_read_waiting_on_its_owner_when_the_account_changes_should_reject() {
+        for uri in [
+            "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
+            "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
+        ] {
+            for (replace, final_wait, change_path) in [
+                (true, false, None),
+                (false, false, None),
+                (true, true, None),
+                (false, true, None),
+                (false, true, Some(Operation::DeleteStream)),
+                (false, true, Some(Operation::UpdateStream)),
+                (false, true, Some(Operation::UpdateTopic)),
+            ] {
+                let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+                let state = read_state_on(Some(sender));
+                let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
+                state
+                    .shard
+                    .shards_table()
+                    .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+                commit_user_request(
+                    &state,
+                    READER_CREATED_AT,
+                    Operation::CreateUser,
+                    &create_reader_request().to_bytes(),
+                );
+                let token = state
+                    .jwt
+                    .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+                    .unwrap();
+                let service = TowerToHyperService::new(router(
+                    state.clone(),
+                    state.forward.body_limit,
+                    None,
+                    None,
+                    false,
+                ));
+                let request = Request::builder()
+                    .uri(uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+                    .body(Body::empty())
+                    .unwrap();
+                let mut response = pin!(service.call(request));
+                assert!(poll!(response.as_mut()).is_pending());
+                let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    read: PartitionRead::Primary,
+                    reply,
+                    ..
+                })) = shard_inbox.try_recv()
+                else {
+                    panic!("{uri} must ask its partition for the primary");
+                };
+
+                let primary = PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                };
+                let (reply, body) = if final_wait {
+                    reply.try_send(primary).unwrap();
+                    assert!(poll!(response.as_mut()).is_pending());
+                    let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                        read,
+                        reply,
+                        ..
+                    })) = shard_inbox.try_recv()
+                    else {
+                        panic!("{uri} must wait for its partition data");
+                    };
+                    let body = match read {
+                        PartitionRead::UnboundPollOnPrimary { metadata, .. } => {
+                            PartitionReadReply::Poll {
+                                context: metadata.context(0),
+                                fragments: Vec::new().into(),
+                                current_offset: 0,
+                            }
+                        }
+                        PartitionRead::ConsumerOffsetOnPrimary { .. } => {
+                            PartitionReadReply::ConsumerOffset {
+                                stored: Some(0),
+                                current_offset: 0,
+                            }
+                        }
+                        _ => panic!("{uri} sent an unexpected partition read"),
+                    };
+                    (reply, body)
+                } else {
+                    (reply, primary)
+                };
+                let rejection = change_reader(&state, replace);
+                if let Some(operation) = change_path {
+                    let body = match operation {
+                        Operation::DeleteStream => DeleteStreamRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                        }
+                        .to_bytes(),
+                        Operation::UpdateStream => UpdateStreamRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                            name: WireName::new("renamed").unwrap(),
+                            options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                        Operation::UpdateTopic => UpdateTopicRequest {
+                            stream_id: WireIdentifier::numeric(0),
+                            topic_id: WireIdentifier::numeric(0),
+                            name: WireName::new("renamed").unwrap(),
+                            options: WireOptions::empty(),
+                        }
+                        .to_bytes(),
+                        _ => unreachable!(),
+                    };
+                    commit_user_request(&state, READER_CREATED_AT + 30, operation, &body);
+                }
+                reply.try_send(body).unwrap();
+                // A read that went on would send to the partition again and
+                // find it gone, instead of waiting for an answer.
+                drop(shard_inbox);
+
+                assert_eq!(
+                    response.await.unwrap().status(),
+                    rejection,
+                    "{uri} with the account replaced: {replace}, final wait: {final_wait}, path change: {change_path:?}"
+                );
+            }
+        }
+    }
+
+    /// The account of [`create_reader_request`], the first one after root.
+    const READER_ID: u32 = 1;
+    const READER_CREATED_AT: u64 = 10;
+
+    /// Replace the reader account under its ID, or revoke its grants, and
+    /// return the status that a read the reader started before must answer.
+    fn change_reader(state: &HttpState, replace: bool) -> StatusCode {
+        const CHANGED_AT: u64 = 20;
+        const REPLACED_AT: u64 = 30;
+        if !replace {
+            commit_user_request(
+                state,
+                CHANGED_AT,
+                Operation::UpdatePermissions,
+                &UpdatePermissionsRequest {
+                    user_id: WireIdentifier::numeric(READER_ID),
+                    permissions: None,
+                }
+                .to_bytes(),
+            );
+            return StatusCode::FORBIDDEN;
+        }
+        commit_user_request(
+            state,
+            CHANGED_AT,
+            Operation::DeleteUser,
+            &DeleteUserRequest {
+                user_id: WireIdentifier::numeric(READER_ID),
+            }
+            .to_bytes(),
+        );
+        commit_user_request(
+            state,
+            REPLACED_AT,
+            Operation::CreateUser,
+            &CreateUserRequest {
+                username: WireName::new("replacement").unwrap(),
+                ..create_reader_request()
+            }
+            .to_bytes(),
+        );
+        assert_eq!(
+            state
+                .shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| users.user_by_name("replacement").unwrap().id),
+            READER_ID,
+            "the replacement must reuse the reader's ID"
+        );
+        StatusCode::UNAUTHORIZED
+    }
 
     #[test]
     fn produce_routing_keeps_the_attested_topic_when_names_are_reused() {
@@ -812,5 +1227,110 @@ mod tests {
     #[test]
     fn barrier_state_met_wins_over_expired_deadline() {
         assert_eq!(barrier_state(5, 5, true), BarrierWait::Ready);
+    }
+
+    fn read_state() -> HttpState {
+        read_state_on(None)
+    }
+
+    /// [`read_state`] whose shard sends its cross-shard requests to `mesh`,
+    /// so a test can hold a read while it waits on another shard.
+    fn read_state_on(mesh: Option<TaggedSender>) -> HttpState {
+        install_default_crypto_provider();
+        let config = Arc::new(ServerConfig::default());
+        let prepared = crate::http::prepare(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            &config.http,
+            &config.cluster,
+        )
+        .unwrap();
+        let bus = Rc::new(IggyMessageBus::with_config(0, &config));
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            METADATA_GROUP,
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mux = ServerMuxStateMachine::default();
+        mux.users().ensure_root_user("iggy", "hash");
+        let metadata = ServerMetadata::new(Some(consensus), None, None, None, mux, None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+                size_of_messages_required_to_save: IggyByteSize::from(
+                    iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+                ),
+                validate_checksum: config.partition.validate_checksum,
+                segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+                preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let mut shard = ServerShard::without_inbox(
+            ShardIdentity::new(0, "http-read-test".to_owned()),
+            Rc::clone(&bus),
+            metadata,
+            partitions,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus),
+        );
+        if let Some(sender) = mesh {
+            shard.attach_senders(vec![sender]);
+        }
+        let shard = Rc::new(shard);
+        SendWrapper::new(Rc::new(HttpInner {
+            session_liveness: Rc::default(),
+            shard,
+            jwt: prepared.jwt,
+            server_config: config,
+            sessions: RefCell::default(),
+            registrations: RegistrationBarrier::default(),
+            roster: Rc::new(ClusterRoster::disabled()),
+            max_http_sessions: Default::default(),
+            max_tokens_per_user: Default::default(),
+            in_flight_writes: Cell::default(),
+            forward: prepared.forward,
+            metrics: HttpMetrics::init(&[]),
+            metadata_watermarks: Rc::default(),
+        }))
+    }
+
+    fn commit_user_request(state: &HttpState, timestamp: u64, operation: Operation, body: &[u8]) {
+        let mut prepare = prepare_message(operation, 0, 0, body);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut prepare.as_mut_slice()[..size_of::<PrepareHeader>()],
+        );
+        header.timestamp = timestamp;
+        header.op = timestamp;
+        let reply = state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .gated_update(consensus::seal_prepare_checksum(prepare))
+            .unwrap();
+        assert_eq!(reply.code, 0, "{operation:?} must commit");
+    }
+
+    async fn authenticated_identity(state: &HttpState, user_id: u32, created_at: u64) -> Identity {
+        let token = state
+            .jwt
+            .generate(user_id, IggyTimestamp::from(created_at))
+            .unwrap();
+        let (mut parts, ()) = Request::builder()
+            .uri("/users/me")
+            .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+            .body(())
+            .unwrap()
+            .into_parts();
+        let Ok(identity) = Identity::from_request_parts(&mut parts, state).await else {
+            panic!("the active account's token must authenticate");
+        };
+        identity
     }
 }

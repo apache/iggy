@@ -223,16 +223,16 @@ impl ServerAuditor {
         &self.stats
     }
 
-    /// Drop every in-flight expectation for `client`, returning how many went.
+    /// Drop every in-flight expectation for `client`, returning them.
     ///
-    /// For a client the cluster evicted: its session is gone, so nothing it had
-    /// outstanding will ever be answered and an expectation left behind would
-    /// wait forever. The requests themselves were refused before commit, so
-    /// forgetting them loses no committed state.
-    pub fn forget_client(&mut self, client: u128) -> usize {
-        let before = self.in_flight.len();
-        self.in_flight.retain(|&(owner, _), _| owner != client);
-        before - self.in_flight.len()
+    /// Call only after a successful handshake proves the old session is fenced.
+    /// Its requests may have committed before the fence, so their effects remain
+    /// unknown until the workload reconciles them.
+    pub fn forget_client(&mut self, client: u128) -> Vec<InFlight> {
+        self.in_flight
+            .extract_if(|&(owner, _), _| owner == client)
+            .map(|(_, entry)| entry)
+            .collect()
     }
 
     /// The action of an outstanding request, if one is recorded for `key`.

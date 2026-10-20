@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { setTimeout as delay } from 'node:timers/promises';
 import { xxh32 } from '@node-rs/xxhash';
-import { idKey, type Id } from '../identifier.utils.js';
+import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializeSendMessages, type CreateMessage } from './message.utils.js';
 import { Partitioning, PartitionKind, serializeMessageKey } from './partitioning.utils.js';
 import type { ClientProvider, CommandResponse, RawClient } from '../../client/client.type.js';
 import { DeserializeError, ResponseError, responseError } from '../error.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
-import { GET_TOPIC } from '../topic/get-topic.command.js';
+import { deserializePartitionRoute, serializePartitionRoute } from '../partition/partition-route.js';
 
 /** Size of the confirmation count prefixing the list. */
 const CONFIRMATIONS_COUNT_SIZE = 4;
@@ -124,6 +125,11 @@ export const SEND_MESSAGES = {
 /** Rust `calculate_32` hashes message keys with XXH32 under this seed. */
 const MESSAGE_KEY_SEED = 0;
 const TOPIC_ID_NOT_FOUND = 2010;
+const PARTITION_NOT_FOUND = 4000;
+const SEND_TIMEOUT_MS = 30_000;
+const ROUTE_RETRY_INTERVAL_MS = 50;
+const TRANSIENT_NOT_ACCEPTED = 58;
+const NOT_PRIMARY = 89;
 
 type TopicPartitions = { count?: number, cursor: number };
 
@@ -140,9 +146,15 @@ const getTopicPartitions = (client: RawClient, streamId: Id, topicId: Id): Topic
       for (const topic of created.values())
         topic.count = undefined;
     });
+    client.on('partitionRoute', (event) => {
+      const { topic, count } = event as { topic: string, count: number };
+      const cached = created.get(topic);
+      if (cached)
+        cached.count = count;
+    });
     topics = created;
   }
-  const key = `${idKey(streamId)}\0${idKey(topicId)}`;
+  const key = Buffer.concat([serializeIdentifier(streamId), serializeIdentifier(topicId)]).toString('hex');
   let topic = topics.get(key);
   if (!topic) {
     topic = { cursor: 0 };
@@ -157,14 +169,28 @@ const getTopicPartitions = (client: RawClient, streamId: Id, topicId: Id): Topic
  */
 const resolvePartitioning = async (
   client: RawClient,
-  { streamId, topicId, partition }: SendMessages
+  { streamId, topicId, partition }: SendMessages,
+  deadline: number
 ): Promise<Partitioning> => {
   if (partition?.kind === PartitionKind.PartitionId)
     return partition;
   const topic = getTopicPartitions(client, streamId, topicId);
-  topic.count ||= GET_TOPIC.deserialize(await client.sendCommand(
-    GET_TOPIC.code, GET_TOPIC.serialize({ streamId, topicId })
-  ))?.partitionsCount;
+  if (!topic.count) {
+    for (;;) {
+      try {
+        const response = await client.sendCommand(COMMAND_CODE.GetPartitionRoute,
+          serializePartitionRoute(streamId, topicId, 0), { deadline, followsLeaderMoves: false });
+        topic.count = deserializePartitionRoute(response.data).partitionsCount;
+        break;
+      } catch (error) {
+        if (!(error instanceof ResponseError) ||
+            (error.errorCode !== TRANSIENT_NOT_ACCEPTED && error.errorCode !== NOT_PRIMARY) ||
+            deadline - Date.now() <= ROUTE_RETRY_INTERVAL_MS)
+          throw error;
+        await delay(ROUTE_RETRY_INTERVAL_MS);
+      }
+    }
+  }
   if (!topic.count)
     throw responseError(COMMAND_CODE.SendMessages, TOPIC_ID_NOT_FOUND);
   if (partition?.kind === PartitionKind.MessageKey)
@@ -184,9 +210,19 @@ export const sendMessages = (getClient: ClientProvider) =>
     const client = await getClient();
     const release = client.hold?.();
     try {
-      const partition = await resolvePartitioning(client, request);
-      return SEND_MESSAGES.deserialize(await client.sendCommand(
-        SEND_MESSAGES.code, SEND_MESSAGES.serialize({ ...request, partition })));
+      const deadline = Date.now() + SEND_TIMEOUT_MS;
+      for (let attempt = 0; ; attempt += 1) {
+        const partition = await resolvePartitioning(client, request, deadline);
+        try {
+          return SEND_MESSAGES.deserialize(await client.sendCommand(
+            SEND_MESSAGES.code, SEND_MESSAGES.serialize({ ...request, partition }), { deadline }));
+        } catch (error) {
+          if (attempt !== 0 || request.partition?.kind === PartitionKind.PartitionId ||
+              !(error instanceof ResponseError) || error.errorCode !== PARTITION_NOT_FOUND)
+            throw error;
+          getTopicPartitions(client, request.streamId, request.topicId).count = undefined;
+        }
+      }
     } catch (error) {
       // A refusal can mean the topic changed shape since its count was read.
       if (error instanceof ResponseError)

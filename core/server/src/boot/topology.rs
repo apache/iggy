@@ -18,8 +18,8 @@
 //! Listener topology and the cluster roster, resolved from config.
 
 use crate::cluster_meta::{
-    BoundPorts, ClusterRoster, METADATA_VIEW_UNKNOWN, resolved_roster_nodes,
-    self_advertised_address,
+    BoundPorts, ClusterRoster, METADATA_VIEW_UNKNOWN, SINGLE_NODE_REPLICA_ID,
+    resolved_roster_nodes, self_advertised_address,
 };
 use crate::server_error::ServerError;
 use configs::server::ServerConfig;
@@ -28,8 +28,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tracing::warn;
-
-const SHARD_REPLICA_ID: u8 = 0;
 
 pub(in crate::boot) struct TcpTopology {
     /// Domain-separation cluster id derived from `cluster.name`; threaded to
@@ -129,11 +127,11 @@ pub(in crate::boot) fn resolve_tcp_topology(
         resolve_optional_listener_addr(config.http.enabled, "http.address", &config.http.address)?;
     if !config.cluster.enabled {
         if let Some(replica_id) = current_replica_id
-            && replica_id != SHARD_REPLICA_ID
+            && replica_id != SINGLE_NODE_REPLICA_ID
         {
             return Err(ServerError::ReplicaIdRequiresCluster {
                 supplied: replica_id,
-                default: SHARD_REPLICA_ID,
+                default: SINGLE_NODE_REPLICA_ID,
             });
         }
         return Ok(TcpTopology {
@@ -143,7 +141,7 @@ pub(in crate::boot) fn resolve_tcp_topology(
             // single-node mode; any other id is rejected above so the WAL
             // cannot commit under an identity that will later disagree with
             // a cluster.nodes[] entry.
-            self_replica_id: SHARD_REPLICA_ID,
+            self_replica_id: SINGLE_NODE_REPLICA_ID,
             replica_count: 1,
             client_listen_addr: default_client_addr,
             replica_listen_addr: Some(SocketAddr::new(default_client_addr.ip(), 0)),

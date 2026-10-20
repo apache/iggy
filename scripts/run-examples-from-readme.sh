@@ -182,18 +182,19 @@ run_rust_examples() {
     resolve_server_binary "${TARGET}" "iggy-server"
     resolve_cli_binary "${TARGET}"
 
-    # The README documents credentials as <iggy_username>/<iggy_password>
-    # placeholders; the test server starts with iggy/iggy. The README keeps
-    # plain cargo run commands, so the cross-compile target is injected here.
-    if [ -n "${TARGET}" ]; then
-        TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
-        }
-    else
-        TRANSFORM_COMMAND() {
-            echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g"
-        }
-    fi
+    TRANSFORM_COMMAND() {
+        local command="$1"
+        command="${command//<iggy_username>/iggy}"
+        command="${command//<iggy_password>/iggy}"
+        # Exercise the documented CLI arguments against the same binary as the other suites.
+        if [[ "$command" == 'cargo run --bin iggy -- '* ]]; then
+            printf '"%s" %s\n' "$CLI_BIN" "${command#cargo run --bin iggy -- }"
+        elif [ -n "${TARGET}" ]; then
+            printf '%s\n' "${command/cargo run /cargo run --target ${TARGET} }"
+        else
+            printf '%s\n' "$command"
+        fi
+    }
 
     # Pre-flight: run CLI commands from root README
     _rust_preflight() {

@@ -685,6 +685,18 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void testBuildAndLoginFromConnectionString() throws Exception {
+        // buildAndLogin completes only after the login with the credentials from the connection string succeeds
+        client = AsyncIggyTcpClient.builder()
+                .fromConnectionString(
+                        "iggy://" + TEST_USERNAME + ":" + TEST_PASSWORD + "@" + serverHost() + ":" + serverTcpPort())
+                .buildAndLogin()
+                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        assertThat(client.users()).isNotNull();
+    }
+
+    @Test
     void testHandleCloseOnUnconnectedClient() throws Exception {
         client = AsyncIggyTcpClient.builder()
                 .host(serverHost())

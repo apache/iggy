@@ -48,6 +48,7 @@ mod fixture;
 pub mod handle;
 mod helpers;
 mod orchestrator;
+mod peer_relay;
 mod port_reserver;
 pub mod seeds;
 mod traits;
@@ -61,6 +62,7 @@ pub use context::{TestContext, get_test_directory};
 pub use error::TestBinaryError;
 pub use handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+    StopOutcome,
 };
 pub use orchestrator::{TestHarness, TestHarnessBuilder, TestLogs};
 pub use traits::{IggyServerDependent, Restartable, TestBinary};

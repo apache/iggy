@@ -36,4 +36,4 @@ pub(crate) mod user_client;
 pub(crate) mod validatable;
 
 pub use binary_impls::decode_send_confirmations;
-pub use binary_impls::rust_sdk_version_info;
+pub use binary_impls::{rust_sdk_version_info, sign_in_request};

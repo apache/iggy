@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
-    Status, VsrConsensus,
+    Consensus, DvcHeaderKind, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome,
+    Sequencer, Status, VsrConsensus, dvc_header_kind,
 };
 use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
 use iggy_binary_protocol::{
@@ -853,7 +853,7 @@ where
         return false;
     }
 
-    if consensus.is_transferring() {
+    if consensus.is_transferring() || consensus.view_log_unproven() {
         return false;
     }
 
@@ -901,6 +901,90 @@ where
     consensus
         .send_or_loopback(primary, message.into_generic())
         .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewLogProof {
+    Proven,
+    /// Fetch `op`; retained entries above `unproven_through` match the view.
+    Missing {
+        op: u64,
+        unproven_through: u64,
+    },
+    Divergent(u64),
+}
+
+/// Prove held entries against the view's hash chain. Canonical headers can
+/// bridge missing bodies; a gap with no header leaves its lower prefix unknown.
+#[must_use]
+pub fn view_log_proof(
+    commit_floor: u64,
+    canonical: &[PrepareHeader],
+    op_head: u64,
+    header_at: impl Fn(u64) -> Option<PrepareHeader>,
+) -> ViewLogProof {
+    let proven = locally_proven_commit(commit_floor, &header_at);
+    if op_head <= proven {
+        return ViewLogProof::Proven;
+    }
+    let Some(head) = canonical
+        .first()
+        .filter(|head| head.op == op_head && dvc_header_kind(head) != DvcHeaderKind::Blank)
+    else {
+        return ViewLogProof::Missing {
+            op: op_head,
+            unproven_through: op_head,
+        };
+    };
+    let mut expected = head.checksum;
+    let mut missing = None;
+    for op in (proven + 1..=op_head).rev() {
+        let header = if let Some(local) = header_at(op) {
+            local
+        } else if let Some(header) = canonical
+            .iter()
+            .find(|header| header.op == op && dvc_header_kind(header) != DvcHeaderKind::Blank)
+        {
+            missing.get_or_insert(op);
+            *header
+        } else {
+            return ViewLogProof::Missing {
+                op,
+                unproven_through: op,
+            };
+        };
+        if header.checksum == CHECKSUM_UNSEALED || header.checksum != expected {
+            return ViewLogProof::Divergent(op);
+        }
+        expected = header.parent;
+    }
+    missing.map_or(ViewLogProof::Proven, |op| ViewLogProof::Missing {
+        op,
+        unproven_through: 0,
+    })
+}
+
+fn locally_proven_commit(
+    commit_floor: u64,
+    header_at: &impl Fn(u64) -> Option<PrepareHeader>,
+) -> u64 {
+    let mut proven = commit_floor;
+    let mut op = commit_floor;
+    let mut parent = None;
+    while let Some(next_op) = op.checked_add(1) {
+        let Some(local) = header_at(next_op) else {
+            break;
+        };
+        if local.checksum == CHECKSUM_UNSEALED
+            || parent.is_some_and(|checksum| local.parent != checksum)
+        {
+            break;
+        }
+        proven = proven.max(local.commit.min(op));
+        parent = Some(local.checksum);
+        op = next_op;
+    }
+    proven
 }
 
 #[cfg(test)]
@@ -1105,7 +1189,8 @@ mod tests {
             commit,
             group: 0,
             log_view: 0,
-            reserved: [0; 68],
+            reserved: [0; 60],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: 0,
         };
@@ -1503,7 +1588,8 @@ mod tests {
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            reserved: [0; 60],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: present,
         };
@@ -1538,7 +1624,8 @@ mod tests {
             commit,
             group: 0,
             log_view,
-            reserved: [0; 68],
+            reserved: [0; 60],
+            partition_incarnation: 0,
             nack_bitset: 0,
             present_bitset: 0,
         };
@@ -1593,7 +1680,8 @@ mod tests {
             replica,
             reserved_frame: [0; 66],
             group: 0,
-            reserved: [0; 120],
+            partition_incarnation: 0,
+            reserved: [0; 112],
         }
     }
 
@@ -1905,6 +1993,34 @@ mod tests {
     }
 
     #[test]
+    fn given_a_started_view_when_its_head_is_unapplied_should_report_the_view_start_unapplied() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(
+            consensus.applied_view_start(),
+            "a replica that started no view has nothing to apply"
+        );
+        consensus.restore_commit_state(2, 2);
+        consensus.sequencer().set_sequence(3);
+        install_local_suffix(&consensus, 3, 2, 0);
+        let _ = consensus.handle_start_view_change(PlaneKind::Partitions, &svc_header(1, 3));
+        let (dvc, body) = dvc_with_full_suffix(2, 3, 0, 3, 2);
+        let _ = consensus.handle_do_view_change(PlaneKind::Partitions, &dvc, &body);
+        let _ = consensus.start_pending_view(PlaneKind::Partitions);
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!((consensus.commit_min(), consensus.commit_max()), (2, 2));
+        assert!(
+            !consensus.applied_view_start(),
+            "op 3 can be a write that the old view acknowledged, and \
+             commit_min == commit_max does not cover it"
+        );
+
+        consensus.advance_commit_max(3);
+        consensus.advance_commit_min(3);
+        assert!(consensus.applied_view_start());
+    }
+
+    #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
@@ -1997,7 +2113,8 @@ mod tests {
             op,
             commit,
             group: 0,
-            reserved: [0; 88],
+            partition_incarnation: 0,
+            reserved: [0; 80],
             incarnation: 0,
         };
         (header, body)
@@ -2106,25 +2223,19 @@ mod tests {
     }
 
     #[test]
-    fn given_start_view_without_suffix_when_adopted_should_trust_the_announced_op() {
-        // Probe answers and stale-view corrections carry numbers only: a backup must
-        // still adopt, and record nothing it could mistake for the view's decision.
+    fn given_start_view_without_suffix_when_adopted_should_keep_proof_pending() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
-
         let (header, body) = start_view_with_suffix(1, 1, 5, 3, false);
         assert!(body.is_empty());
         let actions = consensus.handle_start_view(PlaneKind::Metadata, &header, &body);
 
-        assert!(
-            !actions.is_empty(),
-            "a numbers-only StartView must still adopt"
-        );
+        assert!(!actions.is_empty());
         assert_eq!(consensus.sequencer().current_sequence(), 5);
-        assert!(
-            consensus.pending_view_log().is_none(),
-            "no suffix means no canonical headers to verify against"
-        );
+        let pending = consensus.pending_view_log().unwrap();
+        assert_eq!(pending.op_head, 5);
+        assert_eq!(pending.headers, [] as [PrepareHeader; 0]);
+        assert!(consensus.view_log_unproven());
     }
 
     #[test]
@@ -2492,5 +2603,139 @@ mod tests {
         let update = repaired_frontier_update(169, |op| headers.get(&op).copied());
 
         assert_eq!(update, Some((172, 1720)));
+    }
+
+    #[test]
+    fn given_view_suffix_when_proving_local_history_should_distinguish_gaps_from_divergence() {
+        let local: Vec<_> = (3..=6)
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                commit: 2,
+                checksum: u128::from(op),
+                ..Default::default()
+            })
+            .collect();
+        let canonical = [*local.last().unwrap()];
+        let proof = |floor, entries: &[PrepareHeader], canonical: &[PrepareHeader]| {
+            let held: BTreeMap<_, _> = entries.iter().map(|header| (header.op, *header)).collect();
+            view_log_proof(floor, canonical, 6, |op| held.get(&op).copied())
+        };
+        assert_eq!(proof(2, &local, &canonical), ViewLogProof::Proven);
+        let mut gap = local.clone();
+        gap.remove(2);
+        assert_eq!(
+            proof(2, &gap, &canonical),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            }
+        );
+        let bridged = [local[3], local[2]];
+        assert_eq!(
+            proof(2, &gap, &bridged),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 0,
+            },
+            "a canonical header proves the prefix even while its body is missing"
+        );
+        gap[1].checksum += 10;
+        assert_eq!(proof(2, &gap, &bridged), ViewLogProof::Divergent(4));
+        assert_eq!(
+            proof(2, &gap, &canonical),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            },
+            "a gap cannot prove the held prefix divergent"
+        );
+        gap.insert(2, local[2]);
+        assert_eq!(proof(2, &gap, &canonical), ViewLogProof::Divergent(4));
+        assert_eq!(
+            proof(2, &local, &[]),
+            ViewLogProof::Missing {
+                op: 6,
+                unproven_through: 6
+            }
+        );
+        assert_eq!(proof(6, &local, &[]), ViewLogProof::Proven);
+    }
+
+    #[test]
+    fn given_blank_view_slots_when_proving_history_should_wait_for_evidence() {
+        const HEAD: u64 = 4;
+        let blank = crate::dvc_blank(HEAD);
+        let local = PrepareHeader {
+            op: HEAD,
+            parent: 3,
+            checksum: 4,
+            ..Default::default()
+        };
+        for held in [None, Some(local)] {
+            assert_eq!(
+                view_log_proof(HEAD - 1, &[blank], HEAD, |_| held),
+                ViewLogProof::Missing {
+                    op: HEAD,
+                    unproven_through: HEAD,
+                },
+                "a blank head cannot prove either a missing or held prepare divergent"
+            );
+        }
+        assert_eq!(
+            view_log_proof(HEAD - 2, &[local, crate::dvc_blank(HEAD - 1)], HEAD, |op| {
+                (op == HEAD).then_some(local)
+            }),
+            ViewLogProof::Missing {
+                op: HEAD - 1,
+                unproven_through: HEAD - 1,
+            },
+            "a blank predecessor cannot bridge a proof gap"
+        );
+    }
+
+    #[test]
+    fn given_commit_stamps_when_proving_history_should_require_a_sealed_contiguous_chain() {
+        const FLOOR: u64 = 2;
+        let headers: Vec<_> = (FLOOR + 1..=6)
+            .map(|op| PrepareHeader {
+                op,
+                parent: u128::from(op - 1),
+                checksum: u128::from(op),
+                commit: op - 1,
+                ..Default::default()
+            })
+            .collect();
+        let proof = |headers: &[PrepareHeader]| {
+            view_log_proof(FLOOR, &[], 5, |op| {
+                headers.iter().find(|header| header.op == op).copied()
+            })
+        };
+        assert_eq!(proof(&headers), ViewLogProof::Proven);
+        for damaged in [0, 1] {
+            let mut broken = headers.clone();
+            if damaged == 0 {
+                broken[1].checksum = CHECKSUM_UNSEALED;
+            } else {
+                broken[1].parent += 1;
+            }
+            assert_eq!(
+                proof(&broken),
+                ViewLogProof::Missing {
+                    op: 5,
+                    unproven_through: 5
+                },
+                "a later commit stamp must not bridge an unsealed or disconnected prefix"
+            );
+        }
+        let mut gap = headers;
+        gap.remove(1);
+        assert_eq!(
+            proof(&gap),
+            ViewLogProof::Missing {
+                op: 5,
+                unproven_through: 5
+            }
+        );
     }
 }

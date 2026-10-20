@@ -181,6 +181,136 @@ Latency grows with concurrency while throughput flattens, which is what a server
 shard threads with no blocking pool predicts. No failures at any level. Re-measure before quoting
 these anywhere: a release build will be substantially faster.
 
+### Category U — TLS listeners and client certificates
+
+Needs a running Iggy as in category S. Mint a CA, a server certificate for `127.0.0.1` and two client
+certificates, one for an Iggy user and one for a name no user has:
+
+```bash
+cd /tmp && mkdir -p certs && cd certs
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+  -subj '/CN=iggy kafka test CA' -keyout ca.key -out ca.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj '/CN=gateway' \
+  -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' -keyout server.key -out server.csr
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -copy_extensions copy \
+  -out server.pem
+for name in iggy nobody; do
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/O=Example/CN=$name" \
+    -keyout $name.key -out $name.csr
+  openssl x509 -req -in $name.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -out $name.pem
+done
+```
+
+Then a gateway with every listener, bridged (the bridge looks certificate identities up), with client
+certificates requested on the `SSL` listener and the common name as the Iggy username. The `SASL_SSL`
+listener asks for no client certificate whatever `IGGY_KAFKA_TLS_CLIENT_AUTH` says:
+
+```bash
+IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://127.0.0.1:9095 \
+  IGGY_KAFKA_TLS_CERT_FILE=/tmp/certs/server.pem IGGY_KAFKA_TLS_KEY_FILE=/tmp/certs/server.key \
+  IGGY_KAFKA_TLS_CLIENT_AUTH=requested IGGY_KAFKA_TLS_CLIENT_CA_FILE=/tmp/certs/ca.pem \
+  IGGY_KAFKA_TLS_PRINCIPAL_MAPPING_RULES='RULE:^CN=([^,]+).*$/$1/' \
+  IGGY_KAFKA_TLS_RELOAD_INTERVAL_SECS=5 \
+  IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+  IGGY_KAFKA_IGGY_USERNAME=iggy IGGY_KAFKA_IGGY_PASSWORD=iggy \
+  RUST_LOG=debug cargo run -p iggy-gateway-kafka
+```
+
+`KC` below is `docker run --rm --network host -v /tmp/certs:/certs:ro edenhill/kcat:1.7.1`, and
+`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:3.9.0`.
+
+| ID | Test | Command | Pass criteria | Last run |
+| ---- | ------ | --------- | --------------- | ---------- |
+| U1 | kcat, SSL | `KC -b 127.0.0.1:9094 -X security.protocol=SSL -X ssl.ca.location=/certs/ca.pem -L` | Metadata returned, broker `127.0.0.1:9094` | Pass |
+| U2 | kcat, SASL_SSL | `KC -b 127.0.0.1:9095 -X security.protocol=SASL_SSL -X ssl.ca.location=/certs/ca.pem -X sasl.mechanisms=PLAIN -X sasl.username=iggy -X sasl.password=iggy -L` | Metadata returned, broker `127.0.0.1:9095` | Pass |
+| U3 | kcat, client certificate | U1 plus `-X ssl.certificate.location=/certs/iggy.pem -X ssl.key.location=/certs/iggy.key` | Metadata returned; gateway log says `client certificate authenticated` with `username=iggy` | Pass |
+| U4 | kcat, unknown identity | U3 with `nobody.pem`/`nobody.key` | No metadata, connection closed; gateway log warns `names no active Iggy user` | Pass |
+| U5 | plaintext on the TLS port | `KC -b 127.0.0.1:9094 -L` | No metadata; librdkafka reports the connection closed | Pass |
+| U6 | Java, SSL | `client.properties` with `security.protocol=SSL`, `ssl.truststore.type=PEM`, `ssl.truststore.location=/certs/ca.pem`; `KAFKA /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:9094 --command-config /tmp/client.properties` | Lists the APIs of `127.0.0.1:9094`, with `SaslHandshake(17): UNSUPPORTED` | Pass |
+| U7 | Java, SASL_SSL | U6 with `security.protocol=SASL_SSL` and the S5 `sasl.*` lines, port 9095 | `SaslHandshake(17): 0 to 1 [usable: 1]` | Pass |
+| U8 | Java, client certificate | U6 plus `ssl.keystore.type=PEM`, `ssl.keystore.location=/certs/iggy-bundle.pem` (the key followed by the certificate in one file); `kafka-acls.sh ... --list` | Bindings with `principal=User:iggy` | Pass |
+| U9 | franz-go | see below | Metadata through SSL, SASL_SSL and with a client certificate | Pass |
+| U10 | Reload | Re-mint `server.pem`/`server.key` from a new CSR, wait past the interval, `openssl s_client -connect 127.0.0.1:9094 -CAfile /tmp/certs/ca.pem </dev/null 2>/dev/null \| openssl x509 -noout -serial` | The new serial, without restarting the gateway; log says `TLS certificate reloaded` | Pass |
+
+U1 to U8 and U10 are automated in `tests/kafka_client_e2e_tests.rs` and `tests/tls_listener_tests.rs`.
+U9 is manual, since the suite pulls no Go image. The program, with
+`go mod init probe && go get github.com/twmb/franz-go && go mod tidy` first, dials the broker in
+its first argument, presents the client certificate and key in its second and third when given,
+and authenticates with PLAIN when `SASL_USER` and `SASL_PASS` are set:
+
+```go
+package main
+
+import (
+    "context"
+    "crypto/tls"
+    "crypto/x509"
+    "fmt"
+    "os"
+
+    "github.com/twmb/franz-go/pkg/kgo"
+    "github.com/twmb/franz-go/pkg/kmsg"
+    "github.com/twmb/franz-go/pkg/sasl/plain"
+)
+
+func main() {
+    ca, err := os.ReadFile(os.Getenv("CA_FILE"))
+    if err != nil {
+        panic(err)
+    }
+    pool := x509.NewCertPool()
+    pool.AppendCertsFromPEM(ca)
+    cfg := &tls.Config{RootCAs: pool, ServerName: "localhost"}
+    if len(os.Args) > 3 {
+        cert, err := tls.LoadX509KeyPair(os.Args[2], os.Args[3])
+        if err != nil {
+            panic(err)
+        }
+        cfg.Certificates = []tls.Certificate{cert}
+    }
+    opts := []kgo.Opt{kgo.SeedBrokers(os.Args[1]), kgo.DialTLSConfig(cfg)}
+    if user := os.Getenv("SASL_USER"); user != "" {
+        opts = append(opts, kgo.SASL(plain.Auth{User: user, Pass: os.Getenv("SASL_PASS")}.AsMechanism()))
+    }
+    client, err := kgo.NewClient(opts...)
+    if err != nil {
+        panic(err)
+    }
+    defer client.Close()
+    req := kmsg.NewPtrMetadataRequest()
+    resp, err := req.RequestWith(context.Background(), client)
+    if err != nil {
+        fmt.Println("ERROR:", err)
+        os.Exit(1)
+    }
+    for _, b := range resp.Brokers {
+        fmt.Printf("broker %d at %s:%d\n", b.NodeID, b.Host, b.Port)
+    }
+    acls := kmsg.NewPtrDescribeACLsRequest()
+    acls.ResourceType = 1
+    acls.ResourcePatternType = 1
+    acls.Operation = 1
+    acls.PermissionType = 1
+    aresp, err := acls.RequestWith(context.Background(), client)
+    if err != nil {
+        fmt.Println("describe acls error:", err)
+        return
+    }
+    for _, r := range aresp.Resources {
+        for _, a := range r.ACLs {
+            fmt.Printf("acl %s %s on %s %s\n", a.Principal, a.Operation, r.ResourceType, r.ResourceName)
+        }
+    }
+}
+```
+
+Run it four ways, with `CA_FILE=/tmp/certs/ca.pem` exported: `go run . 127.0.0.1:9094`,
+`SASL_USER=iggy SASL_PASS=iggy go run . 127.0.0.1:9095`,
+`go run . 127.0.0.1:9094 /tmp/certs/iggy.pem /tmp/certs/iggy.key` and the same with
+`nobody.pem`/`nobody.key`. The first three print the one broker on the port they dialed, the SASL
+and certificate runs also list `User:iggy`'s bindings, and the last reports the broker closing the
+connection during `ApiVersions`.
+
 ### Category A — Smoke tests (must pass before check-in)
 
 The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:9092` (a real Kafka
@@ -214,7 +344,7 @@ For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-mes
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
-| 2 | ListOffsets | 1 | 6 | 0, 1, 6, 7 |
+| 2 | ListOffsets | 1 | 7 | 0, 1, 7, 8 |
 | 19 | CreateTopics | 2 | 5 | 1, 2, 5, 6 |
 | 20 | DeleteTopics | 1 | 5 | 0, 1, 5, 6 |
 | 8 | OffsetCommit | 2 | 9 | 1, 2, 9, 10 |
@@ -369,6 +499,38 @@ Record wall-clock time from `git clone` to I3 passing - README.md's Quick start 
 target for a new contributor ([#3539](https://github.com/apache/iggy/issues/3539) acceptance
 criteria).
 
+### Category J — ListOffsets by timestamp with AKHQ
+
+AKHQ reads a topic's first and last offsets with `ListOffsets` EARLIEST and LATEST, and its
+time search with `offsetsForTimes`. It is not in the automated suite, which would need one more
+CI image. Start Iggy with `iggy`/`iggy` root credentials and the gateway with
+`IGGY_KAFKA_BRIDGE_ENABLED=true` on `127.0.0.1:9093`, create stream `kafka` with topic `orders`
+(2 partitions), and send a few messages to each partition at different times. Then run AKHQ on
+the host network with this `application.yml`:
+
+```yaml
+micronaut:
+  server:
+    port: 18080
+akhq:
+  connections:
+    iggy:
+      properties:
+        bootstrap.servers: "127.0.0.1:9093"
+```
+
+```bash
+docker run -d --name akhq-iggy --network host \
+  -v "$PWD/application.yml:/app/application.yml:ro" tchiotludo/akhq:0.25.1
+```
+
+| ID | Test | Steps | Expected |
+| ---- | ------ | ------- | ---------- |
+| J1 | Topic sizes | `curl -s 'http://127.0.0.1:18080/api/iggy/topic?show=ALL'` | `orders` with `firstOffset` 0 and `lastOffset` equal to each partition's record count, and `size` the total |
+| J2 | Records | `curl -s 'http://127.0.0.1:18080/api/iggy/topic/orders/data?sort=OLDEST'` (also `sort=NEWEST`) | Every record, with its partition, offset, timestamp and value |
+| J3 | Time search | Add `&timestamp=<ISO-8601 time between two sends>` to J2 | Only the records sent after that time |
+| J4 | Teardown | `docker rm -f akhq-iggy` | Container removed |
+
 ---
 
 ## 4. Validation reference
@@ -379,16 +541,16 @@ criteria).
 | ------ | ------ | --------------- |
 | -1 | UNKNOWN_SERVER_ERROR | Produce with a bridge: Iggy error with no closer code, or bad bridge login |
 | 0 | NONE | Fetch top-level error field only (`ec=0` there does not mean per-partition success - see A6) |
-| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce with a bridge: missing topic or partition |
-| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection |
-| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored) |
+| 3 | UNKNOWN_TOPIC_OR_PARTITION | Metadata stub, per topic. Produce or ListOffsets with a bridge: missing topic or partition |
+| 6 | NOT_LEADER_OR_FOLLOWER | Produce/Fetch/ListOffsets stub (not stored). Produce with a bridge: Iggy unreachable, or the request budget ran out. Fetch with a bridge: Iggy unreachable, too slow, loading the partition, or an offset past the end in its first 30 s on the connection. ListOffsets with a bridge: Iggy unreachable, partition loading, Iggy refused the read for now, or a lookup by time polled empty without proof that no record matches |
+| 7 | REQUEST_TIMED_OUT | Produce with a bridge: deadline passed, or connection lost mid-send (may be stored). ListOffsets with a bridge: past the 100-topic cap, the request deadline passed, or a lookup by time ran out of its time |
 | 10 | MESSAGE_TOO_LARGE | Produce with a bridge: record, send or partition too large, even alone |
 | 17 | INVALID_TOPIC_EXCEPTION | Produce with a bridge: bad topic name |
 | 21 | INVALID_REQUIRED_ACKS | Produce with a bridge: `acks` is not 0, 1 or -1 |
 | 29 | TOPIC_AUTHORIZATION_FAILED | Produce with a bridge: Iggy user lacks permission |
 | 35 | UNSUPPORTED_VERSION | Out of range: **ApiVersions only** (KIP-511 exception); every other API key's out-of-range version closes the connection instead - see Category B. In range: InitProducerId with a `transactional_id`; Produce with a `transactional_id`, on every partition with or without a bridge (an `acks=0` one closes instead); and, with a bridge, a transactional or control batch - transactions are not supported, see `SCOPE.md` |
-| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` (or any non-positive on v2–v3) |
-| 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` (or any non-positive on v2–v3) |
+| 37 | INVALID_PARTITIONS | CreateTopics: partition count `0` or `< -1` |
+| 38 | INVALID_REPLICATION_FACTOR | CreateTopics: replication factor `0` or `< -1` |
 | 41 | NOT_CONTROLLER | CreateTopics stub (topic not created) |
 | 42 | INVALID_REQUEST | Fetch/ListOffsets/CreateTopics/ApiVersions decode failure. Not Produce: it closes the connection (H1) |
 | 76 | UNSUPPORTED_COMPRESSION_TYPE | Produce with a bridge: zstd before v7 |
@@ -461,6 +623,7 @@ kcat version (if used): ___________
 [ ] G1–G11  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3; G11's default `--describe` is expected to fail)
 [ ] H1–H6  Adversarial input
 [ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
+[ ] J1–J4  AKHQ ListOffsets by timestamp
 
 Automated regression:
 [ ] cargo test -p iggy-gateway-kafka — all passed (see `TEST_SUITE.md` for why this checklist

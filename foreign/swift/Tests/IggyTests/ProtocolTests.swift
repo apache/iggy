@@ -122,13 +122,13 @@ struct CommandCodeTests {
 
     @Test func namesMatchTheDispatchTable() {
         #expect(CommandCode.bindSession.name == "session.bind")
-        #expect(CommandCode.getSendContext.name == "message.send_context")
-        #expect(CommandCode(rawValue: 105) == .getSendContext)
+        #expect(CommandCode.getPartitionRoute.name == "partition.route")
+        #expect(CommandCode(rawValue: 105) == .getPartitionRoute)
         #expect(Set(CommandCode.allCases.map(\.name)).count == CommandCode.allCases.count)
     }
 
     @Test func nonReplicatedCodesCarryNoOperation() {
-        for code in [CommandCode.bindSession, .getSendContext, .pollMessages, .getPollRouting] {
+        for code in [CommandCode.bindSession, .getPartitionRoute, .pollMessages, .getPollRouting] {
             #expect(ConsensusOperation.forCode(code.rawValue) == .nonReplicated)
         }
     }

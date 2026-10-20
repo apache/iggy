@@ -24,9 +24,9 @@ use crate::stm::user::UsersSnapshot;
 
 /// The snapshot format version written by this build.
 ///
-/// Each version identifies a serialized shape. Bump it when fields change,
-/// including nested fields: `MessagePack` encodes structs positionally, so a
-/// layout change can reinterpret bytes without a deserialization error.
+/// Each version identifies a serialized shape and its invariants. Bump it when
+/// fields change, including nested fields: `MessagePack` encodes structs
+/// positionally, so a layout change can reinterpret bytes without an error.
 ///
 /// [`MetadataSnapshot::decode`] accepts versions from
 /// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] through this version. Older accepted
@@ -56,7 +56,10 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 11: streams also persist pending lifecycle intents, and each
 /// `TopicSnapshot` the op of its last consumer group catalog change.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 11;
+///
+/// Version 12: pending consumer group owner generations equal their metadata
+/// operation, replacing independently incremented generations.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 12;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -604,7 +607,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 11;
+        const PINNED_VERSION: u32 = 12;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -615,7 +618,7 @@ mod tests {
         );
         assert_eq!(
             SNAPSHOT_FORMAT_VERSION, PINNED_VERSION,
-            "SNAPSHOT_FORMAT_VERSION moved; confirm the shape moved with it"
+            "SNAPSHOT_FORMAT_VERSION moved; confirm the shape or invariants changed with it"
         );
     }
 
@@ -795,6 +798,19 @@ mod tests {
             assert!(matches!(MetadataSnapshot::decode(&bytes),
                 Err(SnapshotError::UnsupportedFormatVersion { found, .. }) if found == version));
         }
+    }
+
+    #[test]
+    fn given_independent_owner_generation_format_when_decoding_should_refuse_before_restore() {
+        const INDEPENDENT_OWNER_GENERATION_FORMAT: u32 = 11;
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = INDEPENDENT_OWNER_GENERATION_FORMAT;
+        let encoded = snapshot.encode().unwrap();
+        assert!(matches!(
+            MetadataSnapshot::decode(&encoded),
+            Err(SnapshotError::UnsupportedFormatVersion { found, expected })
+                if found == INDEPENDENT_OWNER_GENERATION_FORMAT && expected == SNAPSHOT_FORMAT_VERSION
+        ));
     }
 
     #[test]
