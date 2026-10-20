@@ -33,7 +33,7 @@ use iggy_common::defaults::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use journal::prepare_journal::read_first_prepare_header;
+use journal::prepare_journal::find_prepare_header;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
@@ -76,7 +76,6 @@ pub(in crate::boot) type RootCredentials = CreateUserRequest;
 pub async fn initialize_root_user<B, J, S, SB, Sleep>(
     shard: &Rc<ShellShard<B, J, S, SB>>,
     root_credentials: Option<&CreateUserRequest>,
-    cluster_enabled: bool,
     shutdown: ShutdownToken,
     sleep: impl Fn(Duration) -> Sleep,
 ) -> Result<(), ServerError>
@@ -108,7 +107,11 @@ where
             last_log.is_none_or(|last: Instant| last.elapsed() >= ROOT_INITIALIZATION_LOG_INTERVAL);
         if metadata.is_caught_up_primary() && !root_in_progress {
             let Some(credentials) = root_credentials else {
-                if !cluster_enabled {
+                if metadata
+                    .consensus
+                    .as_ref()
+                    .is_none_or(|consensus| consensus.replica_count() == 1)
+                {
                     return Err(ServerError::RootCredentialsRequired {
                         username_env: IGGY_ROOT_USERNAME_ENV,
                         password_env: IGGY_ROOT_PASSWORD_ENV,
@@ -218,7 +221,8 @@ pub(in crate::boot) fn resolve_root_credentials(
 ) -> Result<Option<RootCredentials>, ServerError> {
     let metadata_path = Path::new(&config.path).join(METADATA_DIR);
     let persisted_root = validate_root_journal(&metadata_path)?;
-    let seed_required = !config.cluster.enabled && !persisted_root;
+    let is_solo = !config.cluster.enabled || config.cluster.nodes.len() == 1;
+    let seed_required = is_solo && !persisted_root;
     let username = env::var(IGGY_ROOT_USERNAME_ENV).ok();
     let password = env::var(IGGY_ROOT_PASSWORD_ENV).ok();
 
@@ -263,9 +267,12 @@ fn validate_root_journal(metadata_path: &Path) -> Result<bool, ServerError> {
         return Ok(true);
     }
     let path = metadata_path.join("journal.wal");
-    let Some(header) = read_first_prepare_header(&path)
-        .map_err(|error| ServerError::MetadataRecovery(RecoveryError::Io(error)))?
-    else {
+    let result = find_prepare_header(&path, 1)
+        .map_err(|error| ServerError::MetadataRecovery(RecoveryError::Io(error)))?;
+    let Some(header) = result.header else {
+        if result.has_entries {
+            return Err(ServerError::RootBootstrapMissing { path });
+        }
         return Ok(false);
     };
     if header.op != 1
@@ -277,6 +284,8 @@ fn validate_root_journal(metadata_path: &Path) -> Result<bool, ServerError> {
             path,
             op: header.op,
             operation: header.operation,
+            client: header.client,
+            user_id: header.user_id,
         });
     }
     Ok(true)
@@ -572,6 +581,51 @@ mod tests {
     use iggy_binary_protocol::{Command, HEADER_SIZE};
 
     #[test]
+    fn given_reordered_prepares_when_validating_should_find_the_latest_root_op_one() {
+        let metadata_path = tempfile::tempdir().unwrap();
+        let journal_path = metadata_path.path().join("journal.wal");
+        let root = root_prepare_header(1, Operation::CreateUser);
+        let other = root_prepare_header(2, Operation::Register);
+        for headers in [[root, other], [other, root]] {
+            let bytes: Vec<_> = headers
+                .iter()
+                .flat_map(|header| bytemuck::bytes_of(header).iter().copied())
+                .collect();
+            std::fs::write(&journal_path, &bytes).unwrap();
+            assert!(validate_root_journal(metadata_path.path()).unwrap());
+            assert_eq!(std::fs::read(&journal_path).unwrap(), bytes);
+        }
+        let wrong_root = root_prepare_header(1, Operation::Register);
+        for (headers, valid) in [([wrong_root, root], true), ([root, wrong_root], false)] {
+            let bytes: Vec<_> = headers
+                .iter()
+                .flat_map(|header| bytemuck::bytes_of(header).iter().copied())
+                .collect();
+            std::fs::write(&journal_path, &bytes).unwrap();
+            assert_eq!(validate_root_journal(metadata_path.path()).is_ok(), valid);
+            assert_eq!(std::fs::read(&journal_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn given_complete_prepares_without_op_one_when_validating_should_refuse_before_replay() {
+        let metadata_path = tempfile::tempdir().unwrap();
+        let journal_path = metadata_path.path().join("journal.wal");
+        let header = root_prepare_header(2, Operation::CreateUser);
+        let bytes = bytemuck::bytes_of(&header);
+        std::fs::write(&journal_path, bytes).unwrap();
+        let error = validate_root_journal(metadata_path.path()).unwrap_err();
+        assert!(
+            matches!(&error, ServerError::RootBootstrapMissing { path } if path == &journal_path)
+        );
+        let message = error.to_string();
+        assert!(message.contains("no validated op 1"));
+        assert!(message.contains("at most one replica at a time"));
+        assert!(message.contains("others hold quorum"));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), bytes);
+    }
+
+    #[test]
     fn given_a_journal_without_root_creation_when_bootstrapping_should_refuse_without_modifying_it()
     {
         for sealed in [false, true] {
@@ -594,7 +648,7 @@ mod tests {
             let error = validate_root_journal(metadata_path.path()).unwrap_err();
             assert!(matches!(
                 &error,
-                ServerError::RootBootstrapNotPersisted { path, op: 1, operation: Operation::Register }
+                ServerError::RootBootstrapNotPersisted { path, op: 1, operation: Operation::Register, .. }
                     if path == &journal_path
             ));
             let message = error.to_string();
@@ -602,6 +656,8 @@ mod tests {
             assert!(message.contains("op 1, operation Register"));
             assert!(message.contains("metadata/snapshot.bin"));
             assert!(message.contains("--fresh"));
+            assert!(message.contains("at most one replica at a time"));
+            assert!(message.contains("others hold quorum"));
             assert_eq!(
                 std::fs::read(journal_path).expect("unchanged journal"),
                 bytes
@@ -648,6 +704,18 @@ mod tests {
         std::fs::write(metadata_path.path().join(SNAPSHOT_FILE_NAME), []).unwrap();
         std::fs::write(metadata_path.path().join("journal.wal"), [0u8; HEADER_SIZE]).unwrap();
         assert!(validate_root_journal(metadata_path.path()).unwrap());
+    }
+
+    fn root_prepare_header(op: u64, operation: Operation) -> PrepareHeader {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            operation,
+            op,
+            size: u32::try_from(HEADER_SIZE).unwrap(),
+            ..PrepareHeader::default()
+        };
+        header.checksum = header.identity_checksum();
+        header
     }
 
     #[test]

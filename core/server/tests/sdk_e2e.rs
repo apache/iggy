@@ -26,6 +26,7 @@
 
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{Client, IggyClientBuilder, UserClient};
+use iggy_binary_protocol::{HEADER_SIZE, PrepareHeader};
 use std::fs::File;
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::path::{Path, PathBuf};
@@ -122,32 +123,52 @@ fn given_fresh_data_dir_without_root_credentials_when_server_starts_should_exit_
 }
 
 #[test]
-fn given_a_cluster_waiting_for_root_when_terminated_should_exit_successfully() {
+fn given_a_single_replica_cluster_without_root_credentials_when_started_should_exit_with_error() {
     let workspace = TempDir::new().unwrap();
-    let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
-    let replica = StdTcpListener::bind("127.0.0.1:0").unwrap();
-    let tcp_addr = tcp.local_addr().unwrap();
-    let child = server_command(workspace.path())
-        .args(["--replica-id", "0"])
-        .env("IGGY_CLUSTER_ENABLED", "true")
-        .env("IGGY_CLUSTER_NODES_0_NAME", "node-0")
-        .env("IGGY_CLUSTER_NODES_0_IP", "127.0.0.1")
-        .env("IGGY_CLUSTER_NODES_0_REPLICA_ID", "0")
-        .env(
-            "IGGY_CLUSTER_NODES_0_PORTS_TCP",
-            tcp_addr.port().to_string(),
-        )
-        .env(
-            "IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA",
-            replica.local_addr().unwrap().port().to_string(),
-        )
-        .spawn()
-        .unwrap();
+    let (mut command, tcp_addr) = cluster_server_command(workspace.path(), 1);
+    let child = command.spawn().unwrap();
     let mut server = TestServer {
         child,
         tcp_addr,
         workspace,
     };
+    let status = wait_for_exit(&mut server.child, STARTUP_TIMEOUT).unwrap();
+    let output = read_process_output(server.workspace.path());
+    assert!(
+        !status.success(),
+        "fresh solo cluster unexpectedly started: {output}"
+    );
+    assert!(
+        output.contains("Root credentials are required"),
+        "unexpected boot failure: {output}"
+    );
+    assert!(
+        !server
+            .workspace
+            .path()
+            .join("data/runtime/current_config.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn given_a_cluster_waiting_for_root_when_terminated_should_exit_successfully() {
+    let workspace = TempDir::new().unwrap();
+    let (mut command, tcp_addr) = cluster_server_command(workspace.path(), 3);
+    let child = command.spawn().unwrap();
+    let mut server = TestServer {
+        child,
+        tcp_addr,
+        workspace,
+    };
+    wait_for_bound_tcp(
+        &server
+            .workspace
+            .path()
+            .join("data/runtime/current_config.toml"),
+        STARTUP_TIMEOUT,
+    )
+    .unwrap();
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         let output = read_process_output(server.workspace.path());
@@ -231,6 +252,33 @@ async fn given_root_credentials_when_restarting_without_them_should_recover_root
         };
         server.assert_root_login(username, password).await;
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn given_repaired_wal_order_when_restarted_without_credentials_should_recover_root() {
+    let mut server = TestServer::start();
+    server
+        .assert_root_login(SENTINEL_ROOT_USERNAME, SENTINEL_ROOT_PASSWORD)
+        .await;
+    assert!(server.stop().success());
+    let path = server.data_path().join("metadata/journal.wal");
+    let bytes = std::fs::read(&path).unwrap();
+    let mut remaining = bytes.as_slice();
+    let mut entries = Vec::new();
+    while !remaining.is_empty() {
+        let header =
+            bytemuck::checked::pod_read_unaligned::<PrepareHeader>(&remaining[..HEADER_SIZE]);
+        let (entry, tail) = remaining.split_at(header.size as usize);
+        entries.push(entry);
+        remaining = tail;
+    }
+    assert!(entries.len() >= 2);
+    entries.swap(0, 1);
+    std::fs::write(&path, entries.concat()).unwrap();
+    server.restart_without_credentials();
+    server
+        .assert_root_login(SENTINEL_ROOT_USERNAME, SENTINEL_ROOT_PASSWORD)
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -374,6 +422,7 @@ fn server_command(workspace: &Path) -> Command {
     let stdout = File::create(workspace.join(STDOUT_FILE)).expect("stdout capture file");
     let stderr = File::create(workspace.join(STDERR_FILE)).expect("stderr capture file");
     command
+        .env("RUST_LOG", "info")
         .env_remove(ROOT_USERNAME_ENV)
         .env_remove(ROOT_PASSWORD_ENV)
         .env("IGGY_ENV_PATH", workspace.join("absent.env"))
@@ -392,6 +441,47 @@ fn server_command(workspace: &Path) -> Command {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     command
+}
+
+fn cluster_server_command(workspace: &Path, replica_count: usize) -> (Command, SocketAddr) {
+    let reservations: Vec<_> = (0..replica_count * 2)
+        .map(|_| StdTcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let tcp_addr = reservations[0].local_addr().unwrap();
+    let mut command = server_command(workspace);
+    command
+        .args(["--replica-id", "0"])
+        .env("IGGY_CLUSTER_ENABLED", "true")
+        .env("IGGY_MESSAGE_BUS_RECONNECT_PERIOD", "100ms");
+    for node in 0..replica_count {
+        command
+            .env(
+                format!("IGGY_CLUSTER_NODES_{node}_NAME"),
+                format!("node-{node}"),
+            )
+            .env(format!("IGGY_CLUSTER_NODES_{node}_IP"), "127.0.0.1")
+            .env(
+                format!("IGGY_CLUSTER_NODES_{node}_REPLICA_ID"),
+                node.to_string(),
+            )
+            .env(
+                format!("IGGY_CLUSTER_NODES_{node}_PORTS_TCP"),
+                reservations[node * 2]
+                    .local_addr()
+                    .unwrap()
+                    .port()
+                    .to_string(),
+            )
+            .env(
+                format!("IGGY_CLUSTER_NODES_{node}_PORTS_TCP_REPLICA"),
+                reservations[node * 2 + 1]
+                    .local_addr()
+                    .unwrap()
+                    .port()
+                    .to_string(),
+            );
+    }
+    (command, tcp_addr)
 }
 
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {

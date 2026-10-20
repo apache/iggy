@@ -26,6 +26,8 @@ use std::error::Error as _;
 use std::path::PathBuf;
 use thiserror::Error;
 
+const ROOT_BOOTSTRAP_RECOVERY: &str = "Restore a compatible data directory containing metadata/snapshot.bin, or use --fresh to delete local data. In multi-node clusters, use --fresh on at most one replica at a time while the others hold quorum.";
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServerError {
@@ -334,13 +336,21 @@ pub enum ServerError {
     #[error("Root initialization was rejected with status {status}")]
     RootInitializationRejected { status: u32 },
     #[error(
-        "Metadata journal at {path} starts with op {op}, operation {operation:?}, without persisted root initialization. Restore a compatible data directory containing metadata/snapshot.bin, or use --fresh to delete this replica's local data and start again."
+        "Metadata journal at {path} has op {op}, operation {operation:?}, client {client}, user_id {user_id}. Expected root CreateUser at op 1 from client 0 and user_id 0. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
     )]
     RootBootstrapNotPersisted {
         path: PathBuf,
         op: u64,
         operation: Operation,
+        client: u128,
+        user_id: u32,
     },
+    #[error(
+        "Metadata journal at {path} contains complete prepares but no validated op 1. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapMissing { path: PathBuf },
     #[error(
         "{provided_env} is set but {missing_env} is not; the root user credentials must be \
          provided as a pair"

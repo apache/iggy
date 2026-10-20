@@ -74,37 +74,59 @@ pub(crate) const SLOT_COUNT: usize = 1024;
 /// journal_slots` in the server config).
 pub const DEFAULT_SLOT_COUNT: usize = SLOT_COUNT;
 
-/// Inspect the first complete prepare using the recovery scan's integrity checks.
-/// An absent, incomplete, or corrupt entry is left for the recovery scan.
+#[derive(Debug, Default)]
+pub struct PrepareHeaderSearch {
+    pub header: Option<PrepareHeader>,
+    pub has_entries: bool,
+}
+
+/// Find the latest complete prepare for an op using the recovery scan's integrity checks.
+///
+/// Physical WAL order can differ from op order after repair. A damaged suffix is left
+/// for the recovery scan without changing the file.
 ///
 /// # Errors
 /// Returns an error if the WAL cannot be opened or read.
-pub fn read_first_prepare_header(path: &Path) -> io::Result<Option<PrepareHeader>> {
+pub fn find_prepare_header(path: &Path, op: u64) -> io::Result<PrepareHeaderSearch> {
+    let mut result = PrepareHeaderSearch::default();
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(result),
         Err(error) => return Err(error),
     };
+    let file_len = file.metadata()?.len();
+    let mut position = 0;
     let mut scratch = Owned::<16>::zeroed(HEADER_SIZE);
     let mut bytes = [0u8; HEADER_SIZE];
-    match file.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+    let mut body = Vec::new();
+    while file_len - position >= HEADER_SIZE as u64 {
+        match file.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        let Some(header) = valid_entry_header(&mut scratch, &bytes) else {
+            break;
+        };
+        if u64::from(header.size) > file_len - position || !valid_header_checksum(&header) {
+            break;
+        }
+        body.resize(header.size as usize - HEADER_SIZE, 0);
+        match file.read_exact(&mut body) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        if !valid_body_checksum(&header, &body) {
+            break;
+        }
+        result.has_entries = true;
+        if header.op == op {
+            result.header = Some(header);
+        }
+        position += u64::from(header.size);
     }
-    let Some(header) = valid_entry_header(&mut scratch, &bytes) else {
-        return Ok(None);
-    };
-    if u64::from(header.size) > file.metadata()?.len() || !valid_header_checksum(&header) {
-        return Ok(None);
-    }
-    let mut body = vec![0u8; header.size as usize - HEADER_SIZE];
-    match file.read_exact(&mut body) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    Ok(valid_body_checksum(&header, &body).then_some(header))
+    Ok(result)
 }
 
 /// Error type for journal operations.
@@ -1388,14 +1410,38 @@ mod tests {
         let path = directory.path().join("journal.wal");
         let entry = make_identity_sealed_prepare(1, 64, 0);
         std::fs::write(&path, entry.as_slice()).unwrap();
-        let header = read_first_prepare_header(&path).unwrap().unwrap();
+        let header = find_prepare_header(&path, 1).unwrap().header.unwrap();
         assert_eq!(header.op, 1);
         assert_eq!(header.operation, Operation::CreateStream);
         assert_eq!(std::fs::read(&path).unwrap(), entry.as_slice());
         let unsealed = make_unsealed_prepare(1, 64);
         std::fs::write(&path, unsealed.as_slice()).unwrap();
-        assert_eq!(read_first_prepare_header(&path).unwrap().unwrap().op, 1);
+        assert_eq!(find_prepare_header(&path, 1).unwrap().header.unwrap().op, 1);
         assert_eq!(std::fs::read(&path).unwrap(), unsealed.as_slice());
+    }
+
+    #[test]
+    fn given_reordered_prepares_when_finding_an_op_should_return_the_latest_complete_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.wal");
+        let entries = [
+            make_identity_sealed_prepare(2, 64, 0),
+            make_identity_sealed_prepare(1, 64, 0),
+            make_identity_sealed_prepare(1, 128, 0),
+            make_identity_sealed_prepare(3, 64, 0),
+        ];
+        let bytes: Vec<_> = entries
+            .iter()
+            .flat_map(|entry| entry.as_slice().iter().copied())
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let found = find_prepare_header(&path, 1).unwrap();
+        assert!(found.has_entries);
+        assert_eq!(found.header.unwrap().checksum, entries[2].header().checksum);
+        let missing = find_prepare_header(&path, 4).unwrap();
+        assert!(missing.has_entries);
+        assert!(missing.header.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]
@@ -1435,11 +1481,11 @@ mod tests {
             }
             invalid_entries.push(corrupt);
         }
-        assert!(read_first_prepare_header(&path).unwrap().is_none());
+        assert!(find_prepare_header(&path, 1).unwrap().header.is_none());
         assert!(!path.exists());
         for bytes in invalid_entries {
             std::fs::write(&path, &bytes).unwrap();
-            assert!(read_first_prepare_header(&path).unwrap().is_none());
+            assert!(find_prepare_header(&path, 1).unwrap().header.is_none());
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
     }

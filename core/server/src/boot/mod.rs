@@ -87,7 +87,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-3\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-4\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -1239,6 +1239,7 @@ mod tests {
             b"IGGY-OWNERSHIP-HISTORY-4\n",
             b"IGGY-OWNERSHIP-HISTORY-5\n",
             b"IGGY-BOUND-GRANTS-2\n",
+            b"IGGY-BOUND-GRANTS-3\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
@@ -1265,6 +1266,17 @@ mod tests {
         }
         std::fs::write(&marker, STORAGE_FORMAT).unwrap();
         assert!(validate_storage_format(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn given_different_root_bootstrap_formats_when_identifying_replicas_should_reject_mixing() {
+        assert_ne!(
+            message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
+            message_bus::replica::handshake::binary_identity(
+                crate::VERSION,
+                b"IGGY-BOUND-GRANTS-3\n"
+            ),
+        );
     }
 
     #[test]

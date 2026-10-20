@@ -74,7 +74,6 @@ pub(in crate::boot) async fn start_tcp_runtime(
         initialize_root_user(
             shard,
             root_credentials,
-            config.cluster.enabled,
             shard.bus.token(),
             compio::time::sleep,
         )
@@ -179,7 +178,6 @@ pub(in crate::boot) async fn start_tcp_runtime(
     initialize_root_user(
         shard,
         root_credentials,
-        config.cluster.enabled,
         shard.bus.token(),
         compio::time::sleep,
     )

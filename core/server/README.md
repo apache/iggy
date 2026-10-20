@@ -47,7 +47,7 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-BOUND-GRANTS-3` storage gate
+complete partition view changes. The `IGGY-BOUND-GRANTS-4` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 Cached replies now preserve a committed-result marker, which older receipts lack.
 No in-place upgrade or implicit migration is supported. A separately validated
@@ -57,7 +57,9 @@ The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IG
 
 Releases up to 0.9 printed a generated password to stdout, and 0.9 also wrote it to the log file. Change any root password that was generated, and delete log files and container logs that still hold it. Snapshots redact that legacy log line.
 
-Older journals can lack a root-creation operation because previous servers created root only in memory. If no metadata checkpoint preserves root, this version refuses those journals before replay. The error identifies the journal path and its first operation. Restore a compatible data directory that contains `metadata/snapshot.bin`, or use `--fresh` to delete this replica's local data and start again. It cannot safely assign user IDs from an empty user list.
+Older journals can lack root creation because earlier servers created root only in memory. Without a metadata checkpoint, this server searches the whole journal for op 1 because repair can write operations out of order. A journal with complete entries but no validated root creation is rejected before replay to keep user IDs stable.
+
+The error identifies the journal path and any unexpected op 1 fields. Restore a compatible data directory containing `metadata/snapshot.bin`, or use `--fresh` to delete local data. In multi-node clusters, use `--fresh` on at most one replica at a time while the others hold quorum.
 
 The diagnostic snapshot (`POST /snapshot`, the binary `GET_SNAPSHOT_FILE` command, `iggy snapshot`) now requires the `manage_servers` permission. `read_servers` alone is rejected, because the archive carries raw server logs and host diagnostics.
 
@@ -222,7 +224,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-BOUND-GRANTS-3` requires this initialization contract;
+Storage format `IGGY-BOUND-GRANTS-4` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

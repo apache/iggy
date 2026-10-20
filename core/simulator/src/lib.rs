@@ -2016,7 +2016,6 @@ mod tests {
             let outcome = server::boot::initialize_root_user(
                 &shard,
                 credentials.as_ref(),
-                true,
                 token,
                 |duration| timer.sleep(duration),
             )
@@ -2169,6 +2168,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn given_a_solo_replica_without_credentials_when_initializing_root_should_fail_without_waiting()
+    {
+        let mut sim = Simulator::build_inner(
+            1,
+            1,
+            std::iter::empty(),
+            PacketSimulatorOptions::default(),
+            true,
+            None,
+            false,
+        );
+        let initialization = start_root_initialization(&mut sim, 0, false);
+        sim.step();
+        assert!(matches!(
+            *initialization.result.borrow(),
+            Some(Err(
+                server::server_error::ServerError::RootCredentialsRequired { .. }
+            ))
+        ));
+        assert_eq!(sim.replicas[0].metadata_journal.last_op(), None);
     }
 
     #[test]
