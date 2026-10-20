@@ -220,10 +220,6 @@ pub(in crate::http) struct HttpInner {
     /// clients out of the shared VSR client table. Read by `resolve_session`
     /// when admitting a fresh session.
     pub(in crate::http) max_http_sessions: usize,
-    /// Configured `[personal_access_token] max_tokens_per_user`, enforced
-    /// pre-consensus by the PAT rewrite inside the write submit (the cap is
-    /// config-derived, so it must never branch inside the replicated apply).
-    pub(in crate::http) max_tokens_per_user: u32,
     /// Awaited partition writes currently in flight across all sessions, gated
     /// by [`MAX_IN_FLIGHT_WRITES_GLOBAL`]. Only [`InFlightWriteGuard`] touches
     /// it, so every admission is paired with exactly one release.

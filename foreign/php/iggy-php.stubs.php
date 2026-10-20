@@ -81,8 +81,17 @@ namespace Iggy {
          * Constructs a new IggyClient from a TCP server address.
          *
          * @param string|null $conn
+         * @param mixed $pending_operations
          */
-        public function __construct(?string $conn = null) {}
+        public function __construct(?string $conn = null, mixed $pending_operations = null) {}
+
+        /**
+         * Releases a retained operation without claiming whether it committed.
+         *
+         * @param string $operation_id
+         * @return void
+         */
+        public function abandonOperation(string $operation_id): void {}
 
         /**
          * Connects the IggyClient to its service.
@@ -100,20 +109,20 @@ namespace Iggy {
          * @param string $name
          * @param string $stream
          * @param string $topic
-         * @param int|null $partition_id
+         * @param mixed $partition_id
          * @param \Iggy\PollingStrategy|null $polling_strategy
-         * @param int|null $batch_length
+         * @param mixed $batch_length
          * @param \Iggy\AutoCommit|null $auto_commit
          * @param bool $create_consumer_group_if_not_exists
          * @param bool $auto_join_consumer_group
-         * @param int|null $poll_interval_micros
-         * @param int|null $polling_retry_interval_micros
-         * @param int|null $init_retries
-         * @param int|null $init_retry_interval_micros
+         * @param mixed $poll_interval_micros
+         * @param mixed $polling_retry_interval_micros
+         * @param mixed $init_retries
+         * @param mixed $init_retry_interval_micros
          * @param bool $allow_replay
          * @return \Iggy\Consumer
          */
-        public function consumerGroup(string $name, string $stream, string $topic, ?int $partition_id = null, ?\Iggy\PollingStrategy $polling_strategy = null, ?int $batch_length = null, ?\Iggy\AutoCommit $auto_commit = null, bool $create_consumer_group_if_not_exists = true, bool $auto_join_consumer_group = true, ?int $poll_interval_micros = null, ?int $polling_retry_interval_micros = null, ?int $init_retries = null, ?int $init_retry_interval_micros = null, bool $allow_replay = false): \Iggy\Consumer {}
+        public function consumerGroup(string $name, string $stream, string $topic, mixed $partition_id = null, ?\Iggy\PollingStrategy $polling_strategy = null, mixed $batch_length = null, ?\Iggy\AutoCommit $auto_commit = null, bool $create_consumer_group_if_not_exists = true, bool $auto_join_consumer_group = true, mixed $poll_interval_micros = null, mixed $polling_retry_interval_micros = null, mixed $init_retries = null, mixed $init_retry_interval_micros = null, bool $allow_replay = false): \Iggy\Consumer {}
 
         /**
          * Creates a new stream.
@@ -132,17 +141,17 @@ namespace Iggy {
          * @param string $name
          * @param int $partitions_count
          * @param string|null $compression_algorithm
-         * @param int|null $message_expiry_micros
-         * @param int|null $max_topic_size
-         * @param int|null $segment_size
+         * @param mixed $message_expiry_micros
+         * @param mixed $max_topic_size
+         * @param mixed $segment_size
          * @param \Iggy\Durability|null $durability
          * @param \Iggy\Durability|null $consumer_offset_durability
-         * @param int|null $messages_required_to_save
-         * @param int|null $size_of_messages_required_to_save
+         * @param mixed $messages_required_to_save
+         * @param mixed $size_of_messages_required_to_save
          * @param bool|null $preallocate_segments
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
 
         /**
          * Deletes a stream by id or name.
@@ -222,6 +231,17 @@ namespace Iggy {
          * @return array
          */
         public function pollMessages(mixed $stream, mixed $topic, int $partition_id, \Iggy\PollingStrategy $polling_strategy, int $count, bool $auto_commit): array {}
+
+        /**
+         * Replays an exact retained operation. A committed rejection raises its original error
+         * and releases its lane; uncertainty keeps it retained. HTTP is unsupported.
+         * Operation IDs use decimal strings to preserve the full unsigned 64-bit range.
+         *
+         * @param string $operation_id
+         * @param mixed $timeout_micros
+         * @return void
+         */
+        public function resolveOperation(string $operation_id, mixed $timeout_micros = null): void {}
 
         /**
          * Sends a command code with a payload and returns the raw response bytes.
@@ -481,6 +501,23 @@ namespace Iggy {
          * @param int $metadata_op
          */
         public function __construct(int $incarnation, int $owner_generation, int $metadata_op) {}
+    }
+
+    /**
+     * Client-wide limits for active and retained mutation frames, including queued writer bytes.
+     */
+    class PendingOperationsConfig {
+        public readonly int $max_bytes;
+
+        public readonly int $max_operations;
+
+        /**
+         * Defaults to 256 operations and 64 MiB of headers and bodies.
+         *
+         * @param mixed $max_operations
+         * @param mixed $max_bytes
+         */
+        public function __construct(mixed $max_operations = null, mixed $max_bytes = null) {}
     }
 
     class PollingStrategy {
@@ -744,6 +781,19 @@ namespace Iggy\Exception {
     }
 
     class NotFoundException extends \Iggy\Exception\IggyException {
+        public function __construct() {}
+    }
+
+    class PendingOperationException extends \Iggy\Exception\IggyException {
+        public readonly string $kind;
+
+        /**
+         * Exact unsigned 64-bit operation ID, represented as a decimal string.
+         *
+         * @var string
+         */
+        public readonly string $operation_id;
+
         public function __construct() {}
     }
 

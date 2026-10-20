@@ -62,7 +62,7 @@ class LoginRoutingHookTest {
         var attempts = new AtomicInteger();
 
         var identity = LoginRoutingHook.NONE
-                .loginOnLeader(() -> {
+                .loginOnLeader(deadline -> {
                     attempts.incrementAndGet();
                     return CompletableFuture.completedFuture(IDENTITY);
                 })
@@ -83,7 +83,7 @@ class LoginRoutingHookTest {
         return loginAttempt -> {
             events.add("route");
             try {
-                loginAttempt.get();
+                loginAttempt.apply(0);
             } catch (LoginAttemptReached expected) {
                 return CompletableFuture.completedFuture(IDENTITY);
             }

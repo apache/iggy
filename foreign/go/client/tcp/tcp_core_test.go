@@ -20,6 +20,8 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -70,28 +72,6 @@ func TestExchange_ReportsAContextThatIsAlreadyDone(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client, _ := newPipeClient(t)
 			_, err := client.SendBinaryRequest(test.ctx, uint32(command.PingCode), nil)
-			assert.ErrorIs(t, err, test.want)
-		})
-	}
-}
-
-func TestExchange_RefusesToSendWhileNotConnected(t *testing.T) {
-	tests := []struct {
-		name  string
-		state iggcon.TransportState
-		want  error
-	}{
-		{name: "shutdown", state: iggcon.TransportStateShutdown, want: ierror.ErrClientShutdown},
-		{name: "disconnected", state: iggcon.TransportStateDisconnected, want: ierror.ErrNotConnected},
-		{name: "connecting", state: iggcon.TransportStateConnecting, want: ierror.ErrNotConnected},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			client, _ := newPipeClient(t)
-			client.transportState = test.state
-			client.config.reconnection.enabled = false
-
-			_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
 			assert.ErrorIs(t, err, test.want)
 		})
 	}
@@ -244,12 +224,20 @@ func TestExchange_GivesUpOnNotCommittedWhenTheBudgetExpires(t *testing.T) {
 
 	_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	var uncertain ierror.UncertainOutcome
+	require.ErrorAs(t, err, &uncertain)
+	require.NotZero(t, uncertain.OperationID)
 }
 
 func TestExchange_PreservesUncertaintyAfterALaterRefusal(t *testing.T) {
 	client, serverConn := newPipeClient(t)
-	server := serve(serverConn, func(index int, _ request) []byte {
+	attempt := 0
+	server := serve(serverConn, func(_ int, read request) []byte {
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return statusReplyFrame(vsr.OperationNonReplicated, uint32(ierror.FeatureUnavailableCode), nil)
+		}
+		index := attempt
+		attempt++
 		switch index {
 		case 0:
 			return statusReplyFrame(vsr.OperationCreatePartitions, uint32(ierror.TransientNotCommittedCode), nil)
@@ -264,10 +252,15 @@ func TestExchange_PreservesUncertaintyAfterALaterRefusal(t *testing.T) {
 	}
 	frame, err := appendCommandFrame(nil, request)
 	require.NoError(t, err)
-	_, _, _, err = client.attempt(context.Background(), uint32(request.Code()), frame, false,
-		time.Now(), time.Now().Add(time.Second))
+	_, err = client.drive(context.Background(), request.Code(), nil, frame, nil)
 	require.NoError(t, err, "a later refusal must not escape as permission to register a fresh identity")
-	recorded := server.recorded()
+	allRecorded := server.recorded()
+	recorded := allRecorded[:0]
+	for _, read := range allRecorded {
+		if read.operation() == vsr.OperationCreatePartitions {
+			recorded = append(recorded, read)
+		}
+	}
 	require.Len(t, recorded, 3)
 	for _, replay := range recorded[1:] {
 		assert.Equal(t, recorded[0].header, replay.header)
@@ -295,7 +288,10 @@ func TestExchange_RetriesALifecycleRefusalAsANewRequest(t *testing.T) {
 	captured := iggcon.PartitionContext{Incarnation: 17, OwnerGeneration: 3, MetadataOp: 4}
 	ctx := context.WithValue(context.Background(), capturedPartitionContext{}, captured)
 
-	response, err := client.do(ctx, lifecycleBusyJoin(t))
+	join := lifecycleBusyJoin(t)
+	frame, err := appendCommandFrame(nil, join)
+	require.NoError(t, err)
+	response, err := client.drive(ctx, join.Code(), nil, frame, &captured)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("joined"), response)
 
@@ -409,22 +405,176 @@ func TestExchange_EscalatesNotAcceptedToALeaderRecheck(t *testing.T) {
 	assert.True(t, sawMetadata, "the client re-checked leadership")
 }
 
-func TestExchange_RetainsTheSessionUntilBindConfirmsAnEviction(t *testing.T) {
+// sentWrite is a mutation that the server answers after the client wrote it.
+type sentWrite struct {
+	name      string
+	operation vsr.Operation
+	send      func(ctx context.Context, client *IggyTcpClient) error
+}
+
+func sentWrites(t *testing.T) []sentWrite {
+	t.Helper()
+	message, err := iggcon.NewIggyMessage([]byte("payload"))
+	require.NoError(t, err)
+	stream, topic := numericIdentifier(t, 1), numericIdentifier(t, 2)
+	return []sentWrite{
+		{"create_stream", vsr.OperationCreateStream, func(ctx context.Context, client *IggyTcpClient) error {
+			_, err := client.do(ctx, &command.CreateStream{Name: "orders"})
+			return err
+		}},
+		{"send_messages", vsr.OperationSendMessages, func(ctx context.Context, client *IggyTcpClient) error {
+			_, err := client.SendMessages(ctx, stream, topic, iggcon.PartitionId(0), []iggcon.IggyMessage{message})
+			return err
+		}},
+	}
+}
+
+// newOfflinePipeClient is a pipe client that cannot dial or sign in again, so
+// a test sees only what the first link did to the session.
+func newOfflinePipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
+	t.Helper()
 	client, serverConn := newPipeClient(t)
 	client.config.reconnection.enabled = false
-	before := client.session.ClientID()
-	serve(serverConn, func(_ int, _ request) []byte {
-		return evictionFrame(vsr.EvictionStaleClient, 0, 0)
-	})
+	client.config.serverAddress = "invalid-address"
+	return client, serverConn
+}
 
-	_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
-	assert.ErrorIs(t, err, ierror.ErrStaleClient)
+func TestExchange_SessionEvictionLeavesASentWriteUncertainUntilTheResetDropsIt(t *testing.T) {
+	for _, reason := range []vsr.EvictionReason{vsr.EvictionSessionTooLow,
+		vsr.EvictionSessionReleaseMismatch, vsr.EvictionUserInactive, vsr.EvictionSessionError} {
+		for _, write := range sentWrites(t) {
+			t.Run(fmt.Sprintf("%s/reason_%d", write.name, reason), func(t *testing.T) {
+				client, serverConn := newOfflinePipeClient(t)
+				server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+					return evictionFrame(reason, 0, 0)
+				})
 
-	var eviction *vsr.EvictionError
-	assert.ErrorAs(t, err, &eviction)
-	assert.True(t, client.session.Bound(), "retain the proof until the resume verdict")
-	assert.Equal(t, before, client.session.ClientID(), "an eviction does not authorize replay under a new identity")
-	assert.Equal(t, iggcon.SessionStateUnauthenticated, client.sessionState)
+				err := write.send(context.Background(), client)
+
+				var uncertain ierror.UncertainOutcome
+				require.ErrorAs(t, err, &uncertain)
+				require.Len(t, requestsFor(server.recorded(), write.operation), 1)
+				client.mtx.Lock()
+				bound := client.session.Bound()
+				client.mtx.Unlock()
+				require.False(t, bound, "the eviction ends the session")
+				require.ErrorIs(t, client.ResolveOperation(context.Background(), uncertain.OperationID), ierror.ErrOperationNotRetained)
+			})
+		}
+	}
+}
+
+func TestExchange_LostLinkKeepsTheSessionAndTheSentWrite(t *testing.T) {
+	for _, event := range []struct {
+		name   string
+		answer func(attempt int, read request) []byte
+	}{
+		{"no_session_eviction", func(int, request) []byte { return evictionFrame(vsr.EvictionNoSession, 0, 0) }},
+		{"stale_client_eviction", func(int, request) []byte { return evictionFrame(vsr.EvictionStaleClient, 0, 0) }},
+		{"mismatched_reply", func(int, request) []byte { return replyFrame(vsr.OperationDeleteStream, resultSection()) }},
+		{"unproved_reply", uncertainAnswer},
+	} {
+		for _, write := range sentWrites(t) {
+			t.Run(event.name+"/"+write.name, func(t *testing.T) {
+				client, serverConn := newOfflinePipeClient(t)
+				attempts := make(map[uint64]int)
+				first := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+					if read.operation() != write.operation {
+						return nil
+					}
+					attempt := attempts[read.requestID()]
+					attempts[read.requestID()]++
+					return event.answer(attempt, read)
+				})
+				client.mtx.Lock()
+				session := client.session.SessionID()
+				client.mtx.Unlock()
+				ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+				defer cancel()
+
+				err := write.send(ctx, client)
+
+				var uncertain ierror.UncertainOutcome
+				require.ErrorAs(t, err, &uncertain)
+				client.mtx.Lock()
+				bound, kept := client.session.Bound(), client.session.SessionID()
+				client.mtx.Unlock()
+				require.True(t, bound, "the session outlives the link")
+				require.Equal(t, session, kept)
+
+				replacementConn, clientConn := net.Pipe()
+				t.Cleanup(func() { _ = replacementConn.Close() })
+				replacement := servePartitionOperations(t, replacementConn, func(_ int, read request) []byte {
+					if read.code() == uint32(command.BindSessionCode) {
+						return bindReplyFrame(0, read.sessionID())
+					}
+					return committedReply(read, 0)
+				})
+				client.links.mu.Lock()
+				client.links.slots[0].link = newTCPLink(clientConn, "pipe")
+				client.links.mu.Unlock()
+
+				require.NoError(t, client.ResolveOperation(context.Background(), uncertain.OperationID))
+
+				reads := replacement.recorded()
+				require.NotEmpty(t, reads)
+				require.Equal(t, uint32(command.BindSessionCode), reads[0].code())
+				require.Equal(t, session, reads[0].sessionID(), "the new link binds the same session")
+				written, replayed := requestsFor(first.recorded(), write.operation), requestsFor(reads, write.operation)
+				require.NotEmpty(t, written)
+				require.Len(t, replayed, 1)
+				require.Equal(t, written[0], replayed[0], "the replay is the frame that the server first read")
+			})
+		}
+	}
+}
+
+func TestExchange_EvictedPollThatMovesItsConsumerEndsNotCommitted(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		reason     vsr.EvictionReason
+		strategy   iggcon.PollingStrategy
+		autoCommit bool
+		want       error
+	}{
+		{"no_session/auto_commit", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), true, ierror.ErrTransientNotCommitted},
+		{"no_session/next", vsr.EvictionNoSession, iggcon.NextPollingStrategy(), false, ierror.ErrTransientNotCommitted},
+		{"no_session/read_only", vsr.EvictionNoSession, iggcon.FirstPollingStrategy(), false, ierror.ErrTransientNotCommitted},
+		{"stale_client/next", vsr.EvictionStaleClient, iggcon.NextPollingStrategy(), true, ierror.ErrTransientNotCommitted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, serverConn := newOfflinePipeClient(t)
+			server := servePartitionOperations(t, serverConn, func(_ int, _ request) []byte {
+				return evictionFrame(test.reason, 0, 0)
+			})
+			partition := uint32(0)
+
+			_, err := client.PollMessages(context.Background(), numericIdentifier(t, 1), numericIdentifier(t, 2),
+				iggcon.NewSingleConsumer(numericIdentifier(t, 3)), test.strategy, 1, test.autoCommit, &partition)
+
+			require.ErrorIs(t, err, test.want)
+			require.Equal(t, 1, requestCount(server.recorded(), command.PollMessagesCode))
+		})
+	}
+}
+
+func TestExchange_DenyReplyToASentWriteStaysDefinitive(t *testing.T) {
+	for _, write := range sentWrites(t) {
+		t.Run(write.name, func(t *testing.T) {
+			client, serverConn := newOfflinePipeClient(t)
+			server := servePartitionOperations(t, serverConn, func(_ int, read request) []byte {
+				return statusReplyFrame(read.operation(), uint32(ierror.UnauthenticatedCode), nil)
+			})
+
+			err := write.send(context.Background(), client)
+
+			require.ErrorIs(t, err, ierror.ErrNotConnected)
+			require.NotErrorIs(t, err, ierror.ErrUncertainOutcome)
+			written := requestsFor(server.recorded(), write.operation)
+			require.Len(t, written, 1)
+			require.ErrorIs(t, client.ResolveOperation(context.Background(), written[0].requestID()), ierror.ErrOperationNotRetained)
+		})
+	}
 }
 
 func TestExchange_MapsEveryEvictionReasonThatReachesTheCaller(t *testing.T) {
@@ -444,7 +594,7 @@ func TestExchange_MapsEveryEvictionReasonThatReachesTheCaller(t *testing.T) {
 			return evictionFrame(test.reason, 0, 0)
 		})
 
-		_, err := client.do(context.Background(), &command.CreateStream{Name: "orders"})
+		_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
 		assert.ErrorIs(t, err, test.want, "reason %d", test.reason)
 	}
 }
@@ -460,7 +610,7 @@ func TestExchange_InvalidatesTheConnectionOnAFrameShorterThanItsHeader(t *testin
 
 	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
 	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState,
+	assert.False(t, linkReady(client.links.any()),
 		"the stream is at an unknown boundary, so the connection is dropped")
 }
 
@@ -475,7 +625,7 @@ func TestExchange_RejectsAFrameAboveTheTransportLimitWithoutReadingItsBody(t *te
 
 	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
 	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	assert.False(t, linkReady(client.links.any()))
 }
 
 func TestExchange_InvalidatesTheConnectionWhenTheReplyIsCutShort(t *testing.T) {
@@ -487,11 +637,11 @@ func TestExchange_InvalidatesTheConnectionWhenTheReplyIsCutShort(t *testing.T) {
 	})
 
 	_, err := client.SendBinaryRequest(context.Background(), uint32(command.PingCode), nil)
-	assert.ErrorIs(t, err, ierror.ErrDisconnected)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	assert.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	assert.False(t, linkReady(client.links.any()))
 }
 
-func TestExchange_InvalidatesTheConnectionWhenTheContextIsCancelledMidRead(t *testing.T) {
+func TestExchange_CancellationDoesNotCloseTheSharedConnection(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	client.config.reconnection.enabled = false
 	ctx, cancel := context.WithCancel(context.Background())
@@ -501,8 +651,8 @@ func TestExchange_InvalidatesTheConnectionWhenTheContextIsCancelledMidRead(t *te
 	})
 
 	_, err := client.SendBinaryRequest(ctx, uint32(command.PingCode), nil)
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+	assert.ErrorIs(t, err, ierror.ErrTransientNotCommitted)
+	assert.True(t, linkReady(client.links.any()))
 }
 
 func TestSendMessages_DecodesTheConfirmations(t *testing.T) {
@@ -551,7 +701,7 @@ func TestSendMessages_RejectsAnEmptyReplyBody(t *testing.T) {
 	_, err = client.SendMessages(context.Background(),
 		numericIdentifier(t, 1), numericIdentifier(t, 1),
 		iggcon.PartitionId(0), []iggcon.IggyMessage{message})
-	assert.ErrorIs(t, err, ierror.ErrInvalidCommand)
+	assert.ErrorIs(t, err, ierror.ErrUncertainOutcome)
 }
 
 func TestSendMessages_AcceptsAZeroCountConfirmationBody(t *testing.T) {
@@ -713,41 +863,6 @@ func TestSendMessages_RejectsAnEmptyBatch(t *testing.T) {
 	assert.Empty(t, server.recorded())
 }
 
-func TestCanReplay_RefusesOnlyReplicatedRequestsWithAnUnknownOutcome(t *testing.T) {
-	tests := []struct {
-		name string
-		code uint32
-		err  error
-		want bool
-	}{
-		{name: "register replays by design",
-			code: uint32(command.LoginRegisterCode), err: ierror.ErrDisconnected, want: true},
-		{name: "non-replicated read replays",
-			code: uint32(command.PingCode), err: ierror.ErrDisconnected, want: true},
-		{name: "replicated write never sent replays",
-			code: uint32(command.CreateStreamCode), err: ierror.ErrNotConnected, want: true},
-		{name: "replicated write refused by the server replays",
-			code: uint32(command.CreateStreamCode), err: ierror.ErrUnauthenticated, want: true},
-		{name: "replicated write on a stale client replays",
-			code: uint32(command.CreateStreamCode), err: ierror.ErrStaleClient, want: true},
-		{name: "replicated write with a lost reply is refused",
-			code: uint32(command.CreateStreamCode), err: ierror.ErrDisconnected, want: false},
-		{name: "send with a lost reply is refused",
-			code: uint32(command.SendMessagesCode), err: ierror.ErrDisconnected, want: false},
-		{name: "token mint with a lost reply is refused",
-			code: uint32(command.CreateAccessTokenCode), err: ierror.ErrDisconnected, want: false},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			assert.Equal(t, test.want, canReplay(test.code, test.err))
-		})
-	}
-}
-
-// topicDetailsBody builds the reply body of GetTopic for a topic with the
-// given partition count and no partitions listed. The trailing 8 zero bytes
-// are the u32 length prefixes of the empty explicit and derived options
-// blocks.
 func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	t.Helper()
 

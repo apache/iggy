@@ -26,6 +26,19 @@ type Client interface {
 	// Close closes the client and releases all the resources.
 	Close() error
 
+	// ResolveOperation replays a retained mutation until its final result or ctx deadline.
+	// The client keeps the last outcomes that its replays proved, as many as the operation
+	// limit of tcp.WithPendingOperations, also across a session reset. So a later call for
+	// the same operation returns that outcome without a request. ierror.OperationNotRetained
+	// means that the client never proved the outcome, because a session reset or an abandon
+	// came first, or that the proven outcome aged out.
+	ResolveOperation(ctx context.Context, operationID uint64) error
+
+	// AbandonOperation forgets local recovery state; it cannot undo a server effect.
+	// A ResolveOperation that is still running keeps the lane until it ends, and the
+	// client keeps the outcome that it proves.
+	AbandonOperation(ctx context.Context, operationID uint64) error
+
 	// GetConnectionInfo returns the current connection information including protocol and server address
 	GetConnectionInfo() *ConnectionInfo
 
@@ -107,11 +120,8 @@ type Client interface {
 	// Authentication is required, and the permission to send the messages.
 	//
 	// The returned confirmations report where the server committed the batch.
-	// A send whose reply is lost to a dropped connection returns
-	// ErrDisconnected without a replay: a reconnect registers a fresh client
-	// identity, so the server could not deduplicate the replay against a
-	// batch that may have already committed. Retrying such a send is the
-	// caller's decision and may write the batch twice.
+	// An uncertain mutation returns ierror.UncertainOutcome with its exact OperationID.
+	// ResolveOperation replays that retained identity; AbandonOperation releases its lane.
 	SendMessages(
 		ctx context.Context,
 		streamId Identifier,

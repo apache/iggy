@@ -43,6 +43,8 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// * `IggyError::InvalidClientAddress`: The client address is invalid.
     /// * `IggyError::NotConnected`: The client is not connected.
     /// * `IggyError::ClientShutdown`: The client has been shut down.
+    /// * `IggyError::LaneBlocked`: A retained operation requires caller recovery.
+    /// * `IggyError::OperationUncertain`: A mutation's outcome requires caller recovery.
     ///
     async fn consume_messages<P>(
         &mut self,
@@ -119,6 +121,8 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
                                 IggyError::InvalidServerAddress |
                                 IggyError::InvalidClientAddress |
                                 IggyError::NotConnected |
+                                IggyError::LaneBlocked(_) |
+                                IggyError::OperationUncertain(_) |
                                 IggyError::ClientShutdown => {
                                     error!("Client error: {err} for consumer: {name} on topic: {topic} and stream: {stream}",
                                         name = self.name(), topic = self.topic(), stream = self.stream());

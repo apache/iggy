@@ -29,23 +29,17 @@ from the same checkout. The SDK targets .NET 8 and .NET 10; repository examples 
 `0.9.0` includes the independent message and consumer-offset durability options.
 
 This checkout uses binary protocol 0.11.1. Servers and applicable SDKs must deploy together; mixed versions and
-rolling upgrades are unsupported. Existing old-format data requires a separately verified migration or restore;
-a binary replacement cannot upgrade it. See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
+rolling upgrades are unsupported. This checkout requires fresh storage and refuses older data directories
+without modification. `--fresh` deletes existing data in the configured directory.
+See the [server recovery guide](../../core/server/README.md#upgrade-recovery).
 Register creates a shared logical session; other TCP connections authenticate with BindSession (15), using the
 parent's identity and proof. A disconnect removes its binding without ending the session. Logout or committed expiry
-ends it; a new session must not replay an unresolved mutation from the old one. Command 14 is retired.
+ends it; a new session must not replay an unresolved mutation from the old one.
+GetPartitionRoute (105) discovers partition primaries. Commands 14, 103, 104 and 123 are retired.
 Ordinary SDK sends and explicit offset mutations support the configured durability, including the Replicated default.
 Crash-safe send retries require Persisted message durability; crash-safe explicit offset retries require Persisted
 offset durability and Quorum acknowledgement. Weaker policies can lose data and receipts on a crash. HTTP NoAck's
 202 confirms dispatch, not partition admission or commit, and supplies no recoverable caller receipt.
-
-The following upgrade guidance describes the 0.9.0 protocol, not source builds of this checkout.
-Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
-and uses separate connections to partition primaries. It requires server support
-for binary commands 14, 103 and 104. Pause binary auto-commit consumers for the
-whole upgrade: upgrade every server first, then the SDKs, and restart consumers
-so they rejoin their groups. Older SDKs can lose membership when a backup refuses
-an offset commit; the new SDK does not fall back to legacy polling.
 
 ### Supported Protocols
 
@@ -209,8 +203,8 @@ contains the connection string.
 Over TCP every request is wrapped in a 256-byte consensus header, the client registers a consensus session at
 login, and replicated writes complete after the required quorum acknowledges them.
 `Durability.Persisted` additionally waits for persistence on that quorum; explicit offset stores have
-an independent `ConsumerOffsetDurability` policy. The `IIggyClient` surface is unchanged, with the
-few exceptions listed under [Limitations](#limitations).
+an independent `ConsumerOffsetDurability` policy. A NoAck success is a weak acknowledgement and does not prove commit.
+Uncertain replicated operations can be resolved through the recovery methods below.
 
 ```c#
 using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
@@ -220,6 +214,8 @@ using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 
     // Upper bound on a reply frame the server announces, 64 MiB by default.
     MaxResponseFrameSize = 64 * 1024 * 1024,
+    MaxPendingOperations = 256,
+    MaxPendingOperationBytes = 64L * 1024 * 1024,
 
     AutoLoginSettings = AutoLoginSettings.For("iggy", "iggy")
 });
@@ -232,12 +228,24 @@ await client.ConnectAsync();
 - **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
   authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
   Disconnecting removes only that binding; Logout, committed lease expiry or user deactivation ends the session.
+  A `StaleClient` eviction also removes only the binding of that link. The reconnect binds the same session
+  again, so its consumer-group memberships stay.
+  A committed `StaleClient` result means that the server ended the session, for example because the user was
+  deleted or deactivated. The client drops that session, and with reconnection enabled it signs in with configured
+  or remembered credentials. A `StaleClient` refusal before commit means only that the server detached the link
+  that carried it from the session. A live session also gets this refusal after a replica replaced its client
+  table. The client closes that link and binds the session again on a new link. If the session ended, that bind
+  fails with `Unauthenticated` and the client signs in again. Otherwise the session, its retained operations and
+  its consumer-group memberships stay.
   Password changes and PAT changes or expiry do not end an established session.
   A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
-  retains the identity and surfaces to the caller, allowing a later reconnect to retry the bind. An unresolved mutation
+  retains the identity while that replica's background reconnect retries the bind. An unresolved mutation
   cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.
-- **Leader redirection is automatic.** The client reads the cluster roster, follows the current leader and
-  re-checks it when a request is refused because the node stopped being primary.
+- **Replica links are independent.** The client proactively opens one shared session link per roster replica.
+  Calls use the advertised metadata or partition primary. Replies are matched by request id, so concurrent
+  reads and different partition groups can progress independently; cancelling one call preserves other calls.
+  With a one-node roster, the client uses `BaseAddress` instead of the address that the node advertises, so a
+  port mapping or a port-forward works.
 - **The client picks partitions.** Balanced and message-key partitioning are resolved
   client-side (xxHash32 matches Rust for identical encoded key bytes and partition counts), and consumer-group polls round-robin
   over the partitions the coordinator assigned to this client.
@@ -254,20 +262,47 @@ await client.ConnectAsync();
 
 ### Retries and failed requests
 
-Within its request deadline, the SDK can replay a request the server reports as never admitted.
-Replay-safe operations can also be retried after a lost connection. Two cases surface to the caller:
+Within one call deadline, the SDK retries an unresolved replicated mutation using its original session,
+request id, context, and frozen frame. Metadata mutations share one lane; partition mutations share a lane
+by incarnation and partition id, including requests using different names for the same partition.
 
-- `IggyInvalidStatusCodeException` carries the server status code, with `FromServer` telling apart a verdict the
-  cluster reported from a failure the client raised itself.
-- `VsrRequestOutcomeUnknownException` means the result is unresolved after the request was written - the
-  connection was lost, the call was cancelled, or the session ended while the request was in flight - so the
-  cluster may or may not have committed it. The SDK will not replay it on a new session,
-  because that would bypass server-side deduplication - re-issuing it is the caller's decision.
-  Background `IggyPublisher` sends report it through the message-batch-failed event without retrying;
-  direct sends throw it to the caller, and
-  `IggyConsumer` rethrows it rather than swallowing it, because an auto-committing poll may have advanced the
-  offset already. Rethrowing ends the consumer's polling loop: catch it around the enumeration, decide whether
-  the operation is safe to re-issue, and start consuming again.
+- `IggyInvalidStatusCodeException` carries the server status. `FromServer` distinguishes a server verdict
+  from a local error, and `Committed` identifies a proved committed result.
+- `VsrRequestOutcomeUnknownException.OperationId` identifies a retained replicated mutation after its call
+  ends without proof. Its lane stays blocked. `VsrLaneBlockedException.OperationId` identifies the operation
+  blocking a subsequent mutation in the same lane; independent groups and pure reads can continue.
+- `ResolveOperationAsync(operationId, timeout, token)` replays that frozen operation. A proved success or
+  business rejection releases the lane; a rejection throws its original status. Further uncertainty retains it.
+  The client keeps the proved outcomes of its last `MaxPendingOperations` replays, also across a session
+  reset. A later resolve of the same operation returns the same outcome without a request.
+- `AbandonOperationAsync(operationId)` releases local ownership without determining the outcome. It does
+  not undo a committed operation. The operation stops counting against `MaxPendingOperations` at once.
+  A `ResolveOperationAsync` that is still running is not canceled and keeps the lane until it ends, so later
+  mutations of the lane still wait behind its replay.
+  `VsrOperationNotRetainedException` means that no replay proved the outcome
+  before a session reset, such as logout or session replacement, or an abandon. A proved outcome that aged
+  out also causes it. It never proves non-commit and never authorizes an automatic fresh resend.
+
+Auto-commit and `Next` polls hold a transient partition lane but are not retained or replayed after uncertainty.
+Their unknown-outcome error has no operation id. `IggyConsumer` reports it through its error event and polls again.
+Under `AutoCommitMode.Auto`, the server can store the offset of a batch whose reply was lost. A `Next` poll then
+starts after that batch, so the consumer skips it. Behind a retained mutation these polls throw
+`VsrLaneBlockedException`. `IggyConsumer` propagates it without resolving the blocker and ends its polling loop.
+The application decides how to resume. Background `IggyPublisher` sends report unknown outcomes through the
+message-batch-failed event; direct sends throw them to the caller.
+
+`IggyConsumer` offset stores and deletes resolve any blocking operation before their own request. A background
+`IggyPublisher` send resolves only a blocking batch of its own. Both continue after a proved commit or committed
+rejection. The client keeps that outcome for the caller that received the operation id, such as the receiver of
+the message-batch-failed event. That caller reads it with `ResolveOperationAsync`.
+
+`MaxPendingOperations` and `MaxPendingOperationBytes` bound active plus retained mutation frames across the
+client, defaulting to 256 operations and 64 MiB. Admission waits within the call deadline before allocating an
+id or frozen frame. A replay shares its reservation; outstanding writers keep bytes charged until released.
+Both limits must be positive. The byte limit includes the 256-byte header and the mutation body.
+Smaller positive limits are valid but reject mutations that cannot fit; reads and login remain available.
+Reads and control requests have a separate per-link limit of 256 pending calls and a 32-frame write queue.
+Their bodies, including unknown raw non-replicated commands, are outside the mutation byte budget.
 
 ### Limitations
 
@@ -288,13 +323,18 @@ Replay-safe operations can also be retried after a lost connection. Two cases su
 - Clients built with `IggyConsumerBuilder` / `IggyPublisherBuilder` now auto-login with the credentials passed
   to `WithConnection`. Before, a builder-created client came back from a
   reconnect unauthenticated; now the credentials are held for the lifetime of the connection and replayed.
-- The TCP client pings every `HeartbeatInterval` (5 seconds) and reconnects by default with unlimited
-  failed roster passes. Each pass tries the known addresses before consuming one retry. Connection
-  and TLS handshake failures can be retried; an invalid local CA file stops after the pass, and
-  rejected credentials are surfaced. Set `MaxRetries`, pass a cancellation token, or disable
-  reconnection to bound attempts. Request replay has its own deadline and outcome-safety rules.
+- The TCP client pings each ready replica every `HeartbeatInterval` (5 seconds). Each replica reconnects
+  independently, with at most four concurrent dials, a two-second dial and TLS deadline, and jittered
+  backoff capped at ten seconds. `MaxRetries` bounds one burst of consecutive retries per replica, and zero
+  allows unlimited retries. While the client is signed in, each heartbeat restarts a replica link that used
+  up its burst, with a fresh budget, so the client recovers from a longer outage without an application call.
+  Logout and `Dispose` stop the restarts. Invalid local CA configuration and rejected credentials surface as
+  errors. A caller's cancellation stops that call while the link owner continues reconnecting. Request replay
+  has its own deadline.
   Configured auto-login credentials take precedence over credentials remembered from successful
   username/password or PAT login. Without either, reconnecting cannot restore the authenticated session.
+  A committed password change or rename of the signed-in user updates these credentials. This includes a
+  change that `ResolveOperationAsync` proves. A committed rejection leaves them unchanged.
 - `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
   them with an object initializer or the `AutoLoginSettings.For` / `AutoLoginSettings.ForPersonalAccessToken`
   factories instead of assigning after construction.
@@ -302,9 +342,7 @@ Replay-safe operations can also be retried after a lost connection. Two cases su
   `WithConnection(protocol, address, personalAccessToken, ...)` overload, as an alternative to a username and
   password.
 - The SDK now ships a dependency on `System.IO.Hashing`, used for the client-side message-key partitioner.
-- TCP sockets are opened with `NoDelay`. The protocol is request/reply, so a write is
-  always the last one before the client waits for the answer and Nagle has nothing to coalesce it with - it
-  only held back the trailing segment of a large request until the previous one was acked.
+- TCP sockets use `NoDelay` to avoid delaying trailing request segments behind acknowledgements.
 
 ## Authentication
 

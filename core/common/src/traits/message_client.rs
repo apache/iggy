@@ -138,7 +138,9 @@ pub trait MessageClient {
     ///
     /// Binary clients refresh the partition context once after a definitive
     /// `HistoryUnavailable` (87) refusal. A refusal after an uncertain send
-    /// keeps its original context and returns `TransientNotCommitted` (57).
+    /// keeps its original context and returns `OperationUncertain(op)`.
+    /// `Balanced` and `MessagesKey` sends select a new partition once after a
+    /// definitive `PartitionNotFound` refusal.
     async fn send_messages(
         &self,
         stream_id: &Identifier,

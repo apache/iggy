@@ -107,7 +107,7 @@ func TestSessionBeginRegister_RearmsWithAFreshClientID(t *testing.T) {
 	assert.Zero(t, session.BeginRegister())
 	assert.False(t, session.Bound())
 	assert.Zero(t, session.SessionID())
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
+	assert.Equal(t, uint64(2), session.CurrentRequestID())
 	assert.NotEqual(t, ClientID{Lo: 7}, session.ClientID())
 }
 
@@ -198,6 +198,10 @@ func TestSessionForksAllocateOneCounterConcurrentlyAndSurviveParentReset(t *test
 	id, err := old.NextRequestID()
 	require.NoError(t, err)
 	assert.Equal(t, uint64(links*requests+1), id)
-	assert.Equal(t, uint64(1), parent.CurrentRequestID())
+	assert.Equal(t, uint64(links*requests+2), parent.CurrentRequestID())
+	require.NoError(t, parent.Bind(43))
+	newID, err := parent.NextRequestID()
+	require.NoError(t, err)
+	assert.Equal(t, id+1, newID)
 	assert.NotEqual(t, parent.ClientID(), old.ClientID())
 }

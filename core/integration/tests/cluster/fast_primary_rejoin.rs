@@ -29,7 +29,12 @@
 //! failure, not a durability failure.
 
 use iggy::prelude::*;
+use iggy_binary_protocol::codes::GET_PARTITION_ROUTE_CODE;
+use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
+use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{IggyMessagesBatch, SendMessagesConfirmations};
 use integration::harness::{TestHarness, disk};
 use integration::iggy_harness;
@@ -272,10 +277,15 @@ async fn require_resume_after_primary_stop(
     harness.stop_node(leader).expect("stop the primary");
 
     acked.extend(require_acked_sends(&producer, "post-primary-stop", 1, RESUME_BUDGET).await);
+    producer
+        .get_stream(&Identifier::named(STREAM_NAME).unwrap())
+        .await
+        .expect("the same session must reach the surviving metadata primary")
+        .expect("the stream must survive primary loss");
     assert_ne!(
         producer.get_connection_info().await.server_address,
         primary_endpoint,
-        "the send that resumed must have landed on a survivor"
+        "connection info must name the recovered metadata primary"
     );
     require_readback(&producer, &acked).await;
 }
@@ -398,16 +408,26 @@ async fn given_a_websocket_producer_when_its_first_roster_hop_is_down_should_rea
 async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_forward_once(
     harness: &mut TestHarness,
 ) {
-    let (producer, leader, primary_endpoint, mut acked) =
+    let (producer, leader, _, mut acked) =
         warmed_producer_past_follower_restart(harness, TransportProtocol::Tcp, None).await;
     harness
         .restart_node(leader)
         .expect("restart the primary with its data intact");
 
     acked.extend(require_acked_sends(&producer, "settled-primary", 1, RESUME_BUDGET).await);
+    let route_request = GetPartitionRouteRequest {
+        stream_id: identifier_to_wire(&Identifier::named(STREAM_NAME).unwrap()).unwrap(),
+        topic_id: identifier_to_wire(&Identifier::named(TOPIC_NAME).unwrap()).unwrap(),
+        partition_id: PARTITION_ID,
+    };
+    let route = producer
+        .send_binary_request(GET_PARTITION_ROUTE_CODE, route_request.to_bytes())
+        .await
+        .expect("discover the partition primary after rejoin");
+    let route = PartitionRouteResponse::decode_from(&route).unwrap();
     assert_ne!(
-        producer.get_connection_info().await.server_address,
-        primary_endpoint,
+        usize::from(route.primary_replica),
+        leader,
         "the HTTP target must be a partition backup for this test"
     );
 

@@ -176,15 +176,16 @@ public final class IggyClient: Sendable {
     ///
     /// Partition requests carry the partition context their typed call
     /// sends: `SendMessages` with an explicit partition id, `PollMessages`,
-    /// `StoreConsumerOffset`, and `DeleteConsumerOffset` take the route of
+    /// `GetConsumerOffset`, `StoreConsumerOffset`, and `DeleteConsumerOffset`
+    /// take the route of
     /// ``sendMessages(streamID:topicID:partitioning:messages:)``,
     /// ``pollMessages(streamID:topicID:partitionID:consumer:strategy:count:autoCommit:)``,
     /// and the offset calls. A raw send with balanced or key partitioning
-    /// fails with ``IggyErrorCode/featureUnavailable``, and a partition
-    /// payload that does not decode fails with ``IggyErrorCode/invalidCommand``,
-    /// before anything is sent. The routing codes `GetPollRouting`,
-    /// `PollMessagesOnPrimary`, and `GetConsumerOffsetRouting` are sent once
-    /// on the current connection, with no reconnect or replay.
+    /// fails with ``IggyErrorCode/featureUnavailable``. A group poll, a store,
+    /// or a delete that names no partition fails with
+    /// ``IggyErrorCode/invalidIdentifier``, and a partition payload that does
+    /// not decode fails with ``IggyErrorCode/invalidCommand``. Each fails
+    /// before anything is sent.
     public func sendRawRequest(code: UInt32, payload: [UInt8]) async throws -> [UInt8] {
         guard !CommandCode.isSessionControl(code) else {
             throw IggyError(.invalidCommand, context: "code \(code) controls the session; use login and logout")

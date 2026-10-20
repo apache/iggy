@@ -234,7 +234,9 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::CannotEstablishConnection
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
-        IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
+        IggyError::TransientNotCommitted | IggyError::OperationUncertain(_) => {
+            ERROR_REQUEST_TIMED_OUT
+        }
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -464,6 +466,12 @@ mod tests {
     fn transient_not_accepted_maps_to_not_leader_or_follower_for_retry() {
         let err = BridgeError::Iggy(IggyError::TransientNotAccepted);
         assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn uncertain_operation_maps_to_request_timed_out() {
+        let err = BridgeError::Iggy(IggyError::OperationUncertain(42));
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
     }
 
     #[test]

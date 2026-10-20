@@ -28,7 +28,7 @@ use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, info, warn};
 
-use super::{IggyBridge, REQUEST_TIMEOUT, with_request_timeout};
+use super::{IggyBridge, REQUEST_TIMEOUT, metadata_write_on, with_request_timeout};
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 use crate::protocol::handlers::topic_config::message_expiry_is_explicit;
@@ -185,7 +185,9 @@ impl IggyBridge {
             partitions_count: Some(partition_count),
             ..TopicCreateOptions::default()
         };
-        match with_request_timeout(self.client.create_topic(stream_id, topic_name, &options)).await
+        match self
+            .metadata_write(|| self.client.create_topic(stream_id, topic_name, &options))
+            .await
         {
             Ok(created) => {
                 info!("created Iggy topic '{topic_name}' with {partition_count} partitions");
@@ -259,7 +261,8 @@ impl IggyBridge {
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
         let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
-        with_request_timeout(self.client.delete_topic(&stream_id, &topic_id)).await
+        self.metadata_write(|| self.client.delete_topic(&stream_id, &topic_id))
+            .await
     }
 
     /// Looks up `kafka_topic`, resolved through the configured
@@ -321,10 +324,10 @@ impl IggyBridge {
             message_expiry: Some(message_expiry),
             ..TopicUpdateOptions::default()
         };
-        with_request_timeout(
+        self.metadata_write(|| {
             self.client
-                .update_topic(&stream_id, &topic_id, topic_name, &options),
-        )
+                .update_topic(&stream_id, &topic_id, topic_name, &options)
+        })
         .await
     }
 
@@ -469,7 +472,11 @@ impl IggyBridge {
             partitions_count: Some(partition_count),
             ..TopicCreateOptions::default()
         };
-        match with_request_timeout(client.create_topic(&stream_id, topic_name, &options)).await {
+        match metadata_write_on(client, || {
+            client.create_topic(&stream_id, topic_name, &options)
+        })
+        .await
+        {
             Ok(created) => {
                 info!("created Iggy topic '{topic_name}' with {partition_count} partitions");
                 // Same postcondition check ensure_topic's own create branch makes: partitions_count
@@ -616,7 +623,7 @@ async fn ensure_stream(client: &IggyClient, stream_name: &str) -> Result<Identif
     let identifier = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
     stream_ensured(
         stream_name,
-        with_request_timeout(client.create_stream(stream_name)).await,
+        metadata_write_on(client, || client.create_stream(stream_name)).await,
     )?;
     Ok(identifier)
 }

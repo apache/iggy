@@ -25,7 +25,7 @@ use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
 };
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
-use crate::stm::user::{DeletePersonalAccessTokenRequest, Users};
+use crate::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use compio::io::AsyncWriteAtExt;
 use consensus::{
@@ -1063,6 +1063,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// `[metadata] partitions_max`, zero for no cap. See
     /// [`Self::admit_partitions`].
     partitions_max: Cell<u32>,
+    /// `[personal_access_token] max_tokens_per_user`, zero for no cap. See
+    /// [`Self::admit_personal_access_token`].
+    max_tokens_per_user: Cell<u32>,
     /// Highest metadata op whose apply has been PUBLISHED on this node, plus
     /// the reads parked on it. Shared by every shard; see
     /// [`AppliedFrontier`] for the ordering and the wake contract.
@@ -1131,6 +1134,7 @@ where
             transfer_offer_cache: RefCell::new(None),
             prepare_gap_drops: Cell::new(0),
             partitions_max: Cell::new(0),
+            max_tokens_per_user: Cell::new(0),
             applied_frontier: Arc::default(),
         }
     }
@@ -1320,6 +1324,22 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// `CreatePartitions`, so every node needs the same value.
     pub fn set_partitions_max(&self, partitions_max: u32) {
         self.partitions_max.set(partitions_max);
+    }
+
+    /// Cap the personal access tokens of each user at `[personal_access_token]
+    /// max_tokens_per_user`, zero for no cap. Only the primary checks it, with
+    /// the value of its own node, when it admits a `CreatePersonalAccessToken`,
+    /// so every node needs the same value.
+    pub fn set_max_tokens_per_user(&self, max_tokens_per_user: u32) {
+        self.max_tokens_per_user.set(max_tokens_per_user);
+    }
+
+    /// The cap that [`Self::set_max_tokens_per_user`] set. Its rejection
+    /// carries only the error code, so an edge that names the cap reads it
+    /// here.
+    #[must_use]
+    pub const fn max_tokens_per_user(&self) -> u32 {
+        self.max_tokens_per_user.get()
     }
 
     /// Fire post-commit notifier. Clones the `Rc` out under a short
@@ -2533,12 +2553,9 @@ where
         match outcome {
             PreflightOutcome::Dispatch => None,
             PreflightOutcome::Replay(reply) => {
-                if let Some(refusal) = unreplayable_secret_refusal(
-                    request_header,
-                    &reply,
-                    consensus.commit_max(),
-                    client_id,
-                ) {
+                if let Some(refusal) =
+                    unreplayable_secret_refusal(request_header, &reply, client_id)
+                {
                     return Some(Ok(refusal));
                 }
                 let owned =
@@ -2641,6 +2658,43 @@ where
             );
         }
         admitted
+    }
+
+    /// `[personal_access_token] max_tokens_per_user` admission for a
+    /// `CreatePersonalAccessToken`. Other operations pass, so a user at the
+    /// cap can still delete a token to free a slot.
+    ///
+    /// A soft cap for the same reason as [`Self::admit_partitions`]: it counts
+    /// the tokens this primary has committed, so creates in flight can
+    /// overshoot it. It runs before the apply, so a create at the cap reports
+    /// the cap even when its name is taken, as the legacy server did.
+    ///
+    /// The PAT rewrite of every transport encodes the body, so the decode
+    /// cannot fail for a client request.
+    fn admit_personal_access_token(
+        &self,
+        message: &Message<RoutedRequestHeader>,
+    ) -> Result<(), IggyError> {
+        let max_tokens_per_user = self.max_tokens_per_user.get();
+        if max_tokens_per_user == 0
+            || message.header().operation != Operation::CreatePersonalAccessToken
+        {
+            return Ok(());
+        }
+        let Ok(request) = CreatePersonalAccessTokenRequest::decode_from(message.body()) else {
+            return Ok(());
+        };
+        let committed = self
+            .mux_stm
+            .users()
+            .read(|users| users.pat_count_of(request.user_id));
+        if committed >= max_tokens_per_user as usize {
+            return Err(IggyError::PersonalAccessTokensLimitReached(
+                request.user_id,
+                max_tokens_per_user,
+            ));
+        }
+        Ok(())
     }
 
     /// Submit `Logout` from in-process, await commit.
@@ -3187,9 +3241,12 @@ where
         }
 
         // After the dedup above: a same-id replay of a create that already
-        // committed got its cached reply there, so its partitions are never
-        // counted twice.
-        if let Err(error) = self.admit_partitions(&message) {
+        // committed got its cached reply there, so its partitions or its token
+        // are never counted twice.
+        if let Err(error) = self
+            .admit_partitions(&message)
+            .and_then(|()| self.admit_personal_access_token(&message))
+        {
             return Ok(build_result_rejection_reply(
                 &request_header,
                 consensus.commit_max(),
@@ -3512,6 +3569,10 @@ where
                     crate::stm::result::ApplyReply::err(IggyError::TransientNotCommitted.as_code());
                 build_reply_message_with(&prepare_header, pending.reply_body_len(), |dst| {
                     pending.write_reply_body(dst);
+                })
+                .transmute_header::<ReplyHeader>(|old, header| {
+                    *header = old;
+                    header.reserved[0] = 0;
                 })
             } else {
                 reply
@@ -4547,6 +4608,7 @@ pub fn build_truncate_partition_client_message(
             client: client_id,
             session,
             request: template.request,
+            request_checksum: template.request_checksum,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
@@ -4727,26 +4789,28 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
 ///
 /// `PersonalAccessTokenAlreadyExists` is the honest code: the original create
 /// committed, so the name IS taken, and the remedy it implies (delete by name,
-/// then recreate) is exactly right.
+/// then recreate) is exactly right. The refusal is the cached reply with only
+/// its result section replaced. It keeps the commit marker, the original op
+/// and the request identity, so a client that holds the create as uncertain
+/// gets a committed outcome for it.
 ///
 /// A cached REJECTION replays untouched: it carries no secret, so serving it
 /// is both safe and useful.
 fn unreplayable_secret_refusal(
     request_header: &RoutedRequestHeader,
     cached: &Frozen<{ server_common::MESSAGE_ALIGN }>,
-    commit: u64,
     client_id: u128,
 ) -> Option<Message<GenericHeader>> {
     if request_header.operation != Operation::CreatePersonalAccessToken {
         return None;
     }
-    let cached_body = cached
+    let (cached_header, cached_body) = cached
         .as_slice()
-        .get(size_of::<ReplyHeader>()..)
-        .unwrap_or_default();
+        .split_at_checked(size_of::<ReplyHeader>())?;
     if iggy_binary_protocol::result_code(cached_body) != Some(0) {
         return None;
     }
+    let committed = bytemuck::checked::try_from_bytes::<ReplyHeader>(cached_header).ok()?;
     warn!(
         target: "iggy.metadata.diag",
         client_id,
@@ -4754,14 +4818,19 @@ fn unreplayable_secret_refusal(
         "refusing replayed CreatePersonalAccessToken: the committed secret is \
          unrecoverable and a re-minted one would not match the stored hash"
     );
-    Some(
-        build_result_rejection_reply(
-            request_header,
-            commit,
-            IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code(),
-        )
-        .into_generic(),
-    )
+    let mut refusal = build_result_rejection_reply(
+        request_header,
+        committed.commit,
+        IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code(),
+    );
+    let header = ReplyHeader {
+        size: refusal.header().size,
+        checksum: 0,
+        checksum_body: 0,
+        ..*committed
+    };
+    refusal.as_mut_slice()[..size_of::<ReplyHeader>()].copy_from_slice(bytemuck::bytes_of(&header));
+    Some(refusal.into_generic())
 }
 
 /// `requested` more partitions on top of the `committed` count against a
@@ -4793,7 +4862,7 @@ mod tests {
     use crate::stm::consumer_group::JoinConsumerGroupRequest;
     use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::stream::{Streams, StreamsInner};
-    use crate::stm::user::{Users, UsersInner};
+    use crate::stm::user::{PAT_TOKEN_HASH_BYTES, Users, UsersInner};
     use consensus::LocalPipeline;
     use iggy_binary_protocol::WireOptions;
     use iggy_binary_protocol::primitives::permissions::{
@@ -4801,7 +4870,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+    use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
     use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
@@ -5419,6 +5488,97 @@ mod tests {
         IggyMetadata::new(Some(consensus), None, None, None, TestMux::default(), None)
     }
 
+    #[compio::test]
+    async fn given_committed_lifecycle_intent_when_waiting_for_completion_should_not_prove_final_result()
+     {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ROOT_USER: u32 = 0;
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ROOT_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let request_header = RoutedRequestHeader {
+            client: CLIENT,
+            session: SESSION,
+            request: 1,
+            user_id: ROOT_USER,
+            group: server_common::sharding::METADATA_GROUP,
+            ..Default::default()
+        };
+        let body = DeleteTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        }
+        .to_bytes();
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(consensus, &request_header, Operation::DeleteTopic, &body),
+            consensus.retry_capacity(&metadata.client_table.borrow()),
+        );
+        let intent_op = prepare.header().op;
+        let pending = metadata
+            .dispatch_prepare_and_await(consensus, prepare)
+            .await
+            .unwrap();
+        assert!(metadata.mux_stm.streams().lifecycle_pending(intent_op));
+        assert_eq!(
+            iggy_binary_protocol::result_code(pending.body()),
+            Some(IggyError::TransientNotCommitted.as_code())
+        );
+        assert!(
+            !pending.header().has_committed_result(),
+            "a committed intent cannot prove its final outcome before every partition finishes"
+        );
+
+        metadata
+            .submit_complete_lifecycle_in_process(
+                CompleteLifecycleRequest::new(
+                    intent_op,
+                    0,
+                    vec![LifecycleCompletion {
+                        topic_id: 0,
+                        partition_id: 0,
+                        partition_op: 1,
+                    }],
+                )
+                .unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(!metadata.mux_stm.streams().lifecycle_pending(intent_op));
+        let final_reply = metadata
+            .client_table
+            .borrow()
+            .get_reply(CLIENT)
+            .unwrap()
+            .clone()
+            .into_message();
+        assert!(final_reply.header().has_committed_result());
+        assert_eq!(
+            iggy_binary_protocol::result_code(final_reply.body()),
+            Some(0)
+        );
+    }
+
     fn create_topic_request(client: u128, wire_user_id: u32) -> Message<RoutedRequestHeader> {
         create_named_topic_request(client, wire_user_id, WireIdentifier::numeric(0), "t")
     }
@@ -5718,12 +5878,15 @@ mod tests {
     /// the dedup cache: the committed secret is unrecoverable (never
     /// replicated) and the rewrite has already minted a fresh one whose hash
     /// never reached consensus, so replaying would hand back a credential that
-    /// authenticates against nothing. A cached REJECTION still replays -- it
-    /// carries no secret.
+    /// authenticates against nothing. The refusal keeps the committed header,
+    /// so the client can still prove that the original create committed. A
+    /// cached REJECTION still replays -- it carries no secret.
     #[compio::test]
     async fn replayed_pat_create_is_refused_but_other_replays_pass_through() {
         const CLIENT: u128 = 1;
         const USER: u32 = 7;
+        const PAT_OP: u64 = 2;
+        const PAT_REQUEST_CHECKSUM: u128 = 0x2a;
 
         let dir = tempfile::tempdir().unwrap();
         let journal =
@@ -5755,22 +5918,55 @@ mod tests {
 
         // Cache a committed SUCCESS for request 1 under the PAT operation,
         // exactly as the commit path would (empty apply body + result section).
-        let pat_success = committed_reply(CLIENT, 1, Operation::CreatePersonalAccessToken, 0);
+        let pat_success = build_reply_message(
+            &PrepareHeader {
+                client: CLIENT,
+                request: 1,
+                request_checksum: PAT_REQUEST_CHECKSUM,
+                operation: Operation::CreatePersonalAccessToken,
+                op: PAT_OP,
+                user_id: USER,
+                ..PrepareHeader::default()
+            },
+            &bytes::Bytes::copy_from_slice(&0u32.to_le_bytes()),
+        );
+        let committed = *pat_success.header();
         md.client_table
             .borrow_mut()
             .commit_reply(CLIENT, USER, pat_success);
 
         // Replaying request 1 as a PAT create must NOT return the cached
         // success; it must refuse with the name-taken code.
-        let reply = md
-            .submit_request_in_process(pat_create_request(CLIENT, 1))
+        let refusal = md
+            .submit_request_in_process(pat_request(
+                CLIENT,
+                1,
+                Operation::CreatePersonalAccessToken,
+                &[],
+            ))
             .await
-            .expect("refusal is a reply, not a submit error");
-        let body = &reply.as_slice()[size_of::<ReplyHeader>()..];
+            .expect("refusal is a reply, not a submit error")
+            .try_into_typed::<ReplyHeader>()
+            .unwrap();
         assert_eq!(
-            iggy_binary_protocol::result_code(body),
+            iggy_binary_protocol::result_code(refusal.body()),
             Some(IggyError::PersonalAccessTokenAlreadyExists(String::new(), 0).as_code()),
             "a replayed PAT create must be refused, never answered from cache"
+        );
+        let header = refusal.header();
+        assert!(
+            header.has_committed_result(),
+            "the refusal must prove that the original create committed"
+        );
+        assert_eq!((header.op, header.commit), (PAT_OP, PAT_OP));
+        let expected = ReplyHeader {
+            size: header.size,
+            ..committed
+        };
+        assert_eq!(
+            bytemuck::bytes_of(header),
+            bytemuck::bytes_of(&expected),
+            "the refusal must keep the committed client, request, request checksum and operation"
         );
 
         // A cached REJECTION for the same operation carries no secret, so it
@@ -5786,7 +5982,12 @@ mod tests {
             .borrow_mut()
             .commit_reply(CLIENT, USER, pat_rejection);
         let reply = md
-            .submit_request_in_process(pat_create_request(CLIENT, 2))
+            .submit_request_in_process(pat_request(
+                CLIENT,
+                2,
+                Operation::CreatePersonalAccessToken,
+                &[],
+            ))
             .await
             .expect("cached rejection replays");
         let body = &reply.as_slice()[size_of::<ReplyHeader>()..];
@@ -5998,6 +6199,112 @@ mod tests {
         );
     }
 
+    /// The cap is graded before the apply grades the name, so a create at the
+    /// cap reports the cap even when its name is taken, as the legacy server
+    /// did.
+    #[test]
+    fn given_at_limit_duplicate_name_when_admitting_should_report_limit_not_duplicate() {
+        let metadata = metadata_capped_over(users_holding_token());
+
+        let error = metadata
+            .admit_personal_access_token(&pat_request(
+                1,
+                1,
+                Operation::CreatePersonalAccessToken,
+                &token_create(TOKEN_NAME).to_bytes(),
+            ))
+            .expect_err("a create at the cap must be denied even for a taken name");
+
+        assert!(
+            matches!(
+                error,
+                IggyError::PersonalAccessTokensLimitReached(TOKEN_OWNER, TOKEN_CAP)
+            ),
+            "expected the cap error before the name grading, got {error:?}"
+        );
+    }
+
+    /// A delete is how a user at the cap frees a slot, so capping it too
+    /// would lock the account at the cap.
+    #[test]
+    fn given_user_at_token_cap_when_deleting_should_admit() {
+        let metadata = metadata_capped_over(users_holding_token());
+
+        assert!(
+            metadata
+                .admit_personal_access_token(&pat_request(
+                    1,
+                    1,
+                    Operation::DeletePersonalAccessToken,
+                    &token_delete().to_bytes(),
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_deletion_freed_a_slot_when_admitting_should_admit_the_next_create() {
+        let mut users = users_holding_token();
+        let deleted = StateHandler::apply(&token_delete(), &mut users, IggyTimestamp::now());
+        assert_eq!(deleted.code, 0, "the fixture token must be deleted");
+        let metadata = metadata_capped_over(users);
+
+        let admitted = metadata.admit_personal_access_token(&pat_request(
+            1,
+            1,
+            Operation::CreatePersonalAccessToken,
+            &token_create("replacement").to_bytes(),
+        ));
+
+        assert!(
+            admitted.is_ok(),
+            "a freed slot must admit the next create, got {admitted:?}"
+        );
+    }
+
+    const TOKEN_OWNER: u32 = 7;
+    const TOKEN_NAME: &str = "token";
+    const TOKEN_CAP: u32 = 1;
+
+    fn token_create(name: &str) -> CreatePersonalAccessTokenRequest {
+        CreatePersonalAccessTokenRequest {
+            user_id: TOKEN_OWNER,
+            name: WireName::new(name).unwrap(),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        }
+    }
+
+    fn token_delete() -> DeletePersonalAccessTokenRequest {
+        DeletePersonalAccessTokenRequest {
+            user_id: TOKEN_OWNER,
+            name: WireName::new(TOKEN_NAME).unwrap(),
+            only_if_expired: false,
+        }
+    }
+
+    /// `TOKEN_OWNER` holding `TOKEN_NAME`, which fills `TOKEN_CAP`.
+    fn users_holding_token() -> UsersInner {
+        let mut users = UsersInner::new();
+        let created =
+            StateHandler::apply(&token_create(TOKEN_NAME), &mut users, IggyTimestamp::now());
+        assert_eq!(created.code, 0, "the fixture token must be created");
+        users
+    }
+
+    /// A plane over `users` that caps each user at `TOKEN_CAP` tokens.
+    fn metadata_capped_over(
+        users: UsersInner,
+    ) -> IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux> {
+        let mut metadata = metadata_plane();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users.into(),
+            (StreamsInner::new().into(), ()),
+        )));
+        metadata.set_max_tokens_per_user(TOKEN_CAP);
+        metadata
+    }
+
     /// Slab ids of `users_with_topic_manager`: root takes 0.
     const TOPIC_MANAGER: u32 = 1;
     const UNGRANTED: u32 = 2;
@@ -6143,22 +6450,31 @@ mod tests {
         reply
     }
 
-    fn pat_create_request(client: u128, request: u64) -> Message<RoutedRequestHeader> {
+    fn pat_request(
+        client: u128,
+        request: u64,
+        operation: Operation,
+        body: &[u8],
+    ) -> Message<RoutedRequestHeader> {
         let header_size = size_of::<RoutedRequestHeader>();
-        let mut message = Message::<RoutedRequestHeader>::new(header_size);
-        let header = bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(
-            &mut message.as_mut_slice()[..header_size],
-        );
-        *header = RoutedRequestHeader {
-            command: Command::Request,
-            operation: Operation::CreatePersonalAccessToken,
-            size: u32::try_from(header_size).unwrap(),
-            client,
-            session: 1,
-            request,
-            group: server_common::sharding::METADATA_GROUP,
-            ..Default::default()
-        };
+        let total = header_size + body.len();
+        let mut message = Message::<RoutedRequestHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
+            *header = RoutedRequestHeader {
+                command: Command::Request,
+                operation,
+                size: u32::try_from(total).unwrap(),
+                client,
+                session: 1,
+                request,
+                group: server_common::sharding::METADATA_GROUP,
+                ..Default::default()
+            };
+        }
         message
     }
 
