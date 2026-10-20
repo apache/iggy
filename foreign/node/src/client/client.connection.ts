@@ -20,14 +20,17 @@ import type { Socket } from 'node:net';
 import { createConnection, isIP } from 'node:net';
 import { connect as TLSConnect } from 'node:tls';
 import { readFileSync } from 'node:fs';
-import type { ClientConfig, TlsOption, TcpOption, ReconnectOption } from "./client.type.js"
+import type { ClientConfig, TlsOption, TcpOption } from "./client.type.js"
 import { debug } from './client.debug.js';
 import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from './client.config.js';
 import {
   ProtocolFrameError,
   ResponseFrameDecoder
 } from './client.frame.js';
-import { Command, peekCommand } from '../wire/vsr/header.js';
+import {
+  Command, EvictionReason, peekCommand, readEviction, readStatus, REQUEST_OFFSET, REPLY_OFFSET
+} from '../wire/vsr/header.js';
+import { ChangeSignal, PermitPool, type FrozenFrame, OPERATION_TIMEOUT_MS, waitWithin } from './client.operation.js';
 import { evictionError } from '../wire/vsr/reply.js';
 
 
@@ -86,586 +89,255 @@ const getTransport = (config: ClientConfig): Socket => {
   }
 };
 
-/** One node of the cluster, as a redial candidate. */
 export type Endpoint = { host: string, port: number };
+export const DIAL_TIMEOUT_MS = 2_000;
+export const LINK_WRITE_QUEUE = 32;
+export const MAX_PENDING_PER_LINK = 256;
+const STALE_CLIENT = 30;
 
-/**
- * Bound on one dial while other endpoints are queued behind it. Neither the
- * connect nor the TLS handshake has a deadline of its own, so a node whose syns
- * are dropped -- or one that accepts TCP and never answers the ClientHello --
- * would hold the whole pass. Matches the Rust SDK.
- */
-const FAILOVER_DIAL_TIMEOUT_MS = 2_000;
+export type LinkAttempt = { response?: Buffer, error?: unknown, started: boolean };
+type Pending = {
+  readonly id: bigint,
+  readonly frame: Buffer,
+  readonly owner?: FrozenFrame,
+  readonly resolve: (result: LinkAttempt) => void,
+  done: boolean,
+  started: boolean
+};
 
-/**
- * Default reconnection settings.
- *
- * One retry is one full pass over every endpoint the client knows, so this is
- * twelve passes rather than twelve dials, waiting 5 seconds between them. The
- * first pass runs at once when more than one endpoint is known: the node just
- * lost may be gone for good, and pausing before dialing a survivor only pushes
- * the failover past the interval a caller is willing to wait.
- */
-const DefaultReconnectOption: ReconnectOption = {
-  enabled: true,
-  interval: 5 * 1000,
-  maxRetries: 12
-}
-
-/**
- * Waits before a reconnection attempt.
- *
- * The timer is unref'd: a queued command fails fast on 'disconnected', so
- * the retry loop is background work that must not keep the process alive.
- *
- * @param interval - Delay in milliseconds before dialing again
- */
-const waitForReconnect = (interval: number): Promise<void> =>
-  new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, interval);
-    (timeout as NodeJS.Timeout).unref();
-  });
-
-/** Socket error with optional error code */
-type SocketError = Error & { code?: string };
-
-/**
- * Manages the low-level TCP/TLS connection to the Iggy server.
- * Handles connection lifecycle, reconnection, and data buffering.
- */
+/** One physical endpoint, with independent reader framing and a bounded writer. */
 export class IggyConnection extends EventEmitter {
-  /** Client configuration */
-  public config: ClientConfig
-  /** Underlying socket connection */
-  public socket: Socket;
-
-  /** Whether the connection is established */
-  public connected: boolean;
-  /** Whether a connection attempt is in progress */
-  public connecting: boolean;
-  /** Whether the connection is being intentionally closed */
-  public ending: boolean;
-  /**
-   * Whether the socket is being replaced by a deliberate leader redirect
-   * rather than lost. The drop looks the same from the outside, but nothing a
-   * caller submitted is in doubt: work waiting to be sent belongs on the node
-   * the client moves to, not in an error.
-   */
-  public redirecting: boolean;
-  /** Reconnection configuration */
-  private reconnectOption: ReconnectOption;
-  /**
-   * Number of passes made over the known endpoints. One pass dials the
-   * endpoint the client is on, the endpoint it was configured with, and every
-   * node the roster named.
-   */
-  private reconnectCount: number;
-  /** Shared promise for concurrent callers waiting on one connection attempt */
+  socket!: Socket;
+  connected = false;
+  connecting = false;
+  ending = false;
+  failure?: unknown;
+  readonly closed: Promise<void>;
+  private close!: () => void;
   private connectPromise?: Promise<this>;
-  /** Shared promise for callers waiting on automatic reconnection */
-  private reconnectPromise?: Promise<this>;
-  /** Endpoint the client was configured with, kept across leader redirects */
-  private readonly seedOptions: ClientConfig['options'];
-  /**
-   * Every node the roster named on the last read, kept as redial candidates.
-   * A node dies together with its address, and the roster is unreachable
-   * exactly when it is needed, so it has to have been remembered while the
-   * connection was still healthy.
-   */
-  private rosterEndpoints: Endpoint[];
+  private readonly decoder: ResponseFrameDecoder;
+  private readonly pending = new Map<bigint, Pending>();
+  private readonly writes: Pending[] = [];
+  private readonly changed = new ChangeSignal();
+  private readonly admissions = new PermitPool(MAX_PENDING_PER_LINK);
+  private writing = false;
+  private frameTimer?: NodeJS.Timeout;
+  private failed = false;
 
-  /** Incremental response frame decoder */
-  private responseDecoder: ResponseFrameDecoder;
-
-  /**
-   * Creates a new IggyConnection.
-   *
-   * @param config - Client configuration
-   */
-  constructor(config: ClientConfig) {
+  constructor(public readonly config: ClientConfig) {
     super();
-    this.config = config;
-    this.connected = false;
-    this.connecting = false;
-    this.ending = false;
-    this.redirecting = false;
-    this.reconnectOption = { ...DefaultReconnectOption, ...config.reconnect };
-    this.seedOptions = { ...config.options };
-    this.rosterEndpoints = [];
-    this.reconnectCount = 0;
-    this.connectPromise = undefined;
-    this.reconnectPromise = undefined;
-    this.responseDecoder = new ResponseFrameDecoder(
-      config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE
-    );
-    this.socket = this._installSocket(getTransport(config));
+    this.decoder = new ResponseFrameDecoder(config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE);
+    this.closed = new Promise<void>((resolve) => { this.close = resolve; });
   }
 
-  /**
-   * Attaches the lifecycle listeners exactly once per socket instance.
-   * Attaching them in `connect()` would stack duplicate handlers whenever a
-   * failed attempt is retried on the same socket.
-   */
-  private _installSocket(socket: Socket): Socket {
-    socket.on('data', (data) => {
-      if (this.socket !== socket)
-        return;
-      if (!Buffer.isBuffer(data)) {
-        this.emit(
-          'error',
-          new ProtocolFrameError('socket returned text instead of binary data')
-        );
-        socket.destroy();
-        return;
-      }
-      this._onData(data);
-    });
-
-    socket.on('error', (err: SocketError) => {
-      if (this.socket !== socket)
-        return;
-      debug('socket/error event', err, err.code, this.ending);
-      if (this.ending && (err?.code === 'ECONNRESET' || err?.code === 'EPIPE'))
-        return
-      this.emit('error', err);
-    });
-
-    // The readiness event, not 'connect': on TLS the socket is only usable
-    // once the handshake completes, and writing a request before that would
-    // announce a connection the peer has not agreed to yet.
-    socket.once(this._readyEvent(), () => {
-      if (this.socket !== socket)
-        return;
-      debug('socket/connect event');
-      this.connected = true;
-      this.connecting = false;
-      this.reconnectCount = 0;
-      this.emit('connect');
-    });
-
-    socket.once('close', (hadError?: boolean) => {
-      if (this.socket !== socket)
-        return;
-      debug('socket/close event', hadError);
-      this.connected = false;
-      this.connecting = false;
-      this.connectPromise = undefined;
-      this._endResponseWait();
-      this.emit('disconnected', hadError);
-      if (!this.ending)
-        void this.reconnect().catch(() => undefined);
-    });
-    return socket;
-  }
-
-  /**
-   * Establishes the connection to the server.
-   *
-   * @returns Promise that resolves when connected
-   */
-  connect(boundDial = false): Promise<this> {
-    if (this.ending)
-      return Promise.reject(new Error('connection is closed'));
+  connect(signal?: AbortSignal): Promise<this> {
+    if (this.ending || this.failed)
+      return Promise.reject(this.failure ?? new Error('connection is closed'));
     if (this.connected)
       return Promise.resolve(this);
-    if (this.reconnectPromise)
-      return this.reconnectPromise;
     if (this.connectPromise)
       return this.connectPromise;
-    if (this.socket.destroyed)
-      this.socket = this._installSocket(getTransport(this.config));
-
     this.connecting = true;
-    const socket = this.socket;
-    // Bounded here too when the client knows somewhere else to go: this dial
-    // is not part of a pass, so an endpoint that never becomes usable would
-    // hold it with no timer of its own and the redial pass would never start.
-    const connectPromise = this._dialWithin(
-      socket,
-      boundDial || this._redialCandidates().length > 1
-    );
-    this.connectPromise = connectPromise;
-    const clearConnectPromise = () => {
-      if (this.connectPromise === connectPromise)
-        this.connectPromise = undefined;
-    };
-    void connectPromise.then(clearConnectPromise, clearConnectPromise);
-    return connectPromise;
+    this.connectPromise = this.dial(signal);
+    return this.connectPromise;
   }
 
-  /**
-   * Waits for one dial, bounded while other endpoints are queued behind it.
-   *
-   * A socket has no connect deadline of its own and there is no 'timeout'
-   * listener on it, so a node whose syns are dropped holds the pass for the
-   * whole OS connect timeout -- and it leads every pass, because the current
-   * endpoint only moves on success. The bound covers the TLS handshake too,
-   * which is what `_readyEvent()` waits for and has no deadline of its own
-   * either. It matches the Rust, Go and C# SDKs'.
-   */
-  private async _dialWithin(socket: Socket, bounded: boolean): Promise<this> {
-    if (!bounded)
-      return this._waitForConnection(socket);
-
-    let expire: NodeJS.Timeout | undefined;
-    const bound = new Promise<never>((_resolve, reject) => {
-      expire = setTimeout(() => {
-        // Destroying it makes the pending dial settle and releases the handle;
-        // left alone it would keep the event loop alive.
-        socket.destroy();
-        reject(new Error(
-          `dial exceeded ${FAILOVER_DIAL_TIMEOUT_MS}ms`
-        ));
-      }, FAILOVER_DIAL_TIMEOUT_MS);
-      expire.unref?.();
-    });
-
+  private async dial(signal?: AbortSignal): Promise<this> {
     try {
-      return await Promise.race([this._waitForConnection(socket), bound]);
-    } finally {
-      clearTimeout(expire);
-    }
-  }
-
-  /**
-   * The event that says a socket can carry a request.
-   *
-   * On TLS that is 'secureConnect', not 'connect': the latter fires as soon as
-   * the TCP handshake completes, so waiting on it would treat a peer that
-   * never answers the ClientHello as connected and leave the handshake with no
-   * deadline at all.
-   */
-  private _readyEvent(): 'connect' | 'secureConnect' {
-    return this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
-  }
-
-  private _waitForConnection(socket: Socket): Promise<this> {
-    const ready = this._readyEvent();
-    return new Promise<this>((resolve, reject) => {
-      const cleanup = () => {
-        socket.removeListener(ready, resolveConnect);
-        socket.removeListener('error', rejectConnect);
-        socket.removeListener('close', rejectClosed);
-      };
-      const rejectConnect = (error: Error) => {
-        cleanup();
-        reject(error);
-      };
-      const rejectClosed = () => {
-        rejectConnect(new Error('connection closed before it was established'));
-      };
-      const resolveConnect = () => {
-        cleanup();
-        resolve(this);
-      };
-      socket.once('error', rejectConnect);
-      socket.once('close', rejectClosed);
-      socket.once(ready, resolveConnect);
-    });
-  }
-
-  /**
-   * Attempts to reconnect to the server.
-   * Respects maxRetries limit and emits error when exceeded.
-   *
-   * @param err - Optional error that triggered the reconnection
-   */
-  async reconnect(err?: Error): Promise<this | undefined> {
-    if (this.ending || this.connected)
-      return;
-    if (this.reconnectPromise)
-      return this.reconnectPromise;
-
-    const { enabled, interval, maxRetries } = this.reconnectOption
-    debug(
-      'reconnect# event/reconnect?', {
-      reconnect: { enabled, interval, maxRetries },
-      count: this.reconnectCount,
-      lastError: err
-    }
-    );
-
-    const reconnectPromise = this._reconnectUntilConnected(
-      enabled,
-      interval,
-      maxRetries,
-      err
-    );
-    this.reconnectPromise = reconnectPromise;
-    try {
-      return await reconnectPromise;
-    } catch (error) {
-      if (!this.ending)
-        this.emit('error', error);
-      return;
-    } finally {
-      if (this.reconnectPromise === reconnectPromise)
-        this.reconnectPromise = undefined;
+      signal?.throwIfAborted();
+      const socket = getTransport(this.config);
+      this.socket = socket;
+      const ready = this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
+      socket.on('data', (data) => this.onData(data));
+      socket.on('error', (error) => this.fail(error));
+      socket.once('close', () => this.fail(this.failure ?? new Error('replica connection closed')));
+      await waitWithin(new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          socket.removeListener(ready, established);
+          socket.removeListener('error', rejected);
+          socket.removeListener('close', closed);
+        };
+        const established = () => { cleanup(); resolve(); };
+        const rejected = (error: Error) => { cleanup(); reject(error); };
+        const closed = () => rejected(new Error('connection closed before establishment'));
+        socket.once(ready, established);
+        socket.once('error', rejected);
+        socket.once('close', closed);
+      }), Date.now() + DIAL_TIMEOUT_MS, signal);
+      if (this.failed || this.ending)
+        throw this.failure ?? new Error('connection is closed');
+      this.connected = true;
       this.connecting = false;
+      this.emit('connect');
+      return this;
+    } catch (error) {
+      this.fail(error);
+      throw error;
     }
   }
 
-  private async _reconnectUntilConnected(
-    enabled: boolean,
-    interval: number,
-    maxRetries: number,
-    initialError?: Error
-  ): Promise<this> {
-    let lastError = initialError;
-    let expectedSocket = this.socket;
-    let firstPass = true;
-    // Reconnection settings bound the retries, not the endpoints. With them off
-    // and several endpoints known - the address the client was configured with,
-    // the nodes the roster named - those endpoints were made known in order to
-    // be tried, so they get one pass and no backoff, as in the other SDKs. A
-    // client that knows one endpoint and turned reconnection off redials
-    // nothing, which is what it asked for.
-    // Counted rather than tracked within this call: every dial the pass fails
-    // closes a socket, and a close starts a reconnect of its own. Bounded by
-    // `firstPass` alone, each of those closes would open another sweep and the
-    // pass would repeat for as long as the endpoints stay down. The count is
-    // reset when a connection is established, so a later loss sweeps again.
-    const sweepOnce = !enabled && this._redialCandidates().length > 1;
-    while ((enabled && this.reconnectCount < maxRetries) ||
-      (sweepOnce && this.reconnectCount < 1)) {
-      this.connecting = true;
-      this.reconnectCount += 1;
-      const candidates = this._redialCandidates();
-      // The backoff paces retries against a single endpoint. With other
-      // endpoints known there is somewhere else to go, and pausing first only
-      // pushes the failover past the interval a caller is willing to wait;
-      // later passes still back off.
-      if (enabled && (!firstPass || candidates.length === 1))
-        await waitForReconnect(interval);
-      firstPass = false;
-      if (this.ending)
-        throw new Error('connection is closed', { cause: lastError });
-      // A redirect may replace the socket at any point. Defer to the active
-      // connection instead of dialing the superseded endpoint.
-      if (this.connected || this.socket !== expectedSocket)
-        return this.connect();
+  async exchange(frame: () => Buffer, deadline: number, signal: AbortSignal, owner?: FrozenFrame): Promise<LinkAttempt> {
+    let release: (() => void) | undefined;
+    let pending: Pending | undefined;
+    try {
+      release = await this.admissions.acquire(deadline, signal);
+      signal.throwIfAborted();
+      if (Date.now() >= deadline)
+        await waitWithin(Promise.resolve(), deadline, signal);
+      if (!this.connected || this.failed)
+        throw this.failure ?? new Error('replica connection is not ready');
+      const bytes = frame();
+      const id = bytes.readBigUInt64LE(REQUEST_OFFSET.request);
+      if (this.pending.has(id))
+        throw new Error('request id already has an active exchange');
+      let resolve!: (attempt: LinkAttempt) => void;
+      const response = new Promise<LinkAttempt>((complete) => { resolve = complete; });
+      pending = { id, frame: bytes, owner, resolve, done: false, started: false };
+      this.pending.set(id, pending);
+      while (this.writes.length >= LINK_WRITE_QUEUE && !pending.done) {
+        await waitWithin(this.changed.promise, deadline, signal);
+      }
+      signal.throwIfAborted();
+      if (!pending.done) {
+        owner?.retain();
+        this.writes.push(pending);
+        void this.writeFrames();
+      }
+      return await waitWithin(response, deadline, signal);
+    } catch (error) {
+      if (pending)
+        this.finish(pending, { error, started: pending.started });
+      return { error, started: pending?.started ?? false };
+    } finally {
+      release?.();
+    }
+  }
 
-      // Every endpoint gets its turn inside one attempt, so a full pass over
-      // the cluster costs one retry rather than one per endpoint: a pass that
-      // stopped at the first refusal would never reach the survivors of a
-      // client configured for a single retry.
-      for (const options of candidates) {
-        // Re-checked every iteration, not once above the loop: a destroy or a
-        // redirect mid-pass has to stop the pass. Left running, the next
-        // endpoint that answers would leave an open socket nobody closes, a
-        // 'connect' event after the destroy, and the process alive.
-        if (this.ending)
-          throw new Error('connection is closed', { cause: lastError });
-        if (this.socket !== expectedSocket)
-          return this.connect();
-
-        const socket = this._installSocket(
-          getTransport({ ...this.config, options })
-        );
-        this.socket = socket;
-        expectedSocket = socket;
+  private async writeFrames(): Promise<void> {
+    if (this.writing)
+      return;
+    this.writing = true;
+    try {
+      while (this.writes.length > 0) {
+        const pending = this.writes.shift()!;
+        this.changed.pulse();
         try {
-          await this._dialWithin(socket, candidates.length > 1);
-          if (this.ending) {
-            socket.destroy();
-            throw new Error('connection is closed', { cause: lastError });
+          if (pending.done)
+            continue;
+          pending.started = true;
+          const written = new Promise<void>((resolve, reject) => {
+            this.socket.write(pending.frame, (error?: Error | null) => error ? reject(error) : resolve());
+          });
+          try {
+            await waitWithin(written, Date.now() + OPERATION_TIMEOUT_MS);
+          } catch (error) {
+            this.fail(error);
+            await written.catch(() => undefined);
           }
-          if (this.socket !== socket)
-            return this.connect();
-          this.config.options = options;
-          return this;
-        } catch (error) {
-          lastError = error instanceof Error
-            ? error
-            : new Error(String(error));
-          debug('reconnect attempt failed', lastError);
+        } finally {
+          pending.owner?.release();
         }
       }
-    }
-
-    debug(`reconnect reached maxRetries of ${maxRetries}`, lastError);
-    throw new Error(
-      `reconnect maxRetries exceeded (count: ${this.reconnectCount})`,
-      { cause: lastError }
-    );
-  }
-
-  /**
-   * Records the cluster roster as redial candidates.
-   *
-   * Replaced wholesale rather than merged: the roster is the cluster's own
-   * answer about where its nodes are, so a node it dropped stops being
-   * dialed. The configured seed is kept separately and outlives it.
-   */
-  rememberRoster(endpoints: Endpoint[]): void {
-    if (endpoints.length === 0)
-      return;
-    this.rosterEndpoints = endpoints;
-  }
-
-  /**
-   * The roster endpoint after the one this connection is on, for a request
-   * the current node keeps refusing to admit. Metadata and partition
-   * consensus groups elect independently, so the metadata leader can hold a
-   * follower replica of the partition a request targets, and only walking
-   * the roster reaches that group's primary. `undefined` when the roster
-   * names nowhere else to go.
-   */
-  nextRosterEndpoint(visited: Set<string>): Endpoint | undefined {
-    const roster = this.rosterEndpoints;
-    if (roster.length === 0)
-      return undefined;
-    const index = roster.findIndex(
-      (endpoint) => this.isConnectedTo(endpoint.host, endpoint.port)
-    );
-    if (index >= 0)
-      visited.add(endpointKey(roster[index]));
-    const start = index < 0 ? 0 : (index + 1) % roster.length;
-    for (let offset = 0; offset < roster.length; offset += 1) {
-      const candidate = roster[(start + offset) % roster.length];
-      const key = endpointKey(candidate);
-      if (visited.has(key) || this.isConnectedTo(candidate.host, candidate.port))
-        continue;
-      visited.add(key);
-      return candidate;
-    }
-    return undefined;
-  }
-
-  /**
-   * Endpoints a redial rotates through, likeliest first: where the client
-   * currently is, the endpoint it was configured with, then the roster it
-   * learned while connected. After a leader redirect the current endpoint may
-   * die with the leader, and the rest of the list is the way back to the
-   * cluster.
-   *
-   * Duplicates are dropped by spelling: the loopback aliases and an
-   * IPv4-mapped IPv6 address collapse onto one endpoint. Names are not
-   * resolved, so a seed given as a DNS name and the roster's IP for the same
-   * node still count as two candidates -- one wasted dial per pass, not a
-   * correctness problem.
-   */
-  _redialCandidates(): ClientConfig['options'][] {
-    const candidates = [this.config.options];
-    const known = [
-      this.seedOptions,
-      ...this.rosterEndpoints.map(
-        ({ host, port }) => ({ ...this.config.options, host, port })
-      )
-    ];
-    for (const candidate of known) {
-      const duplicate = candidates.some(
-        (existing) => existing.port === candidate.port &&
-          normalizeHost(existing.host) === normalizeHost(candidate.host)
-      );
-      if (!duplicate)
-        candidates.push(candidate);
-    }
-    return candidates;
-  }
-
-  async redirect(host: string, port: number) {
-    const redirectedOptions = { ...this.config.options, host, port };
-    const redirectedConfig = {
-      ...this.config,
-      options: redirectedOptions
-    };
-    this.redirecting = true;
-    try {
-      // Destroying the old socket settles any dial still waiting on it. Its
-      // lifecycle listeners stay attached but go inert once the socket is
-      // replaced below, so surface the drop to in-flight exchanges ourselves.
-      this.socket.destroy();
-      this.connected = false;
-      this.connecting = false;
-      this.connectPromise = undefined;
-      this.reconnectPromise = undefined;
-      this._endResponseWait();
-      this.socket = this._installSocket(getTransport(redirectedConfig));
-      this.emit('disconnected', false);
-      await this.connect();
-      this.config.options = redirectedOptions;
+    } catch (error) {
+      this.fail(error);
     } finally {
-      this.redirecting = false;
+      this.writing = false;
     }
+  }
+
+  private onData(data: Buffer | string): void {
+    try {
+      if (!Buffer.isBuffer(data))
+        throw new ProtocolFrameError('socket returned text instead of binary data');
+      const frames = this.decoder.push(data);
+      if (!this.decoder.hasBufferedData) {
+        clearTimeout(this.frameTimer);
+        this.frameTimer = undefined;
+      } else if (!this.frameTimer || frames.length > 0) {
+        clearTimeout(this.frameTimer);
+        this.frameTimer = setTimeout(() => this.fail(new ProtocolFrameError('incomplete consensus frame timed out')),
+          OPERATION_TIMEOUT_MS);
+      }
+      for (const response of frames) {
+        if (peekCommand(response) === Command.Eviction) {
+          const error = evictionError(response);
+          this.emit('eviction', error);
+          // The server keeps the session of a stale client and drops only this
+          // link, so it fails as a lost link and the client rebinds the session.
+          this.fail(readEviction(response).reason === EvictionReason.StaleClient
+            ? new Error('replica link evicted as a stale client', { cause: error }) : error);
+          return;
+        }
+        if (peekCommand(response) !== Command.Reply)
+          throw new ProtocolFrameError('unexpected consensus frame');
+        const id = response.readBigUInt64LE(REPLY_OFFSET.request);
+        const pending = this.pending.get(id);
+        if (pending)
+          this.finish(pending, { response, started: pending.started });
+        // A 30 refusal says that the server no longer attaches this link to the
+        // session. A replica that replaced its client table says so of a live
+        // session too, so the link fails as a lost link and the bind decides.
+        if (readStatus(response) === STALE_CLIENT) {
+          this.fail(new Error('replica link detached from its session'));
+          return;
+        }
+      }
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  private finish(pending: Pending, result: LinkAttempt): void {
+    if (pending.done)
+      return;
+    pending.done = true;
+    if (this.pending.get(pending.id) === pending)
+      this.pending.delete(pending.id);
+    pending.resolve(result);
+    this.changed.pulse();
+  }
+
+  private fail(error: unknown): void {
+    if (this.failed)
+      return;
+    this.failed = true;
+    this.failure = error;
+    this.connected = false;
+    this.connecting = false;
+    clearTimeout(this.frameTimer);
+    this.decoder.clear();
+    for (const pending of this.pending.values())
+      this.finish(pending, { error, started: pending.started });
+    for (const pending of this.writes.splice(0))
+      pending.owner?.release();
+    this.socket?.destroy();
+    this.close();
+    this.changed.pulse();
+    if (this.listenerCount('error') > 0)
+      this.emit('error', error);
+    this.emit('disconnected');
+    debug('replica link closed', error);
   }
 
   abort(): void {
-    this._endResponseWait();
-    this.socket.destroy();
+    this.fail(new Error('replica link aborted'));
   }
 
   isConnectedTo(host: string, port: number): boolean {
     const target = normalizeHost(host);
-    if (this.socket.remotePort === port &&
-        normalizeHost(this.socket.remoteAddress) === target)
+    if (this.socket?.remotePort === port && normalizeHost(this.socket.remoteAddress) === target)
       return true;
-    // A roster may advertise a DNS name while the socket reports a resolved
-    // address; falling back to the configured endpoint avoids a redirect to
-    // the peer the client is already connected to.
-    return this.config.options.port === port &&
-      normalizeHost(this.config.options.host) === target;
+    return this.config.options.port === port && normalizeHost(this.config.options.host) === target;
   }
 
-  /**
-   * Destroys the connection and marks it as ending.
-   */
-  _destroy() {
+  _destroy(): void {
     this.ending = true;
-    this._endResponseWait();
-    this.socket.destroy();
-  }
-
-  /**
-   * Clears the response buffer and resets the waiting state.
-   */
-  _endResponseWait() {
-    this.responseDecoder.clear();
-  }
-
-  /**
-   * Handles incoming data from the socket.
-   * Buffers incomplete responses and emits complete ones.
-   *
-   * @param data - Incoming data buffer
-   */
-  _onData(data: Buffer) {
-    debug(
-      'ONDATA',
-      typeof data,
-      Buffer.isBuffer(data),
-      data?.length,
-      this.responseDecoder.hasBufferedData
-    );
-
-    try {
-      for (const response of this.responseDecoder.push(data)) {
-        if (peekCommand(response) === Command.Eviction)
-          this.emit('eviction', evictionError(response));
-        else
-          this.emit('response', response);
-      }
-    } catch (error) {
-      this._endResponseWait();
-      this.emit(
-        'error',
-        error instanceof Error ? error : new Error(String(error))
-      );
-      this.socket.destroy();
-    }
-  }
-
-  writeFrame(frame: Buffer): void {
-    this.socket.write(frame);
+    this.fail(new Error('connection destroyed'));
   }
 }
 
 const normalizeHost = (host?: string): string => {
   const normalized = (host ?? '').toLowerCase().replace(/^::ffff:/, '');
-  return normalized === 'localhost' || normalized === '::1'
-    ? '127.0.0.1'
-    : normalized;
+  return normalized === 'localhost' || normalized === '::1' ? '127.0.0.1' : normalized;
 };
-
-export const endpointKey = (endpoint: Endpoint): string =>
-  `${normalizeHost(endpoint.host)}:${endpoint.port}`;
+export const endpointKey = (endpoint: Endpoint): string => `${normalizeHost(endpoint.host)}:${endpoint.port}`;

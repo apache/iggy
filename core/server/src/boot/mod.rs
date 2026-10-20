@@ -90,7 +90,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-2\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-3\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -703,6 +703,7 @@ async fn shard_main(
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
     metadata.set_partitions_max(config.metadata.partitions_max);
+    metadata.set_max_tokens_per_user(config.personal_access_token.max_tokens_per_user);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
     // clients that kept their identity across the restart (IGGY-137). Recovery
@@ -1237,6 +1238,7 @@ mod tests {
             b"IGGY-OWNERSHIP-HISTORY-3\n",
             b"IGGY-OWNERSHIP-HISTORY-4\n",
             b"IGGY-OWNERSHIP-HISTORY-5\n",
+            b"IGGY-BOUND-GRANTS-2\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {

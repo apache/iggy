@@ -51,6 +51,7 @@ enum VSRFrame {
         static let request = 200
         static let operation = 208
         static let status = 216
+        static let committedResult = 220
     }
 
     /// Eviction header field offsets the client reads.
@@ -124,7 +125,7 @@ enum VSRFrame {
             requestID = ConsensusSession.registerRequestID
             sessionID = 0
         case .nonReplicated:
-            requestID = session.currentRequestID
+            requestID = session.isBound ? try session.nextRequestID() : session.currentRequestID
             sessionID = session.session ?? 0
         default:
             guard let bound = session.session else {
@@ -207,6 +208,15 @@ enum VSRFrame {
             return nil
         }
         return ConsensusOperation(rawValue: header[header.startIndex + ReplyOffset.operation])
+    }
+
+    /// Proof of a final committed result, independent of whether its body
+    /// reports success or a business rejection. Validate the frame and its
+    /// request identity before relying on this marker for recovery.
+    static func hasCommittedResult(_ header: ArraySlice<UInt8>) -> Bool {
+        header.count == headerSize && peekCommand(header) == .reply
+            && readReplyStatus(header) == 0
+            && header[header.startIndex + ReplyOffset.committedResult] == 1
     }
 
     /// The decoded fields of an eviction frame.

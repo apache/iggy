@@ -32,7 +32,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 
 use super::fetch::LazyClient;
-use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by};
+use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker};
 use crate::bridge::config::{IggyBridgeConfig, ProduceSessionLimits};
 use crate::bridge::error::BridgeError;
 
@@ -408,15 +408,24 @@ impl IggyBridge {
             return (Err(BridgeError::Timeout), Some((turn, kept)));
         }
         let (stream_id, topic_id) = (target.stream_id.clone(), target.topic_id.clone());
+        let recovery_deadline = (Instant::now() + SLOT_LIMIT).into_std();
         let send = async move {
             // Owns the messages, so a send cut off at the limit drops them.
             let send = {
                 let client = Arc::clone(&client);
                 async move {
                     let partitioning = Partitioning::partition_id(partition);
-                    client
-                        .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
-                        .await
+                    loop {
+                        match client
+                            .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
+                            .await
+                        {
+                            Err(IggyError::LaneBlocked(operation)) => {
+                                resolve_blocker(&client, operation, recovery_deadline).await?;
+                            }
+                            result => return result,
+                        }
+                    }
                 }
             };
             within_slot_limit(&session, &client, kept, send).await

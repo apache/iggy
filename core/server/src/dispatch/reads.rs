@@ -33,10 +33,8 @@ use crate::dispatch::complete_session_binding;
 use crate::dispatch::failure::{
     FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
 };
-use crate::dispatch::partition::{
-    handle_get_consumer_offset, handle_poll_messages, resolve_poll_request,
-};
-use crate::namespace::{fence_and_resolve_offset_namespace, resolve_partition_namespace};
+use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
+use crate::namespace::resolve_partition_namespace;
 use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
@@ -54,27 +52,25 @@ use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE,
-    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_ROUTING_CODE,
-    GET_ME_CODE, GET_PARTITION_ROUTE_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_POLL_ROUTING_CODE,
-    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE,
-    POLL_MESSAGES_ON_PRIMARY_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE,
+    POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
-use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
+use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
+use iggy_binary_protocol::requests::system::BindSessionRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
-use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::responses::clients::client_response::ConsumerGroupInfoResponse;
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::responses::messages::{PartitionRouteResponse, PollRoutingResponse};
+use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{ClusterNodeRole, IggyError, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::framing::MAX_MESSAGE_SIZE;
@@ -85,7 +81,7 @@ use server_common::Message;
 use shard::{PartitionRead, PartitionReadReply};
 use std::cell::RefCell;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -208,7 +204,6 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
             | DESCRIBE_OPTIONS_CODE
             | GET_CLUSTER_METADATA_CODE
             | POLL_MESSAGES_CODE
-            | POLL_MESSAGES_ON_PRIMARY_CODE
             | GET_CONSUMER_OFFSET_CODE
             | GET_SNAPSHOT_FILE_CODE
     ) && lookup_command(code).is_some()
@@ -534,26 +529,11 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             )
             .await;
         }
-        GET_POLL_ROUTING_CODE
-        | GET_CONSUMER_OFFSET_ROUTING_CODE
-        | BIND_SESSION_CODE
-        | GET_PARTITION_ROUTE_CODE => {
+        BIND_SESSION_CODE | GET_PARTITION_ROUTE_CODE => {
             let result = if code == BIND_SESSION_CODE {
                 bind_session(shard, sessions, transport_client_id, &request).await
-            } else if code == GET_PARTITION_ROUTE_CODE {
-                partition_route(shard, &request, user_id, attachment, watermark).await
             } else {
-                consumer_routing(
-                    shard,
-                    sessions,
-                    transport_client_id,
-                    &request,
-                    user_id,
-                    attachment,
-                    client_address,
-                    code,
-                )
-                .await
+                partition_route(shard, &request, user_id, attachment, watermark).await
             };
             match result {
                 Ok(bytes) => {
@@ -573,7 +553,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
             }
         }
-        POLL_MESSAGES_CODE | POLL_MESSAGES_ON_PRIMARY_CODE => {
+        POLL_MESSAGES_CODE => {
             let consumer_client = bound
                 .zip(attachment)
                 .map(|((client_id, _), attachment)| (client_id, attachment))
@@ -770,109 +750,6 @@ where
         view,
         partitions_count,
         primary_replica: primary,
-    }
-    .to_bytes())
-}
-
-#[allow(clippy::future_not_send, clippy::too_many_arguments)]
-async fn consumer_routing<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
-    request: &Message<RoutedRequestHeader>,
-    user_id: Option<u32>,
-    attachment: Option<&SessionAttachment>,
-    client_address: Option<SocketAddr>,
-    code: u32,
-) -> Result<Bytes, IggyError>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let poll = if code == GET_POLL_ROUTING_CODE {
-        let poll = PollMessagesRequest::decode_from(request_body(request))
-            .map_err(|_| IggyError::InvalidCommand)?;
-        Some(poll)
-    } else {
-        None
-    };
-    let (wire, _) = GetConsumerOffsetRequest::decode(request_body(request))
-        .map_err(|_| IggyError::InvalidCommand)?;
-    let (client_id, session) = sessions
-        .borrow()
-        .get_session(transport_client_id)
-        .ok_or(IggyError::Unauthenticated)?;
-    let watermark = sessions.borrow().metadata_watermark(transport_client_id);
-    let authorize = || {
-        authorize_partition_read(
-            shard,
-            &wire.stream_id,
-            &wire.topic_id,
-            user_id,
-            |permissioner, user_id, stream_id, topic_id| {
-                permissioner.poll_messages(user_id, stream_id, topic_id)
-            },
-        )
-        .map_or(Ok(()), |code| Err(IggyError::from_code(code)))
-    };
-    authorize_and_hold_read(shard, attachment, code, watermark, &authorize).await?;
-    let namespace = if let Some(poll) = poll {
-        resolve_poll_request(shard, &poll, client_id)?.0
-    } else {
-        fence_and_resolve_offset_namespace(
-            shard,
-            &wire.consumer,
-            &wire.stream_id,
-            &wire.topic_id,
-            wire.partition_id,
-            client_id,
-        )?
-    };
-    let group_id = if wire.consumer.kind == iggy_binary_protocol::KIND_CONSUMER_GROUP {
-        Some(crate::namespace::resolve_offset_group_id(
-            shard.plane.metadata().mux_stm.streams(),
-            &wire.stream_id,
-            &wire.topic_id,
-            &wire.consumer.id,
-        )?)
-    } else {
-        None
-    };
-    let streams = shard.plane.metadata().mux_stm.streams();
-    let metadata = if code == GET_POLL_ROUTING_CODE {
-        streams.poll_metadata(namespace, group_id, client_id)
-    } else {
-        streams.consumer_offset_metadata(namespace, group_id, client_id)
-    }
-    .ok_or(IggyError::TransientNotAccepted)?;
-    let context = metadata.context(shard.plane.metadata().applied_frontier().get());
-    let primary = match shard
-        .partition_read(namespace, PartitionRead::Primary)
-        .await
-    {
-        Some(PartitionReadReply::Primary { primary, .. }) => primary,
-        Some(PartitionReadReply::Rejected(error)) => return Err(error),
-        _ => return Err(IggyError::TransientNotAccepted),
-    };
-    authorize_attached(attachment, authorize)?;
-    let roster = sessions.borrow().cluster_roster();
-    let primary = roster
-        .cluster_metadata(Some(primary), client_address.map(|address| address.ip()))
-        .nodes
-        .into_iter()
-        .find(|node| node.role == ClusterNodeRole::Leader)
-        .ok_or(IggyError::TransientNotAccepted)?;
-    Ok(PollRoutingResponse {
-        context,
-        consumer_session: SessionIdentity {
-            client_id,
-            session,
-            metadata_watermark: watermark.max(shard.plane.metadata().applied_frontier().get()),
-        },
-        primary: primary.into(),
     }
     .to_bytes())
 }

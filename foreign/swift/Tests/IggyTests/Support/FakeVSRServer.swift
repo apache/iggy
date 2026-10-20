@@ -44,6 +44,7 @@ final class FakeVSRServer: @unchecked Sendable {
         /// Status zero with this body; result-framed operations get the
         /// empty result section prepended.
         case ok([UInt8])
+        case uncommitted([UInt8])
         /// `ok` from a metadata operation that committed at `commit`.
         case committed([UInt8], commit: UInt64)
         /// A pre-commit denial: the status in the header, no body.
@@ -100,7 +101,7 @@ final class FakeVSRServer: @unchecked Sendable {
             .childChannelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
                     try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(FrameDecoder()))
-                    try channel.pipeline.syncOperations.addHandler(FakeServerHandler(state: state))
+                    try channel.pipeline.syncOperations.addHandler(FakeServerHandler(state: state, channel: channel))
                 }
             }
         let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
@@ -166,18 +167,6 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
-    /// The reply to `GetPollRouting` and `GetConsumerOffsetRouting`: the
-    /// session of `request` and a primary at `primary`.
-    static func pollRouteBody(for request: Request, context: PartitionContext, primary: String, watermark: UInt64 = 0) -> [UInt8] {
-        var writer = ByteWriter()
-        writer.write(request.clientID)
-        writer.write(request.session)
-        writer.write(watermark)
-        context.encode(into: &writer)
-        writeNode(primary, replicaID: 0, leader: true, into: &writer)
-        return writer.bytes
-    }
-
     /// A poll reply without messages.
     static func polledBody(partitionID: UInt32, context: PartitionContext = .empty) -> [UInt8] {
         var writer = ByteWriter()
@@ -216,7 +205,9 @@ final class FakeVSRServer: @unchecked Sendable {
         return writer.bytes
     }
 
-    static func encodeReply(request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8], commit: UInt64 = 0) -> [UInt8] {
+    static func encodeReply(
+        request: Request, operation: ConsensusOperation, status: UInt32, body: [UInt8], commit: UInt64 = 0, committed: Bool = true
+    ) -> [UInt8] {
         var frame = [UInt8](repeating: 0, count: VSRFrame.headerSize)
         frame.withUnsafeMutableBytes { buffer in
             buffer.storeBytes(of: UInt32(VSRFrame.headerSize + body.count).littleEndian, toByteOffset: VSRFrame.ReplyOffset.size, as: UInt32.self)
@@ -224,6 +215,9 @@ final class FakeVSRServer: @unchecked Sendable {
             buffer.storeBytes(of: commit.littleEndian, toByteOffset: VSRFrame.ReplyOffset.commit, as: UInt64.self)
             buffer.storeBytes(of: request.requestID.littleEndian, toByteOffset: VSRFrame.ReplyOffset.request, as: UInt64.self)
             buffer[VSRFrame.ReplyOffset.operation] = operation.rawValue
+            if committed && status == 0 && (operation.isMetadata || operation.isPartition) {
+                buffer[VSRFrame.ReplyOffset.committedResult] = 1
+            }
             buffer.storeBytes(of: status.littleEndian, toByteOffset: VSRFrame.ReplyOffset.status, as: UInt32.self)
         }
         return frame + body
@@ -296,9 +290,7 @@ final class FakeVSRServer: @unchecked Sendable {
             return .ok(registerBody(session: request.session))
         case .getPartitionRoute:
             return .ok(partitionRouteBody(routeContext))
-        case .getPollRouting, .getConsumerOffsetRouting:
-            return .ok(pollRouteBody(for: request, context: routeContext, primary: address))
-        case .pollMessagesOnPrimary:
+        case .pollMessages:
             return .ok(polledBody(partitionID: 0, context: routeContext))
         default:
             return .ok([])
@@ -349,33 +341,34 @@ actor FakeServerState {
     }
 }
 
-final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
+final class FakeServerHandler: ChannelInboundHandler {
     typealias InboundIn = RawFrame
 
     private let state: FakeServerState
-    private var connection = 0
+    /// The number the server gives this connection. Unstructured tasks run in
+    /// no set order, so every task for the connection awaits it first: the
+    /// client must not see a reply or a close before the connection is
+    /// counted, and its close must not be recorded before its open.
+    private let connection: Task<Int, Never>
 
-    init(state: FakeServerState) {
+    init(state: FakeServerState, channel: Channel) {
         self.state = state
-    }
-
-    func channelActive(context: ChannelHandlerContext) {
-        let channel = context.channel
-        Task { [self] in
-            connection = await state.connectionOpened(channel)
-        }
+        connection = Task { await state.connectionOpened(channel) }
     }
 
     func channelInactive(context: ChannelHandlerContext) {
         let channel = context.channel
-        Task { await state.connectionClosed(channel) }
+        Task { [state, connection] in
+            _ = await connection.value
+            await state.connectionClosed(channel)
+        }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let frame = unwrapInboundIn(data)
         let channel = context.channel
-        Task { [self] in
-            let request = FakeVSRServer.decodeRequest(connection: connection, frame: frame)
+        Task { [state, connection] in
+            let request = FakeVSRServer.decodeRequest(connection: await connection.value, frame: frame)
             let reply = await state.handle(request)
             let operation = request.operation
             func write(_ bytes: [UInt8]) {
@@ -389,6 +382,8 @@ final class FakeServerHandler: ChannelInboundHandler, @unchecked Sendable {
             switch reply {
             case .ok(let body):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body)))
+            case .uncommitted(let body):
+                write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), committed: false))
             case .committed(let body, let commit):
                 write(FakeVSRServer.encodeReply(request: request, operation: operation, status: 0, body: framedBody(body), commit: commit))
             case .status(let status):

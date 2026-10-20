@@ -75,8 +75,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wraps a single Iggy client call in [`REQUEST_TIMEOUT`].
 ///
-/// On expiry, maps to [`BridgeError::Timeout`], not `IggyError::CannotEstablishConnection`: the
-/// SDK's write/read run in a detached task this timeout cannot abort, so the call may still land.
+/// On expiry, a sent mutation can still commit and remains retained by the SDK.
+/// Metadata writes recover such blockers through [`IggyBridge::metadata_write`].
 async fn with_request_timeout<T>(
     op: impl Future<Output = Result<T, IggyError>>,
 ) -> Result<T, BridgeError> {
@@ -272,6 +272,45 @@ impl IggyBridge {
             .and(lookup_client)
             .and(offset_clients)
             .and(shared_client)
+    }
+
+    /// Recovers a canceled metadata write before submitting a later, unsent one.
+    /// A timeout keeps the SDK's retained request and never retries it as a new mutation.
+    async fn metadata_write<T, F: Future<Output = Result<T, IggyError>>>(
+        &self,
+        mut write: impl FnMut() -> F,
+    ) -> Result<T, BridgeError> {
+        let deadline = (Instant::now() + REQUEST_TIMEOUT).into_std();
+        with_request_timeout(write_with_recovery(&self.client, deadline, &mut write)).await
+    }
+}
+
+async fn write_with_recovery<T, F: Future<Output = Result<T, IggyError>>>(
+    client: &IggyClient,
+    deadline: std::time::Instant,
+    mut write: impl FnMut() -> F,
+) -> Result<T, IggyError> {
+    loop {
+        match write().await {
+            Err(IggyError::LaneBlocked(operation)) => {
+                resolve_blocker(client, operation, deadline).await?;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn resolve_blocker(
+    client: &IggyClient,
+    operation: u64,
+    deadline: std::time::Instant,
+) -> Result<(), IggyError> {
+    match client.resolve_operation(operation, deadline).await {
+        Err(error @ (IggyError::OperationUncertain(_) | IggyError::OperationNotRetained(_))) => {
+            Err(error)
+        }
+        // A proved rejection belongs to the earlier call and releases its lane too.
+        _ => Ok(()),
     }
 }
 

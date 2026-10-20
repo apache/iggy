@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::clients::redirect_login_settled;
-use crate::prelude::{ClientWrapper, IggyClient};
+use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_common::PersonalAccessTokenClient;
 use iggy_common::locking::IggyRwLockFn;
@@ -24,12 +23,11 @@ use iggy_common::{
     IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
     RawPersonalAccessToken,
 };
-use tracing::info;
 
 #[async_trait]
 impl PersonalAccessTokenClient for IggyClient {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
-        self.client.read().await.get_personal_access_tokens().await
+        super::with_client!(self, client => client.get_personal_access_tokens().await)
     }
 
     async fn create_personal_access_token(
@@ -37,59 +35,17 @@ impl PersonalAccessTokenClient for IggyClient {
         name: &str,
         expiry: PersonalAccessTokenExpiry,
     ) -> Result<RawPersonalAccessToken, IggyError> {
-        self.client
-            .read()
-            .await
-            .create_personal_access_token(name, expiry)
-            .await
+        super::with_client!(self, client => client.create_personal_access_token(name, expiry).await)
     }
 
     async fn delete_personal_access_token(&self, name: &str) -> Result<(), IggyError> {
-        self.client
-            .read()
-            .await
-            .delete_personal_access_token(name)
-            .await
+        super::with_client!(self, client => client.delete_personal_access_token(name).await)
     }
 
     async fn login_with_personal_access_token(
         &self,
         token: &str,
     ) -> Result<IdentityInfo, IggyError> {
-        let identity = self
-            .client
-            .read()
-            .await
-            .login_with_personal_access_token(token)
-            .await?;
-
-        let should_redirect = {
-            let client = self.client.read().await;
-            match &*client {
-                ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
-                ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
-                ClientWrapper::WebSocket(ws_client) => {
-                    ws_client.handle_leader_redirection().await?
-                }
-                _ => false,
-            }
-        };
-
-        if should_redirect {
-            info!("Redirected to leader, reconnecting and re-authenticating");
-            self.reconnect_after_redirect().await?;
-            // The reconnect signs in with the credentials this very call just
-            // remembered, so on a client without a configured `AutoLogin` the
-            // session is already this user's: signing in again would cost a
-            // logout and a second login (an argon2 each, on the server) for
-            // nothing. With `AutoLogin::Enabled` the reconnect signed in the
-            // configured user, who may not be this one, so the login runs.
-            if redirect_login_settled(&*self.client.read().await).await {
-                return Ok(identity);
-            }
-            self.login_with_personal_access_token(token).await
-        } else {
-            Ok(identity)
-        }
+        super::with_client!(self, client => client.login_with_personal_access_token(token).await)
     }
 }
