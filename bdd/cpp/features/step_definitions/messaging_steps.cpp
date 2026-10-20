@@ -42,10 +42,11 @@ GIVEN("^I have no streams in the system$") {
 }
 
 WHEN("^I create a stream with name \"([^\"]{1,255})\"$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(std::string, name);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    context->client->create_stream(name);
+    context->client->create_stream(name, error_info);
 }
 
 THEN("^the stream should be created successfully$") {
@@ -64,6 +65,7 @@ THEN("^the stream should have name \"([^\"]{1,255})\"$") {
 }
 
 WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0-9]+) partitions$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(std::string, topic_name);
     REGEX_PARAM(int, stream_id);
     REGEX_PARAM(int, partitions_count);
@@ -81,7 +83,7 @@ WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0
     opts.max_topic_size            = "server_default";
 
     context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
-                                  std::move(opts));
+                                  std::move(opts), error_info);
 }
 
 THEN("^the topic should be created successfully$") {
@@ -110,6 +112,7 @@ THEN("^the topic should have ([0-9]+) partitions$") {
 }
 
 WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([0-9]+)$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(int, message_count);
     REGEX_PARAM(int, stream_id);
     REGEX_PARAM(int, topic_id);
@@ -129,7 +132,7 @@ WHEN("^I send ([0-9]+) messages to stream ([0-9]+), topic ([0-9]+), partition ([
     context->client->send_messages(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
                                    bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), "partition_id",
                                    bdd::partition_id_bytes(static_cast<std::uint32_t>(partition_id)),
-                                   std::move(messages));
+                                   std::move(messages), error_info);
 
     context->last_sent_payload = bdd::expected_payload(static_cast<std::uint32_t>(message_count - 1));
     context->last_sent_id_lo   = static_cast<std::uint64_t>(message_count);
@@ -141,6 +144,7 @@ THEN("^all messages should be sent successfully$") {
 }
 
 WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) starting from offset ([0-9]+)$") {
+    iggy::ffi::ErrorInfo error_info{};
     REGEX_PARAM(int, stream_id);
     REGEX_PARAM(int, topic_id);
     REGEX_PARAM(int, partition_id);
@@ -150,7 +154,8 @@ WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) 
     const auto polled = context->client->poll_messages(
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), "offset", static_cast<std::uint64_t>(offset), 100, false);
+        "consumer", bdd::make_numeric_identifier(1), "offset", static_cast<std::uint64_t>(offset), 100, false,
+        error_info);
 
     context->polled.count = polled.count;
     context->polled.offsets.clear();

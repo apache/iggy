@@ -38,8 +38,11 @@ from apache_iggy import (
     AutoLogin,
     IggyClient,
     IggyExpiry,
+    PendingOperationsConfig,
+    QuicConfig,
     TcpConfig,
     TcpReconnectionConfig,
+    WebSocketConfig,
 )
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
@@ -470,3 +473,29 @@ class TestAutoLoginAgainstServer:
 
         with pytest.raises(RuntimeError):
             await client.connect()
+
+
+@pytest.mark.unit
+class TestPendingOperationsConfig:
+    @pytest.mark.parametrize("config_type", [TcpConfig, QuicConfig, WebSocketConfig])
+    def test_shared_limits_round_trip(self, config_type):
+        defaults = config_type().pending_operations
+        assert defaults.max_operations == 256
+        assert defaults.max_bytes == 64 * 1024 * 1024
+        limits = PendingOperationsConfig(max_operations=3, max_bytes=4096)
+        config = config_type(pending_operations=limits)
+        assert config.pending_operations.max_operations == 3
+        assert config.pending_operations.max_bytes == 4096
+        assert repr(limits) in repr(config)
+        with pytest.raises(AttributeError):
+            # pyrefly: ignore  # read-only
+            limits.max_operations = 4
+
+    @pytest.mark.parametrize("field", ["max_operations", "max_bytes"])
+    @pytest.mark.parametrize(
+        "value,exception",
+        [(0, ValueError), (-1, OverflowError), (2**128, OverflowError)],
+    )
+    def test_invalid_limits_are_rejected(self, field, value, exception):
+        with pytest.raises(exception):
+            PendingOperationsConfig(**{field: value})

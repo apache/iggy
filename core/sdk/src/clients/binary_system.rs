@@ -27,27 +27,27 @@ use iggy_common::{
 #[async_trait]
 impl SystemClient for IggyClient {
     async fn get_stats(&self) -> Result<Stats, IggyError> {
-        self.client.read().await.get_stats().await
+        super::with_client!(self, client => client.get_stats().await)
     }
 
     async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
-        self.client.read().await.get_me().await
+        super::with_client!(self, client => client.get_me().await)
     }
 
     async fn get_client(&self, client_id: u32) -> Result<Option<ClientInfoDetails>, IggyError> {
-        self.client.read().await.get_client(client_id).await
+        super::with_client!(self, client => client.get_client(client_id).await)
     }
 
     async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError> {
-        self.client.read().await.get_clients().await
+        super::with_client!(self, client => client.get_clients().await)
     }
 
     async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
-        self.client.read().await.describe_options(scope).await
+        super::with_client!(self, client => client.describe_options(scope).await)
     }
 
     async fn ping(&self) -> Result<(), IggyError> {
-        self.client.read().await.ping().await
+        super::with_client!(self, client => client.ping().await)
     }
 
     async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
@@ -59,10 +59,6 @@ impl SystemClient for IggyClient {
         compression: SnapshotCompression,
         snapshot_types: Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {
-        self.client
-            .read()
-            .await
-            .snapshot(compression, snapshot_types)
-            .await
+        super::with_client!(self, client => client.snapshot(compression, snapshot_types).await)
     }
 }

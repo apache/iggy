@@ -37,6 +37,15 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 #[cxx::bridge(namespace = "iggy::ffi")]
 mod ffi {
+    /// Local to one call. Read after a bridge exception; IDs remain exact u64 values.
+    #[derive(Default)]
+    struct ErrorInfo {
+        code: u32,
+        kind: String,
+        has_operation_id: bool,
+        operation_id: u64,
+    }
+
     struct Identifier {
         kind: String,
         length: u8,
@@ -449,6 +458,9 @@ mod ffi {
         has_tls_validate_certificate: bool,
         tls_validate_certificate: bool,
         no_delay: bool,
+        has_pending_operations: bool,
+        pending_max_operations: u64,
+        pending_max_bytes: u64,
     }
 
     struct TopicCreateOptions {
@@ -495,24 +507,46 @@ mod ffi {
         // Client functions
         fn new_connection(config: IggyClientConfig) -> Result<*mut Client>;
         fn from_connection_string(connection_string: String) -> Result<*mut Client>;
-        fn login_user(self: &Client, username: String, password: String) -> Result<LoginInfo>;
-        fn logout_user(self: &Client) -> Result<()>;
+        fn login_user(
+            self: &Client,
+            username: String,
+            password: String,
+            error_info: &mut ErrorInfo,
+        ) -> Result<LoginInfo>;
+        fn logout_user(self: &Client, error_info: &mut ErrorInfo) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
-        fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
+        fn resolve_operation(
+            self: &Client,
+            op: u64,
+            timeout_micros: u64,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        fn abandon_operation(self: &Client, op: u64, error_info: &mut ErrorInfo) -> Result<()>;
+        fn create_stream(
+            self: &Client,
+            stream_name: String,
+            error_info: &mut ErrorInfo,
+        ) -> Result<StreamDetails>;
         fn update_stream(
             self: &Client,
             stream_id: Identifier,
             stream_name: String,
             options: Vec<HeaderEntry>,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
-        fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
+        fn delete_stream(
+            self: &Client,
+            stream_id: Identifier,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
             topic_name: String,
             options: TopicCreateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<TopicDetails>;
         fn get_topic(
             self: &Client,
@@ -526,25 +560,34 @@ mod ffi {
             topic_id: Identifier,
             topic_name: String,
             options: TopicUpdateOptions,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
-        fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
+        fn delete_topic(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         fn create_partitions(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partitions_count: u32,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn delete_partitions(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partitions_count: u32,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn create_consumer_group(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             name: String,
+            error_info: &mut ErrorInfo,
         ) -> Result<ConsumerGroupDetails>;
         fn get_consumer_group(
             self: &Client,
@@ -562,19 +605,23 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn join_consumer_group(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn leave_consumer_group(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
+        #[allow(clippy::too_many_arguments)]
         fn store_consumer_offset(
             self: &Client,
             stream_id: Identifier,
@@ -583,6 +630,7 @@ mod ffi {
             consumer_kind: String,
             consumer_id: Identifier,
             offset: u64,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_consumer_offset(
             self: &Client,
@@ -599,6 +647,7 @@ mod ffi {
             partition_id: u32,
             consumer_kind: String,
             consumer_id: Identifier,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         /// Stores `offset` under `context`, normally the one returned with the
         /// polled batch. Every retry keeps it, so a deleted or recreated
@@ -614,6 +663,7 @@ mod ffi {
             consumer_id: Identifier,
             offset: u64,
             context: PartitionContext,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
 
         /// The poll takes the context its cached route reports. After another
@@ -633,6 +683,7 @@ mod ffi {
             polling_strategy_value: u64,
             count: u32,
             auto_commit: bool,
+            error_info: &mut ErrorInfo,
         ) -> Result<PolledMessages>;
         /// Polls under `context`, normally the one returned with the offset the
         /// poll continues from. Every retry keeps it.
@@ -649,6 +700,7 @@ mod ffi {
             count: u32,
             auto_commit: bool,
             context: PartitionContext,
+            error_info: &mut ErrorInfo,
         ) -> Result<PolledMessages>;
 
         fn make_message(payload: Vec<u8>, user_headers: Vec<HeaderEntry>) -> IggyMessageToSend;
@@ -661,6 +713,7 @@ mod ffi {
             partitioning_kind: String,
             partitioning_value: Vec<u8>,
             messages: Vec<IggyMessageToSend>,
+            error_info: &mut ErrorInfo,
         ) -> Result<SendMessagesResponse>;
         fn get_stats(self: &Client) -> Result<Stats>;
         fn get_me(self: &Client) -> Result<ClientInfoDetails>;
@@ -677,7 +730,12 @@ mod ffi {
             snapshot_compression: String,
             snapshot_types: Vec<String>,
         ) -> Result<Vec<u8>>;
-        fn send_binary_request(self: &Client, code: u32, payload: Vec<u8>) -> Result<Vec<u8>>;
+        fn send_binary_request(
+            self: &Client,
+            code: u32,
+            payload: Vec<u8>,
+            error_info: &mut ErrorInfo,
+        ) -> Result<Vec<u8>>;
 
         fn disconnect(self: &Client) -> Result<()>;
         fn shutdown(self: &Client) -> Result<()>;
@@ -688,6 +746,7 @@ mod ffi {
             topic_id: Identifier,
             partition_id: u32,
             segments_count: u32,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
         fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
@@ -698,8 +757,14 @@ mod ffi {
             status: UserStatus,
             has_permissions: bool,
             permissions: Permissions,
+            error_info: &mut ErrorInfo,
         ) -> Result<UserInfoDetails>;
-        fn delete_user(self: &Client, user_id: Identifier) -> Result<()>;
+        fn delete_user(
+            self: &Client,
+            user_id: Identifier,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
+        #[allow(clippy::too_many_arguments)]
         fn update_user(
             self: &Client,
             user_id: Identifier,
@@ -708,18 +773,21 @@ mod ffi {
             has_status: bool,
             status: UserStatus,
             options: Vec<HeaderEntry>,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,
             user_id: Identifier,
             has_permissions: bool,
             permissions: Permissions,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn change_password(
             self: &Client,
             user_id: Identifier,
             current_password: String,
             new_password: String,
+            error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
         // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;

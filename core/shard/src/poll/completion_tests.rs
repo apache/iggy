@@ -451,6 +451,83 @@ async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generat
     assert_eq!(fixture.group_offsets(), (Some(0), Some(0)));
 }
 
+#[compio::test]
+async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read_new_history() {
+    const REPLACEMENT_REVISION: u64 = 2;
+    let (mut fixture, _) = BoundPoll::activated().await;
+    fixture.poll().await;
+    fixture.commit().await;
+    let (owner, ..) = fixture.served.as_ref().unwrap();
+    let namespace = fixture.namespace;
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_offset_metadata(namespace, None, BOUND_CLIENT)
+        .unwrap();
+
+    for replaced in [false, true] {
+        if replaced {
+            let (replacement, _) = partition_with_messages_at_revision(
+                &fixture.bus,
+                namespace,
+                &["new history"],
+                REPLACEMENT_REVISION,
+            )
+            .await;
+            owner.plane.partitions().remove(&namespace).unwrap();
+            owner.plane.partitions().insert(namespace, replacement);
+            owner.shards_table.insert(
+                namespace,
+                PartitionLocation::new(ShardId::new(0), REPLACEMENT_REVISION),
+            );
+        }
+        for read in [
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(PollingConsumer::ConsumerGroup(
+                    usize::try_from(BOUND_GROUP).unwrap(),
+                    0,
+                )),
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group_id: u32::try_from(BOUND_GROUP).unwrap(),
+                metadata,
+            },
+        ] {
+            let has_offset = matches!(
+                &read,
+                PartitionRead::ConsumerOffsetOnPrimary {
+                    consumer: Some(_),
+                    ..
+                }
+            );
+            let (reply, replies) = channel(1);
+            owner.on_partition_read(namespace, read, reply).await;
+            let reply = replies.try_recv().unwrap();
+            if replaced {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    ),
+                    "captured read must not read the replacement, got {reply:?}"
+                );
+            } else {
+                let PartitionReadReply::ConsumerOffset { stored, .. } = reply else {
+                    panic!("the original history should answer the read, got {reply:?}");
+                };
+                assert_eq!(stored, has_offset.then_some(0));
+            }
+        }
+    }
+}
+
 /// Equal generations alone must not bind the poller: the partition's owner
 /// at that generation is another client.
 #[compio::test]
@@ -589,9 +666,17 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
                 metadata,
             },
             PartitionRead::ConsumerOffsetOnPrimary {
-                consumer: PollingConsumer::Consumer(1, 0),
+                consumer: Some(PollingConsumer::Consumer(1, 0)),
+                metadata,
             },
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id: 1 },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group_id: 1,
+                metadata,
+            },
         ] {
             let (reply, replies) = channel(1);
             owner.on_partition_read(namespace, read, reply).await;
@@ -982,6 +1067,27 @@ async fn given_deleted_history_when_metadata_still_lists_the_partition_should_re
                             session: table.attach_session(CLIENT, 1, USER).unwrap(),
                             metadata,
                         },
+                    },
+                ),
+                (
+                    "ConsumerOffsetOnPrimary",
+                    PartitionRead::ConsumerOffsetOnPrimary {
+                        consumer: Some(consumer),
+                        metadata,
+                    },
+                ),
+                (
+                    "MissingGroupOffsetOnPrimary",
+                    PartitionRead::ConsumerOffsetOnPrimary {
+                        consumer: None,
+                        metadata,
+                    },
+                ),
+                (
+                    "ExternalGroupOffsetOnPrimary",
+                    PartitionRead::ExternalGroupOffsetOnPrimary {
+                        group_id: 1,
+                        metadata,
                     },
                 ),
             ];

@@ -261,7 +261,7 @@ class AsyncIggyTcpClientEventLoopGroupTest {
                 1024 * 1024,
                 null,
                 errorCode -> {},
-                ignored -> {});
+                (source, cause) -> {});
     }
 
     private static String loopback() {
@@ -302,7 +302,7 @@ class AsyncIggyTcpClientEventLoopGroupTest {
                 timeout);
     }
 
-    private static void await(BooleanSupplier condition, String description, Duration timeout) throws Exception {
+    static void await(BooleanSupplier condition, String description, Duration timeout) throws Exception {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) {

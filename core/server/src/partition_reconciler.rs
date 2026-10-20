@@ -145,13 +145,10 @@
 //! full scan. It wants a partition-id-keyed map in the STM.
 //!
 //! TODO(krishna): the transient deny answers with `IggyError::TransientNotAccepted`,
-//! which the SDK treats as a leader-liveness signal. It replays same-session for
-//! its `transient_deadline` first -- which is the right response and usually long
-//! enough for the namespace to materialise -- but past that deadline `tcp_client`
-//! runs `handle_leader_redirection` and reconnects, re-registering and losing the
-//! session. Every cause of a park deny is node-local convergence, so that failover
-//! cannot help; it needs a distinct "retry here shortly" code that does not move
-//! the client.
+//! which makes the SDK refresh its route and replay within the operation deadline.
+//! The logical session and request identity survive that refresh. Every cause of
+//! a park deny is node-local convergence, so rediscovery can add work without
+//! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
 use crate::partition_helpers::{

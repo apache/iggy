@@ -20,8 +20,10 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo, Socket } from 'node:net';
 import { createServer, type Server } from 'node:net';
-import { describe, it } from 'node:test';
+import type { Readable } from 'node:stream';
+import { describe, it, type TestContext } from 'node:test';
 import { createServer as createTlsServer } from 'node:tls';
+import { groupConsumerStream, singleConsumerStream } from '../stream/consumer-stream.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT } from '../wire/index.js';
 import { UPDATE_USER } from '../wire/user/update-user.command.js';
@@ -45,14 +47,22 @@ import {
   REPLY_OFFSET,
   REQUEST_OFFSET
 } from '../wire/vsr/header.js';
-import { Operation } from '../wire/vsr/operation.js';
+import { Operation, operationForCode } from '../wire/vsr/operation.js';
 import { VsrEvictionError } from '../wire/vsr/reply.js';
-import { CommandResponseStream } from './client.socket.js';
-import type { ClientConfig, CommandResponse } from './client.type.js';
+import { IggyConnection, type LinkAttempt } from './client.connection.js';
+import { OPERATION_TIMEOUT_MS } from './client.operation.js';
+import {
+  CommandResponseStream, LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError
+} from './client.socket.js';
+import type { ClientConfig } from './client.type.js';
 
 const TEST_SESSION = 42n;
 const HISTORY_UNAVAILABLE = 87;
 const TRANSIENT_NOT_ACCEPTED = 58;
+const INVALID_CREDENTIALS = 42;
+const STALE_CLIENT = 30;
+const UNAUTHENTICATED = 40;
+const UNAUTHORIZED = 41;
 const TLS_CERTIFICATE = readFileSync(
   new URL('../../../../core/certs/iggy_cert.pem', import.meta.url)
 );
@@ -68,7 +78,10 @@ type FrameHandler = (frame: Buffer, socket: Socket) => void;
 type VsrTestServer = {
   port: number,
   frames: Buffer[],
-  close: () => Promise<void>
+  sockets: Set<Socket>,
+  close: () => Promise<void>,
+  /** Listens again on the same port after `close`. */
+  reopen: () => Promise<void>
 };
 
 /** Loopback server speaking just enough VSR framing for the client tests. */
@@ -77,7 +90,10 @@ const startVsrServer = async (
   transport: 'TCP' | 'TLS' = 'TCP'
 ): Promise<VsrTestServer> => {
   const frames: Buffer[] = [];
+  const sockets = new Set<Socket>();
   const handleConnection = (socket: Socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
     let pending = Buffer.alloc(0);
     socket.on('data', (data: Buffer) => {
       pending = Buffer.concat([pending, data]);
@@ -100,14 +116,19 @@ const startVsrServer = async (
     : createServer(handleConnection);
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
+  const port = (server.address() as AddressInfo).port;
   return {
-    port: (server.address() as AddressInfo).port,
-    frames,
-    close: () => new Promise((resolve) => server.close(() => resolve()))
+    port, frames, sockets,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+    reopen: async () => {
+      server.listen(port, '127.0.0.1');
+      await once(server, 'listening');
+    }
   };
 };
 
 const replyFrame = (
+  request: Buffer | undefined,
   operation: number,
   body: Buffer = Buffer.alloc(0),
   status = 0
@@ -117,6 +138,12 @@ const replyFrame = (
   frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
   frame.writeUInt8(operation, REPLY_OFFSET.operation);
   frame.writeUInt32LE(status, REPLY_OFFSET.status);
+  if (request) {
+    frame.writeBigUInt64LE(request.readBigUInt64LE(REQUEST_OFFSET.request), REPLY_OFFSET.request);
+    request.copy(frame, REPLY_OFFSET.client, REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16);
+    request.copy(frame, REPLY_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum, REQUEST_OFFSET.requestChecksum + 16);
+    frame.writeBigUInt64LE(request.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation), REPLY_OFFSET.partitionIncarnation);
+  }
   body.copy(frame, HEADER_SIZE);
   return frame;
 };
@@ -153,41 +180,14 @@ const registerReplyBody = (session = TEST_SESSION): Buffer => {
   return body;
 };
 
-const singleNodeMetadataBody = (port: number): Buffer => {
-  const name = Buffer.from('single-node');
-  const nodeName = Buffer.from('iggy-node');
-  const ip = Buffer.from('127.0.0.1');
-  const body = Buffer.alloc(
-    4 + name.length + 4 + 1 + 4 + nodeName.length + 4 + ip.length + 8 + 2
-  );
-  let offset = 0;
-  body.writeUInt32LE(name.length, offset); offset += 4;
-  name.copy(body, offset); offset += name.length;
-  body.writeUInt32LE(1, offset); offset += 4;
-  body.writeUInt8(0, offset); offset += 1;
-  body.writeUInt32LE(nodeName.length, offset); offset += 4;
-  nodeName.copy(body, offset); offset += nodeName.length;
-  body.writeUInt32LE(ip.length, offset); offset += 4;
-  ip.copy(body, offset); offset += ip.length;
-  body.writeUInt16LE(port, offset); offset += 8;
-  body.writeUInt8(0, offset); offset += 1;
-  body.writeUInt8(0, offset);
-  return body;
-};
-
-const twoNodeMetadataBody = (
-  followerPort: number,
-  leaderPort: number,
-  leaderRole = 0,
-  leaderStatus = 0
-): Buffer => {
-  const node = (
-    nodeName: Buffer,
-    replicaId: number,
-    port: number,
-    role: number,
-    status = 0
-  ): Buffer => {
+const metadataBody = (nodes: { port: number, replicaId: number, role?: number, status?: number }[]): Buffer => {
+  const name = Buffer.from('iggy-cluster');
+  const header = Buffer.alloc(4 + name.length + 4);
+  header.writeUInt32LE(name.length, 0);
+  name.copy(header, 4);
+  header.writeUInt32LE(nodes.length, 4 + name.length);
+  return Buffer.concat([header, ...nodes.map(({ port, replicaId, role = 1, status = 0 }) => {
+    const nodeName = Buffer.from(`iggy-node-${replicaId}`);
     const ip = Buffer.from('127.0.0.1');
     const encoded = Buffer.alloc(1 + 4 + nodeName.length + 4 + ip.length + 8 + 2);
     let offset = 0;
@@ -200,76 +200,43 @@ const twoNodeMetadataBody = (
     encoded.writeUInt8(role, offset); offset += 1;
     encoded.writeUInt8(status, offset);
     return encoded;
-  };
-  const name = Buffer.from('iggy-cluster');
-  const header = Buffer.alloc(4 + name.length + 4);
-  header.writeUInt32LE(name.length, 0);
-  name.copy(header, 4);
-  header.writeUInt32LE(2, 4 + name.length);
-  return Buffer.concat([
-    header,
-    node(Buffer.from('iggy-node-1'), 0, leaderPort, leaderRole, leaderStatus),
-    node(Buffer.from('iggy-node-2'), 7, followerPort, 1)
-  ]);
+  })]);
 };
 
-const threeNodeMetadataBody = (
-  firstPort: number,
-  secondPort: number,
-  thirdPort: number
-): Buffer => {
-  const node = (name: string, replicaId: number, port: number, role: number): Buffer => {
-    const nodeName = Buffer.from(name);
-    const ip = Buffer.from('127.0.0.1');
-    const encoded = Buffer.alloc(1 + 4 + nodeName.length + 4 + ip.length + 8 + 2);
-    let offset = 0;
-    encoded.writeUInt8(replicaId, offset); offset += 1;
-    encoded.writeUInt32LE(nodeName.length, offset); offset += 4;
-    nodeName.copy(encoded, offset); offset += nodeName.length;
-    encoded.writeUInt32LE(ip.length, offset); offset += 4;
-    ip.copy(encoded, offset); offset += ip.length;
-    encoded.writeUInt16LE(port, offset); offset += 8;
-    encoded.writeUInt8(role, offset); offset += 1;
-    encoded.writeUInt8(0, offset);
-    return encoded;
-  };
-  const name = Buffer.from('iggy-cluster');
-  const header = Buffer.alloc(4 + name.length + 4);
-  header.writeUInt32LE(name.length, 0);
-  name.copy(header, 4);
-  header.writeUInt32LE(3, 4 + name.length);
-  return Buffer.concat([
-    header,
-    node('iggy-node-1', 0, firstPort, 0),
-    node('iggy-node-2', 7, secondPort, 1),
-    node('iggy-node-3', 9, thirdPort, 1)
-  ]);
-};
+const singleNodeMetadataBody = (port: number): Buffer => metadataBody([{ port, replicaId: 0, role: 0 }]);
+
+const twoNodeMetadataBody = (followerPort: number, leaderPort: number, leaderRole = 0, leaderStatus = 0): Buffer =>
+  metadataBody([{ port: leaderPort, replicaId: 0, role: leaderRole, status: leaderStatus },
+    { port: followerPort, replicaId: 7 }]);
+
+const threeNodeMetadataBody = (firstPort: number, secondPort: number, thirdPort: number): Buffer =>
+  metadataBody([{ port: firstPort, replicaId: 0, role: 0 }, { port: secondPort, replicaId: 7 },
+    { port: thirdPort, replicaId: 9 }]);
 
 /** Register, metadata, and echo behavior of a healthy single VSR node. */
 const singleNodeHandler = (port: number): FrameHandler =>
   (frame, socket) => {
     const operation = frame.readUInt8(REQUEST_OFFSET.operation);
     if (operation === Operation.Register) {
-      socket.write(replyFrame(Operation.Register, registerReplyBody()));
+      socket.write(replyFrame(frame, Operation.Register, registerReplyBody()));
       return;
     }
     const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
     if (code === COMMAND_CODE.BindSession) {
-      socket.write(replyFrame(Operation.NonReplicated, registerReplyBody().subarray(4)));
+      socket.write(replyFrame(frame, Operation.NonReplicated, registerReplyBody().subarray(4)));
       return;
     }
     if (code === COMMAND_CODE.GetClusterMetadata) {
       socket.write(
-        replyFrame(Operation.NonReplicated, singleNodeMetadataBody(port))
+        replyFrame(frame, Operation.NonReplicated, singleNodeMetadataBody(port))
       );
       return;
     }
     if (code === COMMAND_CODE.GetPartitionRoute) {
-      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n)));
+      socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n, 0n, 0)));
       return;
     }
-    socket.write(replyFrame(operation));
+    socket.write(replyFrame(frame, operation));
   };
 
 const vsrConfig = (port: number): ClientConfig => ({
@@ -278,36 +245,6 @@ const vsrConfig = (port: number): ClientConfig => ({
   credentials: { username: 'iggy', password: 'iggy' },
   reconnect: { enabled: false, interval: 100, maxRetries: 1 }
 });
-
-/** Shrinks the leaderless poll so a test observes it without waiting on it. */
-/** The queue a command waits in, for parking one the way the client does. */
-const execQueue = (client: CommandResponseStream): {
-  command: number,
-  payload: Buffer,
-  handleResponse: boolean,
-  deadline: number,
-  resolve: (v: CommandResponse | PromiseLike<CommandResponse>) => void,
-  reject: (e: unknown) => void
-}[] => (client as unknown as { _execQueue: never[] })._execQueue;
-
-/** The connection under a stream, for driving a redirect the way a move does. */
-const connectionOf = (client: CommandResponseStream): {
-  redirect: (host: string, port: number) => Promise<void>
-} => (client as unknown as {
-  connection: { redirect: (host: string, port: number) => Promise<void> }
-}).connection;
-
-const compressLeaderlessPoll = (
-  client: CommandResponseStream,
-  budget: number
-): void => {
-  const settlement = client as unknown as {
-    leaderlessWaitBudget: number,
-    leaderlessPollInterval: number
-  };
-  settlement.leaderlessWaitBudget = budget;
-  settlement.leaderlessPollInterval = 1;
-};
 
 const groupPollPayload = (autocommit = true, partitionId = 0): Buffer =>
   POLL_MESSAGES.serialize({
@@ -325,6 +262,7 @@ const routingBody = (watermark: bigint, incarnation = 0n,
   const route = Buffer.alloc(25);
   route.writeBigUInt64LE(incarnation, 0);
   route.writeBigUInt64LE(watermark, 8);
+  route.writeUInt32LE(Number(watermark), 16);
   route.writeUInt32LE(4, 20);
   route.writeUInt8(primaryReplica, 24);
   return route;
@@ -344,13 +282,14 @@ const registerCredentialsBody = (frame: Buffer): Buffer => {
 const startPollCluster = async (
   primaryOverride?: (frame: Buffer, socket: Socket) => boolean,
   coordinatorOverride?: (frame: Buffer, socket: Socket) => boolean,
-  transport: 'TCP' | 'TLS' = 'TCP'
+  transport: 'TCP' | 'TLS' = 'TCP',
+  overrides: Partial<ClientConfig> = {}
 ) => {
   const primary = await startVsrServer((frame, socket) => {
     if (primaryOverride?.(frame, socket))
       return;
     if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.PollMessages) {
-      socket.write(replyFrame(Operation.NonReplicated, Buffer.from('primary')));
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('primary')));
       return;
     }
     singleNodeHandler(primary.port)(frame, socket);
@@ -360,12 +299,12 @@ const startPollCluster = async (
       return;
     const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
     if (code === COMMAND_CODE.GetClusterMetadata) {
-      socket.write(replyFrame(Operation.NonReplicated,
+      socket.write(replyFrame(frame, Operation.NonReplicated,
         twoNodeMetadataBody(primary.port, coordinator.port)));
       return;
     }
     if (code === COMMAND_CODE.GetPartitionRoute) {
-      socket.write(replyFrame(Operation.NonReplicated, routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n)));
+      socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(frame.readBigUInt64LE(REQUEST_OFFSET.minimumMetadataOp) || 1n)));
       return;
     }
     singleNodeHandler(coordinator.port)(frame, socket);
@@ -375,7 +314,8 @@ const startPollCluster = async (
     options: {
       ...vsrConfig(coordinator.port).options,
       ...(transport === 'TLS' ? { ca: TLS_CA_CERTIFICATE, servername: 'localhost' } : {})
-    }
+    },
+    ...overrides
   };
   const client = new CommandResponseStream(config);
   return {
@@ -424,7 +364,7 @@ const metadataResult = (code: number): Buffer => {
 const offsetCommittingHandler = (port: number): FrameHandler => (frame, socket) => {
   const operation = frame.readUInt8(REQUEST_OFFSET.operation);
   if (operation === Operation.StoreConsumerOffset || operation === Operation.DeleteConsumerOffset) {
-    socket.write(replyFrame(operation, metadataResult(0)));
+    socket.write(replyFrame(frame, operation, metadataResult(0)));
     return;
   }
   singleNodeHandler(port)(frame, socket);
@@ -437,14 +377,14 @@ const contextServer = async (state: {
     if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages) {
       state.onSend?.();
       const sent = frame.readBigUInt64LE(REQUEST_OFFSET.partitionIncarnation);
-      socket.write(replyFrame(Operation.SendMessages, Buffer.alloc(0),
+      socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0),
         !state.refuseAll && sent === state.live ? 0 : HISTORY_UNAVAILABLE));
       return;
     }
     if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
       const context = routingBody(0n, 0n, 0);
       context.writeBigUInt64LE(state.live, 0);
-      socket.write(replyFrame(Operation.NonReplicated, context, state.contextStatus));
+      socket.write(replyFrame(frame, Operation.NonReplicated, context, state.contextStatus));
       return;
     }
     singleNodeHandler(server.port)(frame, socket);
@@ -470,7 +410,7 @@ describe('unified partition routing', () => {
       const replacement = await startVsrServer((frame, socket) => {
         if (frame[REQUEST_OFFSET.operation] === operation &&
             (operation !== Operation.NonReplicated || frame.readUInt32LE(REQUEST_OFFSET.reserved) === command)) {
-          socket.write(replyFrame(operation, operation === Operation.StoreConsumerOffset ||
+          socket.write(replyFrame(frame, operation, operation === Operation.StoreConsumerOffset ||
             operation === Operation.DeleteConsumerOffset ? metadataResult(0) : Buffer.alloc(0)));
           return;
         }
@@ -481,19 +421,19 @@ describe('unified partition routing', () => {
         if (frame[REQUEST_OFFSET.operation] !== operation ||
             (operation === Operation.NonReplicated && frame.readUInt32LE(REQUEST_OFFSET.reserved) !== command))
           return false;
-        socket.write(replyFrame(operation, Buffer.alloc(0), 89));
+        socket.write(replyFrame(frame, operation, Buffer.alloc(0), 89));
         return true;
       }, (frame, socket) => {
         const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
         if (code === COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(Operation.NonReplicated,
+          socket.write(replyFrame(frame, Operation.NonReplicated,
             threeNodeMetadataBody(cluster.coordinator.port, cluster.primary.port, replacement.port)));
           return true;
         }
         if (code !== COMMAND_CODE.GetPartitionRoute)
           return false;
         routes += 1;
-        socket.write(replyFrame(Operation.NonReplicated,
+        socket.write(replyFrame(frame, Operation.NonReplicated,
           routingBody(BigInt(routes), BigInt(routes), routes === 1 ? 7 : 9)));
         return true;
       });
@@ -526,8 +466,10 @@ describe('unified partition routing', () => {
     const cluster = await startPollCluster(undefined, (frame, socket) => {
       if (frame[REQUEST_OFFSET.operation] !== Operation.CreateStream)
         return false;
-      const response = replyFrame(Operation.CreateStream, metadataResult(0));
+      const response = replyFrame(frame, Operation.CreateStream, metadataResult(0));
       response.writeBigUInt64LE(19n, REPLY_OFFSET.commit);
+      response.writeBigUInt64LE(19n, REPLY_OFFSET.op);
+      response[REPLY_OFFSET.reserved] = 1;
       socket.write(response);
       return true;
     });
@@ -554,20 +496,22 @@ describe('unified partition routing', () => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== command)
           return false;
         histories.push(stampedContext(frame).incarnation);
-        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0)));
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0)));
         return true;
       }, (frame, socket) => {
         if (frame[REQUEST_OFFSET.operation] === Operation.UpdateUser) {
           watermark = 19n;
           incarnation = 8n;
-          const response = replyFrame(Operation.UpdateUser, metadataResult(0));
+          const response = replyFrame(frame, Operation.UpdateUser, metadataResult(0));
           response.writeBigUInt64LE(watermark, REPLY_OFFSET.commit);
+          response.writeBigUInt64LE(watermark, REPLY_OFFSET.op);
+          response[REPLY_OFFSET.reserved] = 1;
           socket.write(response);
           return true;
         }
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute)
           return false;
-        socket.write(replyFrame(Operation.NonReplicated, routingBody(watermark, incarnation)));
+        socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(watermark, incarnation)));
         return true;
       });
       try {
@@ -593,7 +537,7 @@ describe('unified partition routing', () => {
       const operation = frame[REQUEST_OFFSET.operation];
       if (operation !== Operation.StoreConsumerOffset && operation !== Operation.DeleteConsumerOffset)
         return false;
-      socket.write(replyFrame(operation, metadataResult(0)));
+      socket.write(replyFrame(frame, operation, metadataResult(0)));
       return true;
     });
     try {
@@ -616,14 +560,15 @@ describe('primary auto-commit polling', () => {
   for (const transport of ['TCP', 'TLS'] as const) {
     for (const refused of [false, true]) {
       it(`preserves raw poll responses over ${transport}${refused ? ' after a refusal' : ''}`, async () => {
-        const expected = replyFrame(Operation.NonReplicated, Buffer.from('raw primary'));
+        let expected!: Buffer;
         let polls = 0;
         const cluster = await startPollCluster((frame, socket) => {
           if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages)
             return false;
           polls += 1;
+          expected = replyFrame(frame, Operation.NonReplicated, Buffer.from('raw primary'));
           socket.write(refused && polls === 1
-            ? replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58)
+            ? replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58)
             : expected);
           return true;
         }, undefined, transport);
@@ -702,19 +647,23 @@ describe('primary auto-commit polling', () => {
     }
   });
 
-  it('refreshes the attachment after a metadata acknowledgement but ignores partition commits', async () => {
+  it('refreshes discovery after metadata acknowledgement while reusing healthy links and ignoring partition commits', async () => {
     const cluster = await startPollCluster((frame, socket) => {
       if (frame[REQUEST_OFFSET.operation] !== Operation.SendMessages)
         return false;
-      const response = replyFrame(Operation.SendMessages);
+      const response = replyFrame(frame, Operation.SendMessages);
       response.writeBigUInt64LE(900n, REPLY_OFFSET.commit);
+      response.writeBigUInt64LE(900n, REPLY_OFFSET.op);
+      response[REPLY_OFFSET.reserved] = 1;
       socket.write(response);
       return true;
     }, (frame, socket) => {
       if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateTopic)
         return false;
-      const response = replyFrame(Operation.UpdateTopic, Buffer.alloc(4));
+      const response = replyFrame(frame, Operation.UpdateTopic, Buffer.alloc(4));
       response.writeBigUInt64LE(15n, REPLY_OFFSET.commit);
+      response.writeBigUInt64LE(15n, REPLY_OFFSET.op);
+      response[REPLY_OFFSET.reserved] = 1;
       socket.write(response);
       return true;
     });
@@ -727,7 +676,7 @@ describe('primary auto-commit polling', () => {
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       const attachments = cluster.primary.frames.filter((frame) =>
         frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
-      assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [1n, 15n]);
+      assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [0n]);
       assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 3);
       await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
       await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
@@ -748,7 +697,7 @@ describe('primary auto-commit polling', () => {
       polls += 1;
       if (polls > 1)
         return false;
-      socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58));
       return true;
     });
     let resets = 0;
@@ -770,7 +719,7 @@ describe('primary auto-commit polling', () => {
       const refuse = (frame: Buffer, socket: Socket): boolean => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== refusing)
           return false;
-        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58));
         return true;
       };
       const cluster = await startPollCluster(refuse, refuse);
@@ -780,9 +729,12 @@ describe('primary auto-commit polling', () => {
         await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
           { deadline: Date.now() + 1_000 }), (error: unknown) =>
           error instanceof ResponseError && error.errorCode === 58);
-        assert.ok(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
+        if (refusing === COMMAND_CODE.BindSession)
+          assert.ok(countCommand(cluster.primary, COMMAND_CODE.BindSession) >= 2);
+        else
+          assert.ok(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
         if (refusing === COMMAND_CODE.GetPartitionRoute)
-          assert.equal(cluster.primary.frames.length, 0);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
         if (refusing === COMMAND_CODE.BindSession)
           assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
         assert.equal(resets, 0);
@@ -796,7 +748,7 @@ describe('primary auto-commit polling', () => {
     const cluster = await startPollCluster(undefined, (frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata)
         return false;
-      socket.write(replyFrame(Operation.NonReplicated, twoNodeMetadataBody(0, cluster.coordinator.port)));
+      socket.write(replyFrame(frame, Operation.NonReplicated, twoNodeMetadataBody(0, cluster.coordinator.port)));
       return true;
     });
     try {
@@ -820,16 +772,20 @@ describe('primary auto-commit polling', () => {
         let rejectMetadata = true;
         let coordinatorPort = 0;
         const cluster = await startPollCluster(undefined, (frame, socket) => {
+          if (standalone && frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
+            socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(0n, 0n, 0)));
+            return true;
+          }
           if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata)
             return false;
           if (rejectMetadata) {
-            socket.write(replyFrame(Operation.NonReplicated,
+            socket.write(replyFrame(frame, Operation.NonReplicated,
               failure === 'empty roster' ? emptyRoster : Buffer.alloc(0),
               failure === 'unavailable' ? 5 : 0));
             return true;
           }
           if (standalone) {
-            socket.write(replyFrame(Operation.NonReplicated, singleNodeMetadataBody(coordinatorPort)));
+            socket.write(replyFrame(frame, Operation.NonReplicated, singleNodeMetadataBody(coordinatorPort)));
             return true;
           }
           return false;
@@ -838,7 +794,7 @@ describe('primary auto-commit polling', () => {
         let resets = 0;
         cluster.client.on('sessionReset', () => { resets += 1; });
         try {
-          await cluster.client.authenticate(vsrConfig(coordinatorPort).credentials);
+          await assert.rejects(cluster.client.authenticate(vsrConfig(coordinatorPort).credentials));
           await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload()));
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), 0);
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 0);
@@ -850,7 +806,7 @@ describe('primary auto-commit polling', () => {
           if (failure === 'unavailable')
             await assert.rejects(refresh, (error: unknown) => error instanceof ResponseError && error.errorCode === 5);
           else
-            await refresh;
+            await assert.rejects(refresh);
           const reads = countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata);
           await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
           assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetClusterMetadata), reads);
@@ -878,13 +834,14 @@ describe('primary auto-commit polling', () => {
     const cluster = await startPollCluster(undefined, (frame, socket) => {
       const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
       if (code === COMMAND_CODE.GetClusterMetadata) {
-        socket.write(replyFrame(Operation.NonReplicated,
+        socket.write(replyFrame(frame, Operation.NonReplicated,
           threeNodeMetadataBody(cluster.coordinator.port, cluster.primary.port, silentPort)));
         return true;
       }
-      if (code !== COMMAND_CODE.GetPartitionRoute || ++routes > 1)
+      if (code !== COMMAND_CODE.GetPartitionRoute)
         return false;
-      socket.write(replyFrame(Operation.NonReplicated, routingBody(1n, 0n, 9)));
+      routes += 1;
+      socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(BigInt(routes), 0n, routes === 1 ? 9 : 7)));
       return true;
     }, 'TLS');
     let resets = 0;
@@ -906,13 +863,15 @@ describe('primary auto-commit polling', () => {
   });
 
   for (const operation of [Operation.TruncatePartition, Operation.DeleteSegments]) {
-    it(`raises the attachment floor for a DeleteSegments acknowledgement with operation ${operation}`, async () => {
+    it(`raises the discovery floor for a DeleteSegments acknowledgement with operation ${operation}`, async () => {
       const cluster = await startPollCluster(undefined, (frame, socket) => {
         if (frame[REQUEST_OFFSET.operation] !== Operation.DeleteSegments)
           return false;
-        const response = replyFrame(operation,
+        const response = replyFrame(frame, operation,
           operation === Operation.TruncatePartition ? Buffer.alloc(4) : Buffer.alloc(0));
         response.writeBigUInt64LE(50n, REPLY_OFFSET.commit);
+        response.writeBigUInt64LE(50n, REPLY_OFFSET.op);
+        response[REPLY_OFFSET.reserved] = 1;
         socket.write(response);
         return true;
       });
@@ -922,7 +881,9 @@ describe('primary auto-commit polling', () => {
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         const attachments = cluster.primary.frames.filter((frame) =>
           frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
-        assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [1n, 50n]);
+        assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [0n]);
+        const lookup = cluster.coordinator.frames.filter((frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute).at(-1)!;
+        assert.equal(stampedContext(lookup).metadataOp, 50n);
         assert.equal(cluster.primary.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).length, 0);
       } finally {
         await cluster.close();
@@ -930,42 +891,49 @@ describe('primary auto-commit polling', () => {
     });
   }
 
-  it('rechecks metadata after waiting behind another primary poll', async () => {
-    let firstPoll!: (socket: Socket) => void;
-    const admitted = new Promise<Socket>((resolve) => { firstPoll = resolve; });
+  it('keeps queued poll context captured and refreshes the next call after metadata acknowledgement', async () => {
+    let firstPoll!: (value: { socket: Socket, frame: Buffer }) => void;
+    const admitted = new Promise<{ socket: Socket, frame: Buffer }>((resolve) => { firstPoll = resolve; });
     let polls = 0;
     const cluster = await startPollCluster((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages || ++polls !== 1)
         return false;
-      firstPoll(socket);
+      firstPoll({ socket, frame });
       return true;
     }, (frame, socket) => {
       if (frame[REQUEST_OFFSET.operation] !== Operation.UpdateTopic)
         return false;
-      const response = replyFrame(Operation.UpdateTopic, Buffer.alloc(4));
+      const response = replyFrame(frame, Operation.UpdateTopic, Buffer.alloc(4));
       response.writeBigUInt64LE(21n, REPLY_OFFSET.commit);
+      response.writeBigUInt64LE(21n, REPLY_OFFSET.op);
+      response[REPLY_OFFSET.reserved] = 1;
       socket.write(response);
       return true;
     });
     try {
       const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
-      const socket = await admitted;
+      const { socket, frame } = await admitted;
       const second = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       await cluster.client.sendCommand(COMMAND_CODE.UpdateTopic, Buffer.alloc(0));
-      assert.equal(polls, 1, 'concurrent polls must share a serialized primary connection');
-      socket.write(replyFrame(Operation.NonReplicated, Buffer.from('primary')));
+      assert.equal(polls, 1, 'progress polls on one partition share its mutation lane');
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('primary')));
       await Promise.all([first, second]);
       assert.equal(polls, 2);
       const attachments = cluster.primary.frames.filter((frame) =>
         frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
-      assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [1n, 21n]);
+      assert.deepEqual(attachments.map((frame) => bindingIdentity(frame).readBigUInt64LE(24)), [0n]);
+      const queued = cluster.primary.frames.filter((frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.PollMessages);
+      assert.deepEqual(queued.map(stampedContext), [stampedContext(frame), stampedContext(frame)]);
+      await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+      const fresh = cluster.primary.frames.filter((frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.PollMessages).at(-1)!;
+      assert.equal(stampedContext(fresh).metadataOp, 21n);
     } finally {
       await cluster.close();
     }
   });
 
   for (const failure of ['disconnect', 'not committed', 'timeout', 'partial reply', 'stale session', 'unauthenticated'] as const) {
-    it(`does not replay an uncertain primary poll after ${failure}`, async () => {
+    it(`replays only a refused primary poll after ${failure}`, async () => {
       let polls = 0;
       const cluster = await startPollCluster((frame, socket) => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages)
@@ -975,26 +943,42 @@ describe('primary auto-commit polling', () => {
           return false;
         if (failure === 'disconnect') socket.destroy();
         if (failure === 'not committed')
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 57));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 57));
         if (failure === 'stale session')
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 30));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 30));
         if (failure === 'unauthenticated')
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 40));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 40));
         if (failure === 'partial reply')
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.from('partial')).subarray(0, HEADER_SIZE + 1));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('partial')).subarray(0, HEADER_SIZE + 1));
         return true;
-      });
+      }, undefined, 'TCP', { reconnect: { enabled: true, interval: 10, maxRetries: 2 } });
       let resets = 0;
       cluster.client.on('sessionReset', () => { resets += 1; });
       try {
-        await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
-          { deadline: Date.now() + 300 }), (error: unknown) =>
-          error instanceof ResponseError && error.errorCode === 57);
+        const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload(),
+          { deadline: Date.now() + 300 });
+        if (failure === 'unauthenticated') {
+          await first;
+          assert.equal(polls, 2);
+          assert.equal(resets, 0);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession), 2);
+          return;
+        }
+        await assert.rejects(first, (error: unknown) =>
+          failure === 'stale session'
+            ? error instanceof ResponseError && error.errorCode === STALE_CLIENT
+            : error instanceof OperationUncertainError && error.operationId === undefined);
         assert.equal(polls, 1);
         assert.equal(resets, 0);
-        await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
-        assert.equal(polls, 2);
-        assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession), failure === 'not committed' ? 1 : 2);
+        if (failure === 'partial reply') {
+          await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+          assert.equal(polls, 1);
+        } else {
+          await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+          assert.equal(polls, 2);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession),
+            failure === 'disconnect' || failure === 'stale session' ? 2 : 1);
+        }
       } finally {
         await cluster.close();
       }
@@ -1007,23 +991,27 @@ describe('primary auto-commit polling', () => {
       const cluster = await startPollCluster((frame, socket) => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.BindSession || ++attachments > 1)
           return false;
-        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), status));
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), status));
         return true;
-      });
+      }, undefined, 'TCP', { reconnect: { enabled: true, interval: 10, maxRetries: 1 } });
       let resets = 0;
       cluster.client.on('sessionReset', () => { resets += 1; });
       try {
+        // A 30 refusal fails only the link, so the slot binds the same session again.
+        const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        if (status === STALE_CLIENT) await first;
+        else await assert.rejects(first, (error: unknown) => error instanceof ResponseError && error.errorCode === 58);
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         assert.equal(attachments, 2);
-        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 1);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), status === STALE_CLIENT ? 2 : 1);
         assert.equal(cluster.primary.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register).length, 0);
-        assert.equal(resets, 0);
+        assert.equal(resets, status === STALE_CLIENT ? 0 : 1);
       } finally {
         await cluster.close();
       }
     });
 
-    it(`returns control session status ${status} without rerouting the lookup`, async () => {
+    it(`rebinds a detached control link after status ${status}`, async () => {
       const registered = new Set<Socket>();
       let routes = 0;
       const cluster = await startPollCluster(undefined, (frame, socket) => {
@@ -1035,17 +1023,29 @@ describe('primary auto-commit polling', () => {
         }
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute || ++routes > 1)
           return false;
-        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), status));
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), status));
         return true;
-      });
+      }, 'TCP', { reconnect: { enabled: true, interval: 10, maxRetries: 1 } });
+      let resets = 0;
+      cluster.client.on('sessionReset', () => { resets += 1; });
       try {
-        await assert.rejects(cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload()),
-          (error: unknown) => error instanceof ResponseError && error.errorCode === status);
-        assert.equal(routes, 1);
-        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
+        const first = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
+        if (status === STALE_CLIENT) {
+          await assert.rejects(first, (error: unknown) => error instanceof ResponseError && error.errorCode === status);
+          assert.equal(routes, 1);
+          assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
+        } else {
+          await first;
+        }
+        // A lookup on the fake primary routes the poll to replica 0, so wait
+        // until the metadata link is bound again on a new socket.
+        const replicas = (cluster.client as unknown as { replicas: Map<number, { attached: boolean }> }).replicas;
+        await waitUntil(() => registered.size === 2 && replicas.get(0)?.attached === true);
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         assert.equal(registered.size, 2);
-        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 1);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages) +
+          countCommand(cluster.coordinator, COMMAND_CODE.PollMessages), status === STALE_CLIENT ? 1 : 2);
+        assert.equal(resets, 0);
       } finally {
         await cluster.close();
       }
@@ -1057,7 +1057,7 @@ describe('primary auto-commit polling', () => {
       const operation = frame[REQUEST_OFFSET.operation];
       if (operation !== Operation.UpdateUser && operation !== Operation.ChangePassword)
         return false;
-      socket.write(replyFrame(operation, Buffer.alloc(4)));
+      socket.write(replyFrame(frame, operation, Buffer.alloc(4)));
       return true;
     });
     try {
@@ -1120,7 +1120,7 @@ describe('primary auto-commit polling', () => {
         await cluster.client.sendCommand(manual.command, manual.payload);
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         const reset = once(cluster.client, 'sessionReset');
-        coordinatorSocket.destroy();
+        coordinatorSocket.write(evictionFrame(EvictionReason.SessionError));
         await reset;
         await cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
         for (const server of [cluster.coordinator]) {
@@ -1151,7 +1151,7 @@ describe('primary auto-commit polling', () => {
       const operation = frame[REQUEST_OFFSET.operation];
       if (operation !== Operation.UpdateUser && operation !== Operation.ChangePassword)
         return false;
-      socket.write(replyFrame(operation, Buffer.alloc(4)));
+      socket.write(replyFrame(frame, operation, Buffer.alloc(4)));
       return true;
     });
     try {
@@ -1188,7 +1188,7 @@ describe('primary auto-commit polling', () => {
     try {
       const polling = cluster.client.sendCommand(POLL_MESSAGES.code, groupPollPayload());
       const failed = assert.rejects(polling, (error: unknown) =>
-        error instanceof ResponseError && error.errorCode === 57);
+        error instanceof OperationUncertainError && error.operationId === undefined);
       await pendingAdmission;
       await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
       await failed;
@@ -1201,65 +1201,6 @@ describe('primary auto-commit polling', () => {
 });
 
 describe('VSR client socket', () => {
-  for (const refusal of [0, 30, 40, 57, 58]) {
-    it(`resumes or replaces a lost connection only after bind verdict ${refusal}`, async () => {
-      let registrations = 0;
-      let sends = 0;
-      let bindStatus = refusal;
-      const server = await startVsrServer((frame, socket) => {
-        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-        if (operation === Operation.Register) {
-          registrations += 1;
-          socket.write(replyFrame(operation, registerReplyBody(TEST_SESSION + BigInt(registrations - 1))));
-        } else if (code === COMMAND_CODE.BindSession) {
-          socket.write(replyFrame(operation, bindStatus === 0 ? registerReplyBody().subarray(4) : undefined, bindStatus));
-        } else if (code === COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(operation, singleNodeMetadataBody(server.port)));
-        } else if (code === COMMAND_CODE.GetPartitionRoute) {
-          socket.write(replyFrame(operation, routingBody(0n, 0n, 0)));
-        } else if (operation === Operation.SendMessages) {
-          sends += 1;
-          if (sends === 1)
-            socket.destroy();
-          else
-            socket.write(replyFrame(operation, Buffer.alloc(4)));
-        }
-      });
-      const config = vsrConfig(server.port);
-      const client = new CommandResponseStream(config);
-      try {
-        await client.authenticate(config.credentials);
-        await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, explicitSend));
-        if (refusal === 57 || refusal === 58) {
-          await assert.rejects(client.authenticate(config.credentials), (error: unknown) =>
-            error instanceof ResponseError && error.errorCode === refusal);
-          assert.equal(registrations, 1, 'lagging metadata must not replace the logical session');
-          bindStatus = 0;
-        }
-        await client.authenticate(config.credentials);
-        assert.equal(sends, 1, 'authentication must not replay the uncertain mutation');
-        const terminal = refusal === 30 || refusal === 40;
-        assert.equal(registrations, terminal ? 2 : 1);
-        const binding = server.frames.find((frame) =>
-          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession)!;
-        assertSharedBinding(server.frames[0], binding);
-        await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
-        const writes = server.frames.filter((frame) => frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages);
-        assert.equal(writes.length, 2);
-        assert.equal(writes[1].readBigUInt64LE(REQUEST_OFFSET.session), terminal ? TEST_SESSION + 1n : TEST_SESSION);
-        const nextRequest = writes[1].readBigUInt64LE(REQUEST_OFFSET.request);
-        assert.ok(nextRequest > 0n);
-        if (!terminal)
-          assert.ok(nextRequest > writes[0].readBigUInt64LE(REQUEST_OFFSET.request));
-        assert.equal(writes[0].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)
-          .equals(writes[1].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16)), !terminal);
-      } finally {
-        client.destroy();
-        await server.close();
-      }
-    });
-  }
 
   it('exchanges VSR frames over TLS', async () => {
     const server = await startVsrServer(
@@ -1334,25 +1275,25 @@ describe('VSR client socket', () => {
     const server = await startVsrServer((frame, socket) => {
       const operation = frame.readUInt8(REQUEST_OFFSET.operation);
       if (operation !== Operation.NonReplicated ||
-          frame.readUInt32LE(REQUEST_OFFSET.reserved) !== 60_002)
+          frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetStats)
         return singleNodeHandler(server.port)(frame, socket);
       attempts += 1;
       socket.write(
         attempts === 1
-          ? replyFrame(operation, Buffer.alloc(0), 57)
-          : replyFrame(operation, Buffer.from('done'))
+          ? replyFrame(frame, operation, Buffer.alloc(0), 57)
+          : replyFrame(frame, operation, Buffer.from('done'))
       );
     });
     const client = new CommandResponseStream(vsrConfig(server.port));
     try {
       const response = await client.sendCommand(
-        60_002,
+        COMMAND_CODE.GetStats,
         Buffer.from('retry-me')
       );
       assert.equal(attempts, 2);
       assert.deepEqual(response.data, Buffer.from('done'));
       const sent = server.frames.filter(
-        (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_002
+        (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetStats
       );
       assert.equal(sent.length, 2);
       assert.deepEqual(sent[0], sent[1]);
@@ -1366,14 +1307,14 @@ describe('VSR client socket', () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_003) {
         socket.write(Buffer.concat([
-          evictionFrame(EvictionReason.NoSession),
-          replyFrame(Operation.NonReplicated, Buffer.from('stale'))
+          evictionFrame(EvictionReason.InvalidCredentials),
+          replyFrame(frame, Operation.NonReplicated, Buffer.from('stale'))
         ]));
         return;
       }
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_014) {
         socket.write(
-          replyFrame(Operation.NonReplicated, Buffer.from('fresh'))
+          replyFrame(frame, Operation.NonReplicated, Buffer.from('fresh'))
         );
         return;
       }
@@ -1391,7 +1332,7 @@ describe('VSR client socket', () => {
           Buffer.alloc(0)
         ),
         (error: unknown) =>
-          error instanceof VsrEvictionError && error.errorCode === 40
+          error instanceof VsrEvictionError && error.errorCode === INVALID_CREDENTIALS
       );
       assert.ok(sessionResets >= 1);
       assert.equal(evictions, 1);
@@ -1420,128 +1361,10 @@ describe('VSR client socket', () => {
           Buffer.alloc(0)
         )
       );
-      assert.equal(client.isAuthenticated, false);
+      assert.equal(client.isAuthenticated, true);
     } finally {
       client.destroy();
       await server.close();
-    }
-  });
-
-  it('redirects a login to the advertised leader and registers there',
-    async () => {
-      const leader = await startVsrServer(
-        (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
-      );
-      const follower = await startVsrServer((frame, socket) => {
-        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
-          return;
-        }
-        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) ===
-            COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(
-            Operation.NonReplicated,
-            twoNodeMetadataBody(follower.port, leader.port)
-          ));
-          return;
-        }
-        socket.write(replyFrame(operation, Buffer.alloc(0), 58));
-      });
-      const client = new CommandResponseStream(vsrConfig(follower.port));
-      try {
-        const response = await client.sendCommand(
-          COMMAND_CODE.LoginUser,
-          Buffer.concat([
-            Buffer.from([4]),
-            Buffer.from('iggy'),
-            Buffer.from([4]),
-            Buffer.from('iggy')
-          ]));
-        assert.equal(response.status, 0);
-        assert.equal(client.isAuthenticated, true);
-        const followerOperations = follower.frames.map(
-          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-        );
-        assert.deepEqual(followerOperations, [
-          Operation.Register,
-          Operation.NonReplicated
-        ]);
-
-        await client.sendCommand(60_018, Buffer.alloc(0));
-
-        const leaderOperations = leader.frames.map(
-          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-        );
-        assert.deepEqual(leaderOperations, [
-          Operation.Register,
-          Operation.NonReplicated,
-          Operation.NonReplicated
-        ]);
-        assert.equal(
-          leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
-          60_018
-        );
-        assert.equal(follower.frames.length, 2);
-      } finally {
-        client.destroy();
-        await leader.close();
-        await follower.close();
-      }
-    });
-
-  it('rechecks leadership after a redirected login', async () => {
-    const leader = await startVsrServer(
-      (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
-    );
-    const intermediate = await startVsrServer((frame, socket) => {
-      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-      if (operation === Operation.Register ||
-          frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
-        singleNodeHandler(intermediate.port)(frame, socket);
-        return;
-      }
-      socket.write(replyFrame(
-        Operation.NonReplicated,
-        twoNodeMetadataBody(intermediate.port, leader.port)
-      ));
-    });
-    const follower = await startVsrServer((frame, socket) => {
-      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-      if (operation === Operation.Register) {
-        socket.write(replyFrame(Operation.Register, registerReplyBody()));
-        return;
-      }
-      socket.write(replyFrame(
-        Operation.NonReplicated,
-        twoNodeMetadataBody(follower.port, intermediate.port)
-      ));
-    });
-    const client = new CommandResponseStream(vsrConfig(follower.port));
-    try {
-      await client.authenticate(vsrConfig(follower.port).credentials);
-      await client.sendCommand(60_019, Buffer.alloc(0));
-
-      assert.deepEqual(
-        follower.frames.map((frame) => frame.readUInt8(REQUEST_OFFSET.operation)),
-        [Operation.Register, Operation.NonReplicated]
-      );
-      assert.deepEqual(
-        intermediate.frames.map(
-          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-        ),
-        [Operation.NonReplicated, Operation.NonReplicated]
-      );
-      assertSharedBinding(follower.frames[0], intermediate.frames[0]);
-      assert.equal(
-        leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
-        60_019
-      );
-    } finally {
-      client.destroy();
-      await follower.close();
-      await intermediate.close();
-      await leader.close();
     }
   });
 
@@ -1563,13 +1386,13 @@ describe('VSR client socket', () => {
         const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
         if (code === COMMAND_CODE.GetClusterMetadata) {
           // The survivor leads once the primary is gone.
-          socket.write(replyFrame(
+          socket.write(replyFrame(frame,
             Operation.NonReplicated,
             twoNodeMetadataBody(primary.port, survivor.port)
           ));
           return;
         }
-        socket.write(replyFrame(operation));
+        socket.write(replyFrame(frame, operation));
       });
 
       const primary = await startVsrServer((frame, socket) => {
@@ -1580,20 +1403,20 @@ describe('VSR client socket', () => {
         }
         const operation = frame.readUInt8(REQUEST_OFFSET.operation);
         if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          socket.write(replyFrame(frame, Operation.Register, registerReplyBody()));
           return;
         }
         const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
         if (code === COMMAND_CODE.GetClusterMetadata) {
           // The primary leads, so the login settles here and the roster is
           // only remembered, not acted on, until the node dies.
-          socket.write(replyFrame(
+          socket.write(replyFrame(frame,
             Operation.NonReplicated,
             twoNodeMetadataBody(survivor.port, primary.port)
           ));
           return;
         }
-        socket.write(replyFrame(operation));
+        socket.write(replyFrame(frame, operation));
       });
 
       const config: ClientConfig = {
@@ -1672,55 +1495,41 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('polls a leaderless roster before redirecting to the elected leader',
-    async () => {
-      const leader = await startVsrServer(
-        (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
-      );
-      let rosterReads = 0;
-      const follower = await startVsrServer((frame, socket) => {
-        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
-          return;
-        }
-        rosterReads += 1;
-        // The first answer is mid-election: neither node holds the leader role.
-        socket.write(replyFrame(
-          Operation.NonReplicated,
-          rosterReads === 1
-            ? twoNodeMetadataBody(follower.port, leader.port, 1)
-            : twoNodeMetadataBody(follower.port, leader.port)
-        ));
-      });
-      const client = new CommandResponseStream(vsrConfig(follower.port));
-      compressLeaderlessPoll(client, 1_000);
-      try {
-        await client.authenticate(vsrConfig(follower.port).credentials);
-
-        assert.equal(rosterReads, 2);
-        const leaderOperations = leader.frames.map(
-          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-        );
-        assert.deepEqual(leaderOperations, [
-          Operation.NonReplicated,
-          Operation.NonReplicated
-        ]);
-        assertSharedBinding(follower.frames[0], leader.frames[0]);
-        assert.equal(client.isAuthenticated, true);
-      } finally {
-        client.destroy();
-        await leader.close();
-        await follower.close();
+  it('redials the configured endpoint of a single node that advertises another', async () => {
+    const unreachable = await startVsrServer(() => {});
+    const advertisedPort = unreachable.port;
+    await unreachable.close();
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
+        socket.write(replyFrame(frame, Operation.NonReplicated, singleNodeMetadataBody(advertisedPort)));
+        return;
       }
+      singleNodeHandler(server.port)(frame, socket);
     });
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0,
+      reconnect: { enabled: true, interval: 1, maxRetries: 3 } });
+    try {
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      assert.equal(countCommand(server, COMMAND_CODE.BindSession), 0);
+      const slot = (client as unknown as { replicas: Map<number, { dialEndpoint: unknown }> }).replicas.get(0);
+      assert.deepEqual(slot?.dialEndpoint, vsrConfig(server.port).options);
+
+      for (const socket of server.sockets) socket.destroy();
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      assert.equal(countCommand(server, COMMAND_CODE.BindSession), 1);
+      assert.equal(framesOf(server, Operation.Register).length, 1);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
 
   it('keeps a login alive when the session dies mid-poll', async () => {
     let rosterReads = 0;
     const server = await startVsrServer((frame, socket) => {
       const operation = frame.readUInt8(REQUEST_OFFSET.operation);
       if (operation === Operation.Register) {
-        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        socket.write(replyFrame(frame, Operation.Register, registerReplyBody()));
         return;
       }
       rosterReads += 1;
@@ -1728,7 +1537,7 @@ describe('VSR client socket', () => {
       // Polling on without a session would re-enter authentication, which
       // awaits the login being settled, and the login would never return.
       socket.write(Buffer.concat([
-        replyFrame(
+        replyFrame(frame,
           Operation.NonReplicated,
           twoNodeMetadataBody(server.port, server.port, 1)
         ),
@@ -1736,7 +1545,6 @@ describe('VSR client socket', () => {
       ]));
     });
     const client = new CommandResponseStream(vsrConfig(server.port));
-    compressLeaderlessPoll(client, 1_000);
     try {
       const outcome = await Promise.race([
         client.authenticate(vsrConfig(server.port).credentials)
@@ -1765,16 +1573,15 @@ describe('VSR client socket', () => {
       const server = await startVsrServer((frame, socket) => {
         const operation = frame.readUInt8(REQUEST_OFFSET.operation);
         if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          socket.write(replyFrame(frame, Operation.Register, registerReplyBody()));
           return;
         }
-        socket.write(replyFrame(
+        socket.write(replyFrame(frame,
           Operation.NonReplicated,
           twoNodeMetadataBody(server.port, unavailablePort, 0, 1)
         ));
       });
       const client = new CommandResponseStream(vsrConfig(server.port));
-      compressLeaderlessPoll(client, 0);
       try {
         await client.authenticate(vsrConfig(server.port).credentials);
 
@@ -1855,46 +1662,6 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('keeps logout and replacement login adjacent in the queue', async () => {
-    const server = await startVsrServer((frame, socket) => {
-      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === 60_015) {
-        setTimeout(() => {
-          socket.write(
-            replyFrame(Operation.NonReplicated, Buffer.from('first'))
-          );
-        }, 10);
-        return;
-      }
-      singleNodeHandler(server.port)(frame, socket);
-    });
-    const client = new CommandResponseStream(vsrConfig(server.port));
-    try {
-      await client.authenticate(vsrConfig(server.port).credentials);
-      const first = client.sendCommand(60_015, Buffer.alloc(0));
-      const second = client.sendCommand(60_016, Buffer.alloc(0));
-      const login = client.sendCommand(
-        COMMAND_CODE.LoginUser,
-        Buffer.concat([
-          Buffer.from([4]),
-          Buffer.from('iggy'),
-          Buffer.from([4]),
-          Buffer.from('iggy')
-        ])
-      );
-      await Promise.all([first, second, login]);
-
-      const operations = server.frames.map(
-        (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
-      );
-      const logoutIndex = operations.lastIndexOf(Operation.Logout);
-      assert.equal(operations[logoutIndex + 1], Operation.Register);
-    } finally {
-      client.destroy();
-      await server.close();
-    }
-  });
-
   it('supports raw VSR responses without decoding', async () => {
     const server = await startVsrServer(
       (frame, socket) => singleNodeHandler(server.port)(frame, socket)
@@ -1917,7 +1684,7 @@ describe('VSR client socket', () => {
   it('remaps a terminal VSR response to the original command', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_009) {
-        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 3));
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 3));
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -1930,42 +1697,6 @@ describe('VSR client socket', () => {
           error instanceof ResponseError &&
           error.commandCode === 60_009 &&
           error.errorCode === 3
-      );
-    } finally {
-      client.destroy();
-      await server.close();
-    }
-  });
-
-  it('rejects synchronous writes and timed-out exchanges', async () => {
-    const server = await startVsrServer(() => {});
-    const client = new CommandResponseStream(vsrConfig(server.port));
-    const exchange = (
-      client as unknown as {
-        _exchange: (write: () => void, timeout?: number) => Promise<Buffer>
-      }
-    )._exchange.bind(client);
-    try {
-      const writeError = new Error('write failed');
-      await assert.rejects(
-        () => exchange(() => { throw writeError; }),
-        (error: unknown) => error === writeError
-      );
-      const connection = (
-        client as unknown as {
-          connection: { emit: (event: string, error: Error) => boolean }
-        }
-      ).connection;
-      const responseError = new Error('response failed');
-      const pending = exchange(() => {});
-      connection.emit('error', responseError);
-      await assert.rejects(
-        () => pending,
-        (error: unknown) => error === responseError
-      );
-      await assert.rejects(
-        () => exchange(() => {}, 1),
-        /timed out after 1 ms/
       );
     } finally {
       client.destroy();
@@ -1990,7 +1721,7 @@ describe('VSR client socket', () => {
       };
       await assert.rejects(
         () => client.sendCommand(60_013, Buffer.alloc(0)),
-        /timed out after 30000 ms/
+        /timed out after 0 ms/
       );
       assert.equal(
         server.frames.some(
@@ -2022,7 +1753,7 @@ describe('VSR client socket', () => {
       const demoted = await startVsrServer((frame, socket) => {
         const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
         if (code === COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(
+          socket.write(replyFrame(frame,
             Operation.NonReplicated,
             demotedYet
               ? twoNodeMetadataBody(demoted.port, leader.port)
@@ -2031,7 +1762,7 @@ describe('VSR client socket', () => {
           return;
         }
         if (code === 60_032) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58));
           return;
         }
         singleNodeHandler(demoted.port)(frame, socket);
@@ -2067,340 +1798,9 @@ describe('VSR client socket', () => {
         assert.equal(reissued, 2,
           'a refused command was not re-issued on the node the move landed on'
         );
-        const connection = (client as unknown as {
-          connection: { isConnectedTo: (host: string, port: number) => boolean }
-        }).connection;
-        assert.equal(connection.isConnectedTo('127.0.0.1', leader.port), true);
+        assert.equal(framesOf(leader, Operation.Register).length, 0);
+        assert.equal(framesOf(demoted, Operation.Register).length, 1);
       } finally {
-        client.destroy();
-        await leader.close();
-        await demoted.close();
-      }
-    }
-  );
-
-  it('walks past two refusing replicas to the partition primary',
-    async () => {
-      const third = await startVsrServer((frame, socket) => {
-        singleNodeHandler(third.port)(frame, socket);
-      });
-      const second = await startVsrServer((frame, socket) => {
-        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        if (operation === Operation.Register ||
-            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
-          singleNodeHandler(second.port)(frame, socket);
-          return;
-        }
-        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
-          return;
-        }
-        socket.write(replyFrame(operation));
-      });
-      const metadataLeader = await startVsrServer((frame, socket) => {
-        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-        if (operation === Operation.Register) {
-          socket.write(replyFrame(Operation.Register, registerReplyBody()));
-          return;
-        }
-        if (code === COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(
-            Operation.NonReplicated,
-            threeNodeMetadataBody(
-              metadataLeader.port,
-              second.port,
-              third.port
-            )
-          ));
-          return;
-        }
-        if (code === 60_040) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
-          return;
-        }
-        socket.write(replyFrame(operation));
-      });
-      const client = new CommandResponseStream(vsrConfig(metadataLeader.port));
-      try {
-        await client.authenticate(vsrConfig(metadataLeader.port).credentials);
-
-        const response = await client.sendCommand(60_040, Buffer.alloc(0), {
-          deadline: Date.now() + 15_000
-        });
-
-        assert.equal(response.status, 0);
-        assert.ok(
-          second.frames.some((frame) =>
-            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040),
-          'the roster walk skipped the second replica'
-        );
-        assert.ok(
-          third.frames.some((frame) =>
-            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040),
-          'the roster walk never reached the partition primary'
-        );
-      } finally {
-        client.destroy();
-        await metadataLeader.close();
-        await second.close();
-        await third.close();
-      }
-    }
-  );
-
-  it('holds a queued command instead of writing it to the node being left',
-    async () => {
-      // A refusal sends its caller to re-read the roster, and the drain that
-      // handed it out keeps going. Written in that window, the next queued
-      // command goes to the socket the move is about to replace: in flight when
-      // that happens, it dies with a lost-connection error nobody can act on
-      // instead of being re-issued on the node the move lands on.
-      const leader = await startVsrServer((frame, socket) => {
-        singleNodeHandler(leader.port)(frame, socket);
-      });
-      let demotedYet = false;
-      const demoted = await startVsrServer((frame, socket) => {
-        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-        if (code === COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(
-            Operation.NonReplicated,
-            demotedYet
-              ? twoNodeMetadataBody(demoted.port, leader.port)
-              : twoNodeMetadataBody(leader.port, demoted.port)
-          ));
-          return;
-        }
-        if (code === 60_037) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
-          return;
-        }
-        if (code === 60_038) {
-          // Accepted and never answered: a command written here is stuck until
-          // the move replaces the socket under it.
-          return;
-        }
-        singleNodeHandler(demoted.port)(frame, socket);
-      });
-
-      const client = new CommandResponseStream(vsrConfig(demoted.port));
-      try {
-        await client.authenticate(vsrConfig(demoted.port).credentials);
-        demotedYet = true;
-
-        // The second command is queued while the first is in flight, which is
-        // where a command caught in a move comes from.
-        const refused = client.sendCommand(60_037, Buffer.alloc(0));
-        const behind = client.sendCommand(60_038, Buffer.alloc(0));
-        refused.catch(() => undefined);
-        behind.catch(() => undefined);
-
-        const settled = await Promise.race([
-          Promise.all([refused, behind]).then(() => 'answered'),
-          new Promise((resolve) => {
-            setTimeout(() => resolve('stalled'), 10_000).unref();
-          })
-        ]);
-        assert.equal(settled, 'answered',
-          'the command behind the refusal went out on the node being left'
-        );
-        assert.ok(
-          !demoted.frames.some((frame) =>
-            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_038),
-          'the command behind the refusal was written to the node being left'
-        );
-        assert.ok(
-          leader.frames.some((frame) =>
-            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_038),
-          'the command behind the refusal never reached the node moved to'
-        );
-      } finally {
-        client.destroy();
-        await leader.close();
-        await demoted.close();
-      }
-    }
-  );
-
-  it('re-issues a command queued behind a leader move instead of failing it',
-    async () => {
-      // A move replaces the socket, which looks like a drop to everything
-      // waiting in the queue. Nothing queued was written, though, so it belongs
-      // on the node the client moves to rather than in a lost-connection error
-      // the caller can do nothing about.
-      const leader = await startVsrServer((frame, socket) => {
-        singleNodeHandler(leader.port)(frame, socket);
-      });
-      const demoted = await startVsrServer((frame, socket) => {
-        singleNodeHandler(demoted.port)(frame, socket);
-      });
-
-      const client = new CommandResponseStream(vsrConfig(demoted.port));
-      try {
-        await client.authenticate(vsrConfig(demoted.port).credentials);
-
-        // Parked the way a command is while something else holds the queue.
-        const queued = new Promise<CommandResponse>((resolve, reject) => {
-          execQueue(client).push({
-            command: 60_034,
-            payload: Buffer.alloc(0),
-            handleResponse: true,
-            deadline: Date.now() + 30_000,
-            resolve,
-            reject
-          });
-        });
-
-        await connectionOf(client).redirect('127.0.0.1', leader.port);
-        await queued;
-
-        const landedOnLeader = leader.frames.some(
-          (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_034
-        );
-        assert.ok(landedOnLeader,
-          'the queued command never reached the node the client moved to'
-        );
-      } finally {
-        client.destroy();
-        await leader.close();
-        await demoted.close();
-      }
-    }
-  );
-
-  it('surfaces the refusal rather than a timeout when the budget runs out',
-    async () => {
-      const server = await startVsrServer((frame, socket) => {
-        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_036) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
-          return;
-        }
-        singleNodeHandler(server.port)(frame, socket);
-      });
-      const client = new CommandResponseStream(vsrConfig(server.port));
-      const realNow = Date.now;
-      try {
-        await client.authenticate(vsrConfig(server.port).credentials);
-        // The request's budget, the first exchange, the window that hands the
-        // refusal out, and then a clock 10ms short of the deadline: too little
-        // to carry another attempt, so the caller has to see the answer the
-        // server gave rather than the timeout a doomed re-issue would produce.
-        const times = [0, 1, 2_001, 29_990];
-        Date.now = () => times.shift() ?? 30_050;
-
-        await assert.rejects(
-          () => client.sendCommand(60_036, Buffer.alloc(0)),
-          (error: unknown) =>
-            error instanceof ResponseError &&
-            error.commandCode === 60_036 &&
-            error.errorCode === 58
-        );
-      } finally {
-        Date.now = realNow;
-        client.destroy();
-        await server.close();
-      }
-    }
-  );
-
-  it('does not suppress leader settlement after a failed roster walk',
-    async () => {
-      const server = await startVsrServer(
-        (frame, socket) => singleNodeHandler(server.port)(frame, socket)
-      );
-      const client = new CommandResponseStream(vsrConfig(server.port));
-      try {
-        await client.authenticate(vsrConfig(server.port).credentials);
-        const routing = client as unknown as {
-          walkSettleSuppressed: boolean,
-          _followLeaderMove: (walkPastLeader: boolean) => Promise<unknown>,
-          connection: {
-            nextRosterEndpoint: () => { host: string, port: number },
-            redirect: (host: string, port: number) => Promise<void>
-          }
-        };
-        routing.connection.nextRosterEndpoint = () => ({
-          host: '127.0.0.1',
-          port: server.port + 1
-        });
-        routing.connection.redirect = async () => {
-          throw new Error('redirect failed');
-        };
-
-        assert.deepEqual(await routing._followLeaderMove(true), {
-          endpoint: { host: '127.0.0.1', port: server.port + 1 },
-          moved: false
-        });
-        assert.equal(routing.walkSettleSuppressed, false,
-          'a failed walk leaked its one-shot suppression into a later login'
-        );
-      } finally {
-        client.destroy();
-        await server.close();
-      }
-    }
-  );
-
-  it('surfaces the refusal when the move left too little of the budget',
-    async () => {
-      // The move itself costs budget: a roster read, an election it waited out,
-      // a redial. What is left can be positive and still too small to carry
-      // another exchange, and re-issued into it the request times out -- the
-      // caller then sees a timeout where the answer was "not admitted".
-      const leader = await startVsrServer((frame, socket) => {
-        singleNodeHandler(leader.port)(frame, socket);
-      });
-      let demotedYet = false;
-      const demoted = await startVsrServer((frame, socket) => {
-        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-        if (code === COMMAND_CODE.GetClusterMetadata) {
-          socket.write(replyFrame(
-            Operation.NonReplicated,
-            demotedYet
-              ? twoNodeMetadataBody(demoted.port, leader.port)
-              : twoNodeMetadataBody(leader.port, demoted.port)
-          ));
-          return;
-        }
-        if (code === 60_039) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
-          return;
-        }
-        singleNodeHandler(demoted.port)(frame, socket);
-      });
-
-      const client = new CommandResponseStream(vsrConfig(demoted.port));
-      const realNow = Date.now;
-      let offset = 0;
-      try {
-        await client.authenticate(vsrConfig(demoted.port).credentials);
-        demotedYet = true;
-
-        const deadline = realNow() + 30_000;
-        const connection = connectionOf(client);
-        const move = connection.redirect.bind(connection);
-        connection.redirect = async (host: string, port: number) => {
-          await move(host, port);
-          // 30ms of budget left the moment the client lands: positive, and
-          // below the interval one exchange needs.
-          offset = deadline - realNow() - 30;
-        };
-        Date.now = () => realNow() + offset;
-
-        await assert.rejects(
-          () => client.sendCommand(60_039, Buffer.alloc(0), { deadline }),
-          (error: unknown) =>
-            error instanceof ResponseError &&
-            error.commandCode === 60_039 &&
-            error.errorCode === 58
-        );
-        assert.ok(
-          !leader.frames.some((frame) =>
-            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_039),
-          'the request was re-issued into a budget too small to answer it'
-        );
-      } finally {
-        Date.now = realNow;
         client.destroy();
         await leader.close();
         await demoted.close();
@@ -2417,7 +1817,7 @@ describe('VSR client socket', () => {
       const server = await startVsrServer((frame, socket) => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_035) {
           refusals += 1;
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58));
           return;
         }
         singleNodeHandler(server.port)(frame, socket);
@@ -2448,7 +1848,7 @@ describe('VSR client socket', () => {
     async () => {
       const server = await startVsrServer((frame, socket) => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_031) {
-          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58));
           return;
         }
         singleNodeHandler(server.port)(frame, socket);
@@ -2476,44 +1876,7 @@ describe('VSR client socket', () => {
     }
   );
 
-  it('keeps a typed transient error and session at its retry deadline',
-    async () => {
-      const server = await startVsrServer((frame, socket) => {
-        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_017) {
-          socket.write(
-            replyFrame(Operation.NonReplicated, Buffer.alloc(0), 57)
-          );
-          return;
-        }
-        singleNodeHandler(server.port)(frame, socket);
-      });
-      const client = new CommandResponseStream(vsrConfig(server.port));
-      const realNow = Date.now;
-      try {
-        await client.authenticate(vsrConfig(server.port).credentials);
-        let sessionResets = 0;
-        client.on('sessionReset', () => { sessionResets += 1; });
-        const times = [0, 1, 30_001];
-        Date.now = () => times.shift() ?? 30_001;
-
-        await assert.rejects(
-          () => client.sendCommand(60_017, Buffer.alloc(0)),
-          (error: unknown) =>
-            error instanceof ResponseError &&
-            error.commandCode === 60_017 &&
-            error.errorCode === 57
-        );
-        assert.equal(client.isAuthenticated, true);
-        assert.equal(sessionResets, 0);
-      } finally {
-        Date.now = realNow;
-        client.destroy();
-        await server.close();
-      }
-    }
-  );
-
-  for (const refusal of [58, 89, 41, 40, 30, 87, 4000]) {
+  for (const refusal of [58, 89, 41, 40, 30, 87, 3007]) {
   it(`keeps an uncertain write uncertain after a later refusal ${refusal}`, async () => {
     const EXPIRED_REQUEST_TIME = 30_001;
     let now = 0;
@@ -2522,13 +1885,13 @@ describe('VSR client socket', () => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages) {
         attempts += 1;
         now = attempts === 1 ? 1 : EXPIRED_REQUEST_TIME;
-        socket.write(replyFrame(
+        socket.write(replyFrame(frame,
           Operation.SendMessages, Buffer.alloc(0), attempts === 1 ? 57 : refusal
         ));
         return;
       }
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
-        socket.write(replyFrame(Operation.NonReplicated, routingBody(0n, 0n, 0)));
+        socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(0n, 0n, 0)));
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -2543,16 +1906,13 @@ describe('VSR client socket', () => {
       await assert.rejects(
         () => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
         (error: unknown) =>
-          error instanceof ResponseError &&
-          error.commandCode === COMMAND_CODE.SendMessages &&
-          error.errorCode === 57
+          error instanceof OperationUncertainError && error.operationId !== undefined
       );
       const writes = server.frames.filter(
         (frame) => frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages
       );
       assert.equal(writes.length, 2);
       assert.deepEqual(writes[1], writes[0]);
-      assert.equal(client.isAuthenticated, true);
       assert.equal(sessionResets, 0);
     } finally {
       Date.now = realNow;
@@ -2605,7 +1965,7 @@ describe('VSR client socket', () => {
   it('keeps an eviction during the send context query typed', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
-        socket.write(evictionFrame(EvictionReason.NoSession));
+        socket.write(evictionFrame(EvictionReason.InvalidCredentials));
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -2613,7 +1973,7 @@ describe('VSR client socket', () => {
     const client = new CommandResponseStream(vsrConfig(server.port));
     try {
       await assert.rejects(() => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
-        (error: unknown) => error instanceof VsrEvictionError && error.errorCode === 40);
+        (error: unknown) => error instanceof VsrEvictionError && error.errorCode === INVALID_CREDENTIALS);
     } finally {
       client.destroy();
       await server.close();
@@ -2626,9 +1986,8 @@ describe('VSR client socket', () => {
     let offset = 0;
     const server = await contextServer({
       live: 1n, refuseAll: true, contextStatus: 0,
-      // 10ms of budget left when the refusal comes back: too little to carry a
-      // context query and another send.
-      onSend: () => { offset = deadline - realNow() - 10; }
+      // Expire the original deadline as the history refusal arrives.
+      onSend: () => { offset = deadline - realNow() + 1; }
     });
     const client = new CommandResponseStream(vsrConfig(server.port));
     try {
@@ -2643,90 +2002,6 @@ describe('VSR client socket', () => {
       Date.now = realNow;
       client.destroy();
       await server.close();
-    }
-  });
-
-  it('keeps the captured context of an offset store re-issued after a leader move', async () => {
-    // The store captures incarnation 1 and then waits behind a command the old
-    // node never answers. The move re-issues it on a node whose route already
-    // reports incarnation 2: an offset taken from 1 must not commit under 2.
-    const leader = await startVsrServer((frame, socket) => {
-      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
-        socket.write(replyFrame(Operation.NonReplicated, routingBody(1n, 2n)));
-        return;
-      }
-      offsetCommittingHandler(leader.port)(frame, socket);
-    });
-    const demoted = await startVsrServer((frame, socket) => {
-      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === COMMAND_CODE.GetPartitionRoute) {
-        socket.write(replyFrame(Operation.NonReplicated, routingBody(1n, 1n)));
-        return;
-      }
-      if (code === 60_038) {
-        void connectionOf(client).redirect('127.0.0.1', leader.port);
-        return;
-      }
-      singleNodeHandler(demoted.port)(frame, socket);
-    });
-    const client = new CommandResponseStream(vsrConfig(demoted.port));
-    try {
-      await client.authenticate(vsrConfig(demoted.port).credentials);
-      const store = client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
-      client.sendCommand(60_038, Buffer.alloc(0)).catch(() => undefined);
-      await store;
-      const stores = framesOf(leader, Operation.StoreConsumerOffset);
-      assert.equal(stores.length, 1);
-      assert.equal(stampedContext(stores[0]).incarnation, 1n);
-      assert.equal(countCommand(leader, COMMAND_CODE.GetPartitionRoute), 0);
-      assert.equal(framesOf(demoted, Operation.StoreConsumerOffset).length, 0);
-    } finally {
-      client.destroy();
-      await leader.close();
-      await demoted.close();
-    }
-  });
-
-  it('refreshes a send context at most once when a leader move re-issues the send', async () => {
-    const leader = await contextServer({ live: 0n, refuseAll: true, contextStatus: 0 });
-    let contextQueries = 0;
-    const demoted = await startVsrServer((frame, socket) => {
-      if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.SendMessages) {
-        socket.write(replyFrame(Operation.SendMessages, Buffer.alloc(0), HISTORY_UNAVAILABLE));
-        return;
-      }
-      const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-      if (code === COMMAND_CODE.GetPartitionRoute) {
-        contextQueries += 1;
-        // The refresh: park the refreshed send behind a command that this
-        // node never answers, so the move finds it in the queue.
-        if (contextQueries === 2)
-          client.sendCommand(60_038, Buffer.alloc(0)).catch(() => undefined);
-        const context = routingBody(0n, 0n, 0);
-        context.writeBigUInt64LE(BigInt(contextQueries), 0);
-        socket.write(replyFrame(Operation.NonReplicated, context));
-        return;
-      }
-      if (code === 60_038) {
-        void connectionOf(client).redirect('127.0.0.1', leader.port);
-        return;
-      }
-      singleNodeHandler(demoted.port)(frame, socket);
-    });
-    const client = new CommandResponseStream(vsrConfig(demoted.port));
-    try {
-      await client.authenticate(vsrConfig(demoted.port).credentials);
-      await assert.rejects(() => client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
-        (error: unknown) => error instanceof ResponseError &&
-          error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === HISTORY_UNAVAILABLE);
-      assert.equal(contextQueries, 2);
-      assert.equal(countCommand(leader, COMMAND_CODE.GetPartitionRoute), 0);
-      assert.deepEqual(framesOf(leader, Operation.SendMessages)
-        .map((frame) => stampedContext(frame).incarnation), [2n]);
-    } finally {
-      client.destroy();
-      await leader.close();
-      await demoted.close();
     }
   });
 
@@ -2810,14 +2085,14 @@ describe('VSR client socket', () => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) !== Operation.SendMessages)
         return false;
       order.push('send');
-      socket.write(replyFrame(Operation.SendMessages, Buffer.alloc(0), refusals-- > 0 ? 88 : 0));
+      socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), refusals-- > 0 ? 88 : 0));
       firstRefusal();
       return true;
     }, (frame, socket) => {
       const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
       if (code === COMMAND_CODE.GetPartitionRoute) {
         routes += 1;
-        socket.write(replyFrame(Operation.NonReplicated, routingBody(BigInt(routes), BigInt(routes))));
+        socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(BigInt(routes), BigInt(routes))));
         return true;
       }
       if (code === otherCommand)
@@ -2850,7 +2125,7 @@ describe('VSR client socket', () => {
       const override = (frame: Buffer, socket: Socket): boolean => {
         if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== code)
           return false;
-        socket.write(replyFrame(frame.readUInt8(REQUEST_OFFSET.operation), Buffer.alloc(0), 88));
+        socket.write(replyFrame(frame, frame.readUInt8(REQUEST_OFFSET.operation), Buffer.alloc(0), 88));
         return true;
       };
       const cluster = await startPollCluster(override, override);
@@ -2874,7 +2149,7 @@ describe('VSR client socket', () => {
     const cluster = await startPollCluster((frame, socket) => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) !== Operation.SendMessages)
         return false;
-      socket.write(replyFrame(Operation.SendMessages, Buffer.alloc(0), 88));
+      socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), 88));
       return true;
     });
     try {
@@ -2884,18 +2159,54 @@ describe('VSR client socket', () => {
         () => cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline }),
         (error: unknown) => error instanceof ResponseError &&
           error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === 88);
-      assert.ok(Date.now() <= deadline, 'the next exponential pause must fit the original deadline');
+      assert.ok(Date.now() <= deadline + 100, 'the original deadline bounds the call');
       assert.ok(framesOf(cluster.primary, Operation.SendMessages).length >= 2);
     } finally {
       await cluster.close();
     }
   });
 
+  it('keeps a lifecycle restart ahead of later mutations in its lane', async () => {
+    let refuse!: () => void;
+    let received!: () => void;
+    const firstReceived = new Promise<void>((resolve) => { received = resolve; });
+    const names: string[] = [];
+    const server = await startVsrServer((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+        names.push(frame.subarray(HEADER_SIZE).toString());
+        if (names.length === 1) {
+          refuse = () => socket.write(replyFrame(frame, Operation.CreateStream, metadataResult(88)));
+          received();
+        } else socket.write(replyFrame(frame, Operation.CreateStream, metadataResult(0)));
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      const body = Buffer.from('first');
+      const first = client.sendCommand(COMMAND_CODE.CreateStream, body);
+      await firstReceived;
+      body.write('other');
+      const second = client.sendCommand(COMMAND_CODE.CreateStream, Buffer.from('second'));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      refuse();
+      await Promise.all([first, second]);
+      assert.deepEqual(names, ['first', 'first', 'second']);
+      const ids = framesOf(server, Operation.CreateStream).map((frame) => frame.readBigUInt64LE(REQUEST_OFFSET.request));
+      assert.equal(new Set(ids).size, 3, 'each admitted mutation has a fresh identity');
+    } finally { client.destroy(); await server.close(); }
+  });
+
   it('retries a lifecycle refusal as new requests while other commands proceed', async () => {
     let refusals = 2;
+    let firstRefusal!: () => void;
+    const refused = new Promise<void>((resolve) => { firstRefusal = resolve; });
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.CreateStream) {
-        socket.write(replyFrame(Operation.CreateStream, metadataResult(refusals-- > 0 ? 88 : 0)));
+        socket.write(replyFrame(frame, Operation.CreateStream, metadataResult(refusals-- > 0 ? 88 : 0)));
+        firstRefusal();
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -2905,6 +2216,7 @@ describe('VSR client socket', () => {
       await client.authenticate(vsrConfig(server.port).credentials);
       const started = Date.now();
       const create = client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
+      await refused;
       const other = client.sendCommand(60_040, Buffer.alloc(0));
       await Promise.all([create, other]);
       const elapsed = Date.now() - started;
@@ -2925,7 +2237,7 @@ describe('VSR client socket', () => {
   it('returns the lifecycle refusal once the request deadline leaves no room for a retry', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.CreateStream) {
-        socket.write(replyFrame(Operation.CreateStream, metadataResult(88)));
+        socket.write(replyFrame(frame, Operation.CreateStream, metadataResult(88)));
         return;
       }
       singleNodeHandler(server.port)(frame, socket);
@@ -2938,7 +2250,7 @@ describe('VSR client socket', () => {
         () => client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0), { deadline }),
         (error: unknown) => error instanceof ResponseError &&
           error.commandCode === COMMAND_CODE.CreateStream && error.errorCode === 88);
-      assert.ok(Date.now() <= deadline, 'the last pause must fit the budget');
+      assert.ok(Date.now() <= deadline + 100, 'the original deadline bounds the call');
       assert.ok(framesOf(server, Operation.CreateStream).length >= 2);
     } finally {
       client.destroy();
@@ -2946,7 +2258,7 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('drops the cached send contexts of a topic after a history refusal', async () => {
+  it('invalidates a refused partition without evicting another partition', async () => {
     const state = { live: 1n, refuseAll: false, contextStatus: 0 };
     const server = await contextServer(state);
     const client = new CommandResponseStream(vsrConfig(server.port));
@@ -2960,9 +2272,9 @@ describe('VSR client socket', () => {
       assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), 3);
       await client.sendCommand(COMMAND_CODE.SendMessages, otherPartition);
       assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), 4,
-        'a refusal for one partition drops its whole topic');
+        'each stale partition refreshes when its own history is refused');
       assert.deepEqual(framesOf(server, Operation.SendMessages).map((frame) =>
-        stampedContext(frame).incarnation), [1n, 1n, 1n, 2n, 2n]);
+        stampedContext(frame).incarnation), [1n, 1n, 1n, 2n, 1n, 2n]);
     } finally {
       client.destroy();
       await server.close();
@@ -2972,7 +2284,13 @@ describe('VSR client socket', () => {
   for (const code of [COMMAND_CODE.DeleteStream, COMMAND_CODE.DeleteTopic,
     COMMAND_CODE.CreatePartitions, COMMAND_CODE.DeletePartitions]) {
     it(`drops every cached send context after the client's own command ${code}`, async () => {
-      const server = await contextServer({ live: 1n, refuseAll: false, contextStatus: 0 });
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === operationForCode(code)) {
+          socket.write(replyFrame(frame, frame[REQUEST_OFFSET.operation], metadataResult(0)));
+          return;
+        }
+        offsetCommittingHandler(server.port)(frame, socket);
+      });
       const client = new CommandResponseStream(vsrConfig(server.port));
       let resets = 0;
       client.on('topicDiscoveryReset', () => { resets += 1; });
@@ -2998,13 +2316,13 @@ describe('VSR client socket', () => {
         (frame, socket) => {
           if (frame.readUInt8(REQUEST_OFFSET.operation) !== operation)
             return false;
-          socket.write(replyFrame(operation, metadataResult(0)));
+          socket.write(replyFrame(frame, operation, metadataResult(0)));
           return true;
         },
         (frame, socket) => {
           if (frame.readUInt8(REQUEST_OFFSET.operation) !== operation)
             return false;
-          socket.write(replyFrame(operation, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
+          socket.write(replyFrame(frame, operation, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
           return true;
         });
       try {
@@ -3033,14 +2351,14 @@ describe('VSR client socket', () => {
         if (frame.readUInt8(REQUEST_OFFSET.operation) !== Operation.StoreConsumerOffset)
           return false;
         stores += 1;
-        socket.write(replyFrame(Operation.StoreConsumerOffset, metadataResult(0),
+        socket.write(replyFrame(frame, Operation.StoreConsumerOffset, metadataResult(0),
           stores === 1 ? HISTORY_UNAVAILABLE : 0));
         return true;
       },
       (frame, socket) => {
         if (frame.readUInt8(REQUEST_OFFSET.operation) !== Operation.CreateStream)
           return false;
-        socket.write(replyFrame(Operation.CreateStream, metadataResult(0)));
+        socket.write(replyFrame(frame, Operation.CreateStream, metadataResult(0)));
         return true;
       });
     try {
@@ -3071,15 +2389,15 @@ describe('VSR client socket', () => {
             return false;
           writes += 1;
           socket.write(writes === 1
-            ? replyFrame(Operation.StoreConsumerOffset, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED)
-            : replyFrame(Operation.StoreConsumerOffset, metadataResult(0)));
+            ? replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED)
+            : replyFrame(frame, Operation.StoreConsumerOffset, metadataResult(0)));
           return true;
         },
         (frame, socket) => {
           if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute)
             return false;
           routes += 1;
-          socket.write(replyFrame(Operation.NonReplicated,
+          socket.write(replyFrame(frame, Operation.NonReplicated,
             routingBody(1n, BigInt(routes))));
           return true;
         });
@@ -3102,8 +2420,10 @@ describe('VSR client socket', () => {
   it('refreshes standalone routes after metadata commits', async () => {
     const server = await startVsrServer((frame, socket) => {
       if (frame.readUInt8(REQUEST_OFFSET.operation) === Operation.CreateStream) {
-        const reply = replyFrame(Operation.CreateStream, metadataResult(0));
+        const reply = replyFrame(frame, Operation.CreateStream, metadataResult(0));
         reply.writeBigUInt64LE(5n, REPLY_OFFSET.commit);
+        reply.writeBigUInt64LE(5n, REPLY_OFFSET.op);
+        reply[REPLY_OFFSET.reserved] = 1;
         socket.write(reply);
         return;
       }
@@ -3132,11 +2452,11 @@ describe('VSR client socket', () => {
     const server = await startVsrServer((frame, socket) => {
       const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
       if (code === COMMAND_CODE.GetPartitionRoute) {
-        socket.write(replyFrame(Operation.NonReplicated, routingBody(1n, live)));
+        socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(1n, live, 0)));
         return;
       }
       if (code === COMMAND_CODE.PollMessages) {
-        socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0),
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0),
           stampedContext(frame).incarnation === live ? 0 : HISTORY_UNAVAILABLE));
         return;
       }
@@ -3166,6 +2486,9 @@ describe('VSR client socket', () => {
     const partitions = Array.from({ length: 4097 }, (_, partitionId) => sendTo(Partitioning.PartitionId(partitionId)));
     try {
       await Promise.all(partitions.map((payload) => client.sendCommand(COMMAND_CODE.SendMessages, payload)));
+      const before = countCommand(server, COMMAND_CODE.GetPartitionRoute);
+      await client.sendCommand(COMMAND_CODE.SendMessages, partitions[4096]);
+      assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), before, 'capacity eviction preserves the newest route');
       await client.sendCommand(COMMAND_CODE.SendMessages, partitions[0]);
       assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), partitions.length + 1);
     } finally {
@@ -3198,6 +2521,1829 @@ describe('VSR client socket', () => {
     } finally {
       client.destroy();
       await server.close();
+    }
+  });
+});
+
+const provedReply = (request: Buffer, code = 0, marker = 1): Buffer => {
+  const operation = request[REQUEST_OFFSET.operation];
+  const body = operation === Operation.SendMessages ? Buffer.alloc(0) : metadataResult(code);
+  const reply = replyFrame(request, operation, body);
+  reply[REPLY_OFFSET.reserved] = marker;
+  reply.writeBigUInt64LE(1n, REPLY_OFFSET.op);
+  reply.writeBigUInt64LE(1n, REPLY_OFFSET.commit);
+  return reply;
+};
+
+const waitUntil = async (predicate: () => boolean): Promise<void> => {
+  const deadline = Date.now() + 2_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail('condition was not reached');
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+};
+
+describe('native mutation recovery', () => {
+  it('freezes a raw request before awaiting route discovery', async () => {
+    const payload = Buffer.from(explicitSend);
+    const submitted = Buffer.from(payload);
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute)
+        payload.fill(0xff);
+      offsetCommittingHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.sendCommand(COMMAND_CODE.SendMessages, payload);
+      assert.deepEqual(framesOf(server, Operation.SendMessages)[0].subarray(HEADER_SIZE), submitted);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('admits a recreated history while retaining an unresolved write to its old history', async () => {
+    let incarnation = 1n;
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
+        const route = routingBody(0n, 0n, 0);
+        route.writeBigUInt64LE(incarnation, 0);
+        socket.write(replyFrame(frame, Operation.NonReplicated, route));
+      } else if (frame[REQUEST_OFFSET.operation] === Operation.SendMessages) {
+        socket.write(incarnation === 1n
+          ? replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), 85)
+          : provedReply(frame));
+      } else if (frame[REQUEST_OFFSET.operation] === Operation.DeleteTopic) {
+        incarnation = 2n;
+        socket.write(replyFrame(frame, Operation.DeleteTopic, metadataResult(0)));
+      } else singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      let retained!: bigint;
+      await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, explicitSend), (error: unknown) => {
+        assert.ok(error instanceof OperationUncertainError);
+        retained = error.operationId!;
+        return true;
+      });
+      await assert.rejects(client.sendCommand(COMMAND_CODE.SendMessages, explicitSend), LaneBlockedError);
+      await client.sendCommand(COMMAND_CODE.DeleteTopic, Buffer.alloc(0));
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      assert.deepEqual(framesOf(server, Operation.SendMessages).map((frame) => stampedContext(frame).incarnation), [1n, 2n]);
+      client.abandonOperation(retained);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  for (const resolving of [false, true]) {
+    it(`preserves uncertainty when a session resets before ${resolving ? 'a retained replay' : 'a retry'} reaches the wire`, async () => {
+      let retain = resolving;
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+          socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), retain ? 85 : 57));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+        let operationId!: bigint;
+        if (resolving) {
+          await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) => {
+            assert.ok(error instanceof OperationUncertainError);
+            operationId = error.operationId!;
+            return true;
+          });
+          retain = false;
+        }
+        const routing = client as unknown as {
+          readyLink: (deadline: number, signal: AbortSignal, avoid?: IggyConnection) => Promise<IggyConnection>
+        };
+        const readyLink = routing.readyLink.bind(client);
+        let selections = 0;
+        let retryWaiting = false;
+        routing.readyLink = async (...args) => {
+          const link = await readyLink(...args);
+          if (++selections === (resolving ? 1 : 2)) {
+            retryWaiting = true;
+            await released;
+          }
+          return link;
+        };
+        const pending = resolving ? client.resolveOperation(operationId)
+          : client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
+        const outcome = pending.then(() => undefined, (error: unknown) => error);
+        await waitUntil(() => retryWaiting);
+        operationId = framesOf(server, Operation.CreateStream)[0].readBigUInt64LE(REQUEST_OFFSET.request);
+        await client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' }));
+        release();
+        const error = await outcome;
+        assert.ok(error instanceof OperationUncertainError, `expected uncertainty, received ${String(error)}`);
+        assert.equal(error.operationId, operationId);
+        assert.equal(framesOf(server, Operation.CreateStream).length, 1);
+        await assert.rejects(client.resolveOperation(operationId), OperationNotRetainedError);
+      } finally { release(); client.destroy(); await server.close(); }
+    });
+  }
+
+  for (const bootstrapOnly of [false, true]) {
+    it(`ends a sent mutation uncertain after an eviction on ${bootstrapOnly ? 'the bootstrap link' : 'a replica link'}`, async () => {
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+          socket.write(evictionFrame(EvictionReason.SessionError));
+          return;
+        }
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(frame, Operation.NonReplicated,
+            metadataBody([{ port: bootstrapOnly ? 0 : server.port, replicaId: 0, role: 0 }])));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+      try {
+        await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) =>
+          error instanceof OperationUncertainError && error.cause instanceof VsrEvictionError);
+        assert.equal(framesOf(server, Operation.CreateStream).length, 1);
+      } finally { client.destroy(); await server.close(); }
+    });
+  }
+
+  for (const bootstrapOnly of [false, true]) {
+    for (const written of ['in-flight', 'retained'] as const) {
+      for (const reason of [EvictionReason.StaleClient, EvictionReason.NoSession]) {
+      it(`binds the same session and proves the ${written} mutation after eviction ${reason} on ${bootstrapOnly ? 'the bootstrap link' : 'a replica link'}`, async () => {
+        let link!: Socket;
+        const server = await startVsrServer((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+            link = socket;
+            if (framesOf(server, Operation.CreateStream).length > 1) socket.write(provedReply(frame));
+            else if (written === 'in-flight') socket.write(evictionFrame(reason));
+            else socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), 85));
+            return;
+          }
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
+            socket.write(replyFrame(frame, Operation.NonReplicated,
+              metadataBody([{ port: bootstrapOnly ? 0 : server.port, replicaId: 0, role: 0 }])));
+            return;
+          }
+          singleNodeHandler(server.port)(frame, socket);
+        });
+        const client = new CommandResponseStream({
+          ...vsrConfig(server.port), heartbeatInterval: 0, reconnect: { enabled: true, interval: 10, maxRetries: 1 }
+        });
+        let resets = 0;
+        client.on('sessionReset', () => { resets += 1; });
+        try {
+          const created = client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
+          if (written === 'retained') {
+            let id!: bigint;
+            await assert.rejects(created, (error: unknown) => {
+              assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+            });
+            const evicted = once(client, 'eviction');
+            link.write(evictionFrame(reason));
+            await evicted;
+            await client.resolveOperation(id);
+          } else await created;
+          assert.equal(resets, 0);
+          const registers = framesOf(server, Operation.Register);
+          const binds = server.frames.filter((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
+          assert.equal(registers.length, 1);
+          assert.equal(binds.length, 1);
+          assertSharedBinding(registers[0], binds[0]);
+          const [original, replay] = framesOf(server, Operation.CreateStream);
+          assert.deepEqual(replay, original);
+        } finally { client.destroy(); await server.close(); }
+      });
+    }
+  }
+  }
+
+  for (const status of [STALE_CLIENT, UNAUTHENTICATED]) {
+    const committed = true;
+    for (const attempt of ['first attempt', 'retry', 'resolve'] as const) {
+      it(`drops the session at once after a ${committed ? 'committed' : 'denied'} ${status} reply to a ${attempt}`, async () => {
+        const server = await startVsrServer((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+            if (attempt !== 'first attempt' && framesOf(server, Operation.CreateStream).length === 1)
+              socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), attempt === 'retry' ? 57 : 85));
+            else socket.write(committed ? provedReply(frame, status)
+              : replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), status));
+            return;
+          }
+          singleNodeHandler(server.port)(frame, socket);
+        });
+        const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+        let resets = 0;
+        client.on('sessionReset', () => { resets += 1; });
+        try {
+          let outcome = await client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0))
+            .catch((error: unknown) => error);
+          const id = framesOf(server, Operation.CreateStream)[0].readBigUInt64LE(REQUEST_OFFSET.request);
+          if (attempt === 'resolve') {
+            assert.ok(outcome instanceof OperationUncertainError && outcome.operationId === id);
+            outcome = await client.resolveOperation(id).catch((error: unknown) => error);
+          }
+          assert.ok(committed || attempt === 'first attempt'
+            ? outcome instanceof ResponseError && outcome.errorCode === status && outcome.committed === committed
+            : outcome instanceof OperationUncertainError && outcome.operationId === id &&
+              outcome.cause instanceof ResponseError && outcome.cause.errorCode === status,
+          `received ${String(outcome)}`);
+          assert.equal(resets, 1);
+          const again = await client.resolveOperation(id).catch((error: unknown) => error);
+          if (committed && attempt === 'resolve') assert.equal(again, outcome);
+          else assert.ok(again instanceof OperationNotRetainedError, `received ${String(again)}`);
+          assert.equal(framesOf(server, Operation.CreateStream).length, attempt === 'first attempt' ? 1 : 2);
+          await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+          assert.equal(framesOf(server, Operation.Register).length, 2);
+        } finally { client.destroy(); await server.close(); }
+      });
+    }
+  }
+
+  for (const live of [true, false]) {
+    for (const attempt of ['first attempt', 'retry', 'resolve'] as const) {
+      it(`lets the bind decide after a denied 30 reply to a ${attempt} on ${live ? 'a live' : 'an ended'} session`, async () => {
+        const server = await startVsrServer((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+            const creates = framesOf(server, Operation.CreateStream).length;
+            if (attempt !== 'first attempt' && creates === 1)
+              socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), attempt === 'retry' ? 57 : 85));
+            else if (creates <= 2)
+              socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), STALE_CLIENT));
+            else socket.write(provedReply(frame));
+            return;
+          }
+          if (!live && frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession) {
+            socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), UNAUTHENTICATED));
+            return;
+          }
+          singleNodeHandler(server.port)(frame, socket);
+        });
+        const client = new CommandResponseStream({
+          ...vsrConfig(server.port), heartbeatInterval: 0, reconnect: { enabled: true, interval: 10, maxRetries: 1 }
+        });
+        let resets = 0;
+        client.on('sessionReset', () => { resets += 1; });
+        try {
+          let outcome = await client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0))
+            .catch((error: unknown) => error);
+          const [original] = framesOf(server, Operation.CreateStream);
+          const id = original.readBigUInt64LE(REQUEST_OFFSET.request);
+          if (attempt === 'resolve') {
+            assert.ok(outcome instanceof OperationUncertainError && outcome.operationId === id);
+            outcome = await client.resolveOperation(id).catch((error: unknown) => error);
+          }
+          assert.ok(attempt === 'first attempt'
+            ? outcome instanceof ResponseError && outcome.errorCode === STALE_CLIENT && !outcome.committed
+            : outcome instanceof OperationUncertainError && outcome.operationId === id &&
+              outcome.cause instanceof ResponseError && outcome.cause.errorCode === STALE_CLIENT,
+          `received ${String(outcome)}`);
+          assert.equal(resets, 0);
+          if (live && attempt !== 'first attempt') {
+            await client.resolveOperation(id);
+            assert.deepEqual(framesOf(server, Operation.CreateStream)[2], original);
+          } else {
+            if (!live) await waitUntil(() => resets === 1);
+            await assert.rejects(client.resolveOperation(id), OperationNotRetainedError);
+          }
+          await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+          const registers = framesOf(server, Operation.Register);
+          const binds = server.frames.filter((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
+          assert.equal(resets, live ? 0 : 1);
+          assert.equal(registers.length, live ? 1 : 2);
+          assert.equal(binds.length, 1);
+          if (live) assertSharedBinding(registers[0], binds[0]);
+        } finally { client.destroy(); await server.close(); }
+      });
+    }
+  }
+
+  for (const live of [true, false]) {
+    it(`uses a bind to check an unauthenticated link on a ${live ? 'live' : 'lost'} session`, async () => {
+      let refuses = true;
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+          socket.write(framesOf(server, Operation.CreateStream).length === 1
+            ? replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), 85) : provedReply(frame));
+          return;
+        }
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if ((code === COMMAND_CODE.GetStats && refuses) || (!live && code === COMMAND_CODE.BindSession)) {
+          refuses = false;
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), UNAUTHENTICATED));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({
+        ...vsrConfig(server.port), heartbeatInterval: 0,
+        reconnect: { enabled: true, interval: 1, maxRetries: 1 }
+      });
+      try {
+        let id!: bigint;
+        await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+        });
+        await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0)).catch((error: unknown) => {
+          assert.equal(live, false, String(error));
+        });
+        if (live) {
+          await client.resolveOperation(id);
+          const [original, replay] = framesOf(server, Operation.CreateStream);
+          assert.deepEqual(replay, original);
+          assert.equal(framesOf(server, Operation.Register).length, 1);
+        } else {
+          await waitUntil(() => !client.isAuthenticated);
+          await assert.rejects(client.resolveOperation(id), OperationNotRetainedError);
+        }
+      } finally { client.destroy(); await server.close(); }
+    });
+  }
+
+  it('retains a canceled send, blocks its lane, and resolves the original frame', async () => {
+    const cancel = new AbortController();
+    const sends: Buffer[] = [];
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.SendMessages) return false;
+      sends.push(frame);
+      if (sends.length === 1) cancel.abort();
+      else socket.write(provedReply(frame));
+      return true;
+    });
+    try {
+      let id!: bigint;
+      await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend,
+        { signal: cancel.signal, deadline: Date.now() + 1_000 }), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError);
+          assert.equal(typeof error.operationId, 'bigint');
+          id = error.operationId!;
+          return true;
+        });
+      await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend),
+        (error: unknown) => error instanceof LaneBlockedError && error.operationId === id);
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, sendTo(Partitioning.PartitionId(4)));
+      await cluster.client.resolveOperation(id, { deadline: Date.now() + 1_000 });
+      assert.deepEqual(sends[0], sends[2]);
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      assert.ok(sends[3].readBigUInt64LE(REQUEST_OFFSET.request) > id);
+      await cluster.client.resolveOperation(id);
+      assert.equal(sends.length, 4);
+    } finally { await cluster.close(); }
+  });
+
+  for (const rejected of [false, true]) {
+    it(`gives every resolver the ${rejected ? 'committed rejection' : 'commit'} that one replay proved`, async () => {
+      const stores: Buffer[] = [];
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] !== Operation.StoreConsumerOffset) return false;
+        stores.push(frame);
+        socket.write(stores.length === 1 ? replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 85)
+          : provedReply(frame, rejected ? HISTORY_UNAVAILABLE : 0));
+        return true;
+      });
+      try {
+        let id!: bigint;
+        await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+        });
+        const racing = await Promise.allSettled([cluster.client.resolveOperation(id), cluster.client.resolveOperation(id)]);
+        const outcomes = [...racing, ...await Promise.allSettled([cluster.client.resolveOperation(id)])];
+        assert.equal(stores.length, 2);
+        assert.deepEqual(stores[0], stores[1]);
+        const [first] = outcomes;
+        if (rejected)
+          assert.ok(first.status === 'rejected' && first.reason instanceof ResponseError &&
+            first.reason.errorCode === HISTORY_UNAVAILABLE && first.reason.committed);
+        else assert.equal(first.status, 'fulfilled');
+        for (const outcome of outcomes) assert.deepEqual(outcome, first);
+      } finally { await cluster.close(); }
+    });
+  }
+
+  it('ends a resolver uncertain when its deadline passes behind a running replay', async () => {
+    let answer!: () => void;
+    let replayed!: () => void;
+    const replaying = new Promise<void>((resolve) => { replayed = resolve; });
+    const server = await startVsrServer((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+        if (framesOf(server, Operation.CreateStream).length === 1)
+          socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), 85));
+        else {
+          answer = () => socket.write(provedReply(frame));
+          replayed();
+        }
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    try {
+      let id!: bigint;
+      await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) => {
+        assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+      });
+      const resolving = client.resolveOperation(id).then(() => undefined, (error: unknown) => error);
+      await replaying;
+      await assert.rejects(client.resolveOperation(id, { deadline: Date.now() + 20 }), (error: unknown) =>
+        error instanceof OperationUncertainError && error.operationId === id);
+      answer();
+      assert.equal(await resolving, undefined);
+      await client.resolveOperation(id);
+      assert.equal(framesOf(server, Operation.CreateStream).length, 2);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('keeps the newest proved outcomes up to the pending operation limit across a session reset', async () => {
+    const stores: Buffer[] = [];
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.StoreConsumerOffset) return false;
+      stores.push(frame);
+      socket.write(stores.length % 2 === 1
+        ? replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 85) : provedReply(frame));
+      return true;
+    }, undefined, 'TCP', { maxPendingOperations: 1 });
+    try {
+      const ids: bigint[] = [];
+      for (let operation = 0; operation < 2; operation += 1) {
+        await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); ids.push(error.operationId!); return true;
+        });
+        await cluster.client.resolveOperation(ids[operation]);
+      }
+      await cluster.client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' }));
+      await cluster.client.resolveOperation(ids[1]);
+      await assert.rejects(cluster.client.resolveOperation(ids[0]), OperationNotRetainedError);
+      assert.equal(stores.length, 4);
+    } finally { await cluster.close(); }
+  });
+
+  for (const proved of [true, false]) {
+    it(`keeps an abandoned replay in its lane until it ends ${proved ? 'proved and keeps its outcome' : 'uncertain'}`, async () => {
+      let answer!: () => void;
+      let replayed!: () => void;
+      const replaying = new Promise<void>((resolve) => { replayed = resolve; });
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+          const creates = framesOf(server, Operation.CreateStream).length;
+          const uncertain = replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), 85);
+          if (creates === 1) socket.write(uncertain);
+          else if (creates === 2) {
+            answer = () => socket.write(proved ? provedReply(frame) : uncertain);
+            replayed();
+          } else socket.write(provedReply(frame));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+      try {
+        let id!: bigint;
+        await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+        });
+        const resolving = client.resolveOperation(id).then(() => undefined, (error: unknown) => error);
+        await replaying;
+        client.abandonOperation(id);
+        const next = client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        assert.equal(framesOf(server, Operation.CreateStream).length, 2, 'the replay keeps its lane');
+        answer();
+        const outcome = await resolving;
+        await next;
+        if (proved) {
+          assert.equal(outcome, undefined);
+          await client.resolveOperation(id);
+        } else {
+          assert.ok(outcome instanceof OperationUncertainError && outcome.operationId === id);
+          await assert.rejects(client.resolveOperation(id), OperationNotRetainedError);
+        }
+        const creates = framesOf(server, Operation.CreateStream);
+        assert.equal(creates.length, 3);
+        assert.ok(creates[2].readBigUInt64LE(REQUEST_OFFSET.request) > id);
+      } finally { client.destroy(); await server.close(); }
+    });
+  }
+
+  for (const rejected of [false, true]) {
+    it(`signs in with the ${rejected ? 'old' : 'new'} password after a resolve proves a ${rejected ? 'rejected' : 'committed'} change`, async () => {
+      let session!: Socket;
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.ChangePassword) {
+          session = socket;
+          socket.write(framesOf(server, Operation.ChangePassword).length === 1
+            ? replyFrame(frame, Operation.ChangePassword, Buffer.alloc(0), 85)
+            : provedReply(frame, rejected ? INVALID_CREDENTIALS : 0));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+      try {
+        let id!: bigint;
+        await assert.rejects(client.sendCommand(CHANGE_PASSWORD.code, CHANGE_PASSWORD.serialize({
+          userId: 7, currentPassword: 'iggy', newPassword: 'second'
+        })), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+        });
+        const resolved = client.resolveOperation(id);
+        if (rejected)
+          await assert.rejects(resolved, (error: unknown) =>
+            error instanceof ResponseError && error.errorCode === INVALID_CREDENTIALS);
+        else await resolved;
+        const reset = once(client, 'sessionReset');
+        session.write(evictionFrame(EvictionReason.SessionError));
+        await reset;
+        await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+        const registers = framesOf(server, Operation.Register);
+        assert.equal(registers.length, 2);
+        const credentials = registerCredentialsBody(registers[1]);
+        const username = readWireName(credentials, 0);
+        assert.equal(username.value, 'iggy');
+        assert.equal(readWireName(credentials, username.next).value, rejected ? 'iggy' : 'second');
+      } finally { client.destroy(); await server.close(); }
+    });
+  }
+
+  for (const marker of [0, 2]) {
+    it(`keeps an uncertain operation retained after unproved marker ${marker}`, async () => {
+      let calls = 0;
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] !== Operation.StoreConsumerOffset) return false;
+        calls += 1;
+        socket.write(calls === 1 ? replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 57)
+          : provedReply(frame, 0, calls === 2 ? marker : 1));
+        return true;
+      });
+      try {
+        let id!: bigint;
+        await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), (error: unknown) => {
+          assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+        });
+        await cluster.client.resolveOperation(id);
+        assert.equal(calls, 3);
+      } finally { await cluster.close(); }
+    });
+  }
+
+  for (const field of ['client', 'request checksum', 'incarnation', 'op', 'commit', 'zero op'] as const) {
+    for (const result of [0, 40]) {
+      it(`rejects contradictory ${field} proof with result ${result} before session effects`, async () => {
+        let calls = 0;
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] !== Operation.StoreConsumerOffset) return false;
+          calls += 1;
+          if (calls === 1) socket.write(replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 57));
+          else {
+            const response = provedReply(frame, calls === 2 ? result : 0);
+            if (calls === 2) {
+              if (field === 'client') response[REPLY_OFFSET.client] ^= 1;
+              if (field === 'request checksum') response[REPLY_OFFSET.requestChecksum] ^= 1;
+              if (field === 'incarnation') response[REPLY_OFFSET.partitionIncarnation] ^= 1;
+              if (field === 'op') response.writeBigUInt64LE(2n, REPLY_OFFSET.op);
+              if (field === 'commit') response.writeBigUInt64LE(2n, REPLY_OFFSET.commit);
+              if (field === 'zero op') { response.writeBigUInt64LE(0n, REPLY_OFFSET.op); response.writeBigUInt64LE(0n, REPLY_OFFSET.commit); }
+            }
+            socket.write(response);
+          }
+          return true;
+        });
+        try {
+          let id!: bigint;
+          await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), (error: unknown) => {
+            assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+          });
+          assert.equal(cluster.client.isAuthenticated, true);
+          await cluster.client.resolveOperation(id);
+          assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
+        } finally { await cluster.close(); }
+      });
+    }
+  }
+
+  for (const uncertain of [false, true]) {
+    it(`handles proved LifecycleBusy correctly ${uncertain ? 'after' : 'before'} uncertainty`, async () => {
+      const mutations: Buffer[] = [];
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] !== Operation.StoreConsumerOffset) return false;
+        mutations.push(frame);
+        if (uncertain && mutations.length === 1)
+          socket.write(replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 57));
+        else socket.write(provedReply(frame, mutations.length === (uncertain ? 2 : 1) ? 88 : 0));
+        return true;
+      });
+      try {
+        const call = cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+        if (uncertain) await assert.rejects(call, (error: unknown) => error instanceof ResponseError && error.errorCode === 88);
+        else await call;
+        assert.equal(mutations.length, 2);
+        assert.equal(mutations[0].readBigUInt64LE(REQUEST_OFFSET.request) === mutations[1].readBigUInt64LE(REQUEST_OFFSET.request), uncertain);
+        await cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+        assert.equal(mutations.length, 3);
+      } finally { await cluster.close(); }
+    });
+  }
+
+  it('never starts a fresh identity for OperationNotRetained without abandonment', async () => {
+    const mutations: Buffer[] = [];
+    let allow = false;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.StoreConsumerOffset) return false;
+      mutations.push(frame);
+      socket.write(allow ? provedReply(frame) : replyFrame(frame, Operation.StoreConsumerOffset, Buffer.alloc(0), 85));
+      return true;
+    });
+    try {
+      let id!: bigint;
+      await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload), (error: unknown) => {
+        assert.ok(error instanceof OperationUncertainError); id = error.operationId!; return true;
+      });
+      await assert.rejects(cluster.client.resolveOperation(id), OperationUncertainError);
+      assert.deepEqual(mutations[0], mutations[1]);
+      cluster.client.abandonOperation(id);
+      allow = true;
+      await cluster.client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+      assert.ok(mutations[2].readBigUInt64LE(REQUEST_OFFSET.request) > id);
+    } finally { await cluster.close(); }
+  });
+
+  for (const strategy of ['auto-commit', 'Next'] as const) {
+    for (const failure of ['not committed', 'cancel'] as const) {
+      it(`ends uncertain ${strategy} polls after ${failure} and releases the transient lane`, async () => {
+        const cancel = new AbortController();
+        let polls = 0;
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
+          polls += 1;
+          if (failure === 'cancel') cancel.abort();
+          else socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 57));
+          return true;
+        });
+        const body = POLL_MESSAGES.serialize({ streamId: 1, topicId: 2, partitionId: 3,
+          consumer: { kind: ConsumerKind.Single, id: 1 }, count: 1,
+          pollingStrategy: strategy === 'Next' ? PollingStrategy.Next : PollingStrategy.First,
+          autocommit: strategy === 'auto-commit' });
+        try {
+          await assert.rejects(cluster.client.sendCommand(COMMAND_CODE.PollMessages, body,
+            { signal: cancel.signal }), (error: unknown) => error instanceof OperationUncertainError && error.operationId === undefined);
+          assert.equal(polls, 1);
+          await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+        } finally { await cluster.close(); }
+      });
+    }
+  }
+
+  it('keeps pure reads retryable after an uncommitted response', async () => {
+    let polls = 0;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.from('read'), ++polls === 1 ? 57 : 0));
+      return true;
+    });
+    try {
+      const body = POLL_MESSAGES.serialize({ streamId: 1, topicId: 2, partitionId: 3,
+        consumer: { kind: ConsumerKind.Single, id: 1 }, count: 1, pollingStrategy: PollingStrategy.First, autocommit: false });
+      assert.equal((await cluster.client.sendCommand(COMMAND_CODE.PollMessages, body)).data.toString(), 'read');
+      assert.equal(polls, 2);
+    } finally { await cluster.close(); }
+  });
+
+  it('attaches every known replica proactively without a partition call', async () => {
+    const cluster = await startPollCluster();
+    try {
+      await cluster.client.authenticate({ username: 'iggy', password: 'iggy' });
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 0);
+      assert.equal(framesOf(cluster.primary, Operation.Register).length, 0);
+      assertSharedBinding(cluster.coordinator.frames[0], cluster.primary.frames[0]);
+    } finally { await cluster.close(); }
+  });
+});
+
+
+describe('native replica and selection lifecycle', () => {
+  for (const partition of [Partitioning.Balanced, Partitioning.MessageKey('key'), Partitioning.PartitionId(0)]) {
+    for (const uncertain of [false, true]) {
+      it(`handles partition-not-found for kind ${partition.kind} with uncertainty ${uncertain}`, async () => {
+        let count = 1;
+        const sends: Buffer[] = [];
+        const cluster = await startPollCluster((frame, socket) => {
+          if (frame[REQUEST_OFFSET.operation] !== Operation.SendMessages) return false;
+          sends.push(frame);
+          count = 2;
+          socket.write(uncertain && sends.length === 1
+            ? replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), 57)
+            : sends.length === (uncertain ? 2 : 1)
+              ? replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), 3007)
+              : provedReply(frame));
+          return true;
+        }, (frame, socket) => {
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+          const route = routingBody(1n);
+          route.writeUInt32LE(count, 20);
+          socket.write(replyFrame(frame, Operation.NonReplicated, route));
+          return true;
+        });
+        try {
+          const pending = sendMessages(async () => cluster.client)({
+            streamId: 1, topicId: 2, messages: [{ payload: 'selected' }], partition
+          });
+          if (uncertain) {
+            await assert.rejects(pending, OperationUncertainError);
+            assert.equal(sends.length, 2);
+            assert.deepEqual(sends[0], sends[1]);
+            assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+          } else if (partition.kind === Partitioning.PartitionId(0).kind) {
+            await assert.rejects(pending, (error: unknown) => error instanceof ResponseError && error.errorCode === 3007);
+            assert.equal(sends.length, 1);
+          } else {
+            await pending;
+            assert.equal(sends.length, 2);
+            assert.ok(sends[1].readBigUInt64LE(REQUEST_OFFSET.request) > sends[0].readBigUInt64LE(REQUEST_OFFSET.request));
+            assert.ok(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
+          }
+        } finally { await cluster.close(); }
+      });
+    }
+  }
+
+  it('reuses another authenticated link when metadata discovery is refused', async () => {
+    let refuse = false;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, twoNodeMetadataBody(cluster.primary.port, cluster.coordinator.port)));
+      return true;
+    }, (frame, socket) => {
+      if (!refuse || frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 58));
+      return true;
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      refuse = true;
+      await cluster.client.sendCommand(COMMAND_CODE.GetClusterMetadata, Buffer.alloc(0), { deadline: Date.now() + 1000 });
+      assert.ok(countCommand(cluster.primary, COMMAND_CODE.GetClusterMetadata) >= 1);
+      assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
+      assert.equal(framesOf(cluster.primary, Operation.Register).length, 0);
+    } finally { await cluster.close(); }
+  });
+
+  it('binds the same session after losing its first roster response', async () => {
+    let reads = 0;
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata && ++reads === 1) {
+        socket.destroy();
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 15 });
+    try {
+      await assert.rejects(client.authenticate(vsrConfig(server.port).credentials));
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+      await waitUntil(() => countCommand(server, COMMAND_CODE.Ping) >= 2);
+      assert.equal(framesOf(server, Operation.Register).length, 1);
+      assert.equal(countCommand(server, COMMAND_CODE.BindSession), 1);
+      assertSharedBinding(framesOf(server, Operation.Register)[0], server.frames.find((frame) =>
+        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession)!);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('logs out a retained metadata lane before relogin and never reuses its operation id', async () => {
+    let calls = 0;
+    const server = await startVsrServer((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+        socket.write(replyFrame(frame, Operation.CreateStream, Buffer.alloc(0), ++calls === 1 ? 57 : 41));
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      let id!: bigint;
+      await assert.rejects(client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0)), (error: unknown) => {
+        assert.ok(error instanceof OperationUncertainError);
+        id = error.operationId!;
+        return true;
+      });
+      await client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' }));
+      await assert.rejects(client.resolveOperation(id), OperationNotRetainedError);
+      const controls = server.frames.filter((frame) => frame[REQUEST_OFFSET.operation] === Operation.Register || frame[REQUEST_OFFSET.operation] === Operation.Logout);
+      assert.deepEqual(controls.map((frame) => frame[REQUEST_OFFSET.operation]), [Operation.Register, Operation.Logout, Operation.Register]);
+      assert.ok(controls[1].readBigUInt64LE(REQUEST_OFFSET.request) > id);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('does not start Register when explicit relogin loses the Logout outcome', async () => {
+    const server = await startVsrServer((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] === Operation.Logout) { socket.destroy(); return; }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      await assert.rejects(client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' })), OperationUncertainError);
+      assert.equal(framesOf(server, Operation.Register).length, 1);
+      assert.equal(framesOf(server, Operation.Logout).length, 1);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('preserves its watermark across reset and ignores a completed old-session receipt', async () => {
+    let commit = 47n;
+    const server = await startVsrServer((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] === Operation.CreateStream) {
+        const reply = provedReply(frame);
+        reply.writeBigUInt64LE(commit, REPLY_OFFSET.op);
+        reply.writeBigUInt64LE(commit, REPLY_OFFSET.commit);
+        socket.write(reply);
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    let received!: () => void;
+    const completedRead = new Promise<void>((resolve) => { received = resolve; });
+    try {
+      await client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
+      const link = (client as unknown as { replicas: Map<number, { connection: IggyConnection }> }).replicas.get(0)!.connection;
+      const exchange = link.exchange.bind(link);
+      link.exchange = async (...args): Promise<LinkAttempt> => {
+        const reply = await exchange(...args);
+        if (reply.response?.[REPLY_OFFSET.operation] === Operation.CreateStream) {
+          received();
+          await released;
+        }
+        return reply;
+      };
+      commit = 999n;
+      const old = client.sendCommand(COMMAND_CODE.CreateStream, Buffer.alloc(0));
+      const rejected = assert.rejects(old, OperationUncertainError);
+      await completedRead;
+      await client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' }));
+      release();
+      await rejected;
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+      const latest = server.frames.at(-1)!;
+      assert.equal(stampedContext(latest).metadataOp, 47n);
+      const creates = framesOf(server, Operation.CreateStream);
+      assert.ok(latest.readBigUInt64LE(REQUEST_OFFSET.request) > creates[1].readBigUInt64LE(REQUEST_OFFSET.request));
+      assert.notDeepEqual(latest.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16),
+        creates[1].subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16));
+    } finally { release(); client.destroy(); await server.close(); }
+  });
+});
+
+
+describe('native retry pacing', () => {
+  for (const retry of ['request', 'lookup', 'metadata', 'register'] as const) {
+    for (const [sample, delays] of [
+      [0, [0, 0, 0, 0, 0, 0, 0]],
+      [0.5, [25, 50, 100, 200, 400, 500, 500]],
+      [1 - Number.EPSILON, [50, 100, 200, 400, 800, 1_000, 1_000]]
+    ] as const) {
+      it(`backs off ${retry} retries with capped full jitter at random sample ${sample}`, async (context) => {
+        const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+        const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+        const attempts: Buffer[] = [];
+        let attempted!: () => void;
+        const firstAttempt = new Promise<void>((resolve) => { attempted = resolve; });
+        const random = context.mock.method(Math, 'random', () => sample);
+        context.mock.method(IggyConnection.prototype, 'exchange', async (encode: () => Buffer): Promise<LinkAttempt> => {
+          const frame = encode();
+          const operation = frame[REQUEST_OFFSET.operation];
+          const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+          const matches = retry === 'request' ? operation === Operation.StoreConsumerOffset
+            : retry === 'lookup' ? code === COMMAND_CODE.GetPartitionRoute
+              : retry === 'metadata' ? code === COMMAND_CODE.GetClusterMetadata : operation === Operation.Register;
+          if (matches) { attempts.push(Buffer.from(frame)); attempted(); }
+          const refused = matches && attempts.length <= delays.length;
+          const body = operation === Operation.Register ? registerReplyBody()
+            : code === COMMAND_CODE.GetClusterMetadata ? singleNodeMetadataBody(server.port)
+              : code === COMMAND_CODE.GetPartitionRoute ? routingBody(1n, 1n, 0) : metadataResult(0);
+          return { started: true, response: replyFrame(frame, operation,
+            refused ? Buffer.alloc(0) : body, refused ? TRANSIENT_NOT_ACCEPTED : 0) };
+        });
+        try {
+          context.mock.timers.enable({ apis: ['setTimeout'] });
+          const pending = retry === 'metadata' || retry === 'register'
+            ? client.authenticate(vsrConfig(server.port).credentials)
+            : client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+          void pending.catch(() => undefined);
+          await firstAttempt;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          for (const [index, delay] of delays.entries()) {
+            assert.equal(attempts.length, index + 1);
+            if (delay > 0) {
+              context.mock.timers.tick(delay - 1);
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              assert.equal(attempts.length, index + 1, 'a retry cannot start before its sampled delay');
+            }
+            context.mock.timers.tick(delay > 0 ? 1 : 0);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assert.equal(attempts.length, index + 2, 'a retry starts at its sampled delay');
+          }
+          await pending;
+          assert.equal(random.mock.callCount(), delays.length);
+          if (retry !== 'lookup')
+            for (const frame of attempts) assert.deepEqual(frame, attempts[0]);
+        } finally { context.mock.timers.reset(); client.destroy(); await server.close(); }
+      });
+    }
+  }
+
+  it('refreshes immediately on a first 89 and backs off repeated refusals with the same identity', async (context) => {
+    const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    const mutations: Buffer[] = [];
+    const statuses = [89, 89, TRANSIENT_NOT_ACCEPTED, 89, 0];
+    let lookups = 0;
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      const random = context.mock.method(Math, 'random', () => 1 - Number.EPSILON);
+      context.mock.method(IggyConnection.prototype, 'exchange', async (encode: () => Buffer): Promise<LinkAttempt> => {
+        const frame = encode();
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
+          const route = routingBody(1n, 1n, 0);
+          route.writeUInt32LE(lookups++, 16);
+          return { started: true, response: replyFrame(frame, Operation.NonReplicated, route) };
+        }
+        assert.equal(frame[REQUEST_OFFSET.operation], Operation.StoreConsumerOffset);
+        mutations.push(Buffer.from(frame));
+        const status = statuses[mutations.length - 1];
+        return { started: true, response: replyFrame(frame, Operation.StoreConsumerOffset,
+          status === 0 ? metadataResult(0) : Buffer.alloc(0), status) };
+      });
+      context.mock.timers.enable({ apis: ['setTimeout'] });
+      const pending = client.sendCommand(COMMAND_CODE.StoreOffset, storeOffsetPayload);
+      void pending.catch(() => undefined);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(mutations.length, 2, 'the first 89 refreshes and retries without a timer');
+      assert.equal(lookups, 2);
+      assert.equal(random.mock.callCount(), 1);
+      for (const [delay, before, after] of [[50, 2, 3], [100, 3, 5]]) {
+        context.mock.timers.tick(delay - 1);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(mutations.length, before);
+        context.mock.timers.tick(1);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(mutations.length, after);
+        assert.equal(lookups, after);
+      }
+      await pending;
+      assert.equal(random.mock.callCount(), 2, 'a new 89 after a different refusal is immediate again');
+      for (const frame of mutations) assert.deepEqual(frame, mutations[0]);
+    } finally { context.mock.timers.reset(); client.destroy(); await server.close(); }
+  });
+
+  for (const [sample, delays] of [
+    [0, [0]],
+    [0.5, [500, 1_000, 2_000, 4_000, 5_000, 5_000]],
+    [1 - Number.EPSILON, [1_000]]
+  ] as const) {
+    it(`jitters failed bootstrap passes with a capped exponential delay at sample ${sample}`, async (context) => {
+      const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+      const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0,
+        reconnect: { enabled: true, interval: 1_000, maxRetries: delays.length } });
+      const connect = IggyConnection.prototype.connect;
+      let attempts = 0;
+      const dials = context.mock.method(IggyConnection.prototype, 'connect', function (this: IggyConnection, signal?: AbortSignal) {
+        return ++attempts <= delays.length ? Promise.reject(new Error('bootstrap unavailable')) : connect.call(this, signal);
+      });
+      const random = context.mock.method(Math, 'random', () => sample);
+      try {
+        context.mock.timers.enable({ apis: ['setTimeout'] });
+        const pending = client.authenticate(vsrConfig(server.port).credentials);
+        void pending.catch(() => undefined);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(dials.mock.callCount(), 1, 'the first bootstrap attempt is immediate');
+        for (const [index, delay] of delays.entries()) {
+          if (delay > 0) {
+            context.mock.timers.tick(delay - 1);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            assert.equal(dials.mock.callCount(), index + 1);
+          }
+          context.mock.timers.tick(delay > 0 ? 1 : 0);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(dials.mock.callCount(), index + 2);
+        }
+        context.mock.timers.reset();
+        await pending;
+        assert.equal(random.mock.callCount(), delays.length);
+        assert.equal(framesOf(server, Operation.Register).length, 1);
+      } finally { context.mock.timers.reset(); client.destroy(); await server.close(); }
+    });
+  }
+});
+
+describe('native replica resources and route floors', () => {
+  it('reconnects an unused replica independently without registering another session', async () => {
+    const cluster = await startPollCluster(undefined, undefined, 'TCP', {
+      reconnect: { enabled: true, interval: 10, maxRetries: 2 }
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      for (const socket of cluster.primary.sockets) socket.destroy();
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 2);
+      assert.equal(framesOf(cluster.primary, Operation.Register).length, 0);
+      assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.PollMessages), 0);
+      assert.equal(cluster.primary.sockets.size, 1);
+      await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+    } finally { await cluster.close(); }
+  });
+
+  for (const [sample, delay] of [[0, 0], [0.5, 500], [1 - Number.EPSILON, 1_000]]) {
+    it(`uses the full jitter range for the first background redial with random sample ${sample}`, async (context) => {
+      const interval = 1_000;
+      const dials = context.mock.method(IggyConnection.prototype, 'connect');
+      const random = context.mock.method(Math, 'random', () => sample);
+      const cluster = await startPollCluster(undefined, undefined, 'TCP', {
+        reconnect: { enabled: true, interval, maxRetries: 2 }
+      });
+      try {
+        await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+        assert.equal(dials.mock.callCount(), 2);
+        assert.equal(random.mock.callCount(), 0, 'bootstrap and initial replica attachment stay immediate');
+        const link = (cluster.client as unknown as {
+          replicas: Map<number, { connection: IggyConnection }>
+        }).replicas.get(7)!.connection;
+        const disconnected = new Promise<void>((resolve) => { link.once('disconnected', resolve); });
+        context.mock.timers.enable({ apis: ['setTimeout'] });
+        for (const socket of cluster.primary.sockets) socket.destroy();
+        await disconnected;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(random.mock.callCount(), 1);
+        assert.equal(dials.mock.callCount(), 2);
+        if (delay > 0) {
+          context.mock.timers.tick(delay - 1);
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(dials.mock.callCount(), 2);
+        }
+        context.mock.timers.tick(delay > 0 ? 1 : 0);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(dials.mock.callCount(), 3, 'the first redial starts at the sampled delay');
+        context.mock.timers.reset();
+        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 2);
+        assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
+        assert.equal(framesOf(cluster.primary, Operation.Register).length, 0);
+      } finally { context.mock.timers.reset(); await cluster.close(); }
+    });
+  }
+
+  it('replaces one replica endpoint, preserves its session, and closes every link on destroy', async () => {
+    let endpoint = 0;
+    const replacement = await startVsrServer((frame, socket) => singleNodeHandler(replacement.port)(frame, socket));
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (!endpoint || frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, twoNodeMetadataBody(endpoint, cluster.coordinator.port)));
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      const original = framesOf(cluster.primary, Operation.SendMessages)[0];
+      endpoint = replacement.port;
+      await cluster.client.sendCommand(COMMAND_CODE.GetClusterMetadata, Buffer.alloc(0));
+      await waitUntil(() => countCommand(replacement, COMMAND_CODE.BindSession) === 1 && cluster.primary.sockets.size === 0);
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      const subsequent = framesOf(replacement, Operation.SendMessages)[0];
+      assert.deepEqual(stampedContext(subsequent), stampedContext(original));
+      assert.deepEqual(subsequent.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16),
+        original.subarray(REQUEST_OFFSET.client, REQUEST_OFFSET.client + 16));
+      assert.equal(framesOf(replacement, Operation.Register).length, 0);
+      cluster.client.destroy();
+      await waitUntil(() => replacement.sockets.size === 0 && cluster.coordinator.sockets.size === 0);
+    } finally { await cluster.close(); await replacement.close(); }
+  });
+
+  it('keeps healthy replica heartbeats running while another replica is unavailable', async () => {
+    const cluster = await startPollCluster(undefined, undefined, 'TCP', {
+      heartbeatInterval: 15, reconnect: { enabled: true, interval: 10, maxRetries: 2 }
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      for (const socket of cluster.primary.sockets) socket.destroy();
+      await cluster.primary.close();
+      await waitUntil(() => countCommand(cluster.coordinator, COMMAND_CODE.Ping) >= 2);
+      await cluster.client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+      assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
+      cluster.client.destroy();
+      await waitUntil(() => cluster.coordinator.sockets.size === 0);
+      const pings = countCommand(cluster.coordinator, COMMAND_CODE.Ping);
+      await new Promise<void>((resolve) => setTimeout(resolve, 45));
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.Ping), pings);
+    } finally { await cluster.close(); }
+  });
+
+  it('restarts a replica link after its retry budget on each heartbeat until destroy', async () => {
+    let down = false;
+    const server = await startVsrServer((frame, socket) => {
+      if (down) { socket.destroy(); return; }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 20,
+      reconnect: { enabled: true, interval: 1, maxRetries: 1 } });
+    const bindings = () => countCommand(server, COMMAND_CODE.BindSession);
+    const outage = async () => {
+      const before = bindings();
+      down = true;
+      for (const socket of server.sockets) socket.destroy();
+      // One budget allows a single redial, so a third bind attempt proves a restart.
+      await waitUntil(() => bindings() >= before + 3);
+    };
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      await outage();
+      down = false;
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0), { deadline: Date.now() + 2_000 });
+      const register = framesOf(server, Operation.Register);
+      assert.equal(register.length, 1);
+      assertSharedBinding(register[0], server.frames.findLast((frame) =>
+        frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession)!);
+
+      await outage();
+      client.destroy();
+      await waitUntil(() => server.sockets.size === 0);
+      const settled = server.frames.length;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      assert.equal(server.frames.length, settled);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('never restarts a stopped replica link when reconnection is disabled', async () => {
+    const cluster = await startPollCluster(undefined, undefined, 'TCP', { heartbeatInterval: 20 });
+    const pings = () => countCommand(cluster.coordinator, COMMAND_CODE.Ping);
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      for (const socket of cluster.primary.sockets) socket.destroy();
+      const before = pings();
+      await waitUntil(() => pings() >= before + 3);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.BindSession), 1);
+    } finally { await cluster.close(); }
+  });
+
+  it('never restarts a stopped replica link after logout', async (context) => {
+    let down = false;
+    const cluster = await startPollCluster((_frame, socket) => {
+      if (!down) return false;
+      socket.destroy();
+      return true;
+    }, undefined, 'TCP', { heartbeatInterval: 20, reconnect: { enabled: true, interval: 1, maxRetries: 1 } });
+    const bindings = () => countCommand(cluster.primary, COMMAND_CODE.BindSession);
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => bindings() === 1);
+      down = true;
+      for (const socket of cluster.primary.sockets) socket.destroy();
+      await waitUntil(() => bindings() >= 2);
+      // After logout no session is left to bind, so count dials, not binds.
+      const dials = context.mock.method(IggyConnection.prototype, 'connect');
+      await cluster.client.sendCommand(LOGOUT.code, LOGOUT.serialize());
+      const settled = dials.mock.callCount();
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      assert.equal(dials.mock.callCount(), settled);
+    } finally { await cluster.close(); }
+  });
+
+  it('resets a replacement history view floor without accepting older metadata', async () => {
+    const original = { incarnation: 17n, metadata: 10n, view: 12 };
+    const replacement = { incarnation: 18n, metadata: 11n, view: 0 };
+    let replaced = false;
+    let lookups = 0;
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetPartitionRoute) {
+        const current = replaced ? replacement : original;
+        const metadata = ++lookups === 2 ? original.metadata - 1n : current.metadata;
+        const route = routingBody(metadata, current.incarnation, 0);
+        route.writeUInt32LE(current.view, 16);
+        socket.write(replyFrame(frame, Operation.NonReplicated, route));
+        return;
+      }
+      if (frame[REQUEST_OFFSET.operation] === Operation.SendMessages) {
+        const stale = replaced && stampedContext(frame).incarnation === original.incarnation;
+        socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), stale ? HISTORY_UNAVAILABLE : 0));
+        return;
+      }
+      singleNodeHandler(server.port)(frame, socket);
+    });
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    try {
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      replaced = true;
+      await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 500 });
+      const sends = framesOf(server, Operation.SendMessages);
+      assert.deepEqual(sends.map((frame) => stampedContext(frame).incarnation),
+        [original.incarnation, original.incarnation, replacement.incarnation]);
+      assert.equal(stampedContext(sends[2]).metadataOp, replacement.metadata);
+      assert.equal(lookups, 3);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  for (const status of [1009, 1010, 2010, 2011, 3007]) {
+    it(`ignores a backup namespace miss ${status} while the primary materializes the route`, async (context) => {
+      const lookups: number[] = [];
+      let primaryLookups = 0;
+      const cluster = await startPollCluster((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        lookups.push(7);
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), status));
+        return true;
+      }, (frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        lookups.push(0);
+        socket.write(++primaryLookups === 1
+          ? replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED)
+          : replyFrame(frame, Operation.NonReplicated, routingBody(1n)));
+        return true;
+      });
+      try {
+        await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+        context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+        let backoffStarted!: () => void;
+        const backoff = new Promise<void>((resolve) => { backoffStarted = resolve; });
+        context.mock.method(Math, 'random', () => { backoffStarted(); return 1 - Number.EPSILON; });
+        const pending = cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 500 });
+        await Promise.race([backoff, pending]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(lookups, [0, 7]);
+        context.mock.timers.tick(50);
+        await pending;
+        assert.deepEqual(lookups, [0, 7, 0]);
+        assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+        assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 1);
+      } finally { context.mock.timers.reset(); await cluster.close(); }
+    });
+
+    it(`returns a known metadata primary namespace miss ${status} without sending`, async (context) => {
+      const cluster = await startPollCluster(undefined, (frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), status));
+        return true;
+      });
+      try {
+        await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+        await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+        context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+        await assert.rejects(
+          cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 500 }),
+          (error: unknown) => error instanceof ResponseError && error.errorCode === status &&
+            error.commandCode === COMMAND_CODE.SendMessages
+        );
+        assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+        assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetPartitionRoute), 0);
+        assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+        assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 0);
+      } finally { context.mock.timers.reset(); await cluster.close(); }
+    });
+  }
+
+  it('keeps backup namespace misses transient until the route deadline expires', async (context) => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), 2010));
+      return true;
+    }, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
+      return true;
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await waitUntil(() => countCommand(cluster.primary, COMMAND_CODE.BindSession) === 1);
+      context.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
+      let backoffStarted!: () => void;
+      const backoff = new Promise<void>((resolve) => { backoffStarted = resolve; });
+      context.mock.method(Math, 'random', () => { backoffStarted(); return 1 - Number.EPSILON; });
+      const routeTimeout = 25;
+      const pending = cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + routeTimeout });
+      await Promise.race([backoff, pending]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetPartitionRoute), 1);
+      const rejected = assert.rejects(pending,
+        (error: unknown) => error instanceof ResponseError && error.errorCode === TRANSIENT_NOT_ACCEPTED
+      );
+      context.mock.timers.tick(routeTimeout);
+      await rejected;
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+      assert.equal(countCommand(cluster.primary, COMMAND_CODE.GetPartitionRoute), 1);
+      assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+      assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 0);
+    } finally { context.mock.timers.reset(); await cluster.close(); }
+  });
+
+  for (const refusal of ['stale', 'conflicting', 'refused'] as const) {
+    it(`visits every ready replica when earlier route replies are ${refusal}`, async () => {
+      const incarnation = 17n;
+      const originalView = 10;
+      const primaryReplica = 7;
+      const lastReplica = 9;
+      const lookups: number[] = [];
+      let discover = false;
+      let sends = 0;
+      const handleRoute = (replica: number, frame: Buffer, socket: Socket): boolean => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+        if (discover) lookups.push(replica);
+        if (discover && replica !== lastReplica && refusal === 'refused') {
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
+          return true;
+        }
+        const current = !discover || replica === lastReplica;
+        const route = routingBody(1n, incarnation, !current && refusal === 'conflicting' ? 0 : primaryReplica);
+        route.writeUInt32LE(!discover ? originalView : current ? originalView + 1
+          : refusal === 'stale' ? originalView - 1 : originalView, 16);
+        socket.write(replyFrame(frame, Operation.NonReplicated, route));
+        return true;
+      };
+      const last = await startVsrServer((frame, socket) => {
+        if (!handleRoute(lastReplica, frame, socket)) singleNodeHandler(last.port)(frame, socket);
+      });
+      const primary = await startVsrServer((frame, socket) => {
+        if (handleRoute(primaryReplica, frame, socket)) return;
+        if (frame[REQUEST_OFFSET.operation] === Operation.SendMessages && ++sends === 2) {
+          discover = true;
+          socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), TRANSIENT_NOT_ACCEPTED));
+          return;
+        }
+        singleNodeHandler(primary.port)(frame, socket);
+      });
+      const coordinator = await startVsrServer((frame, socket) => {
+        if (handleRoute(0, frame, socket)) return;
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(frame, Operation.NonReplicated,
+            threeNodeMetadataBody(coordinator.port, primary.port, last.port)));
+          return;
+        }
+        singleNodeHandler(coordinator.port)(frame, socket);
+      });
+      const client = new CommandResponseStream({ ...vsrConfig(coordinator.port), heartbeatInterval: 0 });
+      try {
+        await client.authenticate(vsrConfig(coordinator.port).credentials);
+        await waitUntil(() => countCommand(primary, COMMAND_CODE.BindSession) === 1 &&
+          countCommand(last, COMMAND_CODE.BindSession) === 1);
+        await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+        await client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 500 });
+        assert.deepEqual(lookups, [0, primaryReplica, lastReplica]);
+        assert.equal(sends, 3);
+      } finally {
+        client.destroy();
+        await Promise.all([coordinator.close(), primary.close(), last.close()]);
+      }
+    });
+  }
+
+  it('keeps a newer route usable after a late refusal from an older view', async () => {
+    let view = 0;
+    const polls: { frame: Buffer, socket: Socket }[] = [];
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetOffset) return false;
+      polls.push({ frame, socket });
+      if (polls.length > 2) socket.write(replyFrame(frame, Operation.NonReplicated));
+      return true;
+    }, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+      const route = routingBody(1n, 17n);
+      route.writeUInt32LE(view, 16);
+      socket.write(replyFrame(frame, Operation.NonReplicated, route));
+      return true;
+    });
+    try {
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      const body = GET_OFFSET.serialize({ streamId: 1, topicId: 2, partitionId: 3,
+        consumer: { kind: ConsumerKind.Single, id: 1 } });
+      const deadline = Date.now() + 1_000;
+      const first = cluster.client.sendCommand(COMMAND_CODE.GetOffset, body, { deadline });
+      const second = cluster.client.sendCommand(COMMAND_CODE.GetOffset, body, { deadline });
+      void first.catch(() => undefined);
+      void second.catch(() => undefined);
+      await waitUntil(() => polls.length === 2);
+      view = 1;
+      polls[0].socket.write(replyFrame(polls[0].frame, Operation.NonReplicated, Buffer.alloc(0), 89));
+      await first;
+      polls[1].socket.write(replyFrame(polls[1].frame, Operation.NonReplicated, Buffer.alloc(0), 89));
+      await second;
+      assert.equal(polls.length, 4);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 3);
+    } finally { await cluster.close(); }
+  });
+
+  it('shares accepted view floors across aliases and rejects conflicting equal-view primaries', async () => {
+    const views = [10, 12, 11, 12, 13];
+    let lookups = 0;
+    const handleRoute = (frame: Buffer, socket: Socket): boolean => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute) return false;
+      const route = routingBody(1n, 17n, lookups === 3 ? 0 : 7);
+      route.writeUInt32LE(views[lookups++], 16);
+      socket.write(replyFrame(frame, Operation.NonReplicated, route));
+      return true;
+    };
+    const cluster = await startPollCluster(handleRoute, handleRoute);
+    try {
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      const alias = SEND_MESSAGES.serialize({ streamId: 'stream', topicId: 'topic',
+        messages: [{ payload: 'alias' }], partition: Partitioning.PartitionId(3) });
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, alias);
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      assert.equal(lookups, 5);
+      assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 3);
+      assert.equal(framesOf(cluster.coordinator, Operation.SendMessages).length, 0);
+    } finally { await cluster.close(); }
+  });
+
+  it('limits concurrent TCP plus TLS dials to four and attaches a healthy later replica', async () => {
+    let active = 0;
+    let peak = 0;
+    const sockets = new Set<Socket>();
+    const stalled: Server[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        active += 1;
+        peak = Math.max(peak, active);
+        socket.on('error', () => undefined);
+        socket.once('close', () => { sockets.delete(socket); active -= 1; });
+        socket.resume();
+      });
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      stalled.push(server);
+    }
+    const healthy = await startVsrServer((frame, socket) => singleNodeHandler(healthy.port)(frame, socket), 'TLS');
+    const coordinator = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetClusterMetadata) {
+        const nodes = [{ port: coordinator.port, replicaId: 0, role: 0 },
+          ...stalled.map((server, index) => ({ port: (server.address() as AddressInfo).port, replicaId: index + 1, role: 1 })),
+          { port: healthy.port, replicaId: 7, role: 1 }];
+        socket.write(replyFrame(frame, Operation.NonReplicated, metadataBody(nodes)));
+        return;
+      }
+      singleNodeHandler(coordinator.port)(frame, socket);
+    }, 'TLS');
+    const client = new CommandResponseStream({ ...vsrConfig(coordinator.port), transport: 'TLS', heartbeatInterval: 0,
+      options: { host: '127.0.0.1', port: coordinator.port, servername: 'localhost', ca: TLS_CA_CERTIFICATE } });
+    try {
+      await client.authenticate(vsrConfig(coordinator.port).credentials);
+      await waitUntil(() => active === 4);
+      assert.equal(countCommand(healthy, COMMAND_CODE.BindSession), 0);
+      assert.equal(peak, 4);
+      const deadline = Date.now() + 3000;
+      while (countCommand(healthy, COMMAND_CODE.BindSession) === 0 && Date.now() < deadline)
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      assert.equal(countCommand(healthy, COMMAND_CODE.BindSession), 1);
+      assert.equal(framesOf(healthy, Operation.Register).length, 0);
+      await client.sendCommand(COMMAND_CODE.GetStats, Buffer.alloc(0));
+    } finally {
+      client.destroy();
+      for (const socket of sockets) socket.destroy();
+      await Promise.all([coordinator.close(), healthy.close(), ...stalled.map((server) =>
+        new Promise<void>((resolve) => server.close(() => resolve())))]);
+    }
+  });
+});
+
+describe('consumer stream', () => {
+  const POLLED_PARTITION = 3;
+  const streamConfig = (port: number): ClientConfig => ({
+    ...vsrConfig(port), heartbeatInterval: 20, reconnect: { enabled: true, interval: 10, maxRetries: 2 }
+  });
+  const pollRequest = {
+    streamId: 1, topicId: 2, pollingStrategy: PollingStrategy.Next, count: 1, interval: 10, endOnLastOffset: true
+  };
+
+  const emptyPoll = (frame: Buffer): Buffer => {
+    const body = Buffer.alloc(40);
+    body.writeUInt32LE(POLLED_PARTITION, 0);
+    return replyFrame(frame, Operation.NonReplicated, body);
+  };
+
+  /** Group 1, whose only member owns `POLLED_PARTITION`. */
+  const groupHandler = (frame: Buffer, socket: Socket): boolean => {
+    const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+    if (frame[REQUEST_OFFSET.operation] === Operation.JoinConsumerGroup) {
+      socket.write(replyFrame(frame, Operation.JoinConsumerGroup, metadataResult(0)));
+    } else if (code === COMMAND_CODE.GetGroup) {
+      const group = Buffer.alloc(13);
+      group.writeUInt32LE(1, 0);
+      socket.write(replyFrame(frame, Operation.NonReplicated, group));
+    } else if (code === COMMAND_CODE.SyncGroup) {
+      const assignment = Buffer.alloc(16);
+      assignment.writeBigUInt64LE(1n, 0);
+      assignment.writeUInt32LE(1, 8);
+      assignment.writeUInt32LE(POLLED_PARTITION, 12);
+      socket.write(replyFrame(frame, Operation.NonReplicated, assignment));
+    } else return false;
+    return true;
+  };
+
+  /** Collects what a stream yields; the returned wait fails on the error that ended it. */
+  const consume = (stream: Readable): () => Promise<unknown[]> => {
+    const polled: unknown[] = [];
+    let ended = false;
+    let failed: unknown;
+    stream.on('data', (response) => polled.push(response));
+    stream.once('end', () => { ended = true; });
+    stream.once('error', (error) => { failed = error; });
+    return async () => {
+      await waitUntil(() => ended || failed !== undefined);
+      assert.ifError(failed);
+      return polled;
+    };
+  };
+
+  const closeAll = async (servers: VsrTestServer[], ...streams: (Readable | undefined)[]): Promise<void> => {
+    for (const stream of streams) stream?.destroy();
+    for (const server of servers)
+      for (const socket of server.sockets) socket.destroy();
+    await Promise.all(servers.map((server) => server.close()));
+  };
+
+  // A budget far shorter than the heartbeat interval lets every link use it up
+  // before a heartbeat restarts one.
+  const outageConfig = (port: number): ClientConfig => ({
+    ...streamConfig(port), reconnect: { enabled: true, interval: 1, maxRetries: 1 }
+  });
+
+  /** Records each error that a poll returns to the stream. */
+  const pollRefusals = (context: TestContext): unknown[] => {
+    const refusals: unknown[] = [];
+    const sendCommand = CommandResponseStream.prototype.sendCommand;
+    context.mock.method(CommandResponseStream.prototype, 'sendCommand',
+      function (this: CommandResponseStream, ...args: Parameters<typeof sendCommand>) {
+        const pending = sendCommand.apply(this, args);
+        if (args[0] === COMMAND_CODE.PollMessages)
+          void pending.catch((error: unknown) => { refusals.push(error); });
+        return pending;
+      });
+    return refusals;
+  };
+
+  /** A cluster whose replicas all stop listening at the first route lookup, until `reopen`. */
+  const startOutageCluster = async () => {
+    let outage = false;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
+      socket.write(emptyPoll(frame));
+      return true;
+    }, (frame, socket) => {
+      if (outage || frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetPartitionRoute)
+        return groupHandler(frame, socket);
+      // A poll without a route asks for any ready link, so it sees every link out of budget.
+      outage = true;
+      for (const server of [cluster.coordinator, cluster.primary]) {
+        void server.close();
+        for (const link of server.sockets) link.destroy();
+      }
+      return true;
+    });
+    return cluster;
+  };
+
+  for (const group of [false, true]) {
+    for (const failure of ['a stale client refusal', 'a lost poll reply', 'a primary link lost past the poll deadline'] as const) {
+      it(`keeps a ${group ? 'group' : 'single'} consumer polling on the same session after ${failure}`, async () => {
+        const lostPrimary = failure === 'a primary link lost past the poll deadline';
+        let primaryDown = lostPrimary;
+        let polls = 0;
+        const third = await startVsrServer((frame, socket) => singleNodeHandler(third.port)(frame, socket));
+        const cluster = await startPollCluster((frame, socket) => {
+          const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+          if (primaryDown && code === COMMAND_CODE.BindSession) {
+            socket.destroy();
+            return true;
+          }
+          if (code !== COMMAND_CODE.PollMessages) return false;
+          polls += 1;
+          if (polls > 1 || lostPrimary) socket.write(emptyPoll(frame));
+          else if (failure === 'a lost poll reply') socket.destroy();
+          else socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), STALE_CLIENT));
+          return true;
+        }, (frame, socket) => {
+          if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetClusterMetadata)
+            return groupHandler(frame, socket);
+          socket.write(replyFrame(frame, Operation.NonReplicated,
+            threeNodeMetadataBody(cluster.coordinator.port, cluster.primary.port, third.port)));
+          return true;
+        });
+        const realNow = Date.now;
+        let clockOffset = 0;
+        Date.now = () => realNow() + clockOffset;
+        let stream: Readable | undefined;
+        try {
+          const config = streamConfig(cluster.coordinator.port);
+          stream = group
+            ? await groupConsumerStream(config)({ ...pollRequest, groupName: 'group' })
+            : await singleConsumerStream(config)({ ...pollRequest, partitionId: POLLED_PARTITION });
+          const ended = consume(stream);
+          if (primaryDown) {
+            // The poll retries its route while the primary link is down, until its deadline passes.
+            await waitUntil(() => countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
+            clockOffset = OPERATION_TIMEOUT_MS;
+            primaryDown = false;
+          }
+          assert.equal((await ended()).length, 1);
+          assert.equal(polls, lostPrimary ? 1 : 2);
+          const registers = framesOf(cluster.coordinator, Operation.Register);
+          const binds = cluster.primary.frames.filter((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.BindSession);
+          assert.equal(registers.length, 1);
+          assert.ok(binds.length >= 2);
+          for (const bind of binds) assertSharedBinding(registers[0], bind);
+          await waitUntil(() => [cluster.coordinator, cluster.primary, third].every((server) => server.sockets.size === 0));
+        } finally {
+          Date.now = realNow;
+          cluster.client.destroy();
+          await closeAll([cluster.coordinator, cluster.primary, third], stream);
+        }
+      });
+    }
+  }
+
+  it('keeps a single consumer polling after its session ends and the client signs in again', async () => {
+    let polls = 0;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
+      polls += 1;
+      socket.write(polls > 1 ? emptyPoll(frame) : evictionFrame(EvictionReason.SessionError));
+      return true;
+    });
+    let stream: Readable | undefined;
+    try {
+      stream = await singleConsumerStream(streamConfig(cluster.coordinator.port))(
+        { ...pollRequest, partitionId: POLLED_PARTITION });
+      assert.equal((await consume(stream)()).length, 1);
+      assert.equal(polls, 2);
+      assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 2);
+    } finally {
+      cluster.client.destroy();
+      await closeAll([cluster.coordinator, cluster.primary], stream);
+    }
+  });
+
+  for (const group of [false, true]) {
+    it(`keeps a ${group ? 'group' : 'single'} consumer polling through an outage longer than every link budget`, async (context) => {
+      const refusals = pollRefusals(context);
+      const cluster = await startOutageCluster();
+      let stream: Readable | undefined;
+      try {
+        const config = outageConfig(cluster.coordinator.port);
+        stream = group
+          ? await groupConsumerStream(config)({ ...pollRequest, groupName: 'group' })
+          : await singleConsumerStream(config)({ ...pollRequest, partitionId: POLLED_PARTITION });
+        const ended = consume(stream);
+        await waitUntil(() => refusals.length > 0);
+        await cluster.coordinator.reopen();
+        // The coordinator comes back first, so that it answers the route lookup.
+        await waitUntil(() => stream!.destroyed || countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute) >= 2);
+        await cluster.primary.reopen();
+        assert.equal((await ended()).length, 1);
+        assert.equal(framesOf(cluster.coordinator, Operation.Register).length, 1);
+        for (const refusal of refusals) assert.ok(refusal instanceof NotConnectedError, String(refusal));
+      } finally {
+        cluster.client.destroy();
+        await closeAll([cluster.coordinator, cluster.primary], stream);
+      }
+    });
+  }
+
+  for (const [setting, overrides] of [
+    ['reconnection is disabled', { reconnect: { enabled: false, interval: 1, maxRetries: 0 } }],
+    ['heartbeats are disabled', { heartbeatInterval: 0 }]
+  ] as const) {
+    it(`ends a consumer stream after an outage when ${setting}`, async () => {
+      const cluster = await startOutageCluster();
+      let stream: Readable | undefined;
+      try {
+        stream = await singleConsumerStream({ ...outageConfig(cluster.coordinator.port), ...overrides })(
+          { ...pollRequest, partitionId: POLLED_PARTITION });
+        stream.on('error', () => undefined).resume();
+        await waitUntil(() => stream!.destroyed);
+        // The client never restarts these links, so the stream must not wait for them.
+        assert.ok(stream.errored && !(stream.errored instanceof NotConnectedError), String(stream.errored));
+      } finally {
+        cluster.client.destroy();
+        await closeAll([cluster.coordinator, cluster.primary], stream);
+      }
+    });
+  }
+
+  it('keeps a single consumer polling while its session ends and no replica accepts a dial', async (context) => {
+    const refusals = pollRefusals(context);
+    let polls = 0;
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
+      polls += 1;
+      if (polls > 1) {
+        socket.write(emptyPoll(frame));
+        return true;
+      }
+      // The client drops every link when its session ends, so the new sign-in has to dial.
+      void cluster.coordinator.close();
+      void cluster.primary.close();
+      socket.write(evictionFrame(EvictionReason.SessionError));
+      return true;
+    });
+    let stream: Readable | undefined;
+    try {
+      stream = await singleConsumerStream(outageConfig(cluster.coordinator.port))(
+        { ...pollRequest, partitionId: POLLED_PARTITION });
+      const ended = consume(stream);
+      await waitUntil(() => refusals.length >= 2);
+      await cluster.coordinator.reopen();
+      // The coordinator comes back first, so that it answers the sign-in.
+      await waitUntil(() => stream!.destroyed || framesOf(cluster.coordinator, Operation.Register).length === 2);
+      await cluster.primary.reopen();
+      assert.equal((await ended()).length, 1);
+      assert.equal(polls, 2);
+      assert.ok(refusals[0] instanceof OperationUncertainError &&
+        refusals[0].cause instanceof VsrEvictionError && refusals[0].cause.errorCode === UNAUTHENTICATED,
+      String(refusals[0]));
+      for (const refusal of refusals.slice(1)) assert.ok(refusal instanceof NotConnectedError, String(refusal));
+    } finally {
+      cluster.client.destroy();
+      await closeAll([cluster.coordinator, cluster.primary], stream);
+    }
+  });
+
+  for (const group of [false, true]) {
+    const kind = group ? 'group' : 'single';
+    const openStream = (config: ClientConfig): Promise<Readable> => group
+      ? groupConsumerStream(config)({ ...pollRequest, groupName: 'group' })
+      : singleConsumerStream(config)({ ...pollRequest, partitionId: POLLED_PARTITION });
+
+    it(`rejects a ${kind} consumer stream at creation and releases its client when no replica accepts a dial`, async (context) => {
+      const unreachable = await startVsrServer(() => undefined);
+      await unreachable.close();
+      const destroys = context.mock.method(CommandResponseStream.prototype, 'destroy');
+      const dials = context.mock.method(IggyConnection.prototype, 'connect');
+      await assert.rejects(openStream(outageConfig(unreachable.port)), NotConnectedError);
+      assert.equal(destroys.mock.callCount(), 1);
+      const settled = dials.mock.callCount();
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      assert.equal(dials.mock.callCount(), settled);
+    });
+
+    it(`rejects a ${kind} consumer stream with its refused sign-in and releases its client`, async (context) => {
+      const server = await startVsrServer((frame, socket) => {
+        if (frame[REQUEST_OFFSET.operation] === Operation.Register)
+          socket.write(evictionFrame(EvictionReason.InvalidCredentials));
+        else singleNodeHandler(server.port)(frame, socket);
+      });
+      const destroys = context.mock.method(CommandResponseStream.prototype, 'destroy');
+      try {
+        await assert.rejects(openStream(outageConfig(server.port)), (error: unknown) =>
+          error instanceof VsrEvictionError && error.errorCode === INVALID_CREDENTIALS);
+        assert.equal(destroys.mock.callCount(), 1);
+        assert.equal(framesOf(server, Operation.Register).length, 1);
+      } finally {
+        await closeAll([server]);
+      }
+    });
+  }
+
+  it('rejects a group consumer stream with its refused join and releases its signed-in client', async () => {
+    const cluster = await startPollCluster(undefined, (frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetGroup) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), UNAUTHORIZED));
+      return true;
+    });
+    try {
+      await assert.rejects(groupConsumerStream(streamConfig(cluster.coordinator.port))({ ...pollRequest, groupName: 'group' }),
+        (error: unknown) => error instanceof ResponseError && error.errorCode === UNAUTHORIZED);
+      await waitUntil(() => cluster.coordinator.sockets.size === 0 && cluster.primary.sockets.size === 0);
+    } finally {
+      cluster.client.destroy();
+      await closeAll([cluster.coordinator, cluster.primary]);
+    }
+  });
+
+  it('stops polling and releases its client when a retrying stream is destroyed', async () => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.PollMessages) return false;
+      socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), STALE_CLIENT));
+      return true;
+    });
+    const stream = await singleConsumerStream(streamConfig(cluster.coordinator.port))(
+      { ...pollRequest, partitionId: POLLED_PARTITION });
+    let failed: unknown;
+    stream.once('error', (error) => { failed = error; });
+    try {
+      stream.resume();
+      await waitUntil(() => failed !== undefined || countCommand(cluster.primary, COMMAND_CODE.PollMessages) >= 2);
+      assert.ifError(failed);
+      stream.destroy();
+      await waitUntil(() => cluster.coordinator.sockets.size === 0 && cluster.primary.sockets.size === 0);
+    } finally {
+      cluster.client.destroy();
+      await closeAll([cluster.coordinator, cluster.primary], stream);
     }
   });
 });

@@ -51,6 +51,7 @@ use crate::protocol::api::{
     decode_sasl_mechanism, describe_acls_outcome, encode_error_for_key, handle_connection_request,
     respond_describe_acls_error, sasl_authenticate_outcome, sasl_handshake_outcome,
 };
+use crate::protocol::auto_topic_creation::{self, AutoTopicCreationConfig};
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::header::{request_header_version, response_header_version};
 use crate::protocol::sasl::{
@@ -160,6 +161,9 @@ pub struct GatewayConfig {
     ///
     /// Client certificate user lookups get the same number of slots again, separate from these.
     pub max_concurrent_authentications: usize,
+    /// Whether a `Metadata` lookup of a missing topic creates it, and with how many partitions
+    /// (`IGGY_KAFKA_AUTO_CREATE_TOPICS_*`). Off by default.
+    pub auto_topic_creation: AutoTopicCreationConfig,
 }
 
 impl Default for GatewayConfig {
@@ -180,6 +184,7 @@ impl Default for GatewayConfig {
             instance_id: 0,
             pre_auth_timeout: Duration::from_secs(15),
             max_concurrent_authentications: 4,
+            auto_topic_creation: AutoTopicCreationConfig::default(),
         }
     }
 }
@@ -478,12 +483,15 @@ impl KafkaGateway {
         // coordinator can take a child token: a parked JoinGroup or SyncGroup waiter would
         // otherwise hold the drain open for a full rebalance timeout.
         let cancel = CancellationToken::new();
-        let state = Arc::new(GatewayState::new(
-            self.bridge.clone(),
-            self.config.max_frame_size,
-            self.config.instance_id,
-            GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
-        ));
+        let state = Arc::new(
+            GatewayState::new(
+                self.bridge.clone(),
+                self.config.max_frame_size,
+                self.config.instance_id,
+                GroupCoordinator::new(self.config.group.clone(), cancel.child_token()),
+            )
+            .with_auto_topic_creation(self.config.auto_topic_creation)?,
+        );
         let shared_auth = Arc::new(SharedAuth::new(
             self.authenticator.clone(),
             resolver,
@@ -536,6 +544,11 @@ impl KafkaGateway {
         cancel.cancel();
         accept_loops.shutdown().await;
         drain(&tracker, &cancel, drain_timeout).await;
+        // After the drain, so no connection starts one after it, and before `run` returns, so
+        // none still runs when the bridge signs out.
+        state
+            .shutdown_auto_topic_creation(auto_topic_creation::SHUTDOWN_WAIT)
+            .await;
         outcome
     }
 

@@ -35,6 +35,7 @@ use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
 };
+use crate::protocol::auto_topic_creation::{AutoTopicCreationConfig, AutoTopicCreator};
 use crate::protocol::bounds_guard::{
     validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
@@ -167,14 +168,6 @@ pub const ERROR_INVALID_REQUEST: i16 = 42;
 /// be stored. `DescribeConfigs` sends this when a requested key is unknown or a stored expiry
 /// cannot be shown as `retention.ms`.
 pub const ERROR_INVALID_CONFIG: i16 = 40;
-/// `ListOffsets`' code for a timestamp lookup the broker cannot perform.
-///
-/// Real brokers send this for an old-message-format log; this bridge sends it for any timestamp
-/// other than the two KIP-79 sentinels, since Iggy has no per-message timestamp index at all.
-/// Non-retriable, so a Java client resolves immediately instead of retrying
-/// [`ERROR_UNKNOWN_SERVER_ERROR`] until its own `default.api.timeout.ms`.
-pub const ERROR_UNSUPPORTED_FOR_MESSAGE_FORMAT: i16 =
-    ResponseError::UnsupportedForMessageFormat.code();
 /// `CreateTopics`, `DescribeConfigs`, and `AlterConfigs`: the request addressed more distinct
 /// topics than this bridge admits in one call.
 ///
@@ -341,8 +334,13 @@ pub struct GatewayState {
     /// Per Kafka topic and partition, how long probes read it as loading. Fetch and `ListOffsets`
     /// share it, since every consumer sees the same probe.
     pub(crate) loading: Mutex<fetch::Spells>,
+    /// Per Kafka topic and partition, how long `ListOffsets` lookups by time poll empty without
+    /// proof that no record matches. Only the first of a spell warns.
+    pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
+    pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -375,7 +373,40 @@ impl GatewayState {
             produce_large: Arc::new(Semaphore::new(PRODUCE_LARGE)),
             groups,
             loading: Mutex::default(),
+            unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            auto_topic_creation: None,
+        }
+    }
+
+    /// Turns on Kafka's `auto.create.topics.enable` behaviour for `Metadata` when `config` says
+    /// so.
+    ///
+    /// # Errors
+    ///
+    /// [`KafkaProtocolError::InvalidConfig`](crate::error::KafkaProtocolError::InvalidConfig)
+    /// when creation is on and `config.partitions` is 0 or over Iggy's per-topic cap.
+    pub fn with_auto_topic_creation(mut self, config: AutoTopicCreationConfig) -> Result<Self> {
+        self.auto_topic_creation = if config.enabled {
+            Some(AutoTopicCreator::new(config.partitions)?)
+        } else {
+            None
+        };
+        Ok(self)
+    }
+
+    /// Cancels the auto topic creations still running and waits up to `deadline` for them to
+    /// end. An embedder that builds its own `GatewayState` calls it before closing the bridge.
+    pub async fn shutdown_auto_topic_creation(&self, deadline: Duration) {
+        let Some(creator) = &self.auto_topic_creation else {
+            return;
+        };
+        if creator.shutdown(deadline).await
+            && let Some(bridge) = &self.bridge
+        {
+            // A cancelled create can keep its client busy, and the bridge's sign-out would queue
+            // behind it.
+            bridge.discard_auto_create_client();
         }
     }
 

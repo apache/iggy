@@ -18,7 +18,7 @@
 # Build context is the repository root (a Cargo workspace member cannot build standalone) -
 # `docker-compose.yml` in this directory sets `context: ../..` accordingly.
 
-ARG RUST_VERSION=1.99
+ARG RUST_VERSION=1.99.1
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
 WORKDIR /build

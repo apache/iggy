@@ -499,6 +499,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
+    use axum::Json;
     use axum::body::Body;
     use axum::extract::{FromRequestParts, Path, Query, State};
     use axum::http::{Request, StatusCode, header::AUTHORIZATION};
@@ -527,9 +528,11 @@ mod tests {
     use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
     use iggy_binary_protocol::{
-        Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier, WireName, WireOptions,
+        ConsumerSession, Operation, PrepareHeader, WireDecode, WireEncode, WireIdentifier,
+        WireName, WireOptions,
     };
-    use iggy_common::{IggyByteSize, IggyTimestamp, UserStatus};
+    use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+    use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, UserStatus};
     use message_bus::IggyMessageBus;
     use message_bus::installer::conn_info::ClientTransportKind;
     use message_bus::transports::tls::install_default_crypto_provider;
@@ -538,6 +541,7 @@ mod tests {
     use metadata::stm::StateHandler;
     use metadata::stm::authz::GatedApply;
     use metadata::stm::stream::StreamsInner;
+    use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use send_wrapper::SendWrapper;
     use server_common::sharding::{METADATA_GROUP, PartitionLocation, ShardId};
@@ -547,21 +551,25 @@ mod tests {
         PartitionRead, PartitionReadReply, ReplicaTopology, ShardFrame, ShardIdentity,
         TaggedSender, shard_channel,
     };
+    use tokio::sync::Mutex;
 
     use super::{
         BarrierWait, FrontierWait, ReadError, barrier_state, hold_for_frontier,
         read_needs_metadata_frontier,
     };
     use crate::cluster_meta::ClusterRoster;
+    use crate::consumer_group::lease::SessionActivity;
     use crate::dispatch::test_support::{
-        create_one_partition_in, create_reader_request, prepare_message,
+        create_one_partition_in, create_reader_request, prepare_message, register_reply,
     };
-    use crate::http::error::ConsistencyQuery;
-    use crate::http::extractor::Identity;
-    use crate::http::handlers::{get_client, get_clients, get_metrics, get_stats, get_user};
+    use crate::http::error::{ConsistencyQuery, WriteError};
+    use crate::http::extractor::{Authenticated, Identity};
+    use crate::http::handlers::{
+        create_pat, get_client, get_clients, get_metrics, get_stats, get_user,
+    };
     use crate::http::metrics::HttpMetrics;
     use crate::http::router;
-    use crate::http::session::RegistrationBarrier;
+    use crate::http::session::{FIRST_REQUEST_ID, HttpSession, RegistrationBarrier};
     use crate::http::state::{HttpInner, HttpState, MetadataWatermarks};
     use crate::http::wire::encode_send_messages;
     use crate::shell::{ServerMetadata, ServerMuxStateMachine, ServerShard};
@@ -1229,6 +1237,75 @@ mod tests {
         assert_eq!(barrier_state(5, 5, true), BarrierWait::Ready);
     }
 
+    /// The reply carries only the cap error code, so the HTTP create must
+    /// name the caller and the cap itself.
+    #[compio::test]
+    async fn given_user_at_token_cap_when_creating_over_http_should_name_the_user_and_the_cap() {
+        const OWNER: u32 = 7;
+        const CLIENT: u128 = 9;
+        const SESSION: u64 = 1;
+        const TOKEN_CAP: u32 = 1;
+        let state = read_state();
+        let metadata = state.shard.plane.metadata();
+        metadata.set_max_tokens_per_user(TOKEN_CAP);
+        let token = CreatePersonalAccessTokenRequest {
+            user_id: OWNER,
+            name: WireName::new("taken").unwrap(),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        };
+        commit_user_request(
+            &state,
+            1,
+            Operation::CreatePersonalAccessToken,
+            &token.to_bytes(),
+        );
+        let attachment = {
+            let mut client_table = metadata.client_table.borrow_mut();
+            client_table
+                .commit_register(CLIENT, OWNER, [0x5a; 32], register_reply(CLIENT, SESSION))
+                .unwrap();
+            client_table.attach_session(CLIENT, SESSION, OWNER).unwrap()
+        };
+        let session = HttpSession {
+            attachment: RefCell::new(attachment),
+            activity: Rc::new(SessionActivity::new(ConsumerSession {
+                client_id: CLIENT,
+                session: SESSION,
+            })),
+            key: String::new(),
+            client_id: CLIENT,
+            session: SESSION,
+            user_id: OWNER,
+            expiry: u64::MAX,
+            gate: Mutex::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
+            partition_gates: RefCell::default(),
+            registry_token: Cell::new(None),
+            in_flight_writes: Cell::new(0),
+        };
+
+        let result = create_pat(
+            State(state.clone()),
+            Authenticated {
+                session: SendWrapper::new(Rc::new(session)),
+            },
+            Json(CreatePersonalAccessToken {
+                name: "fresh".to_owned(),
+                ..CreatePersonalAccessToken::default()
+            }),
+        )
+        .await;
+
+        let Err(WriteError::Rejected(error)) = result else {
+            panic!("a create at the cap must be rejected");
+        };
+        assert_eq!(
+            error.to_string(),
+            IggyError::PersonalAccessTokensLimitReached(OWNER, TOKEN_CAP).to_string()
+        );
+    }
+
     fn read_state() -> HttpState {
         read_state_on(None)
     }
@@ -1292,7 +1369,6 @@ mod tests {
             registrations: RegistrationBarrier::default(),
             roster: Rc::new(ClusterRoster::disabled()),
             max_http_sessions: Default::default(),
-            max_tokens_per_user: Default::default(),
             in_flight_writes: Cell::default(),
             forward: prepared.forward,
             metrics: HttpMetrics::init(&[]),
