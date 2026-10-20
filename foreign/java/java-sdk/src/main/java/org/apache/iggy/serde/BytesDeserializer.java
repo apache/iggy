@@ -83,7 +83,7 @@ public final class BytesDeserializer {
 
     private static final int CONSUMER_GROUP_ASSIGNMENT_ENTRY_BYTES = Integer.BYTES;
     private static final int SEND_CONFIRMATION_BYTES = 3 * Integer.BYTES + Long.BYTES;
-    private static final int MIN_CLUSTER_NODE_BYTES = 18;
+    private static final int MIN_CLUSTER_NODE_BYTES = 19;
     // A one-character key (length byte plus a byte of name), a kind byte, and
     // empty length-prefixed default and description.
     private static final int MIN_OPTION_SPEC_BYTES = 2 + 1 + 4 + 4;
@@ -558,6 +558,7 @@ public final class BytesDeserializer {
     }
 
     public static ClusterNode readClusterNode(ByteBuf response) {
+        int replicaId = response.readUnsignedByte();
         var name = readU32PrefixedString(response, "cluster node name");
         var ip = readU32PrefixedString(response, "cluster node ip");
         var tcpPort = response.readUnsignedShortLE();
@@ -567,7 +568,7 @@ public final class BytesDeserializer {
         var role = ClusterNodeRole.fromCode(response.readUnsignedByte());
         var status = ClusterNodeStatus.fromCode(response.readUnsignedByte());
         return new ClusterNode(
-                name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
+                replicaId, name, ip, new TransportEndpoints(tcpPort, quicPort, httpPort, websocketPort), role, status);
     }
 
     public static UserInfoDetails readUserInfoDetails(ByteBuf response) {

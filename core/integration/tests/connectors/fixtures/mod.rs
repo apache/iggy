@@ -27,6 +27,7 @@ mod iceberg;
 mod influxdb;
 mod meilisearch;
 mod mongodb;
+mod mqtt;
 mod mysql;
 mod postgres;
 mod quickwit;
@@ -83,6 +84,11 @@ pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
+};
+pub use mqtt::{
+    Mqtt5InvalidCredentialsFixture, Mqtt5MetadataQos1Fixture, Mqtt5PendingBatchFixture,
+    Mqtt5Qos0Fixture, Mqtt5Qos1Fixture, Mqtt5Qos2Fixture, Mqtt311InvalidCredentialsFixture,
+    Mqtt311Qos0Fixture, Mqtt311Qos1Fixture, Mqtt311Qos2Fixture,
 };
 pub use mysql::{
     MySqlOps, MySqlSourceAliasedTextTrackingFixture, MySqlSourceAliasedTrackingFixture,

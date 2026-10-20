@@ -23,7 +23,6 @@ and connecting to Iggy servers in various configurations.
 """
 
 import asyncio
-import contextlib
 import os
 import secrets
 import string
@@ -32,9 +31,12 @@ from pathlib import Path
 
 import pytest
 
-from apache_iggy import IggyClient
+from apache_iggy import IggyClient, PendingOperationError
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
+
+# A request and its retained replay can each spend 30 seconds.
+STREAM_CLEANUP_TIMEOUT_SECONDS = 60
 
 
 @pytest.fixture(scope="session")
@@ -125,8 +127,33 @@ async def cleanup_streams(
 
     for stream in await client.get_streams():
         if (stream.id, stream.created_at) not in existing_streams:
-            with contextlib.suppress(RuntimeError):
-                await client.delete_stream(stream.id)
+            try:
+                async with asyncio.timeout(STREAM_CLEANUP_TIMEOUT_SECONDS):
+                    while True:
+                        try:
+                            await client.delete_stream(stream.id)
+                            break
+                        except PendingOperationError as error:
+                            if error.kind not in ("uncertain", "lane_blocked"):
+                                raise
+                            await client.resolve_operation(error.operation_id)
+                            if error.kind == "uncertain":
+                                break
+                            if await client.get_stream(stream.id) is None:
+                                break
+
+                    if await client.get_stream(stream.id) is not None:
+                        raise RuntimeError(
+                            f"Stream {stream.id} still exists after deletion"
+                        )
+            except (RuntimeError, TimeoutError) as error:
+                reason = (
+                    f"Cleanup failed for stream {stream.id} ({stream.name!r}): "
+                    f"{error!r}"
+                )
+                error.add_note(reason)
+                request.session.shouldstop = reason
+                raise
 
 
 @pytest.fixture(scope="session", autouse=True)

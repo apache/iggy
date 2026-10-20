@@ -31,6 +31,7 @@ use tracing::info;
 
 use super::{
     IggyBridge, KafkaTopicMetadata, LazyClient, SLOT_LIMIT, TopicTarget, in_slot, permit_by,
+    write_with_recovery,
 };
 use crate::bridge::error::BridgeError;
 
@@ -281,7 +282,7 @@ impl OffsetPool {
         }
     }
 
-    /// Shuts down each client that connected. See [`LazyClient::close_all`].
+    /// Closes each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         let clients = self
             .slots
@@ -345,11 +346,13 @@ async fn commit_on(
     partition: u32,
     offset: i64,
 ) -> Result<(), BridgeError> {
+    let deadline = (Instant::now() + SLOT_LIMIT).into_std();
     let consumer = &names.consumer;
     let Ok(offset) = u64::try_from(offset) else {
-        return match client
-            .delete_consumer_offset(consumer, stream_id, topic_id, Some(partition))
-            .await
+        return match write_with_recovery(client, deadline, || {
+            client.delete_consumer_offset(consumer, stream_id, topic_id, Some(partition))
+        })
+        .await
         {
             Err(
                 IggyError::ConsumerOffsetNotFound(_) | IggyError::ConsumerGroupNameNotFound(..),
@@ -357,8 +360,11 @@ async fn commit_on(
             deleted => landed(deleted),
         };
     };
-    let store =
-        || client.store_consumer_offset(consumer, stream_id, topic_id, Some(partition), offset);
+    let store = || {
+        write_with_recovery(client, deadline, || {
+            client.store_consumer_offset(consumer, stream_id, topic_id, Some(partition), offset)
+        })
+    };
     match store().await {
         Err(IggyError::ConsumerGroupNameNotFound(..)) => {
             create_offset_group(client, stream_id, topic_id, &names.group).await?;
@@ -384,9 +390,11 @@ async fn create_offset_group(
     topic_id: &Identifier,
     name: &str,
 ) -> Result<(), BridgeError> {
-    match client
-        .create_consumer_group(stream_id, topic_id, name)
-        .await
+    let deadline = (Instant::now() + SLOT_LIMIT).into_std();
+    match write_with_recovery(client, deadline, || {
+        client.create_consumer_group(stream_id, topic_id, name)
+    })
+    .await
     {
         Ok(_) => {
             // `{name:?}`: a client picks the group id, and a newline in it would forge a line.
@@ -402,18 +410,14 @@ async fn create_offset_group(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use iggy::prelude::{ConsumerKind, IggyClientBuilder};
-    use secrecy::SecretString;
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::bridge::iggy_bridge::FetchPool;
-    use crate::bridge::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, TopicMapping};
 
     fn target(topic: &str) -> TopicTarget {
         TopicTarget {
@@ -450,17 +454,6 @@ mod tests {
         read_clients: [Arc<IggyClient>; OFFSET_SLOTS],
     ) -> IggyBridge {
         IggyBridge {
-            client: offline_client(),
-            config: IggyBridgeConfig {
-                address: "127.0.0.1:1".to_string(),
-                username: "iggy".to_string(),
-                password: SecretString::from("iggy"),
-                topic_mapping: TopicMapping::new("kafka".to_string(), HashMap::new()).unwrap(),
-                max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            },
-            send_slot: Arc::new(Semaphore::new(1)),
-            fetch_pool: Arc::new(FetchPool::new()),
-            probe_client: LazyClient::default(),
             offset_pool: OffsetPool {
                 slots: commit_clients
                     .into_iter()
@@ -471,6 +464,7 @@ mod tests {
                     })
                     .collect(),
             },
+            ..IggyBridge::offline()
         }
     }
 

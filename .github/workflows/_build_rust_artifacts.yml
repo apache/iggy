@@ -102,8 +102,8 @@ jobs:
         if: matrix.libc == 'musl'
         run: ./scripts/ci/apt-install.sh musl-tools
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
@@ -112,6 +112,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "22"
+          package-manager-cache: false
 
       - name: Build Web UI static files
         run: npm --prefix web ci && npm --prefix web run build:static
@@ -213,8 +214,8 @@ jobs:
           /tmp/copy-latest-from-master.sh save .github scripts
           /tmp/copy-latest-from-master.sh apply
 
-      - name: Setup Rust with cache
-        uses: ./.github/actions/utils/setup-rust-with-cache
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}

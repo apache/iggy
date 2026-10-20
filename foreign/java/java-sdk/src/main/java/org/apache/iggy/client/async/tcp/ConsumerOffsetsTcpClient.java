@@ -46,10 +46,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     private static final byte ACK_QUORUM = 1;
     private static final int STORE = CommandCode.ConsumerOffset.STORE.getValue();
 
-    private final Supplier<AsyncTcpConnection> connectionSupplier;
-    private final PartitionContexts storeContexts;
     private final PollRouter pollRouter;
-    private final Supplier<CompletableFuture<Boolean>> clustered;
 
     /**
      * Creates a low-level client on the supplied connection without primary routing.
@@ -57,25 +54,11 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
      * partition primary while the coordinator retains group membership.
      */
     public ConsumerOffsetsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
-        this(connectionSupplier, null, () -> CompletableFuture.completedFuture(false));
+        this(connectionSupplier, null);
     }
 
-    ConsumerOffsetsTcpClient(
-            Supplier<AsyncTcpConnection> connectionSupplier,
-            PollRouter pollRouter,
-            Supplier<CompletableFuture<Boolean>> clustered) {
-        this.connectionSupplier = connectionSupplier;
-        this.storeContexts = new PartitionContexts(
-                connectionSupplier,
-                CommandCode.ConsumerOffset.GET_ROUTING.getValue(),
-                PollRouter.ATTACHMENT_BYTES,
-                false);
-        this.pollRouter = pollRouter;
-        this.clustered = clustered;
-    }
-
-    private AsyncTcpConnection connection() {
-        return connectionSupplier.get();
+    ConsumerOffsetsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier, PollRouter pollRouter) {
+        this.pollRouter = pollRouter == null ? new PollRouter(connectionSupplier, null) : pollRouter;
     }
 
     @Override
@@ -115,9 +98,9 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 partitionId,
                 consumer);
 
-        return connection()
-                .send(CommandCode.ConsumerOffset.GET.getValue(), payload)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                pollRouter.partitionRequest(CommandCode.ConsumerOffset.GET.getValue(), payload, Optional.empty()),
+                response -> {
                     try {
                         if (response.isReadable()) {
                             return Optional.of(BytesDeserializer.readConsumerOffsetInfo(response));
@@ -141,7 +124,10 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
         int targetLength = payload.readableBytes();
         payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
         payload.writeByte(ACK_QUORUM);
-        return write(STORE, payload, targetLength, context).thenAccept(ByteBuf::release);
+        return AsyncTcpConnection.mapResponse(write(STORE, payload, targetLength, context), response -> {
+            response.release();
+            return null;
+        });
     }
 
     /**
@@ -152,27 +138,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
      */
     CompletableFuture<ByteBuf> write(
             int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
-        if (pollRouter == null) {
-            return writeOnCoordinator(command, payload, targetLength, context);
-        }
-        return clustered
-                .get()
-                .handle((isClustered, error) -> {
-                    if (error != null) {
-                        payload.release();
-                        return CompletableFuture.<ByteBuf>failedFuture(error);
-                    }
-                    return isClustered
-                            ? pollRouter.writeOffset(command, payload, targetLength, context)
-                            : writeOnCoordinator(command, payload, targetLength, context);
-                })
-                .thenCompose(written -> written);
-    }
-
-    private CompletableFuture<ByteBuf> writeOnCoordinator(
-            int command, ByteBuf payload, int targetLength, Optional<PartitionContext> context) {
-        return storeContexts.send(
-                command, payload, payload.retainedSlice(payload.readerIndex(), targetLength), targetLength, context);
+        return pollRouter.partitionRequest(command, payload, context);
     }
 
     private static ByteBuf offsetTarget(

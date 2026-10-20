@@ -255,7 +255,6 @@ pub(in crate::boot) async fn build_shard_for_thread(
         &bus,
         &shard_handle,
         Arc::new(config.clone()),
-        config.personal_access_token.max_tokens_per_user,
     ));
     let sessions = Rc::clone(host.sessions());
     let consumer_group_liveness = Rc::clone(host.consumer_group_liveness());

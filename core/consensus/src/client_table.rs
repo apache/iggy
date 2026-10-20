@@ -210,9 +210,16 @@ struct ClientEntry {
 #[derive(Debug, Clone)]
 pub struct SessionAttachment {
     session: Weak<()>,
+    user_id: u32,
 }
 
 impl SessionAttachment {
+    /// Authenticated owner of this session, retained for permission rechecks.
+    #[must_use]
+    pub const fn user_id(&self) -> u32 {
+        self.user_id
+    }
+
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.session.strong_count() != 0
@@ -500,13 +507,14 @@ pub struct DedupWatermark {
 /// [`IggyError::RequestTooOld`] because its outcome is unknown.
 ///
 /// The width is in the CLIENT's request-id space, not in this group's writes:
-/// `ConsensusSession` mints from one counter across every partition, stream and
-/// metadata op, so a slice only ever sees the subset of those ids routed to it.
-/// Coverage in a client's own writes to one group is this width divided by the
-/// number of groups it interleaves, so 128 ids is around 16 writes per group
-/// across 8 partitions, and a replay held back longer than that can be refused
-/// with an unknown outcome. A wider bitmap divides by the same fanout: closing
-/// the gap needs per-group request numbering, which waits on the clients-table follow-up.
+/// `ConsensusSession` uses one counter for mutations, bound reads and pings
+/// across all groups. Reads bypass dedup and do not advance this watermark,
+/// but a later committed mutation brings their skipped ids into the window.
+/// Thus 128 ids is not a guarantee of retaining 128 writes: even 16 writes per
+/// group across 8 partitions assumes no intervening reads or metadata calls.
+/// A delayed replay below that window returns an unknown outcome. A wider
+/// bitmap retains the same limitation; different numbering needs a separate
+/// contract that preserves unique request ids for multiplexed replies.
 pub const COMMITTED_WINDOW_BITS: u64 = 128;
 
 /// VSR client table: per-session fence epoch + request-watermark dedup.
@@ -1469,6 +1477,7 @@ impl ClientTable {
         let attachment = entry.attachment.get_or_insert_with(|| Arc::new(()));
         Some(SessionAttachment {
             session: Arc::downgrade(attachment),
+            user_id,
         })
     }
 
@@ -1927,7 +1936,10 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command, Operation};
+    use iggy_binary_protocol::{
+        Command, Operation, PrepareHeader, REJECTION_SECTION_LEN, RoutedRequestHeader, result_code,
+        write_rejection_section,
+    };
 
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
@@ -2282,6 +2294,57 @@ mod tests {
             .unwrap();
         let epoch = table.get_epoch(1).expect("just registered");
         (table, epoch)
+    }
+
+    #[test]
+    fn given_committed_rejection_when_receipt_is_restored_should_preserve_final_result_proof() {
+        const CLIENT: u128 = 1;
+        const REQUEST: u64 = 1;
+        const COMMIT: u64 = 11;
+        let (mut table, epoch) = table_with_client();
+        let request = RoutedRequestHeader {
+            client: CLIENT,
+            session: epoch,
+            request: REQUEST,
+            operation: Operation::CreateUser,
+            ..Default::default()
+        };
+        let code = IggyError::UserAlreadyExists.as_code();
+        let uncommitted = crate::build_result_rejection_reply(&request, COMMIT, code);
+        assert!(!uncommitted.header().has_committed_result());
+        let prepare = PrepareHeader {
+            client: CLIENT,
+            request: REQUEST,
+            op: COMMIT,
+            operation: request.operation,
+            ..Default::default()
+        };
+        let committed = crate::build_reply_message_with(&prepare, REJECTION_SECTION_LEN, |body| {
+            write_rejection_section(body, code);
+        });
+        assert_eq!(uncommitted.header().op, committed.header().op);
+        assert_eq!(uncommitted.header().commit, committed.header().commit);
+        assert_eq!(uncommitted.body(), committed.body());
+        assert!(committed.header().has_committed_result());
+        assert_eq!(
+            table.commit_reply(CLIENT, TEST_USER_ID, committed.clone()),
+            CommitReply::Cached
+        );
+
+        for restored in [
+            ClientTable::from_snapshot(table.to_snapshot()).unwrap(),
+            ClientTable::decode(&table.encode()).unwrap(),
+        ] {
+            let RequestStatus::Duplicate(reply) =
+                restored.check_request(CLIENT, epoch, REQUEST, request.operation)
+            else {
+                panic!("restored committed rejection must remain available to a retry");
+            };
+            assert_eq!(reply.as_bytes(), committed.as_slice());
+            let reply = reply.into_message();
+            assert!(reply.header().has_committed_result());
+            assert_eq!(result_code(reply.body()), Some(code));
+        }
     }
 
     // Registration tests

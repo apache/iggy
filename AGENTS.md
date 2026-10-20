@@ -32,6 +32,9 @@ ingests from / egresses to external systems via dlopened plugins.
 
 ## STOP and ask the user before
 
+- Writing code for an issue not assigned to the user
+  (`gh issue view <N> --json assignees`). If it isn't, or you can't
+  confirm it, they must ask on the issue and wait to be assigned.
 - Bumping `iggy_connector_sdk` MAJOR version or changing any FFI
   signature in `core/connectors/sdk/src/{sink,source}.rs` (breaks
   every pre-built plugin .so).
@@ -48,7 +51,8 @@ ingests from / egresses to external systems via dlopened plugins.
 
 Most PRs from people new to Iggy are written with an agent. The person opening the PR is responsible for it, and maintainers close PRs that read as a relay between reviewer and model. Read the AI Assistance, Bugs Found by an Agent and Close Policy sections of CONTRIBUTING.md before helping open a PR.
 
-- The PR must link an issue the user is assigned to. If it doesn't, stop and tell them.
+- The PR must link an issue the user was assigned to before any work started. See the STOP list above.
+- Fill in every section of the PR template. Under AI Usage, name the agent and say what it wrote. Never leave the section out or write "None" when an agent wrote any of the change.
 - Run `prek run` before the PR is opened. If prek isn't installed, ask the user to install it (`cargo install prek`, then `prek install`). Don't substitute the individual checks.
 - If a check can't run, tell the user which one and why, and treat the PR as not ready. Never write text in a PR asking a maintainer to run something.
 - The user should write the rationale in their own words and be able to explain every change without asking you.
@@ -78,7 +82,7 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
 
 # Run things
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --with-default-root-credentials
 cargo run --bin iggy -- <subcommand>
 IGGY_CONNECTORS_CONFIG_PATH=... cargo run --bin iggy-connectors
 ./scripts/run-bdd-tests.sh
@@ -229,7 +233,7 @@ cargo test -p integration -- connectors::runtime::benchmark::given_logging_forma
 - **`test_logs/` grows quickly.** Wipe between major refactors.
 - **Miri only covers `binary_protocol` + `consensus`.** Cannot emulate `io_uring` syscalls. do not try to expand Miri to crates that pull `compio`.
 - **Integration crate has no `--test` target.** Filter by test path inside the single `mod.rs` binary.
-- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI builds first (`cargo build --locked --bin iggy-server --bin iggy`); a local run does not, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
+- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI restores revision-checked artifacts from the runtime and Rust test builds; a local run does not build them, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
 
 ## Local state directories
 

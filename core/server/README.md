@@ -7,8 +7,10 @@ Clients connect over TCP (custom binary protocol), QUIC, WebSocket, or the HTTP 
 ## Running
 
 ```sh
-cargo run --bin iggy-server --release
+IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=... cargo run --bin iggy-server --release
 ```
+
+The leader needs `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` to create root. For local development, `--with-default-root-credentials` sets both to `iggy`. The leader records root in the metadata journal and replicates the same username and password hash to followers. Restarts recover root without these inputs. The server never generates a root password or writes either credential value to its output or log files.
 
 Missing or empty storage is initialized automatically. Existing incompatible
 storage is refused without modification. `--fresh` deletes existing data in
@@ -26,7 +28,8 @@ The image binds every listener to `0.0.0.0` so the container is reachable from o
 
 ```sh
 docker run -p 3000:3000 -p 8090:8090 \
-  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=... apache/iggy:latest
 ```
 
 Use the hostname or load balancer address clients actually dial when they are not on the same host. The Helm chart derives it from the Service DNS name.
@@ -38,6 +41,46 @@ cargo run --bin iggy-server --release -- --replica-id 0
 ```
 
 Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
+
+## Upgrading
+
+Deploy matching server and SDK releases together. Rolling upgrades and mixed
+server versions are unsupported. Partition control frames from older servers
+carry incarnation zero and are rejected, so a mixed-version cluster cannot
+complete partition view changes. The `IGGY-BOUND-GRANTS-4` storage gate
+requires fresh storage and rejects older data directories without modifying them.
+Cached replies now preserve a committed-result marker, which older receipts lack.
+No in-place upgrade or implicit migration is supported. A separately validated
+offline migration or restore procedure would be required to reuse existing data.
+
+The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` are unset. Supply both variables on every replica before the first cluster start so any promoted node can initialize root. Use `--with-default-root-credentials` only in development. A cluster node without credentials waits for root to be replicated. Once root is persisted, restarts need neither.
+
+Releases up to 0.9 printed a generated password to stdout, and 0.9 also wrote it to the log file. Change any root password that was generated, and delete log files and container logs that still hold it. Snapshots redact that legacy log line.
+
+All data directories from earlier storage formats must be wiped before upgrading. The storage-format check rejects them before metadata replay. There is no in-place upgrade or automatic migration.
+
+After storage-format admission, a checkpoint above op 0 preserves initialized metadata. An empty checkpoint at op 0 does not prove that root exists. Without an initialized checkpoint, startup searches the current-format journal for root creation at op 1 because repair can write operations out of order. A journal with complete entries but no validated root creation is rejected before replay.
+
+The error identifies the journal path and any unexpected op 1 fields. Restore a compatible data directory from this storage format, or use `--fresh` to delete local data. In multi-node clusters, use `--fresh` on at most one replica at a time while the others hold quorum.
+
+The diagnostic snapshot (`POST /snapshot`, the binary `GET_SNAPSHOT_FILE` command, `iggy snapshot`) now requires the `manage_servers` permission. `read_servers` alone is rejected, because the archive carries raw server logs and host diagnostics.
+
+All existing self-issued JWT access and refresh tokens are rejected after this
+upgrade. HTTP clients and the web UI must log in again. In
+`[[http.jwt.trusted_issuers]]`, replace `user_id` with `username`, naming the
+account the issuer may act as. The corresponding environment variable changes
+from `IGGY_HTTP_JWT_TRUSTED_ISSUERS_<n>_USER_ID` to
+`IGGY_HTTP_JWT_TRUSTED_ISSUERS_<n>_USERNAME`.
+
+Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
+`replicaId` component, changing constructor calls and record patterns. C# callers
+must initialize the required `ReplicaId` property. The CLI's cluster metadata list
+appends a replica ID column. Swift's `ClusterNode` initializer now requires
+`replicaID`. C++'s FFI `ClusterNode`, Rust's `iggy_common::ClusterNode` and
+`iggy_binary_protocol::responses::system::ClusterNodeResponse` add the public
+`replica_id` field; update aggregate and struct initializers.
+Go, Java, Node.js and C# clients use command 105's new
+partition routes and refresh on `NotPrimary` (89); use their matching releases.
 
 ## Configuration
 
@@ -52,8 +95,8 @@ IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-ser
 Cluster membership, quorum and replica addressing live under `[cluster]`.
 
 Protocol 0.11.1 uses client-owned registration proofs and `BindSession` (15) to
-share a logical session across connections. Command 14 is retired. Primary
-polling uses commands 103 and 104; offset routing uses 123. Disconnecting a
+share a logical session across connections. Commands 14, 103, 104 and 123 are
+retired. Partition routing uses 105, polling uses 100 and offset reads use 120. Disconnecting a
 connection does not log out its logical session. Server-observed activity renews
 the session lease, and expiry or explicit logout retires it before capacity is
 reused.
@@ -87,6 +130,10 @@ offset writes support the configured policy. Crash-safe send retries require
 receipt still replays its original result, but a lost receipt cannot prevent
 another execution. NoAck and internal auto-commit polls retain their weaker
 completion contracts.
+
+Auto-commit polls are at-most-once: the owner can advance an offset before the
+gateway's final authorization check. If the session ends or permissions are
+revoked during that return hop, the response is denied and the batch can be lost.
 
 Topics have an immutable `partition_resize_policy` creation option. The default,
 `mutable`, permits partition addition and deletion without a bounded cutover or
@@ -179,7 +226,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-OWNERSHIP-HISTORY-4` requires this initialization contract;
+Storage format `IGGY-BOUND-GRANTS-4` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

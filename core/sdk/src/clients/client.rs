@@ -40,7 +40,8 @@ use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{BinaryTransport, Client, HttpMethod, SystemClient};
 use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use tokio::spawn;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -129,6 +130,9 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///    on the next connection; otherwise call [`connect()`] and [`login_user()`] again before
 ///    issuing requests.
 ///
+/// A [`connect()`] and a [`disconnect()`] that race on different tasks end in no defined
+/// order. A caller that needs a defined end state makes both calls from one task.
+///
 /// # Examples
 ///
 /// Build a client from a connection string, connect, publish through a
@@ -148,8 +152,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// .build()?;
 /// client.connect().await?;
 ///
-/// // A background producer batches in the background, retries failed sends,
-/// // and creates a topic.
+/// // A background producer batches messages and creates a topic.
 /// let producer = client
 ///     .producer("stream_name", "topic_name")?
 ///     .topic_durability(iggy::prelude::Durability::Persisted)
@@ -160,7 +163,6 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///             .build(),
 ///     )
 ///     .partitioning(Partitioning::balanced())
-///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
 ///     .create_topic_if_not_exists(
 ///         3,
 ///         IggyExpiry::ServerDefault,
@@ -234,7 +236,16 @@ pub struct IggyClient {
     pub(crate) client: IggyRwLock<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
-    heartbeat_handle: Mutex<Option<JoinHandle<()>>>,
+    heartbeat: Mutex<Heartbeat>,
+}
+
+/// The heartbeat task, and whether an explicit `disconnect()` stopped it.
+/// Only `connect()` clears the stop. A racing `disconnect()` prevents the
+/// completed connection attempt from starting another heartbeat.
+#[derive(Debug, Default)]
+struct Heartbeat {
+    handle: Option<JoinHandle<()>>,
+    stopped: bool,
 }
 
 impl Default for IggyClient {
@@ -294,8 +305,10 @@ impl IggyClient {
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. PEM roots replacing the built-in roots. Default: unset.
     /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
-    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between retry passes. Default: `1s`.
-    /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
+    /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `nodelay`: `bool`. Disable Nagle's algorithm (`TCP_NODELAY`). Default: `false`.
     ///
@@ -318,9 +331,11 @@ impl IggyClient {
     ///
     /// - `validate_certificate`: bool. Verify the server certificate. Default: `false`.
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
-    /// - `reconnection_max_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
-    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
-    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
+    /// - `reconnection_max_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
+    /// - `reconnection_reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
+    /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
     /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer. Default: `10000000`.
     /// - `max_concurrent_bidi_streams`: u64. Number of concurrent bidirectional streams. Default: `10000`.
     /// - `datagram_send_buffer_size`: u64. Number of bytes in the datagram send buffer. Default: `100000`.
@@ -373,9 +388,11 @@ impl IggyClient {
     /// ## WebSocket
     ///
     /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
-    /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
-    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
-    /// - `reestablish_after`: [`IggyDuration`]. Cooldown measured from the last connection establishment. Default: `5s`.
+    /// - `reconnection_retries`: "unlimited" or u32. Retry passes after the initial endpoint pass. Default: `unlimited`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Full-jitter exponential backoff base, capped at 10 seconds. Default: `1s`.
+    /// - `reestablish_after`: [`IggyDuration`]. Stable connection duration that resets the retry count and backoff. Default: `5s`.
+    /// - `max_pending_operations`: positive usize. Active and retained mutations per session. Default: `256`.
+    /// - `max_pending_operation_bytes`: positive usize. Frozen mutation headers and bodies. Default: `67108864` (64 MiB).
     /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: `131072`.
     /// - `write_buffer_size`: usize. Size of the write buffer in bytes. Default: `131072`.
     /// - `max_write_buffer_size`: usize. Must exceed `write_buffer_size`. Default: `usize::MAX`.
@@ -457,7 +474,7 @@ impl IggyClient {
             client,
             partitioner: None,
             encryptor: None,
-            heartbeat_handle: Mutex::new(None),
+            heartbeat: Mutex::default(),
         }
     }
 
@@ -569,7 +586,7 @@ impl IggyClient {
             client,
             partitioner,
             encryptor,
-            heartbeat_handle: Mutex::new(None),
+            heartbeat: Mutex::default(),
         }
     }
 
@@ -747,7 +764,7 @@ impl IggyClient {
     /// # Examples
     ///
     /// Connect a client, build a producer that creates the topic if it is
-    /// missing and retries failed sends, then publish a message.
+    /// missing, then publish a message.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -763,7 +780,6 @@ impl IggyClient {
     ///     .producer("stream_name", "topic_name")?
     ///     .topic_durability(iggy::prelude::Durability::Persisted)
     ///     .partitioning(Partitioning::balanced())
-    ///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
     ///     .create_topic_if_not_exists(
     ///         3,
     ///         IggyExpiry::ServerDefault,
@@ -843,8 +859,8 @@ impl IggyClient {
     /// [`send_http_request`](IggyClient::send_http_request).
     ///
     /// Partition commands carry the partition context the typed API would send.
-    /// `SendMessages` with an explicit partition id captures one with
-    /// `GetSendContext` and caches it. `PollMessages`, `StoreConsumerOffset` and
+    /// `SendMessages` with an explicit partition id captures one from
+    /// `GetPartitionRoute` and caches it. `PollMessages`, `StoreConsumerOffset` and
     /// `DeleteConsumerOffset` are routed like their typed calls and take the
     /// context their route reports, so after another client deleted and
     /// recreated the partition, one call can fail with
@@ -893,12 +909,12 @@ impl IggyClient {
         if SESSION_CONTROL_CODES.contains(&code) {
             return Err(IggyError::InvalidCommand);
         }
-        match &*self.client.read().await {
+        super::with_client!(self, client => match &*client {
             ClientWrapper::Tcp(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Quic(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::WebSocket(client) => client.send_raw_with_response(code, payload).await,
             ClientWrapper::Http(_) | ClientWrapper::Iggy(_) => Err(IggyError::FeatureUnavailable),
-        }
+        })
     }
 
     /// Invokes a HTTP endpoint and returns the raw response body.
@@ -956,77 +972,81 @@ impl IggyClient {
 
 impl Drop for IggyClient {
     fn drop(&mut self) {
-        if let Some(handle) = self.take_heartbeat() {
+        if let Some(handle) = self.stop_heartbeat() {
             handle.abort();
         }
     }
 }
 
 impl IggyClient {
-    /// Connects again after a leader redirect without clearing the caller's
-    /// `disconnect()`: one that lands during the redirect holds, and the
-    /// transport refuses the reconnect.
-    pub(crate) async fn reconnect_after_redirect(&self) -> Result<(), IggyError> {
-        self.client.read().await.reconnect_keeping_intent().await?;
-        self.start_heartbeat().await;
-        Ok(())
-    }
-
     async fn start_heartbeat(&self) {
         let heartbeat_interval = self.client.read().await.heartbeat_interval().await;
-        let mut heartbeat_handle = self
-            .heartbeat_handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if heartbeat_handle
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
+        let mut heartbeat = self.heartbeat();
+        if heartbeat.stopped
+            || heartbeat
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
         {
             return;
         }
 
-        drop(heartbeat_handle.take());
+        drop(heartbeat.handle.take());
         let client = self.client.clone();
-        *heartbeat_handle = Some(spawn(async move {
+        heartbeat.handle = Some(spawn(async move {
             loop {
                 debug!("Sending the heartbeat...");
-                if let Err(error) = client.read().await.ping().await {
-                    error!("There was an error when sending a heartbeat. {error}");
-                    if error == IggyError::ClientShutdown {
-                        warn!("The client has been shut down - stopping the heartbeat.");
-                        return;
+                let keepalive = client.read().await.keepalive().await;
+                match keepalive {
+                    Err(error) => {
+                        error!("There was an error when sending a heartbeat. {error}");
+                        if error == IggyError::ClientShutdown {
+                            warn!("The client has been shut down - stopping the heartbeat.");
+                            return;
+                        }
                     }
-                } else {
-                    debug!("Heartbeat was sent successfully.");
-                    // Picks up a widened assignment (e.g. partition-count
-                    // change) without waiting for an ownership-fence rejection.
-                    client
-                        .read()
-                        .await
-                        .refresh_consumer_group_assignments()
-                        .await;
+                    Ok(true) => {
+                        debug!("Heartbeat was sent successfully.");
+                        // Picks up a widened assignment without waiting for an ownership-fence rejection.
+                        client
+                            .read()
+                            .await
+                            .refresh_consumer_group_assignments()
+                            .await;
+                    }
+                    Ok(false) => {}
                 }
                 sleep(heartbeat_interval.get_duration()).await
             }
         }));
     }
 
-    fn take_heartbeat(&self) -> Option<JoinHandle<()>> {
-        self.heartbeat_handle
+    /// Marks the heartbeat stopped and takes its task, under one lock, so a
+    /// `start_heartbeat` that runs later finds the mark.
+    fn stop_heartbeat(&self) -> Option<JoinHandle<()>> {
+        let mut heartbeat = self.heartbeat();
+        heartbeat.stopped = true;
+        heartbeat.handle.take()
+    }
+
+    fn heartbeat(&self) -> MutexGuard<'_, Heartbeat> {
+        self.heartbeat
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .take()
     }
 }
 
 #[async_trait]
 impl Client for IggyClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.heartbeat().stopped = false;
         self.client.read().await.connect().await?;
         self.start_heartbeat().await;
         Ok(())
     }
 
+    /// Stops the binary client's heartbeat. An explicit login can reconnect,
+    /// but only [`connect`](Client::connect) restarts the heartbeat.
     async fn disconnect(&self) -> Result<(), IggyError> {
         // HTTP keeps no connection, so its disconnect changes nothing and the
         // heartbeat keeps running.
@@ -1034,8 +1054,8 @@ impl Client for IggyClient {
         // A heartbeat ping on a disconnected client only logs errors, and on
         // QUIC a redial it starts during the disconnect blocks the call. The
         // aborted task is awaited, so a reconnect it owned is over before the
-        // transport tears down. `connect` starts the heartbeat again.
-        if !is_http && let Some(handle) = self.take_heartbeat() {
+        // transport tears down. Only `connect` starts the heartbeat again.
+        if !is_http && let Some(handle) = self.stop_heartbeat() {
             handle.abort();
             let _ = handle.await;
         }
@@ -1049,11 +1069,100 @@ impl Client for IggyClient {
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
         self.client.read().await.subscribe_events().await
     }
+
+    async fn resolve_operation(&self, op: u64, deadline: Instant) -> Result<(), IggyError> {
+        iggy_common::with_binary_deadline(deadline.into(), async {
+            let client = tokio::time::timeout_at(
+                iggy_common::binary_operation_deadline(),
+                self.client.read(),
+            )
+            .await
+            .map_err(|_| IggyError::OperationUncertain(op))?;
+            client.resolve_operation(op, deadline).await
+        })
+        .await
+    }
+
+    async fn abandon_operation(&self, op: u64) -> Result<(), IggyError> {
+        super::with_client!(self, client => client.abandon_operation(op).await)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::links::OPERATION_TIMEOUT;
+    use crate::links::fake_cluster::{Answer, FakeCluster, connected, endpoint};
+    use crate::links::test_support::LOCALHOST;
+    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STATS_CODE};
+    use iggy_common::{StreamClient, TcpClientConfig};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn given_nested_client_locks_when_reading_should_share_one_deadline() {
+        let cluster = FakeCluster::new(1);
+        let inner = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        let inner_lock = inner.client.clone();
+        let outer = IggyClient::new(ClientWrapper::Iggy(inner));
+        let outer_lock = outer.client.clone();
+        let inner_guard = inner_lock.write().await;
+        let outer_guard = outer_lock.write().await;
+        let lock_wait = Duration::from_secs(20);
+        let start = tokio::time::Instant::now();
+
+        let ((result, finished), ()) = tokio::join!(
+            async { (outer.get_stats().await, tokio::time::Instant::now()) },
+            async {
+                sleep(lock_wait).await;
+                drop(outer_guard);
+                sleep(lock_wait).await;
+                drop(inner_guard);
+            }
+        );
+
+        assert!(matches!(result, Err(IggyError::TransientNotAccepted)));
+        assert_eq!(finished - start, OPERATION_TIMEOUT);
+        assert_eq!(cluster.count(GET_STATS_CODE), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_wrapper_lock_wait_when_a_mutation_times_out_should_preserve_its_operation() {
+        let cluster = FakeCluster::new(1);
+        let client = IggyClient::new(ClientWrapper::Tcp(TcpClient::from_links(
+            connected(&cluster, 1).await,
+        )));
+        cluster.script(&endpoint(0), CREATE_STREAM_CODE, [Answer::Silence]);
+        let client_lock = client.client.clone();
+        let guard = client_lock.write().await;
+        let start = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(client.create_stream("stream"), async {
+            sleep(Duration::from_secs(20)).await;
+            drop(guard);
+        });
+
+        let Err(IggyError::OperationUncertain(op)) = result else {
+            panic!("a sent mutation must return its retained operation identity");
+        };
+        assert_eq!(tokio::time::Instant::now() - start, OPERATION_TIMEOUT);
+        assert_eq!(cluster.count(CREATE_STREAM_CODE), 1);
+        assert!(client_lock.read().await.retains_operation(op).await);
+
+        let guard = client_lock.write().await;
+        let resolve_budget = Duration::from_secs(5);
+        let result = client
+            .resolve_operation(
+                op,
+                (tokio::time::Instant::now() + resolve_budget).into_std(),
+            )
+            .await;
+        assert_eq!(result, Err(IggyError::OperationUncertain(op)));
+        drop(guard);
+        assert!(client_lock.read().await.retains_operation(op).await);
+        client.abandon_operation(op).await.unwrap();
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -1259,5 +1368,38 @@ mod tests {
                 "code {code} must be rejected before reaching the transport"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn should_start_no_heartbeat_after_disconnect_until_connect() {
+        let listener = TcpListener::bind(LOCALHOST).await.unwrap();
+        let tcp = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: listener.local_addr().unwrap().to_string(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let client = IggyClient::new(ClientWrapper::Tcp(tcp));
+        client.disconnect().await.unwrap();
+
+        // A redirect reconnect that finished just before the disconnect starts
+        // the heartbeat after it.
+        client.start_heartbeat().await;
+        let runs_after_disconnect = heartbeat_runs(&client);
+        client.connect().await.unwrap();
+        let runs_after_connect = heartbeat_runs(&client);
+
+        assert!(
+            !runs_after_disconnect && runs_after_connect,
+            "heartbeat after disconnect() {runs_after_disconnect}, \
+             after connect() {runs_after_connect}"
+        );
+    }
+
+    fn heartbeat_runs(client: &IggyClient) -> bool {
+        client
+            .heartbeat()
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
     }
 }

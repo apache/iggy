@@ -32,8 +32,10 @@ impl Permissioner {
         self.get_server_info(user_id)
     }
 
+    /// The archive carries raw server logs and host diagnostics, so read-only
+    /// server access is not enough.
     pub fn get_snapshot(&self, user_id: u32) -> Result<(), IggyError> {
-        self.get_server_info(user_id)
+        self.manage_servers(user_id)
     }
 
     fn get_server_info(&self, user_id: u32) -> Result<(), IggyError> {
@@ -44,5 +46,76 @@ impl Permissioner {
         }
 
         Err(IggyError::Unauthorized)
+    }
+
+    fn manage_servers(&self, user_id: u32) -> Result<(), IggyError> {
+        if let Some(global_permissions) = self.users_permissions.get(&user_id)
+            && global_permissions.manage_servers
+        {
+            return Ok(());
+        }
+
+        Err(IggyError::Unauthorized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::{GlobalPermissions, Permissions};
+
+    const USER_ID: u32 = 7;
+
+    #[test]
+    fn given_read_servers_only_when_requesting_a_snapshot_should_be_unauthorized() {
+        let permissioner = permissioner_with(GlobalPermissions {
+            read_servers: true,
+            ..GlobalPermissions::default()
+        });
+
+        assert!(matches!(
+            permissioner.get_snapshot(USER_ID),
+            Err(IggyError::Unauthorized)
+        ));
+        permissioner
+            .get_stats(USER_ID)
+            .expect("read_servers still reads stats");
+        permissioner
+            .get_clients(USER_ID)
+            .expect("read_servers still lists clients");
+    }
+
+    #[test]
+    fn given_manage_servers_when_requesting_a_snapshot_should_be_allowed() {
+        let permissioner = permissioner_with(GlobalPermissions {
+            manage_servers: true,
+            ..GlobalPermissions::default()
+        });
+
+        permissioner
+            .get_snapshot(USER_ID)
+            .expect("manage_servers grants the snapshot");
+    }
+
+    #[test]
+    fn given_no_server_permission_when_requesting_a_snapshot_should_be_unauthorized() {
+        let permissioner = permissioner_with(GlobalPermissions::default());
+
+        assert!(matches!(
+            permissioner.get_snapshot(USER_ID),
+            Err(IggyError::Unauthorized)
+        ));
+    }
+
+    fn permissioner_with(global: GlobalPermissions) -> Permissioner {
+        let mut permissioner = Permissioner::new();
+        permissioner.init_permissions_for_user(
+            USER_ID,
+            Some(Permissions {
+                global,
+                streams: None,
+            }),
+        );
+        permissioner
     }
 }

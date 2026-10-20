@@ -18,8 +18,11 @@
 import { MAX_U32 } from '../constant.js';
 import type { ClientConfig, ClientConfigOrString } from './client.type.js';
 import { parseConnectionString } from './client.connection-string.js';
+import { HEADER_SIZE } from '../wire/vsr/header.js';
 
 export const DEFAULT_MAX_RESPONSE_FRAME_SIZE = 64 * 1024 * 1024;
+export const DEFAULT_MAX_PENDING_OPERATIONS = 256;
+export const DEFAULT_MAX_PENDING_OPERATION_BYTES = 64 * 1024 * 1024;
 
 /**
  * The server evicts a connection silent for 36 s (1.2 x its 30 s heartbeat
@@ -39,14 +42,21 @@ export const normalizeClientConfig = (
   const maxResponseFrameSize =
     config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE;
   if (!Number.isSafeInteger(maxResponseFrameSize) ||
-      maxResponseFrameSize < 256)
+      maxResponseFrameSize < HEADER_SIZE)
     throw new TypeError(
       'maxResponseFrameSize must be a safe integer of at least 256 bytes'
     );
 
+  const maxPendingOperations = config.maxPendingOperations ?? DEFAULT_MAX_PENDING_OPERATIONS;
+  const maxPendingOperationBytes = config.maxPendingOperationBytes ?? DEFAULT_MAX_PENDING_OPERATION_BYTES;
+  if (!Number.isSafeInteger(maxPendingOperations) || maxPendingOperations <= 0)
+    throw new TypeError('maxPendingOperations must be a positive safe integer');
+  if (!Number.isSafeInteger(maxPendingOperationBytes) || maxPendingOperationBytes <= 0)
+    throw new TypeError('maxPendingOperationBytes must be a positive safe integer');
+
   if ((config.poolSize?.min ?? 1) > 1 || (config.poolSize?.max ?? 1) > 1)
     throw new TypeError(
-      'VSR clients currently support exactly one pooled connection'
+      'poolSize supports exactly one logical client; replica links are managed independently'
     );
 
   // Only 0 disables the heartbeat. Anything else unusable has to throw here:
@@ -90,6 +100,8 @@ export const normalizeClientConfig = (
     ...config,
     options: { ...config.options },
     maxResponseFrameSize,
+    maxPendingOperations,
+    maxPendingOperationBytes,
     heartbeatInterval,
     poolSize: { min: 1, max: 1 }
   };

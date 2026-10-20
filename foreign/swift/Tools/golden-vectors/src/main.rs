@@ -44,7 +44,7 @@ use iggy_binary_protocol::primitives::user_headers::encode_user_headers;
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::{
-    PollMessagesRequest, RawMessage, SendMessagesEncoder,
+    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
@@ -67,7 +67,8 @@ use iggy_binary_protocol::responses::consumer_groups::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
-    PollMessagesResponseHeader, SendMessagesConfirmationResponse, SendMessagesResponse,
+    PartitionRouteResponse, PollMessagesResponseHeader, SendMessagesConfirmationResponse,
+    SendMessagesResponse,
 };
 use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
@@ -627,6 +628,15 @@ fn main() {
     );
     add(
         &mut vectors,
+        "request.get_partition_route",
+        &GetPartitionRouteRequest {
+            stream_id: numeric(10),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partition_id: 5,
+        },
+    );
+    add(
+        &mut vectors,
         "request.create_user",
         &CreateUserRequest {
             username: name("admin"),
@@ -931,11 +941,18 @@ fn main() {
         operation: Operation::CreateStream,
         size: (HEADER_SIZE + 12) as u32,
         request: 7,
+        commit: 12,
         status: 0,
         client: client_id,
         ..Default::default()
     };
     vectors.insert("vsr.reply.ok".to_owned(), hex(bytemuck::bytes_of(&reply)));
+    let mut committed = reply;
+    committed.reserved[0] = ReplyHeader::COMMITTED_RESULT;
+    vectors.insert(
+        "vsr.reply.committed".to_owned(),
+        hex(bytemuck::bytes_of(&committed)),
+    );
     let denied = ReplyHeader {
         command: Command::Reply,
         operation: Operation::NonReplicated,
@@ -1293,6 +1310,7 @@ fn main() {
             name: "prod-cluster".to_owned(),
             nodes: vec![
                 ClusterNodeResponse {
+                    replica_id: 0,
                     name: "node-1".to_owned(),
                     ip: "10.0.0.1".to_owned(),
                     tcp_port: 8090,
@@ -1303,6 +1321,7 @@ fn main() {
                     status: 0,
                 },
                 ClusterNodeResponse {
+                    replica_id: 1,
                     name: "node-2".to_owned(),
                     ip: "fd00::2".to_owned(),
                     tcp_port: 8091,
@@ -1397,6 +1416,17 @@ fn main() {
         .encode(&mut empty);
         vectors.insert("response.poll_messages.empty".to_owned(), hex(&empty));
     }
+    add(
+        &mut vectors,
+        "response.partition_route",
+        &PartitionRouteResponse {
+            incarnation: 7,
+            metadata_op: 10,
+            view: 3,
+            partitions_count: 4,
+            primary_replica: 2,
+        },
+    );
 
     // Domain option blocks.
     let create_options = TopicCreateOptions {

@@ -755,6 +755,15 @@ func (e LifecycleBusy) Is(target error) bool {
 	return ok
 }
 
+type NotPrimary struct{}
+
+func (e NotPrimary) Error() string { return "the replica is not the primary of the target group" }
+func (e NotPrimary) Code() Code    { return 89 }
+func (e NotPrimary) Is(target error) bool {
+	_, ok := target.(NotPrimary)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -2752,6 +2761,45 @@ func (e RequestIdExhausted) Is(target error) bool {
 	return ok
 }
 
+type UncertainOutcome struct {
+	OperationID uint64
+}
+
+func (e UncertainOutcome) Error() string {
+	return fmt.Sprintf("operation %d has an uncertain outcome", e.OperationID)
+}
+func (e UncertainOutcome) Code() Code { return 14006 }
+func (e UncertainOutcome) Is(target error) bool {
+	_, ok := target.(UncertainOutcome)
+	return ok
+}
+
+type LaneBlocked struct {
+	OperationID uint64
+}
+
+func (e LaneBlocked) Error() string {
+	return fmt.Sprintf("lane blocked by operation %d", e.OperationID)
+}
+func (e LaneBlocked) Code() Code { return 14007 }
+func (e LaneBlocked) Is(target error) bool {
+	_, ok := target.(LaneBlocked)
+	return ok
+}
+
+type OperationNotRetained struct {
+	OperationID uint64
+}
+
+func (e OperationNotRetained) Error() string {
+	return fmt.Sprintf("operation %d is not retained", e.OperationID)
+}
+func (e OperationNotRetained) Code() Code { return 14008 }
+func (e OperationNotRetained) Is(target error) bool {
+	_, ok := target.(OperationNotRetained)
+	return ok
+}
+
 var (
 	ErrError                                      = Error{}
 	ErrInvalidConfiguration                       = InvalidConfiguration{}
@@ -2824,6 +2872,7 @@ var (
 	ErrRequestTooOld                              = RequestTooOld{}
 	ErrHistoryUnavailable                         = HistoryUnavailable{}
 	ErrLifecycleBusy                              = LifecycleBusy{}
+	ErrNotPrimary                                 = NotPrimary{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -3001,6 +3050,9 @@ var (
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 	ErrSessionMismatch                            = SessionMismatch{}
 	ErrRequestIdExhausted                         = RequestIdExhausted{}
+	ErrUncertainOutcome                           = UncertainOutcome{}
+	ErrLaneBlocked                                = LaneBlocked{}
+	ErrOperationNotRetained                       = OperationNotRetained{}
 )
 
 type Code uint32
@@ -3077,6 +3129,7 @@ const (
 	RequestTooOldCode                              Code = 85
 	HistoryUnavailableCode                         Code = 87
 	LifecycleBusyCode                              Code = 88
+	NotPrimaryCode                                 Code = 89
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3254,6 +3307,9 @@ const (
 	IncompatibleProtocolVersionCode                Code = 14003
 	SessionMismatchCode                            Code = 14004
 	RequestIdExhaustedCode                         Code = 14005
+	UncertainOutcomeCode                           Code = 14006
+	LaneBlockedCode                                Code = 14007
+	OperationNotRetainedCode                       Code = 14008
 )
 
 func (c Code) String() string {
@@ -3400,6 +3456,8 @@ func (c Code) String() string {
 		return "HistoryUnavailable"
 	case LifecycleBusyCode:
 		return "LifecycleBusy"
+	case NotPrimaryCode:
+		return "NotPrimary"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3754,6 +3812,12 @@ func (c Code) String() string {
 		return "SessionMismatch"
 	case RequestIdExhaustedCode:
 		return "RequestIdExhausted"
+	case UncertainOutcomeCode:
+		return "UncertainOutcome"
+	case LaneBlockedCode:
+		return "LaneBlocked"
+	case OperationNotRetainedCode:
+		return "OperationNotRetained"
 	default:
 		return "Unknown error code"
 	}
@@ -3903,6 +3967,8 @@ func FromCode(code Code) IggyError {
 		return ErrHistoryUnavailable
 	case LifecycleBusyCode:
 		return ErrLifecycleBusy
+	case NotPrimaryCode:
+		return ErrNotPrimary
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -4257,6 +4323,12 @@ func FromCode(code Code) IggyError {
 		return ErrSessionMismatch
 	case RequestIdExhaustedCode:
 		return ErrRequestIdExhausted
+	case UncertainOutcomeCode:
+		return ErrUncertainOutcome
+	case LaneBlockedCode:
+		return ErrLaneBlocked
+	case OperationNotRetainedCode:
+		return ErrOperationNotRetained
 	default:
 		return ErrError
 	}

@@ -31,7 +31,8 @@ use tokio::time::{Instant, timeout_at};
 
 use super::offsets::high_watermark;
 use super::{
-    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, with_request_timeout,
+    IggyBridge, REQUEST_TIMEOUT, TopicTarget, connect_client, in_slot, permit_by,
+    sign_out_and_shut_down,
 };
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
@@ -59,12 +60,10 @@ impl FetchPool {
         }
     }
 
-    /// A free slot. `None` if none frees by `deadline`.
+    /// A free slot. `None` if none frees before `deadline`: a poll started then would time out at
+    /// once and drop the slot's client.
     async fn take(self: &Arc<Self>, deadline: Instant) -> Option<FetchSlot> {
-        let permit = timeout_at(deadline, Arc::clone(&self.permits).acquire_owned())
-            .await
-            .ok()?
-            .ok()?;
+        let permit = permit_by(&self.permits, deadline).await?;
         let client = self
             .idle
             .lock()
@@ -77,7 +76,7 @@ impl FetchPool {
         })
     }
 
-    /// Shuts down each client that connected. See [`LazyClient::close_all`].
+    /// Closes each client that connected. See [`LazyClient::close_all`].
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         LazyClient::close_all(&self.all).await
     }
@@ -99,6 +98,12 @@ impl LazyClient {
         Self(Arc::new(AsyncMutex::new(Some(client))))
     }
 
+    /// Puts `client` in hand, so a test needs no server.
+    #[cfg(test)]
+    pub(super) async fn hold(&self, client: Arc<IggyClient>) {
+        *self.0.lock().await = Some(client);
+    }
+
     /// The client, connected at the first call. Callers that come during a connect wait for it.
     pub(super) async fn connected(
         &self,
@@ -112,6 +117,24 @@ impl LazyClient {
         *held = Some(Arc::clone(&connected));
         drop(held);
         Ok(connected)
+    }
+
+    /// The client, if it connected.
+    pub(super) async fn held(&self) -> Option<Arc<IggyClient>> {
+        self.0.lock().await.clone()
+    }
+
+    /// Forgets `client` and closes its connection once the call running on it ends. For a send
+    /// that was given up on: the SDK goes on writing it, and it must not land after a later send
+    /// on a new connection.
+    ///
+    /// No timeout. The SDK ends a call by its 30 s read deadline, and a new connection opened
+    /// before that could send ahead of it.
+    pub(super) async fn retire(&self, client: &IggyClient) {
+        self.0.lock().await.take();
+        if let Err(error) = client.shutdown().await {
+            tracing::debug!(%error, "failed to shut down a retired Iggy client");
+        }
     }
 
     /// Runs `call` until `deadline`. A call that times out drops the client.
@@ -129,15 +152,32 @@ impl LazyClient {
         result
     }
 
-    /// Shuts the client down, if it connected.
+    /// [`Self::until`] on a task of its own, so the deadline still drops a stuck client when the
+    /// caller stops waiting first.
+    pub(super) async fn until_detached<T, Call>(
+        &self,
+        deadline: Instant,
+        call: Call,
+    ) -> Result<T, BridgeError>
+    where
+        T: Send + 'static,
+        Call: Future<Output = Result<T, BridgeError>> + Send + 'static,
+    {
+        let client = self.clone();
+        tokio::spawn(async move { client.until(deadline, call).await })
+            .await
+            .unwrap_or(Err(BridgeError::Timeout))
+    }
+
+    /// Signs the client out and shuts it down, if it connected.
     pub(super) async fn close(&self) -> Result<(), BridgeError> {
         let Some(client) = self.0.lock().await.take() else {
             return Ok(());
         };
-        with_request_timeout(client.shutdown()).await
+        sign_out_and_shut_down(&client).await
     }
 
-    /// Shuts down each client that connected, and returns the first error. A client that fails to
+    /// Closes each client that connected, and returns the first error. A client that fails to
     /// shut down stops none of the others.
     pub(super) async fn close_all(
         clients: impl IntoIterator<Item = &Self>,
@@ -311,6 +351,28 @@ impl IggyBridge {
         count: u32,
         deadline: Instant,
     ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
+        self.poll_by(
+            slot,
+            kafka_topic,
+            partition,
+            PollingStrategy::offset(offset),
+            count,
+            deadline,
+        )
+        .await
+    }
+
+    /// [`Self::poll`] with any polling strategy, so `ListOffsets` can read by timestamp or the
+    /// last record through the same slots.
+    pub(crate) async fn poll_by(
+        self: &Arc<Self>,
+        slot: FetchSlot,
+        kafka_topic: &str,
+        partition: u32,
+        strategy: PollingStrategy,
+        count: u32,
+        deadline: Instant,
+    ) -> Option<(Result<PolledMessages, BridgeError>, FetchSlot)> {
         let (bridge, client, topic) = (
             Arc::clone(self),
             slot.client.clone(),
@@ -318,7 +380,7 @@ impl IggyBridge {
         );
         let poll = async move {
             bridge
-                .poll_with(&client, &topic, partition, offset, count, deadline)
+                .poll_with(&client, &topic, partition, &strategy, count, deadline)
                 .await
         };
         in_slot(slot, deadline, poll).await
@@ -329,12 +391,12 @@ impl IggyBridge {
         client: &LazyClient,
         kafka_topic: &str,
         partition: u32,
-        offset: u64,
+        strategy: &PollingStrategy,
         count: u32,
         deadline: Instant,
     ) -> Result<PolledMessages, BridgeError> {
         let target = self.topic_target(kafka_topic)?;
-        let (consumer, strategy) = (Consumer::default(), PollingStrategy::offset(offset));
+        let consumer = Consumer::default();
         let poll = async {
             client
                 .connected(&self.config)
@@ -344,7 +406,7 @@ impl IggyBridge {
                     &target.topic_id,
                     Some(partition),
                     &consumer,
-                    &strategy,
+                    strategy,
                     count,
                     false,
                 )
@@ -354,6 +416,27 @@ impl IggyBridge {
         // The SDK replays a poll that Iggy refuses for up to 30 s. Stop with the request, so the
         // slot frees.
         client.until(deadline, poll).await
+    }
+}
+
+#[cfg(test)]
+impl IggyBridge {
+    /// Gives every Fetch read slot `client`, so a test needs no server.
+    pub(crate) async fn hold_fetch_clients(&self, client: &Arc<IggyClient>) {
+        for slot_client in &self.fetch_pool.all {
+            slot_client.hold(Arc::clone(client)).await;
+        }
+    }
+
+    /// How many Fetch read slots still hold a client.
+    pub(crate) async fn held_fetch_clients(&self) -> usize {
+        let mut held = 0;
+        for slot_client in &self.fetch_pool.all {
+            if slot_client.held().await.is_some() {
+                held += 1;
+            }
+        }
+        held
     }
 }
 
@@ -373,6 +456,29 @@ mod tests {
             .build()
             .expect("building a client dials nothing");
         Arc::new(client)
+    }
+
+    #[tokio::test]
+    async fn given_a_detached_call_whose_caller_gave_up_when_its_deadline_passes_should_drop_the_client()
+     {
+        let client = LazyClient::default();
+        *client.0.lock().await = Some(unconnected());
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let caller = tokio::time::timeout(
+            Duration::from_millis(10),
+            client.until_detached(deadline, std::future::pending::<Result<u8, BridgeError>>()),
+        )
+        .await;
+        assert!(
+            caller.is_err(),
+            "the caller stops waiting before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            client.0.lock().await.is_none(),
+            "the stuck client is dropped at its own deadline, not left for the next lookup"
+        );
     }
 
     #[tokio::test]
@@ -442,6 +548,21 @@ mod tests {
             "with the freed client"
         );
         drop((next, taken));
+    }
+
+    #[tokio::test]
+    async fn given_a_passed_deadline_when_a_slot_is_free_should_take_none_and_keep_its_client() {
+        let pool = Arc::new(FetchPool::new());
+        let held = unconnected();
+        for client in &pool.all {
+            client.hold(Arc::clone(&held)).await;
+        }
+        assert!(pool.take(Instant::now()).await.is_none());
+        for client in &pool.all {
+            assert!(client.held().await.is_some());
+        }
+        let soon = Instant::now() + Duration::from_millis(20);
+        assert!(pool.take(soon).await.is_some(), "the slot stayed free");
     }
 
     fn partition(current_offset: u64, messages_count: u64, size: u64) -> Partition {

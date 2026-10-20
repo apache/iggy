@@ -39,6 +39,7 @@ internal static class VsrHeader
     // internal header. Every field past the operation therefore sits eight bytes
     // earlier than it did while the client header still carried one.
     internal const int REQUEST_CLIENT_OFFSET = 128;
+    internal const int REQUEST_CHECKSUM_OFFSET = 144;
     internal const int REQUEST_TIMESTAMP_OFFSET = 160;
     internal const int REQUEST_ID_OFFSET = 168;
     internal const int REQUEST_OPERATION_OFFSET = 176;
@@ -48,9 +49,16 @@ internal static class VsrHeader
     internal const int REQUEST_OWNER_GENERATION_OFFSET = 208;
     internal const int REQUEST_METADATA_OP_OFFSET = 216;
 
+    internal const int REPLY_CHECKSUM_OFFSET = 128;
+    internal const int REPLY_CLIENT_OFFSET = 160;
+    internal const int REPLY_OP_OFFSET = 176;
+    internal const int REPLY_INCARNATION_OFFSET = 224;
     internal const int REPLY_OPERATION_OFFSET = 208;
     internal const int REPLY_COMMIT_OFFSET = 184;
     internal const int REPLY_STATUS_OFFSET = 216;
+    internal const int REPLY_REQUEST_ID_OFFSET = 200;
+    internal const int REPLY_COMMITTED_OFFSET = 220;
+    internal const byte COMMITTED_RESULT_MARKER = 1;
 
     internal const int EVICTION_CLIENT_OFFSET = 128;
     internal const int EVICTION_PROTOCOL_VERSION_OFFSET = 144;
@@ -67,7 +75,7 @@ internal static class VsrHeader
     ///     different request would let the client table answer that request from the first one's cached reply.
     /// </remarks>
     internal static int EncodeRequestHeader(Span<byte> header, ConsensusSession session, int code,
-        ReadOnlySpan<byte> payload, PartitionContext context = default)
+        ReadOnlySpan<byte> payload, PartitionContext context = default, SessionFrame? retainedFrame = null)
     {
         if (header.Length < HEADER_SIZE)
         {
@@ -84,7 +92,7 @@ internal static class VsrHeader
             throw VsrError.Exception(VsrError.INVALID_COMMAND, "Request body exceeds the maximum frame size.");
         }
 
-        var frame = session.Resolve(operation);
+        var frame = retainedFrame ?? session.Resolve(operation);
         var totalSize = HEADER_SIZE + payload.Length;
 
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);
@@ -130,6 +138,9 @@ internal static class VsrHeader
     {
         return BinaryPrimitives.ReadUInt32LittleEndian(header[REPLY_STATUS_OFFSET..]);
     }
+
+    internal static bool ReadCommitted(ReadOnlySpan<byte> header) => PeekCommand(header) == Command.Reply
+        && ReadStatus(header) == 0 && header[REPLY_COMMITTED_OFFSET] == COMMITTED_RESULT_MARKER;
 
     internal static VsrOperation ReadReplyOperation(ReadOnlySpan<byte> header)
     {

@@ -34,14 +34,11 @@ mod threads;
 mod topology;
 
 pub use crate::dispatch::host::ServerHost;
-pub use credentials::apply_default_root_credentials;
+pub use credentials::{apply_default_root_credentials, initialize_root_user};
 pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
-use crate::boot::credentials::{
-    ensure_default_root_user, load_replica_auth, load_replica_tls_ctx,
-    validate_root_credentials_env,
-};
+use crate::boot::credentials::{load_replica_auth, load_replica_tls_ctx, resolve_root_credentials};
 use crate::boot::fd_limit::client_connection_cap;
 use crate::boot::handoff::{
     BootstrapBarrier, MetadataHandoff, await_bootstrap_complete, await_metadata_bundle,
@@ -90,7 +87,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-OWNERSHIP-HISTORY-4\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-BOUND-GRANTS-4\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -296,7 +293,7 @@ pub fn bootstrap(
     // own idempotent install in its TLS listeners for embedders that never
     // run this bootstrap; after this line those are no-ops.
     install_default_crypto_provider();
-    validate_root_credentials_env(&config)?;
+    let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
@@ -402,6 +399,7 @@ pub fn bootstrap(
         let metadata_handoff_for_shard = if shard_id == 0 {
             MetadataHandoff::Owner {
                 bundle_tx: metadata_bundle_tx.clone(),
+                root_credentials: root_credentials.take(),
             }
         } else {
             MetadataHandoff::Waiter {
@@ -564,11 +562,11 @@ async fn shard_main(
     // so the writer must first be parked in a binding that outlives the peer
     // wait armed below. A `recover()` failure inside the arm is safe for the
     // same reason -- no peer holds a handle yet.
-    let (mux_stm, pending_bundle_tx, owner_state) = match metadata_handoff {
-        MetadataHandoff::Owner { bundle_tx } => {
-            // Root is created locally at boot (never journaled), so replay
-            // must start from the same baseline or every WAL-created user
-            // shifts one slab id and root is lost after the first restart.
+    let (mux_stm, pending_bundle_tx, owner_state, root_credentials) = match metadata_handoff {
+        MetadataHandoff::Owner {
+            bundle_tx,
+            root_credentials,
+        } => {
             let recovered = recover::<ServerMuxStateMachine>(
                 data_dir,
                 ReplicaIdentity {
@@ -578,9 +576,7 @@ async fn shard_main(
                 },
                 config.metadata.journal_slots,
                 config.metadata.clients_table_max,
-                |mux_stm| {
-                    ensure_default_root_user(mux_stm);
-                },
+                |_| {},
                 |mux_stm, header| {
                     if header.operation == iggy_binary_protocol::Operation::Register {
                         mux_stm.streams().refresh_consumer_group_session(
@@ -600,7 +596,6 @@ async fn shard_main(
             )
             .await
             .map_err(ServerError::MetadataRecovery)?;
-            ensure_default_root_user(&recovered.mux_stm);
             (
                 Rc::new(recovered.mux_stm),
                 Some(bundle_tx),
@@ -614,6 +609,7 @@ async fn shard_main(
                     recovered_state: recovered.recovered_state,
                     snapshot_checkpoint: recovered.snapshot_checkpoint,
                 }),
+                root_credentials,
             )
         }
         MetadataHandoff::Waiter { bundle_rx } => {
@@ -626,6 +622,7 @@ async fn shard_main(
             .await?;
             (
                 Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle)),
+                None,
                 None,
                 None,
             )
@@ -703,6 +700,7 @@ async fn shard_main(
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
     metadata.set_partitions_max(config.metadata.partitions_max);
+    metadata.set_max_tokens_per_user(config.personal_access_token.max_tokens_per_user);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
     // clients that kept their identity across the restart (IGGY-137). Recovery
@@ -867,19 +865,21 @@ async fn shard_main(
     });
     bus.track_background(reconciler_handle);
 
-    // Per-shard heartbeat verifier: evicts connections that stop pinging,
-    // releasing their consumer-group membership. Gated on config so a
-    // deployment without heartbeats never reaps live sessions.
+    // Per-shard heartbeat verifier: evicts group-member connections that stop
+    // pinging. Lease expiry, not eviction, ends their sessions. Gated on
+    // config so a deployment without heartbeats never evicts a live client.
     let heartbeat_stop_tx = if config.heartbeat.enabled {
         let (hb_stop_tx, hb_stop_rx) = channel::<()>(1);
         let hb_shard = Rc::clone(&shard);
         let hb_sessions = Rc::clone(&sessions);
         let hb_interval = config.heartbeat.interval.get_duration();
+        let hb_max_age = config.heartbeat.session_timeout();
         let hb_handle = compio::runtime::spawn(async move {
             crate::dispatch::session_ops::run_heartbeat_verifier(
                 hb_shard,
                 hb_sessions,
                 hb_interval,
+                hb_max_age,
                 hb_stop_rx,
             )
             .await;
@@ -1015,6 +1015,7 @@ async fn shard_main(
             accepted_client,
             &connections,
             &shard_metrics_all,
+            root_credentials.as_ref(),
         )
         .await
         {
@@ -1034,14 +1035,16 @@ async fn shard_main(
         // Every enabled client transport is bound and accepting by here, so
         // this is the first point at which a unit ordered after us may dial.
         #[cfg(feature = "systemd")]
-        systemd::notify_ready();
+        if !bus.token().is_triggered() {
+            systemd::notify_ready();
+        }
     }
 
     if shard_id == 0 {
         let (stop_tx, stop_rx) = channel(1);
         let cleaner_shard = Rc::clone(&shard);
         let interval = config.consumer_group.heartbeat_interval.get_duration();
-        let timeout = config.consumer_group.session_timeout.get_duration();
+        let timeout = config.heartbeat.session_timeout();
         let system_path = config.get_system_path();
         let handle = compio::runtime::spawn(async move {
             crate::consumer_group::liveness::run(
@@ -1134,20 +1137,29 @@ fn make_metadata_commit_notifier(
 }
 
 /// Filter at the broadcast site, keeping unrelated ops off the SDK reply
-/// path. Any new partition-shape op must be added here.
+/// path. Any new partition-shape op must be added here, with its reason:
 ///
-/// The bare `CreateTopic` / `CreatePartitions` arms are unreachable: the
-/// leader's prepare-builder in `IggyMetadata` rewrites both into their
-/// `*WithAssignments` form, stamping each partition's `consensus_group_id`
-/// before journaling, so a committed prepare only ever carries the
-/// assignment-bearing variant. Kept as defense-in-depth against a future
-/// commit path that emits a bare op.
+/// - `CreateTopic`, `CreatePartitions`: unreachable, kept as defense in depth
+///   against a future commit path that emits a bare op. The leader's
+///   prepare-builder in `IggyMetadata` rewrites both into their
+///   `*WithAssignments` form, stamping each partition's `consensus_group_id`
+///   before journaling.
+/// - `CreateTopicWithAssignments`, `CreatePartitionsWithAssignments`: add
+///   partitions, which the reconciler materialises on the owning shard and
+///   routes on the others.
+/// - `DeleteStream`, `DeleteTopic`, `DeletePartitions`: begin a lifecycle
+///   whose history fences the reconciler sends to each affected partition.
+/// - `TruncatePartition`: leaves the partition set intact but advances the
+///   per-partition delete watermark, which only the reconciler enforces on
+///   disk. Omitting it defers the on-disk effect to the periodic safety tick,
+///   stretching a segment delete's client-visible tail to a full
+///   `reconcile_periodic_interval`.
+/// - `CompleteLifecycle`: records installed fences, so the reconciler reports
+///   its next batch. The last batch applies the deferred delete, whose
+///   partitions or group offsets the reconciler then removes.
+/// - `DeleteConsumerGroup`: begins a lifecycle whose owner fences the
+///   reconciler sends to each partition of the group's topic.
 ///
-/// "Partition-shape" is not only the partition SET: `TruncatePartition`
-/// leaves the set intact but advances the per-partition delete watermark,
-/// which only the reconciler enforces on disk. Omitting it defers the on-disk
-/// effect to the periodic safety tick, stretching a segment delete's
-/// client-visible tail to a full `reconcile_periodic_interval`.
 /// `DeleteSegments` is absent by design: the leader rewrites it into
 /// `TruncatePartition` before journaling, so no commit ever carries it.
 const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
@@ -1224,6 +1236,10 @@ mod tests {
             b"old format\n".as_slice(),
             b"IGGY-NO-PURGE-1\n",
             b"IGGY-OWNERSHIP-HISTORY-3\n",
+            b"IGGY-OWNERSHIP-HISTORY-4\n",
+            b"IGGY-OWNERSHIP-HISTORY-5\n",
+            b"IGGY-BOUND-GRANTS-2\n",
+            b"IGGY-BOUND-GRANTS-3\n",
             b"IGGY-DURABLE-SESSIONS-3\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
@@ -1253,6 +1269,17 @@ mod tests {
     }
 
     #[test]
+    fn given_different_root_bootstrap_formats_when_identifying_replicas_should_reject_mixing() {
+        assert_ne!(
+            message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),
+            message_bus::replica::handshake::binary_identity(
+                crate::VERSION,
+                b"IGGY-BOUND-GRANTS-3\n"
+            ),
+        );
+    }
+
+    #[test]
     fn reconciler_driven_ops_broadcast_a_commit_tick() {
         // `TruncatePartition` commits without touching the partition set, so
         // nothing else signals the reconciler: `reconcile_segment_truncations`
@@ -1263,6 +1290,31 @@ mod tests {
             operation_triggers_partition_reconcile(Operation::TruncatePartition),
             "TruncatePartition is enforced by the reconciler and must wake it on commit"
         );
+        for (operation, reconciler_work) in [
+            (Operation::CreateTopic, "materialise a bare create"),
+            (
+                Operation::CreateTopicWithAssignments,
+                "materialise the new partitions",
+            ),
+            (Operation::CreatePartitions, "materialise a bare create"),
+            (
+                Operation::CreatePartitionsWithAssignments,
+                "materialise the new partitions",
+            ),
+            (Operation::DeleteStream, "send the history fences"),
+            (Operation::DeleteTopic, "send the history fences"),
+            (Operation::DeletePartitions, "send the history fences"),
+            (
+                Operation::CompleteLifecycle,
+                "report the next batch or remove a finished delete",
+            ),
+            (Operation::DeleteConsumerGroup, "send the owner fences"),
+        ] {
+            assert!(
+                operation_triggers_partition_reconcile(operation),
+                "{operation:?} must wake the reconciler to {reconciler_work}"
+            );
+        }
         assert!(
             !operation_triggers_partition_reconcile(Operation::CreateUser),
             "ops with no partition-shape effect must stay off the broadcast"

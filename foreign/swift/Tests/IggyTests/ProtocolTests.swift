@@ -104,14 +104,15 @@ struct ConsensusSessionTests {
         #expect(!session.isBound)
         #expect(session.clientID != 7)
         #expect(session.bindSecret != secret)
-        #expect(session.currentRequestID == 1)
+        try session.bind(43)
+        #expect(try session.nextRequestID() == 2)
     }
 }
 
 @Suite("Command codes and operations")
 struct CommandCodeTests {
     @Test func retiredCodesStayUnknown() {
-        for code: UInt32 in [14, 102, 205, 305] {
+        for code: UInt32 in [14, 102, 103, 104, 123, 205, 305] {
             #expect(CommandCode(rawValue: code) == nil)
             #expect(ConsensusOperation.forCode(code) == .nonReplicated)
         }
@@ -122,13 +123,13 @@ struct CommandCodeTests {
 
     @Test func namesMatchTheDispatchTable() {
         #expect(CommandCode.bindSession.name == "session.bind")
-        #expect(CommandCode.getSendContext.name == "message.send_context")
-        #expect(CommandCode(rawValue: 105) == .getSendContext)
+        #expect(CommandCode.getPartitionRoute.name == "partition.route")
+        #expect(CommandCode(rawValue: 105) == .getPartitionRoute)
         #expect(Set(CommandCode.allCases.map(\.name)).count == CommandCode.allCases.count)
     }
 
     @Test func nonReplicatedCodesCarryNoOperation() {
-        for code in [CommandCode.bindSession, .getSendContext, .pollMessages, .getPollRouting] {
+        for code in [CommandCode.bindSession, .getPartitionRoute, .pollMessages] {
             #expect(ConsensusOperation.forCode(code.rawValue) == .nonReplicated)
         }
     }
@@ -170,6 +171,24 @@ struct ReplyDecodingTests {
 
     func rejectionBody(_ code: UInt32) -> [UInt8] {
         UInt32(1).littleEndianBytes + UInt32(0).littleEndianBytes + code.littleEndianBytes
+    }
+
+    @Test func committedRejectionRequiresExactProofMarker() {
+        let body = rejectionBody(IggyErrorCode.streamIdNotFound.rawValue)
+        for marker: UInt8 in [0, 1, 2] {
+            var header = replyHeader(operation: .deleteStream, bodyLength: body.count)
+            header[VSRFrame.ReplyOffset.committedResult] = marker
+            #expect(VSRFrame.hasCommittedResult(header[...]) == (marker == 1))
+            #expect(throws: IggyError(.streamIdNotFound)) {
+                try VSRFrame.decodeReply(header: header[...], body: body[...])
+            }
+            header[VSRFrame.ReplyOffset.status] = 58
+            #expect(!VSRFrame.hasCommittedResult(header[...]))
+            header[VSRFrame.ReplyOffset.status] = 0
+            header[VSRFrame.ReplyOffset.command] = VSRFrame.Command.eviction.rawValue
+            #expect(!VSRFrame.hasCommittedResult(header[...]))
+            #expect(!VSRFrame.hasCommittedResult(header.prefix(VSRFrame.headerSize - 1)))
+        }
     }
 
     @Test func metadataSuccessStripsTheResultSection() throws {

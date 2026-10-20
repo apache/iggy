@@ -14,7 +14,7 @@ once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)
 
 | Deliverable | Status | Location |
 | ------------- | -------- | ---------- |
-| TCP listener on `127.0.0.1:9093` (configurable) | Done | `src/server.rs`, `src/main.rs` |
+| TCP listener on `127.0.0.1:9093` (configurable), one listener per security protocol with TLS on the `SSL` ones | Done | `src/server.rs`, `src/listener.rs`, `src/tls/`, `src/main.rs` |
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
 | Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
@@ -50,11 +50,11 @@ it knows the server supports flexible encoding.
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
-| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from `advertised_host` or the bound `local_addr` IP; flexible encoding at v9+ |
+| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; flexible encoding at v9+ |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
-| 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
-| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
+| 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST, a timestamp and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
+| 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default at every version |
 | 20 | DeleteTopics | 1 | 5 | 1, 2, 3, 4, 5 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 (topic-id-based) not advertised - this bridge has no topic-id concept |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
 | 9 | OffsetFetch | 1 | 9 | 1 … 9 | With a bridge: reads each offset, -1 when none is stored, and a null topic list reads every topic that holds the group. Without one: 14. Flexible encoding at v6+ |
@@ -66,7 +66,7 @@ it knows the server supports flexible encoding.
 | 15 | DescribeGroups | 0 | 6 | 0, 1, 2, 3, 4, 5, 6 | Members, assignment and state of groups on this coordinator; a missing group is `Dead`, and v6 also returns `GROUP_ID_NOT_FOUND` (69); flexible encoding at v5+ |
 | 16 | ListGroups | 0 | 5 | 0, 1, 2, 3, 4, 5 | Groups on this coordinator; v4+ state filter and v5 type filter; flexible encoding at v3+ |
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
-| 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
+| 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
@@ -81,7 +81,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | --------- | ------ | ---------------------------------- | ---------------------------- |
 | 0 | Produce | 3–9 | v9 |
 | 1 | Fetch | 4–12 | v12 |
-| 2 | ListOffsets | 1–6 | v6 |
+| 2 | ListOffsets | 1–7 | v6 |
 | 3 | Metadata | 0–9 | v9 |
 | 8 | OffsetCommit | 2–9 | v8 |
 | 9 | OffsetFetch | 1–9 | v6 |
@@ -107,9 +107,9 @@ All API keys not listed above close the connection (see Governance model above) 
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
-| 17 | SaslHandshake | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
-| 29 | DescribeAcls | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
-| 36 | SaslAuthenticate | Implemented behind `IGGY_KAFKA_SASL_ENABLED`, advertised only while it is on ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 17 | SaslHandshake | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
+| 29 | DescribeAcls | Implemented on listeners that name a principal: the SASL ones, and `SSL` with client certificates; advertised only there ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
+| 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
 | 23, 27, 30, 31, 34, 35, 37+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, IncrementalAlterConfigs (44), etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
@@ -193,7 +193,8 @@ below it are still open for the issues that build on top of it.
 - [x] Produce → `send_messages` ([#3535](https://github.com/apache/iggy/issues/3535)) - one call
       per partition, base offset from the send confirmation, one error code per partition. See
       [README.md](../README.md#produce-3535).
-- [ ] Produce: `IggyClient` pool. Pin each partition to one client, so order holds.
+- [x] Produce: `IggyClient` pool, one client per producer, so a producer's batches land in order.
+      See [README.md](../README.md#concurrency-ceiling) and [IDEMPOTENCE.md](IDEMPOTENCE.md).
 - [ ] Produce: write keyed records' header TLVs into one buffer (`records::to_iggy`). Benchmark
       first. Keep Iggy's TLV layout and the 100 KB header check.
 - [ ] Produce: skip the second batch CRC pass (`records::preflight`) only if profiling shows it
@@ -335,12 +336,10 @@ below it are still open for the issues that build on top of it.
       session, so not carried forward as a fix here rather than guessed at. Needs fresh
       reproduction against a real `kcat` before it's re-closed.
 - [x] Real ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)): with
-      `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::high_watermarks` and
-      `EARLIEST` answers `0`. Any other requested timestamp (arbitrary-timestamp offset search,
-      including `offsetsForTimes`/`by_duration` resets) is unsupported - Iggy exposes no
-      per-message timestamp index - and answers `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43) per
-      partition rather than a fabricated offset; non-retriable, so a Java client resolves this
-      immediately instead of spinning until `default.api.timeout.ms`.
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, `LATEST` answers from `IggyBridge::partition_probes` and
+      `EARLIEST` answers `0`. A timestamp answers the first record Iggy appended at or after it,
+      and `MAX_TIMESTAMP` (v7) the last record ([#4516](https://github.com/apache/iggy/issues/4516));
+      `BRIDGE_MAPPING.md` has the difference from Kafka on `CreateTime` topics.
       `src/protocol/handlers/list_offsets.rs`, `tests/list_offsets_real_bridge_tests.rs`. With the
       bridge off, the stub from #3421 answers `NOT_LEADER_OR_FOLLOWER` (6) as before.
   - `EARLIEST = 0` is real *only* for a partition this bridge has never had retention trim: Iggy
@@ -352,16 +351,18 @@ below it are still open for the issues that build on top of it.
     Fetch serves no records until the next write.
   - Bridge fan-out is bounded independently of `bounds_guard`'s `MAX_REQUEST_ELEMENTS` (4,096,
     still a pre-decode ceiling, not a usability one): topic entries sharing a name are deduped to
-    one `high_watermarks` call before any bridge work starts (a name repeated across request
-    entries costs one round trip per entry), and a topic whose every partition asks for an
-    unsupported timestamp skips the call entirely. A request naming more than 100 distinct topics
+    one topic probe before any bridge work starts, and every topic gets that probe whatever its
+    partitions ask for. Repeated (topic, partition, timestamp) entries share one record lookup.
+    A request naming more than 100 distinct topics
     resolves the first 100 and answers the rest `REQUEST_TIMED_OUT` (retriable) with no bridge call
     at all, so a client that retries only its still-erroring topics narrows below the cap on its
     own. The whole request's aggregate bridge work runs under one 20s wall-clock deadline
     (`ListOffsets` carries no `timeout_ms` field in any version this gateway supports, so this is a
     fixed ceiling, not a client-honored one), applied per topic rather than once around the whole
-    batch: a topic already resolved when the deadline arrives keeps its real answer, and only the
-    not-yet-started topics answer `REQUEST_TIMED_OUT`.
+    batch: a topic already resolved when the deadline arrives keeps its real answer, and the
+    not-yet-started topics answer `REQUEST_TIMED_OUT`. Each record lookup by time also gets at
+    most a quarter of that deadline, and answers `REQUEST_TIMED_OUT` past it, so one stalled
+    partition leaves time for the rest.
 - [x] Fetch → `poll_messages` ([#3536](https://github.com/apache/iggy/issues/3536)): with
       `IGGY_KAFKA_BRIDGE_ENABLED=true`, shared topic probes, paged polls per partition with
       records, and a wait of up to `max_wait_ms` (max 18 s) when there are none. Only codes the
@@ -407,8 +408,8 @@ InitProducerId and idempotent producers
 ([#3545](https://github.com/apache/iggy/issues/3545)): [`IDEMPOTENCE.md`](IDEMPOTENCE.md).
 
 - [x] InitProducerId (22) allocates a producer id so a stock idempotent producer starts; a
-      transactional request is refused. The producer-id-keyed connection pool that would make
-      retries deduplicated is deferred - delivery stays at-least-once
+      transactional request is refused
+- [ ] Deduplicate an idempotent producer's retries. Delivery stays at-least-once until then
 
 Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 [`AUTHENTICATION.md`](AUTHENTICATION.md).
@@ -423,7 +424,12 @@ Authentication design ([#3549](https://github.com/apache/iggy/issues/3549)):
 - [x] `DescribeAcls` (29), rendering the authenticated principal's Iggy permissions as Kafka ACL
       bindings ([`ACL_MAPPING.md`](ACL_MAPPING.md)). Read only: `CreateAcls` (30) and `DeleteAcls`
       (31) are not implemented and not advertised
-- [ ] TLS on the gateway listener, a prerequisite for using PLAIN outside a trusted network
+- [x] TLS on the gateway listener ([#4510](https://github.com/apache/iggy/issues/4510)):
+      Kafka-style listeners, one per security protocol, each advertising its own address;
+      rustls with certificate reload; client certificates mapped to Iggy users through
+      `ssl.principal.mapping.rules` on an `SSL` listener; TLS on the bridge's own hop to Iggy.
+      Acting as the mapped user on the data plane is
+      [#4518](https://github.com/apache/iggy/issues/4518)
 - [ ] Tune `max_frame_size` per workload (Kafka defaults: ~1 MiB produce, ~50 MiB fetch; current default 8 MiB)
 - [ ] Target **~15–20 API keys** total for a functional bridge — not all 74+ admin keys
 

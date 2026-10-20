@@ -159,6 +159,14 @@ enum Requests {
         return writer.bytes
     }
 
+    static func partitionRoute(streamID: Identifier, topicID: Identifier, partitionID: UInt32) throws -> [UInt8] {
+        var writer = ByteWriter()
+        try streamID.encode(into: &writer)
+        try topicID.encode(into: &writer)
+        writer.write(partitionID)
+        return writer.bytes
+    }
+
     // MARK: Users
 
     /// Byte length of a bind secret carried by login and bind-session requests.
@@ -268,11 +276,15 @@ enum Requests {
         return writer.bytes
     }
 
-    static func loginRegisterWithPersonalAccessToken(token: String, bindSecret: [UInt8]) throws -> [UInt8] {
+    static func validatePersonalAccessToken(_ token: String) throws {
         let length = token.utf8.count
         guard length >= 1, length <= Identifier.maxNameLength else {
             throw IggyError(.invalidFormat, context: "token must be 1-255 bytes")
         }
+    }
+
+    static func loginRegisterWithPersonalAccessToken(token: String, bindSecret: [UInt8]) throws -> [UInt8] {
+        try validatePersonalAccessToken(token)
         guard bindSecret.count == bindSecretSize else {
             throw IggyError(.invalidFormat, context: "bind secret must be exactly \(bindSecretSize) bytes")
         }

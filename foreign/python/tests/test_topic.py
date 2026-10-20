@@ -33,6 +33,8 @@ from .utils import (
     wait_for_server,
 )
 
+MAX_PARTITIONS_TIMEOUT_SECONDS = 90
+
 
 class TestCreateTopic:
     """Test topic creation via create_topic."""
@@ -416,7 +418,16 @@ class TestCreateTopic:
         assert "Too many partitions" in str(exc_info.value)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("partitions_count", [0, 1, 1000])
+    @pytest.mark.parametrize(
+        "partitions_count",
+        [
+            0,
+            1,
+            pytest.param(
+                1000, marks=pytest.mark.timeout(MAX_PARTITIONS_TIMEOUT_SECONDS)
+            ),
+        ],
+    )
     async def test_create_topic_with_valid_partitions_count(
         self, iggy_client: IggyClient, unique_name, partitions_count: int
     ):
