@@ -53,11 +53,11 @@ Cached replies now preserve a committed-result marker, which older receipts lack
 No in-place upgrade or implicit migration is supported. A separately validated
 offline migration or restore procedure would be required to reuse existing data.
 
-The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` are unset. The leader refuses to initialize root without both variables or `--with-default-root-credentials` in development. Once root is persisted, restarts need neither.
+The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` are unset. Supply both variables on every replica before the first cluster start so any promoted node can initialize root. Use `--with-default-root-credentials` only in development. A cluster node without credentials waits for root to be replicated. Once root is persisted, restarts need neither.
 
 Releases up to 0.9 printed a generated password to stdout, and 0.9 also wrote it to the log file. Change any root password that was generated, and delete log files and container logs that still hold it. Snapshots redact that legacy log line.
 
-Older journals can lack a root-creation operation because previous servers created root only in memory. If no metadata checkpoint preserves root, this version refuses those journals before replay. Such data needs a validated migration or restore. It cannot safely assign user IDs from an empty user list.
+Older journals can lack a root-creation operation because previous servers created root only in memory. If no metadata checkpoint preserves root, this version refuses those journals before replay. The error identifies the journal path and its first operation. Restore a compatible data directory that contains `metadata/snapshot.bin`, or use `--fresh` to delete this replica's local data and start again. It cannot safely assign user IDs from an empty user list.
 
 The diagnostic snapshot (`POST /snapshot`, the binary `GET_SNAPSHOT_FILE` command, `iggy snapshot`) now requires the `manage_servers` permission. `read_servers` alone is rejected, because the archive carries raw server logs and host diagnostics.
 

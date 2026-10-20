@@ -52,8 +52,8 @@ ui:
 server:
   hostNetwork: true
 
-  # The first leader journals and replicates root. A shared initial Secret
-  # keeps the chosen credentials independent of which node leads first.
+  # The pinned image creates root independently on each replica. Every node
+  # must use the same Secret so root credentials agree across the cluster.
   users:
     root:
       createSecret: false

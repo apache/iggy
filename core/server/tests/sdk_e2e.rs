@@ -27,7 +27,7 @@
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{Client, IggyClientBuilder, UserClient};
 use std::fs::File;
-use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread::sleep;
@@ -119,6 +119,63 @@ fn given_fresh_data_dir_without_root_credentials_when_server_starts_should_exit_
         !output.contains("root user password"),
         "server must never mint and print a root password, got: {output}"
     );
+}
+
+#[test]
+fn given_a_cluster_waiting_for_root_when_terminated_should_exit_successfully() {
+    let workspace = TempDir::new().unwrap();
+    let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let replica = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let child = server_command(workspace.path())
+        .args(["--replica-id", "0"])
+        .env("IGGY_CLUSTER_ENABLED", "true")
+        .env("IGGY_CLUSTER_NODES_0_NAME", "node-0")
+        .env("IGGY_CLUSTER_NODES_0_IP", "127.0.0.1")
+        .env("IGGY_CLUSTER_NODES_0_REPLICA_ID", "0")
+        .env(
+            "IGGY_CLUSTER_NODES_0_PORTS_TCP",
+            tcp_addr.port().to_string(),
+        )
+        .env(
+            "IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA",
+            replica.local_addr().unwrap().port().to_string(),
+        )
+        .spawn()
+        .unwrap();
+    let mut server = TestServer {
+        child,
+        tcp_addr,
+        workspace,
+    };
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let output = read_process_output(server.workspace.path());
+        if output.contains("Waiting for root initialization without local credentials.") {
+            break;
+        }
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "server exited before waiting for root: {output}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "server never waited for root: {output}"
+        );
+        sleep(POLL_INTERVAL);
+    }
+    let terminated = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(terminated.success());
+    let status = wait_for_exit(&mut server.child, SHUTDOWN_TIMEOUT).unwrap();
+    let output = read_process_output(server.workspace.path());
+    assert!(
+        status.success(),
+        "normal bootstrap shutdown failed: {status}: {output}"
+    );
+    assert!(!output.contains("Root user initialization complete."));
 }
 
 #[test]

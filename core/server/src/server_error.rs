@@ -17,6 +17,7 @@
 
 use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
+use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
 use partitions::PartitionRecoveryError;
 use server_common::log::LogError;
@@ -332,12 +333,14 @@ pub enum ServerError {
     },
     #[error("Root initialization was rejected with status {status}")]
     RootInitializationRejected { status: u32 },
-    #[error("Shutdown was requested before the root user was initialized")]
-    RootInitializationAborted,
     #[error(
-        "Existing metadata has no persisted root initialization. A validated migration or restore is required before this version can start."
+        "Metadata journal at {path} starts with op {op}, operation {operation:?}, without persisted root initialization. Restore a compatible data directory containing metadata/snapshot.bin, or use --fresh to delete this replica's local data and start again."
     )]
-    RootBootstrapNotPersisted,
+    RootBootstrapNotPersisted {
+        path: PathBuf,
+        op: u64,
+        operation: Operation,
+    },
     #[error(
         "{provided_env} is set but {missing_env} is not; the root user credentials must be \
          provided as a pair"

@@ -19,20 +19,25 @@
 
 use crate::boot::topology::TcpTopology;
 use crate::server_error::ServerError;
-use crate::shell::ServerShard;
+use crate::shell::ShellShard;
 use configs::server::ServerConfig;
-use consensus::MetadataHandle;
-use futures::future::{Either, select};
+use consensus::{MetadataHandle, RESERVED_CLIENT_ID};
+use futures::{FutureExt, pin_mut, select};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
-    HEADER_SIZE, Operation, PrepareHeader, WireGlobalPermissions, WireName, WireOptions,
-    WirePermissions,
+    Operation, WireGlobalPermissions, WireName, WireOptions, WirePermissions,
 };
 use iggy_common::UserStatus;
 use iggy_common::defaults::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
+use journal::prepare_journal::read_first_prepare_header;
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
+use message_bus::MessageBus;
+use message_bus::lifecycle::ShutdownToken;
 use message_bus::replica::auth::ReplicaAuth;
 use message_bus::replica::handshake::ReplicaTlsCtx;
 use message_bus::replica::io as replica_io;
@@ -47,31 +52,44 @@ use rustls::pki_types::ServerName;
 use server_common::crypto;
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
-use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 
 const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
 
-/// Initial root identity and password hash, resolved before shard startup.
-pub(in crate::boot) struct RootCredentials {
-    username: String,
-    password_hash: String,
-}
+const ROOT_INITIALIZATION_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-pub(in crate::boot) async fn initialize_root_user(
-    shard: &Rc<ServerShard>,
-    root_credentials: Option<&RootCredentials>,
-) -> Result<(), ServerError> {
+/// Initial root identity and password hash, resolved before shard startup.
+pub(in crate::boot) type RootCredentials = CreateUserRequest;
+
+/// Replicate root creation, waiting through promotions until it commits or shutdown starts.
+/// The caller supplies the timer so the simulator can run the same initialization loop.
+///
+/// # Errors
+/// Returns an error if a standalone primary needs credentials or root creation is rejected.
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub async fn initialize_root_user<B, J, S, SB, Sleep>(
+    shard: &Rc<ShellShard<B, J, S, SB>>,
+    root_credentials: Option<&CreateUserRequest>,
+    cluster_enabled: bool,
+    shutdown: ShutdownToken,
+    sleep: impl Fn(Duration) -> Sleep,
+) -> Result<(), ServerError>
+where
+    B: MessageBus,
+    J: JournalHandle,
+    J::Target: Journal<Entry = server_common::Message<PrepareHeader>, Header = PrepareHeader>,
+    SB: SuperblockStore,
+    Sleep: Future<Output = ()>,
+{
     let metadata = shard.plane.metadata();
-    let shutdown = shard.bus.token();
-    let mut waiting_logged = false;
+    let mut last_log = None;
+    let mut last_error_log = None;
     loop {
         if !metadata
             .mux_stm
@@ -81,65 +99,75 @@ pub(in crate::boot) async fn initialize_root_user(
             return Ok(());
         }
         if shutdown.is_triggered() {
-            return Err(ServerError::RootInitializationAborted);
+            return Ok(());
         }
-        if metadata.is_caught_up_primary() {
-            let credentials = root_credentials.ok_or(ServerError::RootCredentialsRequired {
-                username_env: IGGY_ROOT_USERNAME_ENV,
-                password_env: IGGY_ROOT_PASSWORD_ENV,
-            })?;
-            let username = WireName::new(credentials.username.clone()).map_err(|_| {
-                ServerError::RootCredentialLength {
-                    env_name: IGGY_ROOT_USERNAME_ENV,
-                    length: credentials.username.len(),
-                    min: MIN_USERNAME_LENGTH,
-                    max: MAX_USERNAME_LENGTH,
+        let root_in_progress = metadata.consensus.as_ref().is_some_and(|consensus| {
+            consensus.pipeline_has_message_from_client(RESERVED_CLIENT_ID)
+        });
+        let log_due =
+            last_log.is_none_or(|last: Instant| last.elapsed() >= ROOT_INITIALIZATION_LOG_INTERVAL);
+        if metadata.is_caught_up_primary() && !root_in_progress {
+            let Some(credentials) = root_credentials else {
+                if !cluster_enabled {
+                    return Err(ServerError::RootCredentialsRequired {
+                        username_env: IGGY_ROOT_USERNAME_ENV,
+                        password_env: IGGY_ROOT_PASSWORD_ENV,
+                    });
                 }
-            })?;
-            let request = CreateUserRequest {
-                username,
-                password: credentials.password_hash.clone(),
-                status: UserStatus::Active.as_code(),
-                permissions: Some(WirePermissions {
-                    global: WireGlobalPermissions {
-                        manage_servers: true,
-                        read_servers: true,
-                        manage_users: true,
-                        read_users: true,
-                        manage_streams: true,
-                        read_streams: true,
-                        manage_topics: true,
-                        read_topics: true,
-                        poll_messages: true,
-                        send_messages: true,
-                    },
-                    streams: Vec::new(),
-                }),
-                options: WireOptions::empty(),
+                if log_due {
+                    warn!(
+                        "Waiting for root initialization without local credentials. \
+                         Set both {IGGY_ROOT_USERNAME_ENV} and {IGGY_ROOT_PASSWORD_ENV} \
+                         on every replica before the first cluster start."
+                    );
+                    last_log = Some(Instant::now());
+                }
+                sleep(Duration::from_millis(50)).await;
+                continue;
             };
-            match select(
-                Box::pin(metadata.submit_root_user_in_process(&request)),
-                Box::pin(shutdown.wait()),
-            )
-            .await
-            {
-                Either::Left((Ok(0), _)) => {
+            let submission = metadata.submit_root_user_in_process(credentials).fuse();
+            let shutdown_wait = shutdown.wait().fuse();
+            pin_mut!(submission, shutdown_wait);
+            let result = loop {
+                let log_tick = sleep(ROOT_INITIALIZATION_LOG_INTERVAL).fuse();
+                pin_mut!(log_tick);
+                select! {
+                    result = submission => break result,
+                    () = shutdown_wait => return Ok(()),
+                    () = log_tick => {
+                        warn!("Waiting for root initialization to commit through metadata replication.");
+                        last_log = Some(Instant::now());
+                    }
+                }
+            };
+            match result {
+                Ok(0) => {
                     info!("Root user creation committed through metadata replication.");
                     return Ok(());
                 }
-                Either::Left((Ok(status), _)) => {
+                Ok(status) => {
                     return Err(ServerError::RootInitializationRejected { status });
                 }
-                Either::Left((Err(_), _)) => {}
-                Either::Right(_) => {
-                    return Err(ServerError::RootInitializationAborted);
+                Err(error) => {
+                    if last_error_log.is_none_or(|last: Instant| {
+                        last.elapsed() >= ROOT_INITIALIZATION_LOG_INTERVAL
+                    }) {
+                        warn!(
+                            ?error,
+                            "Root initialization could not be submitted, retrying."
+                        );
+                        last_error_log = Some(Instant::now());
+                    }
                 }
             }
-        } else if !waiting_logged {
-            info!("Waiting for the primary to initialize the root user.");
-            waiting_logged = true;
+        } else if log_due {
+            info!(
+                root_in_progress,
+                "Waiting for the primary to initialize the root user."
+            );
+            last_log = Some(Instant::now());
         }
-        compio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -189,45 +217,69 @@ pub(in crate::boot) fn resolve_root_credentials(
     config: &ServerConfig,
 ) -> Result<Option<RootCredentials>, ServerError> {
     let metadata_path = Path::new(&config.path).join(METADATA_DIR);
-    validate_root_journal(&metadata_path)?;
-    let seed_required = !config.cluster.enabled
-        && !metadata_path.join(SNAPSHOT_FILE_NAME).exists()
-        && !metadata_path.join("journal.wal").exists();
+    let persisted_root = validate_root_journal(&metadata_path)?;
+    let seed_required = !config.cluster.enabled && !persisted_root;
     let username = env::var(IGGY_ROOT_USERNAME_ENV).ok();
     let password = env::var(IGGY_ROOT_PASSWORD_ENV).ok();
 
     let credentials =
         validate_root_credentials(seed_required, username.as_deref(), password.as_deref())?;
-    Ok(credentials.map(|(username, password)| RootCredentials {
-        username: username.to_owned(),
-        password_hash: crypto::hash_password(password),
-    }))
+    credentials
+        .map(|(username, password)| {
+            let username =
+                WireName::new(username).map_err(|_| ServerError::RootCredentialLength {
+                    env_name: IGGY_ROOT_USERNAME_ENV,
+                    length: username.len(),
+                    min: MIN_USERNAME_LENGTH,
+                    max: MAX_USERNAME_LENGTH,
+                })?;
+            Ok(CreateUserRequest {
+                username,
+                password: crypto::hash_password(password),
+                status: UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: true,
+                        read_servers: true,
+                        manage_users: true,
+                        read_users: true,
+                        manage_streams: true,
+                        read_streams: true,
+                        manage_topics: true,
+                        read_topics: true,
+                        poll_messages: true,
+                        send_messages: true,
+                    },
+                    streams: Vec::new(),
+                }),
+                options: WireOptions::empty(),
+            })
+        })
+        .transpose()
 }
 
-fn validate_root_journal(metadata_path: &Path) -> Result<(), ServerError> {
+fn validate_root_journal(metadata_path: &Path) -> Result<bool, ServerError> {
     if metadata_path.join(SNAPSHOT_FILE_NAME).exists() {
-        return Ok(());
+        return Ok(true);
     }
-    let mut journal = match File::open(metadata_path.join("journal.wal")) {
-        Ok(journal) => journal,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(ServerError::MetadataRecovery(RecoveryError::Io(error))),
+    let path = metadata_path.join("journal.wal");
+    let Some(header) = read_first_prepare_header(&path)
+        .map_err(|error| ServerError::MetadataRecovery(RecoveryError::Io(error)))?
+    else {
+        return Ok(false);
     };
-    let mut bytes = [0u8; HEADER_SIZE];
-    match journal.read_exact(&mut bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
-        Err(error) => return Err(ServerError::MetadataRecovery(RecoveryError::Io(error))),
-    }
-    if let Ok(header) = bytemuck::checked::try_pod_read_unaligned::<PrepareHeader>(&bytes)
-        && (header.op != 1
-            || header.operation != Operation::CreateUser
-            || header.client != 0
-            || header.user_id != 0)
+    if header.op != 1
+        || header.operation != Operation::CreateUser
+        || header.client != RESERVED_CLIENT_ID
+        || header.user_id != 0
     {
-        return Err(ServerError::RootBootstrapNotPersisted);
+        return Err(ServerError::RootBootstrapNotPersisted {
+            path,
+            op: header.op,
+            operation: header.operation,
+        });
     }
-    Ok(())
+    Ok(true)
 }
 
 fn validate_root_credentials<'a>(
@@ -517,31 +569,85 @@ fn warn_ignored_certificate_files(section: &str, cert_file: &str, key_file: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::Command;
+    use iggy_binary_protocol::{Command, HEADER_SIZE};
 
     #[test]
     fn given_a_journal_without_root_creation_when_bootstrapping_should_refuse_without_modifying_it()
     {
-        let metadata_path = tempfile::tempdir().expect("metadata directory");
-        let journal_path = metadata_path.path().join("journal.wal");
-        let header = PrepareHeader {
+        for sealed in [false, true] {
+            let metadata_path = tempfile::tempdir().expect("metadata directory");
+            let journal_path = metadata_path.path().join("journal.wal");
+            let mut header = PrepareHeader {
+                command: Command::Prepare,
+                operation: Operation::Register,
+                client: 7,
+                op: 1,
+                size: u32::try_from(HEADER_SIZE).unwrap(),
+                ..PrepareHeader::default()
+            };
+            if sealed {
+                header.checksum = header.identity_checksum();
+            }
+            let bytes = bytemuck::bytes_of(&header);
+            std::fs::write(&journal_path, bytes).expect("write an old root baseline journal");
+
+            let error = validate_root_journal(metadata_path.path()).unwrap_err();
+            assert!(matches!(
+                &error,
+                ServerError::RootBootstrapNotPersisted { path, op: 1, operation: Operation::Register }
+                    if path == &journal_path
+            ));
+            let message = error.to_string();
+            assert!(message.contains(&journal_path.display().to_string()));
+            assert!(message.contains("op 1, operation Register"));
+            assert!(message.contains("metadata/snapshot.bin"));
+            assert!(message.contains("--fresh"));
+            assert_eq!(
+                std::fs::read(journal_path).expect("unchanged journal"),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_incomplete_first_entry_when_validating_should_require_fresh_solo_credentials() {
+        let metadata_path = tempfile::tempdir().unwrap();
+        for bytes in [
+            Vec::new(),
+            vec![0u8; HEADER_SIZE - 1],
+            vec![0u8; HEADER_SIZE],
+        ] {
+            std::fs::write(metadata_path.path().join("journal.wal"), &bytes).unwrap();
+            let persisted_root = validate_root_journal(metadata_path.path()).unwrap();
+            assert!(!persisted_root);
+            assert!(matches!(
+                validate_root_credentials(!persisted_root, None, None),
+                Err(ServerError::RootCredentialsRequired { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn given_a_persisted_root_or_snapshot_when_validating_should_allow_recovery_without_credentials()
+     {
+        let metadata_path = tempfile::tempdir().unwrap();
+        let mut header = PrepareHeader {
             command: Command::Prepare,
-            operation: Operation::Register,
-            client: 7,
+            operation: Operation::CreateUser,
             op: 1,
+            size: u32::try_from(HEADER_SIZE).unwrap(),
             ..PrepareHeader::default()
         };
-        let bytes = bytemuck::bytes_of(&header);
-        std::fs::write(&journal_path, bytes).expect("write an old root baseline journal");
-
-        assert!(matches!(
-            validate_root_journal(metadata_path.path()),
-            Err(ServerError::RootBootstrapNotPersisted)
-        ));
-        assert_eq!(
-            std::fs::read(journal_path).expect("unchanged journal"),
-            bytes
-        );
+        header.checksum = header.identity_checksum();
+        std::fs::write(
+            metadata_path.path().join("journal.wal"),
+            bytemuck::bytes_of(&header),
+        )
+        .unwrap();
+        assert!(validate_root_journal(metadata_path.path()).unwrap());
+        std::fs::write(metadata_path.path().join(SNAPSHOT_FILE_NAME), []).unwrap();
+        std::fs::write(metadata_path.path().join("journal.wal"), [0u8; HEADER_SIZE]).unwrap();
+        assert!(validate_root_journal(metadata_path.path()).unwrap());
     }
 
     #[test]

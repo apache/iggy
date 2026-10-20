@@ -63,7 +63,8 @@ ENVIRONMENT VARIABLES:
         IGGY_ROOT_PASSWORD=secret                      # Root password, required with the username
 
     Initial root creation requires both variables, or
-    --with-default-root-credentials, on the leader. Root is journaled and
+    --with-default-root-credentials, on every replica before the first cluster
+    start so any promoted node can initialize root. Root is journaled and
     replicated. Restarts recover it without these inputs. The server never
     generates a root password or writes credential values to output or logs.
 

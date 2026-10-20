@@ -34,7 +34,7 @@ mod threads;
 mod topology;
 
 pub use crate::dispatch::host::ServerHost;
-pub use credentials::apply_default_root_credentials;
+pub use credentials::{apply_default_root_credentials, initialize_root_user};
 pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
@@ -1035,7 +1035,9 @@ async fn shard_main(
         // Every enabled client transport is bound and accepting by here, so
         // this is the first point at which a unit ordered after us may dial.
         #[cfg(feature = "systemd")]
-        systemd::notify_ready();
+        if !bus.token().is_triggered() {
+            systemd::notify_ready();
+        }
     }
 
     if shard_id == 0 {

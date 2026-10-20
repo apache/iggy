@@ -56,7 +56,7 @@ pub(in crate::boot) struct LocalClientAcceptFns {
     wss: AcceptedWssClientFn,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(in crate::boot) async fn start_tcp_runtime(
     shard: &Rc<ServerShard>,
     session_liveness: Rc<std::cell::RefCell<crate::consumer_group::lease::ConsumerGroupLiveness>>,
@@ -71,7 +71,17 @@ pub(in crate::boot) async fn start_tcp_runtime(
     root_credentials: Option<&RootCredentials>,
 ) -> Result<(), ServerError> {
     if topology.replica_count == 1 {
-        initialize_root_user(shard, root_credentials).await?;
+        initialize_root_user(
+            shard,
+            root_credentials,
+            config.cluster.enabled,
+            shard.bus.token(),
+            compio::time::sleep,
+        )
+        .await?;
+        if shard.bus.token().is_triggered() {
+            return Ok(());
+        }
     }
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds on its own. Config first, so a bad `[http.*]`
@@ -166,8 +176,17 @@ pub(in crate::boot) async fn start_tcp_runtime(
         )?;
     }
 
-    initialize_root_user(shard, root_credentials).await?;
-    info!("Root user initialization complete.");
+    initialize_root_user(
+        shard,
+        root_credentials,
+        config.cluster.enabled,
+        shard.bus.token(),
+        compio::time::sleep,
+    )
+    .await?;
+    if !shard.bus.token().is_triggered() {
+        info!("Root user initialization complete.");
+    }
 
     Ok(())
 }

@@ -25,7 +25,7 @@ use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +73,39 @@ pub(crate) const SLOT_COUNT: usize = 1024;
 /// [`PrepareJournal::open_with_slots`] (operator knob: `[metadata]
 /// journal_slots` in the server config).
 pub const DEFAULT_SLOT_COUNT: usize = SLOT_COUNT;
+
+/// Inspect the first complete prepare using the recovery scan's integrity checks.
+/// An absent, incomplete, or corrupt entry is left for the recovery scan.
+///
+/// # Errors
+/// Returns an error if the WAL cannot be opened or read.
+pub fn read_first_prepare_header(path: &Path) -> io::Result<Option<PrepareHeader>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut scratch = Owned::<16>::zeroed(HEADER_SIZE);
+    let mut bytes = [0u8; HEADER_SIZE];
+    match file.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let Some(header) = valid_entry_header(&mut scratch, &bytes) else {
+        return Ok(None);
+    };
+    if u64::from(header.size) > file.metadata()?.len() || !valid_header_checksum(&header) {
+        return Ok(None);
+    }
+    let mut body = vec![0u8; header.size as usize - HEADER_SIZE];
+    match file.read_exact(&mut body) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    Ok(valid_body_checksum(&header, &body).then_some(header))
+}
 
 /// Error type for journal operations.
 #[derive(Debug)]
@@ -310,13 +343,25 @@ async fn find_complete_entry(
 fn valid_entry_header(scratch: &mut Owned<16>, bytes: &[u8]) -> Option<PrepareHeader> {
     scratch.as_mut_slice().copy_from_slice(bytes);
     let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(scratch.as_slice()).ok()?;
-    if header.command != Command::Prepare
-        || (header.size as usize) < HEADER_SIZE
-        || u64::from(header.size) > MAX_ENTRY_SIZE
-    {
+    if !valid_entry_size_and_command(&header) {
         return None;
     }
     Some(header)
+}
+
+fn valid_entry_size_and_command(header: &PrepareHeader) -> bool {
+    header.command == Command::Prepare
+        && header.size as usize >= HEADER_SIZE
+        && u64::from(header.size) <= MAX_ENTRY_SIZE
+}
+
+fn valid_header_checksum(header: &PrepareHeader) -> bool {
+    header.checksum == CHECKSUM_UNSEALED || header.identity_checksum() == header.checksum
+}
+
+fn valid_body_checksum(header: &PrepareHeader, body: &[u8]) -> bool {
+    header.checksum_body == CHECKSUM_BODY_UNSEALED
+        || u128::from(XxHash3_64::oneshot(body)) == header.checksum_body
 }
 
 /// Each replacement owns a distinct scratch path, so delayed cancellation cleanup
@@ -573,10 +618,7 @@ impl PrepareJournal {
             let header: PrepareHeader = *header_ref;
 
             // Validate: must be a Prepare command with sane size
-            if header.command != Command::Prepare
-                || (header.size as usize) < HEADER_SIZE
-                || u64::from(header.size) > MAX_ENTRY_SIZE
-            {
+            if !valid_entry_size_and_command(&header) {
                 truncate_or_fail(&storage, pos, "corrupt or non-prepare entry").await?;
                 break;
             }
@@ -603,8 +645,7 @@ impl PrepareJournal {
             // `commit_watermark = max(header.commit)`, so a corrupted `commit` applies
             // uncommitted ops as committed, diverging from the group. `size` and `op`
             // are equally load-bearing for the scan itself.
-            if header.checksum != CHECKSUM_UNSEALED && header.identity_checksum() != header.checksum
-            {
+            if !valid_header_checksum(&header) {
                 if pos + entry_size < file_len {
                     return Err(JournalError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -663,7 +704,7 @@ impl PrepareJournal {
                     body_buf = vec![0u8; body_len];
                 }
                 body_buf = storage.read_at(pos + HEADER_SIZE as u64, body_buf).await?;
-                if u128::from(XxHash3_64::oneshot(&body_buf)) != header.checksum_body {
+                if !valid_body_checksum(&header, &body_buf) {
                     // The header passed the structural checks above, so `entry_size`
                     // is trustworthy. Bytes following this entry mean a later append
                     // completed after it, so this is interior bit-rot of a durable
@@ -1338,6 +1379,69 @@ mod tests {
     /// Byte offset of `field_offset` within the entry for `op`, at a fixed stride.
     const fn header_field_offset(op: u64, body_size: usize, field_offset: usize) -> usize {
         (op as usize - 1) * (HEADER_SIZE + body_size) + field_offset
+    }
+
+    #[test]
+    fn given_a_complete_first_prepare_when_reading_should_follow_recovery_checks_without_modifying_it()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.wal");
+        let entry = make_identity_sealed_prepare(1, 64, 0);
+        std::fs::write(&path, entry.as_slice()).unwrap();
+        let header = read_first_prepare_header(&path).unwrap().unwrap();
+        assert_eq!(header.op, 1);
+        assert_eq!(header.operation, Operation::CreateStream);
+        assert_eq!(std::fs::read(&path).unwrap(), entry.as_slice());
+        let unsealed = make_unsealed_prepare(1, 64);
+        std::fs::write(&path, unsealed.as_slice()).unwrap();
+        assert_eq!(read_first_prepare_header(&path).unwrap().unwrap().op, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), unsealed.as_slice());
+    }
+
+    #[test]
+    fn given_an_unverified_first_prepare_when_reading_should_leave_recovery_to_the_journal_scan() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.wal");
+        let entry = make_identity_sealed_prepare(1, 64, 0);
+        let mut invalid_entries = vec![
+            Vec::new(),
+            vec![0u8; HEADER_SIZE],
+            entry.as_slice()[..HEADER_SIZE - 1].to_vec(),
+            entry.as_slice()[..HEADER_SIZE + 63].to_vec(),
+        ];
+        for size in [
+            u32::try_from(HEADER_SIZE - 1).unwrap(),
+            u32::try_from(MAX_ENTRY_SIZE + 1).unwrap(),
+        ] {
+            let mut invalid_size = entry.deep_copy();
+            let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+                &mut invalid_size.as_mut_slice()[..HEADER_SIZE],
+            );
+            header.size = size;
+            header.checksum = header.identity_checksum();
+            invalid_entries.push(invalid_size.as_slice().to_vec());
+        }
+        for (offset, value) in [
+            (std::mem::offset_of!(PrepareHeader, checksum), 0xFF),
+            (std::mem::offset_of!(PrepareHeader, command), 0),
+            (std::mem::offset_of!(PrepareHeader, size), 0),
+            (std::mem::offset_of!(PrepareHeader, operation), 0xFF),
+            (HEADER_SIZE, 0xFF),
+        ] {
+            let mut corrupt = entry.as_slice().to_vec();
+            corrupt[offset] ^= value;
+            if value == 0 {
+                corrupt[offset] = 0;
+            }
+            invalid_entries.push(corrupt);
+        }
+        assert!(read_first_prepare_header(&path).unwrap().is_none());
+        assert!(!path.exists());
+        for bytes in invalid_entries {
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(read_first_prepare_header(&path).unwrap().is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

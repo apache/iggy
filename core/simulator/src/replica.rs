@@ -149,6 +149,7 @@ pub fn new_shard(
     reply_inbox: shard::Receiver<shard::ShardFrame>,
     clock: ConsensusClock,
     shell: bool,
+    seed_root: bool,
     reader_bundle: Option<SimMetadataBundle>,
     superblock: Option<Rc<SimSuperblock>>,
     metadata_journal: Option<Rc<SimJournal<MemStorage>>>,
@@ -193,17 +194,8 @@ pub fn new_shard(
         .map_or(0, |(snapshot, _)| snapshot.snapshot().sequence_number);
 
     let mux = reader_bundle.map_or_else(
-        // Writer shard (shard 0). Seed the root user at slab id 0, matching
-        // production bootstrap (`ensure_root_user`); it is undeletable in-apply,
-        // so it stays in slot 0 and the workload's users land at slab id 1+, out
-        // of any delete attempt. Peer shards inherit it through the read handle,
-        // so the seed runs only here. Shell mode logs a client in against this
-        // user (the login gate Argon2-checks the stored hash), so seed a real
-        // hash of `SHELL_ROOT_PASSWORD`; otherwise a deterministic placeholder,
-        // since login never runs and a random per-run argon2 salt would break
-        // state equality. Committed metadata replays into it from the retained WAL
-        // after `IggyMetadata` is built (see below), so the factory bundle is minted
-        // only then.
+        // Most workload tests begin with a root fixture. Bootstrap tests start
+        // empty and run the server initializer through metadata replication.
         || {
             // Seeding on top of a restored checkpoint would mint a second root user
             // and shift every workload entity's slab id.
@@ -217,7 +209,9 @@ pub fn new_shard(
             } else {
                 "hash".to_string()
             };
-            users.ensure_root_user(SHELL_ROOT_USERNAME, &root_password_hash);
+            if seed_root {
+                users.ensure_root_user(SHELL_ROOT_USERNAME, &root_password_hash);
+            }
             let streams: Streams = StreamsInner::new().into();
             SimMuxStateMachine::new(variadic!(users, streams))
         },

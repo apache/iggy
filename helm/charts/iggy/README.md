@@ -191,7 +191,7 @@ an inline value, which the chart turns into a Secret of its own:
 and a poor fit for a cluster, since the value then lives in every release's
 stored values.
 
-* **`server.users.root`** supplies credentials for initial root creation. The first leader journals and replicates its username and password hash. Followers use that account, even if their local variables differ or are absent. Restarts recover the stored account. The leader needs both `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` when root does not yet exist. Use the same initial Secret on nodes that can become the first leader so the initial credentials do not depend on startup order.
+* **`server.users.root`** must use the same Secret on every node. The pinned image creates root independently on each replica from its local environment. Different Secrets create different root accounts across the cluster. Newer images with journaled root initialization replicate the first leader's account and recover it on restart. Supply the same initial credentials to every replica so any node can initialize root after a promotion.
 * **`server.cluster.auth`** makes every replica connection complete an
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
