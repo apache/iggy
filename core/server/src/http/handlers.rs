@@ -729,7 +729,7 @@ pub(in crate::http) async fn get_metrics(
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
 /// download with the same headers the legacy server sets.
 ///
-/// Gated on the snapshot rule (`read_servers || manage_servers`) through the
+/// Gated on the snapshot rule (`manage_servers`) through the
 /// shared [`gate_local_read`], which also serves it behind the post-restart
 /// barrier; the archive itself carries no metadata answer to hold. Collection
 /// shells out to system tools on a dedicated OS thread (see

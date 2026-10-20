@@ -22,6 +22,7 @@ use iggy_common::{IggyTimestamp, variadic};
 use journal::superblock::{SuperblockContents, SuperblockStore};
 use journal::{Journal, JournalHandle, Storage};
 use metadata::MuxStateMachine;
+use metadata::impls::recovery::replay_prefix;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use server_common::{Message, iobuf::Owned};
@@ -462,35 +463,24 @@ impl SimJournal<MemStorage> {
         self.fail_next_truncate.set(true);
     }
 
-    /// The committed watermark to restore after a restart, mirroring
-    /// `metadata::recover`. On a solo cluster every appended op commits the instant
-    /// it is durable, so the head IS the commit point; otherwise the highest
-    /// `commit` any journaled prepare stamped, a lower bound, since a prepare
-    /// records the primary's commit point at send time, so the true point may be one
-    /// op higher and re-commits on rejoin.
-    ///
-    /// Floored at the snapshot watermark and clamped at the first gap above it, as
-    /// `metadata::recover` folds from `snapshot_floor` and stops at `chain_break_op`.
-    /// The fold only sees surviving headers, so a backup missing one prepare would
-    /// otherwise claim a commit point ABOVE the hole, telling the cluster there is
-    /// nothing to repair.
+    /// The committed frontier proved by the contiguous chain above the local checkpoint.
     #[must_use]
-    pub fn recovery_commit_watermark(&self, solo: bool) -> u64 {
-        let floor = self.snapshot_op.get();
-        let headers = unsafe { &*self.headers.get() };
-        let claimed = if solo {
-            self.last_op.get().unwrap_or(0).max(floor)
-        } else {
-            headers
-                .values()
-                .map(|header| header.commit)
-                .fold(floor, u64::max)
-        };
-        let mut watermark = floor;
-        while watermark < claimed && headers.contains_key(&(watermark + 1)) {
-            watermark += 1;
-        }
-        watermark
+    pub fn recovery_commit_watermark(&self, solo: bool, checkpoint_op: u64) -> u64 {
+        self.recovery_frontier(solo, checkpoint_op).0
+    }
+
+    #[must_use]
+    pub fn recovery_chain_break(&self, solo: bool, checkpoint_op: u64) -> Option<u64> {
+        self.recovery_frontier(solo, checkpoint_op).1
+    }
+
+    #[must_use]
+    pub fn recovery_frontier(&self, solo: bool, checkpoint_op: u64) -> (u64, Option<u64>) {
+        let floor = self.snapshot_op.get().max(checkpoint_op);
+        let mut headers: Vec<_> = unsafe { &*self.headers.get() }.values().copied().collect();
+        headers.sort_unstable_by_key(|header| header.op);
+        let prefix = replay_prefix(&headers, floor, solo);
+        (prefix.commit_watermark, prefix.chain_break_op)
     }
 
     /// The head prepare's header, `None` when empty. Restores the last-prepare
@@ -599,3 +589,66 @@ impl SuperblockStore for SimSuperblock {
 
 /// Type alias for simulator state machine
 pub type SimMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use futures::FutureExt;
+    use iggy_binary_protocol::{Command, Operation};
+
+    fn prepare(op: u64, commit: u64, parent: u128) -> Message<PrepareHeader> {
+        let mut message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>());
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(message.as_mut_slice());
+        *header = PrepareHeader {
+            command: Command::Prepare,
+            operation: Operation::CreateUser,
+            size: u32::try_from(size_of::<PrepareHeader>()).unwrap(),
+            op,
+            commit,
+            parent,
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+        message
+    }
+
+    #[test]
+    fn given_a_disconnected_tail_when_restoring_watermarks_should_ignore_its_commit_claims() {
+        let journal = SimJournal::<MemStorage>::default();
+        for op in [1, 179, 180, 181] {
+            journal
+                .append(prepare(op, op - 1, 0))
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(journal.recovery_commit_watermark(false, 0), 0);
+        assert_eq!(journal.recovery_commit_watermark(true, 0), 1);
+        assert_eq!(journal.recovery_chain_break(false, 0), Some(179));
+    }
+
+    #[test]
+    fn given_a_broken_parent_when_restoring_watermarks_should_ignore_the_forks_commit_claims() {
+        let journal = SimJournal::<MemStorage>::default();
+        let first = prepare(1, 0, 0);
+        let second = prepare(2, 0, first.header().checksum);
+        for entry in [first, second, prepare(3, 2, 0)] {
+            journal.append(entry).now_or_never().unwrap().unwrap();
+        }
+        assert_eq!(journal.recovery_commit_watermark(false, 0), 0);
+        assert_eq!(journal.recovery_chain_break(false, 0), Some(3));
+    }
+
+    #[test]
+    fn given_a_checkpoint_without_its_prepare_when_restoring_should_start_after_the_checkpoint() {
+        let journal = SimJournal::<MemStorage>::default();
+        journal.set_snapshot_op(99);
+        let first = prepare(101, 100, 0);
+        let second = prepare(102, 101, first.header().checksum);
+        for entry in [first, second] {
+            journal.append(entry).now_or_never().unwrap().unwrap();
+        }
+        assert_eq!(journal.recovery_commit_watermark(false, 100), 101);
+        assert_eq!(journal.recovery_chain_break(false, 100), None);
+    }
+}

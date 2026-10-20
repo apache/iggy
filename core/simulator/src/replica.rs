@@ -149,6 +149,7 @@ pub fn new_shard(
     reply_inbox: shard::Receiver<shard::ShardFrame>,
     clock: ConsensusClock,
     shell: bool,
+    seed_root: bool,
     reader_bundle: Option<SimMetadataBundle>,
     superblock: Option<Rc<SimSuperblock>>,
     metadata_journal: Option<Rc<SimJournal<MemStorage>>>,
@@ -174,9 +175,6 @@ pub fn new_shard(
     // consensus op/commit restore, so a restart recovers committed metadata from its
     // own disk instead of an empty state.
     let solo = replica_count == 1;
-    let restored_op = metadata_journal
-        .as_ref()
-        .and_then(|journal| journal.last_op());
     // Read before the state machine is built: it REPLACES the seeded default rather
     // than layering onto it, so without it a checkpointed replica recovers an empty
     // baseline and loses every op the drain reclaimed.
@@ -192,18 +190,22 @@ pub fn new_shard(
         .as_ref()
         .map_or(0, |(snapshot, _)| snapshot.snapshot().sequence_number);
 
+    let (recovered_commit, chain_break_op) = metadata_journal
+        .as_ref()
+        .map_or((checkpoint_seq, None), |journal| {
+            journal.recovery_frontier(solo, checkpoint_seq)
+        });
+    assert!(
+        !solo || chain_break_op.is_none(),
+        "solo metadata recovery refuses a disconnected WAL"
+    );
+    let restored_op = metadata_journal
+        .as_ref()
+        .and_then(|journal| journal.last_op());
+
     let mux = reader_bundle.map_or_else(
-        // Writer shard (shard 0). Seed the root user at slab id 0, matching
-        // production bootstrap (`ensure_root_user`); it is undeletable in-apply,
-        // so it stays in slot 0 and the workload's users land at slab id 1+, out
-        // of any delete attempt. Peer shards inherit it through the read handle,
-        // so the seed runs only here. Shell mode logs a client in against this
-        // user (the login gate Argon2-checks the stored hash), so seed a real
-        // hash of `SHELL_ROOT_PASSWORD`; otherwise a deterministic placeholder,
-        // since login never runs and a random per-run argon2 salt would break
-        // state equality. Committed metadata replays into it from the retained WAL
-        // after `IggyMetadata` is built (see below), so the factory bundle is minted
-        // only then.
+        // Most workload tests begin with a root fixture. Bootstrap tests start
+        // empty and run the server initializer through metadata replication.
         || {
             // Seeding on top of a restored checkpoint would mint a second root user
             // and shift every workload entity's slab id.
@@ -217,7 +219,9 @@ pub fn new_shard(
             } else {
                 "hash".to_string()
             };
-            users.ensure_root_user(SHELL_ROOT_USERNAME, &root_password_hash);
+            if seed_root {
+                users.ensure_root_user(SHELL_ROOT_USERNAME, &root_password_hash);
+            }
             let streams: Streams = StreamsInner::new().into();
             SimMuxStateMachine::new(variadic!(users, streams))
         },
@@ -276,8 +280,8 @@ pub fn new_shard(
         } else {
             consensus.init();
         }
-        if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
-            let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
+        if let Some(head) = restored_op {
+            let commit_watermark = recovered_commit;
             consensus.sequencer().set_sequence(head);
             consensus.restore_commit_state(commit_watermark, commit_watermark);
             if let Some(header) = last_header {
@@ -350,7 +354,7 @@ pub fn new_shard(
     // The commit notifier is unwired during recovery, hence the no-op hook.
     if let Some(journal) = metadata.journal.as_ref() {
         let floor = journal.snapshot_op().max(checkpoint_seq);
-        let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
+        let commit_watermark = recovered_commit;
         for op in (floor + 1)..=commit_watermark {
             let Some(entry) = journal.entry_sync(op) else {
                 // Applying across a hole would replay effects onto a state machine
