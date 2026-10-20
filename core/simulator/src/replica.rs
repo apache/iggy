@@ -21,6 +21,7 @@ use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerConfig;
 use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
+use futures::FutureExt;
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use journal::Journal;
@@ -175,9 +176,6 @@ pub fn new_shard(
     // consensus op/commit restore, so a restart recovers committed metadata from its
     // own disk instead of an empty state.
     let solo = replica_count == 1;
-    let restored_op = metadata_journal
-        .as_ref()
-        .and_then(|journal| journal.last_op());
     // Read before the state machine is built: it REPLACES the seeded default rather
     // than layering onto it, so without it a checkpointed replica recovers an empty
     // baseline and loses every op the drain reclaimed.
@@ -192,6 +190,24 @@ pub fn new_shard(
     let checkpoint_seq = local_checkpoint
         .as_ref()
         .map_or(0, |(snapshot, _)| snapshot.snapshot().sequence_number);
+
+    let (recovered_commit, chain_break_op) = metadata_journal
+        .as_ref()
+        .map_or((checkpoint_seq, None), |journal| {
+            journal.recovery_frontier(solo, checkpoint_seq)
+        });
+    if let Some(journal) = metadata_journal.as_ref()
+        && let Some(from_op) = chain_break_op
+    {
+        journal
+            .truncate_from(from_op)
+            .now_or_never()
+            .expect("in-memory journal truncation completes synchronously")
+            .expect("disconnected recovery suffix must be removed");
+    }
+    let restored_op = metadata_journal
+        .as_ref()
+        .and_then(|journal| journal.last_op());
 
     let mux = reader_bundle.map_or_else(
         // Most workload tests begin with a root fixture. Bootstrap tests start
@@ -270,8 +286,8 @@ pub fn new_shard(
         } else {
             consensus.init();
         }
-        if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
-            let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
+        if let Some(head) = restored_op {
+            let commit_watermark = recovered_commit;
             consensus.sequencer().set_sequence(head);
             consensus.restore_commit_state(commit_watermark, commit_watermark);
             if let Some(header) = last_header {
@@ -344,7 +360,7 @@ pub fn new_shard(
     // The commit notifier is unwired during recovery, hence the no-op hook.
     if let Some(journal) = metadata.journal.as_ref() {
         let floor = journal.snapshot_op().max(checkpoint_seq);
-        let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
+        let commit_watermark = recovered_commit;
         for op in (floor + 1)..=commit_watermark {
             let Some(entry) = journal.entry_sync(op) else {
                 // Applying across a hole would replay effects onto a state machine

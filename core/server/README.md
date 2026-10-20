@@ -57,9 +57,11 @@ The server no longer generates a root password when `IGGY_ROOT_USERNAME` and `IG
 
 Releases up to 0.9 printed a generated password to stdout, and 0.9 also wrote it to the log file. Change any root password that was generated, and delete log files and container logs that still hold it. Snapshots redact that legacy log line.
 
-Older journals can lack root creation because earlier servers created root only in memory. Without a metadata checkpoint, this server searches the whole journal for op 1 because repair can write operations out of order. A journal with complete entries but no validated root creation is rejected before replay to keep user IDs stable.
+All data directories from earlier storage formats must be wiped before upgrading. The storage-format check rejects them before metadata replay. There is no in-place upgrade or automatic migration.
 
-The error identifies the journal path and any unexpected op 1 fields. Restore a compatible data directory containing `metadata/snapshot.bin`, or use `--fresh` to delete local data. In multi-node clusters, use `--fresh` on at most one replica at a time while the others hold quorum.
+After storage-format admission, a checkpoint above op 0 preserves initialized metadata. An empty checkpoint at op 0 does not prove that root exists. Without an initialized checkpoint, startup searches the current-format journal for root creation at op 1 because repair can write operations out of order. A journal with complete entries but no validated root creation is rejected before replay.
+
+The error identifies the journal path and any unexpected op 1 fields. Restore a compatible data directory from this storage format, or use `--fresh` to delete local data. In multi-node clusters, use `--fresh` on at most one replica at a time while the others hold quorum.
 
 The diagnostic snapshot (`POST /snapshot`, the binary `GET_SNAPSHOT_FILE` command, `iggy snapshot`) now requires the `manage_servers` permission. `read_servers` alone is rejected, because the archive carries raw server logs and host diagnostics.
 

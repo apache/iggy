@@ -443,6 +443,9 @@ pub struct SnapshotCoordinator<M> {
     /// recovered at boot, `(0, 0)` when none. A view-change superblock write reads
     /// this so it records the current pairing instead of regressing it to zero.
     last_checkpoint: Cell<(u64, u128)>,
+    // The snapshot pairing is published before superblock persistence and WAL drain.
+    // An incomplete attempt must remain retryable at the same applied frontier.
+    checkpoint_pending: Cell<bool>,
 }
 
 impl<M> SnapshotCoordinator<M> {
@@ -466,6 +469,7 @@ impl<M> SnapshotCoordinator<M> {
             io: SnapshotIo::Compio,
             checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
             last_checkpoint: Cell::new((0, 0)),
+            checkpoint_pending: Cell::new(false),
         }
     }
 
@@ -4007,11 +4011,15 @@ where
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
+        if snap_op <= coordinator.last_checkpoint().0 && !coordinator.checkpoint_pending.get() {
+            return;
+        }
         // A transferred table may include replies above the restored STM floor.
         // Recovery must never replay that interval against its later protection.
         if snap_op < self.client_table_frontier.get() {
             return;
         }
+        coordinator.checkpoint_pending.set(true);
         // Stamp created_at from the injected consensus clock (seed-derived
         // under the simulator), not the wall clock, so replayed snapshots are
         // byte-identical.
@@ -4077,6 +4085,9 @@ where
         // whatever it reached, and a snapshot left offering those bodies strands
         // the peer that picks this replica as a repair source.
         consensus.note_journal_mutation();
+        if drained.is_ok() {
+            coordinator.checkpoint_pending.set(false);
+        }
         if let Err(e) = drained {
             error!(
                 target: "iggy.metadata.diag",
@@ -4920,6 +4931,7 @@ mod tests {
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
     use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
+    use journal::superblock::SuperblockContents;
     use message_bus::{
         BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
     };
@@ -5221,6 +5233,28 @@ mod tests {
     }
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
+
+    #[derive(Default)]
+    struct CheckpointSuperblock {
+        fail: Cell<bool>,
+        writes: Cell<usize>,
+    }
+
+    #[allow(clippy::future_not_send)]
+    impl SuperblockStore for CheckpointSuperblock {
+        async fn write(&self, _payload: &[u8]) -> io::Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            if self.fail.get() {
+                Err(io::Error::other("injected checkpoint superblock failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn read_latest(&self) -> io::Result<SuperblockContents> {
+            Ok(SuperblockContents::Empty)
+        }
+    }
 
     /// Build a peer-shard-style `IggyMetadata` with `consensus`,
     /// `journal`, and `snapshot` all `None`. Enough to test the
@@ -8638,6 +8672,116 @@ mod tests {
         assert_eq!(metadata.client_table_frontier.get(), TABLE_FRONTIER);
         assert!(!metadata.client_table_mutation_allowed(TABLE_FRONTIER));
         assert!(metadata.client_table_mutation_allowed(TABLE_FRONTIER + 1));
+    }
+
+    #[compio::test]
+    async fn given_a_saved_snapshot_and_failed_superblock_when_retrying_should_finish_the_same_checkpoint()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let superblock = Rc::new(CheckpointSuperblock::default());
+        superblock.fail.set(true);
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux, CheckpointSuperblock> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                Some(Rc::clone(&superblock)),
+                TestMux::default(),
+                Some(directory.path().to_path_buf()),
+            );
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        let request = CreateUserRequest {
+            username: WireName::new("root").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &RoutedRequestHeader::default(),
+                Operation::CreateUser,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&metadata.client_table.borrow()),
+        );
+        assert_eq!(
+            metadata
+                .mux_stm
+                .gated_update(prepare.deep_copy())
+                .unwrap()
+                .code,
+            0
+        );
+        journal.append(prepare).await.unwrap();
+        consensus.sequencer().set_sequence(1);
+        consensus.restore_commit_state(1, 1);
+        metadata.set_checkpoint_margin(usize::MAX);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        assert_eq!(coordinator.last_checkpoint().0, 1);
+        assert!(coordinator.snapshot_path().exists());
+        assert!(coordinator.checkpoint_pending.get());
+        assert_eq!(superblock.writes.get(), 1);
+        superblock.fail.set(false);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        assert!(!coordinator.checkpoint_pending.get());
+        assert_eq!(superblock.writes.get(), 2);
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(superblock.writes.get(), 2);
+    }
+
+    #[compio::test]
+    async fn given_no_applied_progress_when_forcing_checkpoints_should_not_persist_empty_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        metadata.set_checkpoint_margin(usize::MAX);
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        for _ in 0..3 {
+            metadata.checkpoint_if_needed(consensus, journal).await;
+        }
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        assert_eq!(coordinator.last_checkpoint(), (0, 0));
+        assert!(!coordinator.snapshot_path().exists());
+        assert!(!coordinator.checkpoint_pending.get());
     }
 
     #[compio::test]

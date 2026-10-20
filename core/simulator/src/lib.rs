@@ -2135,6 +2135,25 @@ mod tests {
             for initialization in &backups {
                 assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
             }
+            if !replicated {
+                let journal = &sim.replicas[0].metadata_journal;
+                let original = journal.entry_sync(1).unwrap();
+                let mut parent = 0;
+                for op in 179..=181 {
+                    let mut repaired = original.deep_copy();
+                    let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+                        &mut repaired.as_mut_slice()[..size_of::<PrepareHeader>()],
+                    );
+                    header.op = op;
+                    header.commit = op - 1;
+                    header.view += 1;
+                    header.parent = parent;
+                    header.timestamp += op;
+                    header.checksum = header.identity_checksum();
+                    parent = header.checksum;
+                    journal.append(repaired).now_or_never().unwrap().unwrap();
+                }
+            }
             sim.replica_restart(0);
             let restarted = start_root_initialization(&mut sim, 0, false);
             for _ in 0..2_000 {
@@ -2229,92 +2248,114 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn given_journaled_root_when_a_fresh_replica_needs_state_transfer_should_recover_without_credentials()
      {
-        let directory = tempfile::tempdir().unwrap();
-        let mut sim = Simulator::build_inner(
-            3,
-            1,
-            std::iter::once(1),
-            PacketSimulatorOptions {
-                node_count: 3,
-                client_count: 1,
-                seed: 4586,
-                ..Default::default()
-            },
-            true,
-            Some(directory.path()),
-            false,
-        );
-        sim.replica_crash(2);
-        let initializations = [
-            start_root_initialization(&mut sim, 0, true),
-            start_root_initialization(&mut sim, 1, false),
-        ];
-        for _ in 0..200 {
-            sim.step();
-            if initializations
-                .iter()
-                .all(|initialization| initialization.result.borrow().is_some())
-            {
-                break;
-            }
-        }
-        for initialization in &initializations {
-            assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
-        }
-        sim.set_metadata_journal_slots(80);
-        let client = SimClient::new(1);
-        sim.shell_login(&client);
-        for sequence in 0..40 {
-            let reply = submit_and_wait_for_reply(
-                &mut sim,
-                client.client_id(),
-                0,
-                client.create_stream(&format!("root-recovery-{sequence}")),
+        for chunk in [2, 128] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut sim = Simulator::build_inner(
+                3,
+                1,
+                std::iter::once(1),
+                PacketSimulatorOptions {
+                    node_count: 3,
+                    client_count: 1,
+                    seed: 4586,
+                    ..Default::default()
+                },
+                true,
+                Some(directory.path()),
+                false,
             );
-            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
-            for _ in 0..40 {
+            for node in &sim.replicas {
+                for shard in &node.shards {
+                    shard.set_repair_chunk_max(chunk);
+                }
+            }
+            sim.replica_crash(2);
+            let initializations = [
+                start_root_initialization(&mut sim, 0, true),
+                start_root_initialization(&mut sim, 1, false),
+            ];
+            for _ in 0..200 {
                 sim.step();
+                if initializations
+                    .iter()
+                    .all(|initialization| initialization.result.borrow().is_some())
+                {
+                    break;
+                }
             }
-        }
-        assert!(snapshot_floor(&sim, 0) > 1);
-        assert!(sim.replicas[0].metadata_journal.header(1).is_none());
-        sim.replica_restart(2);
-        let rejoined = start_root_initialization(&mut sim, 2, false);
-        for _ in 0..8_000 {
-            sim.step();
-            if rejoined.result.borrow().is_some()
-                && committed_stream_names(&sim, 2) == committed_stream_names(&sim, 0)
-            {
-                break;
+            for initialization in &initializations {
+                assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
             }
+            sim.set_metadata_journal_slots(80);
+            let client = SimClient::new(1);
+            sim.shell_login(&client);
+            for sequence in 0..40 {
+                let reply = submit_and_wait_for_reply(
+                    &mut sim,
+                    client.client_id(),
+                    0,
+                    client.create_stream(&format!("root-recovery-{sequence}")),
+                );
+                assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+                for _ in 0..40 {
+                    sim.step();
+                }
+            }
+            assert!(snapshot_floor(&sim, 0) > 1);
+            assert!(sim.replicas[0].metadata_journal.header(1).is_none());
+            sim.replica_restart(2);
+            for shard in &sim.replicas[2].shards {
+                shard.set_repair_chunk_max(chunk);
+            }
+            let rejoined = start_root_initialization(&mut sim, 2, false);
+            for _ in 0..8_000 {
+                sim.step();
+                let checkpoint = directory.path().join("replica-2/metadata/snapshot.bin");
+                if checkpoint.exists() {
+                    assert!(
+                        metadata::impls::metadata::IggySnapshot::load(&checkpoint)
+                            .unwrap()
+                            .0
+                            .snapshot()
+                            .sequence_number
+                            > 0
+                    );
+                }
+                if rejoined.result.borrow().is_some()
+                    && committed_stream_names(&sim, 2) == committed_stream_names(&sim, 0)
+                {
+                    break;
+                }
+            }
+            assert!(matches!(*rejoined.result.borrow(), Some(Ok(()))));
+            assert!(sim.network.delivered_any(Command::RequestStateChunk));
+            assert!(sim.network.delivered_any(Command::StateChunk));
+            assert_eq!(
+                committed_stream_names(&sim, 2),
+                committed_stream_names(&sim, 0)
+            );
+            let root_identity = |node: usize| {
+                sim.replicas[node].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .users()
+                    .read(|users| {
+                        assert_eq!(users.items.len(), 1);
+                        let root = users.items.get(0).unwrap();
+                        (
+                            root.username.clone(),
+                            root.password_hash.clone(),
+                            root.created_at,
+                        )
+                    })
+            };
+            assert_eq!(root_identity(2), root_identity(0));
+            sim.shell_login_via(&client, 2);
         }
-        assert!(matches!(*rejoined.result.borrow(), Some(Ok(()))));
-        assert!(sim.network.delivered_any(Command::RequestStateChunk));
-        assert!(sim.network.delivered_any(Command::StateChunk));
-        assert_eq!(
-            committed_stream_names(&sim, 2),
-            committed_stream_names(&sim, 0)
-        );
-        let root_identity = |node: usize| {
-            sim.replicas[node].shards[0]
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| {
-                    assert_eq!(users.items.len(), 1);
-                    let root = users.items.get(0).unwrap();
-                    (
-                        root.username.clone(),
-                        root.password_hash.clone(),
-                        root.created_at,
-                    )
-                })
-        };
-        assert_eq!(root_identity(2), root_identity(0));
-        sim.shell_login_via(&client, 2);
     }
 
     const DISCONNECT_STREAM: &str = "sim-stream-0";

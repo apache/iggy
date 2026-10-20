@@ -45,7 +45,7 @@ use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, load_ca_pem, load_pem,
     self_signed_for_loopback,
 };
-use metadata::impls::metadata::StreamsFrontend;
+use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::RecoveryError;
 use metadata::impls::{METADATA_DIR, SNAPSHOT_FILE_NAME};
 use rustls::pki_types::ServerName;
@@ -263,8 +263,13 @@ pub(in crate::boot) fn resolve_root_credentials(
 }
 
 fn validate_root_journal(metadata_path: &Path) -> Result<bool, ServerError> {
-    if metadata_path.join(SNAPSHOT_FILE_NAME).exists() {
-        return Ok(true);
+    let snapshot_path = metadata_path.join(SNAPSHOT_FILE_NAME);
+    if snapshot_path.exists() {
+        let (snapshot, _) = IggySnapshot::load(&snapshot_path)
+            .map_err(|error| ServerError::MetadataRecovery(RecoveryError::Snapshot(error)))?;
+        if snapshot.snapshot().sequence_number > 0 {
+            return Ok(true);
+        }
     }
     let path = metadata_path.join("journal.wal");
     let result = find_prepare_header(&path, 1)
@@ -683,8 +688,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn given_a_persisted_root_or_snapshot_when_validating_should_allow_recovery_without_credentials()
+    #[compio::test]
+    async fn given_a_persisted_root_or_snapshot_when_validating_should_allow_recovery_without_credentials()
      {
         let metadata_path = tempfile::tempdir().unwrap();
         let mut header = PrepareHeader {
@@ -701,9 +706,45 @@ mod tests {
         )
         .unwrap();
         assert!(validate_root_journal(metadata_path.path()).unwrap());
-        std::fs::write(metadata_path.path().join(SNAPSHOT_FILE_NAME), []).unwrap();
+        IggySnapshot::new(1)
+            .persist(&metadata_path.path().join(SNAPSHOT_FILE_NAME))
+            .await
+            .unwrap();
         std::fs::write(metadata_path.path().join("journal.wal"), [0u8; HEADER_SIZE]).unwrap();
         assert!(validate_root_journal(metadata_path.path()).unwrap());
+    }
+
+    #[compio::test]
+    async fn given_a_zero_op_checkpoint_when_validating_should_still_require_root_in_the_wal() {
+        let metadata_path = tempfile::tempdir().unwrap();
+        IggySnapshot::new(0)
+            .persist(&metadata_path.path().join(SNAPSHOT_FILE_NAME))
+            .await
+            .unwrap();
+        assert!(!validate_root_journal(metadata_path.path()).unwrap());
+        let path = metadata_path.path().join("journal.wal");
+        let incomplete = root_prepare_header(2, Operation::Register);
+        std::fs::write(&path, bytemuck::bytes_of(&incomplete)).unwrap();
+        assert!(matches!(
+            validate_root_journal(metadata_path.path()),
+            Err(ServerError::RootBootstrapMissing { .. })
+        ));
+        let root = root_prepare_header(1, Operation::CreateUser);
+        std::fs::write(&path, bytemuck::bytes_of(&root)).unwrap();
+        assert!(validate_root_journal(metadata_path.path()).unwrap());
+    }
+
+    #[test]
+    fn given_a_corrupt_checkpoint_when_validating_root_should_refuse_without_modifying_it() {
+        let metadata_path = tempfile::tempdir().unwrap();
+        let path = metadata_path.path().join(SNAPSHOT_FILE_NAME);
+        let bytes = b"corrupt snapshot";
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            validate_root_journal(metadata_path.path()),
+            Err(ServerError::MetadataRecovery(RecoveryError::Snapshot(_)))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     fn root_prepare_header(op: u64, operation: Operation) -> PrepareHeader {

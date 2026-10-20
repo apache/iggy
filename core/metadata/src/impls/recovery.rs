@@ -323,6 +323,47 @@ pub struct RecoveredMetadata<M> {
     pub chain_break_op: Option<u64>,
 }
 
+/// The contiguous WAL run that can prove recovery's committed frontier.
+pub struct ReplayPrefix<'a> {
+    pub headers: &'a [PrepareHeader],
+    pub commit_watermark: u64,
+    pub chain_break_op: Option<u64>,
+}
+
+/// Select the contiguous parent-chained suffix above a snapshot from sorted headers.
+#[must_use]
+pub fn replay_prefix(headers: &[PrepareHeader], snapshot_op: u64, solo: bool) -> ReplayPrefix<'_> {
+    let start = headers.partition_point(|header| header.op <= snapshot_op);
+    let suffix = &headers[start..];
+    let mut previous = headers[..start]
+        .last()
+        .filter(|header| snapshot_op != 0 && header.op == snapshot_op);
+    let mut expected = snapshot_op.saturating_add(1).max(1);
+    let mut length = 0;
+    let mut commit_watermark = snapshot_op;
+    let mut chain_break_op = None;
+    for header in suffix {
+        let broken_chain = previous.is_some_and(|previous| {
+            previous.checksum != CHECKSUM_UNSEALED
+                && header.checksum != CHECKSUM_UNSEALED
+                && header.parent != previous.checksum
+        });
+        if header.op != expected || broken_chain {
+            chain_break_op = Some(header.op);
+            break;
+        }
+        commit_watermark = commit_watermark.max(if solo { header.op } else { header.commit });
+        previous = Some(header);
+        expected = header.op.saturating_add(1);
+        length += 1;
+    }
+    ReplayPrefix {
+        headers: &suffix[..length],
+        commit_watermark,
+        chain_break_op,
+    }
+}
+
 /// Recover metadata state from disk.
 ///
 /// 1. Load snapshot from `{data_dir}/metadata/snapshot.bin` if present
@@ -482,10 +523,6 @@ where
         &metadata_dir,
     )?;
 
-    let replay_from = snapshot
-        .as_ref()
-        .map_or(0, |snapshot| snapshot.sequence_number() + 1);
-
     let mux_stm = if let Some(snapshot) = snapshot.as_ref() {
         M::restore_snapshot(snapshot.snapshot())?
     } else {
@@ -511,30 +548,19 @@ where
         );
     }
 
-    // Intentional fail-fast: a bad entry aborts recovery and the operator
-    // must repair or truncate the WAL before the node can boot again.
-    let headers_to_replay = journal.iter_headers_from(replay_from);
-
-    // Committed watermark: the `commit` field of each journaled prepare is
-    // the primary's commit point when it was sent, so the highest one is the
-    // highest commit this WAL can prove. Ops above it were prepared but not
-    // provably committed; applying them here would fabricate commit knowledge
-    // (a crashed suffix may have been discarded by a view change) and would
-    // hide the suffix from re-replication. A max fold (not `.last()`) so a
-    // future non-monotone stamping change cannot silently under-apply the
-    // committed prefix.
-    let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let commit_watermark = if identity.is_solo() {
-        headers_to_replay
-            .iter()
-            .map(|header| header.op)
-            .fold(snapshot_floor, u64::max)
-    } else {
-        headers_to_replay
-            .iter()
-            .map(|header| header.commit)
-            .fold(snapshot_floor, u64::max)
-    };
+    let headers = journal.iter_headers_from(snapshot_op);
+    let prefix = replay_prefix(&headers, snapshot_op, identity.is_solo());
+    let headers_to_replay = prefix.headers;
+    let commit_watermark = prefix.commit_watermark;
+    let chain_break_op = prefix.chain_break_op;
+    if let Some(op) = chain_break_op {
+        tracing::error!(
+            op,
+            snapshot_op,
+            last_contiguous_op = headers_to_replay.last().map(|header| header.op),
+            "metadata WAL does not connect at this op, stopping replay before the suffix"
+        );
+    }
 
     // The superblock's `commit_max` is the highest op this replica knew the cluster had
     // committed when it last wrote. Report a gap against what the WAL can prove, since
@@ -562,36 +588,7 @@ where
 
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
-    let mut chain_break_op: Option<u64> = None;
-    let mut previous: Option<PrepareHeader> = None;
-    for header in &headers_to_replay {
-        // Stop at the first op that does not connect to the one before it. Applying
-        // across a hole replays effects onto a state machine that never saw the
-        // missing op, and nothing downstream re-checks it.
-        //
-        // The WAL scan does not cover this: it only fires on CONSECUTIVE ops with
-        // both ends sealed, so a gap reaches here. The first replayed op is exempt,
-        // since a snapshot records no checksum for its parent to chain to.
-        if let Some(previous) = previous {
-            let gap = previous.op + 1 != header.op;
-            let broken_chain = previous.checksum != CHECKSUM_UNSEALED
-                && header.checksum != CHECKSUM_UNSEALED
-                && header.parent != previous.checksum;
-            if gap || broken_chain {
-                tracing::error!(
-                    op = header.op,
-                    previous_op = previous.op,
-                    gap,
-                    broken_chain,
-                    "metadata WAL does not connect at this op; stopping replay and dropping the \
-                     suffix for VSR repair"
-                );
-                chain_break_op = Some(header.op);
-                break;
-            }
-        }
-        previous = Some(*header);
-
+    for header in headers_to_replay {
         last_journaled_op = Some(header.op);
         if header.op > commit_watermark {
             continue;
@@ -1150,6 +1147,156 @@ mod tests {
         let checksum = header.identity_checksum();
         header.checksum = checksum;
         message
+    }
+
+    #[compio::test]
+    async fn given_a_snapshot_and_disconnected_wal_when_recovering_should_ignore_its_commit_claims()
+    {
+        for identity in [CLUSTERED, SOLO] {
+            for contiguous in [0, 2] {
+                let directory = tempdir().unwrap();
+                let metadata_dir = directory.path().join("metadata");
+                std::fs::create_dir_all(&metadata_dir).unwrap();
+                protected_snapshot(100)
+                    .persist(&metadata_dir.join("snapshot.bin"))
+                    .await
+                    .unwrap();
+                {
+                    let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                        .await
+                        .unwrap();
+                    journal
+                        .append(make_prepare_with_commit(100, 100, 32))
+                        .await
+                        .unwrap();
+                    for op in 101..101 + contiguous {
+                        journal
+                            .append(make_prepare_with_commit(op, 100, 32))
+                            .await
+                            .unwrap();
+                    }
+                    for op in 179..=181 {
+                        journal
+                            .append(make_prepare_with_commit(op, op - 1, 32))
+                            .await
+                            .unwrap();
+                    }
+                }
+                let recovered = recover::<TestStm>(
+                    directory.path(),
+                    identity,
+                    journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                    CLIENTS_TABLE_MAX,
+                    |_| {},
+                    |_, _| {},
+                )
+                .await
+                .unwrap();
+                assert_eq!(recovered.chain_break_op, Some(179));
+                assert_eq!(
+                    recovered.last_applied_op,
+                    (identity.is_solo() && contiguous > 0).then_some(102)
+                );
+                assert_eq!(recovered.last_journaled_op, (contiguous > 0).then_some(102));
+                assert_eq!(recovered.journal.last_op(), Some(100 + contiguous));
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_fork_after_a_snapshot_when_recovering_should_stop_at_the_snapshot_parent() {
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        protected_snapshot(100)
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .await
+            .unwrap();
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                .await
+                .unwrap();
+            let fork = make_chained_prepare(101, 101, 0xdead_beef);
+            let child = make_chained_prepare(102, 102, fork.header().checksum);
+            journal.append(fork).await.unwrap();
+            journal
+                .append(make_chained_prepare(100, 100, 0))
+                .await
+                .unwrap();
+            journal.append(child).await.unwrap();
+        }
+        let recovered = recover::<TestStm>(
+            directory.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.chain_break_op, Some(101));
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, None);
+        assert_eq!(recovered.journal.last_op(), Some(100));
+    }
+
+    #[compio::test]
+    async fn given_an_uncommitted_root_and_disconnected_tail_when_recovering_should_not_apply_root()
+    {
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let body = CreateUserRequest {
+            username: WireName::new("uncommitted-root").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let mut root = make_prepare_with_commit(1, 0, body.len());
+        root.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut root.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.operation = Operation::CreateUser;
+        header.timestamp = 1;
+        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+        header.checksum = header.identity_checksum();
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal.append(root).await.unwrap();
+            for op in 179..=181 {
+                journal
+                    .append(make_prepare_with_commit(op, op - 1, 32))
+                    .await
+                    .unwrap();
+            }
+        }
+        let recovered = recover::<UserStm>(
+            directory.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            recovered
+                .mux_stm
+                .users()
+                .read(|users| users.items.is_empty())
+        );
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, Some(1));
+        assert_eq!(recovered.chain_break_op, Some(179));
+        assert_eq!(recovered.journal.last_op(), Some(1));
     }
 
     #[compio::test]
