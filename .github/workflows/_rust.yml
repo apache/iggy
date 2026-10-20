@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   checks:
-    name: ${{ matrix.component == 'rust' && matrix.task || format('{0}/{1}', matrix.component, matrix.task) }}
+    name: ${{ matrix.task }}
     if: ${{ fromJSON(inputs.plan).checks[0] != null }}
     strategy:
       fail-fast: true
