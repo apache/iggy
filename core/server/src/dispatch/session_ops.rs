@@ -110,6 +110,11 @@ where
         return Err(LoginRegisterError::InvalidCredentials);
     }
     shard.plane.metadata().mux_stm.users().read(|users| {
+        if users.items.is_empty() {
+            return Err(LoginRegisterError::Transient(
+                MetadataSubmitError::NotCaughtUp,
+            ));
+        }
         let Some(user) = users.user_by_name(username) else {
             // Constant-cost path: verify against a dummy hash so a missing
             // username is indistinguishable by response timing from a wrong
@@ -172,6 +177,11 @@ where
     // not own the metadata consensus.
     let now = IggyTimestamp::from(shard.bus.realtime_micros());
     shard.plane.metadata().mux_stm.users().read(|users| {
+        if users.items.is_empty() {
+            return Err(LoginRegisterError::Transient(
+                MetadataSubmitError::NotCaughtUp,
+            ));
+        }
         let Some((user_id, token_name)) =
             users.personal_access_token_index.get(token_hash.as_str())
         else {
@@ -1289,6 +1299,23 @@ mod tests {
     use shard::{PartitionConsensusConfig, ReplicaTopology, ShardIdentity};
     use std::future::Future;
     use std::mem::size_of;
+
+    #[test]
+    fn given_uninitialized_root_when_verifying_credentials_should_return_a_retryable_failure() {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 3, FIRST_BOOT));
+        for result in [
+            verify_login_credentials(&shard, "iggy", "iggy"),
+            verify_pat_credentials(&shard, "test-token"),
+        ] {
+            assert!(matches!(
+                result,
+                Err(LoginRegisterError::Transient(
+                    MetadataSubmitError::NotCaughtUp
+                ))
+            ));
+        }
+    }
 
     #[test]
     fn terminal_vs_transient() {

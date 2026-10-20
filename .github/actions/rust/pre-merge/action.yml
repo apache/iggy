@@ -477,14 +477,15 @@ runs:
 
     # macOS is build-only everywhere else in CI, so runtime regressions in the
     # non-Linux driver path (kqueue instead of io_uring) would ship unnoticed.
-    # Boot the freshly built server and ping it over TCP; ping is pre-auth so
-    # no credentials are needed. The retry flags keep each attempt bounded
-    # regardless of CLI reconnection defaults, so a dead server fails the
-    # step fast instead of hanging until the job timeout.
+    # Boot the freshly built server and ping it over TCP. The server refuses
+    # to boot without root credentials, while ping itself is pre-auth. The
+    # retry flags keep each attempt bounded regardless of CLI reconnection
+    # defaults, so a dead server fails the step fast instead of hanging until
+    # the job timeout.
     - name: Smoke test iggy-server boot on macOS
       if: inputs.task == 'build-macos-aarch64'
       run: |
-        target/debug/iggy-server --fresh > server-boot.log 2>&1 &
+        target/debug/iggy-server --fresh --with-default-root-credentials > server-boot.log 2>&1 &
         SERVER_PID=$!
         stop_server() {
           local stop_timeout=30
