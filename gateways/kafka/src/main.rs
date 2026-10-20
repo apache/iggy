@@ -318,6 +318,12 @@ fn load_config() -> Result<GatewayConfig, String> {
         );
     }
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
+    if config.auto_topic_creation.enabled {
+        info!(
+            partitions = config.auto_topic_creation.partitions,
+            "auto topic creation is on: a Metadata lookup of a missing topic creates it"
+        );
+    }
     reject_unread_iggy_tls(
         config.sasl_enabled(),
         bridge_enabled()?,

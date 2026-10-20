@@ -577,7 +577,11 @@ fn decode_requested_topics(
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+    use crate::group::{GroupCoordinator, GroupCoordinatorConfig};
+    use crate::protocol::auto_topic_creation::AutoTopicCreationConfig;
 
     const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
@@ -670,6 +674,34 @@ mod tests {
         let (requested, allow) = decode_requested_topics(3, body, TEST_MAX_FRAME_SIZE).unwrap();
         assert_eq!(requested, Some(vec![StrBytes::from_static_str("orders")]));
         assert!(allow);
+    }
+
+    /// A lookup that failed tells nothing about whether the topic exists, so an Iggy outage must
+    /// not start creating every topic clients name while it lasts.
+    #[tokio::test]
+    async fn given_auto_creation_when_the_lookup_fails_should_not_start_creating() {
+        let bridge = Arc::new(IggyBridge::offline());
+        let state = GatewayState::new(
+            Some(Arc::clone(&bridge)),
+            TEST_MAX_FRAME_SIZE,
+            0,
+            GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
+        )
+        .with_auto_topic_creation(AutoTopicCreationConfig {
+            enabled: true,
+            partitions: 1,
+        })
+        .expect("a valid partition count");
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // one topic
+            0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's',
+        ]);
+
+        let outcome = handle(&state, &ConnectionState::default(), None, 3, body).await;
+
+        let _ = outcome.expect_response("a failed lookup is still answered");
+        let creator = state.auto_topic_creation.as_ref().expect("creation is on");
+        assert_eq!(creator.in_flight(), 0);
     }
 
     fn topic_result(name: &'static str, error_code: i16, partitions_count: u32) -> TopicResult {

@@ -262,7 +262,12 @@ impl TestServer {
     /// its assertions, orphaning a process that still holds its `PortGuard` slot, which then
     /// fails the next test that draws that slot to bind.
     pub async fn spawn_with_password(data_dir: &std::path::Path, password: &str) -> Self {
-        Self::spawn_configured(data_dir, password, None).await
+        Self::spawn_configured(data_dir, password, None, &[]).await
+    }
+
+    /// [`Self::spawn`] with server settings of its own, as `IGGY_*` variables.
+    pub async fn spawn_with_env(data_dir: &std::path::Path, env: &[(&str, &str)]) -> Self {
+        Self::spawn_configured(data_dir, "iggy", None, env).await
     }
 
     /// Spawns `iggy-server` whose TCP listener speaks only TLS, with the given PEM pair.
@@ -274,13 +279,14 @@ impl TestServer {
         cert_file: &std::path::Path,
         key_file: &std::path::Path,
     ) -> Self {
-        Self::spawn_configured(data_dir, "iggy", Some((cert_file, key_file))).await
+        Self::spawn_configured(data_dir, "iggy", Some((cert_file, key_file)), &[]).await
     }
 
     async fn spawn_configured(
         data_dir: &std::path::Path,
         password: &str,
         tls: Option<(&std::path::Path, &std::path::Path)>,
+        env: &[(&str, &str)],
     ) -> Self {
         let port_guard = PortGuard::acquire();
         let address = format!("127.0.0.1:{}", port_guard.port);
@@ -322,7 +328,8 @@ impl TestServer {
             // a fresh server provisions no loginable root user at all, and every bridge connect
             // attempt fails with "invalid credentials" no matter what this test passes.
             .env("IGGY_ROOT_USERNAME", "iggy")
-            .env("IGGY_ROOT_PASSWORD", password);
+            .env("IGGY_ROOT_PASSWORD", password)
+            .envs(env.iter().copied());
         if let Some((cert_file, key_file)) = tls {
             // `self_signed` is off explicitly: left on, the server would still load an existing
             // pair, but the test should fail loudly on a missing file rather than mint one.

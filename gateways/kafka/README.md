@@ -14,10 +14,12 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
 > that reaches this port can also create topics just by naming them in a `Metadata` request. When
 > the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
-> `DeleteTopics`, `AlterConfigs` and `Metadata` auto-creation additionally require it to hold
-> `manage_topics`; without it every resource/name in the request fails `TOPIC_AUTHORIZATION_FAILED`
-> (29) and nothing is written, created or deleted. `CreateTopics` has no such gate yet - SASL on
-> does not protect it. Every client reads and writes as the bridge's Iggy user.
+> `DeleteTopics`, `AlterConfigs` and `Metadata` auto-creation additionally require it to hold a
+> global `manage_topics` or `manage_streams`; without it every resource of a `DeleteTopics` or
+> `AlterConfigs` request, and every missing topic a `Metadata` request would create, fails
+> `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted. `CreateTopics` has
+> no such gate yet - SASL on does not protect it. Every client reads and writes as the bridge's
+> Iggy user.
 > See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
@@ -631,20 +633,31 @@ topics that rely on creation by first use then work without a `CreateTopics` cal
   `UNKNOWN_TOPIC_OR_PARTITION` and never created. Any other name starting with `__`, such as a
   Debezium heartbeat topic, is created like any other.
 - When the connection has a principal (a SASL login, a client certificate mapped to an Iggy user,
-  or `ANONYMOUS` beside either), a principal without `manage_topics` (or `manage_streams`) is
-  answered `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is created. One whose permissions could
-  not be read is answered `UNKNOWN_TOPIC_OR_PARTITION` (3) and nothing is created, since 29 is
-  fatal to Java producers, consumers and Streams while Produce and Fetch still work for it. An
-  explicit `CreateTopics` is not checked against `manage_topics` today, so a
-  principal refused auto-creation can still create the same topic with `CreateTopics`.
+  or `ANONYMOUS` beside either), it needs a global `manage_topics` or `manage_streams`. Only global
+  grants count: `manage_topics` granted on one stream does not, even where Iggy would let the
+  principal create the topic. A principal without it is answered `TOPIC_AUTHORIZATION_FAILED` (29)
+  for each missing topic it names, and nothing is created; topics that exist are answered as usual.
+  Kafka clients treat 29 as fatal, so a consumer whose principal may not create topics should set
+  `allow.auto.create.topics=false`, which keeps its lookups of a missing topic answered
+  `UNKNOWN_TOPIC_OR_PARTITION` (3). A principal whose permissions could not be read is answered 3
+  and nothing is created, since 29 is fatal to Java producers, consumers and Streams while Produce
+  and Fetch still work for it. An explicit `CreateTopics` is not checked against `manage_topics`
+  today, so a principal refused auto-creation can still create the same topic with `CreateTopics`.
 - A topic already being created is not started twice. At most 100 creations run at once; a name
   past that is started by a later refresh. A creation Iggy refuses, for example at
-  `metadata.partitions_max`, is not retried for 1 second. Its first failure is logged at `warn`,
-  and repeats within a minute at `debug`.
+  `metadata.partitions_max`, is not retried for 1 second. One Iggy refuses for the bridge user's
+  permissions is not retried for a minute: Iggy refuses those only after journaling the create, so
+  each attempt costs a replicated metadata write. A name waiting out either still counts toward the
+  100. Its first failure is logged at `warn`, and repeats within a minute at `debug`.
 - Creations run as the bridge's Iggy user, like `CreateTopics`, on an Iggy client of their own.
-  That includes the backing Iggy stream, which the topic mapping names and the client never does:
-  a principal with `manage_topics` but no stream rights still gets a new stream when the mapping
-  names one that does not exist yet.
+  Both create the topic first, and the backing Iggy stream, which the topic mapping names and the
+  client never does, only when Iggy reports it missing. The bridge user needs `manage_topics` on
+  that stream, or globally, to create a topic in a stream that exists, and the global
+  `manage_streams` to create a missing stream. A principal with `manage_topics` but no stream
+  rights still gets a new stream when the mapping names one that does not exist yet.
+- Like every topic the gateway creates, an auto-created topic has no message expiry (see
+  [Provisioning and idempotency](#provisioning-and-idempotency)): its messages are kept until a
+  client sets `retention.ms` with `AlterConfigs`.
 - Shutdown cancels the creations still running before the bridge signs out, and drops their
   client if any was running, so the sign-out does not wait behind it. An embedder that builds its
   own `GatewayState` calls `shutdown_auto_topic_creation` before closing the bridge.
@@ -679,7 +692,8 @@ With auto-creation off, the default, nothing changes: a missing topic is answere
 - `IGGY_KAFKA_PRODUCE_SESSIONS=0`: all producers share one client, one request at a time.
 - Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs share 1 more client, one
   Iggy request at a time. Fetch polls use 4 more, one per read slot, and a `ListOffsets` lookup
-  by time borrows one of those slots for its request. Topic probes use 1 more.
+  by time borrows one of those slots for its request. Topic probes use 1 more. With auto topic
+  creation on, creations use 1 more, opened at the first one.
   Offset calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.

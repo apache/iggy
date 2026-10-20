@@ -313,7 +313,8 @@ impl IggyBridge {
     }
 }
 
-/// [`IggyBridge::metadata_write`] on `client`, for the writes that run on a client of their own.
+/// [`IggyBridge::metadata_write`] on `client`, for the writes that run on the admin client or on
+/// the auto topic creation client.
 async fn metadata_write_on<T, F: Future<Output = Result<T, IggyError>>>(
     client: &IggyClient,
     mut write: impl FnMut() -> F,

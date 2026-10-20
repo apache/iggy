@@ -1337,9 +1337,9 @@ fn consume_as_group(gateway: SocketAddr, count: usize) -> String {
     .expect_ran("java console consumer in a group")
 }
 
-/// The issue's acceptance case: with auto topic creation on, a stock Java producer sends to a topic
-/// nobody created and succeeds. Its first `Metadata` is answered `UNKNOWN_TOPIC_OR_PARTITION` while
-/// the gateway creates the topic, and it retries until the topic appears.
+/// With auto topic creation on, a stock Java producer sends to a topic nobody created and succeeds.
+/// Its first `Metadata` is answered `UNKNOWN_TOPIC_OR_PARTITION` while the gateway creates the
+/// topic, and it retries until the topic appears.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_auto_topic_creation_when_the_java_producer_sends_to_a_new_topic_should_succeed() {
     const NEW_TOPIC: &str = "auto-created";

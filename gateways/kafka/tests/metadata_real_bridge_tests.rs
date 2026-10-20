@@ -21,11 +21,17 @@
 //! than through `kafka_protocol`'s own `Encodable`/`Decodable` (this crate builds
 //! `broker`-feature-only: request `Decodable` and response `Encodable`, not the reverse).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use iggy::prelude::{
+    GlobalPermissions, Identifier, Permissions, StreamClient, StreamPermissions, UserClient,
+    UserStatus,
+};
+use secrecy::SecretString;
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +52,7 @@ mod codec;
 mod iggy_server;
 
 use codec::{Decoder, Encoder};
-use iggy_server::TestServer;
+use iggy_server::{TestServer, raw_client};
 
 const REQUEST_VERSION: i16 = 9;
 const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
@@ -174,13 +180,16 @@ async fn connected_state(server: &TestServer) -> (GatewayState, IggyBridge) {
     let seed = IggyBridge::connect(server.test_config())
         .await
         .expect("seed bridge should connect to a ready server");
-    let state = GatewayState::new(
+    (gateway_on(bridge), seed)
+}
+
+fn gateway_on(bridge: IggyBridge) -> GatewayState {
+    GatewayState::new(
         Some(Arc::new(bridge)),
         TEST_MAX_FRAME_SIZE,
         0,
         GroupCoordinator::new(GroupCoordinatorConfig::default(), CancellationToken::new()),
-    );
-    (state, seed)
+    )
 }
 
 #[tokio::test]
@@ -720,4 +729,165 @@ async fn given_auto_creation_when_a_double_underscore_name_is_not_kafka_internal
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn wait_until_created(seed: &IggyBridge, name: &str) {
+    let deadline = tokio::time::Instant::now() + AUTO_CREATE_WAIT;
+    while !exists(seed, name).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the topic was not created in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The default stream does not exist yet, so the creation makes it before the topic.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_when_the_mapped_stream_is_missing_should_create_the_stream_and_the_topic()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+    let root = raw_client(&server).await;
+    let stream = Identifier::named("kafka").expect("stream name");
+    assert!(
+        root.get_stream(&stream)
+            .await
+            .expect("stream lookup")
+            .is_none()
+    );
+
+    let topics = send_as(&state, None, &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    wait_until_created(&seed, "orders").await;
+}
+
+const LIMITED_USER: &str = "kafka-bridge";
+const LIMITED_PASSWORD: &str = "kafka-bridge-secret";
+
+/// Iggy lets a user create topics in a stream it holds `manage_topics` on, while creating a
+/// stream needs the global `manage_streams`. Such a bridge user auto-creates into a stream that
+/// already exists.
+#[tokio::test]
+#[serial]
+async fn given_a_bridge_user_with_manage_topics_on_the_stream_only_when_auto_creating_there_should_create()
+ {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let manage_topics = StreamPermissions {
+        manage_topics: true,
+        ..StreamPermissions::default()
+    };
+    let state = auto_creating(gateway_on(limited_bridge(&server, manage_topics).await));
+    let seed = IggyBridge::connect(server.test_config())
+        .await
+        .expect("seed bridge");
+
+    let topics = send_as(&state, None, &["orders"], true).await;
+
+    assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    wait_until_created(&seed, "orders").await;
+}
+
+/// Creates the default stream, then a bridge user holding only `on_stream` on it, signed in.
+async fn limited_bridge(server: &TestServer, on_stream: StreamPermissions) -> IggyBridge {
+    let root = raw_client(server).await;
+    let stream = root.create_stream("kafka").await.expect("seed the stream");
+    let stream_id = usize::try_from(stream.id).expect("stream id fits usize");
+    let permissions = Permissions {
+        global: GlobalPermissions::default(),
+        streams: Some(BTreeMap::from([(stream_id, on_stream)])),
+    };
+    root.create_user(
+        LIMITED_USER,
+        LIMITED_PASSWORD,
+        UserStatus::Active,
+        Some(permissions),
+    )
+    .await
+    .expect("create the bridge user");
+    let mut config = server.test_config();
+    config.username = LIMITED_USER.to_string();
+    config.password = SecretString::from(LIMITED_PASSWORD);
+    IggyBridge::connect(config)
+        .await
+        .expect("the limited bridge user signs in")
+}
+
+/// Lets the first creation sign its client in, which Iggy journals, before the journal is
+/// measured.
+const FIRST_CREATION_WAIT: Duration = Duration::from_millis(500);
+
+/// Long enough for two retries after the first creation's hold.
+const RETRY_WINDOW: Duration = Duration::from_secs(3);
+
+fn journal_len(data_dir: &Path) -> u64 {
+    std::fs::metadata(data_dir.join("metadata").join("journal.wal"))
+        .expect("the metadata journal")
+        .len()
+}
+
+/// Starts creating `kafka_topic`, then names it every 100 ms for [`RETRY_WINDOW`], as a producer
+/// waiting for it does. Returns the journal's length before the first creation, and after it.
+async fn name_repeatedly(state: &GatewayState, data_dir: &Path, kafka_topic: &str) -> (u64, u64) {
+    let before = journal_len(data_dir);
+    let _ = send_as(state, None, &[kafka_topic], true).await;
+    tokio::time::sleep(FIRST_CREATION_WAIT).await;
+    let after_first = journal_len(data_dir);
+    let deadline = tokio::time::Instant::now() + RETRY_WINDOW;
+    while tokio::time::Instant::now() < deadline {
+        let topics = send_as(state, None, &[kafka_topic], true).await;
+        assert_eq!(topics[0].1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (before, after_first)
+}
+
+/// At `metadata.partitions_max`, Iggy refuses a topic before journaling it. A retried creation
+/// into a stream that exists must not write anything else, such as a `create_stream` Iggy only
+/// refuses after journaling it.
+#[tokio::test]
+#[serial]
+async fn given_auto_creation_at_the_partition_cap_when_it_retries_should_journal_nothing() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server =
+        TestServer::spawn_with_env(data_dir.path(), &[("IGGY_METADATA_PARTITIONS_MAX", "1")]).await;
+    let (state, seed) = connected_state(&server).await;
+    let state = auto_creating(state);
+    seed.ensure_stream_and_topic("payments", 1)
+        .await
+        .expect("fill the partition cap");
+
+    let (before, after_first) = name_repeatedly(&state, data_dir.path(), "orders").await;
+
+    assert!(after_first > before, "the first creation signed in");
+    assert_eq!(journal_len(data_dir.path()), after_first);
+    assert!(!exists(&seed, "orders").await);
+}
+
+/// Iggy refuses a create the bridge user may not make only after journaling it, so a name it
+/// refused is not retried while clients keep naming it.
+#[tokio::test]
+#[serial]
+async fn given_a_bridge_user_iggy_refuses_when_the_topic_is_named_again_should_not_retry_soon() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let read_only = StreamPermissions {
+        read_stream: true,
+        ..StreamPermissions::default()
+    };
+    let state = auto_creating(gateway_on(limited_bridge(&server, read_only).await));
+    let seed = IggyBridge::connect(server.test_config())
+        .await
+        .expect("seed bridge");
+
+    let (before, after_first) = name_repeatedly(&state, data_dir.path(), "orders").await;
+
+    assert!(after_first > before, "the first creation reached Iggy");
+    assert_eq!(journal_len(data_dir.path()), after_first);
+    assert!(!exists(&seed, "orders").await);
 }

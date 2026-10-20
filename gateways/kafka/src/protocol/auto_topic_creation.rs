@@ -43,12 +43,21 @@ use crate::error::KafkaProtocolError;
 /// must not queue them all. A name not started now is started by a later refresh.
 pub(crate) const MAX_IN_FLIGHT_CREATIONS: usize = 100;
 
-/// How long a topic whose creation failed or timed out is not tried again.
+/// How long a topic whose creation failed or timed out is not tried again, unless
+/// [`REFUSED_CREATION_BACKOFF`] applies.
 ///
 /// A producer refreshes `Metadata` every `retry.backoff.ms` (100 ms by default) while it waits, so
 /// without this a creation Iggy refuses, for example at `partitions_max`, would run ten times a
 /// second.
 pub(crate) const FAILED_CREATION_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How long a topic whose creation Iggy refused for the bridge user's permissions is not tried
+/// again.
+///
+/// Iggy decides that refusal only when it applies the create, after journaling and replicating
+/// it, so each attempt costs a metadata write. Only an operator's grant changes the answer, so a
+/// minute between attempts delays little next to a write a second per name.
+const REFUSED_CREATION_BACKOFF: Duration = Duration::from_secs(60);
 
 /// How long shutdown waits for cancelled creations to end. A cancelled creation ends at its next
 /// poll, so this only covers a runtime too busy to poll it.
@@ -130,9 +139,9 @@ impl AutoTopicCreator {
     }
 
     /// Starts creating `kafka_topic` in the background, unless it is already being created, it
-    /// failed less than [`FAILED_CREATION_BACKOFF`] ago, [`MAX_IN_FLIGHT_CREATIONS`] are
-    /// running, or shutdown began. Returns whether it started one. The caller answers
-    /// `UNKNOWN_TOPIC_OR_PARTITION` either way.
+    /// failed less than [`FAILED_CREATION_BACKOFF`] (or [`REFUSED_CREATION_BACKOFF`]) ago,
+    /// [`MAX_IN_FLIGHT_CREATIONS`] are running, or shutdown began. Returns whether it started one.
+    /// The caller answers `UNKNOWN_TOPIC_OR_PARTITION` either way.
     pub(crate) fn start(&self, bridge: &Arc<IggyBridge>, kafka_topic: &str) -> bool {
         if self.cancel.is_cancelled() {
             return false;
@@ -173,7 +182,7 @@ impl AutoTopicCreator {
     }
 
     #[cfg(test)]
-    fn in_flight(&self) -> usize {
+    pub(crate) fn in_flight(&self) -> usize {
         self.in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -181,14 +190,14 @@ impl AutoTopicCreator {
     }
 }
 
-/// Creates `kafka_topic`, then holds it for [`FAILED_CREATION_BACKOFF`] if that failed.
+/// Creates `kafka_topic`, then, if that failed, holds it for as long as [`backoff_after`] says.
 async fn create(
     bridge: &IggyBridge,
     kafka_topic: &str,
     partitions: u32,
     warnings: &FailureWarnings,
 ) {
-    let back_off = match bridge
+    let hold = match bridge
         .auto_create_kafka_topic(kafka_topic, partitions)
         .await
     {
@@ -198,30 +207,41 @@ async fn create(
                 kafka_topic,
                 partitions, "auto-created a topic a Metadata request named"
             );
-            false
+            None
         }
         Ok(TopicCreationOutcome::AlreadyExists)
         | Err(BridgeError::Iggy(IggyError::RequestAlreadyApplied)) => {
             warnings.forget(kafka_topic);
-            false
+            None
         }
-        // Outcome unknown, the create may still land. Held like a failure so a refresh does not
-        // dial a second client for a create the first may still be sending.
-        Err(BridgeError::Timeout) => {
-            debug!(kafka_topic, "auto topic creation timed out");
-            true
+        // The create may still land. Held like a failure only to space out retries of this name:
+        // a retry that races it is harmless, since Iggy refuses a name already taken.
+        Err(
+            error @ (BridgeError::Timeout | BridgeError::Iggy(IggyError::OperationUncertain(_))),
+        ) => {
+            debug!(kafka_topic, %error, "auto topic creation outcome unknown, it may still land");
+            Some(backoff_after(&error))
         }
         Err(error) if warnings.should_warn(kafka_topic, Instant::now()) => {
             warn!(kafka_topic, %error, "auto topic creation failed");
-            true
+            Some(backoff_after(&error))
         }
         Err(error) => {
             debug!(kafka_topic, %error, "auto topic creation failed again");
-            true
+            Some(backoff_after(&error))
         }
     };
-    if back_off {
-        tokio::time::sleep(FAILED_CREATION_BACKOFF).await;
+    if let Some(hold) = hold {
+        tokio::time::sleep(hold).await;
+    }
+}
+
+/// How long a name is held after its creation failed with `error`.
+const fn backoff_after(error: &BridgeError) -> Duration {
+    if matches!(error, BridgeError::Iggy(IggyError::Unauthorized)) {
+        REFUSED_CREATION_BACKOFF
+    } else {
+        FAILED_CREATION_BACKOFF
     }
 }
 

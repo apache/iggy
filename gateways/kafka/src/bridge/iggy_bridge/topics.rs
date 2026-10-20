@@ -43,9 +43,9 @@ pub const DEFAULT_TOPIC_PARTITIONS: u32 = 1;
 /// refused the same way on every path, including `CreateTopics`' `validate_only`.
 pub const MAX_TOPIC_PARTITIONS: u32 = 1000;
 
-/// How long one auto topic creation may take: a connect, `create_stream` and `create_topic`, each
-/// bounded by [`REQUEST_TIMEOUT`] on its own.
-const AUTO_CREATE_LIMIT: std::time::Duration = REQUEST_TIMEOUT.saturating_mul(3);
+/// How long one auto topic creation may take: a connect, `create_topic`, and for a missing stream
+/// `create_stream` and `create_topic` again, each bounded by [`REQUEST_TIMEOUT`] on its own.
+const AUTO_CREATE_LIMIT: std::time::Duration = REQUEST_TIMEOUT.saturating_mul(4);
 
 /// Outcome of [`IggyBridge::create_kafka_topic`].
 ///
@@ -438,7 +438,7 @@ impl IggyBridge {
     /// # Errors
     ///
     /// Same as [`Self::create_kafka_topic`].
-    pub async fn auto_create_kafka_topic(
+    pub(crate) async fn auto_create_kafka_topic(
         &self,
         kafka_topic: &str,
         partition_count: u32,
@@ -453,6 +453,14 @@ impl IggyBridge {
     }
 
     /// [`Self::create_kafka_topic`] on `client`.
+    ///
+    /// Creates the topic first, and the stream only when Iggy reports it missing, which costs one
+    /// refused `create_topic` for each stream that has to be created. Iggy refuses a
+    /// `create_stream` of a stream that exists, or one the bridge user may not create, only after
+    /// journaling and replicating it, so creating the stream first would cost every creation, and
+    /// every retry of a refused one, a metadata write. It would also lock out a bridge user that
+    /// holds `manage_topics` on the stream alone: `create_topic` accepts that grant, while
+    /// `create_stream` needs the global `manage_streams`.
     async fn create_kafka_topic_on(
         &self,
         client: &IggyClient,
@@ -466,17 +474,27 @@ impl IggyBridge {
             });
         }
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
-        let stream_id = ensure_stream(client, stream_name).await?;
+        let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
 
         let options = TopicCreateOptions {
             partitions_count: Some(partition_count),
             ..TopicCreateOptions::default()
         };
-        match metadata_write_on(client, || {
-            client.create_topic(&stream_id, topic_name, &options)
-        })
-        .await
-        {
+        let create_topic = || {
+            metadata_write_on(client, || {
+                client.create_topic(&stream_id, topic_name, &options)
+            })
+        };
+        let created = match create_topic().await {
+            Err(BridgeError::Iggy(
+                IggyError::StreamIdNotFound(_) | IggyError::StreamNameNotFound(_),
+            )) => {
+                ensure_stream(client, stream_name).await?;
+                create_topic().await
+            }
+            created => created,
+        };
+        match created {
             Ok(created) => {
                 info!("created Iggy topic '{topic_name}' with {partition_count} partitions");
                 // Same postcondition check ensure_topic's own create branch makes: partitions_count
