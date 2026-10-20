@@ -16,6 +16,7 @@
 # under the License.
 
 import json
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 
@@ -336,25 +337,9 @@ class TestLoginIdentity:
         name = unique_name(min_bytes=16, max_bytes=30)
         http_host, http_port = get_http_server_config()
         api = f"http://{http_host}:{http_port}"
-        login_req = urllib.request.Request(  # noqa: S310
-            f"{api}/users/login",
-            data=json.dumps({"username": "iggy", "password": "iggy"}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        jwt, personal_access_token = _create_personal_access_token(
+            api, "iggy", "iggy", name, NEVER_EXPIRE
         )
-        with urllib.request.urlopen(login_req, timeout=10) as response:  # noqa: S310
-            jwt = json.loads(response.read())["access_token"]["token"]
-        create_req = urllib.request.Request(  # noqa: S310
-            f"{api}/personal-access-tokens",
-            data=json.dumps({"name": name, "expiry": NEVER_EXPIRE}).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {jwt}",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(create_req, timeout=10) as response:  # noqa: S310
-            personal_access_token = json.loads(response.read())["token"]
 
         try:
             host, port = get_server_config()
@@ -371,13 +356,7 @@ class TestLoginIdentity:
             assert identity.user_id == user.id
             assert personal_access_token not in repr(identity)
         finally:
-            delete_req = urllib.request.Request(  # noqa: S310
-                f"{api}/personal-access-tokens/{name}",
-                headers={"Authorization": f"Bearer {jwt}"},
-                method="DELETE",
-            )
-            with urllib.request.urlopen(delete_req, timeout=10):  # noqa: S310
-                pass
+            _delete_personal_access_token(api, jwt, name)
 
     @pytest.mark.parametrize(
         "token",
@@ -412,7 +391,11 @@ class TestLoginIdentity:
             with pytest.raises(RuntimeError):
                 await client.login_with_personal_access_token(personal_access_token)
         finally:
-            _delete_personal_access_token(api, jwt, name)
+            try:
+                _delete_personal_access_token(api, jwt, name)
+            except urllib.error.HTTPError as error:
+                if error.code != 404:
+                    raise
 
     @pytest.mark.asyncio
     async def test_deleted_personal_access_token_fails(self, unique_name):
