@@ -20,12 +20,9 @@ on:
   workflow_call:
     inputs:
       plan:
-        description: "JSON with checks (component/task entries) and tests (boolean)"
+        description: "JSON with checks (component/task entries)"
         type: string
         required: true
-    secrets:
-      CODECOV_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -90,10 +87,3 @@ jobs:
           path: reports/**
           if-no-files-found: ignore
           retention-days: 7
-
-  tests:
-    name: tests
-    if: ${{ fromJSON(inputs.plan).tests }}
-    uses: ./.github/workflows/_rust_tests.yml
-    secrets:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -230,7 +230,6 @@ class RuntimeSelection(unittest.TestCase):
         self.assertTrue(runtime_plan["tests"])
         self.assertEqual([entry["task"] for entry in runtime_plan["checks"]], ["test-storage-compat"])
         plan = json.loads(outputs["rust_plan"])
-        self.assertFalse(plan["tests"])
         self.assertFalse({"test", "test-storage-compat"} & {entry["task"] for entry in plan["checks"]})
 
     def test_swift_only_change_builds_server_for_e2e(self):

@@ -349,7 +349,7 @@ jobs:
             }
 
   check-tags:
-    name: Check existing tags
+    name: Existing tags
     needs: [validate, plan]
     if: needs.validate.outputs.has_targets == 'true' && fromJson(needs.plan.outputs.targets).include[0].key != 'noop'
     runs-on: ubuntu-26.04
