@@ -83,11 +83,7 @@ func (c *IggyTcpClient) DeleteConsumerGroup(ctx context.Context, streamId iggcon
 		},
 		GroupId: groupId,
 	})
-	if err != nil {
-		return err
-	}
-	c.groups.markLeft(newGroupKey(streamId, topicId, groupId))
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) JoinConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
@@ -98,11 +94,7 @@ func (c *IggyTcpClient) JoinConsumerGroup(ctx context.Context, streamId iggcon.I
 		},
 		GroupId: groupId,
 	})
-	if err != nil {
-		return err
-	}
-	c.groups.markJoined(newGroupKey(streamId, topicId, groupId))
-	return nil
+	return err
 }
 
 func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
@@ -113,11 +105,34 @@ func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.
 		},
 		GroupId: groupId,
 	})
-	if err != nil {
-		return err
+	return err
+}
+
+// refreshMembership applies the committed request before its lane is released,
+// including raw requests and operations completed through ResolveOperation.
+func (c *IggyTcpClient) refreshMembership(code command.Code, body []byte) {
+	if code != command.JoinGroupCode && code != command.LeaveGroupCode && code != command.DeleteGroupCode {
+		return
 	}
-	c.groups.markLeft(newGroupKey(streamId, topicId, groupId))
-	return nil
+	var key groupKey
+	for _, field := range []*string{&key.stream, &key.topic, &key.group} {
+		if len(body) < fieldPrefixSize {
+			return
+		}
+		end := fieldPrefixSize + int(body[1])
+		if end > len(body) {
+			return
+		}
+		*field, body = string(body[:end]), body[end:]
+	}
+	if len(body) != 0 {
+		return
+	}
+	if code == command.JoinGroupCode {
+		c.groups.markJoined(key)
+	} else {
+		c.groups.markLeft(key)
+	}
 }
 
 func (c *IggyTcpClient) SyncConsumerGroup(

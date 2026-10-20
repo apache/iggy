@@ -17,7 +17,7 @@
 
 use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
-use crate::stm::authz::GatedApply;
+use crate::stm::authz::{GatedApply, reject_stale_session};
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use consensus::{
     ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
@@ -26,8 +26,8 @@ use consensus::{
 use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::IggyError;
-use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use journal::superblock::{
     PingPongSuperblock, SLOT_FILE_NAMES, SuperblockContents, SuperblockStore,
@@ -43,6 +43,10 @@ pub enum RecoveryError {
     Journal(JournalError),
     StateMachine(IggyError),
     Io(std::io::Error),
+    DisconnectedSoloJournal {
+        path: PathBuf,
+        op: u64,
+    },
     /// Opening or reading the durable superblock failed. `dir` is the metadata
     /// directory holding [`journal::superblock::SLOT_FILE_NAMES`]: `compio` attaches no
     /// path to its I/O errors, so without this the operator's chain ends in a bare
@@ -150,6 +154,11 @@ impl fmt::Display for RecoveryError {
             Self::Journal(e) => write!(f, "recovery journal error: {e}"),
             Self::StateMachine(e) => write!(f, "recovery state machine error: {e}"),
             Self::Io(e) => write!(f, "recovery I/O error: {e}"),
+            Self::DisconnectedSoloJournal { path, op } => write!(
+                f,
+                "solo metadata journal {} does not connect at op {op}, refusing boot without changing the WAL",
+                path.display()
+            ),
             Self::Superblock { dir, source } => write!(
                 f,
                 "recovery superblock error in {} ({} / {}): {source}",
@@ -236,7 +245,8 @@ impl std::error::Error for RecoveryError {
             Self::CheckpointAheadOfSnapshot { .. }
             | Self::CheckpointChecksumMismatch { .. }
             | Self::SuperblockUnreadable { .. }
-            | Self::SuperblockIdentityMismatch { .. } => None,
+            | Self::SuperblockIdentityMismatch { .. }
+            | Self::DisconnectedSoloJournal { .. } => None,
         }
     }
 }
@@ -308,18 +318,57 @@ pub struct RecoveredMetadata<M> {
     /// carries the primary's commit watermark when the prepare was sent, and
     /// journaled does not imply committed.
     pub last_applied_op: Option<u64>,
-    /// Highest op present in the journal, `None` when it is empty. Ops in
-    /// `(last_applied_op, last_journaled_op]` are prepared-but-uncommitted:
-    /// they stay journal-only until the recovered primary re-replicates them
-    /// (or a backup sees the commit point advance past them).
+    /// Highest durable op above the snapshot floor, `None` when none remain.
+    /// Later entries may have committed elsewhere. They stay unapplied until
+    /// the cluster proves the adopted log and repairs any missing prefix.
     pub last_journaled_op: Option<u64>,
     /// First op replay could not connect to its predecessor, `None` when the
     /// replayed range is one unbroken chain.
     ///
-    /// `Some(op)` means entries at and above `op` were truncated and must come back
-    /// from the cluster. `last_journaled_op` stops below it, which keeps the restored
-    /// head, the re-pipeline range, and the recovery barrier honest.
+    /// Entries at and above it remain durable but unapplied until the cluster's
+    /// view-log proof reconciles them. The restored head includes this suffix.
     pub chain_break_op: Option<u64>,
+}
+
+/// The contiguous WAL run that can prove recovery's committed frontier.
+pub struct ReplayPrefix<'a> {
+    pub headers: &'a [PrepareHeader],
+    pub commit_watermark: u64,
+    pub chain_break_op: Option<u64>,
+}
+
+/// Select the contiguous parent-chained suffix above a snapshot from sorted headers.
+#[must_use]
+pub fn replay_prefix(headers: &[PrepareHeader], snapshot_op: u64, solo: bool) -> ReplayPrefix<'_> {
+    let start = headers.partition_point(|header| header.op <= snapshot_op);
+    let suffix = &headers[start..];
+    let mut previous = headers[..start]
+        .last()
+        .filter(|header| snapshot_op != 0 && header.op == snapshot_op);
+    let mut expected = snapshot_op.saturating_add(1).max(1);
+    let mut length = 0;
+    let mut commit_watermark = snapshot_op;
+    let mut chain_break_op = None;
+    for header in suffix {
+        let broken_chain = previous.is_some_and(|previous| {
+            previous.checksum != CHECKSUM_UNSEALED
+                && header.checksum != CHECKSUM_UNSEALED
+                && header.parent != previous.checksum
+        });
+        if header.op != expected || broken_chain {
+            chain_break_op = Some(header.op);
+            break;
+        }
+        commit_watermark = commit_watermark.max(if solo { header.op } else { header.commit });
+        previous = Some(header);
+        expected = header.op.saturating_add(1);
+        length += 1;
+    }
+    ReplayPrefix {
+        headers: &suffix[..length],
+        commit_watermark,
+        chain_break_op,
+    }
 }
 
 /// Recover metadata state from disk.
@@ -337,8 +386,8 @@ pub struct RecoveredMetadata<M> {
 ///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
-/// `seed_baseline` reproduces boot-time state that never reaches the WAL
-/// (today: the locally-ensured root user). It runs on the freshly-defaulted
+/// `seed_baseline` reproduces caller-supplied state outside the WAL.
+/// Production root creation is journaled. The callback runs on the freshly-defaulted
 /// state machine BEFORE journal replay and ONLY when no snapshot exists, so
 /// replayed ops land on the same baseline (and the same slab ids) they were
 /// originally applied over. A snapshot already contains that baseline.
@@ -481,10 +530,6 @@ where
         &metadata_dir,
     )?;
 
-    let replay_from = snapshot
-        .as_ref()
-        .map_or(0, |snapshot| snapshot.sequence_number() + 1);
-
     let mux_stm = if let Some(snapshot) = snapshot.as_ref() {
         M::restore_snapshot(snapshot.snapshot())?
     } else {
@@ -510,30 +555,25 @@ where
         );
     }
 
-    // Intentional fail-fast: a bad entry aborts recovery and the operator
-    // must repair or truncate the WAL before the node can boot again.
-    let headers_to_replay = journal.iter_headers_from(replay_from);
-
-    // Committed watermark: the `commit` field of each journaled prepare is
-    // the primary's commit point when it was sent, so the highest one is the
-    // highest commit this WAL can prove. Ops above it were prepared but not
-    // provably committed; applying them here would fabricate commit knowledge
-    // (a crashed suffix may have been discarded by a view change) and would
-    // hide the suffix from re-replication. A max fold (not `.last()`) so a
-    // future non-monotone stamping change cannot silently under-apply the
-    // committed prefix.
-    let snapshot_floor = snapshot.as_ref().map_or(0, IggySnapshot::sequence_number);
-    let commit_watermark = if identity.is_solo() {
-        headers_to_replay
-            .iter()
-            .map(|header| header.op)
-            .fold(snapshot_floor, u64::max)
-    } else {
-        headers_to_replay
-            .iter()
-            .map(|header| header.commit)
-            .fold(snapshot_floor, u64::max)
-    };
+    let headers = journal.iter_headers_from(snapshot_op);
+    let prefix = replay_prefix(&headers, snapshot_op, identity.is_solo());
+    let headers_to_replay = prefix.headers;
+    let commit_watermark = prefix.commit_watermark;
+    let chain_break_op = prefix.chain_break_op;
+    if let Some(op) = chain_break_op {
+        if identity.is_solo() {
+            return Err(RecoveryError::DisconnectedSoloJournal {
+                path: journal_path,
+                op,
+            });
+        }
+        tracing::error!(
+            op,
+            snapshot_op,
+            last_contiguous_op = headers_to_replay.last().map(|header| header.op),
+            "metadata WAL does not connect at this op, stopping replay before the suffix"
+        );
+    }
 
     // The superblock's `commit_max` is the highest op this replica knew the cluster had
     // committed when it last wrote. Report a gap against what the WAL can prove, since
@@ -560,38 +600,8 @@ where
     }
 
     let mut last_applied_op: Option<u64> = None;
-    let mut last_journaled_op: Option<u64> = None;
-    let mut chain_break_op: Option<u64> = None;
-    let mut previous: Option<PrepareHeader> = None;
-    for header in &headers_to_replay {
-        // Stop at the first op that does not connect to the one before it. Applying
-        // across a hole replays effects onto a state machine that never saw the
-        // missing op, and nothing downstream re-checks it.
-        //
-        // The WAL scan does not cover this: it only fires on CONSECUTIVE ops with
-        // both ends sealed, so a gap reaches here. The first replayed op is exempt,
-        // since a snapshot records no checksum for its parent to chain to.
-        if let Some(previous) = previous {
-            let gap = previous.op + 1 != header.op;
-            let broken_chain = previous.checksum != CHECKSUM_UNSEALED
-                && header.checksum != CHECKSUM_UNSEALED
-                && header.parent != previous.checksum;
-            if gap || broken_chain {
-                tracing::error!(
-                    op = header.op,
-                    previous_op = previous.op,
-                    gap,
-                    broken_chain,
-                    "metadata WAL does not connect at this op; stopping replay and dropping the \
-                     suffix for VSR repair"
-                );
-                chain_break_op = Some(header.op);
-                break;
-            }
-        }
-        previous = Some(*header);
-
-        last_journaled_op = Some(header.op);
+    let last_journaled_op = journal.last_op().filter(|op| *op > snapshot_op);
+    for header in headers_to_replay {
         if header.op > commit_watermark {
             continue;
         }
@@ -628,12 +638,21 @@ where
                     "committed Register is missing from WAL",
                 ))
             })?;
-            let verifier = prepare.body().try_into().map_err(|_| {
+            let registration = RegisterRequest::decode_from(prepare.body()).map_err(|_| {
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
+            if !mux_stm.is_active_account(header.user_id, registration.user_created_at) {
+                last_applied_op = Some(header.op);
+                continue;
+            }
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table
-                .commit_register(header.client, header.user_id, verifier, reply)
+                .commit_register(
+                    header.client,
+                    header.user_id,
+                    registration.bind_verifier,
+                    reply,
+                )
                 .map_err(RecoveryError::RetryProtection)?;
             on_replayed_session(&mux_stm, header);
             last_applied_op = Some(header.op);
@@ -679,7 +698,8 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        let reply = mux_stm.gated_update(entry)?;
+        let reply = reject_stale_session(header, &client_table)
+            .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
         if let Some(user_id) = reply.revoked_user {
             for identity in client_table.end_user_sessions(user_id, header.op) {
                 on_replayed_session(
@@ -694,6 +714,7 @@ where
         }
         // Every client commit must restore its original receipt before admission.
         if header.client != consensus::client_table::RESERVED_CLIENT_ID
+            && !message_bus::is_auto_commit_client(header.client)
             && !matches!(
                 header.operation,
                 Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
@@ -720,22 +741,6 @@ where
             "recovery replayed op"
         );
         last_applied_op = Some(header.op);
-    }
-
-    // `truncate_from`, never `drain`: the removed ops must stay refillable, so the
-    // snapshot watermark stays put. Leaving them resident would make `append` refuse
-    // the slot, failing repair on exactly the ops it exists to fix.
-    if let Some(break_op) = chain_break_op {
-        let removed = journal
-            .truncate_from(break_op)
-            .await
-            .map_err(RecoveryError::Io)?;
-        tracing::warn!(
-            break_op,
-            removed,
-            last_journaled_op,
-            "dropped the disconnected metadata WAL suffix; the cluster re-supplies these ops"
-        );
     }
 
     Ok(RecoveredMetadata {
@@ -856,19 +861,23 @@ fn verify_checkpoint_pairing(
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use crate::impls::metadata::{StreamsFrontend, checkpoint_checksum};
+    use crate::impls::metadata::{StreamsFrontend, apply_committed_prepare, checkpoint_checksum};
+    use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::snapshot::{SNAPSHOT_FORMAT_VERSION, Snapshotable};
     use crate::stm::stream::{Streams, StreamsSnapshot};
-    use crate::stm::user::Users;
+    use crate::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES, Users};
     use consensus::CLIENTS_TABLE_MAX;
     use iggy_binary_protocol::consensus::{Command, Operation};
+    use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdateUserRequest,
     };
-    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions};
+    use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions, result_code};
     use iggy_common::UserStatus;
     use journal::Journal;
     use server_common::iobuf::Owned;
+    use std::cell::RefCell;
     use tempfile::tempdir;
 
     use crate::MuxStateMachine;
@@ -1006,8 +1015,13 @@ mod tests {
         user_id: u32,
         request: u64,
     ) -> Message<PrepareHeader> {
+        let registration = RegisterRequest {
+            user_created_at: 1,
+            bind_verifier: [0x5a; 32],
+        }
+        .to_bytes();
         let body: &[u8] = if operation == Operation::Register {
-            &[0x5a; 32]
+            &registration
         } else {
             &[]
         };
@@ -1132,7 +1146,198 @@ mod tests {
     }
 
     #[compio::test]
-    async fn recover_stops_at_a_gap_and_drops_the_disconnected_suffix() {
+    async fn given_a_snapshot_and_disconnected_wal_when_recovering_should_ignore_its_commit_claims()
+    {
+        for contiguous in [0, 2] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            protected_snapshot(100)
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                    .await
+                    .unwrap();
+                journal
+                    .append(make_prepare_with_commit(100, 100, 32))
+                    .await
+                    .unwrap();
+                for op in 101..101 + contiguous {
+                    journal
+                        .append(make_prepare_with_commit(op, 100, 32))
+                        .await
+                        .unwrap();
+                }
+                for op in 179..=181 {
+                    journal
+                        .append(make_prepare_with_commit(op, op - 1, 32))
+                        .await
+                        .unwrap();
+                }
+            }
+            let recovered = recover::<TestStm>(
+                directory.path(),
+                CLUSTERED,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.chain_break_op, Some(179));
+            assert_eq!(recovered.last_applied_op, None);
+            assert_eq!(recovered.last_journaled_op, Some(181));
+            assert_eq!(recovered.journal.last_op(), Some(181));
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_fork_after_a_snapshot_when_recovering_should_stop_at_the_snapshot_parent() {
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        protected_snapshot(100)
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .await
+            .unwrap();
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                .await
+                .unwrap();
+            let fork = make_chained_prepare(101, 101, 0xdead_beef);
+            let child = make_chained_prepare(102, 102, fork.header().checksum);
+            journal.append(fork).await.unwrap();
+            journal
+                .append(make_chained_prepare(100, 100, 0))
+                .await
+                .unwrap();
+            journal.append(child).await.unwrap();
+        }
+        let recovered = recover::<TestStm>(
+            directory.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.chain_break_op, Some(101));
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, Some(102));
+        assert_eq!(recovered.journal.last_op(), Some(102));
+    }
+
+    #[compio::test]
+    async fn given_an_uncommitted_root_and_disconnected_tail_when_recovering_should_not_apply_root()
+    {
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let body = CreateUserRequest {
+            username: WireName::new("uncommitted-root").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let mut root = make_prepare_with_commit(1, 0, body.len());
+        root.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut root.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.operation = Operation::CreateUser;
+        header.timestamp = 1;
+        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+        header.checksum = header.identity_checksum();
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal.append(root).await.unwrap();
+            for op in 179..=181 {
+                journal
+                    .append(make_prepare_with_commit(op, op - 1, 32))
+                    .await
+                    .unwrap();
+            }
+        }
+        let recovered = recover::<UserStm>(
+            directory.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(
+            recovered
+                .mux_stm
+                .users()
+                .read(|users| users.items.is_empty())
+        );
+        assert_eq!(recovered.last_applied_op, None);
+        assert_eq!(recovered.last_journaled_op, Some(181));
+        assert_eq!(recovered.chain_break_op, Some(179));
+        assert_eq!(recovered.journal.last_op(), Some(181));
+    }
+
+    #[compio::test]
+    async fn given_a_disconnected_solo_wal_when_recovering_should_refuse_without_rewriting_it() {
+        for forked in [false, true] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            protected_snapshot(100)
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            let path = metadata_dir.join("journal.wal");
+            {
+                let journal = PrepareJournal::open(&path, 100).await.unwrap();
+                if forked {
+                    let fork = make_chained_prepare(101, 101, 0xdead_beef);
+                    let child = make_chained_prepare(102, 102, fork.header().checksum);
+                    journal.append(fork).await.unwrap();
+                    journal
+                        .append(make_chained_prepare(100, 100, 0))
+                        .await
+                        .unwrap();
+                    journal.append(child).await.unwrap();
+                } else {
+                    journal
+                        .append(make_prepare_with_commit(100, 100, 32))
+                        .await
+                        .unwrap();
+                    journal
+                        .append(make_prepare_with_commit(179, 178, 32))
+                        .await
+                        .unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                recover::<TestStm>(directory.path(), SOLO,
+                    journal::prepare_journal::DEFAULT_SLOT_COUNT, CLIENTS_TABLE_MAX,
+                    |_| {}, |_, _| {}).await,
+                Err(RecoveryError::DisconnectedSoloJournal { op, .. })
+                    if op == if forked { 101 } else { 179 }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_gap_when_recovering_a_cluster_should_preserve_the_durable_suffix() {
         // Ops 1-3 then 5: op 4 never landed. Replaying 5 over a state machine that
         // never saw 4 diverges silently, and the WAL scan waves this through --
         // its chain check only fires on CONSECUTIVE ops, since a gap is also what
@@ -1177,13 +1382,13 @@ mod tests {
         );
         assert_eq!(
             recovered.last_journaled_op,
-            Some(3),
-            "the restored head stops below the break, so nothing re-pipelines it"
+            Some(5),
+            "the restored head must include every durable prepare for the view change"
         );
         assert_eq!(
             recovered.journal.last_op(),
-            Some(3),
-            "the disconnected entry is dropped so repair can journal the cluster's op 5"
+            Some(5),
+            "only a cluster view-log proof may remove a durable prepare"
         );
         assert_eq!(
             recovered.journal.snapshot_op(),
@@ -1692,12 +1897,265 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_revoked_user_when_replaying_wal_should_restore_ended_sessions() {
+    #[allow(clippy::too_many_lines)]
+    async fn given_reused_user_id_when_pending_operations_commit_should_reject_the_old_session() {
+        const CLIENT: u128 = 1;
+        const ROOT_CLIENT: u128 = 2;
+        const REPLACEMENT_CLIENT: u128 = 3;
+        const USER: u32 = 1;
+        const ROOT_SESSION: u64 = 1;
+        const SESSION: u64 = 3;
+        const REPLACEMENT_SESSION: u64 = 8;
+        const TOKEN_HASH: [u8; PAT_TOKEN_HASH_BYTES] = [b'a'; PAT_TOKEN_HASH_BYTES];
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+
+        // Admission rejects reserved IDs, but previously committed sessions must
+        // still replay and fence their pending operations after user deletion.
+        for (client_id, replace_before_token) in [
+            CLIENT,
+            message_bus::server_internal_client_id(0),
+            message_bus::AUTO_COMMIT_CLIENT_ID,
+        ]
+        .into_iter()
+        .flat_map(|client_id| [(client_id, false), (client_id, true)])
+        {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            let stm = UserStm::default();
+            stm.users().ensure_root_user("root", "hash");
+            let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+            let mut account = CreateUserRequest {
+                username: WireName::new("original").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            };
+            let original = account.to_bytes();
+            account.username = WireName::new("replacement").unwrap();
+            account.permissions = Some(WirePermissions {
+                global: WireGlobalPermissions {
+                    manage_servers: false,
+                    read_servers: false,
+                    manage_users: false,
+                    read_users: false,
+                    manage_streams: true,
+                    read_streams: false,
+                    manage_topics: false,
+                    read_topics: false,
+                    poll_messages: false,
+                    send_messages: false,
+                },
+                streams: Vec::new(),
+            });
+            let token = CreatePersonalAccessTokenRequest {
+                user_id: USER,
+                name: WireName::new("token").unwrap(),
+                expiry: 0,
+                token_hash: TOKEN_HASH,
+            }
+            .to_bytes();
+            let stream = CreateStreamRequest {
+                name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes();
+            let register = |created_at| {
+                RegisterRequest {
+                    user_created_at: created_at,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes()
+            };
+            let replacement = (
+                Operation::CreateUser,
+                account.to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            );
+            let pending_token = (
+                Operation::CreatePersonalAccessToken,
+                token.clone(),
+                client_id,
+                USER,
+                SESSION,
+            );
+            let (first, second) = if replace_before_token {
+                (replacement, pending_token)
+            } else {
+                (pending_token, replacement)
+            };
+            let operations = [
+                (Operation::Register, register(1), ROOT_CLIENT, 0, 0),
+                (
+                    Operation::CreateUser,
+                    original,
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+                (Operation::Register, register(2), client_id, USER, 0),
+                (
+                    Operation::DeleteUser,
+                    DeleteUserRequest {
+                        user_id: WireIdentifier::numeric(USER),
+                    }
+                    .to_bytes(),
+                    ROOT_CLIENT,
+                    0,
+                    ROOT_SESSION,
+                ),
+                first,
+                second,
+                (
+                    Operation::CreateStream,
+                    stream.clone(),
+                    client_id,
+                    USER,
+                    SESSION,
+                ),
+                (
+                    Operation::Register,
+                    register(if replace_before_token { 5 } else { 6 }),
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    0,
+                ),
+                (
+                    Operation::CreatePersonalAccessToken,
+                    token,
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    REPLACEMENT_SESSION,
+                ),
+                (
+                    Operation::CreateStream,
+                    stream,
+                    REPLACEMENT_CLIENT,
+                    USER,
+                    REPLACEMENT_SESSION,
+                ),
+                (
+                    Operation::CompleteLifecycle,
+                    CompleteLifecycleRequest::new(
+                        ROOT_SESSION,
+                        0,
+                        vec![LifecycleCompletion {
+                            topic_id: 0,
+                            partition_id: 0,
+                            partition_op: 1,
+                        }],
+                    )
+                    .unwrap()
+                    .to_bytes(),
+                    message_bus::server_internal_client_id(server_common::sharding::METADATA_GROUP),
+                    0,
+                    1,
+                ),
+            ];
+            let mut parent = 0;
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+                for (index, (operation, body, client, user_id, session)) in
+                    operations.into_iter().enumerate()
+                {
+                    let op = u64::try_from(index).unwrap() + 1;
+                    let mut prepare = make_prepare(op, body.len());
+                    prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                    let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                        |old, header: &mut PrepareHeader| {
+                            *header = old;
+                            header.operation = operation;
+                            header.client = client;
+                            header.user_id = user_id;
+                            header.session = session;
+                            header.request = if operation == Operation::Register {
+                                0
+                            } else {
+                                op
+                            };
+                            header.timestamp = op;
+                            header.parent = parent;
+                            header.checksum_body =
+                                u128::from(iggy_common::calculate_checksum(&body));
+                        },
+                    ));
+                    parent = prepare.header().checksum;
+                    let reply =
+                        apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                    let status = if operation == Operation::Register {
+                        result_code(reply.body()).unwrap_or(0)
+                    } else {
+                        result_code(reply.body()).unwrap()
+                    };
+                    let stale = client == client_id && operation != Operation::Register;
+                    assert_eq!(
+                        status,
+                        if stale {
+                            IggyError::StaleClient.as_code()
+                        } else {
+                            0
+                        },
+                        "{operation:?} at op {op}, client {client_id}, replace before token: {replace_before_token}"
+                    );
+                    if stale {
+                        assert_eq!(stm.users().read(|users| users.pat_count_of(USER)), 0);
+                        assert!(stm.streams().read(|streams| streams.items.is_empty()));
+                    }
+                    journal.append(prepare).await.unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let recovered = recover::<UserStm>(
+                directory.path(),
+                SOLO,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |stm| stm.users().ensure_root_user("root", "hash"),
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.client_table.encode(), table.borrow().encode());
+            assert_eq!(recovered.client_table.get_epoch(client_id), None);
+            assert_eq!(
+                recovered.client_table.get_epoch(REPLACEMENT_CLIENT),
+                Some(REPLACEMENT_SESSION)
+            );
+            assert_eq!(
+                recovered.mux_stm.users().read(|users| {
+                    let replacement = users.user_by_name("replacement").unwrap();
+                    (replacement.id, users.pat_count_of(USER))
+                }),
+                (USER, 1)
+            );
+            assert_eq!(
+                recovered
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams.items.len()),
+                1
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_revoked_user_when_replaying_wal_should_preserve_session_revocation() {
         const CLIENT: u128 = 0x1337;
         const ROOT_CLIENT: u128 = CLIENT + 1;
         const USER: u32 = 1;
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
-        for operation in [Operation::DeleteUser, Operation::UpdateUser] {
+        for (operation, register_first, replace) in [
+            (Operation::DeleteUser, true, false),
+            (Operation::UpdateUser, true, false),
+            (Operation::DeleteUser, false, false),
+            (Operation::UpdateUser, false, false),
+            (Operation::DeleteUser, false, true),
+        ] {
             let directory = tempdir().unwrap();
             let metadata_dir = directory.path().join("metadata");
             std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -1723,35 +2181,54 @@ mod tests {
                 }
                 .to_bytes()
             };
+            let registration = (
+                Operation::Register,
+                RegisterRequest {
+                    user_created_at: 2,
+                    bind_verifier: [0x5a; 32],
+                }
+                .to_bytes(),
+                CLIENT,
+                USER,
+            );
+            let mut entries = vec![
+                (
+                    Operation::Register,
+                    RegisterRequest {
+                        user_created_at: 1,
+                        bind_verifier: [0x5a; 32],
+                    }
+                    .to_bytes(),
+                    ROOT_CLIENT,
+                    0,
+                ),
+                (Operation::CreateUser, create.clone(), ROOT_CLIENT, 0),
+            ];
+            if register_first {
+                entries.push(registration.clone());
+            }
+            entries.push((operation, revocation, ROOT_CLIENT, 0));
+            if replace {
+                entries.push((Operation::CreateUser, create, ROOT_CLIENT, 0));
+            }
+            if !register_first {
+                entries.push(registration);
+            }
+            let last_op = entries.len() as u64;
             let mut parent = 0;
             {
                 let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                     .await
                     .unwrap();
-                for (op, operation, body, client, user_id) in [
-                    (
-                        1,
-                        Operation::Register,
-                        bytes::Bytes::from_static(&[0x5a; 32]),
-                        ROOT_CLIENT,
-                        0,
-                    ),
-                    (2, Operation::CreateUser, create, ROOT_CLIENT, 0),
-                    (
-                        3,
-                        Operation::Register,
-                        bytes::Bytes::from_static(&[0x5a; 32]),
-                        CLIENT,
-                        USER,
-                    ),
-                    (4, operation, revocation, ROOT_CLIENT, 0),
-                ] {
+                for (index, (operation, body, client, user_id)) in entries.into_iter().enumerate() {
+                    let op = index as u64 + 1;
                     let mut prepare = make_prepare(op, body.len());
                     prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
                     let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
                         |old, header: &mut PrepareHeader| {
                             *header = old;
                             header.operation = operation;
+                            header.timestamp = op;
                             header.client = client;
                             header.user_id = user_id;
                             header.session = 1;
@@ -1789,19 +2266,27 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(recovered.last_applied_op, Some(4));
+            assert_eq!(recovered.last_applied_op, Some(last_op));
             assert_eq!(recovered.client_table.get_epoch(CLIENT), None);
             assert_eq!(recovered.client_table.get_epoch(ROOT_CLIENT), Some(1));
-            assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
             let ended: Vec<_> = recovered.client_table.ended_sessions().collect();
-            assert_eq!(
-                ended,
-                vec![iggy_binary_protocol::requests::system::SessionIdentity {
-                    client_id: CLIENT,
-                    session: 3,
-                    metadata_watermark: 4,
-                }]
-            );
+            if register_first {
+                assert_eq!(*revoked.borrow(), vec![(CLIENT, 3, 4)]);
+                assert_eq!(
+                    ended,
+                    vec![iggy_binary_protocol::requests::system::SessionIdentity {
+                        client_id: CLIENT,
+                        session: 3,
+                        metadata_watermark: 4,
+                    }]
+                );
+            } else {
+                assert!(revoked.borrow().is_empty());
+                assert_eq!(
+                    ended,
+                    [] as [iggy_binary_protocol::requests::system::SessionIdentity; 0]
+                );
+            }
         }
     }
 

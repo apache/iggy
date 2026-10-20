@@ -19,23 +19,28 @@ use crate::session::ConsensusSession;
 use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
-use iggy_common::{AutoLogin, Credentials, IdKind, Identifier, IggyError};
-use lanes::Lanes;
+use iggy_common::{
+    AutoLogin, ConsumerGroupClientState, Credentials, IdKind, Identifier, IggyError,
+    PendingOperationsConfig,
+};
+use lanes::{Lanes, ProvedOutcomes};
+use pending::PendingOperations;
 use secrecy::SecretString;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::watch;
 
 mod lanes;
+mod pending;
 
 pub(crate) use lanes::{LaneKey, LaneTicket, RetainedOperation};
 
 /// The session state that every link of one client shares: the consensus
 /// session, its epoch, the lanes, the metadata watermark and the sign-in.
 ///
-/// Only [`Self::reset`] holds two of these locks, `session` and then `lanes`.
-/// The epoch is read and written under either of them, never the other way
-/// round. No lock is held across an await.
+/// Lock order is session, lanes, then either the proved outcomes or the
+/// pending-operation usage. The epoch is read and written under session or
+/// lanes, never the other way round. No lock is held across an await.
 #[derive(Debug)]
 pub(crate) struct SessionOwner {
     session: Mutex<ConsensusSession>,
@@ -44,6 +49,9 @@ pub(crate) struct SessionOwner {
     /// belongs to a replaced session.
     epoch: watch::Sender<SessionEpoch>,
     lanes: Mutex<Lanes>,
+    proved: Mutex<ProvedOutcomes>,
+    pending: Arc<PendingOperations>,
+    consumer_group_state: Arc<ConsumerGroupClientState>,
     /// The highest metadata commit a reply showed. A reset keeps it.
     metadata_watermark: AtomicU64,
     sign_in: Mutex<SignIn>,
@@ -55,6 +63,10 @@ pub(crate) struct SessionOwner {
 pub(crate) struct SessionEpoch {
     pub(crate) fence: u64,
     pub(crate) bound: bool,
+    /// A link reset the session because the server lost it, so the client
+    /// still signs in again by itself. Only a sign-in, the start of an
+    /// explicit one, an explicit reset or a forget clears it.
+    pub(crate) sign_in_owed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -79,15 +91,30 @@ struct RememberedSignIn {
 }
 
 impl SessionOwner {
+    #[cfg(test)]
     pub(crate) fn new(auto_login: AutoLogin) -> Self {
+        Self::with_pending_operations(auto_login, PendingOperationsConfig::default())
+    }
+
+    pub(crate) fn with_pending_operations(
+        auto_login: AutoLogin,
+        pending_operations: PendingOperationsConfig,
+    ) -> Self {
         Self {
             session: Mutex::new(ConsensusSession::new()),
             epoch: watch::Sender::new(SessionEpoch::default()),
             lanes: Mutex::default(),
+            proved: Mutex::new(ProvedOutcomes::new(pending_operations.max_operations)),
+            pending: Arc::new(PendingOperations::new(pending_operations)),
+            consumer_group_state: Arc::default(),
             metadata_watermark: AtomicU64::new(0),
             sign_in: Mutex::default(),
             auto_login,
         }
+    }
+
+    pub(crate) fn consumer_group_state(&self) -> Arc<ConsumerGroupClientState> {
+        Arc::clone(&self.consumer_group_state)
     }
 
     /// The caller must not replace the session through the guard, because
@@ -128,29 +155,52 @@ impl SessionOwner {
         }
         let first_bind = !consensus_session.is_bound();
         consensus_session.bind(session)?;
-        self.epoch
-            .send_if_modified(|epoch| !std::mem::replace(&mut epoch.bound, true));
+        self.epoch.send_if_modified(|epoch| {
+            let before = *epoch;
+            epoch.bound = true;
+            epoch.sign_in_owed = false;
+            *epoch != before
+        });
         Ok(first_bind)
     }
 
     /// Replaces the session, raises the fence and drops every retained
-    /// operation. The request counter, the watermark and the sign-in stay.
+    /// operation. The request counter, the proved outcomes, the watermark and
+    /// the sign-in stay. The caller ended the session, so no sign-in is owed.
     pub(crate) fn reset(&self) -> Result<(), IggyError> {
         let mut session = self.session()?;
-        self.replace(&mut session);
+        self.replace(&mut session, false);
         Ok(())
     }
 
     /// [`Self::reset`], but only while the fence is `fence`. So when every
     /// link finds the session gone, only one of them resets it. Returns the
-    /// new fence if this call reset the session.
-    pub(crate) fn reset_if_fence(&self, fence: u64) -> Result<Option<u64>, IggyError> {
+    /// new fence if this call reset the session. That session owes a sign-in
+    /// if `sign_in_owed`, which is false when a caller signs in next.
+    pub(crate) fn reset_if_fence(
+        &self,
+        fence: u64,
+        sign_in_owed: bool,
+    ) -> Result<Option<u64>, IggyError> {
         let mut session = self.session()?;
         if self.fence() != fence {
             return Ok(None);
         }
-        self.replace(&mut session);
+        self.replace(&mut session, sign_in_owed);
         Ok(Some(self.fence()))
+    }
+
+    /// [`Self::reset`], but only while a sign-in is owed. A caller that signs
+    /// in instead gets a new client id, because the server refuses another
+    /// user on the client id of the owed Register. The new fence fails a late
+    /// bind of that Register. Returns whether this call reset the session.
+    pub(crate) fn reset_if_sign_in_owed(&self) -> Result<bool, IggyError> {
+        let mut session = self.session()?;
+        if !self.epoch().sign_in_owed {
+            return Ok(false);
+        }
+        self.replace(&mut session, false);
+        Ok(true)
     }
 
     pub(crate) fn fence(&self) -> u64 {
@@ -173,11 +223,12 @@ impl SessionOwner {
         crate::vsr::observe_metadata_reply(&self.metadata_watermark, header);
     }
 
+    #[cfg(test)]
     pub(crate) fn remember(&self, credentials: Credentials, user_id: u32) {
         self.remember_unless(|| false, credentials, user_id);
     }
 
-    /// [`Self::remember`], unless `withdrawn` returns true. It runs under the
+    /// Remembers credentials unless `withdrawn` returns true. It runs under the
     /// sign-in lock, so a caller that marks the sign-in withdrawn and then
     /// calls [`Self::forget`] cannot have a later sign-in undo that forget.
     /// Returns whether the credentials were kept.
@@ -198,8 +249,14 @@ impl SessionOwner {
         true
     }
 
+    /// Also clears an owed sign-in, so that after a logout or a rejected
+    /// credential the keepalive does not sign in again.
     pub(crate) fn forget(&self) {
         self.sign_in().remembered = None;
+        if let Ok(_session) = self.session() {
+            self.epoch
+                .send_if_modified(|epoch| std::mem::take(&mut epoch.sign_in_owed));
+        }
     }
 
     /// The last successful sign-in, else the configured `AutoLogin` with the
@@ -295,12 +352,6 @@ impl SessionOwner {
         }
     }
 
-    /// The session of a poisoned lock, for tests that poison it.
-    #[cfg(test)]
-    pub(crate) fn session_ignoring_poison(&self) -> MutexGuard<'_, ConsensusSession> {
-        self.session.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn sign_in(&self) -> MutexGuard<'_, SignIn> {
         self.sign_in.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -309,13 +360,20 @@ impl SessionOwner {
         self.lanes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn replace(&self, session: &mut ConsensusSession) {
+    fn proved(&self) -> MutexGuard<'_, ProvedOutcomes> {
+        self.proved.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn replace(&self, session: &mut ConsensusSession, sign_in_owed: bool) {
         let mut lanes = self.lanes();
         *session = ConsensusSession::with_next_request_id(session.current_request_id());
         self.epoch.send_modify(|epoch| {
             epoch.fence += 1;
             epoch.bound = false;
+            epoch.sign_in_owed = sign_in_owed;
         });
+        self.pending.reset(self.fence());
+        self.consumer_group_state.clear_session_scoped();
         lanes::drop_retained(&mut lanes);
     }
 }
@@ -348,6 +406,24 @@ mod tests {
     const BOUND_SESSION: u64 = 3;
     const NEXT_SESSION: u64 = 4;
     const METADATA_COMMIT: u64 = 11;
+
+    #[test]
+    fn given_shared_group_assignments_when_any_link_resets_should_invalidate_the_session_cache() {
+        let owner = SessionOwner::new(AutoLogin::Disabled);
+        let first_link = owner.consumer_group_state();
+        let second_link = owner.consumer_group_state();
+        assert!(Arc::ptr_eq(&first_link, &second_link));
+        for explicit in [true, false] {
+            first_link.set_assignment("stream|topic|group".to_owned(), 1, vec![0]);
+            assert!(second_link.has_assignment("stream|topic|group"));
+            if explicit {
+                owner.reset().unwrap();
+            } else {
+                owner.reset_if_fence(owner.fence(), true).unwrap();
+            }
+            assert!(!second_link.has_assignment("stream|topic|group"));
+        }
+    }
 
     #[test]
     fn given_a_reset_when_the_session_is_replaced_should_raise_the_fence_and_keep_the_watermark_and_sign_in()
@@ -405,8 +481,8 @@ mod tests {
         owner.bind(BOUND_SESSION).unwrap();
         let fence = owner.fence();
 
-        let first = owner.reset_if_fence(fence).unwrap();
-        let second = owner.reset_if_fence(fence).unwrap();
+        let first = owner.reset_if_fence(fence, true).unwrap();
+        let second = owner.reset_if_fence(fence, true).unwrap();
 
         assert_eq!(first, Some(owner.fence()));
         assert_eq!(second, None);

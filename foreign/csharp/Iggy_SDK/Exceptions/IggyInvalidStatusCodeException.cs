@@ -34,6 +34,9 @@ public sealed class IggyInvalidStatusCodeException : Exception
     /// </summary>
     public bool FromServer { get; }
 
+    /// <summary>Whether a correlated reply proves the server committed this result.</summary>
+    public bool Committed { get; internal set; }
+
     internal int? CommandCode { get; set; }
 
     /// <summary>

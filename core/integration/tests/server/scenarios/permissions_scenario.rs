@@ -75,6 +75,8 @@ pub async fn run(harness: &TestHarness) {
     test_change_password_reply_path(harness, &root_client).await;
     test_root_user_is_protected(harness, &root_client).await;
     test_live_permission_revocation(harness, &root_client).await;
+    test_deleted_stream_grant_not_inherited(harness, &root_client).await;
+    test_grant_on_missing_resource_refused(&root_client).await;
     test_deleted_user_session_denied(harness, &root_client).await;
     test_personal_access_token_lifecycle(harness, &root_client).await;
 
@@ -232,7 +234,7 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
         .await;
     assert!(
         matches!(&snapshot_result, Err(e) if e.as_code() == IggyError::Unauthorized.as_code()),
-        "snapshot must be rejected as unauthorized without read_servers, got {snapshot_result:?}"
+        "snapshot must be rejected as unauthorized without manage_servers, got {snapshot_result:?}"
     );
 
     // Self-read skips read_users, matching the legacy server: a user can
@@ -285,13 +287,18 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
         .get_clients()
         .await
         .expect("read_servers: get_clients should work");
-    client
+    // The archive carries raw server logs and host diagnostics, so read-only
+    // server access is not enough to export it.
+    let snapshot_result = client
         .snapshot(
             SnapshotCompression::Deflated,
-            vec![SystemSnapshotType::Test],
+            vec![SystemSnapshotType::ServerLogs],
         )
-        .await
-        .expect("read_servers: snapshot should work");
+        .await;
+    assert!(
+        matches!(&snapshot_result, Err(e) if e.as_code() == IggyError::Unauthorized.as_code()),
+        "read_servers: snapshot must be rejected as unauthorized, got {snapshot_result:?}"
+    );
 
     // But cannot read users or streams
     assert_unauthorized(client.get_users().await, "read_servers: get_users");
@@ -2627,6 +2634,168 @@ async fn test_live_permission_revocation(harness: &TestHarness, root_client: &Ig
 }
 
 // =============================================================================
+// Test: A deleted stream's grant does not reach the stream that reuses its id
+// =============================================================================
+
+async fn test_deleted_stream_grant_not_inherited(harness: &TestHarness, root_client: &IggyClient) {
+    const USER: &str = "deleted-stream-grant-user";
+    let topic_id = Identifier::named(TOPIC_1).unwrap();
+    let deleted = create_stream_with_topic(root_client, "perm-deleted-stream").await;
+    let stream_id = Identifier::numeric(deleted.id).unwrap();
+    let granted_stream_id = deleted.id as usize;
+    create_test_user(
+        root_client,
+        USER,
+        Some(Permissions {
+            global: GlobalPermissions::default(),
+            streams: Some(BTreeMap::from([(
+                granted_stream_id,
+                StreamPermissions {
+                    send_messages: true,
+                    ..Default::default()
+                },
+            )])),
+        }),
+    )
+    .await;
+    let client = login_user(harness, USER).await;
+
+    let mut msgs = test_messages();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut msgs,
+        )
+        .await
+        .expect("send must work on the granted stream");
+
+    root_client
+        .delete_stream(&stream_id)
+        .await
+        .expect("delete the granted stream");
+    let user = root_client
+        .get_user(&Identifier::named(USER).unwrap())
+        .await
+        .expect("get user")
+        .expect("user exists");
+    assert!(
+        user.permissions
+            .and_then(|permissions| permissions.streams)
+            .is_none_or(|streams| !streams.contains_key(&granted_stream_id)),
+        "the user record must drop the grant on the deleted stream"
+    );
+
+    let reusing = create_stream_with_topic(root_client, "perm-reusing-stream").await;
+    assert_eq!(
+        reusing.id, deleted.id,
+        "the new stream must reuse the freed id"
+    );
+    let mut msgs = test_messages();
+    assert_error_code(
+        client
+            .send_messages(
+                &stream_id,
+                &topic_id,
+                &Partitioning::partition_id(0),
+                &mut msgs,
+            )
+            .await,
+        IggyError::Unauthorized,
+        "send to the stream that reuses a deleted stream's id",
+    );
+
+    let _ = root_client.delete_stream(&stream_id).await;
+    delete_test_user(root_client, USER).await;
+}
+
+async fn create_stream_with_topic(root_client: &IggyClient, name: &str) -> StreamDetails {
+    let stream = root_client
+        .create_stream(name)
+        .await
+        .expect("create stream");
+    root_client
+        .create_topic(
+            &Identifier::numeric(stream.id).unwrap(),
+            TOPIC_1,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic");
+    stream
+}
+
+// =============================================================================
+// Test: A grant on a stream or topic that does not exist is refused. Ids are
+// handed out lowest free, so such a grant would reach whatever is created at
+// that id later.
+// =============================================================================
+
+async fn test_grant_on_missing_resource_refused(root_client: &IggyClient) {
+    const USER: &str = "missing-grant-target-user";
+    // Far above any id this scenario creates, inside the stream and topic id ranges.
+    const MISSING_ID: usize = 4000;
+    let dummy_id = Identifier::numeric(0).unwrap();
+
+    assert_error_code(
+        root_client
+            .create_user(
+                USER,
+                "secret",
+                UserStatus::Active,
+                Some(Permissions {
+                    global: GlobalPermissions::default(),
+                    streams: Some(BTreeMap::from([(MISSING_ID, StreamPermissions::default())])),
+                }),
+            )
+            .await,
+        IggyError::StreamIdNotFound(dummy_id.clone()),
+        "create a user with a grant on a missing stream",
+    );
+    let users = root_client.get_users().await.expect("get users");
+    assert!(
+        users.iter().all(|user| user.username != USER),
+        "a refused create must not add the user"
+    );
+
+    create_test_user(root_client, USER, None).await;
+    let stream = root_client
+        .get_stream(&Identifier::named(STREAM_1).unwrap())
+        .await
+        .expect("get stream")
+        .expect("stream exists");
+    assert_error_code(
+        root_client
+            .update_permissions(
+                &Identifier::named(USER).unwrap(),
+                Some(Permissions {
+                    global: GlobalPermissions::default(),
+                    streams: Some(BTreeMap::from([(
+                        stream.id as usize,
+                        StreamPermissions {
+                            topics: Some(BTreeMap::from([(
+                                MISSING_ID,
+                                TopicPermissions::default(),
+                            )])),
+                            ..Default::default()
+                        },
+                    )])),
+                }),
+            )
+            .await,
+        IggyError::TopicIdNotFound(dummy_id.clone(), dummy_id),
+        "grant on a missing topic",
+    );
+
+    delete_test_user(root_client, USER).await;
+}
+
+// =============================================================================
 // Test: Deleting a user with a live session denies that session's next read.
 // A read_servers grant makes the pre-delete read a real Ok (get_stats is not
 // enumeration-safe), so the post-delete denial is unambiguous. Session eviction
@@ -2886,7 +3055,8 @@ fn assert_error_code<T: std::fmt::Debug>(
     let expected_code = expected.as_code();
     match &result {
         Err(e) if e.as_code() == expected_code => {}
-        Err(IggyError::HttpResponseError(_, body))
+        // The HTTP client reports a 404 as `ResourceNotFound` with the same body.
+        Err(IggyError::HttpResponseError(_, body) | IggyError::ResourceNotFound(body))
             if http_error_id(body) == Some(expected_code) => {}
         _ => panic!("{context}: expected error code {expected_code}, got {result:?}"),
     }

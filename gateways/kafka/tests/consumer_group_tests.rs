@@ -83,10 +83,8 @@ fn test_state(config: GroupCoordinatorConfig) -> Arc<GatewayState> {
 
 fn owned_state(config: GroupCoordinatorConfig, max_frame_size: usize) -> GatewayState {
     GatewayState::new(
-        BrokerAdvertise::default(),
         None,
         max_frame_size,
-        false,
         0,
         GroupCoordinator::new(config, CancellationToken::new()),
     )

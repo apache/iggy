@@ -20,6 +20,8 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -216,6 +218,45 @@ func TestPollMessages_GroupPollDoesNotRejoinALeftGroup(t *testing.T) {
 	}
 }
 
+func TestPollMessages_ResolvedLeaveDoesNotRejoinTheGroup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var leaveID atomic.Uint64
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(signedInUserID, 128)
+		case read.code() == uint32(command.BindSessionCode):
+			return bindReplyFrame(signedInUserID, read.sessionID())
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, server.address())
+		case read.code() == uint32(command.SyncGroupCode):
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		case read.operation() == vsr.OperationLeaveConsumerGroup:
+			if leaveID.CompareAndSwap(0, read.requestID()) {
+				cancel()
+				return nil
+			}
+			assert.Equal(t, leaveID.Load(), read.requestID(), "resolve must replay the committed leave")
+			return committedReply(read, 0)
+		default:
+			return committedReply(read, 0)
+		}
+	})
+	client := signedInClient(t, server, true)
+	streamId, topicId, consumer := groupConsumer(t)
+	require.NoError(t, client.JoinConsumerGroup(context.Background(), streamId, topicId, consumer.Id))
+	var uncertain ierror.UncertainOutcome
+	require.ErrorAs(t, client.LeaveConsumerGroup(ctx, streamId, topicId, consumer.Id), &uncertain)
+	require.NoError(t, client.ResolveOperation(context.Background(), uncertain.OperationID))
+
+	_, err := pollOnce(t, client)
+	require.ErrorIs(t, err, ierror.ErrConsumerGroupMemberNotFound)
+	require.Equal(t, 1, len(requestsFor(server.recorded(), vsr.OperationJoinConsumerGroup)),
+		"polling after a resolved leave must not join the group again")
+}
+
 func TestPollMessages_GroupPollRejoinsAfterAnExplicitJoin(t *testing.T) {
 	client, serverConn := newPipeClient(t)
 	member := false
@@ -339,6 +380,74 @@ func TestPollMessages_GroupPollResyncsAfterAFencedPoll(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), polled.PartitionId,
 		"the fenced poll re-synced and retried within the same call")
+}
+
+// pauseAtLog holds the goroutine that logs message until resume closes.
+type pauseAtLog struct {
+	message         string
+	reached, resume chan struct{}
+}
+
+func (p *pauseAtLog) Enabled(context.Context, slog.Level) bool { return true }
+func (p *pauseAtLog) WithAttrs([]slog.Attr) slog.Handler       { return p }
+func (p *pauseAtLog) WithGroup(string) slog.Handler            { return p }
+func (p *pauseAtLog) Handle(_ context.Context, record slog.Record) error {
+	if record.Message == p.message {
+		close(p.reached)
+		<-p.resume
+	}
+	return nil
+}
+
+func TestPollMessages_GroupPollRetiredAfterItsSyncFailsByTheRecoveryState(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		hold, refuseSignIn bool
+		want               error
+	}{
+		{"running", true, false, ierror.ErrTransientNotAccepted},
+		{"bound a new session", false, false, ierror.ErrTransientNotAccepted},
+		{"failed", false, true, ierror.ErrUnauthenticated},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var server *testListener
+			var registers atomic.Int32
+			node := singleNodeHandler(t, func() string { return server.address() })
+			server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+				if read.code() == uint32(command.SyncGroupCode) {
+					return replyFrame(vsr.OperationNonReplicated, assignmentBody(7, 1))
+				}
+				if read.operation() == vsr.OperationRegister && registers.Add(1) > 1 && test.refuseSignIn {
+					return statusReplyFrame(vsr.OperationRegister, uint32(ierror.ErrInvalidCredentials.Code()), nil)
+				}
+				return node(connection, index, read)
+			})
+			client := newDialingClient(t, server.address(), WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+			synced, resume := make(chan struct{}), make(chan struct{})
+			client.logger = slog.New(&pauseAtLog{message: "Synced the consumer group assignment", reached: synced, resume: resume})
+			require.NoError(t, client.Connect(context.Background()))
+			done := make(chan error, 1)
+			go func() { _, err := pollOnce(t, client); done <- err }()
+			select {
+			case <-synced:
+			case <-time.After(time.Second):
+				t.Fatal("the group poll did not sync its assignment")
+			}
+			if test.hold {
+				holdRecovery(t, client)
+			}
+			recoverNow(client)
+			if !test.hold {
+				awaitRecoveryEnd(t, client)
+				client.mtx.Lock()
+				bound := client.session.Bound()
+				client.mtx.Unlock()
+				require.Equal(t, !test.refuseSignIn, bound)
+			}
+			close(resume)
+			require.ErrorIs(t, <-done, test.want)
+		})
+	}
 }
 
 func TestGroupAssignmentCache_TheLeftMarkSurvivesClear(t *testing.T) {

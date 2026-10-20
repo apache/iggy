@@ -22,7 +22,12 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.client.blocking.UsersClientBaseTest;
+import org.apache.iggy.exception.IggyAuthenticationException;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class UsersTcpClientTest extends UsersClientBaseTest {
 
@@ -36,5 +41,12 @@ class UsersTcpClientTest extends UsersClientBaseTest {
     @BeforeEach
     void beforeEach() {
         usersClient = client.users();
+    }
+
+    @Test
+    void shouldRejectInvalidPasswordAndAllowAnotherLoginOnTheSameClient() {
+        assertThatThrownBy(() -> usersClient.login("iggy", "invalid-password"))
+                .isInstanceOf(IggyAuthenticationException.class);
+        assertThat(usersClient.login("iggy", "iggy").userId()).isEqualTo(0L);
     }
 }

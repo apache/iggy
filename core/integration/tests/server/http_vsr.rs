@@ -1039,23 +1039,6 @@ async fn given_ungranted_user_when_reading_or_producing_should_be_forbidden(harn
     );
 }
 
-/// The unauthenticated `POST /users/refresh-token` route: the current token
-/// travels in the JSON body, sent with no bearer header.
-trait RefreshExt {
-    async fn refresh(&self, token: &str) -> Response;
-}
-
-impl RefreshExt for HttpClient {
-    async fn refresh(&self, token: &str) -> Response {
-        self.client
-            .post(self.url("/users/refresh-token"))
-            .json(&json!({ "token": token }))
-            .send()
-            .await
-            .expect("refresh-token request")
-    }
-}
-
 #[iggy_harness]
 async fn given_valid_access_token_when_refreshing_should_issue_working_token_without_revoking_old(
     harness: &TestHarness,

@@ -18,939 +18,292 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
-import {
-  createServer,
-  type AddressInfo,
-  type Server,
-  type Socket
-} from 'node:net';
-import {
-  createServer as createTlsServer,
-  type TLSSocket
-} from 'node:tls';
-import { describe, it, before, after } from 'node:test';
-import { ProtocolFrameError } from './client.frame.js';
-import { IggyConnection } from './client.connection.js';
+import { createServer, Socket, type AddressInfo, type Server } from 'node:net';
+import { createServer as createTlsServer, type TLSSocket } from 'node:tls';
+import { describe, it } from 'node:test';
+import { IggyConnection, LINK_WRITE_QUEUE, MAX_PENDING_PER_LINK } from './client.connection.js';
+import { ResponseFrameDecoder, ProtocolFrameError } from './client.frame.js';
 import type { ClientConfig } from './client.type.js';
-import { Command, HEADER_SIZE, REPLY_OFFSET } from '../wire/vsr/header.js';
+import { Command, HEADER_SIZE, REPLY_OFFSET, REQUEST_OFFSET, encodeRequestHeader } from '../wire/vsr/header.js';
+import { Operation } from '../wire/vsr/operation.js';
+import { FrozenFrame, OPERATION_TIMEOUT_MS } from './client.operation.js';
 
+const TLS_CERTIFICATE = readFileSync(new URL('../../../../core/certs/iggy_cert.pem', import.meta.url));
+const TLS_KEY = readFileSync(new URL('../../../../core/certs/iggy_key.pem', import.meta.url));
+const TLS_CA_CERTIFICATE = readFileSync(new URL('../../../../core/certs/iggy_ca_cert.pem', import.meta.url));
 const FRAME_LIMIT = 2 * HEADER_SIZE;
-
-const TLS_CERTIFICATE = readFileSync(
-  new URL('../../../../core/certs/iggy_cert.pem', import.meta.url)
-);
-const TLS_KEY = readFileSync(
-  new URL('../../../../core/certs/iggy_key.pem', import.meta.url)
-);
-const TLS_CA_CERTIFICATE = readFileSync(
-  new URL('../../../../core/certs/iggy_ca_cert.pem', import.meta.url)
-);
-
-const startTlsServer = async (): Promise<Server> => {
-  const server = createTlsServer({
-    cert: TLS_CERTIFICATE,
-    key: TLS_KEY
-  });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  return server;
-};
-
-const startServer = async (): Promise<Server> => {
-  const server = createServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  return server;
-};
-
 const connectionConfig = (server: Server): ClientConfig => ({
-  transport: 'TCP',
-  options: {
-    host: '127.0.0.1',
-    port: (server.address() as AddressInfo).port
-  },
-  credentials: { username: 'iggy', password: 'iggy' },
-  reconnect: { enabled: false, interval: 0, maxRetries: 0 },
-  maxResponseFrameSize: FRAME_LIMIT
+  transport: 'TCP', options: { host: '127.0.0.1', port: (server.address() as AddressInfo).port },
+  credentials: { username: 'iggy', password: 'iggy' }, heartbeatInterval: 0,
+  reconnect: { enabled: false, interval: 0, maxRetries: 0 }, maxResponseFrameSize: FRAME_LIMIT
 });
-
-const replyFrame = (body: Buffer): Buffer => {
-  const frame = Buffer.alloc(HEADER_SIZE + body.length);
-  frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
-  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
-  body.copy(frame, HEADER_SIZE);
-  return frame;
+const requestFrame = (id: bigint): Buffer => encodeRequestHeader({
+  size: HEADER_SIZE, client: 1n, request: id, operation: Operation.NonReplicated, session: 1n, nonReplicatedCode: 1
+});
+const replyFrame = (request: Buffer, body = Buffer.alloc(0)): Buffer => {
+  const response = Buffer.alloc(HEADER_SIZE + body.length);
+  response.writeUInt32LE(response.length, REPLY_OFFSET.size);
+  response[REPLY_OFFSET.command] = Command.Reply;
+  response[REPLY_OFFSET.operation] = request[REQUEST_OFFSET.operation];
+  response.writeBigUInt64LE(request.readBigUInt64LE(REQUEST_OFFSET.request), REPLY_OFFSET.request);
+  body.copy(response, HEADER_SIZE);
+  return response;
 };
-
-const closeConnection = async (
-  connection: IggyConnection,
-  server: Server
-): Promise<void> => {
+const startServer = async (handler?: (frame: Buffer, socket: Socket) => void, tls = false): Promise<Server> => {
+  const accept = (socket: Socket) => {
+    const decoder = new ResponseFrameDecoder(FRAME_LIMIT);
+    socket.on('error', () => undefined);
+    socket.on('data', (bytes) => { if (!handler) return; for (const frame of decoder.push(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes))) handler?.(frame, socket); });
+  };
+  const server = tls ? createTlsServer({ cert: TLS_CERTIFICATE, key: TLS_KEY }, accept) : createServer(accept);
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return server;
+};
+const closeConnection = async (connection: IggyConnection, server: Server): Promise<void> => {
   connection._destroy();
-  if (!connection.socket.destroyed)
-    await once(connection.socket, 'close');
   await new Promise<void>((resolve) => server.close(() => resolve()));
 };
+const exchange = (connection: IggyConnection, id: bigint, signal = new AbortController().signal) =>
+  connection.exchange(() => requestFrame(id), Date.now() + 1_000, signal);
 
-let keepAlive: NodeJS.Timeout;
-
-describe('IggyConnection', () => {
-
-  // Note:
-  // before node v24 Timeout.unref() would let eventloop exit before test end
-  // (tested against 22.x 23.x -> fail vs 24.x 26.x -> pass)
-  // this timeout prevent eventloop exit before this test end
-  before(() => { keepAlive = setInterval(() => {}, 10000) });
-
-  it('recognizes a connection established before connect is called',
-    async () => {
-      const server = await startServer();
-      const accepted = once(server, 'connection');
-      const connection = new IggyConnection(connectionConfig(server));
-      try {
-        await accepted;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(await connection.connect(), connection);
-        assert.equal(connection.connected, true);
-      } finally {
-        await closeConnection(connection, server);
-      }
-    }
-  );
-
-  it('shares connection attempts, recognizes endpoints, and writes frames',
-    async () => {
-      const server = await startServer();
-      const received = new Promise<Buffer>((resolve) => {
-        server.once('connection', (socket) => {
-          socket.once('data', (data) => resolve(Buffer.from(data)));
-        });
-      });
-      const connection = new IggyConnection(connectionConfig(server));
-      try {
-        const first = connection.connect();
-        assert.equal(connection.connect(), first);
-        await first;
-        assert.equal(await connection.connect(), connection);
-        assert.equal(
-          connection.isConnectedTo(
-            'localhost',
-            (server.address() as AddressInfo).port
-          ),
-          true
-        );
-
-        connection.config.options = {
-          ...connection.config.options,
-          host: 'broker.example'
-        };
-        assert.equal(
-          connection.isConnectedTo(
-            'broker.example',
-            (server.address() as AddressInfo).port
-          ),
-          true
-        );
-
-        const frame = replyFrame(Buffer.from('payload'));
-        connection.writeFrame(frame);
-        assert.deepEqual(await received, frame);
-      } finally {
-        await closeConnection(connection, server);
-      }
-    }
-  );
-
-  it('emits complete buffered responses and rejects malformed frames',
-    async () => {
-      const server = await startServer();
-      const connection = new IggyConnection(connectionConfig(server));
-      try {
-        await connection.connect();
-        const frame = replyFrame(Buffer.from('response'));
-        const response = once(connection, 'response');
-        connection._onData(frame.subarray(0, 6));
-        connection._onData(frame.subarray(6));
-        assert.deepEqual((await response)[0], frame);
-
-        const malformed = replyFrame(Buffer.alloc(0));
-        malformed.writeUInt32LE(FRAME_LIMIT + 1, REPLY_OFFSET.size);
-        const error = once(connection, 'error');
-        connection._onData(malformed);
-        assert.ok((await error)[0] instanceof ProtocolFrameError);
-      } finally {
-        await closeConnection(connection, server);
-      }
-    }
-  );
-
-  it('suppresses expected reset errors during intentional shutdown',
-    async () => {
-      const server = await startServer();
-      const connection = new IggyConnection(connectionConfig(server));
-      try {
-        await connection.connect();
-        let emitted = false;
-        connection.on('error', () => { emitted = true; });
-        connection.ending = true;
-        connection.socket.emit(
-          'error',
-          Object.assign(new Error('reset'), { code: 'ECONNRESET' })
-        );
-        assert.equal(emitted, false);
-      } finally {
-        await closeConnection(connection, server);
-      }
-    }
-  );
-
-  it('does not reconnect or reopen after destruction', async () => {
-    const server = await startServer();
-    const config = {
-      ...connectionConfig(server),
-      reconnect: { enabled: true, interval: 20, maxRetries: 1 }
-    };
-    let connections = 0;
-    let serverSocket: Socket | undefined;
-    server.on('connection', (socket) => {
-      connections += 1;
-      serverSocket = socket;
+describe('IggyConnection multiplexing', () => {
+  it('matches normalized peer addresses and ports with a configured-host fallback', () => {
+    const host = 'bootstrap.example.test';
+    const configuredPort = 8090;
+    const peerPort = configuredPort + 1;
+    const connection = new IggyConnection({ transport: 'TCP', options: { host, port: configuredPort },
+      credentials: { username: 'iggy', password: 'iggy' } });
+    assert.equal(connection.isConnectedTo(host.toUpperCase(), configuredPort), true);
+    assert.equal(connection.isConnectedTo('192.0.2.10', peerPort), false);
+    connection.socket = new Socket();
+    Object.defineProperties(connection.socket, {
+      remoteAddress: { value: '::ffff:192.0.2.10' },
+      remotePort: { value: peerPort }
     });
-    const connection = new IggyConnection(config);
     try {
-      await connection.connect();
-      const disconnected = once(connection, 'disconnected');
-      serverSocket?.destroy();
-      await disconnected;
-      connection._destroy();
-
-      await assert.rejects(
-        () => connection.connect(),
-        /connection is closed/
-      );
-      await new Promise<void>((resolve) => setTimeout(resolve, 40));
-      assert.equal(connections, 1);
-    } finally {
-      await closeConnection(connection, server);
-    }
+      assert.equal(connection.isConnectedTo('192.0.2.10', peerPort), true);
+      assert.equal(connection.isConnectedTo('::FFFF:192.0.2.10', peerPort), true);
+      assert.equal(connection.isConnectedTo('192.0.2.10', configuredPort), false);
+      assert.equal(connection.isConnectedTo('192.0.2.11', peerPort), false);
+      assert.equal(connection.isConnectedTo(host.toUpperCase(), configuredPort), true);
+      assert.equal(connection.isConnectedTo(host, peerPort), false);
+    } finally { connection._destroy(); }
   });
 
-  it('shares reconnect backoff with callers',
-    async () => {
-      const server = await startServer();
-      const config = {
-        ...connectionConfig(server),
-        reconnect: { enabled: true, interval: 10, maxRetries: 2 }
-      };
-      let serverSocket: Socket | undefined;
-      let connections = 0;
-      server.on('connection', (socket) => {
-        connections += 1;
-        serverSocket = socket;
-      });
-      const connection = new IggyConnection(config);
-      connection.on('error', () => undefined);
-      try {
-        await connection.connect();
-        const oldSocket = connection.socket;
-        connection._onData(Buffer.alloc(3));
-        const disconnected = once(connection, 'disconnected');
-        serverSocket?.destroy();
-        await disconnected;
-
-        const first = connection.connect();
-        assert.equal(connection.connect(), first);
-        assert.equal(await first, connection);
-        assert.equal(connection.connected, true);
-        assert.equal(connections, 2);
-
-        const frame = replyFrame(Buffer.from('fresh'));
-        const response = once(connection, 'response');
-        oldSocket.emit('data', Buffer.alloc(8));
-        connection._onData(frame);
-        assert.deepEqual((await response)[0], frame);
-      } finally {
-        await closeConnection(connection, server);
-      }
-    }
-  );
-
-  it('keeps the seed endpoint when a redirect fails', async () => {
-    const server = await startServer();
-    const unavailable = await startServer();
-    const unavailablePort = (unavailable.address() as AddressInfo).port;
-    await new Promise<void>((resolve) => unavailable.close(() => resolve()));
-    const connection = new IggyConnection({
-      ...connectionConfig(server),
-      reconnect: { enabled: true, interval: 10, maxRetries: 1 }
-    });
-    connection.on('error', () => undefined);
+  it('recognizes an IP roster endpoint for a DNS TLS connection', async () => {
+    const server = await startServer((frame, socket) => socket.write(replyFrame(frame)), true);
+    const secured = once(server, 'secureConnection') as Promise<[TLSSocket]>;
+    const host = 'bootstrap.example.test';
+    const port = (server.address() as AddressInfo).port;
+    let accepted = 0;
+    server.on('secureConnection', () => { accepted += 1; });
+    const connection = new IggyConnection({ ...connectionConfig(server), transport: 'TLS',
+      options: { host, port, family: 4, rejectUnauthorized: false,
+        lookup: (_hostname, _options, callback) => callback(null, '127.0.0.1', 4) } });
     try {
       await connection.connect();
-      const seedPort = (server.address() as AddressInfo).port;
-      const reconnected = new Promise<void>((resolve) => {
-        connection.once('connect', () => resolve());
-      });
-      await assert.rejects(
-        () => connection.redirect('127.0.0.1', unavailablePort)
-      );
-      await reconnected;
-      assert.equal(connection.config.options.host, '127.0.0.1');
-      assert.equal(connection.config.options.port, seedPort);
+      const [peer] = await secured;
+      const socket = connection.socket;
+      assert.equal(peer.servername, host);
+      assert.equal(socket.remoteAddress, '127.0.0.1');
+      assert.equal(connection.isConnectedTo('127.0.0.1', port), true);
+      assert.equal(connection.isConnectedTo('::ffff:127.0.0.1', port), true);
+      assert.equal(connection.isConnectedTo(host.toUpperCase(), port), true);
+      assert.equal((await exchange(connection, 1n)).error, undefined);
+      await connection.connect();
+      assert.equal(connection.socket, socket);
+      assert.equal(accepted, 1);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('dials lazily and shares an in-flight connection attempt', async () => {
+    const server = await startServer((frame, socket) => socket.write(replyFrame(frame)));
+    let accepted = 0;
+    server.on('connection', () => { accepted += 1; });
+    const connection = new IggyConnection(connectionConfig(server));
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(accepted, 0);
+      const pending = connection.connect();
+      assert.equal(connection.connect(), pending);
+      await pending;
+      assert.equal(accepted, 1);
+      assert.equal(connection.isConnectedTo('localhost', (server.address() as AddressInfo).port), true);
+      assert.equal((await exchange(connection, 1n)).error, undefined);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('correlates out-of-order replies on one socket', async () => {
+    const requests: Buffer[] = [];
+    const server = await startServer((frame, socket) => {
+      requests.push(frame);
+      if (requests.length === 2)
+        socket.write(Buffer.concat([replyFrame(requests[1], Buffer.from('two')), replyFrame(requests[0], Buffer.from('one'))]));
+    });
+    const connection = new IggyConnection(connectionConfig(server));
+    try {
+      await connection.connect();
+      const [first, second] = await Promise.all([exchange(connection, 1n), exchange(connection, 2n)]);
+      assert.equal(first.response?.subarray(HEADER_SIZE).toString(), 'one');
+      assert.equal(second.response?.subarray(HEADER_SIZE).toString(), 'two');
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('isolates cancellation and discards a late reply without closing the socket', async () => {
+    const canceled = new AbortController();
+    let first: Buffer | undefined;
+    const server = await startServer((frame, socket) => {
+      if (frame.readBigUInt64LE(REQUEST_OFFSET.request) === 1n) { first = frame; canceled.abort(); }
+      else socket.write(Buffer.concat([replyFrame(first!), replyFrame(frame, Buffer.from('alive'))]));
+    });
+    const connection = new IggyConnection(connectionConfig(server));
+    try {
+      await connection.connect();
+      assert.ok((await exchange(connection, 1n, canceled.signal)).error);
+      assert.equal((await exchange(connection, 2n)).response?.subarray(HEADER_SIZE).toString(), 'alive');
       assert.equal(connection.connected, true);
-      assert.equal(
-        connection.isConnectedTo('127.0.0.1', unavailablePort),
-        false
-      );
-    } finally {
-      await closeConnection(connection, server);
-    }
+    } finally { await closeConnection(connection, server); }
   });
 
-  it('stops a pending reconnect after a redirect replaces the socket',
-    async () => {
-      const seed = await startServer();
-      const target = await startServer();
-      const targetPort = (target.address() as AddressInfo).port;
-      let seedConnections = 0;
-      let seedSocket: Socket | undefined;
-      seed.on('connection', (socket) => {
-        seedConnections += 1;
-        seedSocket = socket;
-      });
-      let targetConnections = 0;
-      target.on('connection', () => {
-        targetConnections += 1;
-      });
-      const connection = new IggyConnection({
-        ...connectionConfig(seed),
-        reconnect: { enabled: true, interval: 50, maxRetries: 3 }
-      });
-      connection.on('error', () => undefined);
-      try {
-        await connection.connect();
-        const disconnected = once(connection, 'disconnected');
-        seedSocket?.destroy();
-        await disconnected;
-        await connection.redirect('127.0.0.1', targetPort);
-        assert.equal(connection.connected, true);
-        await new Promise<void>((resolve) => setTimeout(resolve, 150));
-        assert.equal(connection.connected, true);
-        assert.equal(connection.isConnectedTo('127.0.0.1', targetPort), true);
-        assert.equal(seedConnections, 1);
-        assert.equal(targetConnections, 1);
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => seed.close(() => resolve()));
-        await new Promise<void>((resolve) => target.close(() => resolve()));
+  it('assembles partial frames and rejects an oversized declared frame', async () => {
+    let count = 0;
+    const server = await startServer((frame, socket) => {
+      const response = replyFrame(frame, Buffer.from('complete'));
+      if (++count === 1) {
+        socket.write(response.subarray(0, 6));
+        setImmediate(() => socket.write(response.subarray(6)));
+      } else {
+        response.writeUInt32LE(FRAME_LIMIT + 1, REPLY_OFFSET.size);
+        socket.write(response);
       }
-    }
-  );
-
-  it('exhausts consecutive failed retries without unhandled rejections',
-    async () => {
-      const server = await startServer();
-      let serverSocket: Socket | undefined;
-      server.on('connection', (socket) => {
-        serverSocket = socket;
-      });
-      const rejections: unknown[] = [];
-      const onUnhandled = (reason: unknown) => rejections.push(reason);
-      process.on('unhandledRejection', onUnhandled);
-      const connection = new IggyConnection({
-        ...connectionConfig(server),
-        reconnect: { enabled: true, interval: 10, maxRetries: 3 }
-      });
-      try {
-        await connection.connect();
-        const exhausted = new Promise<Error>((resolve) => {
-          const onError = (error: Error) => {
-            if (!error.message.includes('reconnect maxRetries exceeded'))
-              return;
-            connection.removeListener('error', onError);
-            resolve(error);
-          };
-          connection.on('error', onError);
-        });
-        const closed = new Promise<void>(
-          (resolve) => server.close(() => resolve())
-        );
-        serverSocket?.destroy();
-        const retryStartedAt = Date.now();
-        await closed;
-        const error = await exhausted;
-        // Three retries at a 10 ms interval must spend at least 30 ms in
-        // backoff; a broken wait would redial back to back.
-        assert.ok(
-          Date.now() - retryStartedAt >= 30,
-          'reconnect backoff did not elapse between retries'
-        );
-        assert.match(error.message, /reconnect maxRetries exceeded/);
-        await new Promise<void>((resolve) => setTimeout(resolve, 20));
-        assert.deepEqual(rejections, []);
-      } finally {
-        process.removeListener('unhandledRejection', onUnhandled);
-        connection._destroy();
-      }
-    }
-  );
-
-  it('falls back to the seed endpoint when a redirected leader dies',
-    async () => {
-      const seed = await startServer();
-      const seedPort = (seed.address() as AddressInfo).port;
-      const target = await startServer();
-      const targetPort = (target.address() as AddressInfo).port;
-      let targetSocket: Socket | undefined;
-      target.on('connection', (socket) => {
-        targetSocket = socket;
-      });
-      const connection = new IggyConnection({
-        ...connectionConfig(seed),
-        reconnect: { enabled: true, interval: 10, maxRetries: 4 }
-      });
-      connection.on('error', () => undefined);
-      try {
-        await connection.connect();
-        await connection.redirect('127.0.0.1', targetPort);
-        assert.equal(connection.config.options.port, targetPort);
-
-        const reconnected = new Promise<void>((resolve) => {
-          connection.once('connect', () => resolve());
-        });
-        const targetClosed = new Promise<void>(
-          (resolve) => target.close(() => resolve())
-        );
-        targetSocket?.destroy();
-        await targetClosed;
-        await reconnected;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        assert.equal(connection.connected, true);
-        assert.equal(connection.isConnectedTo('127.0.0.1', seedPort), true);
-        assert.equal(connection.config.options.port, seedPort);
-      } finally {
-        await closeConnection(connection, seed);
-      }
-    }
-  );
-
-  it('rotates a redial through the roster it learned while connected',
-    async () => {
-      const seed = await startServer();
-      const seedPort = (seed.address() as AddressInfo).port;
-      const connection = new IggyConnection(connectionConfig(seed));
-      connection.on('error', () => undefined);
-      try {
-        connection.rememberRoster([
-          { host: '127.0.0.1', port: seedPort },
-          { host: '127.0.0.1', port: seedPort + 1 },
-          { host: '127.0.0.1', port: seedPort + 2 }
-        ]);
-        // The endpoint the client is on leads, the roster follows, and the
-        // roster's copy of that endpoint does not earn a second attempt.
-        assert.deepEqual(
-          connection._redialCandidates().map((options) => options.port),
-          [seedPort, seedPort + 1, seedPort + 2]
-        );
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => seed.close(() => resolve()));
-      }
-    }
-  );
-
-  it('walks each roster endpoint once per request', async () => {
-    const seed = await startServer();
-    const seedPort = (seed.address() as AddressInfo).port;
-    const connection = new IggyConnection(connectionConfig(seed));
-    connection.on('error', () => undefined);
-    try {
-      await connection.connect();
-      connection.rememberRoster([
-        { host: '127.0.0.1', port: seedPort },
-        { host: '127.0.0.1', port: seedPort + 1 },
-        { host: '127.0.0.1', port: seedPort + 2 }
-      ]);
-      const visited = new Set<string>();
-
-      assert.deepEqual(connection.nextRosterEndpoint(visited), {
-        host: '127.0.0.1', port: seedPort + 1
-      });
-      assert.deepEqual(connection.nextRosterEndpoint(visited), {
-        host: '127.0.0.1', port: seedPort + 2
-      });
-      assert.equal(connection.nextRosterEndpoint(visited), undefined);
-      assert.equal(visited.size, 3);
-    } finally {
-      await closeConnection(connection, seed);
-    }
-  });
-
-  it('dials the endpoint it is on, then the seed, then the roster',
-    async () => {
-      const seed = await startServer();
-      const seedPort = (seed.address() as AddressInfo).port;
-      const connection = new IggyConnection(connectionConfig(seed));
-      connection.on('error', () => undefined);
-      try {
-        // A redirect moves the client off its seed; the seed is still the one
-        // endpoint the caller vouched for, so it comes before a roster the
-        // cluster may have reshaped since.
-        connection.config.options = {
-          ...connection.config.options,
-          port: seedPort + 9
-        };
-        connection.rememberRoster([{ host: '127.0.0.1', port: seedPort + 5 }]);
-
-        assert.deepEqual(
-          connection._redialCandidates().map((options) => options.port),
-          [seedPort + 9, seedPort, seedPort + 5]
-        );
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => seed.close(() => resolve()));
-      }
-    }
-  );
-
-  it('counts endpoints that only differ in spelling once',
-    async () => {
-      const seed = await startServer();
-      const seedPort = (seed.address() as AddressInfo).port;
-      const connection = new IggyConnection(connectionConfig(seed));
-      connection.on('error', () => undefined);
-      try {
-        // The loopback aliases and an IPv4-mapped address all name the endpoint
-        // the client is already on, so none of them earns a dial of its own.
-        connection.rememberRoster([
-          { host: 'localhost', port: seedPort },
-          { host: '::1', port: seedPort },
-          { host: '::ffff:127.0.0.1', port: seedPort },
-          { host: '127.0.0.1', port: seedPort + 1 }
-        ]);
-
-        assert.deepEqual(
-          connection._redialCandidates().map((options) => options.port),
-          [seedPort, seedPort + 1]
-        );
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => seed.close(() => resolve()));
-      }
-    }
-  );
-
-  it('does not redial at all when reconnection is disabled',
-    async () => {
-      // `enabled: false` is what a caller says to opt out. The retry budget is
-      // whatever the defaults hold, so a loop that reads it without checking
-      // this flag would run every one of those passes - and with the backoff
-      // gated on the same flag, back to back.
-      //
-      // The endpoint accepts and hangs up, so the drop that would start a
-      // redial happens and every dial of it is counted.
-      const hangup = await startServer();
-      const hangupPort = (hangup.address() as AddressInfo).port;
-      let accepted = 0;
-      hangup.on('connection', (socket) => {
-        accepted += 1;
-        socket.destroy();
-      });
-
-      const connection = new IggyConnection({
-        transport: 'TCP',
-        options: { host: '127.0.0.1', port: hangupPort },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
-        maxResponseFrameSize: FRAME_LIMIT
-      });
-      connection.on('error', () => undefined);
-      try {
-        await connection.connect().catch(() => undefined);
-        await new Promise<void>((resolve) => setTimeout(resolve, 300));
-
-        assert.equal(accepted, 1,
-          'a client that turned reconnection off redialed anyway'
-        );
-        assert.equal(connection.connected, false);
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => hangup.close(() => resolve()));
-      }
-    }
-  );
-
-  it('sweeps the endpoints it knows once when reconnection is disabled',
-    async () => {
-      // Opting out of retries is not opting out of the endpoints: with more
-      // than one known, they get exactly one pass and no backoff, as in the
-      // other SDKs.
-      const dead = await startServer();
-      const deadPort = (dead.address() as AddressInfo).port;
-      await new Promise<void>((resolve) => dead.close(() => resolve()));
-      const live = await startServer();
-      const livePort = (live.address() as AddressInfo).port;
-      let accepted = 0;
-      live.on('connection', () => { accepted += 1; });
-
-      const connection = new IggyConnection({
-        transport: 'TCP',
-        options: { host: '127.0.0.1', port: deadPort },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
-        maxResponseFrameSize: FRAME_LIMIT
-      });
-      connection.on('error', () => undefined);
-      try {
-        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
-        await connection.connect().catch(() => undefined);
-        await new Promise<void>((resolve) => setTimeout(resolve, 200));
-
-        assert.equal(accepted, 1,
-          'the known endpoints got either no pass or more than one'
-        );
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => live.close(() => resolve()));
-      }
-    }
-  );
-
-  it('makes one pass when every endpoint is down and reconnection is disabled',
-    async () => {
-      // One pass, not the whole retry budget: with the budget read but the
-      // flag ignored, a client that opted out of retries dials every endpoint
-      // once per pass for all of them -- and with the backoff gated on the same
-      // flag, back to back.
-      //
-      // Plain TCP behind a TLS client, closed at once: the dial fails, so the
-      // pass moves on, and every dial is counted where it lands.
-      const first = await startServer();
-      const firstPort = (first.address() as AddressInfo).port;
-      let firstDials = 0;
-      first.on('connection', (socket) => {
-        firstDials += 1;
-        socket.destroy();
-      });
-      const second = await startServer();
-      const secondPort = (second.address() as AddressInfo).port;
-      let secondDials = 0;
-      second.on('connection', (socket) => {
-        secondDials += 1;
-        socket.destroy();
-      });
-
-      const connection = new IggyConnection({
-        transport: 'TLS',
-        options: {
-          host: '127.0.0.1',
-          port: firstPort,
-          rejectUnauthorized: false
-        },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
-        maxResponseFrameSize: FRAME_LIMIT
-      });
-      connection.on('error', () => undefined);
-      try {
-        connection.rememberRoster([{ host: '127.0.0.1', port: secondPort }]);
-        await connection.connect().catch(() => undefined);
-        await new Promise<void>((resolve) => setTimeout(resolve, 300));
-
-        assert.equal(connection.connected, false);
-        // The connect's own dial of the configured endpoint, then one pass over
-        // both: the endpoint the client starts on is dialed twice, the one
-        // behind it once.
-        assert.deepEqual([firstDials, secondDials], [2, 1],
-          'a client that opted out of retries swept more than once'
-        );
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => first.close(() => resolve()));
-        await new Promise<void>((resolve) => second.close(() => resolve()));
-      }
-    }
-  );
-
-  it('skips the first backoff when another endpoint is known',
-    async () => {
-      // The endpoint the client is on is dead and a live one sits behind it in
-      // the roster: waiting out the interval before the first pass would push
-      // the failover past what the caller waits for, and the node just lost may
-      // be gone for good.
-      const dead = await startServer();
-      const deadPort = (dead.address() as AddressInfo).port;
-      await new Promise<void>((resolve) => dead.close(() => resolve()));
-      const live = await startServer();
-      const livePort = (live.address() as AddressInfo).port;
-
-      const interval = 3000;
-      const connection = new IggyConnection({
-        transport: 'TCP',
-        options: { host: '127.0.0.1', port: deadPort },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: true, interval, maxRetries: 3 },
-        maxResponseFrameSize: FRAME_LIMIT
-      });
-      connection.on('error', () => undefined);
-      try {
-        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
-        const dialed = once(live, 'connection');
-        const started = Date.now();
-        void connection.connect().catch(() => undefined);
-        await dialed;
-
-        assert.ok(Date.now() - started < interval,
-          'the failover waited out the backoff before its first pass'
-        );
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => live.close(() => resolve()));
-      }
-    }
-  );
-
-  it('bounds a dial that never becomes usable when others are queued behind it',
-    async () => {
-      // Plain TCP behind a TLS client: the socket connects, so only a bound on
-      // the handshake ends the attempt. The endpoint behind it is dead, so the
-      // pass has to end on its own rather than hang on the first one.
-      const silent = await startServer();
-      const silentPort = (silent.address() as AddressInfo).port;
-      const held: Socket[] = [];
-      silent.on('connection', (socket) => { held.push(socket); });
-      const dead = await startServer();
-      const deadPort = (dead.address() as AddressInfo).port;
-      await new Promise<void>((resolve) => dead.close(() => resolve()));
-
-      const connection = new IggyConnection({
-        transport: 'TLS',
-        options: {
-          host: '127.0.0.1',
-          port: silentPort,
-          rejectUnauthorized: false
-        },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: true, interval: 10, maxRetries: 3 },
-        maxResponseFrameSize: FRAME_LIMIT
-      });
-      connection.on('error', () => undefined);
-      try {
-        connection.rememberRoster([{ host: '127.0.0.1', port: deadPort }]);
-        void connection.connect().catch(() => undefined);
-
-        // Unbounded, the first dial never ends and this endpoint is dialed
-        // exactly once, forever.
-        const deadline = Date.now() + 8_000;
-        while (held.length < 2 && Date.now() < deadline)
-          await new Promise<void>((resolve) => setTimeout(resolve, 50));
-
-        assert.ok(held.length >= 2,
-          'a dial that never became usable held the pass'
-        );
-        assert.equal(connection.connected, false);
-      } finally {
-        connection._destroy();
-        held.forEach((socket) => socket.destroy());
-        await new Promise<void>((resolve) => silent.close(() => resolve()));
-      }
-    }
-  );
-
-  it('stops a redial pass that is destroyed part-way through',
-    async () => {
-      // The endpoint the client is on is dead, so every dial to it is refused
-      // - and the live roster endpoint behind it is what the pass would reach
-      // next, unless the destroy in between stops the pass.
-      const dead = await startServer();
-      const deadPort = (dead.address() as AddressInfo).port;
-      await new Promise<void>((resolve) => dead.close(() => resolve()));
-      const live = await startServer();
-      const livePort = (live.address() as AddressInfo).port;
-      let accepted = 0;
-      live.on('connection', () => { accepted += 1; });
-
-      const connection = new IggyConnection({
-        transport: 'TCP',
-        options: { host: '127.0.0.1', port: deadPort },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: true, interval: 10, maxRetries: 3 },
-        maxResponseFrameSize: FRAME_LIMIT
-      });
-      let destroyed = false;
-      let connectsAfterDestroy = 0;
-      connection.on('connect', () => {
-        if (destroyed)
-          connectsAfterDestroy += 1;
-      });
-      try {
-        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
-
-        // The first failure is the initial connect, which is what starts the
-        // redial pass; the next one is that pass's first candidate, so
-        // destroying there lands between two candidates rather than before the
-        // pass.
-        const destroyedMidPass = new Promise<void>((resolve) => {
-          let failures = 0;
-          connection.on('error', () => {
-            failures += 1;
-            if (failures < 2 || destroyed)
-              return;
-            connection._destroy();
-            destroyed = true;
-            resolve();
-          });
-        });
-
-        await connection.connect().catch(() => undefined);
-        await destroyedMidPass;
-        await new Promise<void>((resolve) => setTimeout(resolve, 100));
-
-        assert.equal(accepted, 0,
-          'a destroyed connection must not keep dialing the rest of the pass'
-        );
-        assert.equal(connectsAfterDestroy, 0,
-          'a destroyed connection must not announce a connection'
-        );
-        assert.equal(connection.connected, false);
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => live.close(() => resolve()));
-      }
-    }
-  );
-
-  it('settles a dial in flight when a redirect replaces the socket',
-    async () => {
-      const seed = await startServer();
-      const target = await startServer();
-      const targetPort = (target.address() as AddressInfo).port;
-      const connection = new IggyConnection(connectionConfig(seed));
-      connection.on('error', () => undefined);
-      try {
-        const pending = connection.connect();
-        const redirected = connection.redirect('127.0.0.1', targetPort);
-        await assert.rejects(
-          () => pending,
-          /connection closed before it was established/
-        );
-        await redirected;
-        assert.equal(connection.connected, true);
-        assert.equal(connection.isConnectedTo('127.0.0.1', targetPort), true);
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => seed.close(() => resolve()));
-        await new Promise<void>((resolve) => target.close(() => resolve()));
-      }
-    }
-  );
-
-  it('shares the redirect dial with a disconnected listener',
-    async () => {
-      const seed = await startServer();
-      const target = await startServer();
-      const targetPort = (target.address() as AddressInfo).port;
-      let seedConnections = 0;
-      let targetConnections = 0;
-      seed.on('connection', () => {
-        seedConnections += 1;
-      });
-      target.on('connection', () => {
-        targetConnections += 1;
-      });
-      const connection = new IggyConnection(connectionConfig(seed));
-      connection.on('error', () => undefined);
-      let listenerConnection: Promise<IggyConnection> | undefined;
-      try {
-        await connection.connect();
-        connection.once('disconnected', () => {
-          listenerConnection = connection.connect();
-        });
-
-        await connection.redirect('127.0.0.1', targetPort);
-        assert.ok(listenerConnection);
-        assert.equal(await listenerConnection, connection);
-        assert.equal(connection.connected, true);
-        assert.equal(connection.isConnectedTo('127.0.0.1', targetPort), true);
-        assert.equal(seedConnections, 1);
-        assert.equal(targetConnections, 1);
-      } finally {
-        connection._destroy();
-        await new Promise<void>((resolve) => seed.close(() => resolve()));
-        await new Promise<void>((resolve) => target.close(() => resolve()));
-      }
-    }
-  );
-
-  it('rejects an unreadable tls_ca_file with a TypeError at socket creation',
-    () => {
-      assert.throws(
-        () =>
-          new IggyConnection({
-            transport: 'TLS',
-            options: {
-              host: '127.0.0.1',
-              port: 8090,
-              caFile: '/does/not/exist.pem'
-            },
-            credentials: { username: 'iggy', password: 'iggy' },
-            reconnect: { enabled: false, interval: 0, maxRetries: 0 }
-          }),
-        /cannot read tls_ca_file/
-      );
-    }
-  );
-
-  it('sends a DNS host as the SNI server name when none is set',
-    async () => {
-      const server = await startTlsServer();
-      const secureConnection =
-        once(server, 'secureConnection') as Promise<[TLSSocket]>;
-      const connection = new IggyConnection({
-        transport: 'TLS',
-        options: {
-          host: 'localhost',
-          port: (server.address() as AddressInfo).port,
-          ca: TLS_CA_CERTIFICATE
-        },
-        credentials: { username: 'iggy', password: 'iggy' },
-        reconnect: { enabled: false, interval: 0, maxRetries: 0 }
-      });
-      try {
-        await connection.connect();
-        assert.equal(connection.connected, true);
-        const [tlsSocket] = await secureConnection;
-        assert.equal(tlsSocket.servername, 'localhost');
-      } finally {
-        await closeConnection(connection, server);
-      }
-    }
-  );
-
-  it('omits SNI for IP literal hosts', async () => {
-    const server = await startTlsServer();
-    const secureConnection =
-      once(server, 'secureConnection') as Promise<[TLSSocket]>;
-    const connection = new IggyConnection({
-      transport: 'TLS',
-      options: {
-        host: '127.0.0.1',
-        port: (server.address() as AddressInfo).port,
-        rejectUnauthorized: false
-      },
-      credentials: { username: 'iggy', password: 'iggy' },
-      reconnect: { enabled: false, interval: 0, maxRetries: 0 }
     });
+    const connection = new IggyConnection(connectionConfig(server));
     try {
       await connection.connect();
-      assert.equal(connection.connected, true);
-      const [tlsSocket] = await secureConnection;
-      // Node reports a missing SNI name as false on the server side.
-      assert.ok(!tlsSocket.servername);
-    } finally {
-      await closeConnection(connection, server);
-    }
+      assert.equal((await exchange(connection, 1n)).response?.subarray(HEADER_SIZE).toString(), 'complete');
+      assert.ok((await exchange(connection, 2n)).error instanceof ProtocolFrameError);
+      assert.equal(connection.connected, false);
+    } finally { await closeConnection(connection, server); }
   });
 
-  after(() => clearInterval(keepAlive));
+  it('bounds pending calls before frame allocation and releases capacity after cancellation', async () => {
+    const server = await startServer();
+    const connection = new IggyConnection(connectionConfig(server));
+    const cancel = new AbortController();
+    let allocated = 0;
+    try {
+      await connection.connect();
+      const calls = Array.from({ length: MAX_PENDING_PER_LINK + 1 }, (_, index) =>
+        connection.exchange(() => { allocated += 1; return requestFrame(BigInt(index + 1)); }, Date.now() + 2_000, cancel.signal));
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      assert.equal(allocated, MAX_PENDING_PER_LINK);
+      cancel.abort();
+      await Promise.all(calls);
+      assert.equal(allocated, MAX_PENDING_PER_LINK);
+      assert.equal(connection.connected, true);
+    } finally { cancel.abort(); await closeConnection(connection, server); }
+  });
+
+  it('bounds queued writers and pins canceled frame bytes until the write callback completes', async () => {
+    const received: Buffer[] = [];
+    const server = await startServer((frame) => { received.push(frame); });
+    const connection = new IggyConnection(connectionConfig(server));
+    const cancel = new AbortController();
+    let released = false;
+    const owner = new FrozenFrame(requestFrame(1n), () => { released = true; });
+    let completeWrite: (() => void) | undefined;
+    let writing!: () => void;
+    const started = new Promise<void>((resolve) => { writing = resolve; });
+    try {
+      await connection.connect();
+      const write = connection.socket.write.bind(connection.socket);
+      connection.socket.write = ((chunk: Buffer, callback: (error?: Error | null) => void) =>
+        write(chunk, (error) => { completeWrite = () => callback(error); writing(); })) as Socket['write'];
+      const first = connection.exchange(() => owner.buffer, Date.now() + 2_000, cancel.signal, owner);
+      await started;
+      owner.release();
+      const waiting = Array.from({ length: LINK_WRITE_QUEUE + 8 }, (_, index) =>
+        exchange(connection, BigInt(index + 2), cancel.signal));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal((connection as unknown as { writes: unknown[] }).writes.length, LINK_WRITE_QUEUE);
+      cancel.abort();
+      assert.equal((await first).started, true);
+      assert.ok((await Promise.all(waiting)).every((result) => !result.started));
+      assert.equal(released, false);
+      assert.equal(owner.buffer.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
+      connection.socket.write = write;
+      assert.ok(completeWrite);
+      completeWrite();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(released, true);
+      assert.throws(() => owner.buffer, /released/);
+      assert.equal(received.length, 1);
+    } finally { cancel.abort(); completeWrite?.(); await closeConnection(connection, server); }
+  });
+
+  it('expires an incomplete frame independently of the caller deadline', async (context) => {
+    const server = await startServer((frame, socket) => socket.write(replyFrame(frame, Buffer.from('body')).subarray(0, HEADER_SIZE + 1)));
+    const connection = new IggyConnection(connectionConfig(server));
+    try {
+      await connection.connect();
+      context.mock.timers.enable({ apis: ['setTimeout'] });
+      const received = once(connection.socket, 'data');
+      const pending = connection.exchange(() => requestFrame(1n), Date.now() + OPERATION_TIMEOUT_MS * 2,
+        new AbortController().signal);
+      await received;
+      context.mock.timers.tick(OPERATION_TIMEOUT_MS);
+      const result = await pending;
+      assert.ok(result.error instanceof ProtocolFrameError);
+      assert.match(String(result.error), /incomplete consensus frame timed out/);
+      assert.equal(connection.connected, false);
+    } finally { context.mock.timers.reset(); await closeConnection(connection, server); }
+  });
+
+  it('never reconnects a failed physical link', async () => {
+    let accepted = 0;
+    const server = await startServer((_frame, socket) => socket.destroy());
+    server.on('connection', () => { accepted += 1; });
+    const connection = new IggyConnection(connectionConfig(server));
+    try {
+      await connection.connect();
+      assert.ok((await exchange(connection, 1n)).error);
+      await assert.rejects(connection.connect());
+      assert.equal(accepted, 1);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('bounds TCP plus TLS establishment when the peer never completes TLS', async () => {
+    const server = await startServer();
+    const connection = new IggyConnection({ ...connectionConfig(server), transport: 'TLS',
+      options: { ...connectionConfig(server).options, rejectUnauthorized: false } });
+    const started = Date.now();
+    try {
+      await assert.rejects(connection.connect(), /timed out/);
+      assert.ok(Date.now() - started < 3_000);
+      assert.equal(connection.connected, false);
+    } finally { await closeConnection(connection, server); }
+  });
+
+  it('rejects an unreadable CA file when connecting without leaking a socket', async () => {
+    const connection = new IggyConnection({ transport: 'TLS', options: { host: '127.0.0.1', port: 8090,
+      caFile: '/does/not/exist.pem' }, credentials: { username: 'iggy', password: 'iggy' } });
+    await assert.rejects(connection.connect(), /cannot read tls_ca_file/);
+    connection._destroy();
+  });
+
+  for (const host of ['localhost', '127.0.0.1']) {
+    it(`uses the correct TLS server name for ${host}`, async () => {
+      const server = await startServer(undefined, true);
+      const secured = once(server, 'secureConnection') as Promise<[TLSSocket]>;
+      const connection = new IggyConnection({ ...connectionConfig(server), transport: 'TLS',
+        options: { host, port: (server.address() as AddressInfo).port,
+          ...(host === 'localhost' ? { ca: TLS_CA_CERTIFICATE } : { rejectUnauthorized: false }) } });
+      try {
+        await connection.connect();
+        const [socket] = await secured;
+        assert.equal(socket.servername || undefined, host === 'localhost' ? host : undefined);
+      } finally { await closeConnection(connection, server); }
+    });
+  }
 });

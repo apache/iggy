@@ -23,6 +23,6 @@ use iggy_common::{ClusterMetadata, IggyError, locking::IggyRwLockFn};
 #[async_trait]
 impl ClusterClient for IggyClient {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
-        self.client.read().await.get_cluster_metadata().await
+        super::with_client!(self, client => client.get_cluster_metadata().await)
     }
 }
