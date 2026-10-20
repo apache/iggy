@@ -247,8 +247,7 @@ impl IggyBridge {
         let Some((_queued, _turn)) = calls.take(slot, lane).await else {
             return Err(BridgeError::Timeout);
         };
-        let read = async { call(lane.client.connected(&self.config).await?).await };
-        lane.client.until(calls.deadline, read).await
+        lane.client.until(&self.config, calls.deadline, call).await
     }
 }
 

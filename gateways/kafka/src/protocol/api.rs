@@ -35,6 +35,7 @@ use crate::protocol::acl::{
     self, AclBinding, AclFilter, PrincipalPermissions, encode_describe_acls_error_response,
     encode_describe_acls_response,
 };
+use crate::protocol::auto_topic_creation::{AutoTopicCreationConfig, AutoTopicCreator};
 use crate::protocol::bounds_guard::{
     validate_describe_acls_shape, validate_sasl_authenticate_shape, validate_sasl_handshake_shape,
 };
@@ -338,6 +339,8 @@ pub struct GatewayState {
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
+    pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
 
 /// Large Produce requests that decode and send at once. More at once only contend for the
@@ -372,6 +375,38 @@ impl GatewayState {
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            auto_topic_creation: None,
+        }
+    }
+
+    /// Turns on Kafka's `auto.create.topics.enable` behaviour for `Metadata` when `config` says
+    /// so.
+    ///
+    /// # Errors
+    ///
+    /// [`KafkaProtocolError::InvalidConfig`](crate::error::KafkaProtocolError::InvalidConfig)
+    /// when creation is on and `config.partitions` is 0 or over Iggy's per-topic cap.
+    pub fn with_auto_topic_creation(mut self, config: AutoTopicCreationConfig) -> Result<Self> {
+        self.auto_topic_creation = if config.enabled {
+            Some(AutoTopicCreator::new(config.partitions)?)
+        } else {
+            None
+        };
+        Ok(self)
+    }
+
+    /// Cancels the auto topic creations still running and waits up to `deadline` for them to
+    /// end. An embedder that builds its own `GatewayState` calls it before closing the bridge.
+    pub async fn shutdown_auto_topic_creation(&self, deadline: Duration) {
+        let Some(creator) = &self.auto_topic_creation else {
+            return;
+        };
+        if creator.shutdown(deadline).await
+            && let Some(bridge) = &self.bridge
+        {
+            // A cancelled create can keep its client busy, and the bridge's sign-out would queue
+            // behind it.
+            bridge.discard_auto_create_client();
         }
     }
 

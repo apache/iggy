@@ -861,11 +861,10 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     }
 }
 
-/// Serve `GET_SNAPSHOT_FILE`: gate on the snapshot rule (`read_servers ||
-/// manage_servers`, the legacy gate - the archive dumps host diagnostics, so
-/// plain authentication must not suffice), then await the off-thread
-/// collection (see `snapshot::collect`), gate again, and reply with the raw
-/// ZIP bytes.
+/// Serve `GET_SNAPSHOT_FILE`: gate on the snapshot rule (`manage_servers`,
+/// since the archive dumps server logs and host diagnostics), then await the
+/// off-thread collection (see `snapshot::collect`), gate again, and reply
+/// with the raw ZIP bytes.
 #[allow(clippy::future_not_send)]
 async fn handle_get_snapshot<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
