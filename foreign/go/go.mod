@@ -3,7 +3,6 @@ module github.com/apache/iggy/foreign/go
 go 1.25.0
 
 require (
-	github.com/avast/retry-go/v5 v5.0.0
 	github.com/google/go-cmp v0.7.0
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.20.1

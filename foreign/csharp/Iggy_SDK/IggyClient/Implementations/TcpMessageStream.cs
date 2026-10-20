@@ -21,6 +21,7 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography.X509Certificates;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
@@ -41,8 +42,7 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 namespace Apache.Iggy.IggyClient.Implementations;
 
 /// <summary>
-///     A TCP client for interacting with the Iggy server over the consensus (VSR) framing. The framed request
-///     path, leader redirection and register handshake live in <c>TcpMessageStream.Vsr.cs</c>.
+///     A TCP client with one logical consensus session and independently managed, multiplexed replica links.
 /// </summary>
 public sealed partial class TcpMessageStream : IIggyClient
 {
@@ -56,30 +56,21 @@ public sealed partial class TcpMessageStream : IIggyClient
     ];
 
     private readonly IggyClientConfigurator _configuration;
+    private readonly MutationLanes _mutations;
     private readonly SemaphoreSlim _connectGate = new(1, 1);
+    private readonly CancellationTokenSource _clientLifetime = new();
+    private CancellationTokenSource? _sessionRecoveryCancellation;
+    private Task? _sessionRecovery;
     private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
-    private readonly SemaphoreSlim _connectionSemaphore;
-    private readonly CancellationTokenSource _heartbeatCancellation = new();
+    private CancellationTokenSource? _heartbeatCancellation;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _sendingSemaphore;
     private VsrConnection? _connection;
     private string _currentAddress = string.Empty;
 
-    // The address the socket actually connected to, as an IP the roster can be compared against.
-    // _currentAddress keeps whatever the caller configured (possibly a hostname the roster never
-    // mentions), so leader comparisons made against it would move a client that is already on the
-    // leader. Written only by the connect loop.
-    private string _currentRemoteAddress = string.Empty;
-
-    // The dialed address whose connect actually landed. _currentAddress moves ahead of the socket -
-    // a redirect rewrites it before the reconnect - so a leader comparison against it would treat a
-    // node the client never reached as "already there". Written only by the connect loop.
     private string _connectedAddress = string.Empty;
-    private X509Certificate2Collection _customCaStore = [];
     private volatile bool _disposed;
     private Task? _heartbeatTask;
-    private int _isConnecting;
-    private DateTimeOffset _lastConnectionTime;
     private int _stateValue = (int)ConnectionState.Disconnected;
 
     // Every node the roster named on the last read, kept as dial candidates. A node dies together with its
@@ -94,17 +85,14 @@ public sealed partial class TcpMessageStream : IIggyClient
     // eviction is not caller intent and leaves them in place.
     private AutoLoginSettings? _rememberedLogin;
 
-    private bool IsConnecting => Volatile.Read(ref _isConnecting) != 0;
-
     private ConnectionState State => (ConnectionState)Volatile.Read(ref _stateValue);
 
     internal TcpMessageStream(IggyClientConfigurator configuration, ILoggerFactory loggerFactory)
     {
         _configuration = configuration;
+        _mutations = new MutationLanes(_consensusSession, configuration);
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
         _sendingSemaphore = new SemaphoreSlim(1, 1);
-        _connectionSemaphore = new SemaphoreSlim(1, 1);
-        _lastConnectionTime = DateTimeOffset.MinValue;
         _connectionEvents = new EventAggregator<ConnectionStateChangedEventArgs>(loggerFactory);
     }
 
@@ -124,7 +112,11 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
 
         _disposed = true;
-        _heartbeatCancellation.Cancel();
+        _clientLifetime.Cancel();
+        CancelSessionRecovery();
+        StopHeartbeat();
+        StopReplicaLinks();
+        _mutations.Reset();
         _connection?.Dispose();
         _connection = null;
         ClearPollSession();
@@ -619,7 +611,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 "Reconnection is enabled without auto login: a lost session can only be restored once the client has signed in at least once");
         }
 
-        return ConnectAsync(true, true, token);
+        return ConnectAsync(true, token);
     }
 
     /// <inheritdoc />
@@ -711,10 +703,6 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.UpdateUser(userId, userName, status);
         await SendAckAsync(CommandCodes.UPDATE_USER_CODE, message, token);
-        if (userName is not null)
-        {
-            RefreshRememberedCredentials(userId, userName, null);
-        }
     }
 
     /// <inheritdoc />
@@ -731,7 +719,6 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         var message = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
         await SendAckAsync(CommandCodes.CHANGE_PASSWORD_CODE, message, token);
-        RefreshRememberedCredentials(userId, null, newPassword);
     }
 
     /// <inheritdoc />
@@ -757,6 +744,20 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     /// <inheritdoc />
     public async Task LogoutUserAsync(CancellationToken token = default)
+    {
+        CancelSessionRecovery();
+        await _connectGate.WaitAsync(token);
+        try
+        {
+            await LogoutCoreAsync(token);
+        }
+        finally
+        {
+            _connectGate.Release();
+        }
+    }
+
+    private async Task LogoutCoreAsync(CancellationToken token)
     {
         try
         {
@@ -829,99 +830,57 @@ public sealed partial class TcpMessageStream : IIggyClient
         return identity;
     }
 
-    /// <summary>
-    ///     Connects, optionally without the configured auto login. A caller that authenticates itself right
-    ///     after the connect passes <c>false</c>, so the connect does not spend a round trip on credentials the
-    ///     caller is about to replace.
-    /// </summary>
     private async Task ConnectAsync(bool autoLogin, CancellationToken token)
     {
-        await ConnectAsync(autoLogin, true, token);
-    }
-
-    /// <summary>
-    ///     Connects and optionally leaves an authenticated roster walk on the endpoint it reached instead of
-    ///     settling it back onto the metadata leader.
-    /// </summary>
-    private async Task ConnectAsync(bool autoLogin, bool settleOnLeader, CancellationToken token,
-        bool sameEndpointOnly = false)
-    {
-        if (State is ConnectionState.Connected
-            or ConnectionState.Authenticating
-            or ConnectionState.Authenticated)
-        {
-            _logger.LogWarning("Connection is already connected");
-            return;
-        }
-
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token, _clientLifetime.Token);
+        token = cancellation.Token;
         await _connectGate.WaitAsync(token);
-        Interlocked.Exchange(ref _isConnecting, 1);
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-
-            if (State is ConnectionState.Connected
-                or ConnectionState.Authenticating
-                or ConnectionState.Authenticated)
+            if (ReadyReplicaLinks().Length > 0)
             {
                 return;
             }
-
-            // The initial delay paces reconnects to the one endpoint a single-address client has. With other
-            // endpoints known there is somewhere else to go, and pausing first only pushes the failover past the
-            // window the caller is willing to wait; the dial loop's own delay still paces the retries.
-            if (_lastConnectionTime != DateTimeOffset.MinValue && DialCandidates().Length == 1)
-            {
-                await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
-            }
-
+            StopReplicaLinks();
             SetConnectionState(ConnectionState.Connecting);
-            await TryEstablishConnectionAsync(autoLogin, settleOnLeader, token, sameEndpointOnly);
-
-            // Dispose is synchronous and cannot take the sending semaphore, so a Dispose that ran while this
-            // connect was dialing already read a connection that did not exist yet. Reading the flag after the
-            // connection is installed leaves no window: either Dispose sees the new connection and closes it, or
-            // it is seen here and the connection is dropped.
+            await TryEstablishConnectionAsync(autoLogin, token);
             if (_disposed)
             {
                 await DropConnectionAsync();
                 throw new ObjectDisposedException(nameof(TcpMessageStream));
             }
-
             StartHeartbeat();
         }
         finally
         {
-            Interlocked.Exchange(ref _isConnecting, 0);
             _connectGate.Release();
         }
     }
 
-    /// <summary>
-    ///     Starts the idle ping loop. Called under <see cref="_connectGate" />, so a reconnect finds the loop
-    ///     already running and does not start a second one. A loop that ended anyway - an interval the caller
-    ///     mutated out of range faults <see cref="PeriodicTimer" />'s constructor - is started again rather than
-    ///     leaving the client without a heartbeat for the rest of its life.
-    /// </summary>
     private void StartHeartbeat()
     {
-        if (_disposed)
+        lock (_pollRoutingGate)
         {
-            return;
-        }
-
-        if (_heartbeatTask is null or { IsCompleted: true })
-        {
+            if (_disposed || !_consensusSession.IsBound || _heartbeatTask is { IsCompleted: false })
+            {
+                return;
+            }
+            _heartbeatCancellation = new CancellationTokenSource();
             _heartbeatTask = RunHeartbeatAsync(_configuration.HeartbeatInterval, _heartbeatCancellation.Token);
         }
     }
 
-    /// <summary>
-    ///     Pings on a timer so the server keeps hearing from an otherwise idle connection. The ping goes through
-    ///     the regular request path, so a lost session is repaired by the same reconnect and auto login every
-    ///     other request would trigger; the request deadline bounds a stalled server. Failures are logged and
-    ///     the loop keeps going until the client is disposed.
-    /// </summary>
+    private void StopHeartbeat()
+    {
+        lock (_pollRoutingGate)
+        {
+            _heartbeatCancellation?.Cancel();
+            _heartbeatCancellation = null;
+            _heartbeatTask = null;
+        }
+    }
+
     private async Task RunHeartbeatAsync(TimeSpan interval, CancellationToken token)
     {
         try
@@ -929,32 +888,17 @@ public sealed partial class TcpMessageStream : IIggyClient
             using var timer = new PeriodicTimer(interval);
             while (await timer.WaitForNextTickAsync(token))
             {
-                // Without reconnection and auto login a ping on a dead connection can only fail; with them,
-                // the ping is what brings an idle client back.
-                var unrecoverable = State is ConnectionState.Disconnected or ConnectionState.Connecting
-                                    && !(_configuration.ReconnectionSettings.Enabled
-                                         && SignInSettings() != null);
-                if (IsConnecting || unrecoverable)
-                {
-                    continue;
-                }
-
-                try
-                {
-                    await PingAsync(token);
-                }
-                catch (Exception e) when (!token.IsCancellationRequested && !_disposed)
-                {
-                    _logger.LogWarning(e, "Heartbeat failed");
-                }
+                RestartExhaustedReplicaLinks();
+                PingReadyReplicas();
+                await RefreshGroupAssignmentsAsync(token);
             }
         }
-        catch (Exception) when (token.IsCancellationRequested || _disposed)
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
         }
-        catch (Exception e)
+        catch (Exception error)
         {
-            _logger.LogError(e, "Heartbeat stopped");
+            _logger.LogError(error, "Heartbeat stopped");
         }
     }
 
@@ -1007,7 +951,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private Task<SendMessagesResponse> SendMessagesCoreAsync(Identifier streamId, Identifier topicId,
-        Partitioning partitioning, ReadOnlySpan<Message> messages, CancellationToken token)
+        Partitioning partitioning, ReadOnlySpan<Message> messages, CancellationToken token, long? deadline = null)
     {
         var encryptor = _configuration.MessageEncryptor;
 
@@ -1031,16 +975,16 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw;
         }
 
-        return SendConfirmedAndDisposeAsync(payloadBuffer, bodySize, token);
+        return SendConfirmedAndDisposeAsync(payloadBuffer, bodySize, token, deadline);
     }
 
     private async Task<SendMessagesResponse> SendConfirmedAndDisposeAsync(IMemoryOwner<byte> payloadBuffer,
-        int bodySize, CancellationToken token)
+        int bodySize, CancellationToken token, long? deadline)
     {
         try
         {
             using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(CommandCodes.SEND_MESSAGES_CODE,
-                payloadBuffer.Memory[..bodySize], token: token);
+                payloadBuffer.Memory[..bodySize], token: token, deadline: deadline);
             return BinaryMapper.MapSendMessages(responseBuffer.Memory.Span);
         }
         finally
@@ -1059,228 +1003,74 @@ public sealed partial class TcpMessageStream : IIggyClient
         };
     }
 
-    private async Task TryEstablishConnectionAsync(bool autoLogin, bool settleOnLeader, CancellationToken token,
-        bool sameEndpointOnly)
+    private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token)
     {
-        var retryCount = 0;
-        var redirects = 0;
-        var delay = _configuration.ReconnectionSettings.InitialDelay;
-        Exception? configurationFault = null;
-
-        if (string.IsNullOrEmpty(_currentAddress))
+        var attempts = 0;
+        var candidates = DialCandidates();
+        while (true)
         {
-            _currentAddress = _configuration.BaseAddress;
-        }
-
-        var candidates = sameEndpointOnly ? [_currentAddress] : DialCandidates();
-        var candidate = 0;
-        do
-        {
-            await DropConnectionAsync();
-
-            if (!ServerAddress.TryParse(_currentAddress, out var host, out var port))
+            Exception? lastError = null;
+            Exception? configurationError = null;
+            foreach (var endpoint in candidates)
             {
-                throw new InvalidBaseAddressException();
-            }
-
-            Socket? socket = null;
-            var established = false;
-            try
-            {
-                socket = new Socket(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
-                if (_configuration.SendBufferSize.HasValue)
-                {
-                    socket.SendBufferSize = _configuration.SendBufferSize.Value;
-                }
-
-                if (_configuration.ReceiveBufferSize.HasValue)
-                {
-                    socket.ReceiveBufferSize = _configuration.ReceiveBufferSize.Value;
-                }
-
-                // The protocol is request/reply, so a write is always the last one before
-                // the client blocks on the answer and Nagle has nothing to coalesce it with - it only delays the
-                // trailing segment of a large request until the previous one is acked.
-                socket.NoDelay = true;
-
-                // Neither ConnectAsync nor the TLS handshake has a deadline of its own, and nothing up the
-                // stack adds one: a node whose syns are dropped - or one that accepts TCP and then never
-                // answers the ClientHello - would hold the sweep, and the connection semaphore with it, for
-                // the whole kernel connect timeout while a survivor goes untried.
-                using var dialCancellation = candidates.Length > 1 || sameEndpointOnly
-                    ? CancellationTokenSource.CreateLinkedTokenSource(token)
-                    : null;
-                dialCancellation?.CancelAfter(FailoverDialTimeout);
-                var dialToken = dialCancellation?.Token ?? token;
-
-                await socket.ConnectAsync(host, port, dialToken);
-
-                _currentRemoteAddress = socket.RemoteEndPoint is IPEndPoint remote
-                    ? ServerAddress.HostPort(remote.Address.ToString(), (ushort)remote.Port)
-                    : string.Empty;
-                _connectedAddress = _currentAddress;
-
-                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
-
-                var connectionStream = _configuration.TlsSettings.Enabled
-                    ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, dialToken)
-                    : new NetworkStream(socket, true);
-
-                // Established, not merely dialed: everything up to here belongs to this endpoint and the
-                // sweep may try the next one, while everything past it - auto login, a redirect, the leader
-                // lookup - fails the same way wherever the client lands.
-                established = true;
-
-                await _sendingSemaphore.WaitAsync(token);
+                VsrConnection connection;
                 try
                 {
-                    _connection = new VsrConnection(connectionStream, _consensusSession,
-                        _configuration.MaxResponseFrameSize, VsrRequestTimeoutMs, DropVsrConnectionLocked,
-                        _logger, ObserveMetadataCommit);
+                    connection = await DialReplicaAsync(endpoint, token);
                 }
-                finally
+                catch (Exception error) when (!token.IsCancellationRequested && !_disposed)
                 {
-                    _sendingSemaphore.Release();
-                }
-
-                SetConnectionState(ConnectionState.Connected);
-                _lastConnectionTime = DateTimeOffset.UtcNow;
-
-                socket = null;
-
-                // No pre-login roster read: the server auth-gates cluster metadata, so leadership settles after
-                // a sign-in binds a session. A login dialed at a backup still succeeds because the server
-                // forwards the register to the primary.
-                if (autoLogin && SignInSettings() is { } signInSettings)
-                {
-                    if (!await ResumeSessionAsync(token))
+                    lastError = error;
+                    if (IsConnectionConfigurationFault(error))
                     {
-                        await AutoLoginAsync(signInSettings, token);
+                        configurationError = error;
                     }
-
-                    if (settleOnLeader && await RedirectAsync(token))
-                    {
-                        await BackoffOrThrowAsync();
-                        continue;
-                    }
-                }
-
-                break;
-            }
-            // Only bringing an endpoint up is worth trying elsewhere. Everything past it - bad credentials, a
-            // leader that cannot be found - fails the same way wherever the client lands, and with unlimited
-            // retries a caller would otherwise never get the error back.
-            //
-            // A handshake the dial bound cut short is a failed attempt on this endpoint like any other, so it
-            // must not land here: only a cancellation the caller actually asked for is fatal.
-            catch (Exception e) when (established
-                                      || (e is OperationCanceledException && token.IsCancellationRequested)
-                                      || _disposed)
-            {
-                socket?.Dispose();
-
-                // The connection is already installed by the time auto login, a redirect or the leader lookup
-                // can fail, and this path leaves the loop for good, so nothing else would ever close it.
-                await DropConnectionAsync();
-
-                _logger.LogError(e, "Failed to establish connection");
-                SetConnectionState(ConnectionState.Disconnected);
-                throw;
-            }
-            catch (Exception e)
-            {
-                socket?.Dispose();
-
-                _logger.LogError(e, "Failed to connect");
-
-                if (IsTlsConfigurationFault(e))
-                {
-                    // A fault no retry can fix, kept aside rather than thrown at once: it belongs to the
-                    // endpoint that raised it - a CA file that cannot be read - and the endpoints behind that
-                    // one may be perfectly usable.
-                    configurationFault = e;
-                }
-
-                // Every other endpoint gets its turn before the retry delay: the node just lost may be gone for
-                // good, and pausing on it helps nothing.
-                if (++candidate < candidates.Length)
-                {
-                    _currentAddress = candidates[candidate];
                     continue;
                 }
-
-                candidate = 0;
-                _currentAddress = candidates[0];
-
-                // No endpoint answered and at least one said why in a way no retry changes: an unreadable CA
-                // file. The caller gets that reason instead of a retry loop that buries it - unlimited retries
-                // would otherwise redial it forever.
-                if (configurationFault is not null)
+                _connection = connection;
+                _connectedAddress = endpoint;
+                _currentAddress = endpoint;
+                SetConnectionState(ConnectionState.Connected);
+                try
                 {
-                    SetConnectionState(ConnectionState.Disconnected);
-                    throw configurationFault;
+                    if (autoLogin && SignInSettings() is { } settings)
+                    {
+                        if (await ResumeSessionAsync(token))
+                        {
+                            var roster = await ReadClusterMetadataOnReadyLinkAsync(token);
+                            if (roster is not null)
+                            {
+                                RememberRoster(roster);
+                            }
+                        }
+                        else
+                        {
+                            await AutoLoginAsync(settings, token);
+                        }
+                    }
+                    return;
                 }
-
-                // The sweep is what the reconnection budget applies to, not a single dial: checked per dial,
-                // the last round would try only the endpoint the client started on, and a client with
-                // reconnection turned off would never reach its other endpoints at all.
-                if (sameEndpointOnly || !_configuration.ReconnectionSettings.Enabled ||
-                    (_configuration.ReconnectionSettings.MaxRetries > 0 &&
-                     retryCount >= _configuration.ReconnectionSettings.MaxRetries))
+                catch
                 {
+                    await DropConnectionAsync();
                     SetConnectionState(ConnectionState.Disconnected);
                     throw;
                 }
-
-                retryCount++;
-                if (_configuration.ReconnectionSettings.UseExponentialBackoff)
-                {
-                    delay *= _configuration.ReconnectionSettings.BackoffMultiplier;
-
-                    if (delay > _configuration.ReconnectionSettings.MaxDelay)
-                    {
-                        delay = _configuration.ReconnectionSettings.MaxDelay;
-                    }
-                }
-
-                if (_logger.IsEnabled(LogLevel.Information))
-                {
-                    _logger.LogInformation("Retrying connection attempt {RetryCount} with delay {Delay}", retryCount,
-                        delay);
-                }
-
-                await Task.Delay(delay, token);
             }
-        } while (true);
-
-        // A redirect restarts the loop without passing through the catch, so it spends no retry and waits for
-        // nothing. Its own budget rather than the reconnection one: following the roster to the leader is how a
-        // VSR connect succeeds, and it has to work with reconnection turned off.
-        async Task BackoffOrThrowAsync()
-        {
-            if (++redirects > VsrMaxLeaderRedirects)
+            if (configurationError is not null)
+            {
+                throw configurationError;
+            }
+            if (!_configuration.ReconnectionSettings.Enabled
+                || _configuration.ReconnectionSettings.MaxRetries > 0 && attempts >= _configuration.ReconnectionSettings.MaxRetries)
             {
                 SetConnectionState(ConnectionState.Disconnected);
-                throw new MissingLeaderException();
+                throw lastError ?? new NotConnectedException();
             }
-
-            _logger.LogInformation("Following leader redirect {Redirect} to {Address}", redirects, _currentAddress);
-
-            // The redirect moved the client, so the endpoint it moved to leads the next dial.
-            candidates = DialCandidates();
-            candidate = 0;
-
-            await Task.Delay(delay, token);
+            await Task.Delay(ReconnectDelay(attempts++), token);
         }
     }
 
-    /// <summary>
-    ///     Closes the current connection while retaining its logical session. Takes the sending
-    ///     semaphore, which owns every write to <see cref="_connection" />, so an in-flight request never
-    ///     observes the field changing between its write and its reply. Never cancellable: a caller giving up is
-    ///     exactly when the connection has to be released.
-    /// </summary>
     private async Task DropConnectionAsync()
     {
         await _sendingSemaphore.WaitAsync(CancellationToken.None);
@@ -1288,9 +1078,6 @@ public sealed partial class TcpMessageStream : IIggyClient
         {
             _connection?.Dispose();
             _connection = null;
-
-            _groupState.ClearSessionScoped();
-            ClearPollSession();
         }
         finally
         {
@@ -1330,15 +1117,15 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     private async Task AutoLoginAsync(AutoLoginSettings settings, CancellationToken token)
     {
-        if (!string.IsNullOrEmpty(settings.PersonalAccessToken))
-        {
-            _logger.LogInformation("Signing in with a personal access token");
-            await LoginWithPersonalAccessTokenAsync(settings.PersonalAccessToken, token);
-            return;
-        }
-
-        _logger.LogInformation("Signing in with credentials: {Username}", settings.Username);
-        await LoginUserAsync(settings.Username, settings.Password, token);
+        var personalAccessToken = !string.IsNullOrEmpty(settings.PersonalAccessToken);
+        var code = personalAccessToken ? CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE : CommandCodes.LOGIN_REGISTER_CODE;
+        var secret = LoginRegister.CreateBindSecret();
+        var message = personalAccessToken
+            ? LoginRegister.SerializeWithPersonalAccessToken(settings.PersonalAccessToken, secret)
+            : LoginRegister.Serialize(settings.Username, settings.Password, secret);
+        var response = await LoginRegisterCoreAsync(code, message, token);
+        _rememberedLogin = settings;
+        _rememberedUserId = response?.UserId;
     }
 
     /// <summary>
@@ -1361,10 +1148,11 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         ValidateCertificatePath(tlsSettings.CertificatePath);
 
-        _customCaStore = new X509Certificate2Collection();
-        _customCaStore.ImportFromPemFile(tlsSettings.CertificatePath);
+        var customCaStore = new X509Certificate2Collection();
+        customCaStore.ImportFromPemFile(tlsSettings.CertificatePath);
         var stream = new NetworkStream(socket, true);
-        var sslStream = new SslStream(stream, false, RemoteCertificateValidationCallback);
+        var sslStream = new SslStream(stream, false, (sender, certificate, chain, errors) =>
+            RemoteCertificateValidationCallback(sender, certificate, chain, errors, customCaStore));
         try
         {
             // The token carries the dial bound when other endpoints are queued behind this one: a peer that
@@ -1383,18 +1171,10 @@ public sealed partial class TcpMessageStream : IIggyClient
         return sslStream;
     }
 
-    /// <summary>
-    ///     Whether bringing an endpoint up failed for a reason that says this client's own TLS configuration is
-    ///     wrong: a CA file that cannot be read. It does not change on a retry, so the sweep reports it instead
-    ///     of redialing forever.
-    /// </summary>
-    private static bool IsTlsConfigurationFault(Exception e)
+    private static bool IsConnectionConfigurationFault(Exception error)
     {
-        // A handshake verdict describes the peer, not this client: a certificate that names another host, a
-        // peer that answers a ClientHello with something else. The endpoints behind it may be fine, and with
-        // one roster entry per node the target host is a bare address no certificate has to cover, so a failed
-        // handshake ends the dial rather than the connect.
-        return e is InvalidCertificatePathException;
+        // Local configuration faults cannot heal on retry. Peer handshake failures still allow fallback.
+        return error is InvalidBaseAddressException or InvalidCertificatePathException;
     }
 
     private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)
@@ -1403,114 +1183,62 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private async Task<IMemoryOwner<byte>> SendWithResponseAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLoginOnReconnect = true, CancellationToken token = default, PartitionContext? capturedContext = null)
+        CancellationToken token = default, PartitionContext? capturedContext = null, long? deadline = null)
     {
+        TimeSpan? remaining = deadline is { } end ? TimeSpan.FromMilliseconds(end - Environment.TickCount64) : null;
+        if (remaining <= TimeSpan.Zero)
+        {
+            token.ThrowIfCancellationRequested();
+            throw PollNotAccepted();
+        }
         if (code is CommandCodes.SEND_MESSAGES_CODE or CommandCodes.POLL_MESSAGES_CODE
             or CommandCodes.GET_CONSUMER_OFFSET_CODE or CommandCodes.STORE_CONSUMER_OFFSET_CODE
             or CommandCodes.DELETE_CONSUMER_OFFSET_CODE)
         {
-            return await SendRoutedAsync(code, PartitionTarget(code, body.Span), body, capturedContext, token);
+            return await SendRoutedAsync(code, PartitionTarget(code, body.Span), body, capturedContext, token, remaining);
         }
-        return await SendRetryingLifecycleAsync(code, body, autoLoginOnReconnect, capturedContext ?? default, token);
-    }
-
-    /// <summary>
-    ///     A LifecycleBusy refusal is committed, so the request did not apply and goes out again as a new request
-    ///     with a new request id. The pause starts at <see cref="LifecycleRetryIntervalMs" />, doubles up to
-    ///     <see cref="LifecycleRetryMaxIntervalMs" /> and holds no lock, so other requests of this client keep
-    ///     flowing. The retries stop at the request deadline with the last refusal.
-    /// </summary>
-    private async Task<IMemoryOwner<byte>> SendRetryingLifecycleAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLoginOnReconnect, PartitionContext context, CancellationToken token)
-    {
-        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-        var interval = LifecycleRetryIntervalMs;
-        while (true)
+        if (VsrOperations.ForCode(code) is not (VsrOperation.Register or VsrOperation.Logout))
         {
-            try
-            {
-                return await SendWithReconnectAsync(code, body, autoLoginOnReconnect, context, token);
-            }
-            catch (IggyInvalidStatusCodeException error) when (error.FromServer
-                && error.StatusCode == VsrError.LIFECYCLE_BUSY && Environment.TickCount64 + interval < deadline)
-            {
-                await Task.Delay(interval, token);
-                interval = Math.Min(interval * 2, LifecycleRetryMaxIntervalMs);
-            }
+            return await RunClientOperationAsync(code, body, capturedContext, null, token, timeout: remaining);
         }
+        return await SendSessionControlAsync(code, body, token);
     }
 
-    private async Task<IMemoryOwner<byte>> SendWithReconnectAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLoginOnReconnect, PartitionContext context, CancellationToken token)
+    private async Task<IMemoryOwner<byte>> SendSessionControlAsync(int code, ReadOnlyMemory<byte> body,
+        CancellationToken token)
     {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        cancellation.CancelAfter(VsrRequestTimeoutMs);
+        await _sendingSemaphore.WaitAsync(cancellation.Token);
         try
         {
-            return await SendRawAsync(code, body, token, context: context);
-        }
-        catch (Exception e) when (IsLostConnection(e) && !IsConnecting && !_disposed)
-        {
-            _logger.LogWarning("Connection lost");
-
-            // A stale-client eviction is not caller intent: the server's heartbeat verifier sends it after a
-            // gc pause or a laptop sleep, so the remembered sign-in survives it and the reconnect below
-            // re-establishes the session. Only an explicit sign-out or Dispose ends it. Same rule in every SDK.
-            if (!_configuration.ReconnectionSettings.Enabled)
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+            var frame = _consensusSession.Resolve(VsrOperations.ForCode(code));
+            var connection = _connection is { IsReady: true } bootstrap
+                ? bootstrap : ReadyReplicaLinks().FirstOrDefault() ?? throw new NotConnectedException();
+            var attempt = await connection.SendAttemptAsync(code, body, deadline, deadline, HasSensitiveReply(code),
+                cancellation.Token, retainedFrame: frame);
+            if (attempt.Error is null)
             {
-                _logger.LogWarning("Reconnection is disabled");
-                SetConnectionState(ConnectionState.Disconnected);
-                throw;
+                return attempt.Response!;
             }
-
-            // With no credentials - neither configured nor remembered from a sign-in - a reconnect cannot
-            // re-establish the session, so the request would only come back unauthenticated. Login and register
-            // are the exception: they re-authenticate themselves.
-            if (SignInSettings() == null && autoLoginOnReconnect)
+            if (VsrOperations.ForCode(code) == VsrOperation.Register
+                && attempt.Error is VsrSessionEvictedException { InnerException: { } rejection })
             {
-                _logger.LogWarning("No credentials to sign in with, the session cannot be re-established");
-                SetConnectionState(ConnectionState.Disconnected);
-                throw;
+                ExceptionDispatchInfo.Throw(rejection);
             }
-
-            return await HandleReconnectionAsync(code, body, autoLoginOnReconnect, token, context);
-        }
-    }
-
-    // A stale-client eviction is the server telling this connection its session is gone: the transport already
-    // dropped the connection, so the request is replayed over a fresh one like any other lost request.
-    private static bool IsLostConnection(Exception e)
-    {
-        return VsrConnection.IsConnectionException(e)
-               || e is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true };
-    }
-
-    private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
-        bool autoLogin, CancellationToken token, PartitionContext context)
-    {
-        var currentTime = DateTimeOffset.UtcNow;
-        await _connectionSemaphore.WaitAsync(token);
-
-        try
-        {
-            if (State is ConnectionState.Connected or ConnectionState.Authenticated
-                && _lastConnectionTime > currentTime)
+            if (attempt.RequestStarted && attempt.Error is not IggyInvalidStatusCodeException
+                { FromServer: true, StatusCode: not VsrError.TRANSIENT_NOT_COMMITTED })
             {
-                _logger.LogInformation("Connection already established, sending payload");
-                return await SendRawAsync(code, body, token, context: context);
+                throw new VsrRequestOutcomeUnknownException(attempt.Error);
             }
-
-            SetConnectionState(ConnectionState.Disconnected);
-            _logger.LogInformation("Reconnecting to the server");
-            await ConnectAsync(autoLogin, token);
-
-            _logger.LogInformation("Reconnected to the server");
-
-            await Task.Delay(_configuration.ReconnectionSettings.WaitAfterReconnect, token);
-
-            return await SendRawAsync(code, body, token, context: context);
+            ExceptionDispatchInfo.Throw(CallerError(attempt.Error));
+            throw new InvalidOperationException();
         }
         finally
         {
-            _connectionSemaphore.Release();
+            _sendingSemaphore.Release();
         }
     }
 
@@ -1522,11 +1250,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     /// <summary>
-    ///     Sets the connection state and publishes a ConnectionStateChangedEventArgs to subscribers via the connection event
-    ///     aggregator. Callers reach this holding different locks - the connect loop the connection semaphore, a drop the
-    ///     sending one, the login path neither - so the swap has to be atomic: a read-modify-write would let a concurrent
-    ///     transition publish a previous state that never preceded the current one. Only the thread that changed the value
-    ///     publishes, so a state is never announced twice.
+    ///     Link and session owners transition independently. An atomic swap preserves the previous state
+    ///     and prevents duplicate notifications when several links change together.
     /// </summary>
     /// <param name="newState">The new connection state</param>
     private void SetConnectionState(ConnectionState newState)
@@ -1551,7 +1276,7 @@ public sealed partial class TcpMessageStream : IIggyClient
     }
 
     private bool RemoteCertificateValidationCallback(object sender, X509Certificate? certificate, X509Chain? chain,
-        SslPolicyErrors sslPolicyErrors)
+        SslPolicyErrors sslPolicyErrors, X509Certificate2Collection customCaStore)
     {
         if (sslPolicyErrors == SslPolicyErrors.None)
         {
@@ -1568,7 +1293,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             serverCert = new X509Certificate2(certificate);
         }
 
-        if (_customCaStore.Any(ca => ca.Thumbprint == serverCert.Thumbprint))
+        if (customCaStore.Any(ca => ca.Thumbprint == serverCert.Thumbprint))
         {
             if (DateTime.UtcNow <= serverCert.NotAfter && DateTime.UtcNow >= serverCert.NotBefore)
             {
@@ -1585,7 +1310,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         using var customChain = new X509Chain();
         customChain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
         customChain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-        foreach (var ca in _customCaStore)
+        foreach (var ca in customCaStore)
         {
             customChain.ChainPolicy.CustomTrustStore.Add(ca);
             customChain.ChainPolicy.ExtraStore.Add(ca);

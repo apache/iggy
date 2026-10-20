@@ -20,7 +20,6 @@
 package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
-import io.netty.util.ReferenceCounted;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.serde.BytesSerializer;
@@ -67,34 +66,35 @@ public class StreamsTcpClient implements StreamsClient {
     public CompletableFuture<StreamDetails> createStream(String name) {
         var payload = BytesSerializer.toBytes(name, "name");
 
-        return connection().send(CommandCode.Stream.CREATE.getValue(), payload).thenApply(response -> {
-            StreamDetails details = readStreamDetails(response);
-            response.release();
-            return details;
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Stream.CREATE.getValue(), payload), response -> {
+                    StreamDetails details = readStreamDetails(response);
+                    response.release();
+                    return details;
+                });
     }
 
     @Override
     public CompletableFuture<Optional<StreamDetails>> getStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection().send(CommandCode.Stream.GET.getValue(), payload).thenApply(response -> {
-            Optional<StreamDetails> result;
-            if (response.isReadable()) {
-                result = Optional.of(readStreamDetails(response));
-            } else {
-                result = Optional.empty();
-            }
-            response.release();
-            return result;
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Stream.GET.getValue(), payload), response -> {
+                    Optional<StreamDetails> result;
+                    if (response.isReadable()) {
+                        result = Optional.of(readStreamDetails(response));
+                    } else {
+                        result = Optional.empty();
+                    }
+                    response.release();
+                    return result;
+                });
     }
 
     @Override
     public CompletableFuture<List<StreamBase>> getStreams() {
-        return connection()
-                .send(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER)
-                .thenApply(response -> {
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER), response -> {
                     List<StreamBase> streams = new ArrayList<>();
                     while (response.isReadable()) {
                         streams.add(readStreamBase(response));
@@ -112,16 +112,17 @@ public class StreamsTcpClient implements StreamsClient {
         // server reads an absent block as empty. Settings will ride one here,
         // as topics do.
 
-        return connection().send(CommandCode.Stream.UPDATE.getValue(), payload).thenAccept(ReferenceCounted::release);
+        return connection().sendAndRelease(CommandCode.Stream.UPDATE, payload);
     }
 
     @Override
     public CompletableFuture<Void> deleteStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection().send(CommandCode.Stream.DELETE.getValue(), payload).thenAccept(response -> {
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.Stream.DELETE, payload), response -> {
             response.release();
             topologyChanged.run();
+            return null;
         });
     }
 }

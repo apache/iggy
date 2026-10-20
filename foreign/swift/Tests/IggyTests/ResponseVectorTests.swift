@@ -196,17 +196,13 @@ struct ResponseVectorTests {
     }
 
     @Test func routes() async throws {
-        #expect(try Responses.partitionRoute(body("response.partition_route")) == PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10))
+        let route = try Responses.partitionRoute(body("response.partition_route"))
+        #expect(route.context == PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 10))
+        // The view and the partition count sit between the context and the
+        // primary.
+        #expect(route.primaryReplica == 2)
         // A route of any other length comes from a mismatched build.
         await expectCode(.invalidCommand) { _ = try Responses.partitionRoute(body("response.partition_route") + [0]) }
-
-        let poll = try Responses.pollRoute(body("response.poll_routing"))
-        #expect(poll.consumerSession.clientID == UInt128Value(low: 0x090a_0b0c_0d0e_0f10, high: 0x0102_0304_0506_0708))
-        #expect(poll.consumerSession.session == 42)
-        #expect(poll.consumerSession.metadataWatermark == 120)
-        #expect(poll.context == PartitionContext(incarnation: 7, ownerGeneration: 3, metadataOp: 110))
-        #expect(poll.primary.replicaID == 2)
-        #expect(poll.primary.tcpAddress == "10.0.0.3:8092")
     }
 
     @Test func clusterMetadata() throws {

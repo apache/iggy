@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use the `edge` package with server 0.9.0 or `edge`. Stable Node SDK 0.8.0 uses the older wire protocol. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release. Older builds are incompatible. This release requires fresh server storage (`IGGY-BOUND-GRANTS-3`); existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -59,27 +59,97 @@ and after the client deletes a stream or a topic or creates or deletes
 partitions. A raw `SendMessages` command without an explicit partition id
 fails with error code 5 before the client sends it.
 
-Partition commands carry a partition context: the partition incarnation, the
-owner generation and a metadata operation. To make a poll or an offset write
-fail instead of landing in a recreated partition, pass the `context` of the
-earlier poll reply. Without one, the client takes the context that its cached
-route reports. If another client deletes and recreates the partition, one such
-call can fail with error code 87 (5009 for a consumer group). The client then
-drops the route, and the next call routes again. On a cluster, polls and
-offset writes go to the partition primary with one attempt per route, as in the
-Rust SDK. They return a lifecycle refusal (error code 88) at once. The client
-retries an 88 for any other request as a new request until the request
-deadline. The pause starts at 50 ms and doubles up to 1 s.
+Partition commands carry a context containing the partition incarnation, owner
+generation and metadata operation. Pass the context of an earlier poll reply to
+keep an offset write or continuation tied to that history. Otherwise the client
+captures the route context. Non-admission retries and uncertain-operation replay
+preserve the first captured context, request identity and payload. Route refreshes
+change the destination. Lifecycle error 88 retries with a fresh ID and the same
+context. A send without caller-supplied context can refresh history once after
+error 87; explicit contexts return that error. A new call can capture newer
+metadata progress.
 
-VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
+Route discovery uses command 105. Sends, polls and offset reads/writes use the
+partition primary; other commands use the metadata primary. One logical client
+owns a shared session, a monotonic request counter and one multiplexed link per
+replica. Healthy links survive primary changes. Each link dials the address
+that its node advertises in the cluster roster. With a one-node roster, the
+link dials the configured endpoint instead. A single node behind a port
+mapping or a port-forward thus stays reachable. The legacy `poolSize` option
+accepts only one logical client; it does not limit replica links or concurrency.
+The public `Client._pool` property has been removed. Applications should use the
+client methods directly; the client owns its replica connections.
 
-VSR authentication translates the existing password and personal-access-token
-login APIs into the register handshake required by the consensus protocol.
-Transport loss clears local authentication but retains the logical session and
-its bind proof. Login with the same credentials first tries to bind that session;
-a confirmed ended session requires a new registration. Logout forgets the local
-session. Transient not-committed responses retry the exact encoded request within
-one bounded deadline. A disconnected mutation is never replayed under a new session.
+VSR authentication translates password and personal-access-token login into the
+Register handshake. Replacement links bind the existing session. Confirmed
+session expiry requires a new Register; an uncertain mutation is never replayed
+under that new session. An eviction that ends the session does not prove the
+outcome of a mutation that the client already wrote. That call ends with
+`OperationUncertainError`. A stale client eviction drops only its link, because
+the server keeps the session. The client binds the same session on a new link,
+as after any lost link, so retained operations and group membership stay.
+Explicit relogin logs out the previous session first.
+
+A reply with status 30 (`StaleClient`) says that the server no longer attaches
+the link to the session. This happens, for example, after the user was deleted
+or deactivated. A 30 refusal before commit fails a first attempt with that
+error. After an earlier written attempt, it does not prove the outcome, so that
+call ends with `OperationUncertainError`. The client closes that link and binds
+the session on a new link, as after any lost link. A replica that replaced its
+client table refuses a live session the same way, so the bind decides. A live
+session stays, with its retained operations and group membership. An ended
+session refuses the bind, and the client signs in again.
+
+A committed 30 comes from the replicated session table, so that session ended.
+It is a proved outcome, like any other committed rejection, and the client
+drops the session at once and signs in again.
+
+### Mutation recovery and limits
+
+Mutations share one FIFO lane per partition history, with a separate metadata
+lane. An uncertain mutation remains retained and blocks later mutations in its
+lane. `OperationUncertainError.operationId` and `LaneBlockedError.operationId`
+are exact `bigint` values. Use `resolveOperation(operationId, { deadline })` to
+replay the retained frame, where `deadline` is an absolute `Date.now()` timestamp
+in milliseconds. The default operation budget is 30 seconds, including admission,
+routing, link waits and retries.
+
+Resolution requires correlated committed-result proof. A proved business
+rejection returns the original error and releases the lane. An unproved denial
+keeps an uncertain operation retained. The client keeps the proved outcomes of
+its last `maxPendingOperations` replays, also across a session reset. If a
+resolver already proved the outcome, a later `resolveOperation` of the same ID
+returns it without a request. A `resolveOperation` call that waits for another
+replay of the same ID and reaches its deadline fails with
+`OperationUncertainError`.
+
+`abandonOperation(operationId)` releases the client lane without proving that
+the mutation failed. A replay that is already running keeps the lane until it
+ends, and the client keeps the outcome that it proves. Logout, session reset and
+destruction discard retained operations with their outcomes still unknown.
+`OperationNotRetainedError` does not establish the outcome: a reset or an
+abandon came before a proved outcome, or the proved outcome aged out.
+
+**Breaking change:** `Client.destroy()` aborts in-flight calls immediately and
+discards retained operations. It does not wait for outstanding calls to finish.
+Await those calls before destroying the client when their results are needed.
+
+Auto-commit and Next polls hold their partition lane only during the active call.
+Error 57 or a lost reply ends the call immediately with unknown progress and no
+retained operation ID. These polls never replay after uncertainty. Known
+non-admission errors 58/89 remain retryable; pure reads may retry lost replies.
+Before uncertainty, lifecycle error 88 retries with a fresh ID within the same
+deadline. After uncertainty, only committed-result proof can release the lane.
+
+Configure `maxPendingOperations` (default 256) and `maxPendingOperationBytes`
+(default 64 MiB) on the client. Admission waits before allocating an ID or freezing
+a mutation frame. Both limits must be positive. The byte budget includes the
+256-byte header and body; smaller positive budgets reject mutations that cannot
+fit while reads and login remain available. Oversized frames fail locally.
+Completion, abandonment and reset release the operation slot. Writer aliases keep bytes charged until they release
+the frame. These limits cover admitted active/retained frames, not caller buffers,
+queued API input snapshots, or read/control bodies. `sendBinaryRequest` preserves
+its immediate payload snapshot before awaiting a custom provider.
 
 An established session has its own lifetime. Password or PAT changes and PAT
 expiry do not end it. Logout, session lease expiry, or user deactivation end the
@@ -97,6 +167,37 @@ client interval exceeds 36 s, the verifier evicts an idle group member. If it
 exceeds about 72 s, or is 0 to disable client heartbeats, any idle session
 expires. Any other unusable value is rejected instead of silently disabling the
 heartbeat.
+
+A replica link redials on its own after it drops, with jittered exponential
+backoff. `reconnect.maxRetries` limits one burst of redials, not the life of
+the client. While the client stays signed in, each heartbeat restarts a link
+that used its budget, with a fresh budget. A request does not redial a link. It
+retries within its deadline until the link returns. `destroy()` and logout stop
+the restarts.
+
+When every link used its budget, a request can fail before its deadline with
+`NotConnectedError`. When no endpoint accepts a dial within its retry budget, a
+sign-in also fails with `NotConnectedError`, and its `cause` holds the last dial
+error. In both cases a later call can succeed, because the heartbeat restarts
+the links and each sign-in dials again. If reconnection or heartbeats are
+disabled, nothing restarts a link that used its budget, so the request fails
+with a plain `Error` instead.
+
+When a poll fails with status 30, 40, 57, 58 or 89, `singleConsumerStream` and
+`groupConsumerStream` poll again after `interval`. They also poll again after a
+poll deadline, after a poll with unknown progress and after
+`NotConnectedError`. The client binds the session again, signs in again,
+reconnects or routes again after these on its own. Any other error ends the
+stream. If the reply of an auto-commit poll is lost, the stream can skip that
+batch.
+
+`singleConsumerStream` and `groupConsumerStream` sign in before they return the
+stream, and `groupConsumerStream` also joins its group. If the sign-in or the
+join fails, the call destroys its client and rejects with that error. If no
+endpoint accepts a dial within the retry budget, the error is
+`NotConnectedError`. If the 30 second sign-in deadline ends first, the error is
+`VsrResponseTimeoutError`. With the default `reconnect` values, the deadline
+usually ends first. When a stream closes, it destroys its client.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
@@ -145,7 +246,8 @@ const stats = await client.system.getStats();
 Supported schemes are `iggy://` (TCP, default) and `iggy+tcp://`. Credentials
 are `username:password` or a single personal access token. Options mirror the
 other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
-`reconnection_interval`, `heartbeat_interval` and `nodelay`. `reestablish_after`
+`reconnection_interval`, `heartbeat_interval`, `nodelay`, `max_pending_operations`
+and `max_pending_operation_bytes`. `reestablish_after`
 is accepted for format compatibility but has no Node equivalent.
 
 note: `SimpleClient` does not accept a connection string: it wraps an existing
@@ -169,12 +271,10 @@ Durations accept the same expressions as the Rust SDK, for example `500ms`,
 
 ## use sources
 
-Cluster auto-commit polling over TCP/TLS keeps group membership on the coordinator
-and uses separate connections to partition primaries. It requires server support
-for binary commands 15 (`BindSession`), 103 and 104. Pause binary auto-commit consumers for the
-whole upgrade: upgrade every server first, then the SDKs, and restart consumers
-so they rejoin their groups. Older SDKs can lose membership when a backup refuses
-an offset commit; the new SDK does not fall back to legacy polling.
+Cluster polling uses command 15 (`BindSession`), route discovery 105 and poll
+100. Commands 14, 103, 104 and 123 are retired. Pause consumers for the coordinated
+server/SDK upgrade and restart them to rejoin their groups. There is no fallback
+to retired polling commands.
 
 ### Install
 

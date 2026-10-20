@@ -35,25 +35,18 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 namespace Apache.Iggy.IggyClient.Implementations;
 
 /// <summary>
-///     The consensus (VSR) half of the TCP client: the framed request path, the leader redirection, the
-///     register handshake, and the client-side partitioning and consumer-group assignment the broker does not
+///     The consensus (VSR) session lifecycle, register handshake, client-side partitioning, and consumer-group
+///     assignment the broker does not
 ///     resolve server-side. The command surface lives in <see cref="TcpMessageStream" />.
 /// </summary>
 public sealed partial class TcpMessageStream : ISessionGenerationProvider
 {
     /// <summary>
-    ///     Upper bound for a whole VSR request: the transient replays and the leader failovers share it, and so
-    ///     do the reply header and body reads. The connection is lockstep, so an unanswered read would hold the
-    ///     sending semaphore forever and wedge every later request.
+    ///     Admission, routing, and retries share one call deadline. Each link also bounds incomplete frame
+    ///     transfers independently, so cancellation cannot leave its reader or writer stalled forever.
     /// </summary>
     private const int VsrRequestTimeoutMs = 30_000;
 
-    /// <summary>
-    ///     How long a <see cref="VsrError.TRANSIENT_NOT_ACCEPTED" /> request replays on the same connection
-    ///     before the leader roster is re-checked. A node that stopped being primary refuses forever, so
-    ///     replaying alone never recovers.
-    /// </summary>
-    private const int VsrTransientFailoverCheckMs = 2_000;
 
     /// <summary>
     ///     First pause before a <see cref="VsrError.LIFECYCLE_BUSY" /> request goes out again. Every retry is a
@@ -64,21 +57,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
     private const int LifecycleRetryMaxIntervalMs = 1_000;
 
-    /// <summary>
-    ///     How long a transiently leaderless roster is polled before the connection proceeds on the current
-    ///     node anyway. A restarted node cedes the primaryship its stale view assigns it, and the peers need
-    ///     about one heartbeat timeout to elect.
-    /// </summary>
-    private const int VsrLeaderlessWaitMs = 5_000;
 
-    private const int VsrLeaderlessPollMs = 250;
 
-    /// <summary>
-    ///     Cap on consecutive leader redirects, so a flapping roster cannot spin the connect loop or the
-    ///     transient failover path. Each operation - a request, a connect, a register - spends its own local
-    ///     budget, so a long-lived client never latches onto a follower for good.
-    /// </summary>
-    private const int VsrMaxLeaderRedirects = 3;
 
     /// <summary>
     ///     Bound on one endpoint's dial while other endpoints are queued behind it. Neither the connect nor the
@@ -130,85 +110,58 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// <inheritdoc />
     ulong ISessionGenerationProvider.SessionGeneration => _consensusSession.Generation;
 
-    /// <summary>
-    ///     Runs the consensus register handshake and binds the session it commits. Everything before the bind
-    ///     is a consumed register on the server, so any failure resets the session: the next attempt must
-    ///     re-register under a fresh client id rather than send requests the primary would fence.
-    /// </summary>
-    /// <remarks>
-    ///     A bound connection must commit logout before it can register again. The server treats a register on
-    ///     an already-bound transport as an idempotent replay of the existing binding, so re-arming only the
-    ///     local session would pair a fresh client id and request counter with the old server session.
-    /// </remarks>
     private async Task<AuthResponse?> LoginRegisterAsync(int code, byte[] message, CancellationToken token)
     {
-        for (var redirects = 0; ; redirects++)
+        CancelSessionRecovery();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(VsrRequestTimeoutMs);
+        await _connectGate.WaitAsync(deadline.Token);
+        try
         {
-            if (_consensusSession.IsBound)
-            {
-                await LogoutUserAsync(token);
-            }
-            else if (State == ConnectionState.Authenticated)
-            {
-                SetConnectionState(ConnectionState.Connected);
-            }
+            return await LoginRegisterCoreAsync(code, message, deadline.Token);
+        }
+        finally
+        {
+            _connectGate.Release();
+        }
+    }
 
-            SetConnectionState(ConnectionState.Authenticating);
-
-            LoginRegisterResponse response;
+    private async Task<AuthResponse?> LoginRegisterCoreAsync(int code, byte[] message, CancellationToken token)
+    {
+        if (_consensusSession.IsBound)
+        {
+            await LogoutCoreAsync(token);
+        }
+        if (ReadyReplicaLinks().Length == 0)
+        {
+            await TryEstablishConnectionAsync(false, token);
+        }
+        SetConnectionState(ConnectionState.Authenticating);
+        try
+        {
+            using var responseBuffer = await SendWithResponseAsync(code, message, token: token);
+            var response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
+            _consensusSession.Bind(response.Session, LoginRegister.ReadBindSecret(message));
+            SetConnectionState(ConnectionState.Authenticated);
             try
             {
-                using IMemoryOwner<byte> responseBuffer =
-                    await SendWithResponseAsync(code, message, autoLoginOnReconnect: false, token: token);
-
-                response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
-                _consensusSession.Bind(response.Session, LoginRegister.ReadBindSecret(message));
-            }
-            catch
-            {
-                await ResetConsensusSessionAsync();
-                if (State == ConnectionState.Authenticating)
+                var metadata = await ReadClusterMetadataOnReadyLinkAsync(token);
+                if (metadata is not null)
                 {
-                    SetConnectionState(ConnectionState.Connected);
+                    RememberRoster(metadata);
                 }
-
-                throw;
             }
-
-            _logger.LogInformation(
-                "Authenticated against the server, version {ServerVersion}, protocol version {ServerProtocolVersion}",
-                response.ServerVersion, response.ServerProtocolVersion);
-            SetConnectionState(ConnectionState.Authenticated);
-
-            var authResponse = new AuthResponse(response.UserId, null);
-            if (IsConnecting)
+            catch (IggyInvalidStatusCodeException error) when (error.StatusCode == VsrError.FEATURE_UNAVAILABLE)
             {
-                return authResponse;
             }
-
-            if (redirects >= VsrMaxLeaderRedirects)
-            {
-                _logger.LogWarning("Maximum leader redirections reached while registering, staying on {Address}",
-                    _currentAddress);
-            }
-            else if (await RedirectAsync(token))
-            {
-                await ConnectAsync(false, token);
-                if (await ResumeSessionAsync(token))
-                {
-                    return authResponse;
-                }
-                continue;
-            }
-
-            // The redirect probe can tear the connection down without throwing, and success on a client that is
-            // no longer bound would leave the caller unauthenticated with nothing left to re-authenticate it.
-            if (State != ConnectionState.Authenticated)
-            {
-                throw new NotConnectedException();
-            }
-
-            return authResponse;
+            StartHeartbeat();
+            return new AuthResponse(response.UserId, null);
+        }
+        catch
+        {
+            await ResetConsensusSessionAsync();
+            SetConnectionState(ConnectionState.Connected);
+            throw;
         }
     }
 
@@ -243,7 +196,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             }
             if (attempt.Error is { } error)
             {
-                ExceptionDispatchInfo.Throw(error);
+                ExceptionDispatchInfo.Throw(CallerError(error));
             }
             using var response = attempt.Response!;
             var bound = LoginRegister.Deserialize(response.Memory.Span);
@@ -272,9 +225,29 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     private async Task<SendMessagesResponse> SendMessagesResolvedAsync(Identifier streamId, Identifier topicId,
         Partitioning partitioning, IList<Message> messages, CancellationToken token)
     {
-        var resolved = await ResolvePartitioningAsync(streamId, topicId, partitioning, token);
-
-        return await SendMessagesCoreAsync(streamId, topicId, resolved, AsSpan(messages), token);
+        var deadline = Environment.TickCount64 + VsrRequestTimeoutMs;
+        using var selection = CancellationTokenSource.CreateLinkedTokenSource(token);
+        selection.CancelAfter(VsrRequestTimeoutMs);
+        try
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                var resolved = await ResolvePartitioningAsync(streamId, topicId, partitioning, selection.Token);
+                try
+                {
+                    return await SendMessagesCoreAsync(streamId, topicId, resolved, AsSpan(messages), token, deadline);
+                }
+                catch (IggyInvalidStatusCodeException error) when (attempt == 0 && error.FromServer
+                    && error.StatusCode == VsrError.PARTITION_NOT_FOUND)
+                {
+                    _groupState.InvalidateTopic(new TopicKey(streamId, topicId));
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw PollNotAccepted();
+        }
     }
 
     /// <summary>
@@ -454,54 +427,6 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
 
     /// <summary>
-    ///     Points the client at the current leader when it is not the node this connection is on, leaving the
-    ///     stream closed for the caller to reconnect. The caller owns the redirect budget: every operation that
-    ///     follows redirects - a request, a connect, a register - counts them locally against
-    ///     <see cref="VsrMaxLeaderRedirects" />.
-    /// </summary>
-    private async Task<bool> RedirectAsync(CancellationToken token)
-    {
-        // The probe issues a request of its own, which takes the sending semaphore, so it cannot run under that
-        // lock. Only the commit below does.
-        var currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
-        if (currentLeaderNode == null)
-        {
-            return false;
-        }
-
-        var leaderAddress = ServerAddress.HostPort(currentLeaderNode.Ip, currentLeaderNode.Endpoints.Tcp);
-        // The roster may name the leader by either side of this connection: the address the client dialed
-        // (a hostname, an advertised_address) or the endpoint the socket resolved to. IsSame does no DNS
-        // resolution, so a match on either means the client is already on the leader; checking only one
-        // side redirect-loops the other kind of roster. Both are evidence of where the socket landed, so
-        // both come from the connect loop: _currentAddress may already name a leader the client never
-        // reached, and matching on it would silently refuse the redirect that gets it there.
-        if ((_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _currentRemoteAddress))
-            || (_connectedAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _connectedAddress)))
-        {
-            return false;
-        }
-
-        _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}",
-            leaderAddress);
-
-        // The address move and the drop are one step: a reader that saw the new address but the old stream would
-        // find every later redirect short-circuited by the address check above, with no path back to the leader.
-        await _sendingSemaphore.WaitAsync(token);
-        try
-        {
-            _currentAddress = leaderAddress;
-            DropVsrConnectionLocked(_connection);
-        }
-        finally
-        {
-            _sendingSemaphore.Release();
-        }
-
-        return true;
-    }
-
-    /// <summary>
     ///     Keeps every node the roster names as a dial candidate. Replaced wholesale rather than merged: the
     ///     roster is the cluster's own answer about where its nodes are, so a node it dropped stops being dialed.
     ///     The configured address is kept separately and outlives it. A node that does not expose the tcp
@@ -541,71 +466,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         {
             _rosterAddresses = endpoints;
         }
+        InstallReplicaLinks(clusterMetadata);
     }
 
-    private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
+    private async Task<ClusterMetadata?> ReadClusterMetadataOnReadyLinkAsync(CancellationToken token)
     {
-        var leaderlessDeadline = Environment.TickCount64 + VsrLeaderlessWaitMs;
-        try
-        {
-            while (true)
-            {
-                var clusterMetadata = await ReadClusterMetadataNoRedirectAsync(token);
-                if (clusterMetadata == null)
-                {
-                    return null;
-                }
-
-                RememberRoster(clusterMetadata);
-
-                if (clusterMetadata.Nodes.Count() == 1)
-                {
-                    return null;
-                }
-
-                var leaderNode = clusterMetadata.Nodes.FirstOrDefault(x =>
-                    x.Role == ClusterNodeRole.Leader && x.Status == ClusterNodeStatus.Healthy);
-                if (leaderNode != null)
-                {
-                    return leaderNode;
-                }
-
-                if (Environment.TickCount64 >= leaderlessDeadline)
-                {
-                    _logger.LogWarning("No leader in the cluster metadata after {WaitMs} ms, continuing on {Address}",
-                        VsrLeaderlessWaitMs, _currentAddress);
-
-                    return null;
-                }
-
-                await Task.Delay(VsrLeaderlessPollMs, token);
-            }
-        }
-        // todo: change after error refactoring, error code 5 is for feature not supported
-        catch (IggyInvalidStatusCodeException e) when (e is
-        {
-            StatusCode: VsrError.FEATURE_UNAVAILABLE, FromServer: true
-        })
-        {
-            return null;
-        }
-        catch (Exception e) when (e is not OperationCanceledException && !VsrConnection.IsConnectionException(e))
-        {
-            _logger.LogWarning(e, "Failed to read the cluster metadata, continuing on {Address}", _currentAddress);
-
-            return null;
-        }
-    }
-
-    /// <summary>
-    ///     Reads the roster without following redirects: the probe is what redirects are decided from, so a
-    ///     probe that redirected or reconnected would reenter the very loop that called it. A probe the current
-    ///     node keeps refusing simply fails, and the caller stays where it is.
-    /// </summary>
-    private async Task<ClusterMetadata?> ReadClusterMetadataNoRedirectAsync(CancellationToken token)
-    {
-        using IMemoryOwner<byte> responseBuffer = await SendRawAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
-            ReadOnlyMemory<byte>.Empty, token, allowRedirect: false);
+        using IMemoryOwner<byte> responseBuffer = await SendPollControlAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
+            ReadOnlyMemory<byte>.Empty, Environment.TickCount64 + VsrRequestTimeoutMs, token);
 
         if (responseBuffer.Memory.Length == 0)
         {
@@ -613,203 +480,6 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         }
 
         return BinaryMapper.MapClusterMetadata(responseBuffer.Memory.Span);
-    }
-
-    /// <summary>
-    ///     Sends a consensus-framed request: small frames go out as a single coalesced write, larger bodies
-    ///     as a second write straight from the caller's buffer.
-    /// </summary>
-    /// <remarks>
-    ///     One deadline bounds the whole request across transient replays AND leader failovers. Login and
-    ///     register replay on this connection for the whole budget instead: the connect flow owns leader
-    ///     redirection for the handshake, and reconnecting from underneath it would recurse.
-    /// </remarks>
-    private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
-        CancellationToken token, bool allowRedirect = true, PartitionContext context = default)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        if (State is ConnectionState.Disconnected or ConnectionState.Connecting)
-        {
-            throw new NotConnectedException();
-        }
-
-        var isLoginRegister = code is CommandCodes.LOGIN_REGISTER_CODE or CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE;
-        var clearSensitiveReply = HasSensitiveReply(code);
-        var overallDeadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-        var requestEncoded = false;
-        var leaderRedirects = 0;
-        var redirectBudgetLogged = false;
-        var walkingRoster = false;
-        var rosterWalkRestarted = false;
-        HashSet<string> walkedRosterEndpoints = new(StringComparer.OrdinalIgnoreCase);
-        VsrConnection? lastConnection = null;
-
-        try
-        {
-            while (true)
-            {
-                var transientDeadline = isLoginRegister
-                    ? overallDeadline
-                    : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
-
-                var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
-                    clearSensitiveReply, token, context);
-                requestEncoded |= attempt.Encoded;
-                lastConnection = attempt.Connection;
-
-                if (attempt.Error is null)
-                {
-                    return attempt.Response!;
-                }
-
-                if (attempt.Error is IggyInvalidStatusCodeException
-                    {
-                        StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED or VsrError.NOT_PRIMARY, FromServer: true
-                    }
-                    && !isLoginRegister
-                    && allowRedirect
-                    && Environment.TickCount64 + PollRoutingRetryIntervalMs < overallDeadline)
-                {
-                    var moved = false;
-                    if (leaderRedirects < VsrMaxLeaderRedirects && !walkingRoster)
-                    {
-                        moved = await RedirectAsync(token);
-                        if (moved)
-                        {
-                            leaderRedirects++;
-                        }
-                    }
-
-                    if (!moved && attempt.Error is not IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
-                    {
-                        moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
-                        if (!moved && walkingRoster && !rosterWalkRestarted)
-                        {
-                            // A node that refused earlier can serve the request once it catches up, like a
-                            // partition primary that had not materialised the partition yet. Every hop also drops
-                            // the poll connections, so the walk restarts once and then stays on the current node.
-                            rosterWalkRestarted = true;
-                            walkedRosterEndpoints.Clear();
-                            moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
-                        }
-
-                        walkingRoster |= moved;
-                    }
-
-                    if (moved)
-                    {
-                        await ConnectAsync(true, !walkingRoster, token);
-                    }
-                    else if (attempt.Error is IggyInvalidStatusCodeException { StatusCode: VsrError.NOT_PRIMARY })
-                    {
-                        await Task.Delay(PollRoutingRetryIntervalMs, token);
-                    }
-                    else if (!walkingRoster && leaderRedirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
-                    {
-                        redirectBudgetLogged = true;
-                        _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}",
-                            _currentAddress);
-                    }
-
-                    // The redirect and reconnect run without a deadline, so a fresh attempt past the budget
-                    // would read no reply and turn this refusal into an unknown outcome.
-                    if (Environment.TickCount64 + PollRoutingRetryIntervalMs < overallDeadline)
-                    {
-                        continue;
-                    }
-                }
-
-                if (attempt.Error is VsrSessionEvictedException evicted)
-                {
-                    // The session is gone, but the sign-in that established it is not: a stale-client
-                    // eviction comes off the server's heartbeat timer, so the reconnect re-establishes it.
-                    // Only an explicit sign-out or Dispose ends it.
-                    if (attempt.RequestStarted && !VsrOperations.IsReplaySafeRead(code, isLoginRegister, body.Span))
-                    {
-                        throw new VsrRequestOutcomeUnknownException(evicted);
-                    }
-
-                    ExceptionDispatchInfo.Throw(evicted.Verdict);
-                }
-
-                if (attempt.RequestStarted
-                    && !VsrOperations.IsReplaySafeRead(code, isLoginRegister, body.Span)
-                    && !IsDefinitiveVerdict(attempt.Error))
-                {
-                    throw new VsrRequestOutcomeUnknownException(attempt.Error);
-                }
-
-                ExceptionDispatchInfo.Throw(attempt.Error);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            if (requestEncoded)
-            {
-                await DropVsrConnectionAsync(lastConnection);
-            }
-
-            throw;
-        }
-    }
-
-    /// <summary>
-    ///     Moves to the next unvisited roster endpoint after a never-admitted refusal. Metadata and partition
-    ///     groups elect independently, so the metadata leader is not necessarily the primary for the request's
-    ///     partition. The caller's request deadline bounds the walk, and the caller restarts a finished walk once.
-    /// </summary>
-    private async Task<bool> RedirectToNextRosterNodeAsync(HashSet<string> visited, CancellationToken token)
-    {
-        var roster = _rosterAddresses;
-        if (roster.Length == 0)
-        {
-            return false;
-        }
-
-        var currentIndex = Array.FindIndex(roster, address =>
-            (_connectedAddress.Length > 0 && ServerAddress.IsSame(address, _connectedAddress))
-            || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(address, _currentRemoteAddress)));
-        if (currentIndex >= 0)
-        {
-            visited.Add(roster[currentIndex]);
-        }
-
-        string? next = null;
-        for (var offset = 1; offset <= roster.Length; offset++)
-        {
-            var candidate = roster[(Math.Max(currentIndex, -1) + offset) % roster.Length];
-            if (visited.Contains(candidate)
-                || (_connectedAddress.Length > 0 && ServerAddress.IsSame(candidate, _connectedAddress))
-                || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(candidate, _currentRemoteAddress)))
-            {
-                continue;
-            }
-
-            next = candidate;
-            break;
-        }
-
-        if (next is null)
-        {
-            return false;
-        }
-        visited.Add(next);
-        _logger.LogInformation("The request was refused on {Address}, walking the roster to {NextAddress}",
-            _connectedAddress, next);
-
-        await _sendingSemaphore.WaitAsync(token);
-        try
-        {
-            _currentAddress = next;
-            DropVsrConnectionLocked(_connection);
-        }
-        finally
-        {
-            _sendingSemaphore.Release();
-        }
-
-        return true;
     }
 
     /// <summary>
@@ -826,48 +496,6 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     }
 
     /// <summary>
-    ///     Whether the failure carries the server's verdict on this request. A lost connection, a reply frame
-    ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
-    ///     outcome of a request the server may still commit unknowable. REQUEST_TOO_OLD does too: the server
-    ///     refuses the request because it no longer holds the evidence that tells whether it committed.
-    /// </summary>
-    private static bool IsDefinitiveVerdict(Exception error)
-    {
-        return error is IggyInvalidStatusCodeException
-        {
-            FromServer: true,
-            StatusCode: not (VsrError.TRANSIENT_NOT_COMMITTED or VsrError.REQUEST_TOO_OLD)
-        };
-    }
-
-    /// <summary>
-    ///     One attempt on the current connection, resolved under the sending lock so the frame and its reply
-    ///     cannot be split across two sockets, and so a teardown after the lock is gone can tell this
-    ///     connection from a replacement a reconnect installed since.
-    /// </summary>
-    private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
-        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token,
-        PartitionContext context = default, SessionFrame? retainedFrame = null, bool retryTransient = true)
-    {
-        await _sendingSemaphore.WaitAsync(token);
-        try
-        {
-            var connection = _connection;
-            if (connection is null)
-            {
-                return VsrAttempt.Failed(false, new NotConnectedException(), false, null);
-            }
-
-            return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
-                clearSensitiveReply, token, retryTransient, context, retainedFrame);
-        }
-        finally
-        {
-            _sendingSemaphore.Release();
-        }
-    }
-
-    /// <summary>
     ///     Drops the consensus session and the group state scoped to it. Consumer-group assignments are fenced by
     ///     a generation the coordinator tracks per session, so carrying them into a new session would fence every
     ///     poll until the first re-sync. The balanced cursors and the partition counts survive: neither is bound
@@ -875,7 +503,16 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     /// </summary>
     private void ResetConsensusSession()
     {
-        _consensusSession.Reset();
+        StopHeartbeat();
+        lock (_pollRoutingGate)
+        {
+            _consensusSession.Reset();
+        }
+        _mutations.Reset();
+        StopReplicaLinks();
+        _connection?.Dispose();
+        _connection = null;
+        _metadataReplica = null;
         _groupState.ClearSessionScoped();
         ClearPollSession();
     }
@@ -921,48 +558,4 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         }
     }
 
-    /// <summary>
-    ///     Drops the connection while retaining the session. A late or half-read reply would desync the framing of the
-    ///     next request, so the socket cannot be reused. The caller must hold <see cref="_sendingSemaphore" />,
-    ///     which owns every write to <see cref="_connection" />.
-    /// </summary>
-    /// <param name="connection">
-    ///     The connection the caller was using. A reconnect that completed in the meantime already closed it,
-    ///     so dropping anything but the live one would tear down a healthy replacement.
-    /// </param>
-    private void DropVsrConnectionLocked(VsrConnection? connection)
-    {
-        if (connection is null || !ReferenceEquals(_connection, connection))
-        {
-            return;
-        }
-
-        _groupState.ClearSessionScoped();
-        ClearPollSession();
-        _connection = null;
-        SetConnectionState(ConnectionState.Disconnected);
-        connection.Dispose();
-    }
-
-    /// <summary>Drops the connection on behalf of a caller that no longer holds the sending lock.</summary>
-    private async ValueTask DropVsrConnectionAsync(VsrConnection? connection)
-    {
-        // Dispose already closed the stream, and taking a disposed semaphore here would replace the
-        // cancellation the caller is about to rethrow with an ObjectDisposedException. Dispose can still land
-        // between the check and the wait, so the wait itself has to tolerate it.
-        // The request this drop belongs to was cancelled; the drop itself still has to run to completion.
-        if (_disposed || !await TryEnterSendingSemaphoreAsync())
-        {
-            return;
-        }
-
-        try
-        {
-            DropVsrConnectionLocked(connection);
-        }
-        finally
-        {
-            _sendingSemaphore.Release();
-        }
-    }
 }

@@ -17,6 +17,7 @@
 
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -47,6 +48,7 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
     /// </summary>
     private const int NoAssignedPartitionBackoffMs = 100;
+    private const int OperationTimeoutMs = 30_000;
 
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
@@ -266,13 +268,13 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         if (_lastPolledContext.TryGetValue(partitionId, out var context))
         {
-            await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId,
-                context, ct);
+            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer, _config.StreamId,
+                _config.TopicId, offset, partitionId, context, token), ct);
         }
         else
         {
-            await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId,
-                ct);
+            await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer, _config.StreamId,
+                _config.TopicId, offset, partitionId, token), ct);
         }
 
         if (resetLastPolled)
@@ -294,8 +296,8 @@ public partial class IggyConsumer : IAsyncDisposable
     public async Task StoreOffsetAsync(ulong offset, uint partitionId, PartitionContext context,
         CancellationToken ct = default)
     {
-        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId,
-            context, ct);
+        await WithLaneRecoveryAsync(token => _client.StoreOffsetAsync(_config.Consumer, _config.StreamId,
+            _config.TopicId, offset, partitionId, context, token), ct);
     }
 
     /// <summary>
@@ -309,7 +311,8 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <param name="ct">Cancellation token</param>
     public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
     {
-        await _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, partitionId, ct);
+        await WithLaneRecoveryAsync(token => _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId,
+            _config.TopicId, partitionId, token), ct);
     }
 
     /// <summary>
@@ -538,7 +541,9 @@ public partial class IggyConsumer : IAsyncDisposable
             LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
             throw;
         }
-        catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
+        // Without an operation id nothing is retained to resolve, so the next poll can run.
+        catch (Exception ex) when (ex is not (MalformedResponseException
+            or VsrRequestOutcomeUnknownException { OperationId: not null } or VsrLaneBlockedException))
         {
             ForgetRefusedPollingStrategy(ex, polledPartition);
             LogFailedToPollMessages(ex);
@@ -547,6 +552,64 @@ public partial class IggyConsumer : IAsyncDisposable
         finally
         {
             _pollingSemaphore.Release();
+        }
+    }
+
+    private async Task WithLaneRecoveryAsync(Func<CancellationToken, Task> operation, CancellationToken ct)
+    {
+        var deadline = Environment.TickCount64 + OperationTimeoutMs;
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cancellation.CancelAfter(OperationTimeoutMs);
+        try
+        {
+            try
+            {
+                await operation(cancellation.Token);
+            }
+            catch (VsrLaneBlockedException blocked)
+            {
+                ct.ThrowIfCancellationRequested();
+                var remainingMs = deadline - Environment.TickCount64;
+                if (remainingMs <= 0)
+                {
+                    throw;
+                }
+
+                try
+                {
+                    await _client.ResolveOperationAsync(blocked.OperationId, TimeSpan.FromMilliseconds(remainingMs),
+                        cancellation.Token);
+                }
+                catch (VsrRequestOutcomeUnknownException)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    ExceptionDispatchInfo.Throw(blocked);
+                }
+                catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
+                {
+                    ExceptionDispatchInfo.Throw(blocked);
+                }
+                catch (VsrOperationNotRetainedException)
+                {
+                }
+                catch (IggyInvalidStatusCodeException error) when (error.Committed)
+                {
+                    // The blocker can belong to the application, which reads this rejection through
+                    // ResolveOperationAsync. The store only needs the free lane.
+                }
+
+                cancellation.Token.ThrowIfCancellationRequested();
+                if (Environment.TickCount64 >= deadline)
+                {
+                    throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The consumer operation deadline expired.");
+                }
+
+                await operation(cancellation.Token);
+            }
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw VsrError.Exception(VsrError.TRANSIENT_NOT_ACCEPTED, "The consumer operation deadline expired.");
         }
     }
 

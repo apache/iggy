@@ -16,12 +16,12 @@
 // under the License.
 
 use iggy::prelude::{
-    ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient, ConsumerOffsetClient,
-    Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize,
-    MessageClient, PartitionClient, Partitioning, PersonalAccessTokenClient, PollingKind,
-    PollingStrategy, SegmentClient, StreamClient, StreamUpdateOptions, SystemClient,
-    SystemSnapshotType, TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient,
-    UserStatus, UserUpdateOptions,
+    Client, ClusterClient, CompressionAlgorithm, Consumer, ConsumerGroupClient,
+    ConsumerOffsetClient, Identifier, IggyClient, IggyError, IggyExpiry, IggyMessage,
+    IggyTimestamp, MaxTopicSize, MessageClient, PartitionClient, Partitioning,
+    PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
+    StreamUpdateOptions, SystemClient, SystemSnapshotType, TopicClient, TopicCreateOptions,
+    TopicUpdateOptions, UserClient, UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -32,10 +32,13 @@ use rmcp::{
 };
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::error;
 
 use crate::Permissions;
 mod requests;
+
+const OPERATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct IggyService {
@@ -405,6 +408,39 @@ impl IggyService {
         )
     }
 
+    #[tool(
+        description = "Resolve a retained write using operation_id from an uncertain or blocked tool error. Success proves the original write committed and releases its lane; it does not return the original response body. An uncertain result keeps the operation available for another resolve. Requires write permission."
+    )]
+    pub async fn resolve_operation(
+        &self,
+        Parameters(RetainedOperation { operation_id }): Parameters<RetainedOperation>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_recovery()?;
+        request(
+            self.client
+                .resolve_operation(
+                    operation_id_value(&operation_id)?,
+                    Instant::now() + OPERATION_RECOVERY_TIMEOUT,
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Explicitly abandon a retained write using operation_id from an uncertain or blocked tool error. Releases local recovery state without undoing the write or establishing its outcome. Requires write permission."
+    )]
+    pub async fn abandon_operation(
+        &self,
+        Parameters(RetainedOperation { operation_id }): Parameters<RetainedOperation>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_recovery()?;
+        request(
+            self.client
+                .abandon_operation(operation_id_value(&operation_id)?)
+                .await,
+        )
+    }
+
     #[tool(description = "Get stats")]
     pub async fn get_stats(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
@@ -749,9 +785,17 @@ fn id(id: &str) -> Result<Identifier, ErrorData> {
 
 fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallToolResult, ErrorData> {
     let result = result.map_err(|e| {
+        let data = match &e {
+            IggyError::OperationUncertain(op)
+            | IggyError::LaneBlocked(op)
+            | IggyError::OperationNotRetained(op) => {
+                Some(serde_json::json!({ "operation_id": op.to_string() }))
+            }
+            _ => None,
+        };
         let message = format!("There was an error when invoking the method. {e}");
         error!(message);
-        ErrorData::invalid_request(message, None)
+        ErrorData::invalid_request(message, data)
     })?;
 
     let content = ContentBlock::json(result).map_err(|error| {
@@ -761,4 +805,32 @@ fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallTool
     })?;
 
     Ok(CallToolResult::success(vec![content]))
+}
+
+fn operation_id_value(value: &str) -> Result<u64, ErrorData> {
+    value.parse().map_err(|_| {
+        ErrorData::invalid_request(
+            "operation_id must be an unsigned 64-bit decimal string",
+            None,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_uncertain_or_blocked_writes_when_reporting_errors_should_preserve_exact_operation_ids()
+    {
+        for error in [
+            IggyError::OperationUncertain(u64::MAX),
+            IggyError::LaneBlocked(u64::MAX),
+        ] {
+            let result = request(Err::<(), _>(error)).unwrap_err();
+            let data = result.data.unwrap();
+            let operation = data["operation_id"].as_str().unwrap();
+            assert_eq!(operation_id_value(operation).unwrap(), u64::MAX);
+        }
+    }
 }

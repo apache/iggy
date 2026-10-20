@@ -79,34 +79,36 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection().send(CommandCode.Topic.GET.getValue(), payload).thenApply(response -> {
-            try {
-                if (response.isReadable()) {
-                    return Optional.of(BytesDeserializer.readTopicDetails(response));
-                }
-                return Optional.<TopicDetails>empty();
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Topic.GET.getValue(), payload), response -> {
+                    try {
+                        if (response.isReadable()) {
+                            return Optional.of(BytesDeserializer.readTopicDetails(response));
+                        }
+                        return Optional.<TopicDetails>empty();
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
     public CompletableFuture<List<Topic>> getTopics(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection().send(CommandCode.Topic.GET_ALL.getValue(), payload).thenApply(response -> {
-            try {
-                var topicsCount = response.readUnsignedIntLE();
-                List<Topic> topics = new ArrayList<>(Math.toIntExact(topicsCount));
-                for (long i = 0; i < topicsCount; i++) {
-                    topics.add(BytesDeserializer.readTopic(response));
-                }
-                return topics;
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Topic.GET_ALL.getValue(), payload), response -> {
+                    try {
+                        var topicsCount = response.readUnsignedIntLE();
+                        List<Topic> topics = new ArrayList<>(Math.toIntExact(topicsCount));
+                        for (long i = 0; i < topicsCount; i++) {
+                            topics.add(BytesDeserializer.readTopic(response));
+                        }
+                        return topics;
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -128,13 +130,14 @@ public class TopicsTcpClient implements TopicsClient {
                 name,
                 org.apache.iggy.topic.TopicOptions.withDurabilityDefaults(options));
 
-        return connection().send(CommandCode.Topic.CREATE.getValue(), payload).thenApply(response -> {
-            try {
-                return BytesDeserializer.readTopicDetails(response);
-            } finally {
-                response.release();
-            }
-        });
+        return AsyncTcpConnection.mapResponse(
+                connection().send(CommandCode.Topic.CREATE.getValue(), payload), response -> {
+                    try {
+                        return BytesDeserializer.readTopicDetails(response);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     static ByteBuf createTopicPayload(
@@ -204,9 +207,7 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(BytesSerializer.toBytes(
                 createTopicOptions(compressionAlgorithm, messageExpiry, maxTopicSize, options)));
 
-        return connection()
-                .send(CommandCode.Topic.UPDATE.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection().sendAndRelease(CommandCode.Topic.UPDATE, payload);
     }
 
     @Override
@@ -215,9 +216,10 @@ public class TopicsTcpClient implements TopicsClient {
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
 
-        return connection().send(CommandCode.Topic.DELETE.getValue(), payload).thenAccept(response -> {
+        return AsyncTcpConnection.mapResponse(connection().send(CommandCode.Topic.DELETE, payload), response -> {
             response.release();
             topologyChanged.run();
+            return null;
         });
     }
 }

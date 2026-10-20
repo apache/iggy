@@ -89,11 +89,12 @@ runs:
       with:
         bin: target/debug/iggy-server
 
-    - name: Test with coverage
+    - name: Test Rust bridge and C++ coverage
       if: inputs.task == 'test'
       shell: bash
       run: |
         cd foreign/cpp
+        cargo test
         ../../scripts/ci/cpp-coverage.sh
 
     - name: Stop server after tests

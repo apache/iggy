@@ -21,18 +21,25 @@
 //! module invoked from a real (non-unit) test rather than only compiled.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::{
-    Identifier, IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient,
+    Identifier, IggyError, IggyMessage, MessageClient, Partitioning, StreamClient, TopicClient,
 };
 use secrecy::SecretString;
 use serial_test::serial;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use iggy_gateway_kafka::bridge::{
-    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls,
-    ProduceSessionLimits, TopicMapping, TopicOverride,
+    BridgeError, DEFAULT_MAX_MESSAGE_SIZE, IggyBridge, IggyBridgeConfig, IggyTls, OffsetCalls,
+    ProduceSessionLimits, Producer, TopicCreationOutcome, TopicMapping, TopicOverride,
 };
+use iggy_gateway_kafka::protocol::api::ERROR_REQUEST_TIMED_OUT;
 
 #[path = "common/certs.rs"]
 mod certs;
@@ -41,6 +48,180 @@ mod iggy_server;
 
 use certs::TestPki;
 use iggy_server::{PortGuard, TestServer, raw_client};
+
+#[tokio::test]
+#[serial]
+async fn given_timed_out_writes_when_writing_again_should_resolve_all_client_lanes() {
+    const RELAY_BUFFER_SIZE: usize = 8192;
+    const RECOVERY_CANCEL_DELAY: Duration = Duration::from_millis(100);
+    const CALL_DEADLINE: Duration = Duration::from_secs(60);
+
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay");
+    let mut config = server.test_config();
+    let upstream = config.address.clone();
+    config.address = listener.local_addr().expect("relay address").to_string();
+    let (replies, allowed) = watch::channel(true);
+    let mut relays = JoinSet::new();
+    relays.spawn(async move {
+        let mut connections = JoinSet::new();
+        while let Ok((inbound, _)) = listener.accept().await {
+            let outbound = TcpStream::connect(&upstream).await.expect("upstream");
+            let mut allowed = allowed.clone();
+            connections.spawn(async move {
+                let (mut requests, mut replies) = inbound.into_split();
+                let (mut responses, mut writes) = outbound.into_split();
+                tokio::select! {
+                    _ = copy(&mut requests, &mut writes) => {}
+                    () = async {
+                        let mut buffer = [0; RELAY_BUFFER_SIZE];
+                        while let Ok(count) = responses.read(&mut buffer).await {
+                            if count == 0 || allowed.wait_for(|allowed| *allowed).await.is_err() {
+                                break;
+                            }
+                            if replies.write_all(&buffer[..count]).await.is_err() {
+                                break;
+                            }
+                        }
+                    } => {}
+                }
+            });
+        }
+    });
+    let bridge = IggyBridge::connect(config).await.expect("bridge");
+    let raw = raw_client(&server).await;
+    let stream = Identifier::named("kafka").expect("stream name");
+    // The first stream write commits successfully; the second commits an already-exists rejection.
+    for (delayed, next) in [("delayed", "next"), ("rejected", "after_rejection")] {
+        replies.send(false).expect("hold replies");
+        let result = bridge.create_kafka_topic(delayed, 1).await;
+        assert!(matches!(result, Err(BridgeError::Timeout)), "{result:?}");
+        assert!(
+            raw.get_stream(&stream)
+                .await
+                .expect("stream lookup")
+                .is_some(),
+            "the canceled write committed before its reply was released"
+        );
+        assert!(
+            tokio::time::timeout(
+                RECOVERY_CANCEL_DELAY,
+                bridge.create_kafka_topic("blocked", 1)
+            )
+            .await
+            .is_err(),
+            "recovery must wait for proof while replies are withheld"
+        );
+        if delayed == "delayed" {
+            let recovery = bridge
+                .create_kafka_topic("blocked_deadline", 1)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                recovery.to_kafka_error_code(),
+                ERROR_REQUEST_TIMED_OUT,
+                "{recovery:?}"
+            );
+        }
+        replies.send(true).expect("resume replies");
+        assert_eq!(
+            bridge
+                .create_kafka_topic(next, 1)
+                .await
+                .expect("next create"),
+            TopicCreationOutcome::Created
+        );
+        assert!(
+            bridge
+                .get_kafka_topic(next)
+                .await
+                .expect("next topic")
+                .is_some()
+        );
+        for unsent in [delayed, "blocked", "blocked_deadline"] {
+            assert!(
+                bridge
+                    .get_kafka_topic(unsent)
+                    .await
+                    .expect("unsent topic")
+                    .is_none()
+            );
+        }
+    }
+
+    let target = bridge.topic_target("next").expect("topic target");
+    for (payload, hold) in [("warm", false), ("uncertain", true), ("recovered", false)] {
+        let deadline = Instant::now() + CALL_DEADLINE;
+        let (result, returned) = {
+            let turn = bridge
+                .produce_turn(Producer::Connection(1), deadline)
+                .await
+                .expect("produce turn");
+            replies.send(!hold).expect("reply gate");
+            bridge
+                .send_records(
+                    turn,
+                    (),
+                    &target,
+                    0,
+                    vec![IggyMessage::from_str(payload).expect("message")],
+                    deadline,
+                )
+                .await
+        };
+        assert!(
+            returned.is_some(),
+            "the retained operation must keep its client"
+        );
+        drop(returned);
+        if hold {
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::Iggy(IggyError::OperationUncertain(_)))
+                ),
+                "{result:?}"
+            );
+        } else {
+            result.expect("produce recovers the prior retained send");
+        }
+    }
+    for (offset, hold) in [(0, false), (1, true), (2, false)] {
+        replies.send(!hold).expect("reply gate");
+        let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
+        let result = bridge
+            .commit_group_offsets("recovery", &[(&target, 0, offset)], &calls)
+            .await
+            .remove(0);
+        if hold {
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::Iggy(IggyError::OperationUncertain(_)))
+                ),
+                "{result:?}"
+            );
+        } else {
+            result.expect("offset commit recovers the prior retained store");
+        }
+    }
+    let calls = OffsetCalls::new(Instant::now() + CALL_DEADLINE);
+    let stored = bridge
+        .fetch_group_offsets("recovery", &[(&target, 0)], &calls)
+        .await;
+    assert!(matches!(stored.as_slice(), [Ok(Some(2))]), "{stored:?}");
+    let topic = raw
+        .get_topic(&stream, &Identifier::named("next").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        topic.messages_count, 3,
+        "recovery must not duplicate the retained send"
+    );
+    bridge.close().await.expect("close bridge");
+}
 
 /// The bridge's own hop to Iggy encrypted: a server that speaks only TLS on its TCP port, and
 /// a bridge told to trust the CA that signed it. Produce and Fetch go through this client, so
@@ -434,15 +615,14 @@ async fn connect_to_unreachable_iggy_returns_err_not_panic() {
     assert!(matches!(result, Err(BridgeError::Iggy(_))));
 }
 
-/// Regression test for the missing dial timeout: `TcpClient::establish_bounded` only applies its
-/// own `FAILOVER_DIAL_TIMEOUT` when at least two failover candidates are configured, which a
-/// bridge (always exactly one address) never has, so the underlying `TcpStream::connect` had no
-/// deadline at all against an address that drops packets instead of refusing them. 192.0.2.1 is
-/// RFC 5737 TEST-NET-1 - reserved for documentation, routed nowhere, so the connect attempt hangs
-/// on the kernel's own SYN-retry timeout (confirmed against this exact address before writing this
-/// test: over the sandbox's real network stack, a bare `connect()` past 3s had not yet failed).
-/// Before `REQUEST_TIMEOUT`, this test would have hung for minutes; now it must fail within a
-/// bounded window.
+/// Regression test for the missing dial timeout: the SDK once bounded a dial only when at least
+/// two failover candidates were configured, which a bridge (always exactly one address) never
+/// has, so the underlying `TcpStream::connect` had no deadline at all against an address that
+/// drops packets instead of refusing them. 192.0.2.1 is RFC 5737 TEST-NET-1 - reserved for
+/// documentation, routed nowhere, so the connect attempt hangs on the kernel's own SYN-retry
+/// timeout (confirmed against this exact address before writing this test: over the sandbox's
+/// real network stack, a bare `connect()` past 3s had not yet failed). Before `REQUEST_TIMEOUT`,
+/// this test would have hung for minutes; now it must fail within a bounded window.
 #[tokio::test]
 async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
     let config = IggyBridgeConfig {
@@ -468,10 +648,19 @@ async fn connect_to_a_black_hole_address_times_out_instead_of_hanging() {
         "connect took {:?}, longer than REQUEST_TIMEOUT (15s) should allow",
         start.elapsed()
     );
-    // BridgeError::Timeout, not BridgeError::Iggy: with_request_timeout's own elapsed branch
-    // maps here (see that function's doc for why an unknown outcome must not borrow
+    // Either bound can end the attempt first. The SDK cuts every dial at its own timeout and
+    // returns CannotEstablishConnection after its last reconnect pass, which is safe because no
+    // link ever came up. Otherwise with_request_timeout's own elapsed branch maps to
+    // BridgeError::Timeout (see that function's doc for why an unknown outcome must not borrow
     // CannotEstablishConnection's known-safe code).
-    assert!(matches!(result, Err(BridgeError::Timeout)));
+    assert!(
+        matches!(
+            result,
+            Err(BridgeError::Timeout | BridgeError::Iggy(IggyError::CannotEstablishConnection))
+        ),
+        "unexpected connect result: {:?}",
+        result.as_ref().err()
+    );
 }
 
 /// Regression test: `IggyClient::disconnect` (what `close` used to call) never touches

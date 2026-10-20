@@ -3203,7 +3203,7 @@ dependencies = [
  "compio-log",
  "compio-send-wrapper",
  "crossbeam-queue",
- "flume",
+ "flume 0.12.0",
  "futures-util",
  "io-uring",
  "libc",
@@ -3324,7 +3324,7 @@ dependencies = [
  "compio-log",
  "compio-net",
  "compio-runtime",
- "flume",
+ "flume 0.12.0",
  "futures-util",
  "libc",
  "quinn-proto",
@@ -5282,6 +5282,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "flagset"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5321,6 +5327,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b09cf3155332e944990140d967ff5eceb70df778b34f77d8075db46e4704e6d8"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "flume"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
 ]
 
 [[package]]
@@ -7061,7 +7078,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "dashmap",
- "flume",
+ "flume 0.12.0",
  "futures",
  "futures-util",
  "iggy_binary_protocol",
@@ -7198,7 +7215,7 @@ dependencies = [
  "dotenvy",
  "figlet-rs",
  "figment",
- "flume",
+ "flume 0.12.0",
  "futures",
  "iggy",
  "iggy_common",
@@ -7636,6 +7653,27 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "iggy_connector_mqtt_source"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "dashmap",
+ "humantime",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "rumqttc",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -8080,6 +8118,7 @@ dependencies = [
  "reqwest-retry",
  "ring",
  "rmcp",
+ "rumqttc",
  "rust-s3",
  "secrecy",
  "serde",
@@ -8491,7 +8530,7 @@ dependencies = [
  "backon",
  "cfg-if",
  "event-listener",
- "flume",
+ "flume 0.12.0",
  "futures-core",
  "futures-io",
  "tracing",
@@ -12097,6 +12136,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumqttc"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519"
+dependencies = [
+ "bytes",
+ "fixedbitset",
+ "flume 0.11.1",
+ "futures-util",
+ "log",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "rustls-webpki 0.102.8",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "rust-embed"
 version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12265,7 +12326,7 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki",
+ "rustls-webpki 0.103.15",
  "subtle",
  "zeroize",
 ]
@@ -12282,7 +12343,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
- "rustls-webpki",
+ "rustls-webpki 0.103.15",
 ]
 
 [[package]]
@@ -12330,7 +12391,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
- "rustls-webpki",
+ "rustls-webpki 0.103.15",
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
@@ -12342,6 +12403,17 @@ name = "rustls-platform-verifier-android"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
+
+[[package]]
+name = "rustls-webpki"
+version = "0.102.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted 0.9.0",
+]
 
 [[package]]
 name = "rustls-webpki"
@@ -13530,7 +13602,7 @@ checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
  "chrono",
- "flume",
+ "flume 0.12.0",
  "form_urlencoded",
  "futures-channel",
  "futures-core",

@@ -121,6 +121,7 @@ use shard::{PartitionRead, PartitionReadReply};
 
 use crate::dispatch::partition::{
     fence_poll_context, resolve_consumer_offset_request, resolve_poll_request,
+    resolve_primary_consumer_offset_request,
 };
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::http::error::{
@@ -1454,7 +1455,7 @@ pub(in crate::http) async fn get_consumer_offset(
     .await?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
-    let (namespace, partition_id, read) = resolve_consumer_offset_request(&state.shard, &wire)
+    let (namespace, _, _) = resolve_consumer_offset_request(&state.shard, &wire)
         .map_err(|_| ReadError::NotFound)?
         .ok_or(ReadError::NotFound)?;
     let rule = |permissioner: &Permissioner, uid| {
@@ -1484,15 +1485,9 @@ pub(in crate::http) async fn get_consumer_offset(
         return Ok(response);
     }
     authorize_read(&state, &identity, consistency, rule)?;
-    let read = match read {
-        PartitionRead::ConsumerOffset { consumer } => {
-            PartitionRead::ConsumerOffsetOnPrimary { consumer }
-        }
-        PartitionRead::ExternalGroupOffset { group_id } => {
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id }
-        }
-        _ => return Err(ReadError::Rejected(IggyError::InvalidCommand)),
-    };
+    let (namespace, partition_id, read) =
+        resolve_primary_consumer_offset_request(&state.shard, &wire, context)
+            .map_err(ReadError::Rejected)?;
     let reply = SendWrapper::new(state.shard.partition_read(namespace, read)).await;
     authorize_read(&state, &identity, consistency, rule)?;
     consumer_offset_reply(partition_id, reply).map(IntoResponse::into_response)
@@ -2070,7 +2065,16 @@ pub(in crate::http) async fn create_pat(
     .await?;
     // Reject a committed business error before splicing the secret; the success
     // payload is empty, so the returned slice is discarded.
-    committed_payload(&committed)?;
+    committed_payload(&committed).map_err(|error| match error {
+        // The reply carries only the error code, so name the caller and the cap.
+        WriteError::Rejected(IggyError::PersonalAccessTokensLimitReached(..)) => {
+            WriteError::Rejected(IggyError::PersonalAccessTokensLimitReached(
+                identity.session.user_id,
+                state.shard.plane.metadata().max_tokens_per_user(),
+            ))
+        }
+        error => error,
+    })?;
     let reply =
         build_raw_pat_reply(&request_header, committed, raw_token).map_err(WriteError::Rejected)?;
     Ok(Json(RawPersonalAccessToken {

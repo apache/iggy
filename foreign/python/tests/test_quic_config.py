@@ -394,33 +394,23 @@ class TestQuicConfig:
 class TestQuicClientConstruction:
     """Test that `IggyClient(...)` accepts a `QuicConfig`."""
 
-    def test_accepts_a_config(self):
-        """Test that the resulting client is actually QUIC, not silently TCP.
-
-        `IggyClient(...)` is not None for either union arm, so that alone never
-        pinned the transport. `client_address` is a QUIC-only field that
-        `QuicClient::create` binds eagerly here, so a port already held fails
-        the bind synchronously with `Cannot create endpoint`, with no server
-        and no privileged port involved. A client that regressed to the TCP arm
-        has no such field and would construct fine, and no other error maps to
-        that message.
-
-        The held port has to be a real one: an unroutable address would only
-        fail the bind while `net.ipv4.ip_nonlocal_bind` is 0, and a host
-        running keepalived or a container setting it alone would bind
-        successfully and assert nothing. Neither the socket below nor quinn
-        sets `SO_REUSEADDR`, so the second bind is EADDRINUSE regardless.
-        """
-        # A bindable client_address of its own, so the failure below is the
-        # collision and not the field being set at all.
+    @pytest.mark.asyncio
+    async def test_accepts_a_config_and_binds_on_connect(self):
+        """QUIC construction is lazy; connect must honor its local UDP address."""
         assert IggyClient(QuicConfig(client_address="127.0.0.1:0")) is not None
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as held:
             held.bind(("127.0.0.1", 0))
             port = held.getsockname()[1]
 
+            client = IggyClient(
+                QuicConfig(
+                    client_address=f"127.0.0.1:{port}",
+                    reconnection=QuicReconnectionConfig(enabled=False),
+                )
+            )
             with pytest.raises(RuntimeError, match="Cannot create endpoint"):
-                IggyClient(QuicConfig(client_address=f"127.0.0.1:{port}"))
+                await client.connect()
 
     def test_accepts_the_default_config(self):
         """Test that an explicit default `QuicConfig` is accepted."""

@@ -19,22 +19,28 @@
 //! driver.
 
 use super::dial::test_support::ScriptedDialer;
-use super::test_support::{CLIENT, DUPLEX_CAPACITY, read_request_header, refusal, reply};
+use super::test_support::{DUPLEX_CAPACITY, read_request_header, refusal, reply};
 use super::{Dialer, ReconnectPolicy, ReplicaLinks};
 use crate::session_owner::SessionOwner;
 use futures::FutureExt;
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, GET_CLUSTER_METADATA_CODE, GET_PARTITION_ROUTE_CODE, GET_STATS_CODE,
-    LOGIN_REGISTER_CODE,
+    LOGIN_REGISTER_CODE, LOGOUT_USER_CODE,
 };
 use iggy_binary_protocol::consensus::{
-    Command, HEADER_SIZE, NON_REPLICATED_CODE_RANGE, Operation, ReplyHeader, RequestHeader,
+    EvictionHeader, EvictionReason, HEADER_SIZE, NON_REPLICATED_CODE_RANGE, Operation,
+    PrepareHeader, REJECTION_SECTION_LEN, ReplyHeader, RequestHeader, write_rejection_section,
 };
+use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
+use iggy_binary_protocol::responses::streams::get_stream::TopicHeader;
 use iggy_binary_protocol::responses::system::{ClusterMetadataResponse, ClusterNodeResponse};
+use iggy_binary_protocol::responses::topics::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{WireEncode, WireName};
-use iggy_common::{AutoLogin, ClusterNodeRole, ClusterNodeStatus, Credentials, IggyError};
+use iggy_binary_protocol::{PartitionContext, WireDecode, WireEncode, WireName, WireOptions};
+use iggy_common::{
+    AutoLogin, ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Credentials, IggyError,
+};
 use secrecy::SecretString;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -62,6 +68,12 @@ pub(crate) enum Answer {
     Refuse(IggyError),
     /// The reply of a committed metadata request at this commit.
     Commit(u64),
+    CommitBody(u64, Vec<u8>),
+    CommitRejected(u64, IggyError),
+    /// A refusal with `StaleClient` from a replica that replaced its client
+    /// table. The session stays.
+    Detached,
+    Evict(EvictionReason),
     /// The connection ends once the request arrives.
     HangUp,
     Silence,
@@ -76,8 +88,9 @@ pub(crate) struct Received {
 }
 
 /// Replicas that answer each request by a script, else by its code. The
-/// cluster keeps one session: a Register starts a new one, and a bind of any
-/// other session fails with `Unauthenticated`.
+/// cluster keeps one session: a Register starts a new one, a bind of any
+/// other session fails with `Unauthenticated`, and a scripted refusal or
+/// rejection with `StaleClient` ends it.
 #[derive(Default)]
 pub(crate) struct FakeCluster {
     pub(crate) nodes: Mutex<Vec<ClusterNodeResponse>>,
@@ -87,8 +100,15 @@ pub(crate) struct FakeCluster {
     pub(crate) silent: Mutex<HashSet<String>>,
     /// Endpoints that close the connection on a Register.
     pub(crate) hang_up_on_register: Mutex<HashSet<String>>,
+    /// Usernames whose Register registers a session at once, but whose reply
+    /// waits until the name leaves the set.
+    pub(crate) held_registers: Mutex<HashSet<String>>,
     pub(crate) reject_credentials: Mutex<bool>,
     pub(crate) session: Mutex<Option<u64>>,
+    /// The username of each client id that registered with a password. As on
+    /// a server, a Register for another user under that client id ends in an
+    /// eviction.
+    registered_users: Mutex<HashMap<u128, String>>,
     /// The answer of every replica to a route lookup without a script.
     pub(crate) route: Mutex<Option<PartitionRouteResponse>>,
     /// Answers by endpoint and code, used before the answer by code.
@@ -232,6 +252,7 @@ impl FakeCluster {
                 return;
             }
             let code = request_code(&request);
+            let username = register_username(code, &body);
             self.received.lock().unwrap().push((
                 code,
                 Received {
@@ -240,30 +261,57 @@ impl FakeCluster {
                     body,
                 },
             ));
-            let frame = match self.answer(&endpoint, &request, code) {
+            let frame = match self.answer(&endpoint, &request, code, username.as_deref()) {
                 Answer::Body(body) => reply(request.request, &body),
                 Answer::Refuse(error) => refusal(request.request, &error),
-                Answer::Commit(commit) => committed(&request, commit),
+                Answer::Detached => refusal(request.request, &IggyError::StaleClient),
+                Answer::Commit(commit) => committed(&request, commit, None, &[]),
+                Answer::CommitBody(commit, body) => committed(&request, commit, None, &body),
+                Answer::CommitRejected(commit, error) => {
+                    committed(&request, commit, Some(&error), &[])
+                }
+                Answer::Evict(reason) => {
+                    let header = EvictionHeader::new(0, 0, 0, request.client, reason);
+                    let _ = writer.write_all(bytemuck::bytes_of(&header)).await;
+                    return;
+                }
                 Answer::HangUp => return,
                 Answer::Silence => continue,
             };
+            while username
+                .as_ref()
+                .is_some_and(|username| self.held_registers.lock().unwrap().contains(username))
+            {
+                sleep(POLL_STEP).await;
+            }
             if writer.write_all(&frame).await.is_err() {
                 return;
             }
         }
     }
 
-    fn answer(&self, endpoint: &str, request: &RequestHeader, code: u32) -> Answer {
+    fn answer(
+        &self,
+        endpoint: &str,
+        request: &RequestHeader,
+        code: u32,
+        username: Option<&str>,
+    ) -> Answer {
         let scripted = self
             .script
             .lock()
             .unwrap()
             .get_mut(&(endpoint.to_owned(), code))
             .and_then(VecDeque::pop_front);
+        let mut session = self.session.lock().unwrap();
         if let Some(answer) = scripted {
+            if let Answer::Refuse(IggyError::StaleClient)
+            | Answer::CommitRejected(_, IggyError::StaleClient) = answer
+            {
+                *session = None;
+            }
             return answer;
         }
-        let mut session = self.session.lock().unwrap();
         match code {
             LOGIN_REGISTER_CODE if self.hang_up_on_register.lock().unwrap().contains(endpoint) => {
                 Answer::HangUp
@@ -271,9 +319,18 @@ impl FakeCluster {
             LOGIN_REGISTER_CODE if *self.reject_credentials.lock().unwrap() => {
                 Answer::Refuse(IggyError::InvalidCredentials)
             }
+            LOGIN_REGISTER_CODE if self.registered_to_another_user(request.client, username) => {
+                Answer::Evict(EvictionReason::SessionError)
+            }
             LOGIN_REGISTER_CODE => {
                 let registered = FIRST_SESSION + self.registered.fetch_add(1, Ordering::SeqCst);
                 *session = Some(registered);
+                if let Some(username) = username {
+                    self.registered_users
+                        .lock()
+                        .unwrap()
+                        .insert(request.client, username.to_owned());
+                }
                 Answer::Body(binding(registered))
             }
             BIND_SESSION_CODE if *session == Some(request.session) => {
@@ -286,8 +343,25 @@ impl FakeCluster {
                 None => Answer::Refuse(IggyError::TransientNotAccepted),
             },
             UNANSWERED_CODE => Answer::Silence,
+            _ if !matches!(
+                request.operation,
+                Operation::NonReplicated | Operation::Logout
+            ) =>
+            {
+                Answer::Commit(1)
+            }
             _ => Answer::Body(Vec::new()),
         }
+    }
+
+    fn registered_to_another_user(&self, client: u128, username: Option<&str>) -> bool {
+        username.is_some_and(|username| {
+            self.registered_users
+                .lock()
+                .unwrap()
+                .get(&client)
+                .is_some_and(|registered| registered != username)
+        })
     }
 
     fn roster(&self) -> Vec<u8> {
@@ -326,6 +400,41 @@ impl Drop for OpenDial {
             .unwrap()
             .push(self.started.elapsed());
     }
+}
+
+pub(crate) fn topic_body(partitions_count: u32) -> Vec<u8> {
+    GetTopicResponse {
+        topic: TopicHeader {
+            id: 1,
+            created_at: 0,
+            partitions_count,
+            message_expiry: 0,
+            compression_algorithm: CompressionAlgorithm::None.as_code(),
+            max_topic_size: 0,
+            size_bytes: 0,
+            messages_count: 0,
+            name: WireName::new("topic").unwrap(),
+            options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
+        },
+        partitions: (0..partitions_count)
+            .map(|id| PartitionResponse {
+                id,
+                created_at: 0,
+                segments_count: 0,
+                current_offset: 0,
+                size_bytes: 0,
+                messages_count: 0,
+                context: PartitionContext {
+                    incarnation: 7,
+                    owner_generation: 0,
+                    metadata_op: 11,
+                },
+            })
+            .collect(),
+    }
+    .to_bytes()
+    .to_vec()
 }
 
 pub(crate) fn ip(id: u8) -> String {
@@ -406,9 +515,20 @@ fn binding(session: u64) -> Vec<u8> {
     .to_vec()
 }
 
+/// The username of a Register with a password.
+fn register_username(code: u32, body: &[u8]) -> Option<String> {
+    if code != LOGIN_REGISTER_CODE {
+        return None;
+    }
+    LoginRegisterRequest::decode_from(body)
+        .ok()
+        .map(|request| request.username.as_str().to_owned())
+}
+
 fn request_code(request: &RequestHeader) -> u32 {
     match request.operation {
         Operation::Register => LOGIN_REGISTER_CODE,
+        Operation::Logout => LOGOUT_USER_CODE,
         Operation::NonReplicated => u32::from_le_bytes(
             request.reserved[NON_REPLICATED_CODE_RANGE]
                 .try_into()
@@ -420,22 +540,35 @@ fn request_code(request: &RequestHeader) -> u32 {
 
 /// The reply of a committed request at `commit`. A metadata reply raises the
 /// metadata watermark of the client.
-fn committed(request: &RequestHeader, commit: u64) -> Vec<u8> {
+fn committed(
+    request: &RequestHeader,
+    commit: u64,
+    rejection: Option<&IggyError>,
+    payload: &[u8],
+) -> Vec<u8> {
     // An empty result section: no error, then the payload.
-    let body = if request.operation.is_result_framed() {
+    let mut body = if let Some(error) = rejection {
+        assert!(request.operation.is_result_framed());
+        let mut body = vec![0; REJECTION_SECTION_LEN];
+        write_rejection_section(&mut body, error.as_code());
+        body
+    } else if request.operation.is_result_framed() {
         0_u32.to_le_bytes().to_vec()
     } else {
         Vec::new()
     };
-    let header = ReplyHeader {
-        command: Command::Reply,
+    body.extend_from_slice(payload);
+    let prepare = PrepareHeader {
         operation: request.operation,
-        client: CLIENT,
+        client: request.client,
         request: request.request,
-        commit,
-        size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
+        request_checksum: request.request_checksum,
+        partition_incarnation: request.partition_incarnation,
+        op: commit,
         ..Default::default()
     };
+    let header =
+        ReplyHeader::from_prepare(&prepare, u32::try_from(HEADER_SIZE + body.len()).unwrap());
     let mut frame = bytemuck::bytes_of(&header).to_vec();
     frame.extend_from_slice(&body);
     frame
