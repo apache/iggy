@@ -22,6 +22,14 @@ use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RetainedOperation {
+    #[schemars(
+        description = "operation_id from an uncertain or blocked tool error, as a decimal string"
+    )]
+    pub operation_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStream {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,

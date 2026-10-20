@@ -16,6 +16,7 @@
 // under the License.
 
 use super::client_builder::{ClientBuilder, ServerConnection};
+use super::common::SIGTERM_TIMEOUT;
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
 use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
@@ -29,7 +30,7 @@ use iggy_common::TransportProtocol;
 use rand::RngExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -49,6 +50,18 @@ const FAILURE_LOG_TAIL_LINES: usize = 8;
 /// between parses as valid TOML with sections or keys missing; readiness
 /// retries on this message.
 const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
+
+/// How the last [`TestBinary::stop`] of a running server ended.
+#[derive(Debug, Clone, Copy)]
+pub struct StopOutcome {
+    /// `None` when the status could not be collected.
+    pub exit_status: Option<ExitStatus>,
+    /// The server did not exit within [`SIGTERM_TIMEOUT`] of SIGTERM and got
+    /// SIGKILL, so its shutdown flush may not have run.
+    pub killed_after_timeout: bool,
+    /// Waiting for the process failed, so neither field above is reliable.
+    pub wait_error: Option<io::ErrorKind>,
+}
 
 #[derive(Debug, Clone)]
 struct ServerProtocolAddr {
@@ -87,6 +100,10 @@ pub struct ServerHandle {
     mcp: Option<McpHandle>,
     connectors_runtime: Option<ConnectorsRuntimeHandle>,
     open_files_limit: Option<u64>,
+    last_stop: Option<StopOutcome>,
+    /// When [`ServerHandle::signal_stop`] sent SIGTERM; the next stop waits
+    /// out the rest of the grace from then instead of signalling again.
+    sigterm_sent_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for ServerHandle {
@@ -200,6 +217,29 @@ impl ServerHandle {
         archive_log_files(stdout_path, stderr_path, &archive_dir)?;
         self.log_incarnation += 1;
         Ok(())
+    }
+
+    /// How the most recent stop of a running process ended. A stop of a
+    /// server that was not running clears it.
+    pub fn last_stop(&self) -> Option<StopOutcome> {
+        self.last_stop
+    }
+
+    /// Send SIGTERM without waiting, so a caller can signal every node before
+    /// it waits for any of them. The next [`TestBinary::stop`] waits for the
+    /// exit and records the outcome. No-op when the server is not running.
+    pub fn signal_stop(&mut self) {
+        // The watchdog panics on any exit it did not expect.
+        self.stop_watchdog();
+        if let Some(child) = self.child_handle.as_ref() {
+            // A child the watchdog already reaped may have handed its pid to
+            // another process, so a dead node gets no signal; `stop` still
+            // collects what the wait can tell about it.
+            if super::common::is_process_alive(child.id()) {
+                super::common::send_sigterm(child);
+            }
+            self.sigterm_sent_at = Some(Instant::now());
+        }
     }
 
     /// The stderr log when it holds a panic that can leave a dead task behind.
@@ -743,6 +783,8 @@ impl ServerHandle {
             mcp: None,
             connectors_runtime: None,
             open_files_limit: None,
+            last_stop: None,
+            sigterm_sent_at: None,
         }
     }
 
@@ -923,6 +965,8 @@ impl TestBinary for ServerHandle {
             mcp: None,
             connectors_runtime: None,
             open_files_limit: None,
+            last_stop: None,
+            sigterm_sent_at: None,
         }
     }
 
@@ -1038,8 +1082,9 @@ impl TestBinary for ServerHandle {
         }
 
         // `--replica-id` is the single identity input expected by the
-        // server when cluster mode is enabled; all other cluster config is
-        // byte-identical across nodes. Pass the harness's `server_id`
+        // server when cluster mode is enabled; every node sees the same
+        // roster, except that with peer relays each node's peers carry the
+        // relay ports that node dials. Pass the harness's `server_id`
         // unconditionally; bootstrap only validates it when
         // `cluster.enabled=true`, so single-node tests see no effect.
         command.arg("--replica-id").arg(self.server_id.to_string());
@@ -1080,6 +1125,7 @@ impl TestBinary for ServerHandle {
             source: e,
         })?;
         self.child_handle = Some(child);
+        self.sigterm_sent_at = None;
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;
@@ -1091,11 +1137,24 @@ impl TestBinary for ServerHandle {
 
     fn stop(&mut self) -> Result<(), TestBinaryError> {
         self.stop_watchdog();
+        self.last_stop = None;
+        let sigterm_sent_at = self.sigterm_sent_at.take();
 
         if let Some(child) = self.child_handle.take() {
-            let child = super::common::graceful_kill(child);
+            let stopped = match sigterm_sent_at {
+                Some(sent_at) => super::common::wait_or_kill(child, sent_at + SIGTERM_TIMEOUT),
+                None => super::common::graceful_kill(child),
+            };
+            let output = stopped.child.wait_with_output();
+            self.last_stop = Some(StopOutcome {
+                exit_status: output.as_ref().ok().map(|output| output.status),
+                killed_after_timeout: stopped.killed_after_timeout,
+                wait_error: stopped
+                    .wait_error
+                    .or_else(|| output.as_ref().err().map(io::Error::kind)),
+            });
 
-            if let Ok(output) = child.wait_with_output() {
+            if let Ok(output) = output {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -1187,6 +1246,8 @@ impl ServerHandle {
         // Watchdog must stop BEFORE the signal lands: it polls liveness every
         // 100ms and panics on unexpected process death.
         self.stop_watchdog();
+        self.last_stop = None;
+        self.sigterm_sent_at = None;
         if let Some(mut child) = self.child_handle.take() {
             // SAFETY: plain syscall. The watchdog is already joined, so its
             // unexpected-death path (a raw waitpid) can no longer reap this

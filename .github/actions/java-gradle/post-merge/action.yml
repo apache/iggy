@@ -30,8 +30,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Java with cache
-      uses: ./.github/actions/utils/setup-java-with-cache
+    - name: Setup Java
+      uses: ./.github/actions/utils/setup-java
 
     - name: Build for publishing
       shell: bash

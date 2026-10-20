@@ -16,13 +16,50 @@
 // under the License.
 
 use crate::WireError;
-use crate::codec::{WireDecode, WireEncode, read_bytes, read_str, read_u8, read_u32_le};
+use crate::codec::{
+    WireDecode, WireEncode, read_bytes, read_str, read_u8, read_u32_le, read_u64_le,
+};
 use crate::primitives::identifier::WireName;
 use crate::version::ClientVersionInfo;
 use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 
 pub const BIND_SECRET_BYTES: usize = 32;
+pub const REGISTER_REQUEST_BYTES: usize = BIND_SECRET_BYTES + size_of::<u64>();
+
+/// Server-verified account identity and binding proof replicated by Register.
+/// The timestamp prevents a delayed login from registering a reused user ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterRequest {
+    pub user_created_at: u64,
+    pub bind_verifier: [u8; BIND_SECRET_BYTES],
+}
+
+impl WireEncode for RegisterRequest {
+    fn encoded_size(&self) -> usize {
+        REGISTER_REQUEST_BYTES
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u64_le(self.user_created_at);
+        buf.put_slice(&self.bind_verifier);
+    }
+}
+
+impl WireDecode for RegisterRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let user_created_at = read_u64_le(buf, 0)?;
+        let mut bind_verifier = [0; BIND_SECRET_BYTES];
+        bind_verifier.copy_from_slice(read_bytes(buf, size_of::<u64>(), BIND_SECRET_BYTES)?);
+        Ok((
+            Self {
+                user_created_at,
+                bind_verifier,
+            },
+            REGISTER_REQUEST_BYTES,
+        ))
+    }
+}
 
 /// A connection-binding credential retained for one logical session.
 #[derive(Debug)]
@@ -187,6 +224,25 @@ impl WireDecode for LoginRegisterRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_preserves_account_identity_and_rejects_truncated_bodies() {
+        let request = RegisterRequest {
+            user_created_at: 0x0102_0304_0506_0708,
+            bind_verifier: [0x5a; BIND_SECRET_BYTES],
+        };
+        let bytes = request.to_bytes();
+        assert_eq!(bytes.len(), REGISTER_REQUEST_BYTES);
+        assert_eq!(
+            &bytes[..size_of::<u64>()],
+            &request.user_created_at.to_le_bytes()
+        );
+        assert_eq!(&bytes[size_of::<u64>()..], &request.bind_verifier);
+        assert_eq!(RegisterRequest::decode_from(&bytes).unwrap(), request);
+        for length in 0..bytes.len() {
+            assert!(RegisterRequest::decode_from(&bytes[..length]).is_err());
+        }
+    }
 
     fn version_info() -> ClientVersionInfo {
         ClientVersionInfo {

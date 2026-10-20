@@ -114,15 +114,17 @@ pub async fn dispatch(
         API_KEY_PRODUCE => produce::handle(state, connection, principal, api_version, body).await,
         API_KEY_FETCH => fetch::handle(state, connection, api_version, body).await,
         API_KEY_LIST_OFFSETS => list_offsets::handle(state, api_version, body).await,
-        API_KEY_METADATA => metadata::handle(state, api_version, body).await,
+        API_KEY_METADATA => metadata::handle(state, connection, api_version, body).await,
         API_KEY_OFFSET_COMMIT => offset_commit::handle(state, connection, api_version, body).await,
         API_KEY_OFFSET_FETCH => offset_fetch::handle(state, connection, api_version, body).await,
-        API_KEY_API_VERSIONS => api_versions::handle(state, api_version, body).await,
+        API_KEY_API_VERSIONS => api_versions::handle(connection, api_version, body).await,
         API_KEY_CREATE_TOPICS => create_topics::handle(state, api_version, body).await,
         API_KEY_DELETE_TOPICS => delete_topics::handle(state, principal, api_version, body).await,
         API_KEY_DESCRIBE_CONFIGS => describe_configs::handle(state, api_version, body).await,
         API_KEY_ALTER_CONFIGS => alter_configs::handle(state, principal, api_version, body).await,
-        API_KEY_FIND_COORDINATOR => find_coordinator::handle(state, api_version, body).await,
+        API_KEY_FIND_COORDINATOR => {
+            find_coordinator::handle(state, connection, api_version, body).await
+        }
         API_KEY_JOIN_GROUP => join_group::handle(state, api_version, body).await,
         API_KEY_HEARTBEAT => heartbeat::handle(state, connection, api_version, body).await,
         API_KEY_LEAVE_GROUP => leave_group::handle(state, api_version, body).await,

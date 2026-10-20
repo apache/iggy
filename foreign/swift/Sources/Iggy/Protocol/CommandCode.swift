@@ -46,13 +46,12 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case pollMessages = 100
     case sendMessages = 101
     // 102 was flush_unsaved_buffer; the server keeps the code reserved.
-    case getPollRouting = 103
-    case pollMessagesOnPrimary = 104
+    // 103 and 104 are retired and must never be reused.
     case getPartitionRoute = 105
     case getConsumerOffset = 120
     case storeConsumerOffset = 121
     case deleteConsumerOffset = 122
-    case getConsumerOffsetRouting = 123
+    // 123 is retired and must never be reused.
     case getStream = 200
     case getStreams = 201
     case createStream = 202
@@ -105,13 +104,10 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .loginRegisterWithPersonalAccessToken: "user.login_register_with_pat"
         case .pollMessages: "message.poll"
         case .sendMessages: "message.send"
-        case .getPollRouting: "message.poll_routing"
-        case .pollMessagesOnPrimary: "message.poll_primary"
         case .getPartitionRoute: "partition.route"
         case .getConsumerOffset: "consumer_offset.get"
         case .storeConsumerOffset: "consumer_offset.store"
         case .deleteConsumerOffset: "consumer_offset.delete"
-        case .getConsumerOffsetRouting: "consumer_offset.routing"
         case .getStream: "stream.get"
         case .getStreams: "stream.list"
         case .createStream: "stream.create"
@@ -136,11 +132,12 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     }
 
     /// Codes that drive the session handshake and therefore cannot be sent
-    /// through the raw request path.
+    /// through the raw request path. `BindSession` would rebind the
+    /// connection outside the client's bookkeeping of its session.
     static func isSessionControl(_ code: UInt32) -> Bool {
         switch CommandCode(rawValue: code) {
         case .loginUser, .logoutUser, .loginRegister, .loginWithPersonalAccessToken,
-            .loginRegisterWithPersonalAccessToken:
+            .loginRegisterWithPersonalAccessToken, .bindSession:
             true
         default:
             false

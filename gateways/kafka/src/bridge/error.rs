@@ -142,6 +142,25 @@ impl BridgeError {
         }
     }
 
+    /// [`Self::to_kafka_error_code`] for `ListOffsets`. The Java `AdminClient` fails a partition
+    /// on any code that is neither 6 nor retriable (`ListOffsetsHandler.handlePartitionError`), so
+    /// these refusals answer 6 or 7 here, not -1. `HistoryUnavailable` refuses a poll that names
+    /// an older incarnation of the partition, as after a delete and recreate. The retry probes
+    /// again and answers 3 if the topic is gone, and clients handle 3 and 6 alike.
+    /// `RequestTooOld` is not returned to `ListOffsets` reads today, so its arm is defensive.
+    #[must_use]
+    pub const fn to_list_offsets_error_code(&self) -> i16 {
+        match self {
+            Self::Iggy(
+                IggyError::HistoryUnavailable
+                | IggyError::LifecycleBusy
+                | IggyError::ClientShutdown,
+            ) => ERROR_NOT_LEADER_OR_FOLLOWER,
+            Self::Iggy(IggyError::RequestTooOld) => ERROR_REQUEST_TIMED_OUT,
+            _ => self.to_kafka_error_code(),
+        }
+    }
+
     /// True when Iggy rejected the bridge's own login. The Kafka client only sees -1.
     #[must_use]
     pub const fn is_bridge_login_rejected(&self) -> bool {
@@ -215,7 +234,9 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::CannotEstablishConnection
         | IggyError::TcpError
         | IggyError::TransientNotAccepted => ERROR_NOT_LEADER_OR_FOLLOWER,
-        IggyError::TransientNotCommitted => ERROR_REQUEST_TIMED_OUT,
+        IggyError::TransientNotCommitted | IggyError::OperationUncertain(_) => {
+            ERROR_REQUEST_TIMED_OUT
+        }
         // The outcome was forgotten; a retry after client eviction could duplicate the write.
         // UNKNOWN_SERVER_ERROR is non-retryable in the Kafka protocol.
         IggyError::RequestTooOld => ERROR_UNKNOWN_SERVER_ERROR,
@@ -314,6 +335,47 @@ mod tests {
     }
 
     #[test]
+    fn given_a_retriable_iggy_refusal_when_mapped_for_list_offsets_should_answer_retriable() {
+        let retriable = [
+            (IggyError::HistoryUnavailable, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::LifecycleBusy, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::ClientShutdown, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (IggyError::RequestTooOld, ERROR_REQUEST_TIMED_OUT),
+        ];
+        for (error, code) in retriable {
+            let err = BridgeError::Iggy(error);
+            assert_eq!(
+                err.to_kafka_error_code(),
+                ERROR_UNKNOWN_SERVER_ERROR,
+                "{err}"
+            );
+            assert_eq!(err.to_list_offsets_error_code(), code, "{err}");
+        }
+    }
+
+    #[test]
+    fn given_any_other_failure_when_mapped_for_list_offsets_should_keep_the_shared_code() {
+        let others = [
+            BridgeError::InvalidKafkaTopicName {
+                kafka_topic: " ".to_string(),
+                reason: "whitespace".to_string(),
+            },
+            BridgeError::Iggy(IggyError::Unauthorized),
+            BridgeError::Iggy(IggyError::InvalidCredentials),
+            BridgeError::Iggy(IggyError::TopicNameNotFound(String::new(), String::new())),
+            BridgeError::Iggy(IggyError::Disconnected),
+            BridgeError::Timeout,
+        ];
+        for err in others {
+            assert_eq!(
+                err.to_list_offsets_error_code(),
+                err.to_kafka_error_code(),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_partition_count_maps_to_invalid_partitions() {
         let err = BridgeError::InvalidPartitionCount {
             kafka_topic: "orders".to_string(),
@@ -404,6 +466,12 @@ mod tests {
     fn transient_not_accepted_maps_to_not_leader_or_follower_for_retry() {
         let err = BridgeError::Iggy(IggyError::TransientNotAccepted);
         assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
+    }
+
+    #[test]
+    fn uncertain_operation_maps_to_request_timed_out() {
+        let err = BridgeError::Iggy(IggyError::OperationUncertain(42));
+        assert_eq!(err.to_kafka_error_code(), ERROR_REQUEST_TIMED_OUT);
     }
 
     #[test]

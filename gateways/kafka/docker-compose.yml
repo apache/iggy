@@ -104,7 +104,7 @@ services:
     environment:
       - IGGY_KAFKA_BIND_ADDR=0.0.0.0:9093
       # Binding the wildcard address above means the gateway cannot derive its own advertised
-      # host (server.rs::BrokerAdvertise::from_server_config refuses to start without this) -
+      # host (listener.rs::BrokerAdvertise::for_listener refuses to start without this) -
       # same requirement root docker-compose.yml's IGGY_NODE_ADVERTISED_ADDRESS already carries
       # for iggy-server, for the same reason: the value a Kafka client's Metadata response
       # points it back at has to be reachable from outside the container.

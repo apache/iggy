@@ -21,12 +21,19 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyOperationException;
+import org.apache.iggy.partition.PartitionContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -64,7 +71,286 @@ class AsyncTcpConnectionConcurrencyTest {
     private static final int LOGIN_CODE = 38;
     private static final int LOGOUT_CODE = 39;
     private static final int SEND_MESSAGES_CODE = 101;
+    private static final int STORE_OFFSET_CODE = 121;
     private static final int TRANSIENT_NOT_COMMITTED = 57;
+    private static final long OPERATION_ID = 9;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReleaseRetainedFramesOnlyWhenClosingTheirSessionOwner(boolean followsSession) throws Exception {
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(2));
+                    Request register = readRequest(socket.getInputStream());
+                    writeResponse(socket.getOutputStream(), register, registerBody());
+                    assertThat(readRequest(socket.getInputStream()).operation()).isEqualTo(OPERATION_SEND_MESSAGES);
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 50);
+            if (followsSession) {
+                connection.followSession(new ConsensusSession());
+            }
+            ConsensusSession owner = connection.sessionOwner();
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var state = new AsyncTcpConnection.TransientFailoverState();
+                var request = connection.send(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(),
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        state);
+                assertThatThrownBy(() -> request.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.OPERATION_UNCERTAIN));
+                server.get(5, TimeUnit.SECONDS);
+
+                ConsensusSession.Ticket ticket = state.ticket();
+                ByteBuf alias = ticket.frame();
+                ByteBuf allocation = alias;
+                while (allocation.unwrap() != null) {
+                    allocation = allocation.unwrap();
+                }
+                alias.release();
+                ticket.finishWrite();
+                assertThat(allocation.refCnt()).isPositive();
+
+                connection.close().get(5, TimeUnit.SECONDS);
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                if (followsSession) {
+                    assertThat(owner.resume(ticket.operationId(), deadline, connection.eventLoop())
+                                    .join())
+                            .isSameAs(ticket);
+                    assertThat(allocation.refCnt()).isPositive();
+                    owner.abandon(ticket.operationId());
+                    assertThat(allocation.refCnt()).isPositive();
+                    ticket.retain();
+                }
+                assertThat(allocation.refCnt()).isZero();
+                assertThatThrownBy(() -> owner.resume(ticket.operationId(), deadline, connection.eventLoop())
+                                .join())
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.OPERATION_NOT_RETAINED));
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+                owner.reset();
+            }
+        }
+    }
+
+    @Test
+    void shouldKeepAReplayRetainedWhenItsResolveIsCancelledAfterTheReplyIsMarkedCommitted() throws Exception {
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> replayed = new CompletableFuture<>();
+            CompletableFuture<Void> release = new CompletableFuture<>();
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(5));
+                    InputStream input = socket.getInputStream();
+                    OutputStream output = socket.getOutputStream();
+                    Request register = readRequest(input);
+                    writeResponse(output, register, registerBody());
+                    readRequest(input);
+                    Request replay = readRequest(input);
+                    replayed.complete(null);
+                    release.join();
+                    writeResponse(output, replay, new byte[0]);
+                    writeResponse(output, readRequest(input), new byte[0]);
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 50);
+            ConsensusSession owner = connection.sessionOwner();
+            PollRouter router = new PollRouter(() -> connection, endpoint -> {
+                throw new IllegalStateException("A metadata replay opens no partition link");
+            });
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var state = new AsyncTcpConnection.TransientFailoverState();
+                var request = connection.send(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(),
+                        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300),
+                        state);
+                assertThatThrownBy(() -> request.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class);
+                long operation = state.ticket().operationId();
+                var cancelled = router.resolve(operation, Duration.ofSeconds(5));
+                replayed.get(5, TimeUnit.SECONDS);
+                // After the write of the replay ends, only its reply makes the event loop wait for the session.
+                connection.eventLoop().submit(() -> {}).get(5, TimeUnit.SECONDS);
+                Thread eventLoop =
+                        connection.eventLoop().submit(Thread::currentThread).get(5, TimeUnit.SECONDS);
+                synchronized (owner) {
+                    release.complete(null);
+                    // The decoder marks the reply committed before it waits for the session.
+                    awaitBlocked(eventLoop);
+                    cancelled.cancel(false);
+                }
+
+                router.resolve(operation, Duration.ofSeconds(5))
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                server.get(5, TimeUnit.SECONDS);
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+                owner.reset();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldReplayWaitingResolveAfterThePreviousReplayTimesOutOrIsCancelled(boolean cancel) throws Exception {
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> replayReceived = new CompletableFuture<>();
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(5));
+                    InputStream input = socket.getInputStream();
+                    OutputStream output = socket.getOutputStream();
+                    writeResponse(output, readRequest(input), registerBody());
+                    Request original = readRequest(input);
+                    Request replay = readRequest(input);
+                    assertThat(replay.requestId()).isEqualTo(original.requestId());
+                    assertThat(replay.header()).containsExactly(original.header());
+                    replayReceived.complete(null);
+                    Request waitingReplay = readRequest(input);
+                    assertThat(waitingReplay.requestId()).isEqualTo(original.requestId());
+                    assertThat(waitingReplay.header()).containsExactly(original.header());
+                    writeResponse(output, waitingReplay, new byte[0]);
+                } catch (IOException error) {
+                    replayReceived.completeExceptionally(error);
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 50);
+            PollRouter router = new PollRouter(() -> connection, endpoint -> {
+                throw new IllegalStateException("A direct replay opens no partition link");
+            });
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                var state = new AsyncTcpConnection.TransientFailoverState();
+                var original = connection.send(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(),
+                        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300),
+                        state);
+                assertThatThrownBy(() -> original.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class);
+                long operation = state.ticket().operationId();
+                var replay = router.resolve(operation, cancel ? Duration.ofSeconds(5) : Duration.ofSeconds(1));
+                replayReceived.get(5, TimeUnit.SECONDS);
+                var waiting = router.resolve(operation, Duration.ofSeconds(5));
+                assertThat(waiting).isNotDone();
+
+                if (cancel) {
+                    assertThat(replay.cancel(false)).isTrue();
+                } else {
+                    assertThatThrownBy(() -> replay.get(5, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(IggyOperationException.class);
+                }
+
+                waiting.get(5, TimeUnit.SECONDS).release();
+                router.resolve(operation, Duration.ofSeconds(1))
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                server.get(5, TimeUnit.SECONDS);
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void shouldReleaseTheFrameAliasWhenTheRequestIdCannotBeRenewed() throws Exception {
+        try (ServerSocket serverSocket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture<Void> server = CompletableFuture.runAsync(() -> {
+                try (Socket socket = serverSocket.accept()) {
+                    socket.setSoTimeout((int) TimeUnit.SECONDS.toMillis(2));
+                    InputStream input = socket.getInputStream();
+                    Request register = readRequest(input);
+                    writeResponse(socket.getOutputStream(), register, registerBody());
+                    assertThat(input.read()).isEqualTo(-1);
+                } catch (IOException error) {
+                    throw new IllegalStateException("Mock VSR server failed", error);
+                }
+            });
+            AsyncTcpConnection connection = newConnection(serverSocket, Duration.ofHours(1), 50);
+            ConsensusSession owner = connection.sessionOwner();
+            try {
+                connection.connect().get(5, TimeUnit.SECONDS);
+                connection
+                        .send(LOGIN_CODE, loginPayload())
+                        .get(5, TimeUnit.SECONDS)
+                        .release();
+                int frameBytes = HEADER_SIZE + Long.BYTES;
+                var lane = new ConsensusSession.LaneKey(1, 0);
+                owner.configurePendingOperations(1, frameBytes);
+                ConsensusSession.Ticket ticket = owner.acquire(
+                                lane,
+                                true,
+                                frameBytes,
+                                System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                                connection.eventLoop())
+                        .get(5, TimeUnit.SECONDS);
+                ByteBuf frame = Unpooled.buffer(frameBytes).writeZero(frameBytes);
+                frame.setLongLE(REQUEST_ID_OFFSET, OPERATION_ID);
+                ticket.freeze(frame, STORE_OFFSET_CODE, new byte[0]);
+                frame.release();
+                ticket.finishWrite();
+                ticket.startWrite();
+                ticket.finishWrite();
+                ticket.retain();
+
+                var state = new AsyncTcpConnection.TransientFailoverState();
+                state.restore(ticket);
+                state.renewRequestId();
+                var replay = connection.sendRouted(
+                        STORE_OFFSET_CODE,
+                        Unpooled.buffer(),
+                        0,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        state);
+                assertThatThrownBy(() -> replay.get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyOperationException.class)
+                        .satisfies(error -> assertThat(((IggyOperationException) error.getCause()).getErrorCode())
+                                .isEqualTo(IggyErrorCode.OPERATION_NOT_RETAINED));
+
+                owner.abandon(OPERATION_ID);
+                assertThat(frame.refCnt()).isZero();
+                owner.acquire(
+                                lane,
+                                true,
+                                frameBytes,
+                                System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200),
+                                connection.eventLoop())
+                        .get(5, TimeUnit.SECONDS)
+                        .complete();
+            } finally {
+                connection.close().get(5, TimeUnit.SECONDS);
+                owner.reset();
+            }
+            server.get(5, TimeUnit.SECONDS);
+        }
+    }
 
     @Test
     void shouldFlushRequestFromReplyCallbackWithoutFurtherInboundTraffic() throws Exception {
@@ -100,7 +386,7 @@ class AsyncTcpConnectionConcurrencyTest {
                     1024 * 1024,
                     null,
                     errorCode -> {},
-                    ignored -> {});
+                    (source, cause) -> {});
             try {
                 connection.connect().get(5, TimeUnit.SECONDS);
                 connection
@@ -169,7 +455,7 @@ class AsyncTcpConnectionConcurrencyTest {
                     1024 * 1024,
                     null,
                     errorCode -> {},
-                    ignored -> {});
+                    (source, cause) -> {});
             try {
                 connection.connect().get(5, TimeUnit.SECONDS);
                 connection
@@ -177,9 +463,25 @@ class AsyncTcpConnectionConcurrencyTest {
                         .get(5, TimeUnit.SECONDS)
                         .release();
 
-                CompletableFuture<ByteBuf> first = connection.send(SEND_MESSAGES_CODE, sendMessagesPayload());
+                var firstState = new AsyncTcpConnection.TransientFailoverState(
+                        new PartitionContext(BigInteger.valueOf(7), BigInteger.ZERO, BigInteger.ONE));
+                firstState.setLane(new ConsensusSession.LaneKey(7, 3));
+                var secondState = new AsyncTcpConnection.TransientFailoverState(
+                        new PartitionContext(BigInteger.valueOf(8), BigInteger.ZERO, BigInteger.ONE));
+                secondState.setLane(new ConsensusSession.LaneKey(8, 4));
+                CompletableFuture<ByteBuf> first = connection.sendRouted(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(3),
+                        0,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        firstState);
                 firstRequestRead.get(5, TimeUnit.SECONDS);
-                CompletableFuture<ByteBuf> second = connection.send(SEND_MESSAGES_CODE, sendMessagesPayload());
+                CompletableFuture<ByteBuf> second = connection.sendRouted(
+                        SEND_MESSAGES_CODE,
+                        sendMessagesPayload(4),
+                        0,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(2),
+                        secondState);
 
                 assertResponse(first, "first");
                 assertResponse(second, "second");
@@ -368,7 +670,7 @@ class AsyncTcpConnectionConcurrencyTest {
                 1024 * 1024,
                 null,
                 errorCode -> {},
-                ignored -> {});
+                (source, cause) -> {});
     }
 
     private static Request readRequest(InputStream input) throws IOException {
@@ -385,7 +687,8 @@ class AsyncTcpConnectionConcurrencyTest {
         return new Request(
                 Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
                 fields.getLong(REQUEST_ID_OFFSET),
-                fields.getInt(REQUEST_CODE_OFFSET));
+                fields.getInt(REQUEST_CODE_OFFSET),
+                header);
     }
 
     private static void writeResponse(OutputStream output, Request request, byte[] payload) throws IOException {
@@ -401,9 +704,27 @@ class AsyncTcpConnectionConcurrencyTest {
         fields.putInt(REPLY_STATUS_OFFSET, status);
         header[COMMAND_OFFSET] = COMMAND_REPLY;
         header[REPLY_OPERATION_OFFSET] = (byte) request.operation();
+        if (status == 0 && request.operation() != OPERATION_NON_REPLICATED) {
+            header[220] = 1;
+            System.arraycopy(request.header(), 144, header, 128, 16);
+            System.arraycopy(request.header(), 128, header, 160, 16);
+            System.arraycopy(request.header(), 200, header, 224, Long.BYTES);
+            fields.putLong(176, 1);
+            fields.putLong(184, 1);
+        }
         output.write(header);
         output.write(payload);
         output.flush();
+    }
+
+    private static void awaitBlocked(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (thread.getState() != Thread.State.BLOCKED) {
+            assertThat(deadline - System.nanoTime())
+                    .as("%s waits for a lock", thread.getName())
+                    .isPositive();
+            TimeUnit.MILLISECONDS.sleep(1);
+        }
     }
 
     private static void assertNoRequest(InputStream input, Socket socket) throws IOException {
@@ -435,13 +756,17 @@ class AsyncTcpConnectionConcurrencyTest {
     }
 
     private static ByteBuf sendMessagesPayload() {
+        return sendMessagesPayload(3);
+    }
+
+    private static ByteBuf sendMessagesPayload(int partition) {
         ByteBuf payload = Unpooled.buffer();
         payload.writeIntLE(22);
         writeNumericIdentifier(payload, 1);
         writeNumericIdentifier(payload, 2);
         payload.writeByte(2);
         payload.writeByte(4);
-        payload.writeIntLE(3);
+        payload.writeIntLE(partition);
         payload.writeIntLE(0);
         return payload;
     }
@@ -463,5 +788,5 @@ class AsyncTcpConnectionConcurrencyTest {
         }
     }
 
-    private record Request(int operation, long requestId, int commandCode) {}
+    private record Request(int operation, long requestId, int commandCode, byte[] header) {}
 }

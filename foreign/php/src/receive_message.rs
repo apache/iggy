@@ -180,13 +180,13 @@ impl PartitionContext {
     }
 
     /// The consumer group owner generation, or 0 for a poll without a consumer group.
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn owner_generation(&self) -> u64 {
         self.inner.owner_generation
     }
 
     /// The metadata operation the server must have applied before it serves the request.
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn metadata_op(&self) -> u64 {
         self.inner.metadata_op
     }
@@ -220,7 +220,7 @@ impl ConsumerPosition {
         }
     }
 
-    #[php(getter)]
+    #[php(getter, change_case = "snake_case")]
     pub fn partition_id(&self) -> u32 {
         self.inner.partition_id
     }

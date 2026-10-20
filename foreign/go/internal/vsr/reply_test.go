@@ -22,6 +22,7 @@ import (
 	"errors"
 	"testing"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -286,4 +287,59 @@ func TestEvictionError_ReportsTheReasonAndMappedError(t *testing.T) {
 	assert.Contains(t, got.Error(), "13")
 	assert.Contains(t, got.Error(), ierror.ErrStaleClient.Error())
 	assert.ErrorIs(t, got, ierror.ErrStaleClient)
+}
+
+func TestDecodeReplyForRequiresCompleteFinalResultProof(t *testing.T) {
+	var request [HeaderSize]byte
+	EncodeRequestHeader(&request, RequestFields{Size: HeaderSize, Client: ClientID{Lo: 7, Hi: 9}, Request: 42, Operation: OperationCreateTopic, Session: 3})
+	request[requestOffsetChecksum] = 11
+	StampPartitionContext(&request, iggcon.PartitionContext{Incarnation: 8})
+	body := resultSection(uint32(ierror.UnauthorizedCode))
+	header := replyHeader(OperationCreateTopicWithAssignments, 0, len(body))
+	header[replyOffsetResult] = committedResult
+	copy(header[replyOffsetClient:replyOffsetClient+16], request[requestOffsetClient:requestOffsetClient+16])
+	copy(header[replyOffsetChecksum:replyOffsetChecksum+16], request[requestOffsetChecksum:requestOffsetChecksum+16])
+	binary.LittleEndian.PutUint64(header[replyOffsetRequest:], 42)
+	binary.LittleEndian.PutUint64(header[replyOffsetOp:], 17)
+	binary.LittleEndian.PutUint64(header[replyOffsetCommit:], 17)
+	binary.LittleEndian.PutUint64(header[replyOffsetIncarnation:], 8)
+	outcome, err := DecodeReplyFor(&request, header, body)
+	require.NoError(t, err)
+	require.True(t, outcome.Committed)
+	require.ErrorIs(t, outcome.Err, ierror.ErrUnauthorized)
+	for name, offset := range map[string]int{"unknown marker": replyOffsetResult, "client": replyOffsetClient, "checksum": replyOffsetChecksum, "incarnation": replyOffsetIncarnation, "operation": replyOffsetOperation, "commit": replyOffsetCommit} {
+		t.Run(name, func(t *testing.T) {
+			corrupt := *header
+			corrupt[offset] ^= 2
+			got, err := DecodeReplyFor(&request, &corrupt, body)
+			if name == "unknown marker" {
+				require.NoError(t, err)
+				require.False(t, got.Committed)
+			} else {
+				require.ErrorIs(t, err, ierror.ErrInvalidCommand)
+			}
+		})
+	}
+	for _, code := range []ierror.Code{ierror.TransientNotCommittedCode, ierror.TransientNotAcceptedCode, ierror.NotPrimaryCode} {
+		outcome, err = DecodeReplyFor(&request, header, resultSection(uint32(code)))
+		require.NoError(t, err)
+		require.False(t, outcome.Committed)
+	}
+	truncated := append([]byte(nil), body...)
+	binary.LittleEndian.PutUint32(truncated, ^uint32(0))
+	_, err = DecodeReplyFor(&request, header, truncated)
+	require.ErrorIs(t, err, ierror.ErrInvalidCommand)
+	denied := *header
+	binary.LittleEndian.PutUint32(denied[replyOffsetStatus:], uint32(ierror.UnauthorizedCode))
+	outcome, err = DecodeReplyFor(&request, &denied, body)
+	require.NoError(t, err)
+	require.False(t, outcome.Committed)
+}
+
+func TestReplyOperationMatchesOnlyCanonicalDirectedRewrites(t *testing.T) {
+	for _, pair := range [][2]Operation{{OperationCreateTopic, OperationCreateTopicWithAssignments}, {OperationCreatePartitions, OperationCreatePartitionsWithAssignments}, {OperationDeleteSegments, OperationTruncatePartition}} {
+		require.True(t, ReplyOperationMatches(pair[0], pair[1]))
+		require.False(t, ReplyOperationMatches(pair[1], pair[0]))
+	}
+	require.False(t, ReplyOperationMatches(OperationCreateTopic, OperationCreatePartitionsWithAssignments))
 }

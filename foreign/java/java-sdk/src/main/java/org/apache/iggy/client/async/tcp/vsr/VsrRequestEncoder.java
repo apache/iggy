@@ -73,6 +73,7 @@ public final class VsrRequestEncoder {
         return encode(alloc, commandCode, payload, context, 0);
     }
 
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     public ByteBuf encode(
             ByteBufAllocator alloc,
             int commandCode,
@@ -133,7 +134,10 @@ public final class VsrRequestEncoder {
                     VsrHeaders.REQUEST_OWNER_GENERATION_OFFSET,
                     context.ownerGeneration().longValue());
             frame.setLongLE(
-                    VsrHeaders.REQUEST_METADATA_OP_OFFSET, context.metadataOp().longValue());
+                    VsrHeaders.REQUEST_METADATA_OP_OFFSET,
+                    context.equals(PartitionContext.EMPTY)
+                            ? session.metadataWatermark()
+                            : context.metadataOp().longValue());
             if (operation == VsrOperation.NON_REPLICATED) {
                 frame.setIntLE(VsrHeaders.REQUEST_RESERVED_CODE_OFFSET, commandCode);
             }

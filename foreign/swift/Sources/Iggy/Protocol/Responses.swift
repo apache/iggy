@@ -385,23 +385,27 @@ enum Responses {
             let count = try reader.readUInt32()
             var nodes: [ClusterNode] = []
             for _ in 0..<count {
-                let replicaID = try reader.readUInt8()
-                let nodeName = try reader.readLongString()
-                let ip = try reader.readLongString()
-                let endpoints = TransportEndpoints(
-                    tcp: try reader.readUInt16(), quic: try reader.readUInt16(), http: try reader.readUInt16(), websocket: try reader.readUInt16())
-                let roleCode = try reader.readUInt8()
-                let statusCode = try reader.readUInt8()
-                guard let role = ClusterNodeRole(rawValue: roleCode) else {
-                    throw IggyError(.invalidCommand, context: "unknown cluster node role \(roleCode)")
-                }
-                guard let status = ClusterNodeStatus(rawValue: statusCode) else {
-                    throw IggyError(.invalidCommand, context: "unknown cluster node status \(statusCode)")
-                }
-                nodes.append(ClusterNode(replicaID: replicaID, name: nodeName, ip: ip, endpoints: endpoints, role: role, status: status))
+                nodes.append(try clusterNode(from: &reader))
             }
             return ClusterMetadata(name: name, nodes: nodes)
         }
+    }
+
+    static func clusterNode(from reader: inout ByteReader) throws -> ClusterNode {
+        let replicaID = try reader.readUInt8()
+        let name = try reader.readLongString()
+        let ip = try reader.readLongString()
+        let endpoints = TransportEndpoints(
+            tcp: try reader.readUInt16(), quic: try reader.readUInt16(), http: try reader.readUInt16(), websocket: try reader.readUInt16())
+        let roleCode = try reader.readUInt8()
+        let statusCode = try reader.readUInt8()
+        guard let role = ClusterNodeRole(rawValue: roleCode) else {
+            throw IggyError(.invalidCommand, context: "unknown cluster node role \(roleCode)")
+        }
+        guard let status = ClusterNodeStatus(rawValue: statusCode) else {
+            throw IggyError(.invalidCommand, context: "unknown cluster node status \(statusCode)")
+        }
+        return ClusterNode(replicaID: replicaID, name: name, ip: ip, endpoints: endpoints, role: role, status: status)
     }
 
     static func optionSpecs(_ body: ArraySlice<UInt8>) throws -> [OptionSpec] {
@@ -420,6 +424,44 @@ enum Responses {
             }
             return specs
         }
+    }
+
+    // MARK: Routing
+
+    static let partitionRouteSize = 25
+
+    /// One replica's route to a partition, the reply to `GetPartitionRoute`.
+    struct PartitionRoute: Equatable {
+        /// The context a request routed by the reply carries.
+        let context: PartitionContext
+        /// The configured replica id of the partition primary, as
+        /// `GetClusterMetadata` reports it, never a roster position.
+        let primaryReplica: UInt8
+    }
+
+    /// Decodes `[incarnation:8][metadata_op:8][view:4][partitions_count:4][primary_replica:1]`.
+    /// A route names no consumer, so the context carries owner 0, as
+    /// `PartitionRouteResponse::context` in the Rust protocol crate. A reply
+    /// of any other length comes from a mismatched build.
+    static func partitionRoute(_ body: ArraySlice<UInt8>) throws -> PartitionRoute {
+        guard body.count == partitionRouteSize else {
+            throw IggyError(.invalidCommand, context: "partition route is \(body.count) bytes, expected \(partitionRouteSize)")
+        }
+        return try decode(body) { reader in
+            let context = PartitionContext(incarnation: try reader.readUInt64(), ownerGeneration: 0, metadataOp: try reader.readUInt64())
+            // The view and the partition count, which a client that asks only
+            // the coordinator for routes does not use.
+            try reader.skip(2 * MemoryLayout<UInt32>.size)
+            return PartitionRoute(context: context, primaryReplica: try reader.readUInt8())
+        }
+    }
+
+    /// The session a data connection binds to, as `SessionIdentity` in the
+    /// Rust protocol crate.
+    struct SessionIdentity: Equatable {
+        let clientID: UInt128Value
+        let session: UInt64
+        let metadataWatermark: UInt64
     }
 
     // MARK: Messages
