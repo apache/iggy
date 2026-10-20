@@ -29,6 +29,7 @@ pub use error::eviction::eviction_reason_to_error;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
+pub mod request_budget;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use consumer_group_client_state::ConsumerGroupClientState;
 

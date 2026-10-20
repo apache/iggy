@@ -142,6 +142,8 @@ impl ClientProviderConfig {
                     nodelay: args.tcp_nodelay,
                     heartbeat_interval: NonZeroIggyDuration::from_str(&args.tcp_heartbeat_interval)
                         .map_err(|_| IggyError::InvalidConfiguration)?,
+                    request_timeout: NonZeroIggyDuration::from_str(&args.tcp_request_timeout)
+                        .map_err(|_| IggyError::InvalidConfiguration)?,
                     reconnection: TcpClientReconnectionConfig {
                         enabled: args.tcp_reconnection_enabled,
                         max_retries: args.tcp_reconnection_max_retries,

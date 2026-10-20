@@ -35,6 +35,18 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait BinaryTransport {
+    fn request_timeout(&self) -> Option<NonZeroIggyDuration> {
+        None
+    }
+
+    fn expire_request(&self) {}
+
+    /// Waits for another caller's connection before sign-in changes the session.
+    /// A connection owner must not wait for itself.
+    async fn wait_for_connect(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+
     /// Gets the state of the client.
     async fn get_state(&self) -> ClientState;
     /// Sets the state of the client.

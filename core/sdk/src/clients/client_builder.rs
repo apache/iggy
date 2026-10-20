@@ -185,6 +185,12 @@ impl TcpClientBuilder {
         self
     }
 
+    /// Sets the budget for TCP login requests. Other requests do not use it yet.
+    pub fn with_request_timeout(mut self, timeout: NonZeroIggyDuration) -> Self {
+        self.config = self.config.with_request_timeout(timeout);
+        self
+    }
+
     /// Sets the cooldown before reconnecting after a previously successful connection.
     pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
         self.config = self.config.with_reestablish_after(reestablish_after);
