@@ -43,6 +43,7 @@ use consensus::{
 use futures::channel::oneshot;
 use futures::lock::Mutex;
 use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::consensus::CHECKSUM_UNSEALED;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
@@ -2248,9 +2249,34 @@ where
             // `reconcile_metadata_view_divergence`: the pump is
             // single-threaded and `replicate_preflight` refuses prepares
             // while `is_transferring`.
-            let removed = journal
-                .handle()
-                .truncate_from(snapshot_seq + 1)
+            let handle = journal.handle();
+            // A local boundary can belong to a discarded view. Only the adopted
+            // peer log can vouch for it, otherwise the snapshot replaces it too.
+            let boundary_matches = usize::try_from(snapshot_seq)
+                .ok()
+                .and_then(|op| handle.header(op))
+                .is_some_and(|local| {
+                    consensus
+                        .with_pending_view_log(|pending| {
+                            pending
+                                .headers
+                                .iter()
+                                .chain(pending.committed_elsewhere.iter())
+                                .find(|peer| peer.op == snapshot_seq)
+                                .is_some_and(|peer| {
+                                    peer.checksum != CHECKSUM_UNSEALED
+                                        && peer.checksum == local.checksum
+                                })
+                        })
+                        .unwrap_or(false)
+                });
+            let from_op = if boundary_matches {
+                snapshot_seq + 1
+            } else {
+                snapshot_seq
+            };
+            let removed = handle
+                .truncate_from(from_op)
                 .await
                 .map_err(SnapshotError::Io)?;
             if removed > 0 {
@@ -4921,7 +4947,6 @@ mod tests {
     use crate::stm::stream::{Streams, StreamsInner};
     use crate::stm::user::{PAT_TOKEN_HASH_BYTES, Users, UsersInner};
     use consensus::LocalPipeline;
-    use iggy_binary_protocol::WireOptions;
     use iggy_binary_protocol::primitives::permissions::{
         WireGlobalPermissions, WirePermissions, WireStreamPermissions,
     };
@@ -4929,6 +4954,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
     use iggy_binary_protocol::requests::users::{CreateUserRequest, DeleteUserRequest};
+    use iggy_binary_protocol::{StartViewHeader, WireOptions};
     use iggy_common::{IggyTimestamp, UserStatus, variadic};
     use journal::prepare_journal::PrepareJournal;
     use journal::superblock::SuperblockContents;
@@ -8919,128 +8945,169 @@ mod tests {
     /// A state-transfer receiver's WAL can hold a pre-crash suffix above the
     /// incoming floor. The commit walk matches entries by op number alone, so
     /// installing without discarding that suffix would later apply its stale
-    /// bodies as committed. The install must truncate the WAL above
-    /// `snapshot_seq` and keep everything at or below it, which tail repair
-    /// resumes from.
+    /// bodies as committed. The install discards that suffix and keeps the
+    /// boundary header only when the adopted peer log confirms its checksum.
     #[compio::test]
-    async fn state_transfer_install_truncates_the_wal_above_the_incoming_floor() {
-        const CLIENT: u128 = 9;
-        const SESSION: u64 = 1;
-        const ACTING_USER: u32 = 7;
-        const SNAPSHOT_SEQ: u64 = 2;
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_state_transfer_when_installing_should_keep_only_a_verified_boundary() {
+        for peer_matches in [None, Some(false), Some(true)] {
+            const CLIENT: u128 = 9;
+            const SESSION: u64 = 1;
+            const ACTING_USER: u32 = 7;
+            const SNAPSHOT_SEQ: u64 = 2;
 
-        let dir = tempfile::tempdir().unwrap();
-        let journal =
-            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
-                .await
-                .unwrap();
-        let consensus = VsrConsensus::new(
-            1,
-            0,
-            1,
-            server_common::sharding::METADATA_GROUP,
-            NoopBus,
-            LocalPipeline::new(),
-        );
-        consensus.init();
-        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
-            IggyMetadata::new(
-                Some(consensus),
-                Some(journal),
-                None,
-                None,
-                TestMux::default(),
-                None,
+            let dir = tempfile::tempdir().unwrap();
+            let journal =
+                journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                    .await
+                    .unwrap();
+            let consensus = VsrConsensus::new(
+                1,
+                0,
+                3,
+                server_common::sharding::METADATA_GROUP,
+                NoopBus,
+                LocalPipeline::new(),
             );
-        let consensus = md.consensus.as_ref().unwrap();
-        md.client_table
-            .borrow_mut()
-            .commit_register(
-                CLIENT,
-                ACTING_USER,
-                [0x5a; 32],
-                register_reply(CLIENT, SESSION),
-            )
-            .unwrap();
-
-        // Journal ops 1..=3 directly (no acks, so `commit_min` stays 0 and the
-        // transfer is "ahead"): 1 and 2 sit at or below the incoming floor, 3 is
-        // the relic suffix a view change has since reassigned.
-        for (request_id, name) in [(1, "s1"), (2, "s2"), (3, "s3")] {
-            let projected = md
-                .prepare_request(create_stream_request(CLIENT, request_id, name))
-                .expect("CreateStream is client-allowed");
-            consensus.pipeline_message(PlaneKind::Metadata, &projected);
-            md.journal
-                .as_ref()
-                .unwrap()
-                .handle()
-                .append(projected)
-                .await
-                .expect("seeding the WAL succeeds");
-        }
-        let journal_handle = md.journal.as_ref().unwrap().handle();
-        assert_eq!(journal_handle.last_op(), Some(3));
-
-        // A donor mux fills the snapshot the way a serving primary would, so
-        // the restore path sees populated sections rather than a bare envelope.
-        for missing in [true, false] {
-            for frontier in [SNAPSHOT_SEQ, SNAPSHOT_SEQ + 1] {
-                let mut invalid_snapshot =
-                    <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
-                        .unwrap();
-                if !missing {
-                    let mut table = ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot();
-                    table.capacity = 0;
-                    invalid_snapshot.snapshot_mut().client_table = Some(table);
-                }
-                assert!(matches!(
-                    md.install_state_transfer(
-                        &invalid_snapshot.encode().unwrap(),
-                        ClientTable::new(CLIENTS_TABLE_MAX),
-                        frontier,
-                        frontier
-                    )
-                    .await,
-                    Err(SnapshotError::MissingClientTable | SnapshotError::ClientTable(_))
-                ));
-                assert_eq!(
-                    journal_handle.last_op(),
-                    Some(3),
-                    "invalid protection must not truncate the WAL"
+            consensus.init();
+            let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+                IggyMetadata::new(
+                    Some(consensus),
+                    Some(journal),
+                    None,
+                    None,
+                    TestMux::default(),
+                    None,
                 );
-                assert_eq!(consensus.commit_min(), 0);
-                assert_eq!(md.client_table.borrow().get_epoch(CLIENT), Some(SESSION));
-            }
-        }
-        let table = ClientTable::new(CLIENTS_TABLE_MAX);
-        let mut snapshot = <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
-            .expect("donor snapshot builds");
-        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
-        let snapshot_bytes = snapshot.encode().expect("donor snapshot encodes");
-        md.install_state_transfer(&snapshot_bytes, table, SNAPSHOT_SEQ, SNAPSHOT_SEQ)
-            .await
-            .expect("install succeeds");
+            let consensus = md.consensus.as_ref().unwrap();
+            md.client_table
+                .borrow_mut()
+                .commit_register(
+                    CLIENT,
+                    ACTING_USER,
+                    [0x5a; 32],
+                    register_reply(CLIENT, SESSION),
+                )
+                .unwrap();
 
-        assert_eq!(
-            journal_handle.last_op(),
-            Some(SNAPSHOT_SEQ),
-            "the relic above the incoming floor must be gone"
-        );
-        assert!(
-            journal_handle.header(3).is_none(),
-            "op 3 was above the floor; the commit walk must never see it again"
-        );
-        assert!(
-            journal_handle.header(1).is_some() && journal_handle.header(2).is_some(),
-            "ops at or below the floor stay for the walk and tail repair"
-        );
-        assert_eq!(
-            md.applied_frontier().get(),
-            SNAPSHOT_SEQ,
-            "the snapshot IS ops up to its sequence applied, so the read gate has \
+            // Journal ops 1..=3 directly (no acks, so `commit_min` stays 0 and the
+            // transfer is "ahead"): 1 and 2 sit at or below the incoming floor, 3 is
+            // the relic suffix a view change has since reassigned.
+            for (request_id, name) in [(1, "s1"), (2, "s2"), (3, "s3")] {
+                let projected = md
+                    .prepare_request(create_stream_request(CLIENT, request_id, name))
+                    .expect("CreateStream is client-allowed");
+                consensus.pipeline_message(PlaneKind::Metadata, &projected);
+                md.journal
+                    .as_ref()
+                    .unwrap()
+                    .handle()
+                    .append(projected)
+                    .await
+                    .expect("seeding the WAL succeeds");
+            }
+            let journal_handle = md.journal.as_ref().unwrap().handle();
+            assert_eq!(journal_handle.last_op(), Some(3));
+
+            // A donor mux fills the snapshot the way a serving primary would, so
+            // the restore path sees populated sections rather than a bare envelope.
+            for missing in [true, false] {
+                for frontier in [SNAPSHOT_SEQ, SNAPSHOT_SEQ + 1] {
+                    let mut invalid_snapshot =
+                        <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                            .unwrap();
+                    if !missing {
+                        let mut table = ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot();
+                        table.capacity = 0;
+                        invalid_snapshot.snapshot_mut().client_table = Some(table);
+                    }
+                    assert!(matches!(
+                        md.install_state_transfer(
+                            &invalid_snapshot.encode().unwrap(),
+                            ClientTable::new(CLIENTS_TABLE_MAX),
+                            frontier,
+                            frontier
+                        )
+                        .await,
+                        Err(SnapshotError::MissingClientTable | SnapshotError::ClientTable(_))
+                    ));
+                    assert_eq!(
+                        journal_handle.last_op(),
+                        Some(3),
+                        "invalid protection must not truncate the WAL"
+                    );
+                    assert_eq!(consensus.commit_min(), 0);
+                    assert_eq!(md.client_table.borrow().get_epoch(CLIENT), Some(SESSION));
+                }
+            }
+            let table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let mut snapshot =
+                <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                    .expect("donor snapshot builds");
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            let snapshot_bytes = snapshot.encode().expect("donor snapshot encodes");
+            if let Some(matches) = peer_matches {
+                let mut peer = *journal_handle
+                    .header(usize::try_from(SNAPSHOT_SEQ).unwrap())
+                    .unwrap();
+                if !matches {
+                    peer.timestamp += 1;
+                    peer.checksum = peer.identity_checksum();
+                }
+                let header = StartViewHeader {
+                    checksum: 0,
+                    checksum_body: 0,
+                    cluster: 1,
+                    size: u32::try_from(size_of::<StartViewHeader>() + size_of::<PrepareHeader>())
+                        .unwrap(),
+                    view: 1,
+                    release: 0,
+                    command: Command::StartView,
+                    replica: 1,
+                    reserved_frame: [0; 66],
+                    op: SNAPSHOT_SEQ,
+                    commit: SNAPSHOT_SEQ,
+                    group: server_common::sharding::METADATA_GROUP,
+                    partition_incarnation: 0,
+                    reserved: [0; 80],
+                    incarnation: 0,
+                };
+                let _ = consensus.handle_start_view(
+                    PlaneKind::Metadata,
+                    &header,
+                    bytemuck::bytes_of(&peer),
+                );
+                assert!(consensus.view_log_is_pending());
+            }
+            md.install_state_transfer(&snapshot_bytes, table, SNAPSHOT_SEQ, SNAPSHOT_SEQ)
+                .await
+                .expect("install succeeds");
+
+            assert_eq!(
+                journal_handle.last_op(),
+                Some(if peer_matches == Some(true) {
+                    SNAPSHOT_SEQ
+                } else {
+                    SNAPSHOT_SEQ - 1
+                }),
+                "the unverified boundary and relic above it must be gone"
+            );
+            assert!(
+                journal_handle.header(3).is_none(),
+                "op 3 was above the floor; the commit walk must never see it again"
+            );
+            assert!(
+                journal_handle.header(1).is_some()
+                    && journal_handle.header(2).is_some() == (peer_matches == Some(true)),
+                "the snapshot replaces an unverified boundary header too"
+            );
+            assert_eq!(
+                md.applied_frontier().get(),
+                SNAPSHOT_SEQ,
+                "the snapshot IS ops up to its sequence applied, so the read gate has \
              to admit reads at the floor the install jumped to"
-        );
+            );
+        }
     }
 
     #[compio::test]

@@ -2136,23 +2136,29 @@ mod tests {
                 assert!(matches!(*initialization.result.borrow(), Some(Ok(()))));
             }
             if !replicated {
-                let journal = &sim.replicas[0].metadata_journal;
-                let original = journal.entry_sync(1).unwrap();
-                let mut parent = 0;
-                for op in 179..=181 {
-                    let mut repaired = original.deep_copy();
-                    let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
-                        &mut repaired.as_mut_slice()[..size_of::<PrepareHeader>()],
-                    );
-                    header.op = op;
-                    header.commit = op - 1;
-                    header.view += 1;
-                    header.parent = parent;
-                    header.timestamp += op;
-                    header.checksum = header.identity_checksum();
-                    parent = header.checksum;
-                    journal.append(repaired).now_or_never().unwrap().unwrap();
-                }
+                let primary = [1u8, 2]
+                    .into_iter()
+                    .find(|&node| {
+                        sim.replicas[usize::from(node)].shards[0]
+                            .plane
+                            .metadata()
+                            .consensus
+                            .as_ref()
+                            .unwrap()
+                            .is_primary()
+                    })
+                    .unwrap();
+                let repaired = sim.replicas[usize::from(primary)]
+                    .metadata_journal
+                    .entry_sync(client.session_id())
+                    .unwrap();
+                assert!(repaired.header().op > 1);
+                sim.replicas[0]
+                    .metadata_journal
+                    .append(repaired)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
             }
             sim.replica_restart(0);
             let restarted = start_root_initialization(&mut sim, 0, false);
@@ -10270,7 +10276,8 @@ mod metadata_repair_driver_tests {
         cluster, is_commit_for, is_repair_done_for, is_request_prepares_for, prepare_for,
     };
     use super::*;
-    use consensus::Status;
+    use consensus::{Sequencer, Status};
+    use futures::FutureExt;
     use journal::Journal;
     use packet::Packet;
     use server_common::sharding::METADATA_GROUP;
@@ -10421,6 +10428,166 @@ mod metadata_repair_driver_tests {
                 sim.step();
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_an_acked_prepare_above_a_hole_when_restarting_and_losing_primary_should_keep_it() {
+        let (mut sim, client) = cluster(0x5EED_4585);
+        sim.register_client_with_primary(&client);
+        for index in 0..3 {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.create_stream(&format!("before-hole-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        for _ in 0..STEPS_PER_SEND {
+            sim.step();
+        }
+        let floor = sim.replicas[2].metadata_journal.last_op().unwrap();
+        assert_eq!(sim.replicas[0].metadata_journal.last_op(), Some(floor));
+        sim.network.process_disable(ProcessId::Replica(LAGGING));
+        for index in 0..6 {
+            let reply = tests::submit_and_wait_for_reply(
+                &mut sim,
+                client.client_id(),
+                0,
+                client.create_stream(&format!("repair-tail-{index}")),
+            );
+            assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        }
+        let repaired_head = sim.replicas[0].metadata_journal.last_op().unwrap();
+        // Backward repair can persist later entries before it fills the first hole.
+        for op in floor + 2..=repaired_head {
+            let repaired = sim.replicas[0].metadata_journal.entry_sync(op).unwrap();
+            sim.replicas[2]
+                .metadata_journal
+                .append(repaired)
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+        }
+        sim.replica_crash(1);
+        sim.network.process_enable(ProcessId::Replica(LAGGING));
+        sim.network
+            .link_filter_mut(ProcessId::Replica(LAGGING), ProcessId::Replica(0))
+            .remove(Command::RequestPrepares);
+        sim.network
+            .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(LAGGING))
+            .remove(Command::Commit);
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            0,
+            client.create_stream("acked-above-hole"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        let acked_op = reply.header().op;
+        assert_eq!(acked_op, repaired_head + 1);
+        let acked_stream_id = sim.replicas[0].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == "acked-above-hole")
+                    .map(|(id, _)| id)
+                    .unwrap()
+            });
+        let checksum = sim.replicas[2]
+            .metadata_journal
+            .header(usize::try_from(acked_op).unwrap())
+            .unwrap()
+            .checksum;
+        assert!(!journal_holds(&sim, LAGGING, floor + 1));
+        sim.replica_crash(LAGGING);
+        sim.replica_restart(LAGGING);
+        assert!(
+            journal_holds(&sim, LAGGING, acked_op),
+            "restart discarded an acknowledged prepare"
+        );
+        let consensus = sim.replicas[2].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .unwrap();
+        assert_eq!(consensus.sequencer().current_sequence(), acked_op);
+        sim.replica_crash(0);
+        sim.replica_restart(1);
+        for _ in 0..5_000 {
+            sim.step();
+            if [1, 2]
+                .iter()
+                .all(|&node| metadata_state(&sim, node).2 >= acked_op)
+            {
+                break;
+            }
+        }
+        for node in [1, 2] {
+            assert!(metadata_state(&sim, node).2 >= acked_op);
+            assert_eq!(
+                sim.replicas[usize::from(node)]
+                    .metadata_journal
+                    .header(usize::try_from(acked_op).unwrap())
+                    .unwrap()
+                    .checksum,
+                checksum
+            );
+            assert_eq!(
+                sim.replicas[usize::from(node)].shards[0]
+                    .plane
+                    .metadata()
+                    .mux_stm
+                    .streams()
+                    .read(|streams| streams
+                        .items
+                        .iter()
+                        .find(|(_, stream)| &*stream.name == "acked-above-hole")
+                        .map(|(id, _)| id)),
+                Some(acked_stream_id)
+            );
+        }
+        let primary = [1, 2]
+            .into_iter()
+            .find(|&node| {
+                sim.replicas[usize::from(node)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .unwrap()
+                    .is_primary()
+            })
+            .unwrap();
+        let reply = tests::submit_and_wait_for_reply(
+            &mut sim,
+            client.client_id(),
+            primary,
+            client.create_stream("after-hole-recovery"),
+        );
+        assert_eq!(iggy_binary_protocol::result_code(reply.body()), Some(0));
+        assert!(reply.header().op > acked_op);
+        let next_stream_id = sim.replicas[usize::from(primary)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| {
+                streams
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == "after-hole-recovery")
+                    .map(|(id, _)| id)
+                    .unwrap()
+            });
+        assert_ne!(next_stream_id, acked_stream_id);
     }
 
     #[test]

@@ -21,7 +21,6 @@ use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerConfig;
 use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
-use futures::FutureExt;
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use journal::Journal;
@@ -196,15 +195,10 @@ pub fn new_shard(
         .map_or((checkpoint_seq, None), |journal| {
             journal.recovery_frontier(solo, checkpoint_seq)
         });
-    if let Some(journal) = metadata_journal.as_ref()
-        && let Some(from_op) = chain_break_op
-    {
-        journal
-            .truncate_from(from_op)
-            .now_or_never()
-            .expect("in-memory journal truncation completes synchronously")
-            .expect("disconnected recovery suffix must be removed");
-    }
+    assert!(
+        !solo || chain_break_op.is_none(),
+        "solo metadata recovery refuses a disconnected WAL"
+    );
     let restored_op = metadata_journal
         .as_ref()
         .and_then(|journal| journal.last_op());

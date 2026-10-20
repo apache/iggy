@@ -28,7 +28,6 @@ use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeade
 use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_common::IggyError;
-use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use journal::superblock::{
     PingPongSuperblock, SLOT_FILE_NAMES, SuperblockContents, SuperblockStore,
@@ -44,6 +43,10 @@ pub enum RecoveryError {
     Journal(JournalError),
     StateMachine(IggyError),
     Io(std::io::Error),
+    DisconnectedSoloJournal {
+        path: PathBuf,
+        op: u64,
+    },
     /// Opening or reading the durable superblock failed. `dir` is the metadata
     /// directory holding [`journal::superblock::SLOT_FILE_NAMES`]: `compio` attaches no
     /// path to its I/O errors, so without this the operator's chain ends in a bare
@@ -151,6 +154,11 @@ impl fmt::Display for RecoveryError {
             Self::Journal(e) => write!(f, "recovery journal error: {e}"),
             Self::StateMachine(e) => write!(f, "recovery state machine error: {e}"),
             Self::Io(e) => write!(f, "recovery I/O error: {e}"),
+            Self::DisconnectedSoloJournal { path, op } => write!(
+                f,
+                "solo metadata journal {} does not connect at op {op}, refusing boot without changing the WAL",
+                path.display()
+            ),
             Self::Superblock { dir, source } => write!(
                 f,
                 "recovery superblock error in {} ({} / {}): {source}",
@@ -237,7 +245,8 @@ impl std::error::Error for RecoveryError {
             Self::CheckpointAheadOfSnapshot { .. }
             | Self::CheckpointChecksumMismatch { .. }
             | Self::SuperblockUnreadable { .. }
-            | Self::SuperblockIdentityMismatch { .. } => None,
+            | Self::SuperblockIdentityMismatch { .. }
+            | Self::DisconnectedSoloJournal { .. } => None,
         }
     }
 }
@@ -309,17 +318,15 @@ pub struct RecoveredMetadata<M> {
     /// carries the primary's commit watermark when the prepare was sent, and
     /// journaled does not imply committed.
     pub last_applied_op: Option<u64>,
-    /// Highest op present in the journal, `None` when it is empty. Ops in
-    /// `(last_applied_op, last_journaled_op]` are prepared-but-uncommitted:
-    /// they stay journal-only until the recovered primary re-replicates them
-    /// (or a backup sees the commit point advance past them).
+    /// Highest durable op above the snapshot floor, `None` when none remain.
+    /// Later entries may have committed elsewhere. They stay unapplied until
+    /// the cluster proves the adopted log and repairs any missing prefix.
     pub last_journaled_op: Option<u64>,
     /// First op replay could not connect to its predecessor, `None` when the
     /// replayed range is one unbroken chain.
     ///
-    /// `Some(op)` means entries at and above `op` were truncated and must come back
-    /// from the cluster. `last_journaled_op` stops below it, which keeps the restored
-    /// head, the re-pipeline range, and the recovery barrier honest.
+    /// Entries at and above it remain durable but unapplied until the cluster's
+    /// view-log proof reconciles them. The restored head includes this suffix.
     pub chain_break_op: Option<u64>,
 }
 
@@ -554,6 +561,12 @@ where
     let commit_watermark = prefix.commit_watermark;
     let chain_break_op = prefix.chain_break_op;
     if let Some(op) = chain_break_op {
+        if identity.is_solo() {
+            return Err(RecoveryError::DisconnectedSoloJournal {
+                path: journal_path,
+                op,
+            });
+        }
         tracing::error!(
             op,
             snapshot_op,
@@ -587,9 +600,8 @@ where
     }
 
     let mut last_applied_op: Option<u64> = None;
-    let mut last_journaled_op: Option<u64> = None;
+    let last_journaled_op = journal.last_op().filter(|op| *op > snapshot_op);
     for header in headers_to_replay {
-        last_journaled_op = Some(header.op);
         if header.op > commit_watermark {
             continue;
         }
@@ -729,22 +741,6 @@ where
             "recovery replayed op"
         );
         last_applied_op = Some(header.op);
-    }
-
-    // `truncate_from`, never `drain`: the removed ops must stay refillable, so the
-    // snapshot watermark stays put. Leaving them resident would make `append` refuse
-    // the slot, failing repair on exactly the ops it exists to fix.
-    if let Some(break_op) = chain_break_op {
-        let removed = journal
-            .truncate_from(break_op)
-            .await
-            .map_err(RecoveryError::Io)?;
-        tracing::warn!(
-            break_op,
-            removed,
-            last_journaled_op,
-            "dropped the disconnected metadata WAL suffix; the cluster re-supplies these ops"
-        );
     }
 
     Ok(RecoveredMetadata {
@@ -1152,54 +1148,49 @@ mod tests {
     #[compio::test]
     async fn given_a_snapshot_and_disconnected_wal_when_recovering_should_ignore_its_commit_claims()
     {
-        for identity in [CLUSTERED, SOLO] {
-            for contiguous in [0, 2] {
-                let directory = tempdir().unwrap();
-                let metadata_dir = directory.path().join("metadata");
-                std::fs::create_dir_all(&metadata_dir).unwrap();
-                protected_snapshot(100)
-                    .persist(&metadata_dir.join("snapshot.bin"))
-                    .await
-                    .unwrap();
-                {
-                    let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
-                        .await
-                        .unwrap();
-                    journal
-                        .append(make_prepare_with_commit(100, 100, 32))
-                        .await
-                        .unwrap();
-                    for op in 101..101 + contiguous {
-                        journal
-                            .append(make_prepare_with_commit(op, 100, 32))
-                            .await
-                            .unwrap();
-                    }
-                    for op in 179..=181 {
-                        journal
-                            .append(make_prepare_with_commit(op, op - 1, 32))
-                            .await
-                            .unwrap();
-                    }
-                }
-                let recovered = recover::<TestStm>(
-                    directory.path(),
-                    identity,
-                    journal::prepare_journal::DEFAULT_SLOT_COUNT,
-                    CLIENTS_TABLE_MAX,
-                    |_| {},
-                    |_, _| {},
-                )
+        for contiguous in [0, 2] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            protected_snapshot(100)
+                .persist(&metadata_dir.join("snapshot.bin"))
                 .await
                 .unwrap();
-                assert_eq!(recovered.chain_break_op, Some(179));
-                assert_eq!(
-                    recovered.last_applied_op,
-                    (identity.is_solo() && contiguous > 0).then_some(102)
-                );
-                assert_eq!(recovered.last_journaled_op, (contiguous > 0).then_some(102));
-                assert_eq!(recovered.journal.last_op(), Some(100 + contiguous));
+            {
+                let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 100)
+                    .await
+                    .unwrap();
+                journal
+                    .append(make_prepare_with_commit(100, 100, 32))
+                    .await
+                    .unwrap();
+                for op in 101..101 + contiguous {
+                    journal
+                        .append(make_prepare_with_commit(op, 100, 32))
+                        .await
+                        .unwrap();
+                }
+                for op in 179..=181 {
+                    journal
+                        .append(make_prepare_with_commit(op, op - 1, 32))
+                        .await
+                        .unwrap();
+                }
             }
+            let recovered = recover::<TestStm>(
+                directory.path(),
+                CLUSTERED,
+                journal::prepare_journal::DEFAULT_SLOT_COUNT,
+                CLIENTS_TABLE_MAX,
+                |_| {},
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.chain_break_op, Some(179));
+            assert_eq!(recovered.last_applied_op, None);
+            assert_eq!(recovered.last_journaled_op, Some(181));
+            assert_eq!(recovered.journal.last_op(), Some(181));
         }
     }
 
@@ -1237,8 +1228,8 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.chain_break_op, Some(101));
         assert_eq!(recovered.last_applied_op, None);
-        assert_eq!(recovered.last_journaled_op, None);
-        assert_eq!(recovered.journal.last_op(), Some(100));
+        assert_eq!(recovered.last_journaled_op, Some(102));
+        assert_eq!(recovered.journal.last_op(), Some(102));
     }
 
     #[compio::test]
@@ -1294,13 +1285,59 @@ mod tests {
                 .read(|users| users.items.is_empty())
         );
         assert_eq!(recovered.last_applied_op, None);
-        assert_eq!(recovered.last_journaled_op, Some(1));
+        assert_eq!(recovered.last_journaled_op, Some(181));
         assert_eq!(recovered.chain_break_op, Some(179));
-        assert_eq!(recovered.journal.last_op(), Some(1));
+        assert_eq!(recovered.journal.last_op(), Some(181));
     }
 
     #[compio::test]
-    async fn recover_stops_at_a_gap_and_drops_the_disconnected_suffix() {
+    async fn given_a_disconnected_solo_wal_when_recovering_should_refuse_without_rewriting_it() {
+        for forked in [false, true] {
+            let directory = tempdir().unwrap();
+            let metadata_dir = directory.path().join("metadata");
+            std::fs::create_dir_all(&metadata_dir).unwrap();
+            protected_snapshot(100)
+                .persist(&metadata_dir.join("snapshot.bin"))
+                .await
+                .unwrap();
+            let path = metadata_dir.join("journal.wal");
+            {
+                let journal = PrepareJournal::open(&path, 100).await.unwrap();
+                if forked {
+                    let fork = make_chained_prepare(101, 101, 0xdead_beef);
+                    let child = make_chained_prepare(102, 102, fork.header().checksum);
+                    journal.append(fork).await.unwrap();
+                    journal
+                        .append(make_chained_prepare(100, 100, 0))
+                        .await
+                        .unwrap();
+                    journal.append(child).await.unwrap();
+                } else {
+                    journal
+                        .append(make_prepare_with_commit(100, 100, 32))
+                        .await
+                        .unwrap();
+                    journal
+                        .append(make_prepare_with_commit(179, 178, 32))
+                        .await
+                        .unwrap();
+                }
+                journal.storage_ref().fsync().await.unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert!(matches!(
+                recover::<TestStm>(directory.path(), SOLO,
+                    journal::prepare_journal::DEFAULT_SLOT_COUNT, CLIENTS_TABLE_MAX,
+                    |_| {}, |_, _| {}).await,
+                Err(RecoveryError::DisconnectedSoloJournal { op, .. })
+                    if op == if forked { 101 } else { 179 }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_gap_when_recovering_a_cluster_should_preserve_the_durable_suffix() {
         // Ops 1-3 then 5: op 4 never landed. Replaying 5 over a state machine that
         // never saw 4 diverges silently, and the WAL scan waves this through --
         // its chain check only fires on CONSECUTIVE ops, since a gap is also what
@@ -1345,13 +1382,13 @@ mod tests {
         );
         assert_eq!(
             recovered.last_journaled_op,
-            Some(3),
-            "the restored head stops below the break, so nothing re-pipelines it"
+            Some(5),
+            "the restored head must include every durable prepare for the view change"
         );
         assert_eq!(
             recovered.journal.last_op(),
-            Some(3),
-            "the disconnected entry is dropped so repair can journal the cluster's op 5"
+            Some(5),
+            "only a cluster view-log proof may remove a durable prepare"
         );
         assert_eq!(
             recovered.journal.snapshot_op(),
