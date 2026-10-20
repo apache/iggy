@@ -38,7 +38,7 @@ and why, answer review questions about it yourself, and defend the design withou
 back to the tool for an answer. If you can't, the PR isn't ready.
 
 If an AI assistant helped you write the change, review it with the
-[`team-review-slim`](.claude/skills/team-review-slim/SKILL.md) skill before you open the PR.
+[`team-review`](.claude/skills/team-review/SKILL.md) skill before you open the PR.
 The skill can report false findings. Fix every finding that is correct and that applies to
 your change.
 
