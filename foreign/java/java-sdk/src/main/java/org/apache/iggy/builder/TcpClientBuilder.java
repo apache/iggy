@@ -44,6 +44,11 @@ import org.apache.iggy.client.blocking.tcp.IggyTcpClientBuilder;
  *     .credentials("iggy", "iggy")
  *     .buildAndLogin();
  *
+ * // Blocking TCP client - from a connection string, with auto-login
+ * var client = Iggy.tcpClientBuilder()
+ *     .fromConnectionString("iggy://iggy:iggy@localhost:8090")
+ *     .buildAndLogin();
+ *
  * // Async TCP client - manual connect and login
  * var asyncClient = Iggy.tcpClientBuilder().async()
  *     .host("localhost")
@@ -73,6 +78,21 @@ public final class TcpClientBuilder {
      */
     public IggyTcpClientBuilder blocking() {
         return IggyTcpClient.builder();
+    }
+
+    /**
+     * Returns a blocking TCP client builder configured from a connection string.
+     *
+     * <p>This is a shortcut for {@code blocking().fromConnectionString(connectionString)}.
+     * Use {@code async().fromConnectionString(connectionString)} for an async client.
+     *
+     * @param connectionString the connection string, for example {@code iggy://iggy:iggy@localhost:8090}
+     * @return a new IggyTcpClientBuilder configured from the connection string
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the connection string is invalid
+     * @see org.apache.iggy.config.TcpConnectionString
+     */
+    public IggyTcpClientBuilder fromConnectionString(String connectionString) {
+        return blocking().fromConnectionString(connectionString);
     }
 
     /**

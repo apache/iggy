@@ -449,7 +449,6 @@ mod tests {
     use kafka_protocol::protocol::{Decodable, Encodable};
 
     use super::*;
-    use crate::protocol::api::BrokerAdvertise;
 
     fn topic(name: &'static str) -> TopicName {
         TopicName(StrBytes::from_static_str(name))
@@ -466,7 +465,7 @@ mod tests {
     }
 
     async fn fetch(version: i16, request: &OffsetFetchRequest) -> OffsetFetchResponse {
-        let state = GatewayState::stub(BrokerAdvertise::default(), 8 * 1024 * 1024);
+        let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
         let mut body = BytesMut::new();
         request.encode(&mut body, version).unwrap();
@@ -548,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_an_unreadable_request_should_close_rather_than_answer() {
-        let state = GatewayState::stub(BrokerAdvertise::default(), 8 * 1024 * 1024);
+        let state = GatewayState::stub(8 * 1024 * 1024);
         let connection = ConnectionState::default();
         let mut body = BytesMut::new();
         single_group("g").encode(&mut body, 6).unwrap();

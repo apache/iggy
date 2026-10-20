@@ -233,7 +233,7 @@ cargo test -p integration -- connectors::runtime::benchmark::given_logging_forma
 - **`test_logs/` grows quickly.** Wipe between major refactors.
 - **Miri only covers `binary_protocol` + `consensus`.** Cannot emulate `io_uring` syscalls. do not try to expand Miri to crates that pull `compio`.
 - **Integration crate has no `--test` target.** Filter by test path inside the single `mod.rs` binary.
-- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI builds first (`cargo build --locked --bin iggy-server --bin iggy`); a local run does not, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
+- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server`, `iggy-connectors` or `iggy-mcp` is used silently. CI restores revision-checked artifacts from the runtime and Rust test builds; a local run does not build them, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
 
 ## Local state directories
 

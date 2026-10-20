@@ -1565,6 +1565,7 @@ mod tests {
         const LOGIN_TIMEOUT: Duration = Duration::from_secs(5);
         let (_directory, shard) = shard_with_members(2).await;
         let metadata = shard.plane.metadata();
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
         metadata
             .client_table
             .borrow_mut()
@@ -1608,7 +1609,14 @@ mod tests {
         metadata.resume_stranded_commits().await;
         let login = compio::time::timeout(
             LOGIN_TIMEOUT,
-            metadata.submit_register_in_process(CLIENT + 2, 0, [0x6b; 32]),
+            metadata.submit_register_in_process(
+                CLIENT + 2,
+                0,
+                iggy_binary_protocol::requests::users::login_register::RegisterRequest {
+                    user_created_at: 1,
+                    bind_verifier: [0x6b; 32],
+                },
+            ),
         )
         .await
         .expect("a retirement deadline must not strand a prepare ahead of the next login")

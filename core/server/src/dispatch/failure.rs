@@ -471,7 +471,6 @@ mod tests {
     const COMMIT: u64 = 11;
     /// Nonzero, so an echoed stamp is distinguishable from a zeroed field.
     const REQUEST_CHECKSUM: u128 = 0x0123_4567_89AB_CDEF;
-    const MAX_TOKENS_PER_USER: u32 = 1;
     /// Send-failure log label only; no exit reads it.
     const CONTEXT: &str = "shape_test";
     /// Consensus context the eviction shard stamps, spelled out so the
@@ -646,7 +645,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            MAX_TOKENS_PER_USER,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             frame,
@@ -893,7 +891,6 @@ mod tests {
             &shard,
             &sessions,
             &server_config,
-            MAX_TOKENS_PER_USER,
             &Rc::new(ClientDrain::new(&server_config)),
             TRANSPORT,
             request.into_generic(),

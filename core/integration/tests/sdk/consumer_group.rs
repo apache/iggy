@@ -36,8 +36,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Pins a 60s server heartbeat because harness clients never ping on their own:
 // the SDK pinger is spawned by `IggyClient::connect`, which the harness builder
-// does not call. At the shipped 30s interval an idle group member is reaped by
-// the server's verifier, and the failure surfaces as a short member count
+// does not call. With heartbeat checks on, the server logs out a group member
+// that stays silent too long, and the failure surfaces as a short member count
 // instead of anything about the scenario under test.
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],

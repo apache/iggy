@@ -46,6 +46,7 @@ use state::StateStorage;
 use std::{
     collections::HashMap,
     env,
+    num::NonZeroU32,
     sync::{Arc, atomic::AtomicU32},
 };
 use system_stats::capture_allowed_cpus;
@@ -584,6 +585,7 @@ struct SourceConnectorPlugin {
 struct SourceConnectorProducer {
     encoder: Arc<dyn StreamEncoder>,
     producer: IggyProducer,
+    batch_length: NonZeroU32,
 }
 
 struct SourceConnectorWrapper {

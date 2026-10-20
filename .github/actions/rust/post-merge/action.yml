@@ -34,8 +34,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Rust with cache
-      uses: ./.github/actions/utils/setup-rust-with-cache
+    - name: Setup Rust
+      uses: ./.github/actions/utils/setup-rust
 
     - name: Validate package
       env:

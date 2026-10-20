@@ -48,6 +48,7 @@ extension IggyClient {
     public func deleteStream(_ streamID: Identifier) async throws {
         try await requireAuthenticated()
         _ = try await send(.deleteStream, Requests.identifierOnly(streamID))
+        core.groupState.invalidateTopicDiscovery()
     }
 }
 
@@ -58,7 +59,14 @@ extension IggyClient {
     public func getTopic(streamID: Identifier, topicID: Identifier) async throws -> TopicDetails? {
         try await requireAuthenticated()
         let body = try await send(.getTopic, Requests.streamAndTopic(streamID, topicID))
-        return body.isEmpty ? nil : try Responses.topicDetails(body[...])
+        guard !body.isEmpty else {
+            return nil
+        }
+        let details = try Responses.topicDetails(body[...])
+        // Client-side partitioning and the sends that follow read the count
+        // and the partition contexts from here.
+        core.groupState.setTopicPartitions(.init(stream: streamID, topic: topicID), partitions: details.partitions)
+        return details
     }
 
     /// Every topic of a stream.
@@ -88,6 +96,7 @@ extension IggyClient {
     public func deleteTopic(streamID: Identifier, topicID: Identifier) async throws {
         try await requireAuthenticated()
         _ = try await send(.deleteTopic, Requests.streamAndTopic(streamID, topicID))
+        core.groupState.invalidateTopicDiscovery()
     }
 }
 
@@ -98,18 +107,68 @@ extension IggyClient {
     public func createPartitions(streamID: Identifier, topicID: Identifier, count: UInt32) async throws {
         try await requireAuthenticated()
         _ = try await send(.createPartitions, Requests.partitions(streamID: streamID, topicID: topicID, partitionsCount: count))
+        core.groupState.invalidateTopicDiscovery()
     }
 
     /// Removes the last `count` partitions of a topic.
     public func deletePartitions(streamID: Identifier, topicID: Identifier, count: UInt32) async throws {
         try await requireAuthenticated()
         _ = try await send(.deletePartitions, Requests.partitions(streamID: streamID, topicID: topicID, partitionsCount: count))
+        core.groupState.invalidateTopicDiscovery()
     }
 
     /// Removes the oldest `count` closed segments of a partition.
     public func deleteSegments(streamID: Identifier, topicID: Identifier, partitionID: UInt32, count: UInt32) async throws {
         try await requireAuthenticated()
         _ = try await send(.deleteSegments, Requests.deleteSegments(streamID: streamID, topicID: topicID, partitionID: partitionID, segmentsCount: count))
+    }
+}
+
+// MARK: - Consumer groups
+
+extension IggyClient {
+    /// A consumer group with its members, or nil if it does not exist.
+    public func getConsumerGroup(streamID: Identifier, topicID: Identifier, groupID: Identifier) async throws -> ConsumerGroupDetails? {
+        try await requireAuthenticated()
+        let body = try await send(.getConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID))
+        return body.isEmpty ? nil : try Responses.consumerGroupDetails(body[...])
+    }
+
+    /// Every consumer group of a topic.
+    public func getConsumerGroups(streamID: Identifier, topicID: Identifier) async throws -> [ConsumerGroup] {
+        try await requireAuthenticated()
+        let body = try await send(.getConsumerGroups, Requests.streamAndTopic(streamID, topicID))
+        return body.isEmpty ? [] : try Responses.consumerGroups(body[...])
+    }
+
+    /// Creates a consumer group and returns it.
+    public func createConsumerGroup(streamID: Identifier, topicID: Identifier, name: String) async throws -> ConsumerGroupDetails {
+        try await requireAuthenticated()
+        return try Responses.consumerGroupDetails(
+            try await send(.createConsumerGroup, try Requests.createConsumerGroup(streamID: streamID, topicID: topicID, name: name))[...])
+    }
+
+    /// Deletes a consumer group with its stored offsets.
+    public func deleteConsumerGroup(streamID: Identifier, topicID: Identifier, groupID: Identifier) async throws {
+        try await requireAuthenticated()
+        _ = try await send(.deleteConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID))
+    }
+
+    /// Joins a consumer group. Joining changes the member's assignment and
+    /// the group generation, so the next group poll syncs the assignment.
+    public func joinConsumerGroup(streamID: Identifier, topicID: Identifier, groupID: Identifier) async throws {
+        try await requireAuthenticated()
+        _ = try await send(.joinConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID))
+        core.groupState.invalidateAssignment(.init(stream: streamID, topic: topicID, group: groupID))
+    }
+
+    /// Leaves a consumer group. The heartbeat stops syncing its assignment.
+    public func leaveConsumerGroup(streamID: Identifier, topicID: Identifier, groupID: Identifier) async throws {
+        try await requireAuthenticated()
+        _ = try await send(.leaveConsumerGroup, Requests.consumerGroup(streamID: streamID, topicID: topicID, groupID: groupID))
+        let key = ConsumerGroupState.GroupKey(stream: streamID, topic: topicID, group: groupID)
+        core.groupState.invalidateAssignment(key)
+        core.groupState.deregisterGroup(key)
     }
 }
 

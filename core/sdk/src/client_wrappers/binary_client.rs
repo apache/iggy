@@ -26,8 +26,6 @@ use std::time::Instant;
 impl Client for ClientWrapper {
     async fn connect(&self) -> Result<(), IggyError> {
         match self {
-            // The trait `connect` is the caller's: it clears a held disconnect,
-            // where each transport's own `connect` keeps it.
             ClientWrapper::Iggy(client) => Client::connect(client).await,
             ClientWrapper::Http(client) => Client::connect(client).await,
             ClientWrapper::Tcp(client) => Client::connect(client).await,
@@ -83,21 +81,6 @@ impl Client for ClientWrapper {
             ClientWrapper::Tcp(client) => client.abandon_operation(op).await,
             ClientWrapper::Quic(client) => client.abandon_operation(op).await,
             ClientWrapper::WebSocket(client) => client.abandon_operation(op).await,
-        }
-    }
-}
-
-impl ClientWrapper {
-    /// Connects again through the transport's own `connect`, which leaves a
-    /// caller's `disconnect()` in force: a reconnect the client starts on its
-    /// own, such as after a leader redirect, is refused while it holds.
-    pub(crate) async fn reconnect_keeping_intent(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Tcp(client) => client.connect().await,
-            ClientWrapper::Quic(client) => client.connect().await,
-            ClientWrapper::WebSocket(client) => client.connect().await,
-            ClientWrapper::Iggy(client) => Client::connect(client).await,
-            ClientWrapper::Http(client) => Client::connect(client).await,
         }
     }
 }
