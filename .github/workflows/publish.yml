@@ -44,7 +44,7 @@ on:
         required: false
         default: ""
       publish_dockerhub:
-        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, web-ui)"
+        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, rust-kafka-gateway, web-ui)"
         type: string
         required: false
         default: ""
@@ -674,6 +674,7 @@ jobs:
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
       !cancelled() &&
+      needs.check-tags.result == 'success' &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
@@ -712,7 +713,9 @@ jobs:
             core/server/Dockerfile \
             core/ai/mcp/Dockerfile \
             core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
+            core/bench/dashboard/server/Dockerfile \
+            gateways/kafka/Dockerfile \
+            gateways/kafka/Dockerfile.dockerignore
 
           /tmp/copy-latest-from-master.sh apply
 
@@ -791,6 +794,14 @@ jobs:
       DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.validate.outputs.commit }}
@@ -800,6 +811,15 @@ jobs:
           # fetches via allowReachableSHA1InWant=true, so fetch-depth:1
           # here is enough - no need to pay for full history.
           fetch-depth: 1
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Ensure version extractor is executable
         run: |
