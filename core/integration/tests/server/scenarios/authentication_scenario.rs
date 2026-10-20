@@ -33,7 +33,7 @@ use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::codes::*;
 use iggy_binary_protocol::dispatch::COMMAND_TABLE;
 use iggy_binary_protocol::requests::consumer_offsets::GetConsumerOffsetRequest;
-use iggy_binary_protocol::requests::messages::{GetSendContextRequest, PollMessagesRequest};
+use iggy_binary_protocol::requests::messages::{GetPartitionRouteRequest, PollMessagesRequest};
 use iggy_binary_protocol::requests::system::{BindSessionRequest, SessionIdentity};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::{ClientVersionInfo, IGGY_PROTOCOL_VERSION, WireName};
@@ -277,10 +277,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             }
 
             // Messages
-            GET_SEND_CONTEXT_CODE => client
+            GET_PARTITION_ROUTE_CODE => client
                 .send_binary_request(
                     code,
-                    GetSendContextRequest {
+                    GetPartitionRouteRequest {
                         stream_id: identifier_to_wire(&ctx.stream_id).unwrap(),
                         topic_id: identifier_to_wire(&ctx.topic_id).unwrap(),
                         partition_id: 0,

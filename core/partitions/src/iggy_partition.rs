@@ -43,11 +43,11 @@ use consensus::Pipeline;
 use consensus::client_table::{CachedReply, ClientTableWireError};
 use consensus::{
     AutoCommitRequestContext, ClientTable, ClientTableMode, CommitLogEvent, Consensus,
-    LocalRequestOrder, PartitionDiagEvent, PipelineEntry, PlaneKind, Project, ReplicaLogContext,
-    RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
-    build_deny_reply_from_request, build_reply_from_request, build_reply_message,
-    emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
-    fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
+    DvcHeaderKind, LocalRequestOrder, PartitionDiagEvent, PipelineEntry, PlaneKind, Project,
+    ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
+    ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
+    build_reply_message, dvc_header_kind, emit_namespace_progress_event, emit_partition_diag,
+    emit_sim_event, fence_old_prepare_by_commit, repair_session_live, repaired_frontier_update,
     replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
@@ -154,7 +154,8 @@ where
     pub(crate) pending_owner_install: Cell<Option<InstallConsumerGroupOwnerRequest>>,
     /// Op of the last unapplied install the latest log scan found. A view
     /// change can leave several, and the latch holds only the last one, so
-    /// group reads and offset writes wait until every one of them has applied.
+    /// group reads, offset writes and retirement catalogs wait until every one
+    /// of them has applied.
     pub(crate) owner_install_barrier: u64,
     pending_history_transition: Cell<Option<TransitionPartitionHistoryRequest>>,
     pub(crate) history_transition: Option<InstalledPartitionHistory>,
@@ -286,13 +287,6 @@ where
     pub(crate) required_metadata_frontier: u64,
     #[cfg(feature = "simulator")]
     ideal_storage: bool,
-    /// `Partition::created_revision` of the metadata row this partition was
-    /// built for (the reconciler's "epoch"). It keys the on-disk history
-    /// (`prepares-{created_revision}`): a delete whose on-disk cleanup failed
-    /// leaves the directory behind, and the recreated partition must not adopt
-    /// what the dead incarnation left there. `0` for partitions built without
-    /// a metadata row (tests, in-memory storage).
-    pub(crate) created_revision: u64,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -353,10 +347,21 @@ where
     /// [`Self::note_transfer_rearm_scheduled`]; livelock across attempts is
     /// bounded by [`Self::transfer_failures`] and its exponential backoff.
     transfer_attempts: u32,
-    /// Consecutive stalled re-requests on the live repair session, against
-    /// [`crate::types::REPAIR_MAX_STALL_RETRIES`]. Survives the session, so rotating
-    /// the peer cannot reset it; cleared by real progress.
+    /// Repair stall rounds without progress in [`Self::repair_charged_view`],
+    /// against [`crate::types::REPAIR_MAX_STALL_RETRIES`]. Restarts once a
+    /// session spends it, so each peer that the shard rotates to gets the
+    /// whole budget; cleared by real progress.
     repair_attempts: u32,
+    /// Rotations since the last progress in [`Self::repair_charged_view`]
+    /// that opened a session against another peer. Survives the sessions, so
+    /// the shard can give up on the ring; cleared by real progress.
+    repair_rotations: u32,
+    /// `commit_min` at the last repair stall round. A walk past it is real
+    /// progress, see [`Self::burn_repair_attempt`].
+    repair_walked_to: u64,
+    /// The view of the last repair stall round. A round in another view
+    /// starts a fresh count.
+    repair_charged_view: u32,
     /// CONSECUTIVE transfer failures of any class (decode, spill, install,
     /// peer-unavailable, stall exhaustion). Deliberately NOT keyed on the
     /// offered generation: a committing primary advances its generation
@@ -523,7 +528,7 @@ pub enum PendingPartitionTransition {
         drain: Option<crate::PersistenceDrain>,
     },
     Truncate {
-        from_op: u64,
+        ops: std::ops::RangeInclusive<u64>,
         drain: Option<crate::PersistenceDrain>,
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
@@ -550,6 +555,8 @@ struct ConsumerOffsetPlan {
     tracked: Option<DurableOffsetState>,
     persisted: bool,
     action: ConsumerOffsetAction,
+    /// The emptied-at op this effect leaves when it changes it, `0` for none.
+    emptied_at: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -569,6 +576,11 @@ struct PendingCommit {
     owner_install: Option<InstallConsumerGroupOwnerRequest>,
     offset_effects: Vec<ConsumerOffsetEffect>,
     offset_batch: Vec<(usize, ConsumerOffsetPlan)>,
+    /// The offset table's entry count and emptied-at op once the accepted
+    /// effects publish.
+    offset_count: usize,
+    initial_emptied_at: u64,
+    emptied_at: Option<u64>,
     incarnation: crate::PartitionIncarnation,
     poll_history: PollHistoryId,
     applied_floor: u64,
@@ -893,7 +905,6 @@ where
             required_metadata_frontier: 0,
             #[cfg(feature = "simulator")]
             ideal_storage: false,
-            created_revision: 0,
             superblock: None,
             superblock_lock: Rc::new(LocalGate::new()),
             superblock_intent: Cell::new(None),
@@ -908,6 +919,9 @@ where
             transfer: None,
             transfer_attempts: 0,
             repair_attempts: 0,
+            repair_rotations: 0,
+            repair_walked_to: 0,
+            repair_charged_view: 0,
             transfer_failures: 0,
             transfer_refusals: 0,
             transfer_rearm: None,
@@ -923,17 +937,19 @@ where
     }
 
     /// Record the metadata incarnation this partition was built for.
-    pub const fn set_created_revision(&mut self, created_revision: u64) {
-        self.created_revision = created_revision;
+    pub fn set_created_revision(&mut self, created_revision: u64) {
+        self.consensus.set_partition_incarnation(created_revision);
     }
 
+    /// Metadata creation revision that isolates this incarnation's on-disk
+    /// history and consensus frames. Zero only without a metadata row.
     #[must_use]
     pub const fn created_revision(&self) -> u64 {
-        self.created_revision
+        self.consensus.partition_incarnation()
     }
 
-    /// A report covers only an applied barrier on a serving replica. WAL replay
-    /// or the paired checkpoint must restore this floor before admission.
+    /// A report covers an applied retirement barrier or terminal history fence
+    /// on a serving replica. Replay or a checkpoint must restore that proof.
     /// Retirement barriers require persistence at every durability level.
     #[must_use]
     pub fn session_retired(&self, identity: SessionIdentity) -> bool {
@@ -942,8 +958,11 @@ where
             && self.consensus.is_normal()
             && !self.consensus.is_transferring()
             && self.consensus.pending_request(identity.client_id).is_none()
-            && self.required_metadata_frontier >= identity.metadata_watermark
-            && self.dedup.get_epoch(identity.client_id) != Some(identity.session)
+            && (self
+                .history_transition
+                .is_some_and(|history| history.partition_op <= self.consensus.commit_min())
+                || (self.required_metadata_frontier >= identity.metadata_watermark
+                    && self.dedup.get_epoch(identity.client_id) != Some(identity.session)))
     }
 
     fn pending_session_retirement(&self, client_id: u128, session: u64) -> bool {
@@ -1020,8 +1039,31 @@ where
     pub fn consumer_group_owner(&self, group_id: u64) -> Option<ConsumerGroupOwner> {
         self.consumer_group_owners
             .get(&group_id)
-            .filter(|installed| installed.installation.incarnation == self.created_revision)
+            .filter(|installed| installed.installation.incarnation == self.created_revision())
             .map(|installed| installed.installation.owner)
+    }
+
+    #[must_use]
+    pub fn consumer_group_retired(&self, group_id: u64) -> bool {
+        self.owner_retirement
+            .as_ref()
+            .is_some_and(|catalog| catalog.retires(group_id))
+    }
+
+    /// The installed generation that a group offset write with owner 0 binds
+    /// to under rule H1: the installed owner is the writer's client and
+    /// session, and it was decided no later than the metadata op the writer
+    /// routed by. A later decision can have moved the partition away and back,
+    /// so the writer's offset can predate it, and `None` leaves the write to
+    /// the owner match, which refuses it.
+    fn captured_offset_owner(&self, group_id: u64, header: &RoutedRequestHeader) -> Option<u64> {
+        let installation = self.consumer_group_owners.get(&group_id)?.installation;
+        (installation.incarnation == self.created_revision()
+            && !installation.owner.is_unassigned()
+            && installation.owner.client_id == header.client
+            && installation.owner.session == header.session
+            && installation.metadata_op <= header.minimum_metadata_op)
+            .then_some(installation.owner.generation)
     }
 
     fn matches_consumer_owner(
@@ -1036,21 +1078,31 @@ where
         if kind != ConsumerKind::ConsumerGroup {
             return owner_generation == 0;
         }
-        self.consumer_group_owner(u64::from(consumer_id))
-            .is_some_and(|owner| {
-                owner.generation == owner_generation
-                    && (!owner.is_unassigned()
-                        || (operation == Operation::DeleteConsumerOffset
-                            && is_auto_commit_client(client_id)))
-                    && (is_auto_commit_client(client_id)
-                        || (owner.client_id == client_id && owner.session == session))
-            })
+        let group_id = u64::from(consumer_id);
+        let Some(owner) = self.consumer_group_owner(group_id) else {
+            // Group ids are never reused, so no owner follows a retired group.
+            // A replica can still hold its offset when the primary that retired
+            // it had none, and a delete admitted under the fence can commit
+            // after the catalog, so this cleanup passes at any generation.
+            return operation == Operation::DeleteConsumerOffset
+                && is_auto_commit_client(client_id)
+                && self.consumer_group_retired(group_id);
+        };
+        owner.generation == owner_generation
+            && (!owner.is_unassigned()
+                || (operation == Operation::DeleteConsumerOffset
+                    && is_auto_commit_client(client_id)))
+            && (is_auto_commit_client(client_id)
+                || (owner.client_id == client_id && owner.session == session))
     }
 
+    /// Judges the installed owner, not the one metadata names: a successor
+    /// can commit its install here before a later rebalance supersedes it,
+    /// and metadata then still names its predecessor.
     #[must_use]
-    pub fn consumer_group_drained(&self, group_id: u64, source: ConsumerGroupOwner) -> bool {
+    pub fn consumer_group_drained(&self, group_id: u64) -> bool {
         if self.observed_view != self.consensus.view()
-            || self.consumer_group_owner(group_id) != Some(source)
+            || self.consumer_group_owner(group_id).is_none()
             || self
                 .consumer_group_polls
                 .get(&group_id)
@@ -1086,7 +1138,7 @@ where
     ) -> Option<u64> {
         let installed = self.history_transition?;
         (installed.transition == *transition
-            && transition.incarnation == self.created_revision
+            && transition.incarnation == self.created_revision()
             && installed.partition_op <= self.consensus.commit_min()
             && self.fatal.is_none()
             && !self.materialization_missing
@@ -1106,7 +1158,7 @@ where
         transition: TransitionPartitionHistoryRequest,
         partition_op: u64,
     ) -> Result<(), IggyError> {
-        if transition.incarnation != self.created_revision {
+        if transition.incarnation != self.created_revision() {
             return Err(IggyError::HistoryUnavailable);
         }
         if let Some(installed) = self.history_transition {
@@ -1132,7 +1184,7 @@ where
         installation: InstallConsumerGroupOwnerRequest,
         partition_op: u64,
     ) -> Result<(), IggyError> {
-        if installation.incarnation != self.created_revision {
+        if installation.incarnation != self.created_revision() {
             return Ok(());
         }
         if self
@@ -1146,18 +1198,11 @@ where
             return Err(IggyError::HistoryUnavailable);
         }
         if let Some(installed) = self.consumer_group_owners.get(&installation.group_id) {
-            if installation.owner.generation < installed.installation.owner.generation {
-                return Ok(());
-            }
-            if installation.owner.generation == installed.installation.owner.generation {
-                return if installation == installed.installation {
-                    Ok(())
-                } else {
-                    Err(IggyError::InvalidCommand)
-                };
-            }
-            if installation.metadata_op <= installed.installation.metadata_op {
+            if self.conflicts_with_installed_owner(&installation) {
                 return Err(IggyError::InvalidCommand);
+            }
+            if installation.owner.generation <= installed.installation.owner.generation {
+                return Ok(());
             }
         } else if self.consumer_group_owners.len()
             >= crate::state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX as usize
@@ -1178,35 +1223,86 @@ where
         );
         self.consumer_group_polls
             .insert(installation.group_id, Arc::new(AtomicBool::new(true)));
-        self.last_polled_offsets.pin().remove(&ConsumerGroupId(
-            usize::try_from(group_id).map_err(|_| IggyError::InvalidCommand)?,
-        ));
+        self.last_polled_offsets
+            .pin()
+            .remove(&ConsumerGroupId(group_id as usize));
         self.mark_consumer_group_offsets_need_reconcile();
         self.fence_published.set(true);
         Ok(())
     }
 
+    /// Another owner at the installed generation, or a higher generation
+    /// decided no later than the installed owner. The apply refuses both, and
+    /// admission refuses them before they are prepared.
+    fn conflicts_with_installed_owner(
+        &self,
+        installation: &InstallConsumerGroupOwnerRequest,
+    ) -> bool {
+        self.consumer_group_owners
+            .get(&installation.group_id)
+            .is_some_and(|installed| {
+                let installed = installed.installation;
+                if installation.owner.generation == installed.owner.generation {
+                    *installation != installed
+                } else {
+                    installation.owner.generation > installed.owner.generation
+                        && installation.metadata_op <= installed.metadata_op
+                }
+            })
+    }
+
     /// Retirement follows committed metadata deletion and ordered offset cleanup.
     /// Older owner fences cannot resurrect IDs absent from the retained catalog.
-    pub fn has_retirable_consumer_group_owners(&self, is_live: impl Fn(u64) -> bool) -> bool {
+    ///
+    /// Returns the deleted groups that a catalog keeps beside the live ones, or
+    /// `None` while it would retire no row or must wait. A deleted group whose
+    /// durable offset is stranded is kept: a catalog waits for a durable offset,
+    /// and a stranded key gets no delete while the mark holds. A stranded key
+    /// with no durable entry does not keep its group: the cleanup of a retired
+    /// group deletes the offset once a primary that holds it leads. Until that
+    /// delete, a file that every boot fails to read, or fails to remove when
+    /// torn or corrupt, stays on disk with no row.
+    #[must_use]
+    pub fn retirement_kept_groups(&self, is_live: impl Fn(u64) -> bool) -> Option<Vec<u64>> {
+        let capacity = self.consumer_offset_capacity_for(ConsumerKind::ConsumerGroup);
+        let (kept, retired): (Vec<u64>, Vec<u64>) = self
+            .consumer_group_owners
+            .keys()
+            .copied()
+            .filter(|&group_id| !is_live(group_id))
+            .partition(|&group_id| {
+                u32::try_from(group_id).is_ok_and(|id| {
+                    capacity.is_stranded(id)
+                        && self
+                            .durable_consumer_offsets
+                            .contains(ConsumerKind::ConsumerGroup, id)
+                })
+            });
+        (!retired.is_empty()
+            && !self.retirement_waits(|group_id| retired.binary_search(&group_id).is_ok()))
+        .then_some(kept)
+    }
+
+    /// A catalog waits until each group it retires is unassigned and has no
+    /// durable offset, so its apply never depends on local offset files.
+    fn retirement_waits(&self, retires: impl Fn(u64) -> bool) -> bool {
         self.consumer_group_owners
             .iter()
             .any(|(&group_id, installed)| {
-                !is_live(group_id)
-                    && installed.installation.owner.is_unassigned()
-                    && u32::try_from(group_id).is_ok_and(|id| {
-                        !self
-                            .durable_consumer_offsets
-                            .contains(ConsumerKind::ConsumerGroup, id)
-                    })
+                retires(group_id)
+                    && (!installed.installation.owner.is_unassigned()
+                        || u32::try_from(group_id).is_ok_and(|id| {
+                            self.durable_consumer_offsets
+                                .contains(ConsumerKind::ConsumerGroup, id)
+                        }))
             })
     }
 
     fn apply_consumer_group_owner_retirement(
         &mut self,
-        catalog: RetireConsumerGroupOwnersRequest,
+        mut catalog: RetireConsumerGroupOwnersRequest,
     ) -> Result<(), IggyError> {
-        if catalog.incarnation != self.created_revision {
+        if catalog.incarnation != self.created_revision() {
             return Ok(());
         }
         if let Some(installed) = &self.owner_retirement {
@@ -1214,14 +1310,17 @@ where
                 return Ok(());
             }
             if catalog.next_group_id < installed.next_group_id
-                || (catalog.metadata_op == installed.metadata_op && catalog != *installed)
-                || catalog
-                    .live_group_ids
-                    .iter()
-                    .any(|id| installed.retires(*id))
+                || (catalog.metadata_op == installed.metadata_op
+                    && catalog.next_group_id != installed.next_group_id)
             {
                 return Err(IggyError::InvalidCommand);
             }
+            // Each primary keeps the deleted groups it saw with a durable
+            // stranded offset, so a catalog can keep a group that an earlier
+            // one retired.
+            catalog
+                .live_group_ids
+                .retain(|&group_id| !installed.retires(group_id));
         }
         if self.consumer_group_owners.iter().any(|(&id, installed)| {
             catalog.retires(id) && !installed.installation.owner.is_unassigned()
@@ -1230,12 +1329,7 @@ where
         }
         let mut removed = Vec::new();
         self.consumer_group_owners.retain(|&group_id, _| {
-            let prune = catalog.retires(group_id)
-                && u32::try_from(group_id).is_ok_and(|id| {
-                    !self
-                        .durable_consumer_offsets
-                        .contains(ConsumerKind::ConsumerGroup, id)
-                });
+            let prune = catalog.retires(group_id);
             if prune {
                 removed.push(group_id);
             }
@@ -1243,9 +1337,12 @@ where
         });
         for group_id in removed {
             self.consumer_group_polls.remove(&group_id);
-            self.last_polled_offsets.pin().remove(&ConsumerGroupId(
-                usize::try_from(group_id).map_err(|_| IggyError::InvalidCommand)?,
-            ));
+            // Last-polled keys come from u32 group ids only.
+            if let Ok(id) = u32::try_from(group_id) {
+                self.last_polled_offsets
+                    .pin()
+                    .remove(&ConsumerGroupId(id as usize));
+            }
         }
         self.required_metadata_frontier = self.required_metadata_frontier.max(catalog.metadata_op);
         self.owner_retirement = Some(catalog);
@@ -1475,12 +1572,12 @@ where
             .as_ref()
             .ok_or(IggyError::CannotReadFile)?;
         let directory = std::path::Path::new(partition_directory)
-            .join(format!("prepares-{}", self.created_revision));
+            .join(format!("prepares-{}", self.created_revision()));
         if recovered.is_none()
             && self.consensus.replica_count() > 1
             && !self.consensus.recovery_election_allowed()
         {
-            PartitionPersistence::fence_missing_history(&directory, self.created_revision)
+            PartitionPersistence::fence_missing_history(&directory, self.created_revision())
                 .await
                 .map_err(|error| {
                     warn!(%error, "cannot fence missing partition prepare history");
@@ -1489,7 +1586,7 @@ where
         }
         self.materialization_missing = crate::state_transfer::materialization_is_missing(
             partition_directory,
-            self.created_revision,
+            self.created_revision(),
         )
         .await
         .map_err(|_| IggyError::CannotReadFile)?;
@@ -1501,7 +1598,7 @@ where
             PartitionPersistence::open_with_capacity(
                 &directory,
                 self.namespace().inner(),
-                self.created_revision,
+                self.created_revision(),
                 journal::durable_storage::DiskStorage,
                 capacity,
                 self.runtime_options
@@ -2247,7 +2344,10 @@ where
             return;
         };
         while let Some(op) = persistence.head().checked_add(1) {
-            if op > through || op > self.consensus.sequencer().current_sequence() {
+            if op > through
+                || op > self.consensus.sequencer().current_sequence()
+                || !self.consensus.view_log_entry_proven(op)
+            {
                 break;
             }
             let Some(prepare) = self.log.journal().inner.repair_entry(op) else {
@@ -2720,12 +2820,13 @@ where
             consumer_offsets: self.retained_consumer_offsets(ConsumerKind::Consumer),
             consumer_group_offsets: self.retained_consumer_offsets(ConsumerKind::ConsumerGroup),
             external_group_offsets: self.retained_consumer_offsets(ConsumerKind::ExternalGroup),
+            emptied_at: self.durable_consumer_offsets.emptied_at(),
             consumer_group_owners: std::mem::take(&mut self.consumer_group_owners),
             history_transition: self.history_transition,
             owner_retirement: self.owner_retirement.take(),
             durable_offset: self.offset.load(Ordering::Acquire),
             write_offset: self.dirty_offset.load(Ordering::Relaxed),
-            offset_space_used: self.offset_space_used(),
+            offset_space: self.offset_space,
             log: std::mem::take(&mut self.log),
         }
     }
@@ -2754,10 +2855,11 @@ where
             required_metadata_frontier,
             durable_offset,
             write_offset,
-            offset_space_used,
+            offset_space,
             consumer_offsets,
             consumer_group_offsets,
             external_group_offsets,
+            emptied_at,
             consumer_group_owners,
             history_transition,
             owner_retirement,
@@ -2809,18 +2911,11 @@ where
                 offset,
             );
         }
-        // Empty carry-over: the previous incarnation never took a write, so there
-        // is no offset space to restore and claiming one would make the next
-        // prepare mint from a base no peer agrees on.
-        //
-        // Keyed on the RETIRED incarnation's flag, never on `(0, 0)` or on this
-        // partition's own `append_live`. One message at offset 0 reports
-        // the same two zeroes as an empty partition, and this instance is freshly
-        // built so its own flag is always false. The arithmetic test would therefore
-        // adopt the log, skip the counters, and let the next write stamp
-        // `base_offset = 0` where peers stamp 1, with `batch_checksum` over it: two
-        // logs, different bytes at the same op, silently.
-        if !offset_space_used {
+        self.durable_consumer_offsets.set_emptied_at(emptied_at);
+        // Zero counters can describe an empty partition or its first batch.
+        // Preserve both bits so an uncommitted first batch does not become a
+        // committed offset that view truncation is forbidden to discard.
+        if !offset_space.append_live {
             return;
         }
         let durable = durable_offset.max(self.offset.load(Ordering::Acquire));
@@ -2829,11 +2924,8 @@ where
             .max(self.dirty_offset.load(Ordering::Relaxed));
         self.offset.store(durable, Ordering::Release);
         self.dirty_offset.store(dirty, Ordering::Relaxed);
-        self.set_offset_space_used(true);
-        // Everything carried over is already persisted as far as this replica is
-        // concerned, so the flush and commit paths must not re-persist or re-count
-        // it, the same contract boot gives a partition recovered from segments.
-        self.recovered_durable_offset = Some(durable);
+        self.offset_space = offset_space;
+        self.recovered_durable_offset = offset_space.committed_seeded.then_some(durable);
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -3243,23 +3335,57 @@ where
         self.injected_commit_failure = true;
     }
 
-    /// Burn one repair stall round; `true` once the budget is exhausted and the
-    /// session should be re-armed against a different peer.
+    /// Burn one repair stall round; `true` once the session spent the budget.
+    /// The count then restarts, so the session that the shard opens in its
+    /// place gets the whole budget.
     ///
     /// On the PARTITION, not the session, for the same reason the transfer
-    /// budget is: the rotation mints a new session, which would otherwise reset
-    /// the count and re-target forever without ever giving up on the ring.
+    /// budget is: the rotation mints a new session, so only a count outside
+    /// it can add up the rotations ([`Self::note_repair_rotation`]) until the
+    /// shard gives up on the ring.
+    ///
+    /// A walk since the last round restarts both counts like a new frame does:
+    /// while the WAL drains, the peer re-serves frames this journal holds. A
+    /// new view restarts them too, as on the metadata plane: the rounds of an
+    /// earlier view say nothing about the ring of this one.
     #[must_use = "the bool is the rotate verdict; dropping it disables the stall budget"]
     pub const fn burn_repair_attempt(&mut self) -> bool {
+        let commit_min = self.consensus.commit_min();
+        if commit_min > self.repair_walked_to {
+            self.repair_walked_to = commit_min;
+            self.restart_repair_budget();
+        }
+        let view = self.consensus.view();
+        if view != self.repair_charged_view {
+            self.repair_charged_view = view;
+            self.restart_repair_budget();
+        }
         self.repair_attempts += 1;
-        self.repair_attempts > crate::types::REPAIR_MAX_STALL_RETRIES
+        let spent = self.repair_attempts > crate::types::REPAIR_MAX_STALL_RETRIES;
+        if spent {
+            self.repair_attempts = 0;
+        }
+        spent
     }
 
-    /// Real repair progress (any in-window frame from the serving peer): reset
-    /// the stall budget, so it bounds CONSECUTIVE stalls rather than the ones a
-    /// long healthy stream accumulates.
-    pub const fn note_repair_progress(&mut self) {
+    /// Count a rotation that opened a repair session against another peer.
+    /// The shard gives up on the ring once these rotations, with the session
+    /// that just spent its budget, reach the other replicas.
+    pub const fn note_repair_rotation(&mut self) {
+        self.repair_rotations = self.repair_rotations.saturating_add(1);
+    }
+
+    /// Rotations since the last progress, for the shard's ring check and its
+    /// log.
+    #[must_use]
+    pub const fn repair_rotations(&self) -> u32 {
+        self.repair_rotations
+    }
+
+    /// Restart both stall counts when progress or a transfer supersedes repair.
+    pub const fn restart_repair_budget(&mut self) {
         self.repair_attempts = 0;
+        self.repair_rotations = 0;
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -3436,6 +3562,11 @@ where
         false
     }
 
+    /// Restore the op of the committed delete that emptied the recovered table.
+    pub(crate) fn seed_offsets_emptied_at(&self, op: u64) {
+        self.durable_consumer_offsets.set_emptied_at(op);
+    }
+
     #[must_use]
     pub fn durable_consumer_offset_count(&self, kind: ConsumerKind) -> usize {
         self.durable_consumer_offsets.count(kind)
@@ -3598,6 +3729,7 @@ where
             owner,
             file,
             permit,
+            retired_marker: None,
         }
     }
 
@@ -3655,6 +3787,7 @@ where
         self.retire_consumer_offset_file(path);
         crate::io::OffsetDeleteIoJob {
             path: path.to_owned(),
+            emptied_marker: None,
         }
     }
 
@@ -3679,7 +3812,11 @@ where
         pending: PendingConsumerOffsetCommit,
         tracked: Option<DurableOffsetState>,
     ) -> Result<ConsumerOffsetEffect, IggyError> {
-        let plan = self.plan_consumer_offset_effect(pending, tracked);
+        let plan = self.plan_consumer_offset_effect(
+            pending,
+            tracked,
+            self.durable_consumer_offsets.emptied_at(),
+        );
         if let ConsumerOffsetAction::Ready(effect) = plan.action {
             return Ok(effect);
         }
@@ -3687,10 +3824,12 @@ where
         self.accept_consumer_offset_effect(plan, job.execute().await)
     }
 
+    /// `table_emptied_at` is the emptied-at op of the table this effect lands in.
     fn plan_consumer_offset_effect(
         &self,
         pending: PendingConsumerOffsetCommit,
         tracked: Option<DurableOffsetState>,
+        table_emptied_at: u64,
     ) -> ConsumerOffsetPlan {
         let has_path = self.consumer_offsets_dir(pending.kind).is_some();
         let action = match pending.mutation {
@@ -3734,6 +3873,9 @@ where
             persisted: self.consumer_offset_durability().is_persisted()
                 && self.persistence.is_none(),
             action,
+            emptied_at: (matches!(pending.mutation, PendingConsumerOffsetMutation::Upsert(_))
+                && table_emptied_at != 0)
+                .then_some(0),
         }
     }
 
@@ -3744,15 +3886,21 @@ where
         let path = self
             .persisted_offset_path(plan.pending.kind, plan.pending.consumer_id)
             .ok_or(IggyError::CannotWriteToFile)?;
+        let marker = plan
+            .emptied_at
+            .and_then(|emptied_at| Some((self.emptied_marker_path()?, emptied_at)));
         match plan.action {
             ConsumerOffsetAction::Write { offset, fold_max } => {
-                Ok(crate::io::PartitionIoJob::OffsetWrite(
-                    self.prepare_consumer_offset_write(&path, offset, plan.persisted, fold_max),
-                ))
+                let mut job =
+                    self.prepare_consumer_offset_write(&path, offset, plan.persisted, fold_max);
+                job.retired_marker = marker.map(|(marker, _)| marker);
+                Ok(crate::io::PartitionIoJob::OffsetWrite(job))
             }
-            ConsumerOffsetAction::Delete => Ok(crate::io::PartitionIoJob::OffsetDelete(
-                self.prepare_consumer_offset_delete(&path),
-            )),
+            ConsumerOffsetAction::Delete => {
+                let mut job = self.prepare_consumer_offset_delete(&path);
+                job.emptied_marker = marker;
+                Ok(crate::io::PartitionIoJob::OffsetDelete(job))
+            }
             ConsumerOffsetAction::Ready(_) => Err(IggyError::CannotWriteToFile),
         }
     }
@@ -3785,7 +3933,9 @@ where
                             state: None,
                         })
                     }
-                    Err(error) => {
+                    // Only a failed unlink reports this error. The marker write
+                    // after a successful one leaves no file behind to strand.
+                    Err(error @ IggyError::CannotDeleteConsumerOffsetFile(_)) => {
                         self.consumer_offset_capacity_for(pending.kind)
                             .record_stranded(pending.consumer_id);
                         warn!(
@@ -3795,6 +3945,7 @@ where
                         );
                         Err(error)
                     }
+                    Err(error) => Err(error),
                 }
             }
             _ => Err(IggyError::CannotWriteToFile),
@@ -3921,7 +4072,7 @@ where
         }
         Ok(PollCompletion {
             context: iggy_binary_protocol::primitives::partition_history::PartitionContext {
-                incarnation: self.created_revision,
+                incarnation: self.created_revision(),
                 owner_generation: result.context.owner.map_or(0, |owner| owner.generation),
                 metadata_op: self.required_metadata_frontier,
             },
@@ -3994,6 +4145,9 @@ where
         // poll would report progress the group never agreed, and a later
         // read on the primary would hand the same messages out again.
         // Refusing keeps the outcome retriable on a replica that can commit.
+        if consensus.is_normal_backup() {
+            return Err(IggyError::NotPrimary);
+        }
         if !consensus.is_primary()
             || !consensus.is_normal()
             || consensus.is_transferring()
@@ -4015,16 +4169,9 @@ where
         let request = self.build_poll_auto_commit_request(kind, consumer_id, offset)?;
         // Automatic commits bypass the request handler, so check journal
         // capacity here before queueing or assigning an operation.
-        if self
-            .persistence
-            .as_ref()
-            .is_some_and(|persistence| {
-                !persistence.has_capacity(
-                    request.header().size as usize
-                        + iggy_binary_protocol::requests::consumer_offsets::PREPARED_OWNER_GENERATION_SIZE,
-                )
-            })
-        {
+        if self.persistence.as_ref().is_some_and(|persistence| {
+            !persistence.has_capacity(Self::prepared_request_size(&request))
+        }) {
             return Err(IggyError::TransientNotAccepted);
         }
         let order = self.next_local_request_order()?;
@@ -4280,7 +4427,7 @@ where
                     session: 1,
                     request: 1,
                     group: namespace.inner(),
-                    partition_incarnation: self.created_revision,
+                    partition_incarnation: self.created_revision(),
                     owner_generation: if kind == ConsumerKind::ConsumerGroup {
                         self.consumer_group_owner(u64::from(consumer_id))
                             .map_or(0, |owner| owner.generation)
@@ -4566,7 +4713,11 @@ where
                 let tracked = self
                     .durable_consumer_offsets
                     .get(pending.kind, pending.consumer_id);
-                let plan = self.plan_consumer_offset_effect(pending, tracked);
+                let plan = self.plan_consumer_offset_effect(
+                    pending,
+                    tracked,
+                    self.durable_consumer_offsets.emptied_at(),
+                );
                 if let ConsumerOffsetAction::Ready(effect) = plan.action {
                     self.publish_no_ack_effect(effect);
                 } else {
@@ -4710,6 +4861,23 @@ where
     /// The offset directory of `kind`, once storage is configured.
     pub(crate) fn consumer_offsets_dir(&self, kind: ConsumerKind) -> Option<&str> {
         self.consumer_offset_dirs[kind.index()].as_deref()
+    }
+
+    /// The marker beside the offset directories that names the committed
+    /// delete which emptied every kind. `None` unless every kind has a
+    /// directory under one parent, which is where boot reads it.
+    pub(crate) fn emptied_marker_path(&self) -> Option<String> {
+        let mut parents = ConsumerKind::ALL.into_iter().map(|kind| {
+            self.consumer_offsets_dir(kind)
+                .and_then(|dir| std::path::Path::new(dir).parent())
+        });
+        let parent = parents.next().flatten()?;
+        parents.all(|other| other == Some(parent)).then(|| {
+            parent
+                .join(crate::offset_storage::EMPTIED_MARKER_FILE)
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     pub(crate) const fn consumer_offset_capacity_for(
@@ -5442,17 +5610,25 @@ where
 
     pub fn defer_view_truncation(
         &mut self,
-        from_op: u64,
+        ops: std::ops::RangeInclusive<u64>,
         actions: Vec<consensus::VsrAction>,
         peer: Option<u8>,
     ) {
         self.transition = Some(PendingPartitionTransition::Truncate {
-            from_op,
+            ops,
             drain: None,
             actions,
             peer,
         });
         self.notify_io();
+    }
+
+    #[must_use]
+    pub const fn view_truncation_pending(&self) -> bool {
+        matches!(
+            self.transition,
+            Some(PendingPartitionTransition::Truncate { .. })
+        )
     }
 
     #[must_use]
@@ -5645,12 +5821,11 @@ where
             let message = self.deferred_views.swap_remove(next);
             return Ok(crate::PartitionIoStep::Transition(message));
         }
-        if let Some(PendingPartitionTransition::Truncate { from_op, drain, .. }) =
-            &mut self.transition
+        if let Some(PendingPartitionTransition::Truncate { ops, drain, .. }) = &mut self.transition
         {
             if let Some(persistence) = &self.persistence {
                 if drain.is_none() {
-                    persistence.truncate_from(*from_op);
+                    persistence.truncate_from(*ops.start());
                     if persistence.start() {
                         self.consensus
                             .message_bus()
@@ -5668,15 +5843,12 @@ where
                 persistence.finish_drain(drain);
             }
             let Some(PendingPartitionTransition::Truncate {
-                from_op,
-                actions,
-                peer,
-                ..
+                ops, actions, peer, ..
             }) = self.transition.take()
             else {
                 unreachable!("truncate transition exists");
             };
-            self.truncate_resident_from(from_op).await?;
+            self.remove_resident_range(ops).await?;
             return Ok(crate::PartitionIoStep::ViewApplied { actions, peer });
         }
         if matches!(
@@ -5849,7 +6021,7 @@ where
                         .partition_dir
                         .clone()
                         .ok_or(IggyError::CannotDeleteFile)?,
-                    revision: self.created_revision,
+                    revision: self.created_revision(),
                     replicated: self.consensus.replica_count() > 1,
                 })
             }
@@ -6607,8 +6779,21 @@ where
             // State-dependent admission belongs to the primary. A backup can
             // lag the committed offset table or message frontier and would
             // otherwise turn a routing artifact into a terminal 404 or 400.
-            // Reject it first with the only response that proves the request
-            // was never admitted, so the caller may safely retry elsewhere.
+            // Reject it first with a response that proves the request was
+            // never admitted, so the caller may safely retry elsewhere. A
+            // normal backup names the cause, so the caller goes to the
+            // primary at once instead of backing off.
+            if consensus.is_normal_backup() {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::NotPrimary.as_code(),
+                    "not-primary reply send failed",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
             if self.fatal.is_some()
                 || self.maintenance.shutdown.is_some()
                 || self.io_active.is_retiring()
@@ -6669,18 +6854,38 @@ where
                 return;
             }
             if message.header().operation == Operation::RetireConsumerGroupOwners {
-                let valid = RetireConsumerGroupOwnersRequest::decode_from(message.body())
-                    .is_ok_and(|catalog| {
-                        catalog.incarnation == self.created_revision
+                let Some(catalog) = RetireConsumerGroupOwnersRequest::decode_from(message.body())
+                    .ok()
+                    .filter(|catalog| {
+                        catalog.incarnation == self.created_revision()
                             && catalog.metadata_op <= message.header().metadata_watermark
                             && !self.history_deleted()
-                    });
-                if !valid {
+                    })
+                else {
                     Self::send_partition_deny_or_log(
                         consensus,
                         message.header(),
                         IggyError::InvalidCommand.as_code(),
                         "invalid owner retirement catalog",
+                        reply.take(),
+                    )
+                    .await;
+                    return;
+                };
+                // An install admitted ahead of the catalog commits first and can
+                // assign a retired row again, which the catalog apply refuses.
+                if self.retirement_waits(|group_id| catalog.retires(group_id))
+                    || self
+                        .pending_owner_install
+                        .get()
+                        .is_some_and(|pending| catalog.retires(pending.group_id))
+                    || consensus.commit_min() < self.owner_install_barrier
+                {
+                    Self::send_partition_deny_or_log(
+                        consensus,
+                        message.header(),
+                        IggyError::TransientNotAccepted.as_code(),
+                        "owner retirement awaits offset cleanup or an owner install",
                         reply.take(),
                     )
                     .await;
@@ -6691,7 +6896,7 @@ where
                 let transition =
                     match TransitionPartitionHistoryRequest::decode_from(message.body()) {
                         Ok(transition)
-                            if transition.incarnation == self.created_revision
+                            if transition.incarnation == self.created_revision()
                                 && !self.history_deleted() =>
                         {
                             transition
@@ -6757,7 +6962,7 @@ where
                     let installation =
                         match InstallConsumerGroupOwnerRequest::decode_from(message.body()) {
                             Ok(installation)
-                                if installation.incarnation == self.created_revision
+                                if installation.incarnation == self.created_revision()
                                     && !self.history_deleted() =>
                             {
                                 installation
@@ -6824,6 +7029,17 @@ where
                             message.header(),
                             IggyError::TransientNotAccepted.as_code(),
                             reason,
+                            reply.take(),
+                        )
+                        .await;
+                        return;
+                    }
+                    if self.conflicts_with_installed_owner(&installation) {
+                        Self::send_partition_deny_or_log(
+                            consensus,
+                            message.header(),
+                            IggyError::InvalidCommand.as_code(),
+                            "conflicting ownership installation",
                             reply.take(),
                         )
                         .await;
@@ -6973,7 +7189,7 @@ where
                 ) {
                     consensus::client_table::RequestStatus::New => {}
                     consensus::client_table::RequestStatus::Duplicate(cached) => {
-                        if cached.header().partition_incarnation != self.created_revision {
+                        if cached.header().partition_incarnation != self.created_revision() {
                             Self::send_partition_deny_or_log(
                                 consensus,
                                 message.header(),
@@ -7062,6 +7278,26 @@ where
                 .await;
                 return;
             }
+            // A group offset write without a position carries owner 0. It
+            // takes the installed generation before the owner match, so
+            // promotion, the prepare and apply all see the bound owner.
+            let message = match consumer_offset {
+                Some((ConsumerKind::ConsumerGroup, consumer_id, _, _))
+                    if message.header().owner_generation == 0
+                        && !is_auto_commit_client(client_id) =>
+                {
+                    match self.captured_offset_owner(u64::from(consumer_id), message.header()) {
+                        Some(generation) => message.transmute_header(
+                            |mut header, captured: &mut RoutedRequestHeader| {
+                                header.owner_generation = generation;
+                                *captured = header;
+                            },
+                        ),
+                        None => message,
+                    }
+                }
+                _ => message,
+            };
             if let Some((kind, consumer_id, _, _)) = consumer_offset
                 && !self.matches_consumer_owner(
                     kind,
@@ -7374,11 +7610,12 @@ where
                 }
                 continue;
             }
-            if matches!(
+            let offset_request = matches!(
                 header.operation,
                 Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) && let Ok((kind, consumer_id, _, _)) =
-                Self::parse_consumer_offset_request(header.operation, &request.message)
+            )
+            .then(|| Self::parse_consumer_offset_request(header.operation, &request.message));
+            if let Some(Ok((kind, consumer_id, _, _))) = offset_request
                 && !self.matches_consumer_owner(
                     kind,
                     consumer_id,
@@ -7445,12 +7682,7 @@ where
                 }
                 continue;
             }
-            if matches!(
-                header.operation,
-                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) {
-                let parsed =
-                    Self::parse_consumer_offset_request(header.operation, &request.message);
+            if let Some(parsed) = offset_request {
                 let (kind, consumer_id, offset, _) = match parsed {
                     Ok(parsed) => parsed,
                     Err(error) => {
@@ -7611,16 +7843,19 @@ where
         }
     }
 
+    /// Bytes of the prepare that `project` builds. An offset prepare is sized
+    /// from `header.size`, because an auto-commit buffer already reserves the
+    /// owner trailer past it.
     fn prepared_request_size(message: &Message<RoutedRequestHeader>) -> usize {
-        message.as_slice().len()
-            + if matches!(
-                message.header().operation,
-                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-            ) {
-                iggy_binary_protocol::requests::consumer_offsets::PREPARED_OWNER_GENERATION_SIZE
-            } else {
-                0
-            }
+        if matches!(
+            message.header().operation,
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+        ) {
+            message.header().size as usize
+                + iggy_binary_protocol::requests::consumer_offsets::PREPARED_OWNER_GENERATION_SIZE
+        } else {
+            message.as_slice().len()
+        }
     }
 
     async fn deny_queued_request(
@@ -8125,6 +8360,7 @@ where
         if self.fatal.is_some()
             || self.materialization_missing
             || self.commit_waits_for_checkpoint()
+            || self.consensus.view_log_unproven()
         {
             return;
         }
@@ -8195,7 +8431,9 @@ where
                 let Some(entry) = pipeline.entry_by_op(op) else {
                     break;
                 };
-                if !self.prepare_body_is_ready(&entry.header, materialize) {
+                if !self.consensus.view_log_entry_proven(entry.header.op)
+                    || !self.prepare_body_is_ready(&entry.header, materialize)
+                {
                     break;
                 }
                 if self.no_ack.front().is_some_and(|head| {
@@ -8206,9 +8444,6 @@ where
                     break;
                 }
                 selected.push(entry.header);
-                if entry.header.operation == Operation::TransitionPartitionHistory {
-                    break;
-                }
             }
             selected
         })
@@ -8272,24 +8507,16 @@ where
             .filter(|head| head.op >= from_op)
             .map_or(commit_max, |head| commit_max.min(head.op - 1));
         let materialize = self.should_persist_messages(config);
-        let mut drained = Vec::new();
-        for header in self
-            .log
+        self.log
             .journal()
             .inner
             .committed_headers_from(from_op, commit_max, max_ops)
-        {
-            if !self.prepare_body_is_ready(&header, materialize) {
-                break;
-            }
-            // Ops after the delete fence are validated only once it applies.
-            let fence = header.operation == Operation::TransitionPartitionHistory;
-            drained.push(header);
-            if fence {
-                break;
-            }
-        }
-        drained
+            .into_iter()
+            .take_while(|header| {
+                self.consensus.view_log_entry_proven(header.op)
+                    && self.prepare_body_is_ready(header, materialize)
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8542,11 +8769,47 @@ where
     }
 
     async fn truncate_resident_from(&mut self, from_op: u64) -> Result<usize, IggyError> {
+        self.remove_resident_range(from_op..=u64::MAX).await
+    }
+
+    /// Replace a proven mismatch while retaining the canonical tail across gaps.
+    ///
+    /// # Errors
+    /// Returns an error if the WAL or resident indexes cannot be rewritten.
+    pub async fn remove_divergent_prepare(&mut self, op: u64) -> Result<(), IggyError> {
+        if op
+            <= self
+                .consensus
+                .commit_min()
+                .max(self.log.journal().inner.evicted_through())
+        {
+            return Err(IggyError::InvalidCommand);
+        }
+        if let Some(persistence) = &self.persistence {
+            // The durable WAL is contiguous. A canonical tail beyond a divergent
+            // entry is repair-held and must be persisted again after the gap fills.
+            // Truncation invalidates the head certificate. A crash before refill
+            // requires state transfer; the old certificate cannot vouch for a prefix.
+            persistence.truncate_from(op);
+            self.start_persistence();
+            persistence
+                .drain_with_timeout()
+                .await
+                .map_err(|_| IggyError::CannotSyncFile)?;
+        }
+        self.remove_resident_range(op..=op).await?;
+        Ok(())
+    }
+
+    async fn remove_resident_range(
+        &mut self,
+        ops: std::ops::RangeInclusive<u64>,
+    ) -> Result<usize, IggyError> {
         let mut entries = self.log.journal().inner.resident_entries();
         entries.sort_unstable_by_key(peek_op);
         let mut retained_info = JournalInfo::default();
         let mut retained_next_offset = 0;
-        let mut rewind_next_offset = None;
+        let mut removed_messages = false;
         for entry in &entries {
             if peek_operation(entry) != Operation::SendMessages {
                 continue;
@@ -8556,12 +8819,8 @@ where
             if batch.message_count() == 0 {
                 continue;
             }
-            if peek_op(entry) >= from_op {
-                rewind_next_offset = Some(
-                    rewind_next_offset.map_or(batch.header.base_offset, |offset: u64| {
-                        offset.min(batch.header.base_offset)
-                    }),
-                );
+            if ops.contains(&peek_op(entry)) {
+                removed_messages = true;
                 continue;
             }
             accumulate_committed_info(
@@ -8600,14 +8859,14 @@ where
             .log
             .journal()
             .inner
-            .truncate_from(from_op)
+            .remove_range(ops.clone())
             .await
             .map_err(|_| IggyError::CannotAppendMessage)?;
 
         self.log.journal_mut().info = retained_info;
         self.log.active_segment_mut().current_position = restored_position;
-        if let Some(next_offset) = rewind_next_offset {
-            let next_offset = next_offset.max(minimum_next_offset);
+        if removed_messages {
+            let next_offset = minimum_next_offset;
             self.dirty_offset
                 .store(next_offset.saturating_sub(1), Ordering::Relaxed);
             // The APPEND bit follows the rewound counter. The committed bit does
@@ -8621,9 +8880,8 @@ where
             }
         }
         self.consensus.note_journal_mutation();
-        let commit_max = self.consensus.commit_max();
         self.pending_consumer_offset_commits
-            .retain(|op, _| *op < from_op || *op <= commit_max);
+            .retain(|op, _| !ops.contains(op));
         self.offset_reservations_need_resync.set(true);
         self.truncated_since_scan.set(true);
         Ok(removed)
@@ -9474,10 +9732,14 @@ where
         }
         let plan = self.plan_committed_offset(&header, pending)?;
         if let ConsumerOffsetAction::Ready(effect) = plan.action {
-            self.accept_committed_offset_effect(effect)?;
+            self.accept_committed_offset_effect(&plan, effect)?;
         } else {
             let mut batch = Vec::new();
-            if matches!(plan.action, ConsumerOffsetAction::Write { .. }) {
+            // A batch writes concurrently, so a store that retires the marker
+            // runs alone to keep the removal ahead of every write.
+            if matches!(plan.action, ConsumerOffsetAction::Write { .. })
+                && plan.emptied_at.is_none()
+            {
                 for (entry, header) in pending
                     .headers
                     .iter()
@@ -9579,7 +9841,27 @@ where
                 },
                 |effect| effect.state,
             );
-        Ok(self.plan_consumer_offset_effect(offset, tracked))
+        let emptied_at = pending.emptied_at.unwrap_or(pending.initial_emptied_at);
+        let mut plan = self.plan_consumer_offset_effect(offset, tracked, emptied_at);
+        if matches!(offset.mutation, PendingConsumerOffsetMutation::Delete) {
+            // Only a delete of the last key the table holds empties it. An
+            // absent key may be one whose file boot lost, and a stranded file
+            // may hold an offset the table never loaded.
+            //
+            // Accepted limit: a donor whose boot lost offsets (one file, every
+            // file or a kind directory) still marks the table emptied when it
+            // deletes the last key it holds, even one stored after the boot.
+            // A receiver that missed that delete then drops the lost keys too.
+            // A non-empty offer from that donor already drops them the same way.
+            plan.emptied_at = (emptied_at == 0
+                && tracked.is_some()
+                && pending.offset_count == 1
+                && ConsumerKind::ALL
+                    .into_iter()
+                    .all(|kind| self.consumer_offset_capacity_for(kind).stranded_count() == 0))
+            .then_some(header.op);
+        }
+        Ok(plan)
     }
 
     fn capture_commit_phase(
@@ -9684,7 +9966,7 @@ where
                                 plan,
                                 crate::io::PartitionIoResult::OffsetWrite(result),
                             )
-                            .and_then(|effect| self.accept_committed_offset_effect(effect));
+                            .and_then(|effect| self.accept_committed_offset_effect(&plan, effect));
                         if let Err(error) = outcome {
                             first_error.get_or_insert((entry, error));
                         }
@@ -9700,7 +9982,7 @@ where
                     }
                 } else {
                     let effect = self.accept_consumer_offset_effect(plan, result)?;
-                    self.accept_committed_offset_effect(effect)
+                    self.accept_committed_offset_effect(&plan, effect)
                 }
             }
             (
@@ -9753,6 +10035,7 @@ where
 
     fn accept_committed_offset_effect(
         &mut self,
+        plan: &ConsumerOffsetPlan,
         effect: ConsumerOffsetEffect,
     ) -> Result<(), IggyError> {
         let pending = self
@@ -9772,6 +10055,11 @@ where
         }
         self.consumer_offset_dirs_touched[effect.pending.kind.index()]
             .set(Some((header.op, header.operation)));
+        pending.offset_count = (pending.offset_count + usize::from(effect.state.is_some()))
+            .saturating_sub(usize::from(plan.tracked.is_some()));
+        if let Some(emptied_at) = plan.emptied_at {
+            pending.emptied_at = Some(emptied_at);
+        }
         pending.offset_effects.push(effect);
         pending.next_entry += 1;
         pending.phase = CommitPhase::Offsets;
@@ -9817,6 +10105,9 @@ where
             || headers
                 .windows(2)
                 .any(|pair| pair[0].op.checked_add(1) != Some(pair[1].op))
+            || headers
+                .iter()
+                .any(|header| !self.consensus.view_log_entry_proven(header.op))
         {
             return false;
         }
@@ -9859,6 +10150,12 @@ where
             owner_install: None,
             offset_effects: Vec::new(),
             offset_batch: Vec::new(),
+            offset_count: ConsumerKind::ALL
+                .into_iter()
+                .map(|kind| self.durable_consumer_offsets.count(kind))
+                .sum(),
+            initial_emptied_at: self.durable_consumer_offsets.emptied_at(),
+            emptied_at: None,
             incarnation: self.incarnation,
             poll_history: self.poll_history,
             applied_floor,
@@ -9946,6 +10243,9 @@ where
         for effect in &pending.offset_effects {
             self.publish_consumer_offset_effect(*effect);
             self.apply_consumer_offset_commit(effect.pending);
+        }
+        if let Some(emptied_at) = pending.emptied_at {
+            self.durable_consumer_offsets.set_emptied_at(emptied_at);
         }
         let mut retirements = pending.retirements.into_iter().peekable();
         let mut committed = Vec::with_capacity(entries.len());
@@ -10072,7 +10372,7 @@ where
                     | Operation::DeleteConsumerOffset
                     | Operation::InstallConsumerGroupOwner
                     | Operation::RetireConsumerGroupOwners
-            ) && (header.partition_incarnation != self.created_revision
+            ) && (header.partition_incarnation != self.created_revision()
                 || self.history_deleted())
             {
                 self.fence_failed_commit(*header);
@@ -11317,13 +11617,20 @@ where
         nth_oldest_sealed_end(self.log.segments(), count)
     }
 
+    /// Settle the session floor that a `RangeEvicted` reply reports.
+    pub const fn note_repair_floor(&mut self, floor: u64) {
+        if let Some(session) = self.repair.as_mut() {
+            session.floor = Some(floor);
+        }
+    }
+
     /// Ingest one repaired prepare: journal + stage it exactly like a live
     /// replicated op, minus the view fence, the gap check, and the ack (the
     /// op is already committed cluster-wide; there is nobody to ack to). The
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
         let header = *message.header();
-        if !self.prepare_history_available(&header) {
+        if self.view_truncation_pending() || !self.prepare_history_available(&header) {
             return;
         }
         let Some(session) = self.repair else {
@@ -11346,7 +11653,10 @@ where
                 pending
                     .headers
                     .iter()
-                    .find(|expected| expected.op == header.op)
+                    .find(|expected| {
+                        expected.op == header.op
+                            && dvc_header_kind(expected) != DvcHeaderKind::Blank
+                    })
                     .map(|expected| expected.checksum)
             })
             .flatten();
@@ -11355,11 +11665,19 @@ where
         {
             return;
         }
-        // Any in-window frame proves the stream is alive; only silence
-        // should age the stall counter or spend the rotation budget.
+        // A held frame is no progress: a peer that re-serves the same chunk
+        // every round must still spend the budget, or it cannot be rotated
+        // away from.
+        if let Some(held) = self.log.journal().inner.header_by_op(header.op) {
+            if held.checksum == header.checksum {
+                self.consensus.note_repaired_view_header(header);
+            }
+            return;
+        }
+        // Any other in-window frame proves the stream is alive; only silence
+        // should age the stall counter.
         if let Some(session) = self.repair.as_mut() {
             session.idle_ticks = 0;
-            self.repair_attempts = 0;
         }
         if self.materialization_missing
             || self.transition.is_some()
@@ -11368,27 +11686,13 @@ where
             || self.maintenance.flush_drain.is_some()
             || self.maintenance.shutdown.is_some()
         {
-            return;
-        }
-        if self.log.journal().inner.holds_op(header.op) {
+            // The pause keeps this frame out of the journal, not a fault in
+            // the frame, so it still refunds the budget.
+            self.restart_repair_budget();
             return;
         }
         let applied = if header.operation == Operation::SendMessages {
-            match self.append_repaired_send_messages(message).await {
-                Ok(base_offset) => {
-                    if header.op <= session.commit_to_op
-                        && let Some(session) = self.repair.as_mut()
-                    {
-                        session.first_batch_offset = Some(
-                            session
-                                .first_batch_offset
-                                .map_or(base_offset, |first| first.min(base_offset)),
-                        );
-                    }
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
+            self.append_repaired_send_messages(message).await
         } else {
             self.apply_replicated_operation(message).await.map(|_| ())
         };
@@ -11403,6 +11707,11 @@ where
             );
             return;
         }
+        // A frame the journal refuses is no progress: it stays not held, so
+        // its peer serves it again every round, and a refund per serve would
+        // pin the session to that peer.
+        self.restart_repair_budget();
+        self.consensus.note_repaired_view_header(header);
         self.persist_repaired_prefix();
         // Advance the sequencer only along the CONTIGUOUS journaled
         // frontier. DVC advertises `op = sequencer.current_sequence()` and
@@ -11450,6 +11759,24 @@ where
                 .repaired_window_shape(self.consensus().commit_min(), floor)
                 .complete
         });
+        self.persist_repaired_prefix();
+        // With a prepare WAL every op in `(commit_min, head]` is resident, so a
+        // floor the filter kept is above the head. The WAL grows only at
+        // `head + 1` and the peer retains nothing at or below the floor, so
+        // this floor can never become durable here and its refusal is final.
+        if let Some(floor) = session.floor
+            && self
+                .persistence
+                .as_ref()
+                .is_some_and(|persistence| floor > persistence.head())
+        {
+            self.commit_journal(config).await;
+            self.repair = None;
+            return RepairConclusion::FloorRefused {
+                floor,
+                to_op: session.commit_to_op,
+            };
+        }
         // A floor at or below the live commit point is moot: it cannot move
         // `commit_min`, so nothing below it is skipped and the connection
         // check has no jump to guard. Verifying it could only refuse: below
@@ -11460,6 +11787,15 @@ where
             .floor
             .filter(|&floor| floor > self.consensus().commit_min())
         {
+            // Offset continuity cannot certify that recovered bytes belong to
+            // the adopted history. An evicted proof gap needs state transfer.
+            if self.consensus().view_log_unproven() {
+                self.repair = None;
+                return RepairConclusion::FloorRefused {
+                    floor,
+                    to_op: session.commit_to_op,
+                };
+            }
             // A peer may have evicted past this replica's commit frontier;
             // an unclamped floor would drive commit_min above commit_max and
             // panic the next advance.
@@ -11480,29 +11816,19 @@ where
                 .map(|durable| durable.saturating_add(1))
                 .max(self.installed_frontier);
             let committed_shape = journal.repaired_window_shape(floor, session.commit_to_op);
-            let connected = match (session.first_batch_offset, stand_in) {
+            // Read at check time, not collected per frame: the journal keeps
+            // each batch's own stamps, so a batch journaled before this floor
+            // settled anchors it as well as one served after.
+            let first_batch_offset = journal.first_batch_offset(floor, session.commit_to_op);
+            let connected = match (first_batch_offset, stand_in) {
                 (Some(first), Some(bound)) => first <= bound,
                 (Some(first), None) => first == 0,
-                // No repaired batch arrived, so there is no offset anchor to
-                // verify the floor's continuum claim against. `None` is only
-                // safe when the served window itself proves it carried no
-                // messages: every op in `(floor, to_op]` journaled and none
-                // of them `SendMessages`. Anything less -- dropped frames, or
-                // a fully evicted window -- is indistinguishable from a
-                // message range below the floor that this replica does not
-                // durably own, and accepting it would serve a holed log.
-                // A replica with no committed message transfers too: a jump
-                // would leave its counter at 0 while the group may have
-                // committed messages below the floor. Such a replica then
-                // moves its commit point only by walking each op, by a window
-                // whose first batch starts at offset 0, or by an install, so
-                // its empty offer as primary is real state.
-                (None, _) => {
-                    self.offset_frontier() > 0
-                        && floor < session.commit_to_op
-                        && committed_shape.complete
-                        && !committed_shape.holds_messages
-                }
+                // No batch above the floor, so nothing ties the floor to this
+                // replica's offsets. The floor stands only while this journal
+                // lacks an op up to the reported floor, and no shape of the
+                // window above it shows that the ops the jump skips carried no
+                // messages. Refused, the window goes to state transfer.
+                (None, _) => false,
             };
             if !connected {
                 tracing::error!(
@@ -11510,16 +11836,16 @@ where
                     plane = "partitions",
                     namespace_raw = self.namespace().inner(),
                     floor,
-                    first_batch_offset = ?session.first_batch_offset,
+                    first_batch_offset = ?first_batch_offset,
                     recovered_durable_offset = ?durable_end,
                     "refusing commit floor: repaired window does not connect \
                      to recovered durable state (needs state transfer)"
                 );
                 self.commit_journal(config).await;
                 // A refusal is DEFINITIVE only once the window itself is
-                // fully present (or provably empty): until then more frames
-                // can still lower `first_batch_offset` into connection, so
-                // the session stays armed and the stall retry re-requests.
+                // fully present (or provably empty): until then a frame can
+                // still land a lower first batch that connects, so the
+                // session stays armed and the stall retry re-requests.
                 // A complete window that still cannot connect will never
                 // improve -- the peer retains nothing below the floor and
                 // this replica holds nothing either -- and an EMPTY window
@@ -11540,8 +11866,12 @@ where
                 self.consensus().set_commit_floor(floor);
             }
         }
-        if let Some(conclusion) = self.repair_persistence_pending(session) {
-            return conclusion;
+        if self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| !persistence.is_durable_through(session.fetch_to_op))
+        {
+            return RepairConclusion::InProgress;
         }
         let before = self.consensus().commit_min();
         self.commit_journal(config).await;
@@ -11599,26 +11929,6 @@ where
         }
     }
 
-    fn repair_persistence_pending(&mut self, session: RepairSession) -> Option<RepairConclusion> {
-        if let Some(persistence) = &self.persistence {
-            self.persist_repaired_prefix();
-            if session
-                .floor
-                .is_some_and(|floor| floor > persistence.head())
-            {
-                self.repair = None;
-                return Some(RepairConclusion::FloorRefused {
-                    floor: session.floor.unwrap_or(0),
-                    to_op: session.commit_to_op,
-                });
-            }
-            if !persistence.is_durable_through(session.fetch_to_op) {
-                return Some(RepairConclusion::InProgress);
-            }
-        }
-        None
-    }
-
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
     /// batch stamps. A stored prepare was stamped by `append_messages` on
     /// the serving replica BEFORE it was journaled, so its `base_offset` /
@@ -11631,7 +11941,7 @@ where
     async fn append_repaired_send_messages(
         &mut self,
         message: Message<PrepareHeader>,
-    ) -> Result<u64, IggyError> {
+    ) -> Result<(), IggyError> {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
         if !self.prepare_history_available(message.header()) {
@@ -11689,21 +11999,21 @@ where
             .store(dirty.max(last_offset), Ordering::Relaxed);
         self.log.segments_mut()[segment_index].current_position = next_position;
         self.log.journal_mut().info = journal_info;
-        Ok(base_offset)
+        Ok(())
     }
 
-    /// Admission and queue promotion share this rule. Session retirement
-    /// carries no incarnation, and a lifecycle fence names its incarnation in
-    /// its body, which admission checks.
+    /// Retirement requests name sessions rather than histories; their prepares
+    /// carry this partition's incarnation. A lifecycle fence names its
+    /// incarnation in its body, which admission checks.
     fn request_history_available(&self, header: &RoutedRequestHeader) -> bool {
         header.operation == Operation::RetireSession
             || header.operation.is_partition_lifecycle()
-            || (header.partition_incarnation == self.created_revision && !self.history_deleted())
+            || (header.partition_incarnation == self.created_revision() && !self.history_deleted())
     }
 
-    fn prepare_history_available(&self, header: &PrepareHeader) -> bool {
-        header.operation == Operation::RetireSession
-            || (header.partition_incarnation == self.created_revision && !self.history_deleted())
+    const fn prepare_history_available(&self, header: &PrepareHeader) -> bool {
+        header.partition_incarnation == self.created_revision()
+            && (matches!(header.operation, Operation::RetireSession) || !self.history_deleted())
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) -> bool {
@@ -12212,7 +12522,7 @@ mod tests {
     use super::*;
     use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
     use crate::iggy_index_reader::IggyIndexReader;
-    use crate::offset_storage::persist_offset;
+    use crate::offset_storage::{OffsetRecord, decode_offset_record, persist_offset};
     use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
     use crate::{IggyIndexWriter, MessagesWriter};
     use bytes::{Bytes, BytesMut};
@@ -12223,7 +12533,9 @@ mod tests {
         Command, CommitHeader, ReplyHeader, StartViewHeader, WireConsumer, WireEncode, WireName,
     };
     use journal::DurableAppend;
-    use journal::durable_storage::DiskStorage;
+    use journal::durable_storage::{
+        DiskStorage, DurableStorage, OpenMode, RegularFiles, StorageEntry,
+    };
     use message_bus::{BusMessage, SendError};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Owned;
@@ -12744,6 +13056,7 @@ mod tests {
                     prepare_checksum: Some(prepare.header().checksum),
                     checkpoint_prepare: prepare.as_slice().to_vec(),
                     next_offset: 1,
+                    emptied_at: 0,
                     consumers: Vec::new(),
                     groups: Vec::new(),
                     external_groups: Vec::new(),
@@ -12814,6 +13127,7 @@ mod tests {
             prepare_checksum: Some(last.header().checksum),
             checkpoint_prepare: last.as_slice().to_vec(),
             next_offset: 3,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -12863,6 +13177,7 @@ mod tests {
             prepare_checksum: Some(checksum),
             checkpoint_prepare: prepare.as_slice().to_vec(),
             next_offset: 1,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -13046,6 +13361,7 @@ mod tests {
             prepare_checksum: Some(prepare.header().checksum),
             checkpoint_prepare: prepare.as_slice().to_vec(),
             next_offset: 1,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -14057,6 +14373,37 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_discarded_suffix_with_an_offset_gap_when_truncated_should_reuse_the_retained_frontier()
+     {
+        let mut partition = partition_at_view(0, 0);
+        let retained = checksummed_segment_prepare(1, 0, 0, b"retained");
+        let parent = retained.header().checksum;
+        partition
+            .append_repaired_send_messages(retained)
+            .await
+            .unwrap();
+        let discarded = checksummed_segment_prepare(3, parent, 2, b"discarded");
+        partition
+            .append_repaired_send_messages(discarded)
+            .await
+            .unwrap();
+        partition.consensus.sequencer().set_sequence(3);
+
+        partition.truncate_uncommitted_from(2).await.unwrap();
+
+        assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 0);
+        let replacement = checksummed_segment_prepare(2, parent, 1, b"replacement");
+        partition
+            .append_received_send_messages_to_journal(replacement)
+            .await
+            .unwrap();
+        assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 1);
+        assert!(partition.log.journal().inner.holds_op(1));
+        assert!(partition.log.journal().inner.holds_op(2));
+        assert!(!partition.log.journal().inner.holds_op(3));
+    }
+
+    #[compio::test]
     async fn live_wal_rollback_preserves_replacement_indexes_and_pollable_bodies() {
         let root = tempfile::tempdir().unwrap();
         let mut config = repair_config();
@@ -15000,6 +15347,169 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_foreign_session_retirement_when_replicated_or_repaired_should_preserve_current_history()
+     {
+        const INCARNATION: u64 = 7;
+        const COMMITTED_ELSEWHERE: u64 = 14;
+        const NEXT_OP: u64 = 1;
+        let (mut primary, _) = recording_partition_at(0, 3);
+        primary.set_created_revision(INCARNATION);
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 1,
+        };
+        primary
+            .on_request(retire_session_request(primary.namespace(), identity), None)
+            .await;
+        let bytes = primary.log.journal().inner.repair_entry(NEXT_OP).unwrap();
+        let mut valid = Message::<PrepareHeader>::new(bytes.len());
+        valid.as_mut_slice().copy_from_slice(bytes.as_slice());
+        assert_eq!(valid.header().partition_incarnation, INCARNATION);
+
+        for repaired in [false, true] {
+            let (mut backup, _) = recording_partition_at(1, 3);
+            backup.set_created_revision(INCARNATION);
+            if repaired {
+                backup.repair = Some(armed_session(NEXT_OP, 0));
+            }
+            for foreign in [0, INCARNATION - 1, INCARNATION + 1] {
+                for commit in [0, COMMITTED_ELSEWHERE] {
+                    let message = consensus::seal_prepare_checksum(valid.clone().transmute_header(
+                        |mut original, header: &mut PrepareHeader| {
+                            original.partition_incarnation = foreign;
+                            original.commit = commit;
+                            original.op = commit + NEXT_OP;
+                            *header = original;
+                        },
+                    ));
+                    if repaired {
+                        backup.apply_repaired_prepare(message).await;
+                    } else {
+                        backup.on_replicate(message).await;
+                    }
+                    assert_eq!(backup.consensus().commit_max(), 0);
+                    assert_eq!(backup.consensus().sequencer().current_sequence(), 0);
+                    assert!(
+                        backup
+                            .log
+                            .journal()
+                            .inner
+                            .header_by_op(commit + NEXT_OP)
+                            .is_none()
+                    );
+                    assert!(!backup.session_retired(identity));
+                }
+            }
+            if repaired {
+                backup.apply_repaired_prepare(valid.clone()).await;
+            } else {
+                backup.on_replicate(valid.clone()).await;
+            }
+            assert!(
+                backup.log.journal().inner.header_by_op(NEXT_OP).is_some(),
+                "a retirement of the hosted incarnation must still enter the journal"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_deleted_history_when_retirement_is_replicated_or_repaired_should_commit_it() {
+        const FENCE_OP: u64 = 1;
+        const RETIREMENT_OP: u64 = 2;
+        let config = repair_config();
+        let directory = tempfile::tempdir().unwrap();
+        let (mut primary, _) = recording_partition_at(0, 3);
+        primary.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        let transition = TransitionPartitionHistoryRequest {
+            incarnation: primary.created_revision(),
+            metadata_op: 10,
+        };
+        primary
+            .on_request(
+                partition_control_request(
+                    &primary,
+                    Operation::TransitionPartitionHistory,
+                    &transition.to_bytes(),
+                    transition.metadata_op,
+                ),
+                None,
+            )
+            .await;
+        primary.consensus.advance_commit_max(FENCE_OP);
+        primary.commit_journal(&config).await;
+        assert!(primary.history_deleted());
+        let bytes = primary.log.journal().inner.repair_entry(FENCE_OP).unwrap();
+        let fence =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(bytes.as_slice())).unwrap();
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 20,
+        };
+        assert!(primary.session_retired(identity));
+        primary
+            .on_request(retire_session_request(primary.namespace(), identity), None)
+            .await;
+        let bytes = primary
+            .log
+            .journal()
+            .inner
+            .repair_entry(RETIREMENT_OP)
+            .expect("retirement must remain journaled after the terminal fence");
+        let retirement =
+            Message::<PrepareHeader>::try_from(Owned::copy_from_slice(bytes.as_slice())).unwrap();
+
+        for repaired in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut backup, _) = recording_partition_at(1, 3);
+            backup.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            backup.on_replicate(fence.clone()).await;
+            backup.consensus.advance_commit_max(FENCE_OP);
+            backup.commit_journal(&config).await;
+            assert!(backup.history_deleted());
+            if repaired {
+                backup.repair = Some(armed_session(RETIREMENT_OP, 0));
+                backup.apply_repaired_prepare(retirement.clone()).await;
+            } else {
+                backup.on_replicate(retirement.clone()).await;
+            }
+            assert!(
+                backup.log.journal().inner.holds_op(RETIREMENT_OP),
+                "retirement after the delete fence must reach the backup, repaired={repaired}"
+            );
+            backup.consensus.advance_commit_max(RETIREMENT_OP);
+            backup.commit_journal(&config).await;
+            assert_eq!(backup.consensus.commit_min(), RETIREMENT_OP);
+            assert!(backup.session_retired(identity));
+            assert!(backup.fatal().is_none());
+        }
+    }
+
+    #[compio::test]
+    async fn given_unpublished_delete_fence_when_checking_retirement_should_wait_for_commit() {
+        let mut partition = test_partition();
+        let identity = SessionIdentity {
+            client_id: 1,
+            session: 1,
+            metadata_watermark: 20,
+        };
+        partition
+            .apply_history_transition(
+                TransitionPartitionHistoryRequest {
+                    incarnation: partition.created_revision(),
+                    metadata_op: 10,
+                },
+                1,
+            )
+            .unwrap();
+        assert!(!partition.session_retired(identity));
+        partition.consensus.advance_commit_max(1);
+        partition.consensus.advance_commit_min(1);
+        assert!(partition.session_retired(identity));
+    }
+
+    #[compio::test]
     async fn given_queued_session_retirement_when_promoted_at_a_live_incarnation_should_prepare_it()
     {
         const INCARNATION: u64 = 7;
@@ -15037,6 +15547,7 @@ mod tests {
         assert_eq!(partition.consensus().request_queue_len(), 0);
         let promoted = partition.consensus.pipeline_head_header().unwrap();
         assert_eq!(promoted.operation, Operation::RetireSession);
+        assert_eq!(promoted.partition_incarnation, INCARNATION);
         for (_, reply) in replies.borrow().iter() {
             let header = bytemuck::checked::from_bytes::<ReplyHeader>(
                 &reply.as_slice()[..size_of::<ReplyHeader>()],
@@ -15254,6 +15765,7 @@ mod tests {
             prepare_checksum: Some(first.header().checksum),
             checkpoint_prepare: first.as_slice().to_vec(),
             next_offset: 1,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -15622,7 +16134,7 @@ mod tests {
                 .consensus()
                 .handle_start_view(PlaneKind::Partitions, start.header(), &[]);
             assert!(!partition.consensus().view_log_is_pending());
-            partition.repair = Some(armed_fetch_session(0, 3, 0, None));
+            partition.repair = Some(armed_fetch_session(0, 3, 0));
             partition.apply_repaired_prepare(first.clone()).await;
             assert!(
                 !partition.log.journal().inner.holds_op(1),
@@ -16020,6 +16532,7 @@ mod tests {
                     prepare_checksum: Some(transferred.header().checksum),
                     checkpoint_prepare: transferred.as_slice().to_vec(),
                     next_offset: 2,
+                    emptied_at: 0,
                     consumers: Vec::new(),
                     groups: Vec::new(),
                     external_groups: Vec::new(),
@@ -16055,7 +16568,7 @@ mod tests {
             let (recovered, _) = crate::persistence::PartitionPersistence::open_with_storage(
                 &directory.join("prepares-0"),
                 reopened.namespace().inner(),
-                reopened.created_revision,
+                reopened.created_revision(),
                 journal::durable_storage::DiskStorage,
             )
             .await
@@ -16305,7 +16818,7 @@ mod tests {
     ) {
         let mut checkpoint = Box::new(partition_at_view(0, 0));
         checkpoint.set_partition_dir(partition.partition_dir.clone().unwrap());
-        checkpoint.set_created_revision(partition.created_revision);
+        checkpoint.set_created_revision(partition.created_revision());
         checkpoint
             .consensus()
             .restore_commit_state(through, through);
@@ -16365,7 +16878,7 @@ mod tests {
         let mut cursor = consensus::le_cursor::LeCursor::new(content);
         cursor.take(size_of::<[u8; 4]>()).unwrap();
         assert_eq!(cursor.u64().unwrap(), partition.consensus().group());
-        assert_eq!(cursor.u64().unwrap(), partition.created_revision);
+        assert_eq!(cursor.u64().unwrap(), partition.created_revision());
         assert_eq!(cursor.u64().unwrap(), CHECKPOINT_OP);
         let wire = crate::state_transfer::ConsumerOffsetsWire::decode(cursor.remaining()).unwrap();
         assert!(wire.consumers.is_empty() && wire.groups.is_empty());
@@ -16390,8 +16903,7 @@ mod tests {
         const CLIENT_ID: u128 = 42;
         let mut partition = test_partition();
         install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
-        let owner = partition.consumer_group_owner(GROUP_ID).unwrap();
-        assert!(partition.consumer_group_drained(GROUP_ID, owner));
+        assert!(partition.consumer_group_drained(GROUP_ID));
         let read = partition
             .build_poll_plan(
                 PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0),
@@ -16399,10 +16911,10 @@ mod tests {
                 false,
             )
             .execute_resident();
-        assert!(!partition.consumer_group_drained(GROUP_ID, owner));
+        assert!(!partition.consumer_group_drained(GROUP_ID));
         assert!(read.fragments.is_empty());
         partition.complete_poll(read).unwrap();
-        assert!(partition.consumer_group_drained(GROUP_ID, owner));
+        assert!(partition.consumer_group_drained(GROUP_ID));
         let read = poll_read_result(
             &partition,
             PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0),
@@ -16410,13 +16922,40 @@ mod tests {
             Some(0),
         );
         partition.complete_poll(read).unwrap();
-        assert!(!partition.consumer_group_drained(GROUP_ID, owner));
+        assert!(!partition.consumer_group_drained(GROUP_ID));
         partition.consensus.set_view(1);
         partition.resynchronize_consumer_offset_reservations();
-        assert!(!partition.consumer_group_drained(GROUP_ID, owner));
+        assert!(!partition.consumer_group_drained(GROUP_ID));
         install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
-        let owner = partition.consumer_group_owner(GROUP_ID).unwrap();
-        assert!(partition.consumer_group_drained(GROUP_ID, owner));
+        assert!(partition.consumer_group_drained(GROUP_ID));
+    }
+
+    #[compio::test]
+    async fn given_recorded_last_polled_when_owner_install_applies_should_clear_it() {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const POLLED_OFFSET: u64 = 0;
+        let mut partition = test_partition();
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let read = poll_read_result(
+            &partition,
+            PollingConsumer::ConsumerGroup(usize::try_from(GROUP_ID).unwrap(), 0),
+            false,
+            Some(POLLED_OFFSET),
+        );
+        partition.complete_poll(read).unwrap();
+        assert_eq!(
+            partition.group_offset_state(GROUP_ID).0,
+            Some(POLLED_OFFSET)
+        );
+
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID + 1).await;
+
+        assert_eq!(
+            partition.group_offset_state(GROUP_ID).0,
+            None,
+            "a new owner must not inherit the last polled offset"
+        );
     }
 
     #[compio::test]
@@ -16702,6 +17241,73 @@ mod tests {
         assert_eq!(partition.group_offset_state(first.group_id).1, Some(0));
     }
 
+    /// A store without a poll position carries owner 0. It binds to the
+    /// installed owner only from that owner's client and session, and only
+    /// when the writer routed by metadata that already decided the install.
+    /// Any other owner-0 store stays refused, so a store never lands under an
+    /// owner its writer did not see.
+    #[compio::test]
+    async fn given_owner_zero_store_when_admitted_should_bind_only_the_installed_owner_it_routed_by()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const STORED_OFFSET: u64 = 0;
+        let group = u32::try_from(GROUP_ID).unwrap();
+        let mut partition = test_partition();
+        partition.stats.increment_messages_count(1);
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let installed = partition.consumer_group_owners[&GROUP_ID].installation;
+        let frontier = partition.required_metadata_frontier;
+        assert!(installed.metadata_op <= frontier);
+        let store = |request: u64, session: u64, minimum_metadata_op: u64| {
+            store_offset_request(
+                CLIENT_ID,
+                request,
+                ConsumerKind::ConsumerGroup,
+                group,
+                STORED_OFFSET,
+                AckLevel::Quorum,
+            )
+            .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+                header.session = session;
+                header.metadata_watermark = frontier;
+                header.minimum_metadata_op = minimum_metadata_op;
+                *next = header;
+            })
+        };
+        let head = partition.consensus.sequencer().current_sequence();
+
+        for (request, session, minimum_metadata_op) in [
+            (1, installed.owner.session, installed.metadata_op - 1),
+            (2, installed.owner.session + 1, installed.metadata_op),
+        ] {
+            let (sender, receiver) = consensus::oneshot_channel();
+            partition
+                .on_request(store(request, session, minimum_metadata_op), Some(sender))
+                .await;
+            assert_eq!(
+                receiver.await.unwrap().header().status,
+                IggyError::ConsumerGroupPartitionNotOwned(group, 0).as_code(),
+                "session {session} routed by op {minimum_metadata_op} must not bind"
+            );
+        }
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head);
+
+        partition
+            .on_request(
+                store(3, installed.owner.session, installed.metadata_op),
+                None,
+            )
+            .await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head + 1);
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(
+            partition.group_offset_state(GROUP_ID).1,
+            Some(STORED_OFFSET)
+        );
+    }
+
     /// An install wipes the log above its commit op. A barrier left at an
     /// install it dropped would hold the installed owner until commits pass that
     /// op, and the auto-commits it refuses are all an idle group would commit.
@@ -16867,7 +17473,7 @@ mod tests {
         let head = origin.consensus.sequencer().current_sequence();
         assert_eq!(head, installed_op + 2);
 
-        partition.repair = Some(armed_session(head, installed_op, None));
+        partition.repair = Some(armed_session(head, installed_op));
         for op in [head, head - 1] {
             partition
                 .apply_repaired_prepare(retained_prepare(&origin, op))
@@ -17215,6 +17821,89 @@ mod tests {
         assert_eq!(partition.consumer_group_owner(0), Some(installation.owner));
     }
 
+    /// A user revocation can decide two owners at one op, and a reader can
+    /// install the first. The second must fail admission, not its commit.
+    #[compio::test]
+    async fn given_two_owner_decisions_in_one_op_when_the_second_install_arrives_should_refuse_at_admission()
+     {
+        const GROUP_ID: u64 = 7;
+        const DECISION_OP: u64 = 5;
+        let mut partition = test_partition();
+        let config = repair_config();
+        let incarnation = partition.created_revision();
+        let installation = |client_id, generation| InstallConsumerGroupOwnerRequest {
+            incarnation,
+            group_id: GROUP_ID,
+            owner: ConsumerGroupOwner {
+                client_id,
+                session: 1,
+                generation,
+            },
+            metadata_op: generation,
+        };
+        let installed = installation(42, DECISION_OP);
+        partition
+            .on_request(owner_install_request(&partition, &installed), None)
+            .await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
+        partition.consensus.advance_commit_max(1);
+        partition.commit_journal(&config).await;
+        assert_eq!(
+            partition.consumer_group_owner(GROUP_ID),
+            Some(installed.owner)
+        );
+
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(
+                owner_install_request(&partition, &installation(43, DECISION_OP)),
+                Some(sender),
+            )
+            .await;
+        // A prepared install answers only at its commit, so check the
+        // sequencer before awaiting the reply.
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            1,
+            "a conflicting install must not be prepared"
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::InvalidCommand.as_code()
+        );
+        assert!(partition.pending_owner_install.get().is_none());
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(
+            partition.consumer_group_owner(GROUP_ID),
+            Some(installed.owner)
+        );
+
+        let higher = installation(45, DECISION_OP + 1);
+        for (admitted, owner) in [
+            (installation(44, DECISION_OP - 1), installed.owner),
+            (installed, installed.owner),
+            (higher, higher.owner),
+        ] {
+            let op = partition.consensus.sequencer().current_sequence() + 1;
+            partition
+                .on_request(owner_install_request(&partition, &admitted), None)
+                .await;
+            assert_eq!(
+                partition.consensus.sequencer().current_sequence(),
+                op,
+                "{admitted:?}"
+            );
+            partition.consensus.advance_commit_max(op);
+            partition.commit_journal(&config).await;
+            assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+            assert_eq!(
+                partition.consumer_group_owner(GROUP_ID),
+                Some(owner),
+                "{admitted:?}"
+            );
+        }
+    }
+
     #[compio::test]
     async fn given_confirmed_group_deletion_when_retired_and_restarted_should_reject_late_owner() {
         const LIVE_GROUP_ID: u64 = 1;
@@ -17303,6 +17992,767 @@ mod tests {
         );
         install_test_owner(&mut recovered, DELETED_GROUP_ID + 1, CLIENT_ID).await;
         assert_eq!(recovered.consumer_group_owners.len(), 2);
+    }
+
+    #[compio::test]
+    async fn given_retired_owner_with_group_offset_when_catalog_arrives_should_refuse_until_offset_is_deleted()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const STORED_OFFSET: u64 = 7;
+        let mut partition = test_partition();
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let fence = install_unassigned_test_owner(&mut partition, GROUP_ID).await;
+        let offset_key = u32::try_from(GROUP_ID).unwrap();
+        partition.seed_recovered_consumer_offset(
+            ConsumerKind::ConsumerGroup,
+            offset_key,
+            STORED_OFFSET,
+            STORED_OFFSET,
+        );
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: GROUP_ID + 1,
+            live_group_ids: Vec::new(),
+        };
+        let head = partition.consensus.sequencer().current_sequence();
+
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(owner_retirement_request(&partition, &catalog), Some(sender))
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "a catalog must wait while a group it retires has an offset"
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+
+        partition
+            .on_request(fenced_group_offset_delete(&fence), None)
+            .await;
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert!(
+            !partition
+                .durable_consumer_offsets
+                .contains(ConsumerKind::ConsumerGroup, offset_key)
+        );
+
+        partition
+            .on_request(owner_retirement_request(&partition, &catalog), None)
+            .await;
+        assert_eq!(partition.consensus.sequencer().current_sequence(), head + 2);
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert!(!partition.consumer_group_owners.contains_key(&GROUP_ID));
+        assert_eq!(partition.owner_retirement, Some(catalog));
+    }
+
+    /// A boot loads offset files that can be newer than its checkpoint, so two
+    /// replicas can apply one catalog with different offsets.
+    #[test]
+    fn given_replicas_with_different_offset_files_when_catalog_applies_should_keep_identical_owners()
+     {
+        const LIVE_GROUP_ID: u64 = 1;
+        const RETIRED_GROUP_ID: u64 = 2;
+        const STORED_OFFSET: u64 = 7;
+        let mut with_offset = test_partition();
+        let mut without_offset = test_partition();
+        let live = InstallConsumerGroupOwnerRequest {
+            incarnation: with_offset.created_revision(),
+            group_id: LIVE_GROUP_ID,
+            owner: ConsumerGroupOwner {
+                client_id: 42,
+                session: 1,
+                generation: 1,
+            },
+            metadata_op: 1,
+        };
+        let retired = InstallConsumerGroupOwnerRequest {
+            group_id: RETIRED_GROUP_ID,
+            owner: ConsumerGroupOwner {
+                client_id: 0,
+                session: 0,
+                generation: 2,
+            },
+            metadata_op: 2,
+            ..live
+        };
+        for (partition_op, installation) in (1..).zip([live, retired]) {
+            for replica in [&mut with_offset, &mut without_offset] {
+                replica
+                    .apply_consumer_group_owner(installation, partition_op)
+                    .unwrap();
+            }
+        }
+        with_offset.seed_recovered_consumer_offset(
+            ConsumerKind::ConsumerGroup,
+            u32::try_from(RETIRED_GROUP_ID).unwrap(),
+            STORED_OFFSET,
+            STORED_OFFSET,
+        );
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: live.incarnation,
+            metadata_op: retired.metadata_op + 1,
+            next_group_id: RETIRED_GROUP_ID + 1,
+            live_group_ids: vec![LIVE_GROUP_ID],
+        };
+
+        for replica in [&mut with_offset, &mut without_offset] {
+            replica
+                .apply_consumer_group_owner_retirement(catalog.clone())
+                .unwrap();
+        }
+        let owners = [&with_offset, &without_offset].map(|replica| {
+            replica
+                .consumer_group_owners
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(owners[0], owners[1], "replicas diverged on one catalog");
+        assert_eq!(owners[0], [LIVE_GROUP_ID]);
+    }
+
+    /// A failed `NoAck` write strands a durable group offset. The reconciler
+    /// sends no delete for it until a restart, a transfer or a later write
+    /// clears the mark, and the other deleted groups must not wait for that.
+    #[compio::test]
+    async fn given_stranded_offset_of_deleted_group_when_retiring_should_keep_it_until_the_mark_clears()
+     {
+        const STRANDED_GROUP_ID: u64 = 7;
+        const FREE_GROUP_ID: u64 = 8;
+        const CLIENT_ID: u128 = 42;
+        const STORED_OFFSET: u64 = 7;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("prepares-0")).unwrap();
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        install_test_owner(&mut partition, STRANDED_GROUP_ID, CLIENT_ID).await;
+        install_test_owner(&mut partition, FREE_GROUP_ID, CLIENT_ID).await;
+        let offset_key = u32::try_from(STRANDED_GROUP_ID).unwrap();
+        partition.seed_recovered_consumer_offset(
+            ConsumerKind::ConsumerGroup,
+            offset_key,
+            STORED_OFFSET,
+            STORED_OFFSET,
+        );
+        partition
+            .consumer_offset_capacity_for(ConsumerKind::ConsumerGroup)
+            .record_stranded(offset_key);
+        let fence = install_unassigned_test_owner(&mut partition, STRANDED_GROUP_ID).await;
+        install_unassigned_test_owner(&mut partition, FREE_GROUP_ID).await;
+        let is_live = |group_id| group_id > FREE_GROUP_ID;
+
+        assert_eq!(
+            partition.dead_group_offset_keys(is_live),
+            Vec::<(ConsumerKind, u32)>::new()
+        );
+        assert_eq!(
+            partition.retirement_kept_groups(is_live),
+            Some(vec![STRANDED_GROUP_ID]),
+            "the free group must not wait for a stranded offset"
+        );
+        let keeping = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: FREE_GROUP_ID + 1,
+            live_group_ids: vec![STRANDED_GROUP_ID],
+        };
+        partition
+            .on_request(owner_retirement_request(&partition, &keeping), None)
+            .await;
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(
+            partition
+                .consumer_group_owners
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [STRANDED_GROUP_ID]
+        );
+        let checkpoint = partition.consensus.commit_min();
+        partition
+            .persist_retry_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        drop(partition);
+
+        // The restart loads the offset file again, with no stranded mark.
+        let mut recovered = test_partition();
+        recovered.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        recovered
+            .restore_retry_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        recovered
+            .consensus
+            .restore_commit_state(checkpoint, checkpoint);
+        recovered.consensus.sequencer().set_sequence(checkpoint);
+        recovered.seed_recovered_consumer_offset(
+            ConsumerKind::ConsumerGroup,
+            offset_key,
+            STORED_OFFSET,
+            STORED_OFFSET,
+        );
+        assert_eq!(recovered.retirement_kept_groups(is_live), None);
+        assert_eq!(
+            recovered.dead_group_offset_keys(is_live),
+            [(ConsumerKind::ConsumerGroup, offset_key)]
+        );
+        recovered
+            .on_request(fenced_group_offset_delete(&fence), None)
+            .await;
+        commit_log(&mut recovered).await;
+        assert_eq!(recovered.retirement_kept_groups(is_live), Some(Vec::new()));
+        let retiring = RetireConsumerGroupOwnersRequest {
+            live_group_ids: Vec::new(),
+            ..keeping
+        };
+        recovered
+            .on_request(owner_retirement_request(&recovered, &retiring), None)
+            .await;
+        commit_log(&mut recovered).await;
+        assert!(recovered.fatal().is_none(), "{:?}", recovered.fatal());
+        assert!(recovered.consumer_group_owners.is_empty());
+        assert_eq!(recovered.owner_retirement, Some(retiring));
+    }
+
+    /// A boot that cannot read a group offset file, or a `NoAck` delete whose
+    /// directory sync fails, strands the key with no durable entry. The group
+    /// retires at once, and when a later boot loads that file, the cleanup of
+    /// a retired group deletes it with no owner row.
+    #[compio::test]
+    async fn given_unloaded_offset_of_deleted_group_when_a_later_boot_loads_it_should_stay_deletable()
+     {
+        const UNREAD_GROUP_ID: u64 = 7;
+        const UNSYNCED_GROUP_ID: u64 = 8;
+        const FREE_GROUP_ID: u64 = 9;
+        const CLIENT_ID: u128 = 42;
+        const STORED_OFFSET: u64 = 7;
+        const STRANDED_GROUP_IDS: [u64; 2] = [UNREAD_GROUP_ID, UNSYNCED_GROUP_ID];
+        const DELETED_GROUP_IDS: [u64; 3] = [UNREAD_GROUP_ID, UNSYNCED_GROUP_ID, FREE_GROUP_ID];
+        let kind = ConsumerKind::ConsumerGroup;
+        let keys = STRANDED_GROUP_IDS.map(|group_id| u32::try_from(group_id).unwrap());
+        let [unread_key, unsynced_key] = keys;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("prepares-0")).unwrap();
+        let group_offsets = directory.path().join("groups");
+        std::fs::create_dir(&group_offsets).unwrap();
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.consumer_offset_dirs[kind.index()] =
+            Some(group_offsets.to_string_lossy().into_owned());
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
+        assert!(partition.seed_stranded_consumer_offset(kind, unread_key));
+        for group_id in DELETED_GROUP_IDS {
+            install_test_owner(&mut partition, group_id, CLIENT_ID).await;
+        }
+        let stored = PendingConsumerOffsetCommit::upsert(kind, unsynced_key, STORED_OFFSET);
+        partition
+            .persist_consumer_offset_commit(stored)
+            .await
+            .unwrap();
+        partition.apply_consumer_offset_commit(stored);
+        partition
+            .consumer_offset_dir_sync_fault
+            .set(Some(kind.index()));
+        let delete =
+            delete_offset_request_with_ack(CLIENT_ID, 1, kind, unsynced_key, AckLevel::NoAck);
+        partition
+            .apply_consumer_offset_no_ack(
+                Box::new(*delete.header()),
+                kind,
+                unsynced_key,
+                None,
+                None,
+            )
+            .await;
+        partition.consumer_offset_dir_sync_fault.set(None);
+        assert!(!group_offsets.join(unsynced_key.to_string()).exists());
+        for key in keys {
+            assert!(!partition.durable_consumer_offsets.contains(kind, key));
+            assert!(
+                partition
+                    .consumer_offset_capacity_for(kind)
+                    .is_stranded(key)
+            );
+        }
+        for group_id in DELETED_GROUP_IDS {
+            install_unassigned_test_owner(&mut partition, group_id).await;
+        }
+        let is_live = |group_id| group_id > FREE_GROUP_ID;
+
+        assert_eq!(
+            partition.retirement_kept_groups(is_live),
+            Some(Vec::new()),
+            "a stranded key with no durable entry must not keep its deleted group"
+        );
+        let retiring = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: FREE_GROUP_ID + 1,
+            live_group_ids: Vec::new(),
+        };
+        partition
+            .on_request(owner_retirement_request(&partition, &retiring), None)
+            .await;
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert!(partition.consumer_group_owners.is_empty());
+        let checkpoint = partition.consensus.commit_min();
+        partition
+            .persist_retry_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        drop(partition);
+
+        // The later boot reads the first file, and a crash undid the unsynced
+        // unlink of the second.
+        let mut recovered = test_partition();
+        recovered.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        recovered
+            .restore_retry_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        recovered
+            .consensus
+            .restore_commit_state(checkpoint, checkpoint);
+        recovered.consensus.sequencer().set_sequence(checkpoint);
+        for key in keys {
+            recovered.seed_recovered_consumer_offset(kind, key, STORED_OFFSET, STORED_OFFSET);
+        }
+        assert!(recovered.consumer_group_owners.is_empty());
+        assert_eq!(recovered.owner_retirement, Some(retiring));
+        assert_eq!(
+            recovered.dead_group_offset_keys(is_live),
+            keys.map(|key| (kind, key))
+        );
+        for key in keys {
+            let cleanup = delete_offset_request_with_ack(
+                AUTO_COMMIT_CLIENT_ID,
+                1,
+                kind,
+                key,
+                AckLevel::Quorum,
+            );
+            recovered.on_request(cleanup, None).await;
+        }
+        commit_log(&mut recovered).await;
+        assert!(recovered.fatal().is_none(), "{:?}", recovered.fatal());
+        assert_eq!(
+            recovered.durable_consumer_offset_count(kind),
+            0,
+            "the cleanup must delete the offsets of retired groups"
+        );
+    }
+
+    /// The old primary had no copy of the group offset and prepared a catalog
+    /// that retires the group. This replica holds a copy, leads the next view
+    /// before that catalog applies, and admits the delete under the fence. The
+    /// catalog then commits first and prunes the row.
+    #[compio::test]
+    async fn given_unapplied_catalog_retiring_group_when_its_durable_offset_is_deleted_should_not_fence()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const STORED_OFFSET: u64 = 7;
+        let kind = ConsumerKind::ConsumerGroup;
+        let key = u32::try_from(GROUP_ID).unwrap();
+        let mut partition = test_partition();
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let fence = install_unassigned_test_owner(&mut partition, GROUP_ID).await;
+        partition.seed_recovered_consumer_offset(kind, key, STORED_OFFSET, STORED_OFFSET);
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: GROUP_ID + 1,
+            live_group_ids: Vec::new(),
+        };
+        let prepare = partition.pipeline_local_request(
+            owner_retirement_request(&partition, &catalog),
+            None,
+            None,
+        );
+        let catalog_op = prepare.header().op;
+        partition.on_replicate(prepare).await;
+        partition.consensus.set_view(1);
+
+        partition
+            .on_request(fenced_group_offset_delete(&fence), None)
+            .await;
+        let delete_op = partition.consensus.sequencer().current_sequence();
+        assert_eq!(
+            delete_op,
+            catalog_op + 1,
+            "the delete must be prepared behind the catalog"
+        );
+        commit_log(&mut partition).await;
+
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus.commit_min(), delete_op);
+        assert!(!partition.durable_consumer_offsets.contains(kind, key));
+        assert_eq!(partition.owner_retirement, Some(catalog));
+    }
+
+    /// A group with no owner row passes the owner check only for the
+    /// auto-commit delete of its offset, and only once the installed catalog
+    /// retires the group.
+    #[compio::test]
+    async fn given_retired_group_without_row_when_other_requests_arrive_should_refuse() {
+        const GROUP_ID: u64 = 7;
+        const UNRETIRED_KEY: u32 = 9;
+        const CLIENT_ID: u128 = 42;
+        let kind = ConsumerKind::ConsumerGroup;
+        let key = u32::try_from(GROUP_ID).unwrap();
+        let mut partition = test_partition();
+        partition.stats.increment_messages_count(1);
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        install_unassigned_test_owner(&mut partition, GROUP_ID).await;
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: GROUP_ID + 1,
+            live_group_ids: Vec::new(),
+        };
+        partition
+            .on_request(owner_retirement_request(&partition, &catalog), None)
+            .await;
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert!(partition.consumer_group_retired(GROUP_ID));
+        assert!(!partition.consumer_group_retired(u64::from(UNRETIRED_KEY)));
+        partition.seed_recovered_consumer_offset(kind, key, 0, 0);
+        partition.seed_recovered_consumer_offset(kind, UNRETIRED_KEY, 0, 0);
+        let frontier = partition.required_metadata_frontier;
+        let head = partition.consensus.sequencer().current_sequence();
+
+        // A current watermark keeps the frontier check from refusing it first.
+        let client_delete =
+            delete_offset_request_with_ack(CLIENT_ID, 1, kind, key, AckLevel::Quorum)
+                .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+                    header.metadata_watermark = frontier;
+                    *next = header;
+                });
+        partition.on_request(client_delete, None).await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "a client delete of a retired group must be refused"
+        );
+        partition
+            .on_request(
+                store_offset_request(AUTO_COMMIT_CLIENT_ID, 2, kind, key, 0, AckLevel::Quorum),
+                None,
+            )
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "a store of a retired group must be refused"
+        );
+        partition
+            .on_request(
+                delete_offset_request_with_ack(
+                    AUTO_COMMIT_CLIENT_ID,
+                    3,
+                    kind,
+                    UNRETIRED_KEY,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "a delete for a group that has no row and no retiring catalog must be refused"
+        );
+        partition
+            .on_request(
+                delete_offset_request_with_ack(
+                    AUTO_COMMIT_CLIENT_ID,
+                    4,
+                    kind,
+                    key,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head + 1,
+            "the cleanup delete of a retired group passes"
+        );
+    }
+
+    /// Each primary keeps the deleted groups it saw with a durable stranded
+    /// offset. So after a view change, a catalog can keep a group that an
+    /// earlier catalog in the log retired.
+    #[test]
+    fn given_catalog_keeping_a_retired_group_when_applied_should_keep_it_retired() {
+        const LIVE_GROUP_ID: u64 = 1;
+        const RETIRED_GROUP_ID: u64 = 2;
+        let mut partition = test_partition();
+        let live = InstallConsumerGroupOwnerRequest {
+            incarnation: partition.created_revision(),
+            group_id: LIVE_GROUP_ID,
+            owner: ConsumerGroupOwner {
+                client_id: 42,
+                session: 1,
+                generation: 1,
+            },
+            metadata_op: 1,
+        };
+        let retired = InstallConsumerGroupOwnerRequest {
+            group_id: RETIRED_GROUP_ID,
+            owner: ConsumerGroupOwner {
+                client_id: 0,
+                session: 0,
+                generation: 2,
+            },
+            metadata_op: 2,
+            ..live
+        };
+        for (partition_op, installation) in (1..).zip([live, retired]) {
+            partition
+                .apply_consumer_group_owner(installation, partition_op)
+                .unwrap();
+        }
+        let retiring = RetireConsumerGroupOwnersRequest {
+            incarnation: live.incarnation,
+            metadata_op: retired.metadata_op + 1,
+            next_group_id: RETIRED_GROUP_ID + 1,
+            live_group_ids: vec![LIVE_GROUP_ID],
+        };
+        let keeping = RetireConsumerGroupOwnersRequest {
+            live_group_ids: vec![LIVE_GROUP_ID, RETIRED_GROUP_ID],
+            ..retiring
+        };
+        let later = RetireConsumerGroupOwnersRequest {
+            metadata_op: retiring.metadata_op + 1,
+            ..keeping.clone()
+        };
+
+        for catalog in [retiring, keeping, later] {
+            let applied = partition.apply_consumer_group_owner_retirement(catalog);
+            assert!(
+                applied.is_ok(),
+                "{applied:?}: a catalog that keeps a retired group must not fence the partition"
+            );
+        }
+        partition.apply_consumer_group_owner(retired, 3).unwrap();
+        assert_eq!(
+            partition
+                .consumer_group_owners
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [LIVE_GROUP_ID],
+            "a retired group stays retired"
+        );
+    }
+
+    #[test]
+    fn given_recorded_last_polled_when_retirement_prunes_the_group_should_clear_it() {
+        const GROUP_ID: u32 = 7;
+        const POLLED_OFFSET: u64 = 3;
+        let mut partition = test_partition();
+        let fence = InstallConsumerGroupOwnerRequest {
+            incarnation: partition.created_revision(),
+            group_id: u64::from(GROUP_ID),
+            owner: ConsumerGroupOwner {
+                client_id: 0,
+                session: 0,
+                generation: 1,
+            },
+            metadata_op: 1,
+        };
+        partition.apply_consumer_group_owner(fence, 1).unwrap();
+        // The fence install clears the entry, so the test seeds it after.
+        partition.last_polled_offsets.pin().insert(
+            ConsumerGroupId(GROUP_ID as usize),
+            ConsumerOffset::new(
+                ConsumerKind::ConsumerGroup,
+                GROUP_ID,
+                POLLED_OFFSET,
+                String::new(),
+            ),
+        );
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: fence.incarnation,
+            metadata_op: fence.metadata_op + 1,
+            next_group_id: fence.group_id + 1,
+            live_group_ids: Vec::new(),
+        };
+
+        partition
+            .apply_consumer_group_owner_retirement(catalog)
+            .unwrap();
+
+        assert!(partition.consumer_group_owners.is_empty());
+        assert_eq!(
+            partition.group_offset_state(fence.group_id).0,
+            None,
+            "a retired group must not keep its last polled offset"
+        );
+    }
+
+    /// A replay starts from the owners of an older checkpoint, and the offset
+    /// files can already lack the offset that a later delete removed. A catalog
+    /// committed ahead of that delete would then prune the owner it needs.
+    #[compio::test]
+    async fn given_retirement_racing_offset_cleanup_when_replayed_from_older_checkpoint_should_not_fence_partition()
+     {
+        const GROUP_ID: u64 = 7;
+        const CLIENT_ID: u128 = 42;
+        const STORED_OFFSET: u64 = 7;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("prepares-0")).unwrap();
+        let mut partition = test_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        install_test_owner(&mut partition, GROUP_ID, CLIENT_ID).await;
+        let fence = install_unassigned_test_owner(&mut partition, GROUP_ID).await;
+        let checkpoint = partition.consensus.commit_min();
+        partition
+            .persist_retry_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        partition.seed_recovered_consumer_offset(
+            ConsumerKind::ConsumerGroup,
+            u32::try_from(GROUP_ID).unwrap(),
+            STORED_OFFSET,
+            STORED_OFFSET,
+        );
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: GROUP_ID + 1,
+            live_group_ids: Vec::new(),
+        };
+        // The reconciler can send the catalog in the pass that deletes the
+        // offset, and again in a later pass.
+        let passes = [
+            vec![
+                owner_retirement_request(&partition, &catalog),
+                fenced_group_offset_delete(&fence),
+            ],
+            vec![owner_retirement_request(&partition, &catalog)],
+        ];
+        let mut tail = Vec::new();
+        for pass in passes {
+            for request in pass {
+                partition.on_request(request, None).await;
+            }
+            // The commit walk evicts what it applied, so take the tail first.
+            let first = checkpoint + 1 + tail.len() as u64;
+            for op in first..=partition.consensus.sequencer().current_sequence() {
+                let journaled = partition.log.journal().inner.repair_entry(op).unwrap();
+                tail.push(
+                    Message::<PrepareHeader>::try_from(Owned::copy_from_slice(
+                        journaled.as_slice(),
+                    ))
+                    .unwrap(),
+                );
+            }
+            commit_log(&mut partition).await;
+            assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        }
+        let head = partition.consensus.commit_min();
+        assert_eq!(head, checkpoint + tail.len() as u64);
+        drop(partition);
+
+        let mut recovered = test_partition();
+        recovered.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        recovered
+            .restore_retry_checkpoint(checkpoint)
+            .await
+            .unwrap();
+        for prepare in tail {
+            recovered.apply_replicated_operation(prepare).await.unwrap();
+        }
+        recovered.consensus.sequencer().set_sequence(head);
+        recovered.consensus.restore_commit_state(checkpoint, head);
+        commit_log(&mut recovered).await;
+        assert!(recovered.fatal().is_none(), "{:?}", recovered.fatal());
+        assert_eq!(recovered.consensus.commit_min(), head);
+        assert_eq!(recovered.consumer_group_owner(GROUP_ID), None);
+        assert_eq!(recovered.owner_retirement, Some(catalog));
+    }
+
+    /// An install for a group that a catalog retires assigns the row again
+    /// when it commits ahead of the catalog, and the catalog apply then fences
+    /// the partition. After a view change the latch names only the last
+    /// install of the log, so the barrier must hold the catalog too.
+    #[compio::test]
+    async fn given_unapplied_install_for_retired_group_when_catalog_arrives_should_refuse_it() {
+        const LIVE_GROUP_ID: u64 = 1;
+        const RETIRED_GROUP_ID: u64 = 2;
+        const CLIENT_ID: u128 = 42;
+        let mut partition = test_partition();
+        install_test_owner(&mut partition, RETIRED_GROUP_ID, CLIENT_ID).await;
+        install_unassigned_test_owner(&mut partition, RETIRED_GROUP_ID).await;
+        let catalog = RetireConsumerGroupOwnersRequest {
+            incarnation: partition.created_revision(),
+            metadata_op: partition.required_metadata_frontier + 1,
+            next_group_id: RETIRED_GROUP_ID + 1,
+            live_group_ids: vec![LIVE_GROUP_ID],
+        };
+        let obsolete = next_test_installation(&partition, RETIRED_GROUP_ID, CLIENT_ID);
+        partition
+            .on_request(owner_install_request(&partition, &obsolete), None)
+            .await;
+        let obsolete_op = partition.consensus.sequencer().current_sequence();
+        assert_eq!(partition.pending_owner_install.get(), Some(obsolete));
+
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(owner_retirement_request(&partition, &catalog), Some(sender))
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            obsolete_op,
+            "a catalog must wait for a pending install of a group it retires"
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+
+        let live = next_test_installation(&partition, LIVE_GROUP_ID, CLIENT_ID);
+        let prepare =
+            partition.pipeline_local_request(owner_install_request(&partition, &live), None, None);
+        partition.on_replicate(prepare).await;
+        partition.consensus.set_view(1);
+        partition.resynchronize_consumer_offset_reservations();
+        assert_eq!(partition.pending_owner_install.get(), Some(live));
+        let (sender, receiver) = consensus::oneshot_channel();
+        partition
+            .on_request(owner_retirement_request(&partition, &catalog), Some(sender))
+            .await;
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            obsolete_op + 1,
+            "a catalog must wait for every install the log retains"
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::TransientNotAccepted.as_code()
+        );
+
+        commit_log(&mut partition).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(
+            partition.consumer_group_owner(RETIRED_GROUP_ID),
+            Some(obsolete.owner)
+        );
     }
 
     #[compio::test]
@@ -18530,6 +19980,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 1_030,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -19116,6 +20567,18 @@ mod tests {
         )
     }
 
+    fn owner_retirement_request<B: MessageBus>(
+        partition: &IggyPartition<B>,
+        catalog: &RetireConsumerGroupOwnersRequest,
+    ) -> Message<RoutedRequestHeader> {
+        partition_control_request(
+            partition,
+            Operation::RetireConsumerGroupOwners,
+            &catalog.to_bytes(),
+            catalog.metadata_op,
+        )
+    }
+
     fn partition_control_request<B: MessageBus>(
         partition: &IggyPartition<B>,
         operation: Operation,
@@ -19132,7 +20595,7 @@ mod tests {
                 header.request = metadata_op;
                 header.group = partition.consensus.group();
                 header.metadata_watermark = metadata_op;
-                header.partition_incarnation = partition.created_revision;
+                header.partition_incarnation = partition.created_revision();
                 header.size = u32::try_from(size).unwrap();
             },
         );
@@ -19210,7 +20673,7 @@ mod tests {
         partition.set_created_revision(INCARNATION);
         partition.consensus.restore_commit_state(1, 1);
         partition.consensus.sequencer().set_sequence(1);
-        partition.repair = Some(armed_session(2, 1, None));
+        partition.repair = Some(armed_session(2, 1));
         for incarnation in [INCARNATION - 1, INCARNATION + 1] {
             let stale =
                 valid
@@ -19293,7 +20756,7 @@ mod tests {
         replica.open_persistence().await.unwrap();
         let persistence = Rc::clone(replica.persistence.as_ref().unwrap());
         replica.consensus().advance_commit_max(to_op);
-        replica.repair = Some(armed_session(to_op, 0, None));
+        replica.repair = Some(armed_session(to_op, 0));
         for prepare in prepares {
             replica.apply_repaired_prepare(prepare).await;
         }
@@ -19398,6 +20861,21 @@ mod tests {
             Some(op)
         );
         op
+    }
+
+    /// Commit the unassigned owner that a group deletion installs as its fence.
+    async fn install_unassigned_test_owner(
+        partition: &mut IggyPartition<IggyMessageBus>,
+        group_id: u64,
+    ) -> InstallConsumerGroupOwnerRequest {
+        let mut fence = next_test_installation(partition, group_id, 0);
+        fence.owner.session = 0;
+        partition
+            .on_request(owner_install_request(partition, &fence), None)
+            .await;
+        commit_log(partition).await;
+        assert_eq!(partition.consumer_group_owner(group_id), Some(fence.owner));
+        fence
     }
 
     /// Creates an empty partition with the supplied consensus queue capacities.
@@ -19534,6 +21012,23 @@ mod tests {
         })
     }
 
+    /// The delete that offset cleanup sends for a group under its fence.
+    fn fenced_group_offset_delete(
+        fence: &InstallConsumerGroupOwnerRequest,
+    ) -> Message<RoutedRequestHeader> {
+        delete_offset_request_with_ack(
+            AUTO_COMMIT_CLIENT_ID,
+            fence.metadata_op,
+            ConsumerKind::ConsumerGroup,
+            u32::try_from(fence.group_id).unwrap(),
+            AckLevel::Quorum,
+        )
+        .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+            header.owner_generation = fence.owner.generation;
+            *next = header;
+        })
+    }
+
     fn store_offset_request(
         client_id: u128,
         request_id: u64,
@@ -19597,6 +21092,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 10,
+            emptied_at: 0,
             consumers: vec![(7, 1), (8, 2)],
             groups: vec![(9, 3)],
             external_groups: Vec::new(),
@@ -19775,7 +21271,7 @@ mod tests {
                             if owned && metadata.len() > 0 {
                                 let wal = directory
                                     .path()
-                                    .join(format!("prepares-{}", partition.created_revision));
+                                    .join(format!("prepares-{}", partition.created_revision()));
                                 assert!(
                                     std::fs::read_dir(wal).unwrap().any(|entry| entry
                                         .unwrap()
@@ -20164,15 +21660,15 @@ mod tests {
             crate::PartitionIoStep::Transition(server_common::MessageBag::StartViewChange(message))
             if message.header().view == 2));
         partition.transition = Some(PendingPartitionTransition::Truncate {
-            from_op: 3,
+            ops: 3..=u64::MAX,
             actions: Vec::new(),
             peer: None,
             drain: None,
         });
         partition.defer_view_transition(start_view(3));
         assert!(matches!(
-            partition.transition,
-            Some(PendingPartitionTransition::Truncate { from_op: 3, .. })
+            partition.transition.as_ref(),
+            Some(PendingPartitionTransition::Truncate { ops, .. }) if *ops == (3..=u64::MAX)
         ));
         partition.defer_view_transition(start_view(4));
         partition.transition = None;
@@ -21211,6 +22707,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 0,
+            emptied_at: 0,
             consumers: vec![(7, 5)],
             groups: vec![(8, 5)],
             external_groups: Vec::new(),
@@ -21549,9 +23046,11 @@ mod tests {
         assert!(offset_file.exists());
     }
 
-    /// Known residual: the replica stays refused until its group commits a message or offset store.
+    /// A replica holding an offset whose delete no peer retains catches up by
+    /// transfer. The donor's empty offer names the delete that emptied its table,
+    /// and the receiver keeps that op to serve it in turn.
     #[compio::test]
-    async fn given_counter_zero_replica_that_missed_an_evicted_offset_delete_when_transferring_should_stay_refused()
+    async fn given_counter_zero_replica_that_missed_an_evicted_offset_delete_when_transferring_should_install_and_drop_the_deleted_offset()
      {
         let donor_directory = tempfile::tempdir().unwrap();
         let (mut donor, _) = recording_partition_at(0, 3);
@@ -21601,18 +23100,54 @@ mod tests {
 
         // No peer retains the delete any more, so repair cannot reach it.
         receiver.consensus().advance_commit_max(2);
-        receiver.repair = Some(armed_session(2, 2, None));
+        receiver.repair = Some(armed_session(2, 2));
         assert_eq!(
             receiver.complete_repair(&repair_config()).await,
             RepairConclusion::FloorRefused { floor: 2, to_op: 2 }
         );
         let offer = donor.state_transfer_offer(&repair_config()).await.unwrap();
-        let refused = receiver
+        let installed = receiver
             .install_state_transfer(
                 &repair_config(),
                 offer.commit_op,
                 Vec::new(),
                 &offer.offsets.1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(installed.applied_commit_op, 2);
+        assert_eq!(receiver.consensus().commit_min(), 2);
+        assert_eq!(
+            receiver.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            None
+        );
+        assert!(!offset_file.exists());
+        assert_eq!(emptied_marker_op(receiver_directory.path()), Some(2));
+        assert_eq!(receiver.durable_consumer_offsets.emptied_at(), 2);
+    }
+
+    /// A receiver that already applied the op its donor's table was emptied at
+    /// cannot have missed that delete, so the empty offer does not explain the
+    /// offset it holds.
+    #[compio::test]
+    async fn given_receiver_at_the_emptied_op_when_offered_nothing_should_refuse() {
+        const EMPTIED_AT: u64 = 2;
+        const OFFER_COMMIT_OP: u64 = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let mut receiver = external_offset_receiver(directory.path(), EMPTIED_AT).await;
+        let emptied = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: receiver.dedup().capacity(),
+            emptied_at: EMPTIED_AT,
+            ..Default::default()
+        };
+
+        let refused = receiver
+            .install_state_transfer(
+                &repair_config(),
+                OFFER_COMMIT_OP,
+                Vec::new(),
+                &emptied.encode(),
             )
             .await;
 
@@ -21625,14 +23160,722 @@ mod tests {
                     }
                 )
             ),
-            "expected the donor's empty offer to be refused, got {refused:?}"
+            "expected the empty offer to be refused, got {refused:?}"
         );
-        assert_eq!(receiver.consensus().commit_min(), 1);
         assert_eq!(
             receiver.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
             Some(MESSAGE_LESS_EXTERNAL_OFFSET)
         );
-        assert!(offset_file.exists());
+    }
+
+    /// An emptied op past the offer's own op is not one its donor applied, so it
+    /// proves nothing about the table at the offer.
+    #[compio::test]
+    async fn given_emptied_op_past_the_offer_when_offered_nothing_should_refuse() {
+        const OFFER_COMMIT_OP: u64 = 5;
+        let directory = tempfile::tempdir().unwrap();
+        let mut receiver = external_offset_receiver(directory.path(), 1).await;
+        let ahead = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: receiver.dedup().capacity(),
+            emptied_at: OFFER_COMMIT_OP + 1,
+            ..Default::default()
+        };
+
+        let refused = receiver
+            .install_state_transfer(
+                &repair_config(),
+                OFFER_COMMIT_OP,
+                Vec::new(),
+                &ahead.encode(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(
+                    crate::state_transfer::PartitionInstallError::OfferErasesDurableOffsets {
+                        local_offsets: 1
+                    }
+                )
+            ),
+            "expected the empty offer to be refused, got {refused:?}"
+        );
+        assert_eq!(emptied_marker_op(directory.path()), None);
+    }
+
+    /// An installed table that holds offsets keeps no marker, neither the
+    /// receiver's nor one the offer names, so none can outlive the installed files.
+    #[compio::test]
+    async fn given_emptied_receiver_when_installing_offsets_should_remove_its_marker() {
+        const OFFER_COMMIT_OP: u64 = 5;
+        const OFFER_EMPTIED_AT: u64 = 4;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut receiver, _) = recording_partition_at(1, 3);
+        receiver.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut receiver, directory.path());
+        let marker = directory.path().join("offsets/emptied");
+        persist_offset(&marker.to_string_lossy(), 1, true)
+            .await
+            .unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire {
+            dedup_capacity: receiver.dedup().capacity(),
+            emptied_at: OFFER_EMPTIED_AT,
+            external_groups: vec![(MESSAGE_LESS_EXTERNAL_GROUP_ID, MESSAGE_LESS_EXTERNAL_OFFSET)],
+            ..Default::default()
+        };
+
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                OFFER_COMMIT_OP,
+                Vec::new(),
+                &offsets.encode(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(
+            receiver.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            Some(MESSAGE_LESS_EXTERNAL_OFFSET)
+        );
+    }
+
+    /// A store into an emptied table retires the marker before its file lands,
+    /// so a crash that loses the file cannot leave a marker claiming the table
+    /// is still empty.
+    #[compio::test]
+    async fn given_emptied_marker_when_an_offset_is_stored_again_should_remove_the_marker() {
+        let (directory, mut partition) = emptied_external_origin().await;
+        assert_eq!(emptied_marker_op(directory.path()), Some(2));
+
+        partition
+            .on_request(
+                store_offset_request(
+                    MESSAGE_LESS_CLIENT_ID,
+                    3,
+                    ConsumerKind::ExternalGroup,
+                    MESSAGE_LESS_EXTERNAL_GROUP_ID,
+                    MESSAGE_LESS_EXTERNAL_OFFSET,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        partition.consensus().advance_commit_max(3);
+        partition.commit_journal(&repair_config()).await;
+
+        assert_eq!(partition.consensus().commit_min(), 3);
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        let offer = partition
+            .state_transfer_offer(&repair_config())
+            .await
+            .unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire::decode(&offer.offsets.1).unwrap();
+        assert_eq!(offsets.emptied_at, 0);
+    }
+
+    /// The node-local store skips the commit walk, and it too retires the marker
+    /// before its file lands.
+    #[compio::test]
+    async fn given_no_ack_store_in_flight_when_a_send_is_queued_should_keep_the_emptied_marker_cleared()
+     {
+        let config = repair_config();
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition();
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.log.retire_front().unwrap();
+        partition.install_empty_segment(&config, 0).await.unwrap();
+        set_offset_dirs_under(&mut partition, directory.path());
+        commit_external_store_then_delete(&mut partition).await;
+        assert_eq!(emptied_marker_op(directory.path()), Some(2));
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let store = store_offset_request(
+            MESSAGE_LESS_CLIENT_ID,
+            3,
+            ConsumerKind::ExternalGroup,
+            MESSAGE_LESS_EXTERNAL_GROUP_ID,
+            MESSAGE_LESS_EXTERNAL_OFFSET,
+            AckLevel::NoAck,
+        );
+
+        partition
+            .apply_consumer_offset_no_ack(
+                Box::new(*store.header()),
+                ConsumerKind::ExternalGroup,
+                MESSAGE_LESS_EXTERNAL_GROUP_ID,
+                Some(MESSAGE_LESS_EXTERNAL_OFFSET),
+                None,
+            )
+            .await;
+        assert!(matches!(partition.drive_no_ack(), NoAckStep::Progress));
+        let store_job = partition.capture_no_ack_phase().unwrap();
+
+        let send = history_send_request(&partition, 1, partition.required_metadata_frontier);
+        partition.on_request(send, None).await;
+        partition.consensus().advance_commit_max(3);
+        assert_eq!(partition.select_persistable_commits(&config), []);
+        partition.accept_no_ack_phase(store_job.execute().await);
+
+        assert_eq!(
+            partition.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            Some(MESSAGE_LESS_EXTERNAL_OFFSET)
+        );
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(partition.durable_consumer_offsets.emptied_at(), 0);
+
+        settle_partition_io(&mut partition, &config).await;
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+        assert_eq!(partition.consensus().commit_min(), 3);
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(partition.durable_consumer_offsets.emptied_at(), 0);
+        assert!(matches!(
+            partition.state_transfer_offer(&config).await,
+            Err(crate::state_transfer::PartitionTransferUnavailable::FlushPending)
+        ));
+        settle_partition_io(&mut partition, &config).await;
+        let offer = partition.state_transfer_offer(&config).await.unwrap();
+        let offsets = crate::state_transfer::ConsumerOffsetsWire::decode(&offer.offsets.1).unwrap();
+        assert_eq!(offsets.emptied_at, 0);
+    }
+
+    /// A stranded file may hold an offset the table never loaded, so a delete of
+    /// the last loaded offset does not mark the table emptied.
+    #[compio::test]
+    async fn given_stranded_offset_when_a_delete_empties_the_table_should_not_mark_it_emptied() {
+        const STRANDED_GROUP_ID: u32 = MESSAGE_LESS_EXTERNAL_GROUP_ID + 1;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _) = recording_partition_at(0, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut partition, directory.path());
+        assert!(
+            partition.seed_stranded_consumer_offset(ConsumerKind::ExternalGroup, STRANDED_GROUP_ID)
+        );
+
+        commit_external_store_then_delete(&mut partition).await;
+
+        assert_eq!(
+            partition.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            None
+        );
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(partition.durable_consumer_offsets.emptied_at(), 0);
+    }
+
+    /// A delete that leaves another offset does not empty the table. Only the
+    /// delete of the last offset marks it, with that delete's op.
+    #[compio::test]
+    async fn given_two_offsets_when_both_are_deleted_should_mark_only_the_last_delete() {
+        const LAST_DELETE_OP: u64 = 4;
+        let (directory, mut origin) = external_origin_that_deleted_one_of_two_groups().await;
+        assert_eq!(emptied_marker_op(directory.path()), None);
+        assert_eq!(origin.durable_consumer_offsets.emptied_at(), 0);
+
+        origin
+            .on_request(
+                delete_offset_request_with_ack(
+                    MESSAGE_LESS_CLIENT_ID,
+                    LAST_DELETE_OP,
+                    ConsumerKind::ExternalGroup,
+                    LIVE_EXTERNAL_GROUP_ID,
+                    AckLevel::Quorum,
+                ),
+                None,
+            )
+            .await;
+        origin.consensus().advance_commit_max(LAST_DELETE_OP);
+        origin.commit_journal(&repair_config()).await;
+
+        assert_eq!(origin.consensus().commit_min(), LAST_DELETE_OP);
+        assert_eq!(emptied_marker_op(directory.path()), Some(LAST_DELETE_OP));
+        assert_eq!(origin.durable_consumer_offsets.emptied_at(), LAST_DELETE_OP);
+    }
+
+    /// A donor that restarts after emptying its table still proves it: boot reads
+    /// the marker back, and the offer at the checkpointed op names the delete.
+    #[compio::test]
+    async fn given_table_emptied_by_a_delete_when_the_donor_restarts_should_offer_the_emptied_op() {
+        const EMPTIED_AT: u64 = 2;
+        let (_origin_directory, origin) = emptied_external_origin().await;
+        let donor_directory = tempfile::tempdir().unwrap();
+        let (config, mut donor) = Box::pin(restarted_replica_of(
+            &origin,
+            donor_directory.path(),
+            1,
+            EMPTIED_AT,
+        ))
+        .await;
+        // A view change makes the restarted replica the primary.
+        donor.consensus.set_view(1);
+
+        let offer = donor.state_transfer_offer(&config).await.unwrap();
+
+        let offsets = crate::state_transfer::ConsumerOffsetsWire::decode(&offer.offsets.1).unwrap();
+        assert_eq!(
+            (offer.commit_op, offsets.emptied_at),
+            (EMPTIED_AT, EMPTIED_AT)
+        );
+        assert_eq!(offsets.external_groups, []);
+    }
+
+    /// A donor whose boot lost its offset files holds an empty table, so its
+    /// delete of a key that table lacks removes nothing. Its empty offer must
+    /// not name that delete, or a receiver behind it erases an offset that the
+    /// origin still holds.
+    #[compio::test]
+    async fn given_donor_that_lost_its_offset_files_when_it_deletes_an_absent_offset_should_not_erase_the_receiver_offsets()
+     {
+        const CHECKPOINT_OP: u64 = 2;
+        const DELETE_OP: u64 = 3;
+        let (_origin_directory, origin) = external_origin_that_deleted_one_of_two_groups().await;
+
+        for tear_files in [true, false] {
+            let donor_directory = tempfile::tempdir().unwrap();
+            let (config, donor) = Box::pin(restarted_replica_of(
+                &origin,
+                donor_directory.path(),
+                1,
+                CHECKPOINT_OP,
+            ))
+            .await;
+            drop(donor);
+            let offsets_dir = std::path::PathBuf::from(config.get_offsets_path(1, 1, 0));
+            if tear_files {
+                for group_id in [MESSAGE_LESS_EXTERNAL_GROUP_ID, LIVE_EXTERNAL_GROUP_ID] {
+                    let file = offsets_dir.join(format!("external_groups/{group_id}"));
+                    std::fs::write(file, []).unwrap();
+                }
+            } else {
+                std::fs::remove_dir_all(&offsets_dir).unwrap();
+            }
+            let (config, mut donor) = replica_with_prepare_history(donor_directory.path(), 1).await;
+            assert_eq!(donor.external_group_offset(LIVE_EXTERNAL_GROUP_ID), None);
+            commit_replicated_through(&mut donor, &origin, &config, DELETE_OP).await;
+            // A view change makes the restarted replica the primary.
+            donor.consensus.set_view(1);
+            let offer = donor.state_transfer_offer(&config).await.unwrap();
+            let (receiver_directory, mut receiver) = transfer_receiver();
+            for op in 1..=CHECKPOINT_OP {
+                receiver.on_replicate(retained_prepare(&origin, op)).await;
+            }
+            receiver.consensus().advance_commit_max(CHECKPOINT_OP);
+            receiver.commit_journal(&repair_config()).await;
+            assert_eq!(receiver.consensus().commit_min(), CHECKPOINT_OP);
+
+            let refused = receiver
+                .install_state_transfer(
+                    &repair_config(),
+                    offer.commit_op,
+                    Vec::new(),
+                    &offer.offsets.1,
+                )
+                .await;
+
+            assert!(
+                matches!(
+                    refused,
+                    Err(
+                        crate::state_transfer::PartitionInstallError::OfferErasesDurableOffsets {
+                            local_offsets: 2
+                        }
+                    )
+                ),
+                "files torn: {tear_files}, expected the empty offer to be refused, got {refused:?}"
+            );
+            assert_eq!(
+                receiver.external_group_offset(LIVE_EXTERNAL_GROUP_ID),
+                Some(MESSAGE_LESS_EXTERNAL_OFFSET)
+            );
+            assert!(
+                receiver_directory
+                    .path()
+                    .join(format!("offsets/external_groups/{LIVE_EXTERNAL_GROUP_ID}"))
+                    .exists()
+            );
+        }
+    }
+
+    /// Boot lost the file of one of the donor's two offsets, so its delete of
+    /// that key removes nothing and the table still holds the other. That
+    /// delete must not mark the table emptied.
+    #[compio::test]
+    async fn given_donor_that_lost_one_of_two_offset_files_when_it_deletes_that_offset_should_not_mark_the_table_emptied()
+     {
+        const CHECKPOINT_OP: u64 = 2;
+        const DELETE_OP: u64 = 3;
+        let (_origin_directory, origin) = external_origin_that_deleted_one_of_two_groups().await;
+        let donor_directory = tempfile::tempdir().unwrap();
+        let (config, donor) = Box::pin(restarted_replica_of(
+            &origin,
+            donor_directory.path(),
+            1,
+            CHECKPOINT_OP,
+        ))
+        .await;
+        drop(donor);
+        let lost_file = format!(
+            "{}/{MESSAGE_LESS_EXTERNAL_GROUP_ID}",
+            config.get_external_group_offsets_path(1, 1, 0)
+        );
+        std::fs::write(lost_file, []).unwrap();
+        let (config, mut donor) = replica_with_prepare_history(donor_directory.path(), 1).await;
+        assert_eq!(
+            donor.external_group_offset(MESSAGE_LESS_EXTERNAL_GROUP_ID),
+            None
+        );
+
+        commit_replicated_through(&mut donor, &origin, &config, DELETE_OP).await;
+
+        assert_eq!(
+            donor.external_group_offset(LIVE_EXTERNAL_GROUP_ID),
+            Some(MESSAGE_LESS_EXTERNAL_OFFSET)
+        );
+        let partition_dir = config.get_partition_path(1, 1, 0);
+        assert_eq!(
+            emptied_marker_op(std::path::Path::new(&partition_dir)),
+            None
+        );
+        assert_eq!(donor.durable_consumer_offsets.emptied_at(), 0);
+    }
+
+    /// The simulator's restart image keeps the emptied-at op, as boot reads the
+    /// marker back from disk.
+    #[compio::test]
+    async fn given_emptied_table_when_retained_across_a_restart_should_keep_the_emptied_op() {
+        let (_directory, mut origin) = emptied_external_origin().await;
+        let retained = origin.take_retained_state();
+        let (mut restarted, _) = recording_partition_at(0, 3);
+
+        restarted.adopt_retained_log(retained);
+
+        assert_eq!(restarted.durable_consumer_offsets.emptied_at(), 2);
+    }
+
+    /// A crash that beats the directory sync can bring back an offset file the
+    /// emptying delete unlinked. Boot then drops the marker instead of trusting it.
+    #[compio::test]
+    async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remove_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PartitionsConfig {
+            path_layout: crate::PartitionPathLayout {
+                streams_root: dir.path().to_string_lossy().into_owned(),
+            },
+            ..repair_config()
+        };
+        let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
+        persist_offset(&external_file, 1_000, true).await.unwrap();
+        let offsets_dir = config.get_offsets_path(1, 1, 0);
+        persist_offset(&format!("{offsets_dir}/emptied"), 2, true)
+            .await
+            .unwrap();
+        let (mut partition, _) = recording_partition();
+
+        crate::partition_storage::configure_consumer_offsets_with_storage(
+            &DiskStorage,
+            &mut partition,
+            &config,
+            IggyNamespace::new(1, 1, 0),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(partition.external_group_offset(9), Some(1_000));
+        let partition_dir = std::path::Path::new(&offsets_dir).parent().unwrap();
+        assert_eq!(emptied_marker_op(partition_dir), None);
+    }
+
+    /// An offset file that boot cannot read strands its key, and it may hold an
+    /// offset the table never loaded. Boot then drops the marker.
+    #[compio::test]
+    async fn given_emptied_marker_beside_a_stranded_offset_file_when_recovering_should_remove_the_marker()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PartitionsConfig {
+            path_layout: crate::PartitionPathLayout {
+                streams_root: dir.path().to_string_lossy().into_owned(),
+            },
+            ..repair_config()
+        };
+        let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
+        persist_offset(&external_file, 1_000, true).await.unwrap();
+        let offsets_dir = config.get_offsets_path(1, 1, 0);
+        persist_offset(&format!("{offsets_dir}/emptied"), 2, true)
+            .await
+            .unwrap();
+        let (mut partition, _) = recording_partition();
+
+        crate::partition_storage::configure_consumer_offsets_with_storage(
+            &FailingPathStorage(external_file.into()),
+            &mut partition,
+            &config,
+            IggyNamespace::new(1, 1, 0),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            partition.stranded_consumer_offset_count(ConsumerKind::ExternalGroup),
+            1
+        );
+        let partition_dir = std::path::Path::new(&offsets_dir).parent().unwrap();
+        assert_eq!(emptied_marker_op(partition_dir), None);
+        assert_eq!(partition.durable_consumer_offsets.emptied_at(), 0);
+    }
+
+    /// A kind directory whose presence boot cannot check may hold offsets, so
+    /// the load fails instead of starting that kind empty.
+    #[compio::test]
+    async fn given_failed_offset_directory_check_when_recovering_should_fail_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PartitionsConfig {
+            path_layout: crate::PartitionPathLayout {
+                streams_root: dir.path().to_string_lossy().into_owned(),
+            },
+            ..repair_config()
+        };
+        for (kind, path) in [
+            (
+                ConsumerKind::Consumer,
+                config.get_consumer_offsets_path(1, 1, 0),
+            ),
+            (
+                ConsumerKind::ConsumerGroup,
+                config.get_consumer_group_offsets_path(1, 1, 0),
+            ),
+            (
+                ConsumerKind::ExternalGroup,
+                config.get_external_group_offsets_path(1, 1, 0),
+            ),
+        ] {
+            let (mut partition, _) = recording_partition();
+
+            let Err(error) = crate::partition_storage::configure_consumer_offsets_with_storage(
+                &FailingPathStorage(path.into()),
+                &mut partition,
+                &config,
+                IggyNamespace::new(1, 1, 0),
+                0,
+            )
+            .await
+            else {
+                panic!("{kind}: a failed directory check must fail the load");
+            };
+
+            assert!(
+                matches!(
+                    &error,
+                    crate::PartitionRecoveryError::ConsumerOffsetsLoad { consumer_kind, .. }
+                        if *consumer_kind == kind.as_str()
+                ),
+                "{kind}: {error:?}"
+            );
+        }
+    }
+
+    /// [`DiskStorage`] whose read-only opens and link-following existence
+    /// checks of one path fail with `EIO`.
+    struct FailingPathStorage(std::path::PathBuf);
+
+    impl FailingPathStorage {
+        fn check(&self, path: &std::path::Path) -> std::io::Result<()> {
+            if path == self.0 {
+                return Err(std::io::Error::from_raw_os_error(
+                    nix::errno::Errno::EIO as i32,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl DurableStorage for FailingPathStorage {
+        type File = <DiskStorage as DurableStorage>::File;
+
+        async fn open(
+            &self,
+            path: &std::path::Path,
+            mode: OpenMode,
+        ) -> std::io::Result<Self::File> {
+            if mode == OpenMode::Read {
+                self.check(path)?;
+            }
+            DiskStorage.open(path, mode).await
+        }
+
+        async fn create_directories(&self, path: &std::path::Path) -> std::io::Result<()> {
+            DiskStorage.create_directories(path).await
+        }
+
+        async fn sync_directory(&self, path: &std::path::Path) -> std::io::Result<()> {
+            DiskStorage.sync_directory(path).await
+        }
+
+        async fn rename(
+            &self,
+            source: &std::path::Path,
+            target: &std::path::Path,
+        ) -> std::io::Result<()> {
+            DiskStorage.rename(source, target).await
+        }
+
+        async fn remove_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+            DiskStorage.remove_file(path).await
+        }
+
+        async fn hard_link(
+            &self,
+            source: &std::path::Path,
+            target: &std::path::Path,
+        ) -> std::io::Result<()> {
+            DiskStorage.hard_link(source, target).await
+        }
+
+        async fn exists(&self, path: &std::path::Path) -> std::io::Result<bool> {
+            DiskStorage.exists(path).await
+        }
+
+        async fn exists_following_links(&self, path: &std::path::Path) -> std::io::Result<bool> {
+            self.check(path)?;
+            DiskStorage.exists_following_links(path).await
+        }
+
+        async fn entries(&self, path: &std::path::Path) -> std::io::Result<Vec<StorageEntry>> {
+            DiskStorage.entries(path).await
+        }
+
+        async fn regular_files(&self, path: &std::path::Path) -> std::io::Result<RegularFiles> {
+            DiskStorage.regular_files(path).await
+        }
+
+        async fn remove_tree(&self, path: &std::path::Path) -> std::io::Result<()> {
+            DiskStorage.remove_tree(path).await
+        }
+    }
+
+    /// The op the emptied-table marker under `root` names, `None` without one.
+    fn emptied_marker_op(root: &std::path::Path) -> Option<u64> {
+        let bytes = match std::fs::read(root.join("offsets/emptied")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("cannot read the emptied marker: {error}"),
+        };
+        match decode_offset_record(&bytes) {
+            OffsetRecord::Value {
+                offset,
+                checksummed: true,
+            } => Some(offset),
+            other => panic!("invalid emptied marker: {other:?}"),
+        }
+    }
+
+    /// A replica whose only offset is one external group's, committed through
+    /// `commit_min`.
+    async fn external_offset_receiver(
+        root: &std::path::Path,
+        commit_min: u64,
+    ) -> IggyPartition<RecordingBus> {
+        let (mut receiver, _) = recording_partition_at(1, 3);
+        receiver.set_partition_dir(root.to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut receiver, root);
+        receiver.stage_consumer_offset_upsert(
+            1,
+            ConsumerKind::ExternalGroup,
+            MESSAGE_LESS_EXTERNAL_GROUP_ID,
+            MESSAGE_LESS_EXTERNAL_OFFSET,
+            false,
+        );
+        receiver
+            .apply_staged_consumer_offset_commit(1)
+            .await
+            .unwrap();
+        receiver.consensus().sequencer().set_sequence(commit_min);
+        receiver.consensus().advance_commit_max(commit_min);
+        for op in 1..=commit_min {
+            receiver.consensus().advance_commit_min(op);
+        }
+        receiver
+    }
+
+    /// A primary with offset directories whose only external group offset was
+    /// stored at op 1 and deleted at op 2.
+    async fn emptied_external_origin() -> (tempfile::TempDir, IggyPartition<RecordingBus>) {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut origin, _) = recording_partition_at(0, 3);
+        origin.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut origin, directory.path());
+        commit_external_store_then_delete(&mut origin).await;
+        (directory, origin)
+    }
+
+    async fn commit_external_store_then_delete(primary: &mut IggyPartition<RecordingBus>) {
+        let store = store_offset_request(
+            MESSAGE_LESS_CLIENT_ID,
+            1,
+            ConsumerKind::ExternalGroup,
+            MESSAGE_LESS_EXTERNAL_GROUP_ID,
+            MESSAGE_LESS_EXTERNAL_OFFSET,
+            AckLevel::Quorum,
+        );
+        let delete = delete_offset_request_with_ack(
+            MESSAGE_LESS_CLIENT_ID,
+            2,
+            ConsumerKind::ExternalGroup,
+            MESSAGE_LESS_EXTERNAL_GROUP_ID,
+            AckLevel::Quorum,
+        );
+        for (op, request) in [(1, store), (2, delete)] {
+            primary.on_request(request, None).await;
+            primary.consensus().advance_commit_max(op);
+            primary.commit_journal(&repair_config()).await;
+        }
+        assert!(primary.fatal().is_none(), "{:?}", primary.fatal());
+        assert_eq!(primary.consensus().commit_min(), 2);
+    }
+
+    const LIVE_EXTERNAL_GROUP_ID: u32 = MESSAGE_LESS_EXTERNAL_GROUP_ID + 1;
+
+    /// A primary with offset directories that stored the offsets of external
+    /// groups `MESSAGE_LESS_EXTERNAL_GROUP_ID` at op 1 and
+    /// `LIVE_EXTERNAL_GROUP_ID` at op 2, then deleted the first at op 3.
+    async fn external_origin_that_deleted_one_of_two_groups()
+    -> (tempfile::TempDir, IggyPartition<RecordingBus>) {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut origin, _) = recording_partition_at(0, 3);
+        origin.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut origin, directory.path());
+        let store = |op, group_id| {
+            store_offset_request(
+                MESSAGE_LESS_CLIENT_ID,
+                op,
+                ConsumerKind::ExternalGroup,
+                group_id,
+                MESSAGE_LESS_EXTERNAL_OFFSET,
+                AckLevel::Quorum,
+            )
+        };
+        let delete = delete_offset_request_with_ack(
+            MESSAGE_LESS_CLIENT_ID,
+            3,
+            ConsumerKind::ExternalGroup,
+            MESSAGE_LESS_EXTERNAL_GROUP_ID,
+            AckLevel::Quorum,
+        );
+        for (op, request) in [
+            (1, store(1, MESSAGE_LESS_EXTERNAL_GROUP_ID)),
+            (2, store(2, LIVE_EXTERNAL_GROUP_ID)),
+            (3, delete),
+        ] {
+            origin.on_request(request, None).await;
+            origin.consensus().advance_commit_max(op);
+            origin.commit_journal(&repair_config()).await;
+        }
+        assert_eq!(origin.consensus().commit_min(), 3);
+        (directory, origin)
     }
 
     /// A message-less replica that falls behind catches up only by transfer. A donor that
@@ -21641,36 +23884,16 @@ mod tests {
     #[compio::test]
     async fn given_message_less_donor_restarted_after_checkpoint_when_persistent_replica_transfers_should_hold_its_state()
      {
-        const COMMIT_ROUNDS_MAX: usize = 8;
         let (_origin_directory, origin, transition) = message_less_origin().await;
         let commit_op = origin.consensus().commit_min();
         let donor_directory = tempfile::tempdir().unwrap();
-        let (config, mut donor) = replica_with_prepare_history(donor_directory.path(), 1).await;
-        let persistence = Rc::clone(donor.persistence.as_ref().unwrap());
-        for op in 1..=commit_op {
-            donor.on_replicate(retained_prepare(&origin, op)).await;
-        }
-        donor.consensus().advance_commit_max(commit_op);
-        // Each applied op waits on persistence, so drive it between commits.
-        for _ in 0..COMMIT_ROUNDS_MAX {
-            donor.commit_journal(&config).await;
-            persistence.drain_with_timeout().await.unwrap();
-            donor.drive_persistence().await;
-            if donor.consensus().commit_min() == commit_op {
-                break;
-            }
-        }
-        assert_eq!(donor.consensus().commit_min(), commit_op);
-        persistence.request_checkpoint();
-        donor.checkpoint_persistence(&config).await;
-        persistence.drain_with_timeout().await.unwrap();
-        assert!(donor.fatal().is_none(), "{:?}", donor.fatal());
-        assert_eq!(persistence.checkpoint_op(), commit_op);
-        drop(persistence);
-        drop(donor);
-
-        let (_, mut donor) = replica_with_prepare_history(donor_directory.path(), 1).await;
-        assert_eq!(donor.consensus().commit_min(), commit_op);
+        let (config, mut donor) = Box::pin(restarted_replica_of(
+            &origin,
+            donor_directory.path(),
+            1,
+            commit_op,
+        ))
+        .await;
         // A view change makes the restarted replica the primary.
         donor.consensus.set_view(1);
         let offer = donor.state_transfer_offer(&config).await.unwrap();
@@ -21696,6 +23919,56 @@ mod tests {
                 .repair_entry(commit_op)
                 .is_some()
         );
+    }
+
+    /// Replicate `origin`'s ops through `commit_op` to a replica that keeps
+    /// prepare history under `root`, checkpoint them, and restart that replica.
+    async fn restarted_replica_of(
+        origin: &IggyPartition<RecordingBus>,
+        root: &std::path::Path,
+        replica: u8,
+        commit_op: u64,
+    ) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+        let (config, mut donor) = replica_with_prepare_history(root, replica).await;
+        commit_replicated_through(&mut donor, origin, &config, commit_op).await;
+        let persistence = Rc::clone(donor.persistence.as_ref().unwrap());
+        persistence.request_checkpoint();
+        donor.checkpoint_persistence(&config).await;
+        persistence.drain_with_timeout().await.unwrap();
+        assert!(donor.fatal().is_none(), "{:?}", donor.fatal());
+        assert_eq!(persistence.checkpoint_op(), commit_op);
+        drop(persistence);
+        drop(donor);
+
+        let (config, donor) = replica_with_prepare_history(root, replica).await;
+        assert_eq!(donor.consensus().commit_min(), commit_op);
+        (config, donor)
+    }
+
+    /// Replicate `origin`'s ops past the commit point of `replica`, a replica
+    /// that keeps prepare history, and commit them through `commit_op`.
+    async fn commit_replicated_through(
+        replica: &mut IggyPartition<RecordingBus>,
+        origin: &IggyPartition<RecordingBus>,
+        config: &PartitionsConfig,
+        commit_op: u64,
+    ) {
+        const COMMIT_ROUNDS_MAX: usize = 8;
+        let persistence = Rc::clone(replica.persistence.as_ref().unwrap());
+        for op in replica.consensus().commit_min() + 1..=commit_op {
+            replica.on_replicate(retained_prepare(origin, op)).await;
+        }
+        replica.consensus().advance_commit_max(commit_op);
+        // Each applied op waits on persistence, so drive it between commits.
+        for _ in 0..COMMIT_ROUNDS_MAX {
+            replica.commit_journal(config).await;
+            persistence.drain_with_timeout().await.unwrap();
+            replica.drive_persistence().await;
+            if replica.consensus().commit_min() == commit_op {
+                break;
+            }
+        }
+        assert_eq!(replica.consensus().commit_min(), commit_op);
     }
 
     /// A replica of three that keeps prepare history under `root`, opened the way boot
@@ -21739,10 +24012,14 @@ mod tests {
             },
             ..repair_config()
         };
-        // A file where `offsets/` belongs fails every directory creation below it.
-        let offsets = config.get_offsets_path(1, 1, 0);
-        std::fs::create_dir_all(config.get_partition_path(1, 1, 0)).unwrap();
-        std::fs::write(&offsets, b"not a directory").unwrap();
+        // A file where the external group directory belongs fails its creation.
+        // One at `offsets/` would fail the consumer directory check first.
+        std::fs::create_dir_all(config.get_offsets_path(1, 1, 0)).unwrap();
+        std::fs::write(
+            config.get_external_group_offsets_path(1, 1, 0),
+            b"not a directory",
+        )
+        .unwrap();
         let (mut partition, _) = recording_partition_at(0, 3);
         partition.set_partition_dir(config.get_partition_path(1, 1, 0));
 
@@ -21875,6 +24152,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_reserved_owner_trailer_when_sizing_an_offset_prepare_should_match_its_projected_frame()
+    {
+        let partition = test_partition();
+        let automatic = partition
+            .build_poll_auto_commit_request(ConsumerKind::Consumer, 7, 0)
+            .expect("auto-commit request");
+        let explicit = store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::Quorum);
+        for (label, request) in [("auto-commit", automatic), ("client", explicit)] {
+            let sized = IggyPartition::<IggyMessageBus>::prepared_request_size(&request);
+            let prepare = request.project(partition.consensus());
+            assert_eq!(
+                sized,
+                prepare.as_slice().len(),
+                "{label} store must be sized as the prepare it projects to"
+            );
+        }
+    }
+
     #[compio::test]
     async fn given_queued_offset_when_wal_capacity_is_exhausted_should_deny_before_minting() {
         let directory = tempfile::tempdir().unwrap();
@@ -21914,6 +24210,93 @@ mod tests {
         partition.on_request(retry, None).await;
         assert_eq!(partition.consensus.sequencer().current_sequence(), 1);
         assert!(partition.fatal().is_none());
+    }
+
+    #[compio::test]
+    async fn given_queued_group_store_when_its_owner_is_replaced_should_refuse_it_at_promotion() {
+        const GROUP_ID: u32 = 7;
+        const CLIENT_ID: u128 = 42;
+        let mut partition = test_partition();
+        partition.stats.increment_messages_count(1);
+        install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID).await;
+        let replaced = partition.consumer_group_owner(u64::from(GROUP_ID)).unwrap();
+        install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID + 1).await;
+        let store = store_offset_request(
+            replaced.client_id,
+            1,
+            ConsumerKind::ConsumerGroup,
+            GROUP_ID,
+            0,
+            AckLevel::Quorum,
+        )
+        .transmute_header(|mut header, next: &mut RoutedRequestHeader| {
+            header.metadata_watermark = partition.required_metadata_frontier;
+            header.owner_generation = replaced.generation;
+            *next = header;
+        });
+        let head = partition.consensus.sequencer().current_sequence();
+        let (sender, receiver) = consensus::oneshot_channel();
+        assert!(
+            partition
+                .consensus
+                .push_queued_request(consensus::RequestEntry::with_sender(store, Some(sender)))
+                .is_ok()
+        );
+
+        partition.drain_request_queue_into_prepares(1).await;
+
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "a store of a replaced owner must not be prepared"
+        );
+        assert_eq!(
+            receiver.await.unwrap().header().status,
+            IggyError::ConsumerGroupPartitionNotOwned(GROUP_ID, 0).as_code()
+        );
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
+    }
+
+    #[compio::test]
+    async fn given_queued_auto_commit_when_its_owner_is_replaced_should_refuse_it_at_promotion() {
+        const GROUP_ID: u32 = 7;
+        const CLIENT_ID: u128 = 42;
+        let mut partition = test_partition();
+        partition.stats.increment_messages_count(1);
+        install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID).await;
+        let store = partition
+            .build_poll_auto_commit_request(ConsumerKind::ConsumerGroup, GROUP_ID, 0)
+            .unwrap();
+        let generation = store.header().owner_generation;
+        install_test_owner(&mut partition, u64::from(GROUP_ID), CLIENT_ID + 1).await;
+        assert!(
+            partition
+                .consumer_group_owner(u64::from(GROUP_ID))
+                .unwrap()
+                .generation
+                > generation
+        );
+        let head = partition.consensus.sequencer().current_sequence();
+        assert!(
+            partition
+                .consensus
+                .push_queued_request(consensus::RequestEntry::with_sender(store, None),)
+                .is_ok()
+        );
+
+        partition.drain_request_queue_into_prepares(1).await;
+
+        assert_eq!(
+            partition.consensus.sequencer().current_sequence(),
+            head,
+            "an internal auto-commit must retain the owner generation it captured"
+        );
+        assert!(partition.consensus.pop_queued_request().is_none());
+        assert_eq!(
+            partition.group_offset_state(u64::from(GROUP_ID)),
+            (None, None)
+        );
+        assert!(partition.fatal().is_none(), "{:?}", partition.fatal());
     }
 
     #[compio::test]
@@ -22016,7 +24399,7 @@ mod tests {
             partition.on_ack(stale_ack, &config).await;
             assert_eq!(partition.pending_owner_install.get(), Some(discarded));
 
-            partition.defer_view_truncation(discarded_op, Vec::new(), None);
+            partition.defer_view_truncation(discarded_op..=u64::MAX, Vec::new(), None);
             assert!(matches!(
                 partition.resume_io(&config).await,
                 crate::PartitionIoStep::ViewApplied { .. }
@@ -22532,18 +24915,25 @@ mod tests {
     /// A backup answering a read cannot originate the offset prepare, so
     /// admitting the commit would advance local progress alone. The primary
     /// would still hold the old offset and hand the same messages out again.
+    /// A normal backup names the primary as the place to retry, and a backup
+    /// in transfer cannot name it.
     #[test]
     fn given_backup_when_auto_commit_poll_completes_should_reject_without_progress() {
-        let (mut partition, _) = recording_partition_at(1, 3);
-        let consumer = PollingConsumer::Consumer(7, 0);
-        let read_result = poll_read_result(&partition, consumer, true, Some(9));
+        for (transferring, expected) in [
+            (false, IggyError::NotPrimary),
+            (true, IggyError::TransientNotAccepted),
+        ] {
+            let (mut partition, _) = recording_partition_at(1, 3);
+            if transferring {
+                partition.consensus.begin_state_transfer_await();
+            }
+            let consumer = PollingConsumer::Consumer(7, 0);
+            let read_result = poll_read_result(&partition, consumer, true, Some(9));
 
-        assert!(matches!(
-            partition.complete_poll(read_result),
-            Err(IggyError::TransientNotAccepted)
-        ));
-        assert_eq!(partition.get_consumer_offset(consumer), None);
-        assert_eq!(partition.consensus.pipeline_len(), 0);
+            assert_eq!(partition.complete_poll(read_result).unwrap_err(), expected);
+            assert_eq!(partition.get_consumer_offset(consumer), None);
+            assert_eq!(partition.consensus.pipeline_len(), 0);
+        }
     }
 
     /// A backup whose durable table already covers the offset has nothing to
@@ -23565,6 +25955,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 10,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -23747,6 +26138,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 2,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -24394,29 +26786,37 @@ mod tests {
     }
 
     #[compio::test]
-    async fn on_request_delete_on_stale_backup_replies_transient_before_not_found() {
-        let (mut partition, sent_to_clients) = recording_partition_at(1, 3);
-        let client_id = 42;
+    async fn on_request_delete_on_stale_backup_replies_routing_denial_before_not_found() {
+        for (transferring, expected) in [
+            (false, IggyError::NotPrimary),
+            (true, IggyError::TransientNotAccepted),
+        ] {
+            let (mut partition, sent_to_clients) = recording_partition_at(1, 3);
+            if transferring {
+                partition.consensus.begin_state_transfer_await();
+            }
+            let client_id = 42;
 
-        partition
-            .on_request(delete_offset_request(client_id, 7, 5), None)
-            .await;
+            partition
+                .on_request(delete_offset_request(client_id, 7, 5), None)
+                .await;
 
-        let sent = sent_to_clients.borrow();
-        assert_eq!(sent.len(), 1, "exactly one routing denial");
-        let (reply_client, frame) = &sent[0];
-        assert_eq!(*reply_client, client_id);
-        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
-            &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
-        )
-        .expect("deny frame starts with a valid reply header");
-        assert_eq!(header.status, IggyError::TransientNotAccepted.as_code());
-        assert_eq!(header.op, 0, "the backup admitted nothing");
-        assert_eq!(
-            partition.consensus().pipeline_len(),
-            0,
-            "a backup must not replicate the delete"
-        );
+            let sent = sent_to_clients.borrow();
+            assert_eq!(sent.len(), 1, "exactly one routing denial");
+            let (reply_client, frame) = &sent[0];
+            assert_eq!(*reply_client, client_id);
+            let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+                &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+            )
+            .expect("deny frame starts with a valid reply header");
+            assert_eq!(header.status, expected.as_code());
+            assert_eq!(header.op, 0, "the backup admitted nothing");
+            assert_eq!(
+                partition.consensus().pipeline_len(),
+                0,
+                "a backup must not replicate the delete"
+            );
+        }
     }
 
     fn unique_temp_offset_dir() -> String {
@@ -25899,24 +28299,19 @@ mod tests {
         }
     }
 
-    fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
-        armed_fetch_session(to_op, to_op, floor, first_batch_offset)
+    fn armed_session(to_op: u64, floor: u64) -> RepairSession {
+        armed_fetch_session(to_op, to_op, floor)
     }
 
-    fn armed_fetch_session(
-        to_op: u64,
-        fetch_to_op: u64,
-        floor: u64,
-        first_batch_offset: Option<u64>,
-    ) -> RepairSession {
+    fn armed_fetch_session(to_op: u64, fetch_to_op: u64, floor: u64) -> RepairSession {
         RepairSession {
             nonce: 1,
             view: 0,
+            from_op: 1,
             commit_to_op: to_op,
             fetch_to_op,
             floor: Some(floor),
             peer: 0,
-            first_batch_offset,
             idle_ticks: 0,
         }
     }
@@ -26093,7 +28488,7 @@ mod tests {
     {
         const IDLE_TICKS: u32 = 7;
         let mut partition = test_partition();
-        partition.repair = Some(armed_session(3, 0, None));
+        partition.repair = Some(armed_session(3, 0));
         partition.repair.as_mut().unwrap().idle_ticks = IDLE_TICKS;
         partition.repair_attempts = 2;
         partition.transition = Some(PendingPartitionTransition::View { drain: None });
@@ -26113,6 +28508,181 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_held_repair_frame_when_peer_re_serves_it_should_keep_stall_budget() {
+        const IDLE_TICKS: u32 = 7;
+        const ATTEMPTS: u32 = 2;
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, 1))
+            .await;
+        assert!(partition.log.journal().inner.holds_op(1));
+        partition.repair.as_mut().unwrap().idle_ticks = IDLE_TICKS;
+        partition.repair_attempts = ATTEMPTS;
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, 1))
+            .await;
+
+        assert_eq!(
+            partition.repair.as_ref().unwrap().idle_ticks,
+            IDLE_TICKS,
+            "a held frame must not restart the stall clock"
+        );
+        assert_eq!(
+            partition.repair_attempts, ATTEMPTS,
+            "a held frame must not refund the stall budget"
+        );
+    }
+
+    /// A frame that passes the window filters but that the journal refuses
+    /// stays not held, so the peer serves it again every round. It is no
+    /// progress, so the budget must still run out.
+    #[compio::test]
+    async fn given_unjournalable_repair_frame_when_peer_re_serves_it_should_spend_stall_budget() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0));
+
+        let mut verdicts = Vec::new();
+        for _ in 0..=crate::types::REPAIR_MAX_STALL_RETRIES {
+            partition
+                .apply_repaired_prepare(pipeline_prepare(1, Operation::SendMessages))
+                .await;
+            assert!(!partition.log.journal().inner.holds_op(1));
+            verdicts.push(partition.burn_repair_attempt());
+        }
+
+        assert_eq!(
+            verdicts.iter().position(|&rotate| rotate),
+            Some(verdicts.len() - 1),
+            "a frame the journal refuses must not refund the budget: {verdicts:?}"
+        );
+    }
+
+    /// Without a prepare WAL a refused floor stays in progress while the
+    /// window is incomplete, and every re-request gets the same chunk back.
+    /// Those frames are held, so the budget must run out and rotate the peer.
+    /// Above a committed prefix, so the walk mark that the first round records
+    /// must not pass for progress in the rounds after it.
+    #[compio::test]
+    async fn given_walless_refused_floor_when_peer_re_serves_held_frames_should_rotate_session() {
+        const COMMIT_MIN: u64 = 5;
+        const FLOOR: u64 = 10;
+        const SERVED_THROUGH: u64 = 12;
+        const COMMIT_TO_OP: u64 = SERVED_THROUGH + 1;
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup
+            .consensus()
+            .restore_commit_state(COMMIT_MIN, COMMIT_MIN);
+        backup.consensus().advance_commit_max(COMMIT_TO_OP);
+        backup.repair = Some(armed_session(COMMIT_TO_OP, FLOOR));
+        let config = repair_config();
+
+        let mut verdicts = Vec::new();
+        for _ in 0..=crate::types::REPAIR_MAX_STALL_RETRIES {
+            for op in FLOOR + 1..=SERVED_THROUGH {
+                backup
+                    .apply_repaired_prepare(checksummed_segment_prepare(op, 0, op - 1, b"repaired"))
+                    .await;
+            }
+            assert_eq!(
+                backup.complete_repair(&config).await,
+                RepairConclusion::InProgress
+            );
+            verdicts.push(backup.burn_repair_attempt());
+        }
+
+        assert_eq!(
+            verdicts.iter().position(|&rotate| rotate),
+            Some(verdicts.len() - 1),
+            "only the round past the budget rotates: {verdicts:?}"
+        );
+    }
+
+    /// While the WAL is not durable through `fetch_to_op`, `complete_repair`
+    /// waits and only the shard's walk backstop moves `commit_min`, so stall
+    /// rounds re-serve frames this journal holds. Modeled without a WAL, one
+    /// walk slice per round: the walk is progress, so the peer is kept.
+    #[compio::test]
+    async fn given_advancing_repair_walk_when_peer_re_serves_held_frames_should_keep_peer() {
+        const ROUNDS: u32 = crate::types::REPAIR_MAX_STALL_RETRIES + 1;
+        const COMMIT_TO_OP: u64 = COMMIT_WALK_OPS_MAX as u64 * ROUNDS as u64;
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.consensus().advance_commit_max(COMMIT_TO_OP);
+        backup.repair = Some(RepairSession {
+            floor: None,
+            ..armed_session(COMMIT_TO_OP, 0)
+        });
+        let config = repair_config();
+
+        for round in 0..ROUNDS {
+            for op in backup.consensus().commit_min() + 1..=COMMIT_TO_OP {
+                backup
+                    .apply_repaired_prepare(checksummed_segment_prepare(op, 0, op - 1, b"repaired"))
+                    .await;
+            }
+            backup.commit_journal(&config).await;
+            assert!(
+                !backup.burn_repair_attempt(),
+                "round {round} rotated away although the walk reached {}",
+                backup.consensus().commit_min()
+            );
+        }
+
+        assert_eq!(backup.consensus().commit_min(), COMMIT_TO_OP);
+    }
+
+    /// A walk restarts the budget once: the mark moves with it, so the rounds
+    /// after the walk stops spend a whole budget and no more.
+    #[test]
+    fn given_credited_walk_when_later_stall_rounds_find_no_progress_should_rotate_at_budget() {
+        const COMMIT_MIN: u64 = 5;
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup
+            .consensus()
+            .restore_commit_state(COMMIT_MIN, COMMIT_MIN + 1);
+        assert!(!backup.burn_repair_attempt());
+        backup.consensus().advance_commit_min(COMMIT_MIN + 1);
+
+        let verdicts: Vec<bool> = (0..=crate::types::REPAIR_MAX_STALL_RETRIES)
+            .map(|_| backup.burn_repair_attempt())
+            .collect();
+
+        assert_eq!(
+            verdicts.iter().position(|&rotate| rotate),
+            Some(verdicts.len() - 1),
+            "only the round past the budget that follows the walk rotates: {verdicts:?}"
+        );
+    }
+
+    /// A stall round in a new view starts a fresh count, as on the metadata
+    /// plane: the rotations of an earlier view say nothing about the ring of
+    /// this one.
+    #[test]
+    fn given_burned_repair_budget_when_view_changes_should_start_fresh_counts() {
+        let (mut backup, _) = recording_partition_at(1, 3);
+        for _ in 0..crate::types::REPAIR_MAX_STALL_RETRIES {
+            assert!(!backup.burn_repair_attempt());
+        }
+        backup.note_repair_rotation();
+        let next_view = backup.consensus().view() + 1;
+        backup.consensus.set_view(next_view);
+
+        let verdicts: Vec<bool> = (0..=crate::types::REPAIR_MAX_STALL_RETRIES)
+            .map(|_| backup.burn_repair_attempt())
+            .collect();
+
+        assert_eq!(
+            (
+                verdicts.iter().position(|&rotate| rotate),
+                backup.repair_rotations()
+            ),
+            (Some(verdicts.len() - 1), 0),
+            "the new view must restart the stall rounds and the rotations: {verdicts:?}"
+        );
+    }
+
+    #[compio::test]
     async fn given_lower_backfill_when_applying_repaired_prepare_should_not_rewind_parent() {
         // The call-site regression for the WAL frontier rewind: a repaired op
         // below the DVC-adopted head must leave BOTH halves of the frontier
@@ -26123,7 +28693,7 @@ mod tests {
         const CHECKSUM_2: u128 = 0x22;
         const CHECKSUM_3: u128 = 0x33;
         let mut partition = test_partition();
-        partition.repair = Some(armed_session(3, 0, None));
+        partition.repair = Some(armed_session(3, 0));
 
         partition
             .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
@@ -26165,7 +28735,7 @@ mod tests {
         const CHECKSUM_2: u128 = 0x22;
         const CHECKSUM_3: u128 = 0x33;
         let mut partition = test_partition();
-        partition.repair = Some(armed_session(3, 0, None));
+        partition.repair = Some(armed_session(3, 0));
 
         partition
             .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
@@ -26191,7 +28761,7 @@ mod tests {
     #[compio::test]
     async fn given_prior_view_repair_when_a_new_view_started_should_discard_it() {
         let mut partition = test_partition();
-        partition.repair = Some(armed_fetch_session(0, 1, 0, None));
+        partition.repair = Some(armed_fetch_session(0, 1, 0));
         partition.consensus.set_view(1);
 
         partition
@@ -26256,7 +28826,7 @@ mod tests {
             journal_send_batch(&mut partition, op).await;
         }
         partition.consensus().advance_commit_max(3);
-        partition.repair = Some(armed_session(3, 2, Some(2)));
+        partition.repair = Some(armed_session(3, 2));
         partition.transfer_rearm = Some(crate::state_transfer::PendingTransferRearm {
             peer: 0,
             after_ticks: 1,
@@ -26275,7 +28845,7 @@ mod tests {
     async fn given_no_repaired_batch_when_window_never_arrived_should_refuse_commit_floor() {
         let mut partition = test_partition();
         partition.consensus().advance_commit_max(8);
-        partition.repair = Some(armed_session(8, 5, None));
+        partition.repair = Some(armed_session(8, 5));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26291,46 +28861,345 @@ mod tests {
         );
     }
 
+    /// A backup whose prepare WAL holds `1..=wal_head`, durable and committed,
+    /// with nothing resident above it: where a rejoining backup stands after
+    /// its replayed history was walked and flushed, or after an install.
+    async fn backup_with_durable_wal(
+        directory: &std::path::Path,
+        wal_head: u64,
+    ) -> IggyPartition<RecordingBus> {
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.set_partition_dir(directory.to_string_lossy().into_owned());
+        backup.open_persistence().await.unwrap();
+        let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+        let mut parent = 0;
+        for op in 1..=wal_head {
+            let prepare = checksummed_segment_prepare(op, parent, op - 1, b"durable");
+            parent = prepare.header().checksum;
+            persistence.append(prepare.into_frozen(), true).unwrap();
+        }
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable_through(wal_head));
+        backup.consensus().restore_commit_state(wal_head, wal_head);
+        backup.consensus().sequencer().set_sequence(wal_head);
+        backup.recovered_durable_offset = Some(wal_head - 1);
+        backup
+    }
+
     #[compio::test]
-    async fn given_no_repaired_batch_when_window_offsets_only_at_counter_zero_should_refuse_commit_floor()
+    async fn given_durable_unproven_history_when_resuming_io_should_not_select_or_apply_it() {
+        const HEAD: u64 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let config = repair_config();
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        backup.open_persistence().await.unwrap();
+        let persistence = Rc::clone(backup.persistence.as_ref().unwrap());
+        let mut parent = 0;
+        let mut headers = Vec::new();
+        for op in 1..=HEAD {
+            let prepare = checksummed_segment_prepare(op, parent, op - 1, b"old-view");
+            parent = prepare.header().checksum;
+            headers.push(*prepare.header());
+            backup
+                .log
+                .journal()
+                .inner
+                .append(prepare.clone().into_frozen())
+                .await
+                .unwrap();
+            persistence.append(prepare.into_frozen(), true).unwrap();
+        }
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        assert!(persistence.is_durable_through(HEAD));
+        backup.consensus().advance_commit_max(HEAD);
+        backup.consensus().fence_view_log(HEAD + 1, HEAD + 1);
+
+        assert!(!backup.select_commit(headers.clone(), &config, false));
+        assert_eq!(
+            backup.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &config),
+            []
+        );
+        for _ in 0..HEAD {
+            backup.resume_io(&config).await;
+            assert_eq!(backup.consensus().commit_min(), 0);
+            assert!(!backup.has_pending_commit());
+        }
+
+        backup.consensus().settle_view_log_proof();
+        assert_eq!(
+            backup.collect_committable_from_journal(COMMIT_WALK_OPS_MAX, &config),
+            headers
+        );
+        backup.commit_journal(&config).await;
+        assert_eq!(backup.consensus().commit_min(), HEAD);
+    }
+
+    #[compio::test]
+    async fn given_unproven_history_when_repair_floor_connects_should_require_state_transfer() {
+        const FLOOR: u64 = 2;
+        const HEAD: u64 = 3;
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.consensus().advance_commit_max(HEAD);
+        backup.repair = Some(armed_session(HEAD, FLOOR));
+        backup
+            .apply_repaired_prepare(checksummed_segment_prepare(HEAD, 0, 0, b"connected"))
+            .await;
+        backup.consensus().fence_view_log(FLOOR, FLOOR);
+
+        assert_eq!(
+            backup.complete_repair(&repair_config()).await,
+            RepairConclusion::FloorRefused {
+                floor: FLOOR,
+                to_op: HEAD
+            }
+        );
+        assert_eq!(backup.consensus().commit_min(), 0);
+        assert!(backup.consensus().view_log_unproven());
+        assert!(backup.repair.is_none());
+    }
+
+    /// The serving peer evicted every op below `RETAINED_FROM` and retains more
+    /// than one repair chunk above it. Every request that starts below
+    /// `RETAINED_FROM` gets `RangeEvicted` and the same first chunk, so the
+    /// refused window can never complete. With a prepare WAL attached, a floor
+    /// above the WAL head can never be accepted, so the first refusal is final.
+    #[compio::test]
+    async fn given_floor_above_wal_head_when_refused_window_exceeds_one_chunk_should_refuse_commit_floor()
      {
+        // The default `[cluster] repair_chunk_max`, `shard::REPAIR_CHUNK_MAX`.
+        const CHUNK_OPS: u64 = 128;
+        const WAL_HEAD: u64 = 2;
+        const RETAINED_FROM: u64 = 11;
+        // One op more than the chunk served from `RETAINED_FROM` covers.
+        const COMMIT_TO_OP: u64 = RETAINED_FROM + CHUNK_OPS;
+        // One round past the stall budget, so a peer rotation would be due.
+        const ROUNDS: u32 = crate::types::REPAIR_MAX_STALL_RETRIES + 1;
+        let directory = tempfile::tempdir().unwrap();
+        let mut backup = backup_with_durable_wal(directory.path(), WAL_HEAD).await;
+        backup.consensus().advance_commit_max(COMMIT_TO_OP);
+        backup.repair = Some(RepairSession {
+            floor: None,
+            ..armed_session(COMMIT_TO_OP, 0)
+        });
+        let config = repair_config();
+
+        let mut request = WAL_HEAD + 1..=COMMIT_TO_OP;
+        let mut rounds = Vec::new();
+        for _ in 0..ROUNDS {
+            // The serve path clamps the request to its retained range, reports
+            // that with `RangeEvicted`, and serves at most one chunk.
+            let from_op = (*request.start()).max(RETAINED_FROM);
+            if from_op > *request.start() {
+                backup.repair.as_mut().unwrap().floor = Some(RETAINED_FROM - 1);
+            }
+            for op in from_op..=(*request.end()).min(from_op + CHUNK_OPS - 1) {
+                backup
+                    .apply_repaired_prepare(checksummed_segment_prepare(op, 0, op - 1, b"repaired"))
+                    .await;
+            }
+            let conclusion = backup.complete_repair(&config).await;
+            if conclusion != RepairConclusion::InProgress {
+                rounds.push((request, conclusion, false));
+                break;
+            }
+            // The stall retry burns one attempt, then re-requests from the live
+            // commit point, where the pull after `RepairDone` starts too.
+            let rotate = backup.burn_repair_attempt();
+            rounds.push((request, conclusion, rotate));
+            if rotate {
+                break;
+            }
+            request = backup.consensus().commit_min() + 1..=backup.repair.unwrap().fetch_to_op;
+        }
+
+        assert_eq!(
+            rounds.last().map(|(_, conclusion, _)| *conclusion),
+            Some(RepairConclusion::FloorRefused {
+                floor: RETAINED_FROM - 1,
+                to_op: COMMIT_TO_OP,
+            }),
+            "a floor above the WAL head can never be accepted, so its refusal is final; \
+             rounds as (request, conclusion, rotate): {rounds:?}"
+        );
+        assert!(backup.repair.is_none());
+    }
+
+    /// Can a WAL-backed partition accept a floor above its WAL head? This window
+    /// connects: ops 3 to 10 carried no messages, so its first batch starts right
+    /// after the recovered durable end. Its last frame is missing, so a refusal
+    /// cannot come from the window-completeness check of the refused path.
+    #[compio::test]
+    async fn given_wal_attached_when_connected_floor_above_wal_head_should_refuse_commit_floor() {
+        const WAL_HEAD: u64 = 2;
+        const FLOOR: u64 = 10;
+        const SERVED_THROUGH: u64 = 12;
+        const COMMIT_TO_OP: u64 = SERVED_THROUGH + 1;
+        let directory = tempfile::tempdir().unwrap();
+        let mut backup = backup_with_durable_wal(directory.path(), WAL_HEAD).await;
+        backup.consensus().advance_commit_max(COMMIT_TO_OP);
+        backup.repair = Some(armed_session(COMMIT_TO_OP, FLOOR));
+        for (offset, op) in (WAL_HEAD..).zip(FLOOR + 1..=SERVED_THROUGH) {
+            backup
+                .apply_repaired_prepare(checksummed_segment_prepare(op, 0, offset, b"repaired"))
+                .await;
+        }
+
+        let conclusion = backup.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: FLOOR,
+                to_op: COMMIT_TO_OP,
+            },
+            "the WAL cannot become durable through ops the peer no longer retains"
+        );
+        assert!(backup.repair.is_none());
+        assert_eq!(
+            backup.consensus().commit_min(),
+            WAL_HEAD,
+            "a refused floor must not lift commit_min over ops the WAL never persisted"
+        );
+    }
+
+    /// The other half of the question: boot replay leaves every op in
+    /// `(commit_min, head]` resident, so a floor at or below the WAL head is
+    /// dropped before the connection check, and the replayed ops are walked.
+    /// This window can never connect (no repaired batch, message ops in it), so
+    /// a floor that reached the check would be refused instead.
+    #[compio::test]
+    async fn given_boot_replayed_wal_when_floor_at_or_below_wal_head_should_walk_resident_ops() {
+        const WAL_HEAD: u64 = 4;
+        const RECOVERED_COMMIT: u64 = 2;
+        let config = repair_config();
+        for floor in RECOVERED_COMMIT + 1..=WAL_HEAD {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut backup, _) = recording_partition_at(1, 3);
+            backup.set_partition_dir(directory.path().to_string_lossy().into_owned());
+            backup.log.retire_front().unwrap();
+            backup.install_empty_segment(&config, 0).await.unwrap();
+            let mut wal = journal::PartitionPrepareJournal::open(
+                &directory.path().join("prepares-0"),
+                backup.consensus().group(),
+                0,
+            )
+            .await
+            .unwrap();
+            let mut parent = 0;
+            for op in 1..=WAL_HEAD {
+                // A prepare carries the primary's commit point at send time.
+                let prepare = checksummed_segment_prepare(op, parent, op - 1, b"replayed")
+                    .transmute_header(|original, header: &mut PrepareHeader| {
+                        *header = original;
+                        header.commit = RECOVERED_COMMIT.min(op - 1);
+                        header.checksum = header.identity_checksum();
+                    });
+                parent = prepare.header().checksum;
+                wal.append(prepare.into_frozen()).await.unwrap();
+            }
+            drop(wal);
+            backup.open_persistence().await.unwrap();
+            backup.commit_journal(&config).await;
+            assert_eq!(backup.consensus().commit_min(), RECOVERED_COMMIT);
+            assert!(
+                backup
+                    .log
+                    .journal()
+                    .inner
+                    .repaired_window_shape(RECOVERED_COMMIT, WAL_HEAD)
+                    .complete,
+                "boot replay must leave (commit_min, head] resident"
+            );
+            backup.consensus().advance_commit_max(WAL_HEAD);
+            backup.repair = Some(armed_session(WAL_HEAD, floor));
+
+            let conclusion = backup.complete_repair(&config).await;
+
+            assert_eq!(
+                conclusion,
+                RepairConclusion::Done,
+                "floor {floor} at or below the WAL head must be dropped, not refused"
+            );
+            assert_eq!(backup.consensus().commit_min(), WAL_HEAD);
+        }
+    }
+
+    /// The window above the floor is complete and carries no messages, so no
+    /// batch anchors the floor. The jump would skip ops 1 to 5, which this
+    /// journal never held, and nothing shows that they carried no messages,
+    /// whether or not this replica committed messages before.
+    #[compio::test]
+    async fn given_no_batch_above_floor_when_window_carries_no_messages_should_refuse_commit_floor()
+    {
+        const COMMITTED_OFFSET: u64 = 99;
+        for committed_messages in [false, true] {
+            let mut partition = test_partition();
+            if committed_messages {
+                partition.set_offset_space_used(true);
+                partition.offset.store(COMMITTED_OFFSET, Ordering::Release);
+            }
+            partition.consensus().advance_commit_max(8);
+            // Stands in for any op without messages, such as a consumer
+            // offset store.
+            for op in 6..=8 {
+                journal_prepare(&partition, op, Operation::CreateStream).await;
+            }
+            partition.repair = Some(armed_session(8, 5));
+
+            let conclusion = partition.complete_repair(&repair_config()).await;
+
+            assert_eq!(
+                (conclusion, partition.consensus().commit_min()),
+                (RepairConclusion::FloorRefused { floor: 5, to_op: 8 }, 0),
+                "committed messages before the window: {committed_messages}"
+            );
+            assert!(
+                partition.repair.is_none(),
+                "a definitive refusal hands recovery to state transfer"
+            );
+        }
+    }
+
+    /// The committed window above the floor carries no messages, and the only
+    /// batch above the floor belongs to the uncommitted suffix. A view change
+    /// can still replace that op, so its batch must not anchor the floor, even
+    /// at offset 0, which would connect it here.
+    #[compio::test]
+    async fn given_suffix_batch_above_commit_to_op_when_committed_window_carries_no_messages_should_refuse_commit_floor()
+     {
+        const FLOOR: u64 = 5;
+        const COMMIT_TO_OP: u64 = 8;
+        const SUFFIX_OP: u64 = COMMIT_TO_OP + 1;
         let mut partition = test_partition();
-        partition.consensus().advance_commit_max(8);
-        for op in 6..=8 {
+        partition.consensus().advance_commit_max(COMMIT_TO_OP);
+        for op in FLOOR + 1..=COMMIT_TO_OP {
             journal_prepare(&partition, op, Operation::CreateStream).await;
         }
-        partition.repair = Some(armed_session(8, 5, None));
+        partition
+            .log
+            .journal()
+            .inner
+            .append(checksummed_segment_prepare(SUFFIX_OP, 0, 0, b"suffix").into_frozen())
+            .await
+            .expect("journal append");
+        partition.repair = Some(armed_fetch_session(COMMIT_TO_OP, SUFFIX_OP, FLOOR));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
         assert_eq!(
-            conclusion,
-            RepairConclusion::FloorRefused { floor: 5, to_op: 8 },
-            "a jump would leave the counter at 0 whatever messages ops 1 to 5 hold"
+            (conclusion, partition.consensus().commit_min()),
+            (
+                RepairConclusion::FloorRefused {
+                    floor: FLOOR,
+                    to_op: COMMIT_TO_OP
+                },
+                0
+            ),
+            "the batch at op {SUFFIX_OP} must not anchor the floor"
         );
-        assert_eq!(partition.consensus().commit_min(), 0);
-        assert!(partition.repair.is_none());
-    }
-
-    #[compio::test]
-    async fn given_no_repaired_batch_when_window_offsets_only_above_counter_zero_should_accept_commit_floor()
-     {
-        let mut partition = test_partition();
-        partition.set_offset_space_used(true);
-        partition.offset.store(99, Ordering::Release);
-        partition.consensus().advance_commit_max(8);
-        // Any non-SendMessages operation exercises the offsets-only arm; the
-        // commit walk no-ops operations it does not recognize, so the test
-        // needs no on-disk offset directories.
-        for op in 6..=8 {
-            journal_prepare(&partition, op, Operation::CreateStream).await;
-        }
-        partition.repair = Some(armed_session(8, 5, None));
-
-        let conclusion = partition.complete_repair(&repair_config()).await;
-
-        assert_eq!(conclusion, RepairConclusion::Done);
-        assert!(partition.consensus().commit_min() >= 5);
     }
 
     #[compio::test]
@@ -26341,7 +29210,7 @@ mod tests {
         for op in 7..=8 {
             journal_prepare(&partition, op, Operation::CreateStream).await;
         }
-        partition.repair = Some(armed_session(8, 5, None));
+        partition.repair = Some(armed_session(8, 5));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26361,7 +29230,7 @@ mod tests {
     async fn given_no_repaired_batch_when_window_fully_evicted_should_refuse_commit_floor() {
         let mut partition = test_partition();
         partition.consensus().advance_commit_max(8);
-        partition.repair = Some(armed_session(8, 8, None));
+        partition.repair = Some(armed_session(8, 8));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26380,7 +29249,7 @@ mod tests {
     async fn given_empty_committed_window_with_a_suffix_fetch_should_escape_to_state_transfer() {
         let mut partition = test_partition();
         partition.consensus().advance_commit_max(5);
-        partition.repair = Some(armed_fetch_session(5, 9, 5, None));
+        partition.repair = Some(armed_fetch_session(5, 9, 5));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26477,7 +29346,7 @@ mod tests {
             journal_send_batch(&mut partition, op).await;
         }
         partition.consensus().advance_commit_max(3);
-        partition.repair = Some(armed_fetch_session(2, 3, 0, Some(0)));
+        partition.repair = Some(armed_fetch_session(2, 3, 0));
         partition.commit_journal(&repair_config()).await;
         let _ = partition.log.journal().inner.evict_prefix(3);
 
@@ -26494,7 +29363,7 @@ mod tests {
     #[compio::test]
     async fn given_suffix_fetch_when_its_view_is_discarded_should_clear_the_session() {
         let mut partition = test_partition();
-        partition.repair = Some(armed_fetch_session(0, 3, 0, None));
+        partition.repair = Some(armed_fetch_session(0, 3, 0));
         partition.consensus.set_view(1);
 
         let conclusion = partition.complete_repair(&repair_config()).await;
@@ -26514,18 +29383,214 @@ mod tests {
         // No recovered segments (durable end None) and the served window's
         // first batch starts at offset 3: ops below the floor are neither
         // locally durable nor repaired.
-        partition.repair = Some(armed_session(8, 5, Some(3)));
+        partition.repair = Some(armed_session(8, 5));
+        partition
+            .apply_repaired_prepare(checksummed_segment_prepare(6, 0, 3, b"repaired"))
+            .await;
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
         assert_eq!(
             conclusion,
             RepairConclusion::InProgress,
-            "with the window incomplete, later frames can still lower the \
-             first batch offset into connection"
+            "with the window incomplete, later frames can still land a lower \
+             first batch that connects"
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_some());
+    }
+
+    /// A backup without a WAL that repairs `(0, to_op]` and has walked ops
+    /// `1..=walked_to`, each with one message, op `n` at offset `n - 1`.
+    async fn walless_backup_walked_to(walked_to: u64, to_op: u64) -> IggyPartition<RecordingBus> {
+        let (mut backup, _) = recording_partition_at(1, 3);
+        backup.consensus().advance_commit_max(to_op);
+        backup.repair = Some(RepairSession {
+            floor: None,
+            ..armed_session(to_op, 0)
+        });
+        serve_batches(&mut backup, 1..=walked_to, 0).await;
+        assert_eq!(
+            backup.complete_repair(&repair_config()).await,
+            RepairConclusion::InProgress
+        );
+        assert_eq!(backup.consensus().commit_min(), walked_to);
+        backup
+    }
+
+    /// Serves `ops` as one-message batches at consecutive offsets from
+    /// `first_offset`.
+    async fn serve_batches(
+        backup: &mut IggyPartition<RecordingBus>,
+        ops: std::ops::RangeInclusive<u64>,
+        first_offset: u64,
+    ) {
+        for (op, offset) in ops.zip(first_offset..) {
+            backup
+                .apply_repaired_prepare(checksummed_segment_prepare(op, 0, offset, b"repaired"))
+                .await;
+        }
+    }
+
+    /// The peer's ring slid past the ops after the walked prefix. The batches
+    /// walked before the floor rose say nothing about the ops between them
+    /// and the floor.
+    #[compio::test]
+    async fn given_batches_walked_before_floor_rise_when_window_completes_should_refuse_commit_floor()
+     {
+        const WALKED_TO: u64 = 4;
+        const FLOOR: u64 = 8;
+        const TO_OP: u64 = 12;
+        let mut backup = walless_backup_walked_to(WALKED_TO, TO_OP).await;
+
+        backup.note_repair_floor(FLOOR);
+        serve_batches(&mut backup, FLOOR + 1..=TO_OP, FLOOR).await;
+        let conclusion = backup.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            backup.consensus().commit_min(),
+            WALKED_TO,
+            "the floor must not lift commit_min over ops {}..={FLOOR}, which carried messages",
+            WALKED_TO + 1
+        );
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: FLOOR,
+                to_op: TO_OP
+            }
+        );
+    }
+
+    /// A batch at or below the floor never anchors it, even one that starts
+    /// at the stand-in bound, because the jump skips it. Both edges of the
+    /// skipped window: the op after the walked prefix, and the floor itself.
+    #[compio::test]
+    async fn given_batch_at_or_below_floor_at_stand_in_bound_when_window_completes_should_refuse_commit_floor()
+     {
+        const WALKED_TO: u64 = 4;
+        const FLOOR: u64 = 8;
+        const TO_OP: u64 = 12;
+        for skipped_op in [WALKED_TO + 1, FLOOR] {
+            let mut backup = walless_backup_walked_to(WALKED_TO, TO_OP).await;
+            backup.recovered_durable_offset = Some(WALKED_TO - 1);
+
+            backup.note_repair_floor(FLOOR);
+            serve_batches(&mut backup, skipped_op..=skipped_op, WALKED_TO).await;
+            serve_batches(&mut backup, FLOOR + 1..=TO_OP, WALKED_TO + 1).await;
+            let conclusion = backup.complete_repair(&repair_config()).await;
+
+            assert_eq!(
+                conclusion,
+                RepairConclusion::FloorRefused {
+                    floor: FLOOR,
+                    to_op: TO_OP
+                },
+                "the batch at op {skipped_op} must not anchor the floor"
+            );
+            assert!(
+                backup.consensus().commit_min() < FLOOR,
+                "the floor must not lift commit_min over the batch at op {skipped_op}"
+            );
+        }
+    }
+
+    /// Ops between the walked prefix and the floor carried no messages, so
+    /// the first batch above the floor starts at the stand-in bound, one past
+    /// the recovered durable end.
+    #[compio::test]
+    async fn given_batch_above_floor_at_stand_in_bound_when_window_completes_should_accept_commit_floor()
+     {
+        const WALKED_TO: u64 = 4;
+        const FLOOR: u64 = 8;
+        const TO_OP: u64 = 12;
+        let mut backup = walless_backup_walked_to(WALKED_TO, TO_OP).await;
+        backup.recovered_durable_offset = Some(WALKED_TO - 1);
+
+        backup.note_repair_floor(FLOOR);
+        serve_batches(&mut backup, FLOOR + 1..=TO_OP, WALKED_TO).await;
+        let conclusion = backup.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::Done,
+            "a first batch above the floor at the stand-in bound connects the window"
+        );
+        assert_eq!(backup.consensus().commit_min(), TO_OP);
+    }
+
+    /// The batches above the floor were journaled before the floor settled: in
+    /// a round without a floor, under a lower floor before the peer's ring
+    /// slid, or under the same floor in a round whose `RepairDone` was lost.
+    /// The peer re-serves them, the journal holds them, and they still anchor
+    /// the floor. Ops 5 to 8 carried no messages, so the first batch above the
+    /// floor starts at the stand-in bound.
+    #[compio::test]
+    async fn given_batches_journaled_before_floor_settled_when_window_completes_should_accept_commit_floor()
+     {
+        const WALKED_TO: u64 = 4;
+        const LOWER_FLOOR: u64 = 6;
+        const FLOOR: u64 = 8;
+        const TO_OP: u64 = 12;
+        for earlier_floor in [None, Some(LOWER_FLOOR), Some(FLOOR)] {
+            let mut backup = walless_backup_walked_to(WALKED_TO, TO_OP).await;
+            backup.recovered_durable_offset = Some(WALKED_TO - 1);
+            if let Some(floor) = earlier_floor {
+                backup.note_repair_floor(floor);
+            }
+            serve_batches(&mut backup, FLOOR + 1..=TO_OP, WALKED_TO).await;
+
+            backup.note_repair_floor(FLOOR);
+            serve_batches(&mut backup, FLOOR + 1..=TO_OP, WALKED_TO).await;
+            let conclusion = backup.complete_repair(&repair_config()).await;
+
+            assert_eq!(
+                (conclusion, backup.consensus().commit_min()),
+                (RepairConclusion::Done, TO_OP),
+                "batches journaled under the earlier floor {earlier_floor:?} must anchor the floor"
+            );
+        }
+    }
+
+    /// A second floor in one session rises over ops whose messages never
+    /// arrived. The batches that anchored the first floor are walked and sit
+    /// below the second one, so they prove nothing about it.
+    #[compio::test]
+    async fn given_second_floor_above_walked_batches_when_window_completes_should_refuse_commit_floor()
+     {
+        const WALKED_TO: u64 = 4;
+        const FIRST_FLOOR: u64 = 6;
+        const FIRST_TO: u64 = 8;
+        const FLOOR: u64 = 12;
+        const TO_OP: u64 = 16;
+        // Ops 9 to 12 carried offsets 6 to 9, which never arrive here.
+        const FIRST_OFFSET_ABOVE_FLOOR: u64 = 10;
+        let mut backup = walless_backup_walked_to(WALKED_TO, TO_OP).await;
+        backup.recovered_durable_offset = Some(WALKED_TO - 1);
+        backup.note_repair_floor(FIRST_FLOOR);
+        serve_batches(&mut backup, FIRST_FLOOR + 1..=FIRST_TO, WALKED_TO).await;
+        assert_eq!(
+            backup.complete_repair(&repair_config()).await,
+            RepairConclusion::InProgress
+        );
+        assert_eq!(backup.consensus().commit_min(), FIRST_TO);
+
+        backup.note_repair_floor(FLOOR);
+        serve_batches(&mut backup, FLOOR + 1..=TO_OP, FIRST_OFFSET_ABOVE_FLOOR).await;
+        let conclusion = backup.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            (conclusion, backup.consensus().commit_min()),
+            (
+                RepairConclusion::FloorRefused {
+                    floor: FLOOR,
+                    to_op: TO_OP
+                },
+                FIRST_TO
+            ),
+            "the second floor must not lift commit_min over ops {}..={FLOOR}",
+            FIRST_TO + 1
+        );
     }
 
     /// A `RangeEvicted` floor arrives above `commit_min`, and the walk passes
@@ -26538,11 +29603,11 @@ mod tests {
     async fn given_floor_below_commit_min_when_completing_repair_should_ignore_the_floor() {
         let mut partition = test_partition();
         partition.consensus().restore_commit_state(7, 8);
-        // Disconnected on its face: the served window starts at offset 20 and
-        // the boot-recovered segments end at 10. Meaningless below commit_min.
+        // Disconnected on its face: no batch above the floor ties it to the
+        // boot-recovered segments. Meaningless below commit_min.
         partition.recovered_durable_offset = Some(10);
         journal_prepare(&partition, 8, Operation::CreateStream).await;
-        partition.repair = Some(armed_session(8, 5, Some(20)));
+        partition.repair = Some(armed_session(8, 5));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26561,7 +29626,7 @@ mod tests {
         partition.consensus().restore_commit_state(5, 5);
         // The peer retains nothing below op 10, so it cannot serve the suffix
         // either. Only the raw floor tells this apart from a moot one.
-        partition.repair = Some(armed_fetch_session(5, 9, 9, None));
+        partition.repair = Some(armed_fetch_session(5, 9, 9));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26581,7 +29646,7 @@ mod tests {
         // The peer retains from op 6, everything this replica still needs, so
         // the suffix fetch must go on. Escaping to state transfer here copied
         // segments for a window the peer can serve.
-        partition.repair = Some(armed_fetch_session(5, 9, 5, None));
+        partition.repair = Some(armed_fetch_session(5, 9, 5));
 
         let conclusion = partition.complete_repair(&repair_config()).await;
 
@@ -26637,6 +29702,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 50,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -26691,6 +29757,7 @@ mod tests {
             prepare_checksum: None,
             checkpoint_prepare: Vec::new(),
             next_offset: 1_000,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -26784,7 +29851,7 @@ mod tests {
         let (_receiver_directory, mut receiver) = transfer_receiver();
         receiver.consensus().advance_commit_max(3);
         // An empty serving journal reports eviction from its commit point.
-        receiver.repair = Some(armed_session(3, 3, None));
+        receiver.repair = Some(armed_session(3, 3));
 
         let conclusion = receiver.complete_repair(&repair_config()).await;
         assert_eq!(
@@ -26815,7 +29882,7 @@ mod tests {
         let (_receiver_directory, mut receiver) = transfer_receiver();
         receiver.consensus().advance_commit_max(3);
         // The serving peer evicted op 1 and still retains ops 2 and 3.
-        receiver.repair = Some(armed_session(3, 1, None));
+        receiver.repair = Some(armed_session(3, 1));
         for op in [2, 3] {
             receiver
                 .apply_repaired_prepare(retained_prepare(&origin, op))
@@ -26968,7 +30035,7 @@ mod tests {
             assert!(receiver.log.journal().inner.holds_op(1), "{durability:?}");
             assert_eq!(receiver.consensus().commit_min(), 0, "{durability:?}");
             receiver.consensus().advance_commit_max(3);
-            receiver.repair = Some(armed_session(3, 2, None));
+            receiver.repair = Some(armed_session(3, 2));
             receiver
                 .apply_repaired_prepare(retained_prepare(&origin, 3))
                 .await;
@@ -27618,7 +30685,7 @@ mod tests {
         .await;
         let partition = &mut fixture.partition;
         partition.log.journal().inner.set_repair_retention(true);
-        partition.repair = Some(armed_session(4, 0, None));
+        partition.repair = Some(armed_session(4, 0));
         let prepares: Vec<_> = (1..=4)
             .map(|op| repaired_send_prepare(op, 0, u128::from(op)).into_frozen())
             .collect();
@@ -27697,7 +30764,7 @@ mod tests {
         )
         .await;
         let partition = &mut fixture.partition;
-        partition.repair = Some(armed_session(6, 0, None));
+        partition.repair = Some(armed_session(6, 0));
         for op in [1, 2, 3, 6] {
             partition
                 .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
@@ -27743,7 +30810,7 @@ mod tests {
             Rc::new(|_, _| {}),
             crate::largest_legal_job_charge().unwrap(),
         );
-        partition.repair = Some(armed_session(6, 0, None));
+        partition.repair = Some(armed_session(6, 0));
         for op in [1, 2, 3, 6, 4, 5] {
             partition
                 .apply_repaired_prepare(repaired_send_prepare(op, 0, u128::from(op)))
@@ -27808,6 +30875,7 @@ mod tests {
             prepare_checksum: Some(last.header().checksum),
             checkpoint_prepare: last.as_slice().to_vec(),
             next_offset: INSTALLED_OPS,
+            emptied_at: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
             external_groups: Vec::new(),
@@ -28000,7 +31068,7 @@ mod tests {
         const OPS: u64 = COMMIT_WALK_OPS_MAX as u64 + 1;
         let mut partition = test_partition();
         let record_len = build_segment_record(IggyNamespace::new(1, 1, 0), 1).len() as u64;
-        partition.repair = Some(armed_session(OPS, 0, None));
+        partition.repair = Some(armed_session(OPS, 0));
 
         for op in 1..=OPS {
             partition
@@ -28037,7 +31105,7 @@ mod tests {
              is what lets the repair ingest re-deliver it"
         );
 
-        partition.repair = Some(armed_session(OPS, 0, None));
+        partition.repair = Some(armed_session(OPS, 0));
         partition
             .apply_repaired_prepare(repaired_send_prepare(OPS, 0, CHECKSUM))
             .await;

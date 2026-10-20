@@ -69,34 +69,13 @@ func (c *IggyTcpClient) DeleteConsumerOffset(ctx context.Context, consumer iggco
 	}, nil)
 }
 
-// writeOffset sends an offset write to the partition primary over a data
-// connection, as the Rust SDK's PollRouter::write_offset does. A replay on the
-// coordinator would walk the roster to the primary under a new client identity,
-// which is no member of the group. A captured context is stamped on every
-// attempt; without one, the write takes the context its route reports.
 func (c *IggyTcpClient) writeOffset(ctx context.Context, cmd command.Command, captured *iggcon.PartitionContext) error {
 	if ctx == nil {
 		return ierror.ErrNilContext
 	}
-	if err := c.ensureTopology(ctx); err != nil {
-		return err
+	if captured != nil {
+		ctx = context.WithValue(ctx, capturedPartitionContext{}, *captured)
 	}
-	if !c.clustered.Load() {
-		if captured != nil {
-			ctx = context.WithValue(ctx, capturedPartitionContext{}, *captured)
-		}
-		_, err := c.do(ctx, cmd)
-		return err
-	}
-	payload, err := cmd.MarshalBinary()
-	if err != nil {
-		return err
-	}
-	routePayload, err := offsetRoutePayload(cmd.Code(), payload)
-	if err != nil {
-		return err
-	}
-	_, err = c.sendRouted(ctx, cmd.Code(), routeKey(command.GetOffsetRoutingCode, routePayload),
-		command.GetOffsetRoutingCode, routePayload, payload, captured)
+	_, err := c.do(ctx, cmd)
 	return err
 }

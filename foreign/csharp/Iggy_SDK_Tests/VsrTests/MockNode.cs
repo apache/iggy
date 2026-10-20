@@ -54,22 +54,9 @@ internal static class MockFrames
     /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
     internal static byte[] Answer(MockRequest request)
     {
-        if (request.Code == CommandCodes.GET_SEND_CONTEXT_CODE)
+        if (request.Code == CommandCodes.GET_PARTITION_ROUTE_CODE)
         {
-            var context = new byte[24];
-            BinaryPrimitives.WriteUInt64LittleEndian(context, 17);
-            BinaryPrimitives.WriteUInt64LittleEndian(context.AsSpan(16), 1);
-            return Reply(OPERATION_NON_REPLICATED, context);
-        }
-        if (request.Code is CommandCodes.GET_POLL_ROUTING_CODE or CommandCodes.GET_CONSUMER_OFFSET_ROUTING_CODE)
-        {
-            var route = new byte[56];
-            BinaryPrimitives.WriteUInt128LittleEndian(route, request.ClientId);
-            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(16), request.Session);
-            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(24), 1);
-            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(32), 17);
-            BinaryPrimitives.WriteUInt64LittleEndian(route.AsSpan(48), 1);
-            return Reply(OPERATION_NON_REPLICATED, route);
+            return RouteReply(request, new PartitionContext(17, 0, 1), 0);
         }
         if (request.Code == BIND_SESSION_CODE)
         {
@@ -107,19 +94,16 @@ internal static class MockFrames
         return Reply(OPERATION_NON_REPLICATED, body.ToArray());
     }
 
-    /// <summary>A GetPollRouting or GetConsumerOffsetRouting reply that routes the caller's session to a primary.</summary>
-    internal static byte[] RouteReply(MockRequest request, PartitionContext context, ushort primaryPort, bool leader)
+    internal static byte[] RouteReply(MockRequest request, PartitionContext context, byte primaryReplica,
+        uint partitionsCount = 1, uint view = 0)
     {
-        var attachment = new byte[32];
-        BinaryPrimitives.WriteUInt128LittleEndian(attachment, request.ClientId);
-        BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(16), request.Session);
-        BinaryPrimitives.WriteUInt64LittleEndian(attachment.AsSpan(24), 1);
-        var body = new List<byte>(attachment);
-        body.AddRange(BitConverter.GetBytes(context.Incarnation));
-        body.AddRange(BitConverter.GetBytes(context.OwnerGeneration));
-        body.AddRange(BitConverter.GetBytes(context.MetadataOp));
-        WriteNode(body, primaryPort, leader);
-        return Reply(OPERATION_NON_REPLICATED, body.ToArray());
+        var body = new byte[PartitionRoute.ENCODED_SIZE];
+        BinaryPrimitives.WriteUInt64LittleEndian(body, context.Incarnation);
+        BinaryPrimitives.WriteUInt64LittleEndian(body.AsSpan(8), context.MetadataOp);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(16), view);
+        BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(20), partitionsCount);
+        body[24] = primaryReplica;
+        return Reply(OPERATION_NON_REPLICATED, body);
     }
 
     /// <summary>A SyncConsumerGroup reply body: the assignment generation and the member's partitions.</summary>
@@ -136,8 +120,9 @@ internal static class MockFrames
         return body;
     }
 
-    internal static void WriteNode(List<byte> body, ushort port, bool leader)
+    internal static void WriteNode(List<byte> body, ushort port, bool leader, byte replicaId = 0)
     {
+        body.Add(replicaId);
         WriteString(body, $"node-{port}");
         WriteString(body, "127.0.0.1");
         body.AddRange(BitConverter.GetBytes(port));

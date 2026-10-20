@@ -37,6 +37,17 @@ use iggy_binary_protocol::consensus::{
 /// via `binary_protocol`. Re-exported so server-side callers keep one import.
 pub use iggy_binary_protocol::consensus::result_code;
 
+/// A stream or topic removed by a committed delete, named by slab id.
+///
+/// Grants name streams and topics by slab id, and the slab gives a freed id to
+/// the next create. So the grants on a deleted id must go in the same apply, or
+/// they reach the stream or topic that reuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedResource {
+    Stream(usize),
+    Topic { stream_id: usize, topic_id: usize },
+}
+
 /// Outcome of applying one committed metadata op.
 ///
 /// `code == 0` is success, `body` the typed reply payload. Nonzero `code` is a
@@ -50,6 +61,8 @@ pub struct ApplyReply {
     /// Local apply effect, recomputed from the committed operation on every replay.
     /// It is not part of the client reply or persisted receipt.
     pub(crate) revoked_user: Option<u32>,
+    /// Local apply effect, like `revoked_user`: the grants on this resource must go.
+    pub(crate) deleted_resource: Option<DeletedResource>,
 }
 
 impl ApplyReply {
@@ -60,6 +73,7 @@ impl ApplyReply {
             code: 0,
             body,
             revoked_user: None,
+            deleted_resource: None,
         }
     }
 
@@ -71,6 +85,7 @@ impl ApplyReply {
             code: code.into(),
             body: Bytes::new(),
             revoked_user: None,
+            deleted_resource: None,
         }
     }
 
@@ -216,6 +231,8 @@ result_enum!(TruncatePartitionResult {
 result_enum!(CreateUserResult {
     InvalidUsername = 43,
     UserAlreadyExists = 46,
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
     InvalidOptionValue = 4042,
 });
 result_enum!(UpdateUserResult {
@@ -235,6 +252,8 @@ result_enum!(ChangePasswordResult {
 result_enum!(UpdatePermissionsResult {
     UserNotFound = 20,
     CannotChangePermissions = 49,
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
 });
 
 // Personal access tokens.
@@ -286,20 +305,25 @@ const LIFECYCLE_BUSY_CODE: u32 = 88;
 /// `IggyError::InvalidCommand`, committed by the lifecycle apply paths.
 const INVALID_COMMAND_CODE: u32 = 3;
 
-/// True if `code` is one this op's result enum declares (`Ok = 0` included), or
-/// one of the global codes `UNAUTHORIZED_CODE`, `LIFECYCLE_BUSY_CODE` and
-/// `INVALID_COMMAND_CODE`.
+/// True if the state machine can commit `code` for this op.
+///
+/// That is a code of the op's result enum (`Ok = 0` included), the global
+/// `UNAUTHORIZED_CODE`, `LIFECYCLE_BUSY_CODE` for an op behind a lifecycle gate,
+/// or `INVALID_COMMAND_CODE` for an op that begins a lifecycle.
 ///
 /// The state machine only commits codes from the op's own enum, plus the
-/// global in-apply denials of the authorization and lifecycle gates, so an
+/// in-apply denials of the authorization and lifecycle gates, so an
 /// unrecognized one is a server bug, not a race (a race still yields a declared
 /// code). Enriched internal ops map to their client-op enum; ops with no result
 /// section (partition plane) return `true`.
 #[must_use]
 pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
-    // The in-apply RBAC and lifecycle gates can deny any control-plane op,
-    // committing a no-op, so accept their codes globally rather than per-op enum.
-    if code == UNAUTHORIZED_CODE || code == LIFECYCLE_BUSY_CODE || code == INVALID_COMMAND_CODE {
+    // The in-apply RBAC gate can deny any control-plane op, committing a no-op,
+    // so accept its code globally rather than per-op enum.
+    if code == UNAUTHORIZED_CODE
+        || (code == LIFECYCLE_BUSY_CODE && lifecycle_gated(operation))
+        || (code == INVALID_COMMAND_CODE && begins_lifecycle(operation))
+    {
         return true;
     }
     match operation {
@@ -333,6 +357,40 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
         Operation::LeaveConsumerGroup => LeaveConsumerGroupResult::from_u32(code).is_some(),
         _ => true,
     }
+}
+
+/// Ops whose apply commits `LIFECYCLE_BUSY_CODE` for a target that a pending
+/// lifecycle covers, in their client and enriched forms.
+const fn lifecycle_gated(operation: Operation) -> bool {
+    matches!(
+        operation,
+        Operation::UpdateStream
+            | Operation::DeleteStream
+            | Operation::CreateTopic
+            | Operation::CreateTopicWithAssignments
+            | Operation::UpdateTopic
+            | Operation::DeleteTopic
+            | Operation::CreatePartitions
+            | Operation::CreatePartitionsWithAssignments
+            | Operation::DeletePartitions
+            | Operation::TruncatePartition
+            | Operation::CreateConsumerGroup
+            | Operation::DeleteConsumerGroup
+            | Operation::JoinConsumerGroup
+            | Operation::LeaveConsumerGroup
+    )
+}
+
+/// Ops that begin a lifecycle, whose apply commits `INVALID_COMMAND_CODE` for a
+/// target it cannot encode.
+const fn begins_lifecycle(operation: Operation) -> bool {
+    matches!(
+        operation,
+        Operation::DeleteStream
+            | Operation::DeleteTopic
+            | Operation::DeletePartitions
+            | Operation::DeleteConsumerGroup
+    )
 }
 
 #[cfg(test)]
@@ -439,6 +497,39 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn given_an_op_without_a_lifecycle_gate_when_lifecycle_busy_should_not_be_recognized() {
+        for operation in [
+            Operation::CreateUser,
+            Operation::CreatePersonalAccessToken,
+            Operation::CreateStream,
+        ] {
+            assert!(
+                !result_code_recognized(operation, IggyError::LifecycleBusy.as_code()),
+                "{operation:?} has no lifecycle gate"
+            );
+        }
+    }
+
+    #[test]
+    fn given_an_op_that_begins_no_lifecycle_when_invalid_command_should_not_be_recognized() {
+        for operation in [
+            Operation::CreateUser,
+            Operation::CreateStream,
+            Operation::UpdateTopic,
+            Operation::JoinConsumerGroup,
+        ] {
+            assert!(
+                !result_code_recognized(operation, IggyError::InvalidCommand.as_code()),
+                "{operation:?} begins no lifecycle"
+            );
+        }
+        assert!(result_code_recognized(
+            Operation::DeleteConsumerGroup,
+            IggyError::InvalidCommand.as_code()
+        ));
+    }
+
     // Pins every result-enum discriminant to the `IggyError` variant its doc
     // claims, via `IggyError::as_code()` (the real wire discriminant the SDKs
     // decode). The discriminants are bare literals with no compile-time tie to
@@ -482,7 +573,19 @@ mod tests {
             stream_not_found
         );
         assert_eq!(
+            u32::from(TruncatePartitionResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
             u32::from(CreateConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(CreateUserResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::StreamNotFound),
             stream_not_found
         );
 
@@ -510,7 +613,16 @@ mod tests {
             topic_not_found
         );
         assert_eq!(
+            u32::from(TruncatePartitionResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
             u32::from(CreateConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(u32::from(CreateUserResult::TopicNotFound), topic_not_found);
+        assert_eq!(
+            u32::from(UpdatePermissionsResult::TopicNotFound),
             topic_not_found
         );
 
@@ -533,6 +645,58 @@ mod tests {
         assert_eq!(
             u32::from(CreateTopicResult::InvalidPartitionsCount),
             IggyError::InvalidPartitionsCount.as_code(),
+        );
+        assert_eq!(
+            u32::from(DeletePartitionsResult::InvalidPartitionsCount),
+            IggyError::InvalidPartitionsCount.as_code(),
+        );
+
+        // PartitionResizeDisabled (2023).
+        let partition_resize_disabled = IggyError::PartitionResizeDisabled.as_code();
+        assert_eq!(
+            u32::from(CreatePartitionsResult::PartitionResizeDisabled),
+            partition_resize_disabled,
+        );
+        assert_eq!(
+            u32::from(DeletePartitionsResult::PartitionResizeDisabled),
+            partition_resize_disabled,
+        );
+
+        // PartitionNotFound (3007).
+        assert_eq!(
+            u32::from(TruncatePartitionResult::PartitionNotFound),
+            IggyError::PartitionNotFound(0, id(), id()).as_code(),
+        );
+
+        // UnsupportedOptionKey (4041) / InvalidOptionValue (4042).
+        assert_eq!(
+            u32::from(UpdateTopicResult::UnsupportedOptionKey),
+            IggyError::UnsupportedOptionKey(String::new()).as_code(),
+        );
+        let invalid_option_value = IggyError::InvalidOptionValue(String::new()).as_code();
+        assert_eq!(
+            u32::from(CreateStreamResult::InvalidOptionValue),
+            invalid_option_value
+        );
+        assert_eq!(
+            u32::from(UpdateStreamResult::InvalidOptionValue),
+            invalid_option_value
+        );
+        assert_eq!(
+            u32::from(CreateTopicResult::InvalidOptionValue),
+            invalid_option_value
+        );
+        assert_eq!(
+            u32::from(UpdateTopicResult::InvalidOptionValue),
+            invalid_option_value
+        );
+        assert_eq!(
+            u32::from(CreateUserResult::InvalidOptionValue),
+            invalid_option_value
+        );
+        assert_eq!(
+            u32::from(UpdateUserResult::InvalidOptionValue),
+            invalid_option_value
         );
 
         // UserAlreadyExists (46) - also stands in for username-already-exists.
@@ -615,6 +779,11 @@ mod tests {
             u32::from(CreateConsumerGroupResult::NameAlreadyExists),
             IggyError::ConsumerGroupNameAlreadyExists(String::new(), id()).as_code(),
         );
+        // TooManyConsumerGroups (5010).
+        assert_eq!(
+            u32::from(CreateConsumerGroupResult::TooManyConsumerGroups),
+            IggyError::TooManyConsumerGroups.as_code(),
+        );
         let consumer_group_not_found = IggyError::ConsumerGroupIdNotFound(id(), id()).as_code();
 
         // Delete/Join/Leave mirror the legacy `resolve_consumer_group` error
@@ -692,7 +861,7 @@ mod tests {
 
         // Unauthorized (41) - the global in-apply RBAC denial code.
         assert_eq!(UNAUTHORIZED_CODE, IggyError::Unauthorized.as_code());
-        // LifecycleBusy (88) and InvalidCommand (3) - the global lifecycle gate codes.
+        // LifecycleBusy (88) and InvalidCommand (3) - the lifecycle gate codes.
         assert_eq!(LIFECYCLE_BUSY_CODE, IggyError::LifecycleBusy.as_code());
         assert_eq!(INVALID_COMMAND_CODE, IggyError::InvalidCommand.as_code());
     }

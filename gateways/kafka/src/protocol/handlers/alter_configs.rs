@@ -123,10 +123,10 @@ pub async fn handle(
     )
 }
 
-/// Denies every resource when `principal` is known but is not allowed to alter topic
-/// configuration, or when its permissions could not be read. `None` means SASL is off, which
-/// this gateway treats as no principal to enforce against - the same choice the rest of this
-/// gateway makes when authentication itself is not configured.
+/// Denies every resource when `principal` is not allowed to alter topic configuration, or when
+/// its permissions could not be read. `None` means no listener of this gateway names principals,
+/// so there is nothing to enforce against; once one does, a connection that proved no identity
+/// carries [`AuthenticatedPrincipal::anonymous`] instead and is denied here.
 fn authorize(
     principal: Option<&AuthenticatedPrincipal>,
     resources: &[AlterConfigsResource],
@@ -144,9 +144,8 @@ fn authorize(
             "AlterConfigs asked on a connection whose permissions were never read; denying"
         );
     }
-    let message = StrBytes::from_static_str(
-        "the authenticated principal is not authorized to alter topic configuration",
-    );
+    let message =
+        StrBytes::from_static_str("the principal is not authorized to alter topic configuration");
     Some(
         resources
             .iter()

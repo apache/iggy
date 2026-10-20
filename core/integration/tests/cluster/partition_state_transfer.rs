@@ -224,45 +224,27 @@ async fn given_evicted_ring_when_fresh_node_joins_late_should_state_transfer_par
 async fn given_evicted_ring_when_node_restarts_with_data_should_state_transfer_partition(
     harness: &mut TestHarness,
 ) {
-    // Node 2 holds a durable prefix, then misses enough traffic that the
-    // survivors' ring moves past its durable end: its repaired window cannot
-    // connect, which is exactly the refusal-site trigger.
-    let client = harness
-        .root_client_for_node(0)
-        .await
-        .expect("connect a root client to the node");
-    seed_topic(&client, None).await;
-    produce(&client, 40).await;
-    sleep(Duration::from_secs(1)).await;
-    harness.stop_node(2).expect("stop node 2");
+    restart_lagging_node_and_await_install(harness).await;
+}
 
-    produce(&client, MESSAGES_COUNT).await;
-    let _seed_client = client;
-
-    harness.restart_node(2).expect("restart node 2 with data");
-
-    await_marker(harness, 2, CONVERSION_MARKER).await;
-    await_marker(harness, 2, INSTALL_MARKER).await;
-    // The serving side proves the pull actually ran (not a vacuous install).
-    // Retried like every other marker check here: stdout goes through the
-    // buffered non-blocking appender, so a survivor's line can trail node 2's
-    // install by more than one poll.
-    await_marker_any(harness, &[0, 1], FULLY_SERVED_MARKER).await;
-
-    // The markers only say the machinery ran. Read node 2's OWN segment bytes
-    // and check every produced payload is there, in ascending file order: a
-    // truncated, short or reordered install fails here and passes above.
-    //
-    // Read off disk rather than polled: the SDK is leader-aware and redirects
-    // a poll to the primary, so no client-side read can be pinned to the
-    // rejoined node.
-    // Two produce runs, each numbering its payloads from 0, so the expected
-    // chain is 0..40 followed by 0..MESSAGES_COUNT.
-    let expected: Vec<String> = (0..40)
-        .chain(0..MESSAGES_COUNT)
-        .map(|sequence| format!("message-{sequence}"))
-        .collect();
-    await_installed_payloads(harness, 2, &expected).await;
+/// The survivors' ring holds more than one repair chunk (`repair_chunk_max`,
+/// 128 ops) above node 2's floor, yet fewer than the 200 ops node 2 misses, so
+/// the floor is still evicted. Nothing is written after the restart, so the
+/// ring never slides the window down to one chunk. The chunk is pinned: one of
+/// 150 ops or more covers the window in one round, and a refusal that waits
+/// for the whole window would then pass too.
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(
+        sharding.cpu_allocation = "0..1",
+        partition.evicted_ring_capacity = "150",
+        cluster.repair_chunk_max = "128"
+    )
+)]
+async fn given_evicted_ring_wider_than_repair_chunk_when_node_restarts_with_data_should_state_transfer_partition(
+    harness: &mut TestHarness,
+) {
+    restart_lagging_node_and_await_install(harness).await;
 }
 
 #[iggy_harness(
@@ -369,6 +351,48 @@ async fn given_transfer_peer_dies_when_stalled_should_leave_dead_peer_and_recove
         );
         sleep(MARKER_POLL).await;
     }
+}
+
+async fn restart_lagging_node_and_await_install(harness: &mut TestHarness) {
+    // Node 2 holds a durable prefix, then misses enough traffic that the
+    // survivors' ring moves past its durable end: its repaired window cannot
+    // connect, which is exactly the refusal-site trigger.
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client to the node");
+    seed_topic(&client, None).await;
+    produce(&client, 40).await;
+    sleep(Duration::from_secs(1)).await;
+    harness.stop_node(2).expect("stop node 2");
+
+    produce(&client, MESSAGES_COUNT).await;
+    let _seed_client = client;
+
+    harness.restart_node(2).expect("restart node 2 with data");
+
+    await_marker(harness, 2, CONVERSION_MARKER).await;
+    await_marker(harness, 2, INSTALL_MARKER).await;
+    // The serving side proves the pull actually ran (not a vacuous install).
+    // Retried like every other marker check here: stdout goes through the
+    // buffered non-blocking appender, so a survivor's line can trail node 2's
+    // install by more than one poll.
+    await_marker_any(harness, &[0, 1], FULLY_SERVED_MARKER).await;
+
+    // The markers only say the machinery ran. Read node 2's OWN segment bytes
+    // and check every produced payload is there, in ascending file order: a
+    // truncated, short or reordered install fails here and passes above.
+    //
+    // Read off disk rather than polled: the SDK is leader-aware and redirects
+    // a poll to the primary, so no client-side read can be pinned to the
+    // rejoined node.
+    // Two produce runs, each numbering its payloads from 0, so the expected
+    // chain is 0..40 followed by 0..MESSAGES_COUNT.
+    let expected: Vec<String> = (0..40)
+        .chain(0..MESSAGES_COUNT)
+        .map(|sequence| format!("message-{sequence}"))
+        .collect();
+    await_installed_payloads(harness, 2, &expected).await;
 }
 
 async fn connect_any(harness: &TestHarness, nodes: &[usize]) -> Option<IggyClient> {

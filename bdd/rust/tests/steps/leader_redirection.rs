@@ -34,7 +34,7 @@ async fn given_cluster_config(world: &mut LeaderContext, node_count: usize) {
 }
 
 #[given(regex = r"^node (\d+) is configured on port (\d+)$")]
-async fn given_node_configured(world: &mut LeaderContext, node_id: u32, port: u16) {
+async fn given_node_configured(world: &mut LeaderContext, node_id: u8, port: u16) {
     let (quic_port, http_port, ws_port) = match port {
         8091 => (8081, 3001, 8071),               // Leader ports
         8092 => (8082, 3002, 8072),               // Follower ports
@@ -42,6 +42,7 @@ async fn given_node_configured(world: &mut LeaderContext, node_id: u32, port: u1
     };
 
     let node = ClusterNode {
+        replica_id: node_id,
         name: format!("node-{}", node_id),
         ip: "iggy-server".to_string(),
         endpoints: TransportEndpoints::new(

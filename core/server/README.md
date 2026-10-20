@@ -39,6 +39,33 @@ cargo run --bin iggy-server --release -- --replica-id 0
 
 Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
+## Upgrading
+
+Deploy matching server and SDK releases together. Rolling upgrades and mixed
+server versions are unsupported. Partition control frames from older servers
+carry incarnation zero and are rejected, so a mixed-version cluster cannot
+complete partition view changes. The `IGGY-BOUND-GRANTS-2` storage gate also
+rejects older data directories without modifying them. Existing data requires a
+separately validated offline migration or restore procedure before this release
+can use it.
+
+All existing self-issued JWT access and refresh tokens are rejected after this
+upgrade. HTTP clients and the web UI must log in again. In
+`[[http.jwt.trusted_issuers]]`, replace `user_id` with `username`, naming the
+account the issuer may act as. The corresponding environment variable changes
+from `IGGY_HTTP_JWT_TRUSTED_ISSUERS_<n>_USER_ID` to
+`IGGY_HTTP_JWT_TRUSTED_ISSUERS_<n>_USERNAME`.
+
+Cluster metadata includes `replica_id`. Java's `ClusterNode` record adds a leading
+`replicaId` component, changing constructor calls and record patterns. C# callers
+must initialize the required `ReplicaId` property. The CLI's cluster metadata list
+appends a replica ID column. Swift's `ClusterNode` initializer now requires
+`replicaID`. C++'s FFI `ClusterNode`, Rust's `iggy_common::ClusterNode` and
+`iggy_binary_protocol::responses::system::ClusterNodeResponse` add the public
+`replica_id` field; update aggregate and struct initializers.
+Go, Java, Node.js and C# clients use command 105's new
+partition routes and refresh on `NotPrimary` (89); use their matching releases.
+
 ## Configuration
 
 Settings are read from [config.toml](config.toml), resolved relative to the working directory. Set `IGGY_CONFIG_PATH` to load a different file.
@@ -87,6 +114,10 @@ offset writes support the configured policy. Crash-safe send retries require
 receipt still replays its original result, but a lost receipt cannot prevent
 another execution. NoAck and internal auto-commit polls retain their weaker
 completion contracts.
+
+Auto-commit polls are at-most-once: the owner can advance an offset before the
+gateway's final authorization check. If the session ends or permissions are
+revoked during that return hop, the response is denied and the batch can be lost.
 
 Topics have an immutable `partition_resize_policy` creation option. The default,
 `mutable`, permits partition addition and deletion without a bounded cutover or
@@ -179,7 +210,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-OWNERSHIP-HISTORY-4` requires this initialization contract;
+Storage format `IGGY-BOUND-GRANTS-2` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory
