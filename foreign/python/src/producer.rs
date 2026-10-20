@@ -34,6 +34,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_py
 use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::{RwLock, Semaphore};
 
+use crate::awaitable::none_future_into_py;
 use crate::duration::{duration_repr, iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::partitioning::Partitioning;
 use crate::send_message::{SendMessage, SendMessagesConfirmation, SendMessagesResponse};
@@ -611,9 +612,9 @@ impl IggyProducer {
     #[gen_stub(override_return_type(type_repr = "collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn shutdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        future_into_py(py, async move {
+        none_future_into_py(py, async move {
             shutdown(inner).await?;
-            Ok(Python::attach(|py| py.None()))
+            Ok(())
         })
     }
 
