@@ -19,10 +19,12 @@ package client
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -73,13 +75,14 @@ const (
 // types them as non-zero durations whose wire format carries whole
 // microseconds; reestablish_after takes the zero spellings, which Rust
 // accepts there.
-// The Go client keeps its own reconnect and heartbeat pacing, so those
-// three spellings are validated for compatibility and then ignored, and
+// The Go client keeps its own reconnect pacing, so the reconnection
+// spellings are validated for compatibility and then ignored, and
 // a value the other SDKs would reject is still rejected here, so one
-// connection string is either valid everywhere or nowhere. The nodelay
-// spelling is applied, because the Go client carries a matching
-// TCP_NODELAY option; it defaults to true, the Go client default, so
-// only nodelay=false ever turns Nagle back on.
+// connection string is either valid everywhere or nowhere. The
+// heartbeat_interval and nodelay spellings are applied, because the Go
+// client carries matching options: heartbeat_interval defaults to the
+// client five-second pacing, and nodelay defaults to true, the Go
+// client default, so only nodelay=false ever turns Nagle back on.
 func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 	protocolParts := strings.Split(connectionString, "://")
 	if len(protocolParts) != 2 {
@@ -156,6 +159,15 @@ func ParseConnectionString(connectionString string) ([]tcp.Option, error) {
 		options = append(options, tcp.WithTLS(tlsOpts...))
 	}
 	options = append(options, tcp.WithNoDelay(tlsConfig.noDelay))
+	if tlsConfig.heartbeatIntervalNanos != 0 {
+		// time.Duration counts nanoseconds in an int64, so an interval the
+		// grammar accepts but Go cannot represent fails the parse, like
+		// every other spelling the connection string cannot honor.
+		if tlsConfig.heartbeatIntervalNanos > math.MaxInt64 {
+			return nil, ierror.InvalidConnectionString{}
+		}
+		options = append(options, tcp.WithHeartbeatInterval(time.Duration(tlsConfig.heartbeatIntervalNanos)))
+	}
 	return options, nil
 }
 
@@ -192,11 +204,14 @@ type parsedTLS struct {
 	domain  string
 	caFile  string
 	noDelay bool
+	// heartbeatIntervalNanos carries the parsed heartbeat_interval, zero
+	// when the spelling is absent so the client keeps its own pacing.
+	heartbeatIntervalNanos uint64
 }
 
 // parseConnectionOptions validates the shared connection-string grammar,
-// keeping the tls options and ignoring the reconnect spellings the Go
-// client does not take from a connection string.
+// keeping the tls and heartbeat options and ignoring the reconnect
+// spellings the Go client does not take from a connection string.
 func parseConnectionOptions(optionsString string) (parsedTLS, error) {
 	parsed := parsedTLS{noDelay: true}
 	if optionsString == "" {
@@ -227,8 +242,12 @@ func parseConnectionOptions(optionsString string) (parsedTLS, error) {
 			// Rust types both as NonZeroIggyDuration, which refuses the
 			// zero spellings and anything shorter than the whole
 			// microseconds the wire format carries.
-			if nanos, err := parseIggyDuration(value); err != nil || nanos < 1_000 {
+			nanos, err := parseIggyDuration(value)
+			if err != nil || nanos < 1_000 {
 				return parsed, ierror.InvalidConnectionString{}
+			}
+			if name == "heartbeat_interval" {
+				parsed.heartbeatIntervalNanos = nanos
 			}
 		case "reestablish_after":
 			// Rust takes this one as a plain duration, where the zero

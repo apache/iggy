@@ -459,6 +459,15 @@ func (c *IggyTcpClient) GetNoDelay() bool {
 	return c.config.noDelay
 }
 
+// GetHeartbeatInterval reports the pacing of the managed heartbeat task on
+// ready replica links, which tests and callers can use to observe the
+// parsed heartbeat_interval option before a connection exists.
+func (c *IggyTcpClient) GetHeartbeatInterval() time.Duration {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.config.heartbeatInterval
+}
+
 // ResolveOperation replays the retained bytes under their original identity.
 // A committed business rejection is returned unchanged and releases the lane.
 // For an operation that is no longer retained, it returns what a replay proved.

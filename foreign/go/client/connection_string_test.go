@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	"github.com/apache/iggy/foreign/go/internal/command"
@@ -86,6 +87,31 @@ func TestParseConnectionString_NoDelayOptionLandsOnTheClient(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, applyOptions(t, disabled).GetNoDelay(),
 		"?nodelay=false must reach the dial instead of being dropped")
+}
+
+// TestParseConnectionString_HeartbeatIntervalLandsOnTheClient pins the
+// parsed heartbeat_interval reaching the client instead of leaving the
+// five-second default, and the representation check that refuses an
+// interval wider than the client own duration type.
+func TestParseConnectionString_HeartbeatIntervalLandsOnTheClient(t *testing.T) {
+	withoutOption, err := ParseConnectionString("iggy://iggy:secret@localhost:8090")
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Second, applyOptions(t, withoutOption).GetHeartbeatInterval(),
+		"a query without heartbeat_interval must keep the default pacing")
+
+	oneSecond, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?heartbeat_interval=1s")
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, applyOptions(t, oneSecond).GetHeartbeatInterval(),
+		"?heartbeat_interval=1s must reach the client instead of being dropped")
+
+	fractions, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?heartbeat_interval=250ms")
+	require.NoError(t, err)
+	assert.Equal(t, 250*time.Millisecond, applyOptions(t, fractions).GetHeartbeatInterval())
+
+	tooLarge, err := ParseConnectionString("iggy://iggy:secret@localhost:8090?heartbeat_interval=1000y")
+	require.Error(t, err,
+		"an interval wider than time.Duration must fail the parse instead of wrapping")
+	assert.Empty(t, tooLarge)
 }
 
 // TestParseConnectionString_NonZeroDurationOptionsRejectZeroSpellings
