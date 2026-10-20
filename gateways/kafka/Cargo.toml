@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-gateway-kafka"
-version = "0.1.0"
+version = "0.1.0-edge.1"
 description = "Kafka wire protocol gateway foundation for Apache Iggy"
 edition = "2024"
 license = "Apache-2.0"
