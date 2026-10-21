@@ -30,7 +30,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -312,6 +312,57 @@ impl IggyClient {
         future_into_py(py, async move {
             let stats = inner.get_stats().await.map_err(to_runtime_error)?;
             Ok(PyStats::from(stats))
+        })
+    }
+
+    /// Capture a diagnostic snapshot of the server as a compressed ZIP archive.
+    ///
+    /// Args:
+    ///     compression: Archive compression method. One of `"stored"`,
+    ///         `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
+    ///     snapshot_types: Data to include in the snapshot. Each entry is one
+    ///         of `"filesystem_overview"`, `"process_list"`, `"resource_usage"`,
+    ///         `"test"`, `"server_logs"`, `"server_config"`, `"all"`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the ZIP archive `bytes`.
+    ///
+    /// Raises:
+    ///     ValueError: If `compression` is empty or unknown, `snapshot_types`
+    ///         is empty, or any entry in `snapshot_types` is unknown.
+    ///     RuntimeError: If the client is not connected, the session is not
+    ///         authenticated, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
+    fn snapshot<'a>(
+        &self,
+        py: Python<'a>,
+        compression: &str,
+        snapshot_types: Vec<String>,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let compression = match compression.trim() {
+            "" => return Err(PyValueError::new_err("compression must not be empty")),
+            value => SnapshotCompression::from_str(value).map_err(to_value_error)?,
+        };
+        if snapshot_types.is_empty() {
+            return Err(PyValueError::new_err("snapshot_types must not be empty"));
+        }
+
+        let mut seen_snapshot_types = HashSet::new();
+        let snapshot_types = snapshot_types
+            .into_iter()
+            .filter(|snapshot_type| seen_snapshot_types.insert(snapshot_type.clone()))
+            .map(|snapshot_type| {
+                SystemSnapshotType::from_str(&snapshot_type).map_err(to_value_error)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let snapshot = inner
+                .snapshot(compression, snapshot_types)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &snapshot.0).unbind()))
         })
     }
 
