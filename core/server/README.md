@@ -179,10 +179,13 @@ Rotating the server key takes two phases, and messages are never re-encrypted:
 
 1. Set `key` to the new key and `previous_keys` to the old one on every node (`IGGY_ENCRYPTION_PREVIOUS_KEYS`). The metadata primary adds a wrap under the new key to every encrypted stream, and a stream created on a phase 1 node is wrapped under both keys. Old wraps stay, so nodes still on the old key keep serving and booting during the rollout, whichever node is primary.
 2. Once every node runs the phase 1 config and every encrypted stream reports the new fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and set `retired_kek_fingerprints` to the old key's fingerprint (`IGGY_ENCRYPTION_RETIRED_KEK_FINGERPRINTS`). The primary then drops the wraps under it.
+3. Once every encrypted stream has dropped the old fingerprint, clear `retired_kek_fingerprints` on every node.
 
    A node given only the new key before phase 1 finished serves none of the streams still wrapped only under the old key, and a standalone node refuses to boot. Without the retired fingerprint a node never drops a wrap.
 
-The primary logs each sweep that rewraps streams, each stream it cannot rewrap, and once that every set is settled. `previous_keys` holds at most two keys. A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
+The primary logs each sweep that rewraps streams, each stream it cannot rewrap, and once that every set is settled. `previous_keys` holds at most two keys, and a stream holds at most three wraps. Retire an old fingerprint before adding a fourth key.
+
+A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
 
 ## Upgrade recovery
 

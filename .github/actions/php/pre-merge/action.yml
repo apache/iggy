@@ -166,6 +166,7 @@ runs:
       with:
         bin: target/debug/iggy-server
         encryption-enabled: "true"
+        encryption-key: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
 
     - name: Run PHP SDK tests
       if: inputs.task == 'test'
@@ -186,6 +187,8 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    # No encryption key, the shipped default, so this lane also covers a server
+    # that keeps streams plaintext and refuses client stream keys.
     - name: Start Iggy server (TLS)
       if: inputs.task == 'test'
       id: iggy-tls
@@ -195,6 +198,7 @@ runs:
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:
+        IGGY_PATH: ${{ runner.temp }}/iggy-php-tls-data
         IGGY_TCP_TLS_ENABLED: "true"
         IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
         IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem

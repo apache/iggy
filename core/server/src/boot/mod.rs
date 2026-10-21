@@ -732,6 +732,7 @@ async fn shard_main(
         sessions,
         consumer_group_liveness,
         shard_handle,
+        unbuilt,
     } = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
@@ -850,6 +851,7 @@ async fn shard_main(
         topology.self_replica_id,
         topology.replica_count,
     ));
+    reconciler_ctx.mark_unbuilt(unbuilt);
     let reconcile_periodic = config.sharding.reconcile_periodic_interval.get_duration();
     let reconciler_handle = compio::runtime::spawn({
         let ctx = Rc::clone(&reconciler_ctx);

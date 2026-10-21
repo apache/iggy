@@ -61,6 +61,7 @@ impl StreamClient for HttpClient {
         name: &str,
         options: &StreamCreateOptions,
     ) -> Result<StreamDetails, IggyError> {
+        // The options erase on drop, the JSON body the HTTP client serializes does not.
         let response = self
             .post(
                 PATH,

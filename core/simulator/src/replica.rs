@@ -16,13 +16,14 @@
 // under the License.
 
 use crate::bus::{SharedSimOutbox, SimOutbox};
+use crate::client::SIM_STREAM_KEK;
 use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerConfig;
 use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
-use iggy_common::IggyByteSize;
 use iggy_common::variadic;
+use iggy_common::{IggyByteSize, ServerKeyContext};
 use journal::Journal;
 use metadata::impls::metadata::IggySnapshot;
 use metadata::impls::metadata::StreamsFrontend;
@@ -392,7 +393,12 @@ pub fn new_shard(
         validate_checksum: true,
         segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
         preallocate_segments: false,
-        key_context: Arc::default(),
+        // Opens the fixed wrap set keyed creates carry, so metadata admits them.
+        // Partitions stay plaintext: the simulator never resolves an encryptor.
+        key_context: Arc::new(
+            ServerKeyContext::from_config(SIM_STREAM_KEK, &[], false)
+                .expect("the simulator key-encryption key is valid"),
+        ),
         path_layout: PartitionPathLayout::default(),
     };
 

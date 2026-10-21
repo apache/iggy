@@ -27,6 +27,7 @@ import { CREATE_STREAM, createStream } from './create-stream.command.js';
 import { StreamEncryptionKey, encryptionKeyFingerprint } from './stream-options.js';
 
 const INVALID_ENCRYPTION_KEY = 70;
+const INVALID_COMMAND = 3;
 
 const keySpellings = (bytes: Buffer): string[] => [
   bytes.toString('hex'),
@@ -91,7 +92,7 @@ describe('given stream key when printing create arguments should show only its f
     };
     const redacted = (error: unknown) => {
       assert.ok(error instanceof ResponseError);
-      assert.equal(error.errorCode, INVALID_ENCRYPTION_KEY);
+      assert.equal(error.errorCode, INVALID_COMMAND);
       assert.equal(error.fromServer, false);
       for (const spelling of keySpellings(bytes))
         assert.ok(!`${error.message} ${error.stack}`.includes(spelling));

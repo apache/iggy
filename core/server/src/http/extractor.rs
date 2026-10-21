@@ -32,6 +32,7 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use iggy_common::{
     IggyError, IggyTimestamp, OptionInputValue, OptionsUpdate, PersonalAccessToken, RESET_FIELD,
+    erase_buffer,
 };
 use send_wrapper::SendWrapper;
 use serde::Deserializer as _;
@@ -145,12 +146,13 @@ where
         let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let Json(value) =
+        let value =
             Json::<T>::from_request(Request::from_parts(parts, Body::from(bytes.clone())), state)
-                .await
-                .map_err(IntoResponse::into_response)?;
-        let Json(members) = Json::<BTreeMap<String, IgnoredAny>>::from_bytes(&bytes)
-            .map_err(IntoResponse::into_response)?;
+                .await;
+        let members = Json::<BTreeMap<String, IgnoredAny>>::from_bytes(&bytes);
+        erase_buffer(bytes);
+        let Json(value) = value.map_err(IntoResponse::into_response)?;
+        let Json(members) = members.map_err(IntoResponse::into_response)?;
         Ok(Self {
             value,
             members: members.into_keys().collect(),
@@ -169,7 +171,7 @@ where
         let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
             .await
             .map_err(|_| WriteError::Rejected(IggyError::InvalidCommand))?;
-        match Json::<OptionsUpdate>::from_request(
+        let update = match Json::<OptionsUpdate>::from_request(
             Request::from_parts(parts, Body::from(bytes.clone())),
             state,
         )
@@ -180,7 +182,9 @@ where
                 WriteError::Rejected(IggyError::InvalidCommand),
                 WriteError::MalformedMember,
             )),
-        }
+        };
+        erase_buffer(bytes);
+        update
     }
 }
 

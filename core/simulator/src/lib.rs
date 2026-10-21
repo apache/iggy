@@ -701,6 +701,25 @@ impl Simulator {
     /// If no login reply arrives within `SETUP_TOTAL_STEPS`, or it carries no
     /// session.
     pub fn shell_login_via(&mut self, client: &SimClient, target: u8) {
+        self.shell_login_as(
+            client,
+            target,
+            replica::SHELL_ROOT_USERNAME,
+            replica::SHELL_ROOT_PASSWORD,
+        );
+    }
+
+    /// [`Self::shell_login_via`] with the credentials of a user the run created.
+    ///
+    /// # Panics
+    /// As [`Self::shell_login_via`].
+    pub fn shell_login_as(
+        &mut self,
+        client: &SimClient,
+        target: u8,
+        username: &str,
+        password: &str,
+    ) {
         // Connection metadata on every replica, as `install_client_fd` does in
         // production. `ensure_transport_connection` reads it to admit the connection
         // into the SessionManager, which the login's bind
@@ -717,9 +736,7 @@ impl Simulator {
         // From here this client talks the real client protocol. See
         // `SimClient::shell_wire`.
         client.set_shell_wire();
-        let msg = client
-            .login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD)
-            .into_generic();
+        let msg = client.login(username, password).into_generic();
         // `build_reply_with_body` maps the session field to `op`.
         let session = self
             .await_setup_reply(
@@ -1956,24 +1973,26 @@ fn stamp_metadata_watermark(
 mod tests {
     use super::partition_repair_driver_tests::{cluster, is_commit_for, sharded_cluster};
     use super::*;
-    use crate::client::SimClient;
+    use crate::client::{SIM_ROTATED_WRAP_SET, SIM_STREAM_WRAP_SET, SimClient};
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
     use consensus::{Consensus, Project, Sequencer, Status, client_table::COMMITTED_WINDOW_BITS};
     use futures::FutureExt;
     use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+    use iggy_binary_protocol::requests::streams::{RewrapStreamKeyEntry, RewrapStreamKeysRequest};
     use iggy_binary_protocol::requests::users::CreateUserRequest;
     use iggy_binary_protocol::{
         AckLevel, ConsensusHeader, Operation, PrepareOkHeader, RoutedRequestHeader, WireEncode,
         WireGlobalPermissions, WireIdentifier, WireName, WireOptions, WirePermissions,
     };
-    use iggy_common::{ConsumerKind, IggyError};
+    use iggy_common::{ConsumerKind, HeaderKey, IggyError, OptionKey, WrapSet};
     use journal::{Journal, JournalHandle};
     use message_bus::AUTO_COMMIT_CLIENT_ID;
     use message_bus::lifecycle::Shutdown;
     use metadata::stm::stream::Streams;
     use server_common::MessageBag;
     use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, METADATA_GROUP};
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct RootInitialization {
@@ -2597,7 +2616,7 @@ mod tests {
         const SHARDS_PER_REPLICA: u16 = 2;
         let (mut sim, client) = sharded_cluster(0x5245_4352, SHARDS_PER_REPLICA);
         sim.register_client_with_primary(&client);
-        complete_metadata_op(&mut sim, &client, client.create_stream(STREAM));
+        complete_metadata_op(&mut sim, &client, client.create_keyed_stream(STREAM));
         complete_metadata_op(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
         let (namespace, deleted) = incarnation(&sim);
         assert_ne!(
@@ -3739,6 +3758,170 @@ mod tests {
         }
     }
 
+    /// A keyed create commits its wrap set on every replica, then a rewrap
+    /// replaces it there while an entry naming another incarnation is skipped.
+    #[test]
+    fn given_keyed_stream_when_rewrapped_should_store_the_new_set_on_every_replica() {
+        const PROGRESS_STEPS: usize = 4_000;
+        const STREAM: &str = "keyed";
+        let (mut sim, client) = cluster(0x5245_5752);
+        sim.register_client_with_primary(&client);
+        complete_metadata_op(&mut sim, &client, client.create_keyed_stream(STREAM));
+        let (stream_id, created_op) = keyed_stream(&sim, 0, STREAM);
+        for replica in 0..sim.replica_count {
+            assert_eq!(
+                keyed_stream_wrap_set(&sim, replica, STREAM),
+                Some(SIM_STREAM_WRAP_SET.to_vec())
+            );
+        }
+
+        let key_fingerprint = WrapSet::try_from(SIM_STREAM_WRAP_SET.as_slice())
+            .expect("a valid wrap set")
+            .key_fingerprint_bytes()
+            .try_into()
+            .expect("an eight byte fingerprint");
+        let request = RewrapStreamKeysRequest {
+            entries: vec![
+                RewrapStreamKeyEntry {
+                    stream_id,
+                    created_op,
+                    key_fingerprint,
+                    wrap_set: Bytes::from_static(&SIM_ROTATED_WRAP_SET),
+                },
+                RewrapStreamKeyEntry {
+                    stream_id,
+                    created_op: created_op + 1,
+                    key_fingerprint,
+                    wrap_set: Bytes::from_static(&SIM_STREAM_WRAP_SET),
+                },
+            ],
+        };
+        let primary = usize::from(sim.metadata_primary_index().expect("a metadata primary"));
+        let shard = Rc::clone(&sim.replicas[primary].shards[0]);
+        let committed = Rc::new(Cell::new(None));
+        let outcome = Rc::clone(&committed);
+        let task = sim.executor.spawn(async move {
+            let result = shard
+                .plane
+                .metadata()
+                .submit_rewrap_stream_keys_in_process(request)
+                .await;
+            outcome.set(Some(result.is_ok()));
+        });
+        sim.replicas[primary].pump_tasks.push(task);
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                committed.get().is_some()
+                    && (0..sim.replica_count).all(|replica| {
+                        keyed_stream_wrap_set(&sim, replica, STREAM)
+                            == Some(SIM_ROTATED_WRAP_SET.to_vec())
+                    })
+            }),
+            "every replica must store the rewrapped set, and keep it past the stale entry"
+        );
+        assert_eq!(committed.get(), Some(true));
+    }
+
+    /// A user deactivating itself ends its own session on commit. Every replica
+    /// keeps that session's receipt, which a client table snapshot admits after
+    /// the session end only for a self-deactivation.
+    #[test]
+    fn given_shell_user_when_deactivating_itself_should_end_its_session_and_keep_the_receipt() {
+        const PROGRESS_STEPS: usize = 4_000;
+        const ROOT_CLIENT: u128 = 1;
+        const USER_CLIENT: u128 = 2;
+        const USERNAME: &str = "self-deactivating";
+        const PASSWORD: &str = "self-deactivating-password";
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let mut sim = Simulator::with_shards_shell(
+            3,
+            1,
+            [ROOT_CLIENT, USER_CLIENT].into_iter(),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 2,
+                seed: 0x4445_4143,
+                ..Default::default()
+            },
+        );
+        let root = SimClient::new(ROOT_CLIENT);
+        sim.shell_login(&root);
+        let permissions = WirePermissions {
+            global: WireGlobalPermissions {
+                manage_servers: false,
+                read_servers: false,
+                manage_users: true,
+                read_users: true,
+                manage_streams: false,
+                read_streams: false,
+                manage_topics: false,
+                read_topics: false,
+                poll_messages: false,
+                send_messages: false,
+            },
+            streams: Vec::new(),
+        };
+        let created = submit_and_wait_for_reply(
+            &mut sim,
+            ROOT_CLIENT,
+            0,
+            root.create_user_with_permissions(
+                USERNAME,
+                PASSWORD,
+                iggy_common::UserStatus::Active.as_code(),
+                Some(permissions),
+            ),
+        );
+        assert_eq!(metadata::stm::result::result_code(created.body()), Some(0));
+
+        let user = SimClient::new(USER_CLIENT);
+        sim.shell_login_as(&user, 0, USERNAME, PASSWORD);
+        let deactivated = submit_and_wait_for_reply(
+            &mut sim,
+            USER_CLIENT,
+            0,
+            user.update_user(USERNAME, None, Some(iggy_common::UserStatus::Inactive)),
+        );
+        assert_eq!(deactivated.header().status, 0);
+        assert_eq!(
+            metadata::stm::result::result_code(deactivated.body()),
+            Some(0)
+        );
+
+        assert!(
+            (0..PROGRESS_STEPS).any(|_| {
+                sim.step();
+                sim.replicas.iter().all(|replica| {
+                    let table = replica.shards[0].plane.metadata().client_table.borrow();
+                    table.get_epoch(USER_CLIENT).is_none()
+                        && table
+                            .ended_sessions()
+                            .any(|session| session.client_id == USER_CLIENT)
+                })
+            }),
+            "every replica must end the deactivated user's session"
+        );
+        for replica in &sim.replicas {
+            let table = replica.shards[0].plane.metadata().client_table.borrow();
+            assert_eq!(
+                table
+                    .get_reply(USER_CLIENT)
+                    .expect("the ended session keeps its receipt")
+                    .header()
+                    .operation,
+                Operation::UpdateUserResolved
+            );
+            assert!(
+                consensus::client_table::ClientTable::from_snapshot(table.to_snapshot()).is_ok()
+            );
+        }
+    }
+
     pub fn submit_and_wait_for_reply(
         sim: &mut Simulator,
         client_id: u128,
@@ -3757,6 +3940,47 @@ mod tests {
             }
         }
         panic!("request {request_id} did not receive a reply");
+    }
+
+    /// `(stream id, created op)` of `name` on `replica`.
+    fn keyed_stream(sim: &Simulator, replica: u8, name: &str) -> (u32, u64) {
+        let streams = sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams();
+        let stream_id = streams
+            .resolve_stream_id(&WireIdentifier::named(name).expect("valid name"))
+            .expect("the stream is committed");
+        let created_op = streams.read(|inner| {
+            inner
+                .items
+                .get(stream_id)
+                .expect("the stream is committed")
+                .created_op
+        });
+        (
+            u32::try_from(stream_id).expect("stream id fits u32"),
+            created_op,
+        )
+    }
+
+    /// The wrap set `replica` stores for stream `name`.
+    fn keyed_stream_wrap_set(sim: &Simulator, replica: u8, name: &str) -> Option<Vec<u8>> {
+        let streams = sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams();
+        let stream_id = streams.resolve_stream_id(&WireIdentifier::named(name).ok()?)?;
+        streams.read(|inner| {
+            inner.items.get(stream_id).and_then(|stream| {
+                stream
+                    .options
+                    .get(&HeaderKey::from(OptionKey::EncryptionKeyWrapped))
+                    .map(|wrapped| wrapped.value.as_bytes().to_vec())
+            })
+        })
     }
 
     /// Submit a metadata op to replica 0 and step until every live replica applied
@@ -7655,10 +7879,11 @@ mod tests {
 
         let replica_count: u8 = 3;
         let client_id: u128 = 1;
-        // Hand-picked: of seeds 1..=40 under these options, ten reached a transient.
-        // Crashing the primary under a lossy network is necessary but not sufficient,
-        // so the seed cannot be arbitrary. Re-scan if the PRNG streams are remapped.
-        let seed = 2;
+        // Hand-picked: of seeds 1..=40 under these options, seventeen reached a
+        // transient. Crashing the primary under a lossy network is necessary but not
+        // sufficient, so the seed cannot be arbitrary. Re-scan if the PRNG streams
+        // are remapped.
+        let seed = 1;
         let network_opts = packet::PacketSimulatorOptions {
             node_count: replica_count,
             client_count: 1,

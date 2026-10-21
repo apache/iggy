@@ -33,6 +33,7 @@ final class SensitiveParameterTest extends TestCase
         return [
             'connection string' => ['fromConnectionString', 'connection_string'],
             'password' => ['loginUser', 'password'],
+            'raw binary payload' => ['sendBinaryRequest', 'payload'],
             'stream key' => ['createStream', 'encryption_key'],
             'fingerprinted key' => ['encryptionKeyFingerprint', 'key'],
             'raw stream options' => ['createStream', 'raw'],

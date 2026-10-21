@@ -58,9 +58,9 @@ inputs:
     required: false
     default: "false"
   encryption-key:
-    description: "Server encryption key (base64 of 32 bytes), a fixed test key shared with the BDD server. Set even with encryption disabled, so streams created with their own key work. Empty starts without a key."
+    description: "Server encryption key (base64 of 32 bytes). Empty, the shipped default, starts without a key, so streams stay plaintext and client stream keys are refused. Lanes that test stream keys pass the fixed key shared with the BDD server."
     required: false
-    default: "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+    default: ""
 outputs:
   pid:
     description: "PID of the background server process"

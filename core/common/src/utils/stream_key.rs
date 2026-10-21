@@ -29,6 +29,7 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox};
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
+use thiserror::Error;
 
 pub use iggy_binary_protocol::requests::streams::{
     MAX_WRAP_SET_ENVELOPES, WRAPPED_STREAM_KEY_LENGTH,
@@ -96,6 +97,19 @@ pub struct ServerKeyContext {
     previous: Vec<KeyEncryptionKey>,
     retired: Vec<KekFingerprint>,
     generates: bool,
+}
+
+/// Why a node cannot plan the rewrap a stored wrap set calls for.
+#[derive(Debug, Error)]
+pub enum RewrapPlanError {
+    /// The set holds the most wraps, none under the current key and none
+    /// under a retired one, so a wrap under the current key does not fit.
+    #[error(
+        "wrap set already holds {MAX_WRAP_SET_ENVELOPES} wraps and none is retired, retire a key-encryption key fingerprint"
+    )]
+    WrapSetFull,
+    #[error(transparent)]
+    Key(#[from] IggyError),
 }
 
 #[derive(Clone)]
@@ -494,6 +508,19 @@ impl ServerKeyContext {
                 .any(|envelope| self.retires(&envelope[KEK_FINGERPRINT_OFFSET..NONCE_OFFSET]))
     }
 
+    /// Whether a stored wrap set holds an envelope under a configured
+    /// key-encryption key. Reads only the fingerprints, like
+    /// [`Self::is_settled`], so a scan over every stream allocates nothing.
+    #[must_use]
+    pub fn holds_wrap_for(&self, stored: &[u8]) -> bool {
+        let (envelopes, rest) = stored.as_chunks::<WRAPPED_STREAM_KEY_LENGTH>();
+        rest.is_empty()
+            && envelopes.iter().any(|envelope| {
+                self.keks()
+                    .any(|kek| envelope[KEK_FINGERPRINT_OFFSET..NONCE_OFFSET] == kek.fingerprint)
+            })
+    }
+
     /// The set a rewrap should store instead of `stored`: every envelope not
     /// under a retired key-encryption key, plus one under the current key
     /// when missing. Envelopes under keys this node does not hold stay,
@@ -503,11 +530,10 @@ impl ServerKeyContext {
     /// # Errors
     ///
     /// When the set must change but this node cannot do it, and the set is
-    /// left alone: `CannotDecryptData` when no envelope opens here,
-    /// `UnsupportedCriticalOption` when the set already holds the most
-    /// envelopes and none is retired, `CannotEncryptData` when wrapping
-    /// fails.
-    pub fn target_set(&self, stored: &WrapSet) -> Result<Option<WrapSet>, IggyError> {
+    /// left alone: `WrapSetFull` when the set already holds the most
+    /// envelopes and none is retired, `CannotDecryptData` when no envelope
+    /// opens here, `CannotEncryptData` when wrapping fails.
+    pub fn target_set(&self, stored: &WrapSet) -> Result<Option<WrapSet>, RewrapPlanError> {
         let Some(current) = &self.current else {
             return Ok(None);
         };
@@ -525,9 +551,12 @@ impl ServerKeyContext {
             .iter()
             .any(|envelope| envelope.kek_fingerprint_bytes() == current.fingerprint)
         {
+            if envelopes.len() == MAX_WRAP_SET_ENVELOPES {
+                return Err(RewrapPlanError::WrapSetFull);
+            }
             envelopes.push(current.wrap(&key, stored.origin())?);
         }
-        WrapSet::new(envelopes).map(Some)
+        Ok(Some(WrapSet::new(envelopes)?))
     }
 
     fn keks(&self) -> impl Iterator<Item = &KeyEncryptionKey> {
@@ -1133,12 +1162,10 @@ mod tests {
             (context(THIRD_CONFIG_KEY, &[], true), &old_only),
             (phase_two, &old_only),
         ] {
-            assert_eq!(
-                node.target_set(stuck)
-                    .expect_err("no wrap opens here")
-                    .as_code(),
-                IggyError::CannotDecryptData.as_code()
-            );
+            assert!(matches!(
+                node.target_set(stuck).expect_err("no wrap opens here"),
+                RewrapPlanError::Key(IggyError::CannotDecryptData)
+            ));
         }
     }
 
@@ -1157,13 +1184,12 @@ mod tests {
         )
         .expect("three wraps");
         let fourth = context(FOURTH_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true);
-        assert_eq!(
+        assert!(matches!(
             fourth
                 .target_set(&full)
-                .expect_err("a fourth wrap does not fit")
-                .as_code(),
-            IggyError::UnsupportedCriticalOption(String::new()).as_code()
-        );
+                .expect_err("a fourth wrap does not fit"),
+            RewrapPlanError::WrapSetFull
+        ));
 
         let retired = fourth
             .with_retired_kek_fingerprints(&[OTHER_KEK_FINGERPRINT_VECTOR.to_owned()])

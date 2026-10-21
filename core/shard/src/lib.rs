@@ -1861,6 +1861,8 @@ where
                 count: senders.len(),
             })?;
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
+        // Metadata admits a stream's wrap set with the keys its partitions open.
+        let metadata = metadata.with_stream_key_context(partitions.key_context());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let poll_completions =
@@ -2430,6 +2432,8 @@ where
         let (_reply_tx, reply_inbox) = channel(1);
         let metrics = crate::metrics::ShardMetrics::for_shard();
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
+        // Metadata admits a stream's wrap set with the keys its partitions open.
+        let metadata = metadata.with_stream_key_context(partitions.key_context());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
         let host: Rc<dyn ShardHost> = Rc::new(NoopHost);

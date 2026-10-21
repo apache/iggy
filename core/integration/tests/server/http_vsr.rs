@@ -119,11 +119,11 @@ impl HttpSessionExt for HttpClient {
             options: OptionInputMap(BTreeMap::from([
                 (
                     "durability".to_string(),
-                    OptionInputValue::String(Durability::Persisted.to_string()),
+                    OptionInputValue::String(Durability::Persisted.to_string().into()),
                 ),
                 (
                     "consumer_offset_durability".to_string(),
-                    OptionInputValue::String(Durability::Persisted.to_string()),
+                    OptionInputValue::String(Durability::Persisted.to_string().into()),
                 ),
             ])),
         };
@@ -1150,11 +1150,11 @@ async fn given_independent_durability_policies_when_producing_should_attest_mess
                 options: OptionInputMap(BTreeMap::from([
                     (
                         "durability".to_string(),
-                        OptionInputValue::String(message_policy.to_string()),
+                        OptionInputValue::String(message_policy.to_string().into()),
                     ),
                     (
                         "consumer_offset_durability".to_string(),
-                        OptionInputValue::String(offset_policy.to_string()),
+                        OptionInputValue::String(offset_policy.to_string().into()),
                     ),
                 ])),
                 ..CreateTopic::default()
@@ -1251,7 +1251,7 @@ async fn given_one_http_durability_option_when_creating_should_derive_the_other_
                 name: key.to_string(),
                 options: OptionInputMap(BTreeMap::from([(
                     key.to_string(),
-                    OptionInputValue::String("persisted".to_string()),
+                    OptionInputValue::String("persisted".to_string().into()),
                 )])),
                 ..CreateTopic::default()
             })

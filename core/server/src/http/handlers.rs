@@ -2041,7 +2041,11 @@ mod tests {
     fn given_create_with_stream_key_when_encoding_body_should_zero_on_drop_and_free_its_options() {
         let options = OptionInputMap(BTreeMap::from([(
             OptionKey::EncryptionKey.to_string(),
-            OptionInputValue::String("/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_owned()),
+            OptionInputValue::String(
+                "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE="
+                    .to_owned()
+                    .into(),
+            ),
         )]));
         let request = CreateStreamRequest {
             name: WireName::new("orders").expect("valid name"),

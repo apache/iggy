@@ -70,6 +70,7 @@ impl<B: BinaryClient> StreamClient for B {
     ) -> Result<StreamDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
         let wire_name = WireName::new(name).map_err(|_| IggyError::InvalidFormat)?;
+        // The transport owns the encoded request, so a plaintext stream key in it is not erased.
         let response = self
             .send_raw_with_response(
                 CREATE_STREAM_CODE,

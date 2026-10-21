@@ -76,7 +76,7 @@ use configs::http::HttpTlsConfig;
 use consensus::MetadataHandle;
 use futures::{Stream, StreamExt};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, erase_buffer};
 use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
@@ -618,7 +618,7 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
         .path_and_query()
         .map_or("/", |path_and_query| path_and_query.as_str());
     let deadline = Instant::now() + FORWARD_RETRY_DEADLINE;
-    loop {
+    let response = loop {
         let outcome = match primary_socket(state) {
             // No resolvable primary (mid-election, or a roster hole): count it
             // as a retryable attempt so a completing election is picked up.
@@ -638,7 +638,7 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
             }
         };
         match outcome {
-            AttemptOutcome::Relay(response) => return response,
+            AttemptOutcome::Relay(response) => break response,
             AttemptOutcome::Retry => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -646,7 +646,7 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
                         path = parts.uri.path(),
                         "forward retry budget exhausted without a reachable primary"
                     );
-                    return with_retry_after(error_response(
+                    break with_retry_after(error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no_reachable_primary",
                         "no primary accepted the request within the forward budget; retry",
@@ -655,7 +655,10 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
                 compio::time::sleep(FORWARD_RETRY_INTERVAL.min(remaining)).await;
             }
         }
-    }
+    };
+    // Kept for retries, so it may hold a create body's plaintext stream key.
+    erase_buffer(body);
+    response
 }
 
 enum AttemptOutcome {

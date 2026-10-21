@@ -20,7 +20,10 @@ use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::requests::streams::{RewrapStreamKeyEntry, RewrapStreamKeysRequest};
-use iggy_common::{HeaderKey, IggyError, OptionKey, ServerKeyContext, stream_wrap_set};
+use iggy_common::{
+    HeaderKey, IggyError, MAX_WRAP_SET_ENVELOPES, OptionKey, RewrapPlanError, ServerKeyContext,
+    stream_wrap_set,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
@@ -66,7 +69,7 @@ struct StuckStream {
     stream_id: usize,
     created_op: u64,
     kek_fingerprints: String,
-    error: IggyError,
+    error: RewrapPlanError,
 }
 
 /// Run the rewrapper until `stop` fires, planning with `context`, this node's
@@ -145,15 +148,23 @@ impl Rewrapper {
             for failure in failures {
                 let incarnation = (failure.stream_id, failure.created_op);
                 if !self.stuck.contains(&incarnation) {
-                    warn!(
-                        stream_id = failure.stream_id,
-                        stored_kek_fingerprints = %failure.kek_fingerprints,
-                        node_kek_fingerprints = %context.kek_fingerprints().join(","),
-                        error = %failure.error,
-                        "Stream {} needs a key rewrap this node cannot make: {}",
-                        failure.stream_id,
-                        failure.error
-                    );
+                    match &failure.error {
+                        RewrapPlanError::WrapSetFull => warn!(
+                            stream_id = failure.stream_id,
+                            stored_kek_fingerprints = %failure.kek_fingerprints,
+                            node_kek_fingerprints = %context.kek_fingerprints().join(","),
+                            "Stream {} wrap set is full with {MAX_WRAP_SET_ENVELOPES} wraps, none under the current server key or a retired one, so add one of its fingerprints to retired_kek_fingerprints",
+                            failure.stream_id
+                        ),
+                        RewrapPlanError::Key(error) => warn!(
+                            stream_id = failure.stream_id,
+                            stored_kek_fingerprints = %failure.kek_fingerprints,
+                            node_kek_fingerprints = %context.kek_fingerprints().join(","),
+                            error = %error,
+                            "Stream {} needs a key rewrap this node cannot make: {error}",
+                            failure.stream_id
+                        ),
+                    }
                 }
                 stuck.insert(incarnation);
             }
@@ -254,7 +265,7 @@ fn planned_entries(
 fn planned_entry(
     stream: &Stream,
     context: &ServerKeyContext,
-) -> Result<Option<RewrapStreamKeyEntry>, IggyError> {
+) -> Result<Option<RewrapStreamKeyEntry>, RewrapPlanError> {
     let Some(stored) = stream_wrap_set(&stream.options)? else {
         return Ok(None);
     };
@@ -274,17 +285,21 @@ fn planned_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::test_support::{SpyBus, prepare_message, test_shard_with_key_context};
-    use consensus::Sequencer;
+    use crate::dispatch::test_support::{
+        SpyBus, TestShard, prepare_message, test_shard_with_key_context,
+    };
+    use consensus::{Consensus as _, Plane as _, PlaneKind, Sequencer};
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-    use iggy_binary_protocol::{Operation, WireEncode, WireName};
+    use iggy_binary_protocol::{Operation, PrepareOkHeader, WireEncode, WireName};
     use iggy_common::wire_conversions::resource_options_to_wire;
     use iggy_common::{
         HeaderValue, IggyTimestamp, OptionValue, OptionsProvenance, ResourceOptions,
         StreamEncryptionKey, StreamKeyOrigin, WrapSet, critical_keys_marker,
     };
+    use journal::prepare_journal::PrepareJournal;
     use metadata::stm::{StateHandler, StateMachine};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     const OLD_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
     const NEW_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
@@ -308,7 +323,7 @@ mod tests {
             // A backup holds a stale set and must leave it to the primary.
             // The sole replica is the primary, but its set already matches.
             let stored_under = if replica_count == 1 { NEW_KEY } else { OLD_KEY };
-            seed_stream(&shard, &context(stored_under, &[]));
+            seed_stream(&shard, "seeded", &context(stored_under, &[]));
             let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
             let sequence = consensus.sequencer().current_sequence();
 
@@ -337,7 +352,7 @@ mod tests {
             1,
             Arc::clone(&rotated),
         ));
-        seed_stream(&shard, &context(STRANGER_KEY, &[]));
+        seed_stream(&shard, "seeded", &context(STRANGER_KEY, &[]));
         let (_stop_sender, stop) = shard::channel(1);
         let mut rewrapper = Rewrapper::default();
 
@@ -352,6 +367,62 @@ mod tests {
             Sweep::Unchanged
         );
         assert_eq!(rewrapper.stuck.len(), 1);
+    }
+
+    #[compio::test]
+    async fn given_settled_primary_when_a_stale_stream_commits_should_rescan_and_rewrap_it() {
+        let directory = TempDir::new().expect("metadata journal directory");
+        let rotated = context(NEW_KEY, &[OLD_KEY]);
+        let shard = journal_backed_primary(&directory, &rotated).await;
+        let (_stop_sender, stop) = shard::channel(1);
+        let mut rewrapper = Rewrapper::default();
+        assert_eq!(
+            rewrapper.sweep(&shard, &rotated, &stop).await,
+            Sweep::Finished
+        );
+        assert!(rewrapper.settled);
+        assert_eq!(
+            rewrapper.sweep(&shard, &rotated, &stop).await,
+            Sweep::Unchanged
+        );
+
+        // An edge still on the old config wraps a new stream under the old key only.
+        commit_stream(&shard, "created-mid-rotation", &context(OLD_KEY, &[])).await;
+        let consensus = shard.plane.metadata().consensus.as_ref().expect("primary");
+        let before = consensus.commit_min();
+
+        assert_eq!(
+            rewrapper.sweep(&shard, &rotated, &stop).await,
+            Sweep::Finished
+        );
+        assert_eq!(consensus.commit_min(), before + 1, "one rewrap commits");
+        assert_eq!(unsettled(&shard, &rotated), Vec::<usize>::new());
+    }
+
+    #[compio::test]
+    async fn given_more_stale_streams_than_one_operation_when_sweeping_should_commit_every_chunk() {
+        let directory = TempDir::new().expect("metadata journal directory");
+        let rotated = context(NEW_KEY, &[OLD_KEY]);
+        let shard = journal_backed_primary(&directory, &rotated).await;
+        let old = context(OLD_KEY, &[]);
+        let stale_count = 2 * MAX_ENTRIES_PER_OPERATION + 8;
+        for index in 0..stale_count {
+            seed_stream(&shard, &format!("stale-{index}"), &old);
+        }
+        let (_stop_sender, stop) = shard::channel(1);
+        let consensus = shard.plane.metadata().consensus.as_ref().expect("primary");
+        let before = consensus.commit_min();
+
+        assert_eq!(
+            Rewrapper::default().sweep(&shard, &rotated, &stop).await,
+            Sweep::Finished
+        );
+
+        assert_eq!(
+            consensus.commit_min() - before,
+            stale_count.div_ceil(MAX_ENTRIES_PER_OPERATION) as u64
+        );
+        assert_eq!(unsettled(&shard, &rotated), Vec::<usize>::new());
     }
 
     #[test]
@@ -423,10 +494,10 @@ mod tests {
         assert_eq!(entries[0].stream_id, 1);
         assert_eq!(stuck.len(), 1);
         assert_eq!(stuck[0].stream_id, 0);
-        assert_eq!(
-            stuck[0].error.as_code(),
-            IggyError::CannotDecryptData.as_code()
-        );
+        assert!(matches!(
+            stuck[0].error,
+            RewrapPlanError::Key(IggyError::CannotDecryptData)
+        ));
         assert_eq!(
             stuck[0].kek_fingerprints,
             context(STRANGER_KEY, &[]).kek_fingerprint().expect("a key")
@@ -505,14 +576,84 @@ mod tests {
         assert_eq!(reply.code, 0);
     }
 
-    fn seed_stream<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>, wrapping: &ServerKeyContext)
-    where
+    async fn journal_backed_primary(
+        directory: &TempDir,
+        keys: &Arc<ServerKeyContext>,
+    ) -> Rc<TestShard> {
+        let mut shard = test_shard_with_key_context(&SpyBus::default(), 0, 1, 1, Arc::clone(keys));
+        shard.plane.metadata_mut().journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .expect("opens the metadata journal"),
+        );
+        Rc::new(shard)
+    }
+
+    /// Commits a create through the primary's replicate path, as the create an
+    /// edge rewrote reaches it.
+    async fn commit_stream(shard: &TestShard, name: &str, wrapping: &ServerKeyContext) {
+        let metadata = shard.plane.metadata();
+        let consensus = metadata.consensus.as_ref().expect("primary");
+        let prepare = consensus::seal_prepare_checksum(
+            prepare_message(
+                Operation::CreateStream,
+                0,
+                1,
+                &create_stream_body(name, wrapping),
+            )
+            .transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.session = 0;
+            }),
+        );
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        metadata.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for ack in loopback {
+            metadata
+                .on_ack(
+                    ack.try_into_typed::<PrepareOkHeader>()
+                        .expect("loopback holds self PrepareOks"),
+                )
+                .await;
+        }
+    }
+
+    fn unsettled(shard: &TestShard, keys: &ServerKeyContext) -> Vec<usize> {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| unsettled_streams(streams, keys))
+    }
+
+    fn seed_stream<B, MJ, S, SB>(
+        shard: &Rc<ShellShard<B, MJ, S, SB>>,
+        name: &str,
+        wrapping: &ServerKeyContext,
+    ) where
         B: ShellBus,
         MJ: JournalHandle + 'static,
         MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         S: 'static,
         SB: SuperblockStore + 'static,
     {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateStream,
+                1,
+                1,
+                &create_stream_body(name, wrapping),
+            ))
+            .expect("applies");
+    }
+
+    fn create_stream_body(name: &str, wrapping: &ServerKeyContext) -> Bytes {
         let set = WrapSet::from(
             wrapping
                 .wrap(&seeded_key(5), StreamKeyOrigin::Client)
@@ -523,16 +664,10 @@ mod tests {
             HeaderKey::from(OptionKey::EncryptionKeyWrapped),
             OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("fits")),
         );
-        let body = CreateStreamRequest {
-            name: WireName::new("seeded").expect("valid name"),
+        CreateStreamRequest {
+            name: WireName::new(name).expect("valid name"),
             options: resource_options_to_wire(&options, OptionsProvenance::All).expect("encodes"),
         }
-        .to_bytes();
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .update(prepare_message(Operation::CreateStream, 1, 1, &body))
-            .expect("applies");
+        .to_bytes()
     }
 }

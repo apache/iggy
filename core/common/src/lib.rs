@@ -170,9 +170,9 @@ pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;
 pub use utils::serde_secret;
 pub use utils::stream_key::{
-    MAX_PREVIOUS_KEYS, MAX_WRAP_SET_ENVELOPES, STREAM_KEY_LENGTH, ServerKeyContext,
-    StreamEncryptionKey, StreamKeyOrigin, WRAPPED_STREAM_KEY_LENGTH, WrapSet, WrappedStreamKey,
-    stream_key_fingerprint,
+    MAX_PREVIOUS_KEYS, MAX_WRAP_SET_ENVELOPES, RewrapPlanError, STREAM_KEY_LENGTH,
+    ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WRAPPED_STREAM_KEY_LENGTH, WrapSet,
+    WrappedStreamKey, stream_key_fingerprint,
 };
 pub use utils::text;
 pub use utils::timestamp::*;

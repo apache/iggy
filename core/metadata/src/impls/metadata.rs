@@ -70,9 +70,9 @@ use iggy_common::variadic;
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
 use iggy_common::{
     HeaderKey, IggyError, OptionAdmissionContext, OptionKey, OptionOperation, OptionValue,
-    OptionVisibility, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
-    TopicResolvedOptions, UserId, admit, critical_keys_marker, derived_defaults, topic_option_keys,
-    validate_topic_segment_size,
+    OptionVisibility, OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext,
+    TopicCreateOptions, TopicResolvedOptions, UserId, admit, critical_keys_marker,
+    derived_defaults, stream_wrap_set, topic_option_keys, validate_topic_segment_size,
 };
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -1087,6 +1087,9 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// the reads parked on it. Shared by every shard; see
     /// [`AppliedFrontier`] for the ordering and the wake contract.
     applied_frontier: Arc<AppliedFrontier>,
+    /// This node's server keys. The primary refuses to prepare a
+    /// `CreateStream` whose wrap set none of them opens.
+    stream_key_context: Arc<ServerKeyContext>,
 }
 
 impl<B, J, S, M, SB> IggyMetadata<VsrConsensus<B>, J, S, M, SB>
@@ -1153,6 +1156,7 @@ where
             partitions_max: Cell::new(0),
             max_tokens_per_user: Cell::new(0),
             applied_frontier: Arc::default(),
+            stream_key_context: Arc::default(),
         }
     }
 }
@@ -1173,6 +1177,15 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     #[must_use]
     pub fn with_applied_frontier(mut self, applied_frontier: Arc<AppliedFrontier>) -> Self {
         self.applied_frontier = applied_frontier;
+        self
+    }
+
+    /// Admit `CreateStream` wrap sets against this node's server keys, the
+    /// ones its partitions open stream keys with. Without them every wrapped
+    /// create is refused.
+    #[must_use]
+    pub fn with_stream_key_context(mut self, stream_key_context: Arc<ServerKeyContext>) -> Self {
+        self.stream_key_context = stream_key_context;
         self
     }
 
@@ -4384,13 +4397,21 @@ where
             Operation::CreateStream => {
                 let request = WireCreateStreamRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
+                let options = resource_options_from_wire(&request.options, true)?;
                 // Apply refuses a plaintext key too, but only after every replica journaled it.
-                if let Some(secret) = resource_options_from_wire(&request.options, true)?
+                if let Some(secret) = options
                     .keys()
                     .filter_map(|key| OptionKey::try_from(key).ok())
                     .find(|key| key.descriptor().visibility == OptionVisibility::Secret)
                 {
                     return Err(IggyError::InvalidOptionValue(secret.to_string()));
+                }
+                // An edge whose keys no peer holds wraps only under its own, and
+                // data committed under such a wrap opens nowhere else.
+                if let Some(set) = stream_wrap_set(&options)?
+                    && self.stream_key_context.open(&set).is_err()
+                {
+                    return Err(IggyError::StreamEncryptionUnavailable);
                 }
                 Ok(message.project(consensus))
             }
@@ -6239,6 +6260,83 @@ mod tests {
                 IggyError::InvalidOptionValue(key) if *key == OptionKey::EncryptionKey.to_string()
             ),
             "expected the plaintext key refusal, got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn given_wrap_set_no_primary_key_opens_when_preparing_create_stream_should_refuse_before_replication()
+     {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 10;
+        const ACTING_USER: u32 = 7;
+        let primary_keys = Arc::new(
+            ServerKeyContext::from_config(
+                "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
+                &[],
+                true,
+            )
+            .expect("valid key"),
+        );
+        let stranger_keys = ServerKeyContext::from_config(
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+            &[],
+            true,
+        )
+        .expect("valid key");
+        let plane = metadata_plane().with_stream_key_context(Arc::clone(&primary_keys));
+        plane
+            .client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .expect("register commits");
+        let wrapped_under = |keys: &ServerKeyContext| {
+            let set = keys
+                .wrap_set(
+                    &StreamEncryptionKey::try_from([7u8; 32].as_slice()).expect("32 bytes"),
+                    StreamKeyOrigin::Server,
+                )
+                .expect("wraps");
+            let mut options = ResourceOptions::new();
+            options.insert(
+                HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+                OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("fits")),
+            );
+            options.insert(
+                HeaderKey::from(OptionKey::CriticalKeys),
+                OptionValue::explicit(
+                    critical_keys_marker(&[OptionKey::EncryptionKeyWrapped]).expect("marker"),
+                ),
+            );
+            resource_options_to_wire(&options, OptionsProvenance::All).expect("options encode")
+        };
+
+        let Err(refusal) = plane.prepare_request(create_stream_request_with(
+            CLIENT,
+            1,
+            "stranger",
+            wrapped_under(&stranger_keys),
+        )) else {
+            panic!("a wrap set the primary cannot open must not be sealed into a prepare");
+        };
+
+        assert_eq!(
+            refusal.as_code(),
+            IggyError::StreamEncryptionUnavailable.as_code()
+        );
+        assert!(
+            plane
+                .prepare_request(create_stream_request_with(
+                    CLIENT,
+                    2,
+                    "own",
+                    wrapped_under(&primary_keys),
+                ))
+                .is_ok()
         );
     }
 
@@ -8936,7 +9034,15 @@ mod tests {
         const CLIENT: u128 = 9;
         const USER: u32 = 0;
         let directory = tempfile::tempdir().unwrap();
-        let mut metadata = metadata_plane();
+        let context = Arc::new(
+            ServerKeyContext::from_config(
+                "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
+                &[],
+                true,
+            )
+            .unwrap(),
+        );
+        let mut metadata = metadata_plane().with_stream_key_context(Arc::clone(&context));
         metadata.journal = Some(
             PrepareJournal::open(&directory.path().join("journal.wal"), 0)
                 .await
@@ -8955,12 +9061,6 @@ mod tests {
             .await
             .unwrap();
         // Two edge rewrites of the same keyless create generate two keys.
-        let context = ServerKeyContext::from_config(
-            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=",
-            &[],
-            true,
-        )
-        .unwrap();
         let envelope_block = |seed: u8| {
             let set = WrapSet::from(
                 context

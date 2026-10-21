@@ -24,6 +24,7 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyError, OptionKey, OptionValue, OptionsProvenance, ResourceOptions,
     ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, critical_keys_marker, erase_buffer,
 };
+use metadata::stm::stream::StreamsInner;
 use secrecy::zeroize::Zeroize;
 use server_common::Message;
 
@@ -44,19 +45,22 @@ pub enum Bounded {
 /// client's key when it sent one, or a key generated here when it did not and
 /// this node encrypts new streams. The key is wrapped under every configured
 /// server key, so the stream also opens on nodes a rotation has not reached.
-/// Only the wrap set and the critical marker travel on, so no plaintext key
-/// reaches a replica, the log or a snapshot. The body is built from the
-/// admitted options, and the copies of a client key this node decoded are
-/// erased whatever the outcome. Runs after catalog admission, which refuses a
-/// client-sent wrapped key.
+/// TCP requests carry only the wrap set and the critical marker onward, so no
+/// plaintext key reaches a replica, the log or a snapshot. An HTTP follower
+/// relays the raw body to the primary, which wraps the key there. The body is
+/// built from the admitted options, and the copies of a client key this node
+/// decoded are erased whatever the outcome. Runs after catalog admission,
+/// which refuses a client-sent wrapped key.
 ///
 /// # Errors
 ///
 /// `StreamEncryptionUnavailable` for a client key on a node without a server
-/// key, `CannotEncryptData` when generating or wrapping fails.
+/// key, or for any key while `deferring` reports a committed stream key this
+/// node cannot open, `CannotEncryptData` when generating or wrapping fails.
 pub fn maybe_rewrite_secret_options_request(
     context: &ServerKeyContext,
     bounded: Bounded,
+    deferring: impl FnOnce() -> bool,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let (request, create, options) = match bounded {
         Bounded::Request(request) => return Ok(request),
@@ -66,7 +70,7 @@ pub fn maybe_rewrite_secret_options_request(
             options,
         } => (request, create, options),
     };
-    match sealed_body(context, &create, options) {
+    match sealed_body(context, &create, options, deferring) {
         Ok(None) => Ok(request),
         Ok(Some(body)) => {
             let rewritten = rewrite_request_body(&request, &body);
@@ -99,6 +103,7 @@ fn sealed_body(
     context: &ServerKeyContext,
     create: &CreateStreamRequest,
     mut options: ResourceOptions,
+    deferring: impl FnOnce() -> bool,
 ) -> Result<Option<Bytes>, IggyError> {
     let client_key = match options.remove(&HeaderKey::from(OptionKey::EncryptionKey)) {
         Some(plaintext) => {
@@ -119,6 +124,11 @@ fn sealed_body(
         None => None,
     };
     if let Some((key, origin)) = key {
+        // Keys that leave a committed stream unopenable may be keys no peer
+        // holds, and a stream wrapped only under them opens nowhere else.
+        if deferring() {
+            return Err(IggyError::StreamEncryptionUnavailable);
+        }
         let set = context.wrap_set(&key, origin)?;
         options.insert(
             HeaderKey::from(OptionKey::EncryptionKeyWrapped),
@@ -142,6 +152,20 @@ fn sealed_body(
     ))
 }
 
+/// Whether a committed stream holds no wrap under this node's keys, so this
+/// node defers serving it. One fingerprint scan over every stream, run only
+/// for a create that wraps a key.
+#[must_use]
+pub fn defers_stream_keys(streams: &StreamsInner, context: &ServerKeyContext) -> bool {
+    let wrapped_key = HeaderKey::from(OptionKey::EncryptionKeyWrapped);
+    streams.items.iter().any(|(_, stream)| {
+        stream
+            .options
+            .get(&wrapped_key)
+            .is_some_and(|option| !context.holds_wrap_for(option.value.as_bytes()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,9 +174,10 @@ mod tests {
     use iggy_binary_protocol::{Operation, WireDecode, WireName, WireOptions};
     use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
-        AdmittedOptions, OptionAdmissionContext, OptionColumns, OptionOperation, OptionsScope,
-        StreamCreateOptions, WrapSet, admit, stream_wrap_set, text,
+        AdmittedOptions, IggyTimestamp, OptionAdmissionContext, OptionColumns, OptionOperation,
+        OptionsScope, StreamCreateOptions, WrapSet, admit, stream_wrap_set, text,
     };
+    use metadata::stm::StateHandler;
 
     const CONFIG_KEY: &str = "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=";
     const NEW_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
@@ -198,8 +223,9 @@ mod tests {
 
         let disabled = self::context(false);
         let request = create_request(WireOptions::empty());
-        let passed = maybe_rewrite_secret_options_request(&disabled, bounded(request.clone()))
-            .expect("passes through");
+        let passed =
+            maybe_rewrite_secret_options_request(&disabled, bounded(request.clone()), || false)
+                .expect("passes through");
         assert_eq!(passed.as_slice(), request.as_slice());
     }
 
@@ -284,6 +310,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_committed_stream_this_node_cannot_open_when_wrapping_a_create_should_refuse() {
+        let context = context(true);
+        let stranger = ServerKeyContext::from_config(NEW_CONFIG_KEY, &[], true).expect("valid key");
+        let rotated = ServerKeyContext::from_config(NEW_CONFIG_KEY, &[CONFIG_KEY.to_owned()], true)
+            .expect("valid keys");
+        let mut streams = StreamsInner::new();
+        insert_wrapped_stream(&mut streams, "opens-here", &context);
+        assert!(!defers_stream_keys(&streams, &context));
+        insert_wrapped_stream(&mut streams, "stranger", &stranger);
+        assert!(defers_stream_keys(&streams, &context));
+        assert!(!defers_stream_keys(&streams, &rotated));
+
+        let client_key = StreamCreateOptions {
+            encryption_key: Some(StreamEncryptionKey::try_from([4u8; 32].as_slice()).unwrap()),
+            ..StreamCreateOptions::default()
+        }
+        .to_wire()
+        .unwrap();
+        for options in [WireOptions::empty(), client_key] {
+            let refusal = maybe_rewrite_secret_options_request(
+                &context,
+                bounded(create_request(options)),
+                || defers_stream_keys(&streams, &context),
+            )
+            .expect_err("a deferring node must not wrap a new stream key");
+            assert_eq!(
+                refusal.as_code(),
+                IggyError::StreamEncryptionUnavailable.as_code()
+            );
+        }
+        let plaintext = self::context(false);
+        let request = create_request(WireOptions::empty());
+        let passed =
+            maybe_rewrite_secret_options_request(&plaintext, bounded(request.clone()), || {
+                defers_stream_keys(&streams, &plaintext)
+            })
+            .expect("a create that wraps nothing passes");
+        assert_eq!(passed.as_slice(), request.as_slice());
+    }
+
     fn context(enabled: bool) -> ServerKeyContext {
         ServerKeyContext::from_config(CONFIG_KEY, &[], enabled).unwrap()
     }
@@ -301,7 +368,7 @@ mod tests {
         context: &ServerKeyContext,
         options: WireOptions,
     ) -> Result<Message<RoutedRequestHeader>, IggyError> {
-        maybe_rewrite_secret_options_request(context, bounded(create_request(options)))
+        maybe_rewrite_secret_options_request(context, bounded(create_request(options)), || false)
     }
 
     /// `request` past static bounds, admitted the way both chains admit it.
@@ -320,6 +387,34 @@ mod tests {
         let options = resource_options_from_wire(&create.options, true).unwrap();
         assert!(!options.contains_key(&HeaderKey::from(OptionKey::EncryptionKey)));
         stream_wrap_set(&options).unwrap()
+    }
+
+    fn insert_wrapped_stream(streams: &mut StreamsInner, name: &str, wrapping: &ServerKeyContext) {
+        let set = wrapping
+            .wrap_set(
+                &StreamEncryptionKey::try_from([9u8; 32].as_slice()).unwrap(),
+                StreamKeyOrigin::Server,
+            )
+            .unwrap();
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).unwrap()),
+        );
+        options.insert(
+            HeaderKey::from(OptionKey::CriticalKeys),
+            OptionValue::explicit(
+                critical_keys_marker(&[OptionKey::EncryptionKeyWrapped]).unwrap(),
+            ),
+        );
+        let request = CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+            options: resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+        };
+        assert_eq!(
+            StateHandler::apply(&request, streams, IggyTimestamp::now()).code,
+            0
+        );
     }
 
     fn raw_key_block(base64: &str) -> WireOptions {

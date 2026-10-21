@@ -251,6 +251,9 @@ pub struct ReconcilerCtx {
     /// change.
     stats_registry: Arc<StatsRegistry>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
+    /// Owned namespaces boot left unbuilt, whose files a delete committed
+    /// before any build must still remove.
+    unbuilt_owned: RefCell<AHashSet<IggyNamespace>>,
     /// `Streams::revision` observed at the end of the last pass that fully
     /// converged. Paired with `last_pass_noop` for the fast-skip in
     /// [`reconcile_once`] (no O(N) scan when nothing changed).
@@ -289,6 +292,7 @@ impl ReconcilerCtx {
             replica_count,
             stats_registry,
             failure_state: RefCell::new(AHashMap::new()),
+            unbuilt_owned: RefCell::new(AHashSet::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
             group_offset_cleanup_inflight: Rc::new(RefCell::new(AHashSet::new())),
@@ -296,6 +300,48 @@ impl ReconcilerCtx {
             last_group_offset_reconcile_epoch: Cell::new(0),
             lifecycle_reports: LifecycleReports::default(),
         }
+    }
+
+    /// Record the owned namespaces boot did not build.
+    pub fn mark_unbuilt(&self, namespaces: impl IntoIterator<Item = IggyNamespace>) {
+        self.unbuilt_owned.borrow_mut().extend(namespaces);
+    }
+
+    /// Owned namespaces that never built and left the committed target. Boot
+    /// records its own, and a failed build keeps its `Add` record until the
+    /// removals pass, which runs before stale records are pruned.
+    fn unbuilt_ghosts(&self, target_set: &AHashSet<IggyNamespace>) -> Vec<IggyNamespace> {
+        let partitions = self.shard.plane.partitions();
+        let mut ghosts = Vec::new();
+        self.unbuilt_owned.borrow_mut().retain(|ns| {
+            if partitions.contains(ns) {
+                return false;
+            }
+            if target_set.contains(ns) {
+                return true;
+            }
+            ghosts.push(*ns);
+            false
+        });
+        ghosts.extend(
+            self.failure_state
+                .borrow()
+                .keys()
+                .filter(|(ns, cause)| *cause == FailureCause::Add && !target_set.contains(ns))
+                .map(|(ns, _)| *ns),
+        );
+        ghosts.retain(|ns| !partitions.contains(ns) && !partitions.is_tombstoned(ns));
+        ghosts.sort_unstable();
+        ghosts.dedup();
+        ghosts
+    }
+
+    /// `true` when a recorded failure is due for its retry.
+    fn has_retry_due(&self, now: Instant) -> bool {
+        self.failure_state
+            .borrow()
+            .values()
+            .any(|record| record.next_retry_at <= now)
     }
 
     fn is_backed_off(&self, ns: IggyNamespace, cause: FailureCause, now: Instant) -> bool {
@@ -424,6 +470,8 @@ struct PassCounters {
     routed: usize,
     removed_local: usize,
     removed_routed: usize,
+    /// Logged only. A pass that skipped only backed-off namespaces converged
+    /// until a retry comes due, which the fast-skip checks on its own.
     backoff_skipped: usize,
     /// Stale incarnations (slab-key reuse) torn down for rebuild.
     stale: usize,
@@ -461,7 +509,6 @@ impl PassCounters {
             + self.routed
             + self.removed_local
             + self.removed_routed
-            + self.backoff_skipped
             + self.stale
             + self.cg_offsets_submitted
             + self.cg_offsets_completed
@@ -502,8 +549,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // Fast-skip: committed partition set unchanged since the last
     // fully-converged pass and no backoff retry due, so the O(N) diff is
     // pure waste. Safe because reconcile is level-triggered: the next
-    // partition-shaping commit bumps `revision`, a pending retry keeps
-    // `failure_state` non-empty, and a pass that found work it could not
+    // partition-shaping commit bumps `revision`, a retry coming due forces
+    // the pass, and a pass that found work it could not
     // finish (a deferred rebuild, an incomplete trim) leaves
     // `last_pass_noop` false; any of the three forces the next pass.
     //
@@ -516,7 +563,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // namespace's legitimate convergence window.
     if ctx.last_revision.get() == Some(revision)
         && ctx.last_pass_noop.get()
-        && ctx.failure_state.borrow().is_empty()
+        && !ctx.has_retry_due(Instant::now())
         && ctx.group_offset_cleanup_completed.get() == 0
         && !ctx.shard.has_parked_partition_frames()
         && ctx.last_group_offset_reconcile_epoch.get() == group_offset_epoch
@@ -1042,6 +1089,13 @@ async fn reconcile_removals(
         .filter(|ns| !target_set.contains(ns) && !partitions.contains(ns))
         .collect();
     for ns in fenced_ghosts {
+        tear_down_owned_partition(ctx, ns, counters).await;
+    }
+
+    // A namespace deferred for its stream key or left by a failed build has
+    // files on disk but no partition and no tombstone, so neither loop above
+    // reaches it once a delete commits.
+    for ns in ctx.unbuilt_ghosts(target_set) {
         tear_down_owned_partition(ctx, ns, counters).await;
     }
 
@@ -2808,6 +2862,65 @@ mod tests {
                 !opens
             );
             assert_eq!(Path::new(&partition_dir).exists(), opens);
+        }
+    }
+
+    #[compio::test]
+    async fn given_only_backed_off_add_when_reconciling_should_skip_until_retry_is_due() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let stream_context = key_context(CONFIG_KEY);
+        let node_context = key_context(OTHER_CONFIG_KEY);
+        let mux = TestMux::default();
+        seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+        let shard = build_test_shard_with_keys(0, &config, mux, node_context);
+        let ctx = make_ctx(shard, 1, Rc::new(config));
+
+        assert!(reconcile_once(&ctx).await);
+        assert!(!ctx.failure_state.borrow().is_empty());
+        assert!(!reconcile_once(&ctx).await);
+
+        for record in ctx.failure_state.borrow_mut().values_mut() {
+            record.next_retry_at = Instant::now();
+        }
+        assert!(reconcile_once(&ctx).await);
+    }
+
+    #[compio::test]
+    async fn given_unbuilt_encrypted_partition_when_its_stream_is_deleted_should_remove_its_files()
+    {
+        for boot_deferred in [false, true] {
+            let tmp = TempDir::new().expect("tempdir for system path");
+            let config = test_config(&tmp);
+            let partition_dir = config.get_partition_path(0, 0, 0);
+            let stream_context = key_context(CONFIG_KEY);
+            let mux = TestMux::default();
+            seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
+            seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+            let shard = build_test_shard_with_keys(0, &config, mux, key_context(OTHER_CONFIG_KEY));
+            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ns = IggyNamespace::new(0, 0, 0);
+            std::fs::create_dir_all(&partition_dir).expect("prior partition files");
+            if boot_deferred {
+                ctx.mark_unbuilt([ns]);
+            } else {
+                reconcile_pass(&ctx).await;
+                assert!(
+                    ctx.failure_state
+                        .borrow()
+                        .contains_key(&(ns, FailureCause::Add))
+                );
+            }
+
+            seed_delete_stream(&shard.plane.metadata().mux_stm, 3, 0);
+            reconcile_pass(&ctx).await;
+
+            assert!(
+                !Path::new(&partition_dir).exists(),
+                "boot deferred {boot_deferred}: a deleted partition that never built keeps no files"
+            );
+            assert!(!shard.plane.partitions().is_tombstoned(&ns));
         }
     }
 

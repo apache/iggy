@@ -33,7 +33,7 @@ use consensus::{
     VsrState,
 };
 use iggy_common::{
-    IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
+    EncryptorKind, IggyByteSize, IggyError, PartitionStats, ServerKeyContext, StreamEncryption,
     TopicRuntimeOptions, check_critical_options,
 };
 use journal::Journal;
@@ -70,6 +70,15 @@ struct OwnedPartition {
     encryption: StreamEncryption,
 }
 
+/// How boot treats an owned partition, by whether its stream key opens here.
+enum OwnedPartitionKey {
+    /// Build it with this encryptor, `None` for a plaintext stream.
+    Build(Option<Arc<EncryptorKind>>),
+    /// Leave it unbuilt, hosted nowhere on this shard, until catch-up commits
+    /// a wrap this node opens.
+    Defer,
+}
+
 /// A shard built for its thread, with what `shard_main` wires after the
 /// build: the session manager its request plane shares and the weak
 /// self-reference the host's handlers upgrade per frame, already
@@ -79,6 +88,9 @@ pub(in crate::boot) struct ShardBuild {
     pub sessions: Rc<RefCell<SessionManager>>,
     pub consumer_group_liveness: Rc<RefCell<ConsumerGroupLiveness>>,
     pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
+    /// Owned namespaces left unbuilt, for the reconciler to clean up if their
+    /// delete commits before they build.
+    pub unbuilt: Vec<IggyNamespace>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -236,6 +248,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     let mut deferred_streams = BTreeSet::new();
+    let mut unbuilt = Vec::new();
     for OwnedPartition {
         stream_id,
         topic_id,
@@ -246,21 +259,18 @@ pub(in crate::boot) async fn build_shard_for_thread(
         encryption,
     } in owned
     {
-        if deferred_streams.contains(&stream_id) {
-            continue;
-        }
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let encryptor = match partitions.resolve_stream_encryptor(identity, &encryption) {
-            Ok(encryptor) => encryptor,
-            Err(source) => {
-                defer_or_refuse_stream_key(
-                    stream_id,
-                    &encryption,
-                    &partitions.key_context(),
-                    source,
-                    solo,
-                )?;
-                deferred_streams.insert(stream_id);
+        let encryptor = match owned_partition_key(
+            &partitions,
+            &mut deferred_streams,
+            stream_id,
+            identity,
+            &encryption,
+            solo,
+        )? {
+            OwnedPartitionKey::Build(encryptor) => encryptor,
+            OwnedPartitionKey::Defer => {
+                unbuilt.push(namespace);
                 continue;
             }
         };
@@ -293,6 +303,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                     "skipping this partition at boot; the reconciler retries its first \
                      offset reservation claim"
                 );
+                unbuilt.push(namespace);
                 continue;
             }
             Err(error) => return Err(error),
@@ -387,7 +398,37 @@ pub(in crate::boot) async fn build_shard_for_thread(
         sessions,
         consumer_group_liveness,
         shard_handle,
+        unbuilt,
     })
+}
+
+/// The key decision for one owned partition. A stream deferred once stays
+/// deferred for its other partitions, so its key is resolved once.
+fn owned_partition_key(
+    partitions: &IggyPartitions<Rc<IggyMessageBus>>,
+    deferred_streams: &mut BTreeSet<usize>,
+    stream_id: usize,
+    identity: StreamKeyIdentity,
+    encryption: &StreamEncryption,
+    solo: bool,
+) -> Result<OwnedPartitionKey, ServerError> {
+    if deferred_streams.contains(&stream_id) {
+        return Ok(OwnedPartitionKey::Defer);
+    }
+    match partitions.resolve_stream_encryptor(identity, encryption) {
+        Ok(encryptor) => Ok(OwnedPartitionKey::Build(encryptor)),
+        Err(source) => {
+            defer_or_refuse_stream_key(
+                stream_id,
+                encryption,
+                &partitions.key_context(),
+                source,
+                solo,
+            )?;
+            deferred_streams.insert(stream_id);
+            Ok(OwnedPartitionKey::Defer)
+        }
+    }
 }
 
 // Pin the configs-crate default literals (duplicated there to avoid a
@@ -972,6 +1013,83 @@ mod tests {
                 node_context.kek_fingerprints()
             );
         }
+    }
+
+    #[test]
+    fn given_stream_key_that_does_not_open_when_deciding_owned_partitions_should_leave_them_unbuilt()
+     {
+        let stream_context = ServerKeyContext::from_config(CONFIG_KEY, &[], true).expect("key");
+        let key = StreamEncryptionKey::try_from([1; 32].as_slice()).expect("32 bytes");
+        let set = WrapSet::from(
+            stream_context
+                .wrap(&key, StreamKeyOrigin::Server)
+                .expect("wraps"),
+        );
+        let wrapped = StreamEncryption::from(&ResourceOptions::from([(
+            HeaderKey::from(OptionKey::EncryptionKeyWrapped),
+            OptionValue::explicit(HeaderValue::try_from(set.as_ref()).expect("set fits")),
+        )]));
+        let identity = StreamKeyIdentity {
+            stream_id: 0,
+            created_op: 1,
+        };
+        let node_partitions = |config_key: &str| {
+            IggyPartitions::new(
+                ShardId::new(0),
+                PartitionsConfig {
+                    messages_required_to_save: 1,
+                    size_of_messages_required_to_save: IggyByteSize::from(1024_u64),
+                    validate_checksum: true,
+                    segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+                    preallocate_segments: false,
+                    key_context: Arc::new(
+                        ServerKeyContext::from_config(config_key, &[], true).expect("key"),
+                    ),
+                    path_layout: partitions::PartitionPathLayout {
+                        streams_root: "/var/lib/iggy/streams".to_owned(),
+                    },
+                },
+            )
+        };
+
+        let other_key = node_partitions(OTHER_CONFIG_KEY);
+        let mut deferred = BTreeSet::new();
+        for _ in 0..2 {
+            let decision =
+                owned_partition_key(&other_key, &mut deferred, 0, identity, &wrapped, false);
+            assert!(matches!(decision, Ok(OwnedPartitionKey::Defer)));
+        }
+        assert_eq!(deferred, BTreeSet::from([0]));
+        assert!(matches!(
+            owned_partition_key(
+                &other_key,
+                &mut BTreeSet::new(),
+                0,
+                identity,
+                &wrapped,
+                true
+            ),
+            Err(ServerError::StreamKeyUnavailable { stream_id: 0, .. })
+        ));
+
+        let same_key = node_partitions(CONFIG_KEY);
+        let mut deferred = BTreeSet::new();
+        assert!(matches!(
+            owned_partition_key(&same_key, &mut deferred, 0, identity, &wrapped, false),
+            Ok(OwnedPartitionKey::Build(Some(_)))
+        ));
+        assert!(matches!(
+            owned_partition_key(
+                &same_key,
+                &mut deferred,
+                1,
+                identity,
+                &StreamEncryption::Plaintext,
+                false
+            ),
+            Ok(OwnedPartitionKey::Build(None))
+        ));
+        assert!(deferred.is_empty());
     }
 
     #[test]

@@ -113,6 +113,16 @@ async fn given_empty_replacement_node_when_state_transferring_should_unwrap_stre
         );
         sleep(POLL_INTERVAL).await;
     }
+    for stream_id in 0..STREAMS.len() {
+        let partition_dir = harness
+            .node(2)
+            .data_path()
+            .join(format!("streams/{stream_id}/topics/0/partitions/0"));
+        assert!(
+            !partition_dir.exists(),
+            "a node that cannot open the key must not build partition {stream_id}"
+        );
+    }
 }
 
 #[iggy_harness(

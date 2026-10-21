@@ -39,7 +39,9 @@ use crate::pat::{maybe_rewrite_pat_request, rewrite_pat_request_for_user};
 use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShard};
-use crate::stream_keys::{Bounded, erase_stream_create, maybe_rewrite_secret_options_request};
+use crate::stream_keys::{
+    Bounded, defers_stream_keys, erase_stream_create, maybe_rewrite_secret_options_request,
+};
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::{MetadataHandle, PartitionsHandle};
@@ -150,12 +152,19 @@ where
         stage: RewriteStage::StaticBounds,
         error,
     })?;
-    let request =
-        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), bounded)
-            .map_err(|error| RewriteDeny {
-                stage: RewriteStage::SecretOptions,
-                error,
-            })?;
+    let key_context = shard.plane.partitions().key_context();
+    let request = maybe_rewrite_secret_options_request(&key_context, bounded, || {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| defers_stream_keys(streams, &key_context))
+    })
+    .map_err(|error| RewriteDeny {
+        stage: RewriteStage::SecretOptions,
+        error,
+    })?;
     let request = maybe_rewrite_consumer_group_request(request).map_err(|error| RewriteDeny {
         stage: RewriteStage::ConsumerGroup,
         error,
@@ -188,8 +197,15 @@ where
     let (request, raw_token) = rewrite_pat_request_for_user(user_id, request)?;
     let request = maybe_rewrite_user_password_request(shard, request)?;
     let bounded = static_bounds(shard, Some(user_id), request)?;
-    let request =
-        maybe_rewrite_secret_options_request(&shard.plane.partitions().key_context(), bounded)?;
+    let key_context = shard.plane.partitions().key_context();
+    let request = maybe_rewrite_secret_options_request(&key_context, bounded, || {
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| defers_stream_keys(streams, &key_context))
+    })?;
     Ok((request, raw_token))
 }
 

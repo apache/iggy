@@ -25,7 +25,7 @@ use crate::wire_conversions::resource_options_to_wire;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use iggy_binary_protocol::WireOptions;
-use secrecy::zeroize::Zeroize;
+use secrecy::zeroize::Zeroizing;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -43,13 +43,13 @@ const MAX_EXACT_JSON_INTEGER: u64 = (1 << 53) - 1;
 /// One option value in an HTTP body: a JSON boolean, a JSON integer, or a
 /// string in the same form a config file uses (`"7 days"`, `"1 GiB"`). A
 /// 64-bit value above 2^53 travels as a decimal string so JavaScript clients
-/// keep its precision.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+/// keep its precision. Text is erased on drop, since it may be the base64
+/// stream key.
+#[derive(Clone, PartialEq, Eq)]
 pub enum OptionInputValue {
     Bool(bool),
     U64(u64),
-    String(String),
+    String(Zeroizing<String>),
 }
 
 /// Option values for a create body, keyed by option name. A name repeated in
@@ -69,6 +69,8 @@ pub struct OptionsUpdate {
     pub set: BTreeMap<String, OptionInputValue>,
     pub reset: BTreeSet<String>,
 }
+
+struct InputValueVisitor;
 
 struct UniqueKeysVisitor;
 
@@ -119,27 +121,6 @@ impl OptionsUpdate {
     }
 }
 
-impl OptionInputValue {
-    /// Zero text in place, since it may be the base64 stream key.
-    fn erase(&mut self) {
-        if let Self::String(text) = self {
-            text.as_mut_str().zeroize();
-        }
-    }
-}
-
-impl Drop for OptionInputMap {
-    fn drop(&mut self) {
-        self.0.values_mut().for_each(OptionInputValue::erase);
-    }
-}
-
-impl Drop for OptionsUpdate {
-    fn drop(&mut self) {
-        self.set.values_mut().for_each(OptionInputValue::erase);
-    }
-}
-
 impl TryFrom<&HeaderValue> for OptionInputValue {
     type Error = IggyError;
 
@@ -148,7 +129,7 @@ impl TryFrom<&HeaderValue> for OptionInputValue {
     /// form travels as the text a config file uses.
     fn try_from(value: &HeaderValue) -> Result<Self, Self::Error> {
         match value.kind() {
-            HeaderKind::String => Ok(Self::String(value.as_str()?.to_owned())),
+            HeaderKind::String => Ok(Self::String(Zeroizing::new(value.as_str()?.to_owned()))),
             HeaderKind::Bool => Ok(Self::Bool(value.as_bool()?)),
             HeaderKind::Uint8 => Ok(Self::U64(u64::from(value.as_uint8()?))),
             HeaderKind::Uint16 => Ok(Self::U64(u64::from(value.as_uint16()?))),
@@ -156,13 +137,15 @@ impl TryFrom<&HeaderValue> for OptionInputValue {
             HeaderKind::Uint64 => {
                 let number = value.as_uint64()?;
                 Ok(if number > MAX_EXACT_JSON_INTEGER {
-                    Self::String(number.to_string())
+                    Self::String(Zeroizing::new(number.to_string()))
                 } else {
                     Self::U64(number)
                 })
             }
-            HeaderKind::Raw => Ok(Self::String(STANDARD.encode(value.as_bytes()))),
-            _ => Ok(Self::String(value.to_string_value())),
+            HeaderKind::Raw => Ok(Self::String(Zeroizing::new(
+                STANDARD.encode(value.as_bytes()),
+            ))),
+            _ => Ok(Self::String(Zeroizing::new(value.to_string_value()))),
         }
     }
 }
@@ -172,7 +155,7 @@ impl Debug for OptionInputValue {
         match self {
             Self::Bool(value) => write!(formatter, "{value}"),
             Self::U64(value) => write!(formatter, "{value}"),
-            Self::String(value) => write!(formatter, "{value:?}"),
+            Self::String(value) => write!(formatter, "{:?}", value.as_str()),
         }
     }
 }
@@ -204,6 +187,22 @@ impl Debug for OptionsUpdate {
             )
             .field("reset", &self.reset)
             .finish()
+    }
+}
+
+impl Serialize for OptionInputValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::U64(value) => serializer.serialize_u64(*value),
+            Self::String(value) => serializer.serialize_str(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OptionInputValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(InputValueVisitor)
     }
 }
 
@@ -242,6 +241,36 @@ impl<'de> Deserialize<'de> for OptionsUpdate {
     }
 }
 
+impl Visitor<'_> for InputValueVisitor {
+    type Value = OptionInputValue;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a boolean, a non-negative integer or a string")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(OptionInputValue::Bool(value))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(OptionInputValue::U64(value))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        u64::try_from(value)
+            .map(OptionInputValue::U64)
+            .map_err(|_| E::custom("a negative integer is not an option value"))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(OptionInputValue::String(Zeroizing::new(value.to_owned())))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(OptionInputValue::String(Zeroizing::new(value)))
+    }
+}
+
 impl<'de> Visitor<'de> for UniqueKeysVisitor {
     type Value = OptionInputMap;
 
@@ -251,9 +280,8 @@ impl<'de> Visitor<'de> for UniqueKeysVisitor {
 
     fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
         let mut values = OptionInputMap::default();
-        while let Some((key, mut value)) = access.next_entry::<String, OptionInputValue>()? {
+        while let Some((key, value)) = access.next_entry::<String, OptionInputValue>()? {
             if values.0.contains_key(&key) {
-                value.erase();
                 return Err(A::Error::custom(format!("duplicate option key: {key}")));
             }
             values.0.insert(key, value);
@@ -368,6 +396,7 @@ mod tests {
         descriptors_for,
     };
     use iggy_binary_protocol::WireName;
+    use secrecy::zeroize::ZeroizeOnDrop;
 
     #[test]
     fn given_update_body_when_parsing_json_should_skip_nulls_and_separate_resets() {
@@ -408,7 +437,7 @@ mod tests {
         let update = OptionsUpdate {
             set: BTreeMap::from([(
                 "message_expiry".to_owned(),
-                OptionInputValue::String("7 days".to_owned()),
+                OptionInputValue::String(Zeroizing::new("7 days".to_owned())),
             )]),
             reset: BTreeSet::new(),
         };
@@ -417,8 +446,8 @@ mod tests {
             r#"{"message_expiry":"7 days"}"#
         );
         let with_reset = OptionsUpdate {
-            set: update.set.clone(),
             reset: BTreeSet::from(["max_topic_size".to_owned()]),
+            ..update
         };
         let json = serde_json::to_string(&with_reset).unwrap();
         assert_eq!(
@@ -596,7 +625,9 @@ mod tests {
         );
         assert_eq!(
             OptionInputValue::try_from(&HeaderValue::from(exact + 2)),
-            Ok(OptionInputValue::String((exact + 2).to_string()))
+            Ok(OptionInputValue::String(Zeroizing::new(
+                (exact + 2).to_string()
+            )))
         );
     }
 
@@ -605,7 +636,7 @@ mod tests {
         let update = OptionsUpdate {
             set: BTreeMap::from([(
                 RESET_FIELD.to_owned(),
-                OptionInputValue::String("x".to_owned()),
+                OptionInputValue::String(Zeroizing::new("x".to_owned())),
             )]),
             reset: BTreeSet::new(),
         };
@@ -624,24 +655,21 @@ mod tests {
     }
 
     #[test]
-    fn given_parsed_bodies_with_stream_key_when_erasing_should_zero_the_key_text_in_place() {
+    fn given_parsed_bodies_with_stream_key_when_moving_values_out_should_keep_them_erased_on_drop()
+    {
         const BODY: &str = r#"{"encryption_key":"c2VjcmV0LXNlY3JldA==","message_expiry":7}"#;
-        let mut input: OptionInputMap = serde_json::from_str(BODY).expect("valid create options");
-        let mut update: OptionsUpdate = serde_json::from_str(BODY).expect("valid update body");
-        for values in [&mut input.0, &mut update.set] {
+        let input: OptionInputMap = serde_json::from_str(BODY).expect("valid create options");
+        let OptionsUpdate { set, reset } = serde_json::from_str(BODY).expect("valid update body");
+        assert!(reset.is_empty());
+        for mut values in [input.0, set] {
             let key = values
-                .get_mut(<&str>::from(OptionKey::EncryptionKey))
+                .remove(<&str>::from(OptionKey::EncryptionKey))
                 .expect("key parsed");
-            let OptionInputValue::String(text) = &*key else {
+            let OptionInputValue::String(text) = key else {
                 panic!("the key parses as text");
             };
-            let (address, length) = (text.as_ptr(), text.len());
-            key.erase();
-            let OptionInputValue::String(text) = &*key else {
-                panic!("erasing keeps the kind");
-            };
-            assert_eq!(text.as_ptr(), address, "zeroed in its own buffer");
-            assert_eq!(text.as_bytes(), vec![0; length], "every byte zeroed");
+            assert_erased_on_drop(&text);
+            assert_eq!(text.as_str(), "c2VjcmV0LXNlY3JldA==");
             assert_eq!(values["message_expiry"], OptionInputValue::U64(7));
         }
     }
@@ -673,4 +701,6 @@ mod tests {
             &OptionAdmissionContext::default(),
         )
     }
+
+    fn assert_erased_on_drop<T: ZeroizeOnDrop>(_: &T) {}
 }

@@ -52,6 +52,7 @@ pub enum Action {
     JoinFixtureGroup,
     LeaveFixtureGroup,
     StoreStaleOwnerOffset,
+    CreateKeyedStream,
 }
 
 // Lock the discriminants of the first three variants. Inserting a new variant before

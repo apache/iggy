@@ -441,6 +441,8 @@ key = ""
 # 2. Once every node runs the phase 1 config and every encrypted stream reports the new
 #    key's fingerprint in `encryption_kek_fingerprint`, empty `previous_keys` and put the
 #    old key's fingerprint in `retired_kek_fingerprints`. The primary drops the wraps under it.
+# 3. Once every stream has dropped the old wrap, clear `retired_kek_fingerprints` on every node.
+# A stream holds at most three wraps. Retire an old fingerprint before adding a fourth key.
 # Messages are never re-encrypted. Losing a key that still wraps a stream makes it unreadable.
 # As an environment variable: IGGY_ENCRYPTION_PREVIOUS_KEYS='["<old base64 key>"]', a single key may also be given bare.
 previous_keys = []

@@ -119,7 +119,7 @@ fn given_refused_raw_entry_after_the_key_when_encoding_should_free_no_copy_of_th
 fn given_stream_key_in_http_create_body_when_encoding_should_free_no_copy_of_it() {
     let body = OptionInputMap(BTreeMap::from([(
         OptionKey::EncryptionKey.to_string(),
-        OptionInputValue::String(KEY_BASE64.to_owned()),
+        OptionInputValue::String(KEY_BASE64.to_owned().into()),
     )]));
     let (wire, freed) = freed_copies_during(|| body.to_wire());
     let wire = wire.expect("encodes");
@@ -132,7 +132,7 @@ fn given_refused_http_key_after_the_stream_key_when_encoding_should_free_no_copy
     let body = OptionInputMap(BTreeMap::from([
         (
             OptionKey::EncryptionKey.to_string(),
-            OptionInputValue::String(KEY_BASE64.to_owned()),
+            OptionInputValue::String(KEY_BASE64.to_owned().into()),
         ),
         ("z".repeat(256), OptionInputValue::Bool(true)),
     ]));
@@ -148,7 +148,7 @@ fn given_refused_http_key_after_the_stream_key_when_encoding_should_free_no_copy
 fn given_stream_key_in_http_update_body_when_splitting_should_free_no_copy_of_it() {
     let set = BTreeMap::from([(
         OptionKey::EncryptionKey.to_string(),
-        OptionInputValue::String(KEY_BASE64.to_owned()),
+        OptionInputValue::String(KEY_BASE64.to_owned().into()),
     )]);
     let accepted = OptionsUpdate {
         set: set.clone(),

@@ -25,6 +25,7 @@ import { deserializeToStream, type Stream } from './stream.utils.js';
 import { StreamEncryptionKey, type StreamOptions } from './stream-options.js';
 
 const INVALID_ENCRYPTION_KEY = 70;
+const INVALID_COMMAND = 3;
 
 /**
  * Parameters for the create stream command.
@@ -55,7 +56,7 @@ export const CREATE_STREAM = {
     // A plain entry prints its value wherever the caller logs the arguments.
     if (extraOptions.some(({ key }) => key === StreamOptionKey.EncryptionKey))
       throw responseError(
-        COMMAND_CODE.CreateStream, INVALID_ENCRYPTION_KEY,
+        COMMAND_CODE.CreateStream, INVALID_COMMAND,
         'stream key must be passed as encryptionKey, not as an options entry'
       );
 

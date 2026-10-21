@@ -1782,7 +1782,7 @@ mod tests {
         );
         assert_eq!(
             options.to_input_map().unwrap()[topic_option_keys::PARTITION_RESIZE_POLICY],
-            OptionInputValue::String("fixed".to_owned())
+            OptionInputValue::String("fixed".to_owned().into())
         );
 
         options.partition_resize_policy = Some(PartitionResizePolicy::Mutable);
@@ -1794,7 +1794,7 @@ mod tests {
         );
         assert_eq!(
             options.to_input_map().unwrap()[topic_option_keys::PARTITION_RESIZE_POLICY],
-            OptionInputValue::String("mutable".to_owned())
+            OptionInputValue::String("mutable".to_owned().into())
         );
     }
 
@@ -2024,7 +2024,7 @@ mod tests {
         assert_eq!(parsed.consumer_offset_durability, Durability::Replicated);
         assert_eq!(
             options.to_input_map().unwrap()["durability"],
-            OptionInputValue::String("persisted".to_owned())
+            OptionInputValue::String("persisted".to_owned().into())
         );
     }
 
