@@ -564,14 +564,11 @@ func (r *replicaLinks) stopHeartbeat() {
 }
 
 func (r *replicaLinks) disconnect(wait bool) {
-	stopped := r.detach()
-	if wait {
-		stopped()
-	}
+	r.detach()(wait)
 }
 
-// detach separates ownership changes from waiting for the old link tasks.
-func (r *replicaLinks) detach() func() {
+// detach removes ownership; its result closes sockets outside the session lock.
+func (r *replicaLinks) detach() func(bool) {
 	r.mu.Lock()
 	if r.cancel != nil {
 		r.cancel()
@@ -597,10 +594,13 @@ func (r *replicaLinks) detach() func() {
 	r.hasPrimary = false
 	r.hasRoster.Store(false)
 	r.mu.Unlock()
-	for link := range links {
-		link.close(ierror.ErrClientShutdown)
-	}
-	return func() {
+	return func(wait bool) {
+		for link := range links {
+			link.close(ierror.ErrClientShutdown)
+		}
+		if !wait {
+			return
+		}
 		if attempt != nil {
 			<-attempt.done
 		}

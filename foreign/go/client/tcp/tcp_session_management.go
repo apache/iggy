@@ -88,11 +88,15 @@ func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credent
 	c.rememberedLogin = AutoLogin{}
 	c.loggedOut = true
 	c.invalidateSessionLocked()
+	var stopped func(bool)
 	if len(c.registerGate) != 0 {
 		c.session.Reset()
-		c.links.disconnect(false)
+		stopped = c.links.detach()
 	}
 	c.mtx.Unlock()
+	if stopped != nil {
+		stopped(false)
+	}
 	callerCtx := ctx
 	defer func() {
 		if err == nil {
@@ -104,13 +108,17 @@ func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credent
 			err = callerCtx.Err()
 		}
 		c.mtx.Lock()
-		defer c.mtx.Unlock()
+		var stopped func(bool)
 		if c.epoch.Load() == epoch {
 			c.session.Reset()
 			c.invalidateSessionLocked()
 			c.rememberedLogin = AutoLogin{}
 			c.loggedOut = true
-			c.links.disconnect(false)
+			stopped = c.links.detach()
+		}
+		c.mtx.Unlock()
+		if stopped != nil {
+			stopped(false)
 		}
 	}()
 	if ctx == nil {
@@ -154,12 +162,16 @@ func (c *IggyTcpClient) register(ctx context.Context, code command.Code, credent
 		if err = epoch.err(); err == nil {
 			err = ctx.Err()
 		}
+		var stopped func(bool)
 		if err == nil {
 			c.session.Reset()
 			c.invalidateSessionLocked()
-			c.links.disconnect(false)
+			stopped = c.links.detach()
 		}
 		c.mtx.Unlock()
+		if stopped != nil {
+			stopped(false)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -584,7 +596,7 @@ func (c *IggyTcpClient) finishLogout(epoch *signInEpoch) {
 	c.resetSessionLocked(true)
 	stopped := c.links.detach()
 	c.mtx.Unlock()
-	stopped()
+	stopped(true)
 }
 
 // signInCredentials are the last sign-in, else the configured AutoLogin. A

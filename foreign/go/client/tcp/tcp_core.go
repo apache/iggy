@@ -522,7 +522,7 @@ func (c *IggyTcpClient) Disconnect() error {
 	c.loggedOut = c.autoLoginBlocked
 	stopped := c.links.detach()
 	c.mtx.Unlock()
-	stopped()
+	stopped(true)
 	c.connectMu.Lock()
 	attempt := c.connectionAttempt
 	c.connectMu.Unlock()

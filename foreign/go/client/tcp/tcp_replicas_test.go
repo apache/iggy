@@ -134,6 +134,7 @@ type managedLinkTestConnection struct {
 	closed      chan<- struct{}
 	readStopped chan<- struct{}
 	resumeRead  <-chan struct{}
+	resumeClose <-chan struct{}
 }
 
 func (connection *managedLinkTestConnection) Read(buffer []byte) (int, error) {
@@ -151,7 +152,52 @@ func (connection *managedLinkTestConnection) Close() error {
 	case connection.closed <- struct{}{}:
 	default:
 	}
+	if connection.resumeClose != nil {
+		<-connection.resumeClose
+	}
 	return err
+}
+
+func TestSlowSocketCloseDoesNotHoldSessionLock(t *testing.T) {
+	for _, action := range []string{"disconnect", "close", "failed_login"} {
+		t.Run(action, func(t *testing.T) {
+			peer, connection := net.Pipe()
+			defer func() { _ = peer.Close() }()
+			closing, resume := make(chan struct{}, 1), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(resume) })
+			defer unblock()
+			client := newTestClient(t, &managedLinkTestConnection{Conn: connection, closed: closing, resumeClose: resume})
+			done := make(chan error, 1)
+			go func() {
+				switch action {
+				case "disconnect":
+					done <- client.Disconnect()
+				case "close":
+					done <- client.Close()
+				default:
+					_, err := client.LoginUser(context.Background(), "", "password")
+					done <- err
+				}
+			}()
+			select {
+			case <-closing:
+			case <-time.After(managedLinkTestBudget):
+				t.Fatal("the socket did not start closing")
+			}
+			locked := client.mtx.TryLock()
+			if locked {
+				client.mtx.Unlock()
+			}
+			require.True(t, locked, "socket shutdown blocked the session lock")
+			require.Nil(t, client.links.any())
+			unblock()
+			if action == "failed_login" {
+				require.Error(t, <-done)
+			} else {
+				require.NoError(t, <-done)
+			}
+		})
+	}
 }
 
 func TestManagedLinks_StopHeartbeatAndReconnectOnSessionEnd(t *testing.T) {
