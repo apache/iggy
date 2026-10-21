@@ -746,7 +746,7 @@ export class CommandResponseStream extends EventEmitter {
     connection.on('error', (error: Error) => {
       // Keep diagnostic link errors separate from EventEmitter's special
       // 'error' event: internal events.once waits must survive link recovery.
-      if (!this.lifetime.signal.aborted && this.listenerCount('connectionError') > 0)
+      if (!connection.ending && !this.lifetime.signal.aborted && this.listenerCount('connectionError') > 0)
         this.emit('connectionError', error);
     });
     connection.on('eviction', (error) => this.emit('eviction', error));
@@ -999,7 +999,7 @@ export class CommandResponseStream extends EventEmitter {
   }
 }
 
-export function getRawClient(options: ClientConfigOrString): RawClient {
+export function getRawClient(options: ClientConfigOrString): Omit<RawClient, 'destroy'> & { destroy: () => Promise<void> } {
   return new CommandResponseStream(options);
 }
 

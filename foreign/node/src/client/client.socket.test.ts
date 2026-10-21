@@ -16,7 +16,7 @@
 // under the License.
 
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { once, type EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo, Socket } from 'node:net';
 import { createServer, type Server } from 'node:net';
@@ -50,6 +50,7 @@ import {
 import { Operation, operationForCode } from '../wire/vsr/operation.js';
 import { VsrEvictionError } from '../wire/vsr/reply.js';
 import { IggyConnection, type LinkAttempt } from './client.connection.js';
+import { Client } from './client.js';
 import { OPERATION_TIMEOUT_MS } from './client.operation.js';
 import {
   CommandResponseStream, LaneBlockedError, NotConnectedError, OperationNotRetainedError, OperationUncertainError
@@ -3280,6 +3281,28 @@ describe('native mutation recovery', () => {
 
 
 describe('native replica and selection lifecycle', () => {
+  it('keeps normal login and logout out of public connection errors', async () => {
+    const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+    const client = new Client({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    const errors: Error[] = [];
+    client.on('error', (error) => errors.push(error));
+    try {
+      await client.system.ping();
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const connected = once(client as unknown as EventEmitter, 'connected')
+          .then(() => undefined, (error: Error) => error);
+        await client.session.login({ username: 'iggy', password: 'iggy' });
+        assert.equal(await connected, undefined);
+        assert.deepEqual(errors, []);
+      }
+      await client.session.logout();
+      assert.deepEqual(errors, []);
+    } finally {
+      await client.destroy();
+      await server.close();
+    }
+  });
+
   for (const partition of [Partitioning.Balanced, Partitioning.MessageKey('key'), Partitioning.PartitionId(0)]) {
     for (const uncertain of [false, true]) {
       it(`handles partition-not-found for kind ${partition.kind} with uncertainty ${uncertain}`, async () => {

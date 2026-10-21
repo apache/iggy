@@ -21,7 +21,7 @@ import { createServer, type AddressInfo, type Server, type Socket } from 'node:n
 import { setImmediate as nextTick } from 'node:timers/promises';
 import { describe, it } from 'node:test';
 import { Client, SimpleClient, SingleClient } from './client.js';
-import { CommandResponseStream, NotConnectedError } from './client.socket.js';
+import { CommandResponseStream, getRawClient, NotConnectedError } from './client.socket.js';
 import type { ClientConfig } from './client.type.js';
 import { ResponseFrameDecoder } from './client.frame.js';
 import { ResponseError } from '../wire/error.utils.js';
@@ -201,6 +201,23 @@ describe('Client lifecycle events', () => {
     } finally {
       release();
       await destroy();
+      await server.close();
+    }
+  });
+
+  it('exposes the socket closure promise from getRawClient', async () => {
+    const server = await startServer();
+    const raw = getRawClient(clientConfig(server.server));
+    const client = new SimpleClient(raw);
+    try {
+      await client.system.ping();
+      const socket = raw.getReadStream() as Socket;
+      let closed = false;
+      socket.once('close', () => { closed = true; });
+      const ended: Promise<void> = raw.destroy();
+      await ended.then(() => assert.ok(closed));
+    } finally {
+      await raw.destroy();
       await server.close();
     }
   });
