@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::bridge::IggyBridge;
+use crate::cluster_id::ClusterId;
 use crate::error::Result;
 use crate::group::{GroupCoordinator, GroupCoordinatorConfig, GroupMember};
 use crate::protocol::acl::{
@@ -42,10 +43,10 @@ use crate::protocol::bounds_guard::{
 use crate::protocol::handlers::api_versions::Advertisement;
 use crate::protocol::handlers::init_producer_id::ProducerIdAllocator;
 use crate::protocol::handlers::{
-    alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_configs,
-    describe_groups, dispatch, fetch, find_coordinator, heartbeat, init_producer_id, join_group,
-    leave_group, list_groups, list_offsets, metadata, offset_commit, offset_fetch, produce,
-    respond_or_close, sync_group,
+    alter_configs, api_versions, create_topics, decode_guarded, delete_topics, describe_cluster,
+    describe_configs, describe_groups, dispatch, fetch, find_coordinator, heartbeat,
+    init_producer_id, join_group, leave_group, list_groups, list_offsets, metadata, offset_commit,
+    offset_fetch, produce, respond_or_close, sync_group,
 };
 use crate::protocol::probe_board::ProbeBoard;
 use crate::protocol::sasl::{
@@ -74,6 +75,7 @@ pub const API_KEY_DESCRIBE_ACLS: i16 = 29;
 pub const API_KEY_DESCRIBE_CONFIGS: i16 = 32;
 pub const API_KEY_ALTER_CONFIGS: i16 = 33;
 pub const API_KEY_SASL_AUTHENTICATE: i16 = 36;
+pub const API_KEY_DESCRIBE_CLUSTER: i16 = 60;
 
 pub const DEFAULT_KAFKA_PORT: u16 = 9093;
 
@@ -201,6 +203,10 @@ pub const ERROR_FENCED_INSTANCE_ID: i16 = 82;
 /// retriable, so a client would resend a batch that can never decode. A client older than Kafka
 /// 2.4 reads 87 as a generic server error, which is still terminal and still better than a loop.
 pub const ERROR_INVALID_RECORD: i16 = ResponseError::InvalidRecord.code();
+/// `DescribeCluster` v1+ asked a broker for the controller endpoints.
+pub const ERROR_MISMATCHED_ENDPOINT_TYPE: i16 = ResponseError::MismatchedEndpointType.code();
+/// `DescribeCluster` v1+ named an endpoint type Kafka does not define.
+pub const ERROR_UNSUPPORTED_ENDPOINT_TYPE: i16 = ResponseError::UnsupportedEndpointType.code();
 
 /// Kafka's -1 for an offset or a timestamp that is not known.
 pub(crate) const UNKNOWN_OFFSET: i64 = -1;
@@ -301,6 +307,7 @@ static SUPPORTED_RANGES: &[ApiVersionRange] = &[
     sync_group::RANGE,
     describe_groups::RANGE,
     list_groups::RANGE,
+    describe_cluster::RANGE,
 ];
 
 #[must_use]
@@ -339,6 +346,9 @@ pub struct GatewayState {
     pub(crate) unproven_empty: Mutex<fetch::Spells>,
     /// Topic probes that every Fetch shares.
     pub(crate) probe_board: ProbeBoard,
+    /// What Metadata and `DescribeCluster` report. Random unless [`Self::with_cluster_id`] sets
+    /// the one stored in Iggy.
+    pub cluster_id: ClusterId,
     /// Present only while `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` is on.
     pub(crate) auto_topic_creation: Option<AutoTopicCreator>,
 }
@@ -375,6 +385,7 @@ impl GatewayState {
             loading: Mutex::default(),
             unproven_empty: Mutex::default(),
             probe_board: ProbeBoard::default(),
+            cluster_id: ClusterId::random(),
             auto_topic_creation: None,
         }
     }
@@ -408,6 +419,12 @@ impl GatewayState {
             // behind it.
             bridge.discard_auto_create_client();
         }
+    }
+
+    #[must_use]
+    pub fn with_cluster_id(mut self, cluster_id: ClusterId) -> Self {
+        self.cluster_id = cluster_id;
+        self
     }
 
     /// State with no bridge, so every handler takes its stub path.
@@ -821,6 +838,9 @@ pub fn encode_error_for_key(
             describe_configs::encode_error_response(api_version, error_code)
         }
         API_KEY_ALTER_CONFIGS => alter_configs::encode_error_response(api_version, error_code),
+        API_KEY_DESCRIBE_CLUSTER => {
+            describe_cluster::encode_error_response(api_version, error_code)
+        }
         // Carries the listener's live advertisement, not a hardcoded `NONE`: answering an
         // illegal-state ApiVersions with a SASL-less key set contradicts the advertisement sent
         // one frame earlier on the same connection.

@@ -1492,6 +1492,44 @@ async fn given_a_group_that_committed_when_the_gateway_restarts_should_resume_af
     );
 }
 
+/// The id `kafka-cluster.sh cluster-id` prints, which it reads through `DescribeCluster`.
+fn cluster_id(gateway: SocketAddr) -> String {
+    let bootstrap = gateway.to_string();
+    let output = run_client(
+        KAFKA_IMAGE,
+        &[
+            "/opt/kafka/bin/kafka-cluster.sh",
+            "cluster-id",
+            "--bootstrap-server",
+            &bootstrap,
+        ],
+        &[],
+    )
+    .expect_ran("kafka-cluster.sh cluster-id");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Cluster ID: "))
+        .unwrap_or_else(|| panic!("no cluster id printed, got: {output}"))
+        .trim()
+        .to_string()
+}
+
+/// The Java tool prints the same id before and after a gateway restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_a_gateway_restart_when_kafka_cluster_prints_the_id_should_print_the_same_one() {
+    let Some(server) = ready_server() else {
+        return;
+    };
+    let gateway = start_bridged_gateway(&server, &[]).await;
+    let before = cluster_id(gateway.addr);
+    gateway.stop().await;
+
+    let restarted = start_bridged_gateway(&server, &[]).await;
+    let after = cluster_id(restarted.addr);
+    assert_eq!(before, after, "the id must survive a restart");
+    assert_ne!(before, "None", "a null id prints as None");
+}
+
 /// G11 of `docs/MANUAL_TESTING.md`. Two members split the topic. When one leaves, the other
 /// resumes its partition at the offset it committed: an earlier offset reads records twice, a
 /// later one skips them. Records are written only once both members hold a partition, so each

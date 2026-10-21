@@ -59,6 +59,7 @@ max-threads = 4
 [[profile.default.overrides]]
 filter = '''
     binary_id(iggy-gateway-kafka::bridge_iggy_integration_tests)
+    + binary_id(iggy-gateway-kafka::cluster_id_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::fetch_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::list_offsets_real_bridge_tests)
     + binary_id(iggy-gateway-kafka::produce_real_bridge_tests)

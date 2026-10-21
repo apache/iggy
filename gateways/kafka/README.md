@@ -617,6 +617,16 @@ messages or 1 MiB of unflushed data, whichever comes first). Kafka's own default
 posture, so this isn't a wrong choice, but on a single node both can lose an acked write to a power
 cut before that threshold is reached - worth knowing rather than discovering later.
 
+The bridge also keeps the Kafka cluster id in Iggy, in topic `cluster_id` of stream
+`<default stream>.meta`, created on the first start with durability `persisted`, no expiry and no
+size cap. Leave that stream alone: deleting it gives the next start a new id, and a topic mapping
+override that targets it is refused at startup. On the start that stores the id, the bridge's Iggy
+user needs to create whichever of that stream and topic is missing, then `send_messages` and
+`poll_messages` on the stream. Every later start only polls. A user without `manage_streams` can
+still run the gateway once an operator creates the stream and the topic (one partition,
+durability `persisted`) and grants it `poll_messages` and `send_messages` on the stream: the
+bridge creates only what it finds missing. See [docs/SCOPE.md](docs/SCOPE.md#cluster-id).
+
 ### Auto topic creation
 
 With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, the gateway behaves like a Kafka broker with

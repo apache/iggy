@@ -51,9 +51,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|listener| listener.protocol == SecurityProtocol::SaslPlaintext);
     let bridge = connect_bridge(sasl_enabled).await?;
+    // Loaded before the listeners bind, so no client waits in the backlog behind Iggy.
+    let cluster_id = match &bridge {
+        Some(bridge) => Some(bridge.load_cluster_id().await.map_err(|e| e.to_string())?),
+        None => None,
+    };
 
     let listeners = bind_listeners(&config).map_err(|e| e.to_string())?;
     let mut server = KafkaGateway::new(config).with_bridge(bridge.clone());
+    if let Some(cluster_id) = cluster_id {
+        server = server.with_cluster_id(cluster_id);
+    }
     if sasl_enabled {
         let authenticator = IggyAuthenticator::from_env()?;
         if plaintext_sasl {

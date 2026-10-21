@@ -29,8 +29,8 @@ pub mod topic_map;
 pub use config::{DEFAULT_MAX_MESSAGE_SIZE, IggyBridgeConfig, IggyTls, ProduceSessionLimits};
 pub use error::BridgeError;
 pub use iggy_bridge::{
-    DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS,
-    OFFSET_GROUP_PREFIX, OffsetCalls, ProduceTurn, Producer, StreamTopicCache,
-    TopicCreationOutcome, TopicLoad, TopicTarget,
+    CLUSTER_ID_TOPIC, ClusterIdCall, DEFAULT_TOPIC_PARTITIONS, IggyBridge, KafkaTopicMetadata,
+    MAX_TOPIC_PARTITIONS, OFFSET_GROUP_PREFIX, OffsetCalls, ProduceTurn, Producer,
+    StreamTopicCache, TopicCreationOutcome, TopicLoad, TopicTarget, cluster_id_stream,
 };
 pub use topic_map::{TopicMapping, TopicOverride};

@@ -35,7 +35,7 @@ Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiV
 **Every unsupported-version case closes the connection, for every listed key** - not just above
 the encoder max. `kafka_protocol`'s schema floor for each supported message happens to equal
 `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0, ApiVersions 0,
-CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1, DescribeConfigs 1, AlterConfigs 0, and 0 for the five group coordination keys, DescribeGroups and ListGroups), so there is no version below an API's
+CreateTopics 2, InitProducerId 0, OffsetCommit 2, OffsetFetch 1, DescribeConfigs 1, AlterConfigs 0, DescribeCluster 0, and 0 for the five group coordination keys, DescribeGroups and ListGroups), so there is no version below an API's
 min that the crate can actually encode a response for either - `unsupported_version_response`
 still tries, but the encode attempt fails and the connection closes rather than sending a
 malformed body.
@@ -50,7 +50,7 @@ it knows the server supports flexible encoding.
 | API key | Name | Min version | Max version | Valid versions | Behavior |
 | --------- | ------ | ------------- | ------------- | ---------------- | ---------- |
 | 18 | ApiVersions | 0 | 3 | 0, 1, 2, 3 | Advertise supported ranges; flexible encoding at v3+ |
-| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; flexible encoding at v9+. With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
+| 3 | Metadata | 0 | 9 | 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 | Decode topic list count; stub broker host from the listener's advertised address or its bound IP; the [cluster id](#cluster-id) from v2; flexible encoding at v9+. With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a named missing topic is created as in Kafka (README "Auto topic creation") |
 | 0 | Produce | 3 | 9 | 3, 4, 5, 6, 7, 8, 9 | With a bridge: one `send_messages` per partition. Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 1 | Fetch | 4 | 12 | 4, 5, 6, 7, 8, 9, 10, 11, 12 | With a bridge: shared topic probes, paged `poll_messages` per partition with records, wait up to `max_wait_ms` (max 18 s). Without one: stub returns `NOT_LEADER_OR_FOLLOWER` (6) |
 | 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST, a timestamp and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
@@ -68,6 +68,7 @@ it knows the server supports flexible encoding.
 | 22 | InitProducerId | 0 | 5 | 0, 1, 2, 3, 4, 5 | Allocate a producer id (epoch 0); a `transactional_id` gets `UNSUPPORTED_VERSION` (35); flexible encoding at v2+ |
 | 32 | DescribeConfigs | 1 | 4 | 1, 2, 3, 4 | Topic resources only. Returns `retention.ms` and leaves out `cleanup.policy`. Flexible encoding at v4. See [`CONFIGS.md`](CONFIGS.md) |
 | 33 | AlterConfigs | 0 | 2 | 0, 1, 2 | Persists `retention.ms` only. Flexible encoding at v2. See [`CONFIGS.md`](CONFIGS.md) |
+| 60 | DescribeCluster | 0 | 2 | 0, 1, 2 | The [cluster id](#cluster-id) and the broker Metadata advertises on the same listener. The controller endpoint type gets `MISMATCHED_ENDPOINT_TYPE` (114) and an unknown one `UNSUPPORTED_ENDPOINT_TYPE` (115). `cluster_authorized_operations` stays unset, so a Java client reads it as null. Flexible encoding at every version |
 
 A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above).
 
@@ -98,6 +99,45 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 22 | InitProducerId | 0–5 | v2 |
 | 32 | DescribeConfigs | 1–4 | v4 |
 | 33 | AlterConfigs | 0–2 | v2 |
+| 60 | DescribeCluster | 0–2 | v0 |
+
+### Cluster id
+
+Metadata v2+ and DescribeCluster report one id, so `kafka-cluster.sh cluster-id`, Connect and
+Confluent REST Proxy see a cluster instead of a null one. It is a Kafka-shaped id: 16 random
+bytes in unpadded URL-safe base64, 22 characters. Like Kafka's `Uuid.randomUuid`, the gateway
+never mints one that contains `-`, but it reads a stored one that does. A stored id must be
+exactly that form: padding, other lengths, a spelling with non-zero trailing bits and Kafka's
+two reserved ids (all zeros, and `AAAAAAAAAAAAAAAAAAAAAQ`) are refused.
+
+With a bridge, the id lives in Iggy and never changes. It is the first message of topic
+`cluster_id` in stream `<default stream>.meta` (`kafka.meta` by default), a one-partition topic
+with durability `persisted`, no expiry and no size cap. The default `replicated` durability acks
+before the write reaches stable storage, and a single-node Iggy that crashes then drops the id.
+At startup the gateway reads the earliest message. If the partition is empty it writes a new id
+and reads again, so gateways that start at once all report whichever message landed first. A
+stored message that is not an id stops the gateway at startup instead of being reported.
+Deleting the stream or the topic makes the next start a new cluster. To keep the id of an
+existing Kafka cluster, send it as the first message of that topic before the first start.
+
+The gateway warns at startup when the topic is not `persisted`, has an expiry, a size cap or
+other than one partition, or no longer starts at offset 0, and keeps running. Expiry and size cap
+can be fixed in place with an `UpdateTopic`. Durability and partitions need the topic recreated
+and the id sent back as its first message, with every gateway stopped first: one that starts
+while the topic is empty stores a new id. The check needs `read_topics` on the stream, and is
+skipped with an info log without it. A topic mapping override into
+`<default stream>.meta` is refused, and so is a default stream whose `.meta` name is longer than
+Iggy's 255-byte limit.
+
+On the start that stores the id, the bridge's Iggy user needs `manage_streams` if
+`<default stream>.meta` is missing, `manage_topics` on it if the topic is missing, then
+`send_messages` and `poll_messages` on it. Every later start only polls. A user scoped to the
+default stream fails at startup with an error that names the stream and the permission. Instead
+of widening it, an operator can create the stream and the topic (one partition, durability
+`persisted`) and grant the user `poll_messages` and `send_messages` on the stream: the bridge
+creates only what it finds missing.
+
+Without a bridge, nothing is stored: the id is random and lasts as long as the process.
 
 ---
 
