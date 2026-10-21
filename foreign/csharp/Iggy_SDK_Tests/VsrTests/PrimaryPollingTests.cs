@@ -245,6 +245,28 @@ public sealed class PrimaryPollingTests
     }
 
     [Fact]
+    public async Task given_group_assignment_read_when_polling_should_refresh_at_its_metadata_floor()
+    {
+        using var cluster = new PollCluster();
+        cluster.OnCoordinator = request =>
+        {
+            if (request.Code != CommandCodes.GET_CONSUMER_GROUP_CODE)
+            {
+                return null;
+            }
+            var reply = Reply(request.Operation, []);
+            BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET), MetadataCommit);
+            return reply;
+        };
+        using var client = await cluster.ConnectAsync();
+        await PollAsync(client);
+        _ = await client.GetConsumerGroupByIdAsync(Stream, Topic, Group, TestContext.Current.CancellationToken);
+        await PollAsync(client);
+
+        Assert.Equal(new ulong[] { 0, MetadataCommit }, cluster.RouteRequests.Select(request => request.Context.MetadataOp));
+    }
+
+    [Fact]
     public async Task given_roster_without_nodes_when_polling_should_preserve_the_last_valid_topology()
     {
         using var cluster = new PollCluster();

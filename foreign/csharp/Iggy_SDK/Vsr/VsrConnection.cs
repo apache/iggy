@@ -365,7 +365,8 @@ internal sealed class VsrConnection : IDisposable
                             throw VsrError.Exception(VsrError.INVALID_COMMAND, "Committed reply does not match the original request.");
                         }
                         var payload = VsrReplyDecoder.Decode(header, buffer.AsMemory(0, bodySize));
-                        if (committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments))
+                        if (committed && (operation.IsMetadata() || operation == VsrOperation.DeleteSegments)
+                            || request.Code is CommandCodes.GET_CONSUMER_GROUP_CODE or CommandCodes.SYNC_CONSUMER_GROUP_CODE)
                         {
                             _observeMetadataCommit?.Invoke(BinaryPrimitives.ReadUInt64LittleEndian(
                                 header.AsSpan(VsrHeader.REPLY_COMMIT_OFFSET)));
