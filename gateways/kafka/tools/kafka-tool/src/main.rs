@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use iggy_gateway_kafka::protocol::api::supported_api_ranges;
 use kafka_protocol::messages::add_partitions_to_txn_request::*;
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
+use kafka_protocol::messages::create_partitions_request::*;
 use kafka_protocol::messages::create_topics_request::*;
 use kafka_protocol::messages::delete_records_request::*;
 use kafka_protocol::messages::delete_topics_request::*;
@@ -572,6 +573,20 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .with_auth_bytes(Bytes::from_static(b"\x00iggy\x00secret"))
                 .encode(&mut buf, version)
                 .context("SaslAuthenticate")?;
+        }
+        37 => {
+            let topic = CreatePartitionsTopic::default()
+                .with_name(TopicName::from(StrBytes::from_static_str(
+                    "iggy-test-topic",
+                )))
+                .with_count(2)
+                .with_assignments(None);
+            CreatePartitionsRequest::default()
+                .with_topics(vec![topic])
+                .with_timeout_ms(30_000)
+                .with_validate_only(false)
+                .encode(&mut buf, version)
+                .context("CreatePartitions")?;
         }
         60 => {
             DescribeClusterRequest::default()

@@ -741,6 +741,68 @@ pub fn validate_delete_topics_shape(
     Ok(())
 }
 
+/// Mirrors the field order `CreatePartitionsRequest::decode` walks.
+///
+/// Each topic's `assignments` array is nullable (a client that names no replicas sends null),
+/// and each assignment's `broker_ids` array is not.
+///
+/// # Errors
+///
+/// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
+/// in the frame, or the body is truncated or malformed in a way that cannot be walked.
+pub fn validate_create_partitions_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
+    let flexible = version >= 2;
+
+    let topics_count = if flexible {
+        c.compact_array_count()?
+    } else {
+        c.legacy_array_count()?
+    };
+    for _ in 0..topics_count {
+        if flexible {
+            c.compact_string(false)?;
+        } else {
+            c.legacy_string(false)?;
+        }
+        let _count = c.read_i32()?;
+
+        let assignments_count = if flexible {
+            c.compact_array_count_nullable()?
+        } else {
+            c.legacy_array_count_nullable()?
+        };
+        for _ in 0..assignments_count {
+            let broker_ids_count = if flexible {
+                c.compact_array_count()?
+            } else {
+                c.legacy_array_count()?
+            };
+            for _ in 0..broker_ids_count {
+                let _broker_id = c.read_i32()?;
+            }
+            if flexible {
+                c.tagged_fields()?;
+            }
+        }
+
+        if flexible {
+            c.tagged_fields()?;
+        }
+    }
+
+    let _timeout_ms = c.read_i32()?;
+    let _validate_only = c.read_bool()?;
+    if flexible {
+        c.tagged_fields()?;
+    }
+    Ok(())
+}
+
 /// Mirrors the field order `MetadataRequest::decode` walks.
 ///
 /// # Errors
@@ -1741,6 +1803,86 @@ mod tests {
             0x03, 0xE8, // first name's declared length: 1000, no bytes follow
         ]);
         assert!(validate_delete_topics_shape(1, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Same POC class as `delete_topics_v5_huge_topic_names_count_rejected`, against
+    /// `validate_create_partitions_shape`'s own `topics` compact array count.
+    #[test]
+    fn create_partitions_v3_huge_topics_count_rejected() {
+        let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+        assert!(validate_create_partitions_shape(3, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The nested `broker_ids` count: one topic with one assignment whose replica list claims
+    /// more entries than the frame holds.
+    #[test]
+    fn create_partitions_v3_huge_broker_ids_count_rejected() {
+        let body = Bytes::from_static(&[
+            0x02, // topics: one entry
+            0x07, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x02, // count
+            0x02, // assignments: one entry
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // u32::MAX broker ids
+        ]);
+        assert!(validate_create_partitions_shape(3, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Legacy shape: a declared topic-name length with nothing behind it, the `legacy_string`
+    /// branch below v2.
+    #[test]
+    fn create_partitions_v0_truncated_legacy_topic_name_rejected() {
+        let body = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // topics: legacy array count = 1
+            0x03, 0xE8, // first name's declared length: 1000, no bytes follow
+        ]);
+        assert!(validate_create_partitions_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// The shape every client sends for `NewPartitions.increaseTo(n)`: one topic, a null
+    /// assignments array, at both wire encodings.
+    #[test]
+    fn create_partitions_well_formed_requests_accepted() {
+        let flexible = Bytes::from_static(&[
+            0x02, // topics: one entry
+            0x07, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x03, // count
+            0x00, // assignments: null
+            0x00, // topic tagged fields
+            0x00, 0x00, 0x13, 0x88, // timeout_ms
+            0x00, // validate_only
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_create_partitions_shape(3, &flexible, TEST_MAX_FRAME_SIZE).is_ok());
+
+        let legacy = Bytes::from_static(&[
+            0x00, 0x00, 0x00, 0x01, // topics: one entry
+            0x00, 0x06, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x03, // count
+            0xFF, 0xFF, 0xFF, 0xFF, // assignments: null
+            0x00, 0x00, 0x13, 0x88, // timeout_ms
+            0x00, // validate_only
+        ]);
+        assert!(validate_create_partitions_shape(0, &legacy, TEST_MAX_FRAME_SIZE).is_ok());
+    }
+
+    /// A present assignment list, so the nested `broker_ids` walk and its tagged fields are
+    /// consumed at the right offsets and the trailer still lines up.
+    #[test]
+    fn create_partitions_v3_with_an_assignment_accepted() {
+        let body = Bytes::from_static(&[
+            0x02, // topics: one entry
+            0x07, b'o', b'r', b'd', b'e', b'r', b's', // name
+            0x00, 0x00, 0x00, 0x02, // count
+            0x02, // assignments: one entry
+            0x02, // broker_ids: one entry
+            0x00, 0x00, 0x00, 0x01, // broker id 1
+            0x00, // assignment tagged fields
+            0x00, // topic tagged fields
+            0x00, 0x00, 0x13, 0x88, // timeout_ms
+            0x01, // validate_only
+            0x00, // request tagged fields
+        ]);
+        assert!(validate_create_partitions_shape(3, &body, TEST_MAX_FRAME_SIZE).is_ok());
     }
 
     /// Reviewed POC (C2): 1 topic x 65,535 partitions was within the *old* 65,536 cumulative

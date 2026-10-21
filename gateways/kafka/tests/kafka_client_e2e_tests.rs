@@ -1213,6 +1213,70 @@ async fn given_kafka_topics_sh_when_creating_then_deleting_a_topic_should_round_
     );
 }
 
+/// `kafka-topics.sh --alter --partitions N` grows a topic through
+/// the bridge and `--describe` (Metadata) reports the new count, while a smaller count fails
+/// with `INVALID_PARTITIONS` and leaves the count alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn given_kafka_topics_sh_when_altering_the_partition_count_should_grow_the_topic_through_the_bridge()
+ {
+    const NEW_TOPIC: &str = "kafka-topics-grow";
+    let Some((_server, gateway)) = bridged_stack().await else {
+        return;
+    };
+
+    let created = kafka_topics(
+        gateway,
+        &[
+            "--create",
+            "--topic",
+            NEW_TOPIC,
+            "--partitions",
+            "1",
+            "--replication-factor",
+            "1",
+        ],
+    )
+    .expect_ran("kafka-topics.sh --create");
+    assert!(
+        created.contains(&format!("Created topic {NEW_TOPIC}")),
+        "kafka-topics.sh must report the topic created, got: {created}"
+    );
+
+    let altered = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "3"],
+    )
+    .expect_ran("kafka-topics.sh --alter --partitions 3");
+    assert!(
+        !altered.to_lowercase().contains("error"),
+        "kafka-topics.sh --alter must succeed, got: {altered}"
+    );
+
+    let described = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the grow");
+    assert!(
+        described.contains("PartitionCount: 3"),
+        "Metadata must report the grown count, got: {described}"
+    );
+
+    let shrunk = kafka_topics(
+        gateway,
+        &["--alter", "--topic", NEW_TOPIC, "--partitions", "2"],
+    )
+    .text();
+    assert!(
+        shrunk.contains("InvalidPartitionsException"),
+        "a smaller count must fail with INVALID_PARTITIONS, got: {shrunk}"
+    );
+
+    let described_after = kafka_topics(gateway, &["--describe", "--topic", NEW_TOPIC])
+        .expect_ran("kafka-topics.sh --describe after the refused shrink");
+    assert!(
+        described_after.contains("PartitionCount: 3"),
+        "a refused shrink must leave the count alone, got: {described_after}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn given_records_produced_by_kcat_when_kcat_consumes_should_read_them_back_in_order() {
     let Some((_server, gateway)) = bridged_stack().await else {

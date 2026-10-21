@@ -2,12 +2,13 @@
 
 ## Issue #3421 — in scope (this iteration)
 
-A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs use Iggy.
+A TCP listener on the Kafka wire port. It decodes requests, validates scoped API keys, versions and wire formats, and answers them. With a bridge, Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs use Iggy.
 
 **Stub semantics (important):** without a bridge, every API answers with a stub. Produce discards
 the payload and answers with retriable `NOT_LEADER_OR_FOLLOWER` (6). Fetch and ListOffsets answer 6
-too. CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs answer `NOT_CONTROLLER` (41), so
-clients do not believe a topic was created, deleted, or that configs were read or changed.
+too. CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs answer
+`NOT_CONTROLLER` (41), so clients do not believe a topic was created, deleted or grown, or that
+configs were read or changed.
 OffsetCommit and OffsetFetch answer retriable `COORDINATOR_LOAD_IN_PROGRESS`
 (14). Do not read `ec=0` from a stub as durable storage. Produce is the one API that stores records
 once you configure a bridge ([#3535](https://github.com/apache/iggy/issues/3535)).
@@ -56,6 +57,7 @@ it knows the server supports flexible encoding.
 | 2 | ListOffsets | 1 | 7 | 1, 2, 3, 4, 5, 6, 7 | With a bridge: LATEST, EARLIEST, a timestamp and, from v7, `MAX_TIMESTAMP` (see `BRIDGE_MAPPING.md`). Without one: stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default at every version |
 | 20 | DeleteTopics | 1 | 5 | 1, 2, 3, 4, 5 | With a bridge: deletes the Iggy topic, never the backing stream (see `BRIDGE_MAPPING.md`). Without one: stub returns `NOT_CONTROLLER` (41). v6 (topic-id-based) not advertised - this bridge has no topic-id concept |
+| 37 | CreatePartitions | 0 | 3 | 0, 1, 2, 3 | With a bridge: adds partitions to the Iggy topic through `create_partitions`; a count at or below the current one answers `INVALID_PARTITIONS` (37). Without one: stub returns `NOT_CONTROLLER` (41). Flexible encoding at v2+ |
 | 8 | OffsetCommit | 2 | 9 | 2 … 9 | With a bridge: stores each offset as an Iggy external group offset, and a negative offset deletes it ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md)). Without one: `COORDINATOR_LOAD_IN_PROGRESS` (14). Flexible encoding at v8+ |
 | 9 | OffsetFetch | 1 | 9 | 1 … 9 | With a bridge: reads each offset, -1 when none is stored, and a null topic list reads every topic that holds the group. Without one: 14. Flexible encoding at v6+ |
 | 10 | FindCoordinator | 0 | 4 | 0, 1, 2, 3, 4 | Answers "this gateway" for group keys; `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) for the transaction key type, `INVALID_REQUEST` (42) for share; flexible encoding at v3+ |
@@ -99,6 +101,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 | 22 | InitProducerId | 0–5 | v2 |
 | 32 | DescribeConfigs | 1–4 | v4 |
 | 33 | AlterConfigs | 0–2 | v2 |
+| 37 | CreatePartitions | 0–3 | v2 |
 | 60 | DescribeCluster | 0–2 | v0 |
 
 ### Cluster id
@@ -151,7 +154,7 @@ All API keys not listed above close the connection (see Governance model above) 
 | 29 | DescribeAcls | Implemented on listeners that name a principal: the SASL ones, and `SSL` with client certificates; advertised only there ([`ACL_MAPPING.md`](ACL_MAPPING.md)) |
 | 36 | SaslAuthenticate | Implemented on `SASL_PLAINTEXT` and `SASL_SSL` listeners, advertised only there ([`AUTHENTICATION.md`](AUTHENTICATION.md)) |
 | 24, 25, 26, 28 | AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit | Transactions - not supported, see below |
-| 23, 27, 30, 31, 34, 35, 37+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, IncrementalAlterConfigs (44), etc. | Later issues |
+| 23, 27, 30, 31, 34, 35, 38+ | `OffsetForLeaderEpoch`, `WriteTxnMarkers`, `CreateAcls`/`DeleteAcls`, IncrementalAlterConfigs (44), etc. | Later issues |
 | 21 | DeleteRecords | Not advertised on purpose, see below |
 | 68 | ConsumerGroupHeartbeat | KIP-848 protocol, opt-in via `group.protocol=consumer`; the 4.0 default is still `classic` |
 
@@ -214,8 +217,8 @@ nor moved by retention. That is the same core change the ListOffsets `EARLIEST` 
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
 | **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
-| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 19 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs with a bridge |
-| **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, DescribeConfigs and AlterConfigs wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), DeleteTopics ([#3546](https://github.com/apache/iggy/issues/3546)), DescribeConfigs and AlterConfigs call it |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 20 keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses except InitProducerId and the consumer-group keys, and Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs with a bridge |
+| **3 — Iggy bridge** | Produce, Fetch, ListOffsets, Metadata, CreateTopics, DeleteTopics, CreatePartitions, DescribeConfigs and AlterConfigs wired | `bridge/` module (connection, topic mapping, provisioning, high watermark, `topic_target` + `send_records`, `probe` + `poll`). Produce ([#3535](https://github.com/apache/iggy/issues/3535)), Fetch ([#3536](https://github.com/apache/iggy/issues/3536)), ListOffsets ([#3537](https://github.com/apache/iggy/issues/3537)), Metadata ([#3534](https://github.com/apache/iggy/issues/3534)), CreateTopics ([#3538](https://github.com/apache/iggy/issues/3538)), DeleteTopics ([#3546](https://github.com/apache/iggy/issues/3546)), CreatePartitions ([#4520](https://github.com/apache/iggy/issues/4520)), DescribeConfigs and AlterConfigs call it |
 
 ---
 
@@ -316,6 +319,72 @@ below it are still open for the issues that build on top of it.
     called. With SASL off there is no principal to check, and the request is not gated here.
   - v6 (the `topics: Vec<DeleteTopicState>`, topic-id-based shape) is not advertised - this bridge
     has no concept of a Kafka topic id, only the Kafka-side name `TopicMapping` resolves.
+- [x] Real CreatePartitions ([#4520](https://github.com/apache/iggy/issues/4520)): with
+      `IGGY_KAFKA_BRIDGE_ENABLED=true`, grows the Iggy topic through
+      `IggyBridge::create_kafka_partitions`. `src/protocol/handlers/create_partitions.rs`,
+      `tests/create_partitions_real_bridge_tests.rs`. With the bridge off, the stub answers
+      `NOT_CONTROLLER` (41), matching CreateTopics' own stub convention. v0-v3, the whole range
+      Kafka serves.
+  - Grow only, as Kafka: a `count` at or below the current partition count answers
+    `INVALID_PARTITIONS` (37) with the `KRaft` controller's own text and changes nothing. Iggy appends the new
+    partitions after the current last index, so every existing Kafka partition index keeps
+    naming the same Iggy partition and no stored record moves.
+  - Iggy's `create_partitions` takes the number to add, with no expected current count, and the
+    Kafka request the number to reach, so each topic is read before it is written. On one
+    gateway, the read and the write run behind `GatewayState::partition_growth`, held by a task
+    that outlives a cancelled request, so two `CreatePartitions` that read the same count cannot
+    both add. `CreateTopics` and `DeleteTopics` take the same lock around their writes, so
+    nothing on this gateway deletes or recreates the topic in between.
+  - After the write the topic is read again. `NONE` only when it is the same Iggy topic (id and
+    creation time) at exactly the requested count. A topic deleted or recreated in between
+    answers `UNKNOWN_TOPIC_OR_PARTITION` (3), a count moved by someone else `INVALID_PARTITIONS`
+    (37).
+  - An Iggy reply of `RequestTooOld` means the SDK resent a write Iggy had already run and whose
+    reply aged out. The topic is read once more: the requested count answers `NONE`, an
+    unchanged one `REQUEST_TIMED_OUT` (7) with "timed out waiting for Iggy; no partitions were
+    added", anything else the same verdict as after any other write.
+  - Only refusals that prove nothing changed (a missing stream or topic, `Unauthorized`,
+    `TooManyPartitions`, `PartitionsLimitReached`, `PartitionResizeDisabled`,
+    `PartitionIdSpaceExhausted`, `TransientNotAccepted`, an invalid name or count) answer at
+    once. Every other write error (a bridge timeout, `TransientNotCommitted`, a dropped
+    connection, anything unexpected) has an unknown outcome and keeps the lock while the count
+    is re-read, until 20 s after the write started, so the next request sees it if it
+    committed. The client gets retriable `REQUEST_TIMED_OUT` (7) with "timed out waiting for
+    Iggy; the partitions may have been added". A write still uncommitted after that can commit
+    later, and a retry that read the old count adds again. A count that moved to anything else
+    also ends the wait, and this write may still land on top of it.
+  - The write never starts past the request's deadline, so the lock is held at most 50 s after
+    the request that took it arrived (30 s request ceiling plus 20 s). `CreateTopics`,
+    `DeleteTopics` and other `CreatePartitions` on this gateway wait behind it up to their own
+    deadline, then answer retriable `REQUEST_TIMED_OUT` (7). The Java admin client does not
+    retry that code per topic: the caller sees a `TimeoutException` and must retry.
+  - **Known limitation:** the lock is per gateway process. Several gateways in front of one Iggy
+    cluster, or Iggy clients calling `create_partitions` directly, can still both add to the
+    same count and overshoot it. The check after the write reports the mismatch, but the extra
+    partitions stay. The follow-up is a server-side expected count (grow to N) on Iggy's
+    `create_partitions`.
+  - `validate_only` runs every check, including the topic read and the fixed partition count
+    check, and skips only the write.
+  - A manual `assignments` list must hold one entry per new partition, each naming this
+    gateway's single broker (node id 1) once, else `INVALID_REPLICA_ASSIGNMENT` (39). Iggy
+    cannot take a placement, so a valid list changes nothing about the write, but a list this
+    gateway cannot honor is refused rather than answered `NONE`.
+  - More than 1000 partitions added to one topic in one request answers `INVALID_REQUEST` (42)
+    locally, the same code Iggy's own `TooManyPartitions` maps to, so `validate_only` sees it
+    too. A topic created with a fixed partition count (`PartitionResizeDisabled`), a node at
+    `metadata.partitions_max` (`PartitionsLimitReached`) and a topic with no partition ids left
+    (`PartitionIdSpaceExhausted`) all answer `POLICY_VIOLATION` (44).
+  - The 1000 cap is per topic, so one request can add up to 100 topics x 1000 partitions. Iggy's
+    `metadata.partitions_max` defaults to 0 (unlimited, `core/server/config.toml`). Set it
+    before exposing the gateway to clients you do not control.
+  - Same topic cap as CreateTopics: more than 100 distinct topics is `POLICY_VIOLATION` for
+    every entry. A repeated name is answered first, before authorization, as Kafka's
+    `ControllerApis` does: one `INVALID_REQUEST` result per repeated name with "Duplicate topic
+    name.", and nothing grown for it. The wire `timeout_ms` (clamped to `[1s, 30s]`) bounds each
+    topic's own bridge work with the deadline checked before each call starts.
+  - With SASL on, the authenticated principal must hold `manage_topics`, as for DeleteTopics
+    and AlterConfigs - without it every topic fails `TOPIC_AUTHORIZATION_FAILED` (29) and
+    nothing is written.
 - [x] Document partition mapping in [`BRIDGE_MAPPING.md`](BRIDGE_MAPPING.md):
   - Iggy partitions are **0-based** (same as Kafka) — direct `partition_id` mapping, no offset conversion
   - Kafka consumer groups do **not** map onto Iggy consumer groups. Assignment stays client-side, and Iggy's group registry is used as an offset key only ([`OFFSET_STORAGE.md`](OFFSET_STORAGE.md))
