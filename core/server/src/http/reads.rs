@@ -88,7 +88,7 @@ pub(in crate::http) fn authorize_read(
     Ok(())
 }
 
-/// A reply must still belong to the topic incarnation captured before its owner read.
+/// A reply must still belong to the partition incarnation captured before its owner read.
 pub(in crate::http) fn check_partition_incarnation(
     state: &HttpInner,
     namespace: IggyNamespace,
@@ -105,7 +105,7 @@ pub(in crate::http) fn check_partition_incarnation(
     {
         Ok(())
     } else {
-        Err(ReadError::Rejected(IggyError::TransientNotAccepted))
+        Err(ReadError::Rejected(IggyError::HistoryUnavailable))
     }
 }
 
@@ -575,6 +575,7 @@ pub(in crate::http) mod tests {
     use std::pin::pin;
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use axum::Json;
     use axum::body::Body;
@@ -583,6 +584,7 @@ pub(in crate::http) mod tests {
     use axum::response::IntoResponse;
     use configs::server::ServerConfig;
     use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
+    use futures::future::{Either, select};
     use futures::poll;
     use hyper::service::Service as _;
     use hyper_util::service::TowerToHyperService;
@@ -955,14 +957,108 @@ pub(in crate::http) mod tests {
     }
 
     #[compio::test]
-    async fn given_a_poll_waiting_on_its_owner_when_topic_recreated_should_refuse_not_accepted() {
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_partition_read_when_freshness_expires_before_retry_should_not_read_again() {
+        for uri in [
+            "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
+            "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
+        ] {
+            let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+            let frontier = Arc::new(
+                AppliedFrontier::default().with_partition_freshness(Instant::now(), Duration::ZERO),
+            );
+            let state = read_state_with_frontier(Some(sender), None, Arc::clone(&frontier));
+            let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
+            state
+                .shard
+                .shards_table()
+                .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+            commit_user_request(
+                &state,
+                READER_CREATED_AT,
+                Operation::CreateUser,
+                &create_reader_request().to_bytes(),
+            );
+            let token = state
+                .jwt
+                .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+                .unwrap();
+            let service = TowerToHyperService::new(router(
+                state.clone(),
+                state.forward.body_limit,
+                None,
+                None,
+                false,
+            ));
+            let request = Request::builder()
+                .uri(uri)
+                .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+                .body(Body::empty())
+                .unwrap();
+            frontier.credit_partition_freshness(Instant::now(), Duration::ZERO);
+            let mut response = pin!(service.call(request));
+            assert!(poll!(response.as_mut()).is_pending());
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. })) =
+                shard_inbox.try_recv()
+            else {
+                panic!("{uri} must start its first read while evidence is fresh");
+            };
+            reply
+                .try_send(PartitionReadReply::Rejected(IggyError::NotPrimary))
+                .unwrap();
+            assert!(poll!(response.as_mut()).is_pending());
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                read: PartitionRead::Primary,
+                reply,
+                ..
+            })) = shard_inbox.try_recv()
+            else {
+                panic!("{uri} must look up the primary after a refusal");
+            };
+            compio::time::sleep(AppliedFrontier::PARTITION_FRESHNESS_MARGIN).await;
+            assert!(!frontier.partition_requests_allowed(Instant::now()));
+            reply
+                .try_send(PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                })
+                .unwrap();
+            let receive = pin!(shard_inbox.recv());
+            let Either::Right((
+                Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { read, reply, .. })),
+                _,
+            )) = select(response.as_mut(), receive).await
+            else {
+                panic!("{uri} must resolve its freshness refusal against the primary");
+            };
+            assert!(
+                matches!(read, PartitionRead::Primary),
+                "{uri} retried its data read after freshness expired"
+            );
+            reply
+                .try_send(PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                })
+                .unwrap();
+            assert_eq!(
+                response.await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(shard_inbox.try_recv().is_err());
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_poll_waiting_on_its_owner_when_topic_recreated_should_refuse_changed_history()
+    {
         assert_read_refused_after_topic_recreation(
             "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
         ).await;
     }
 
     #[compio::test]
-    async fn given_an_offset_read_waiting_on_its_owner_when_topic_recreated_should_refuse_not_accepted()
+    async fn given_an_offset_read_waiting_on_its_owner_when_topic_recreated_should_refuse_changed_history()
      {
         assert_read_refused_after_topic_recreation(
             "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
@@ -1037,15 +1133,18 @@ pub(in crate::http) mod tests {
         drop(shard_inbox);
 
         let response = response.await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        let expected = ReadError::Rejected(IggyError::HistoryUnavailable).into_response();
+        assert_eq!(response.status(), expected.status(), "{uri}");
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let expected = ReadError::Rejected(IggyError::TransientNotAccepted).into_response();
         let expected = axum::body::to_bytes(expected.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(body, expected, "{uri} must report58 without the old data");
+        assert_eq!(
+            body, expected,
+            "{uri} must refuse the old data without retrying an admitted read"
+        );
     }
 
     /// The account of [`create_reader_request`], the first one after root.

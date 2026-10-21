@@ -1373,6 +1373,7 @@ pub(in crate::http) async fn poll_messages(
         PartitionEffect::Read
     };
     let serve_locally = async || {
+        check_partition_freshness(&state).map_err(ReadError::Rejected)?;
         authorize_read(&state, &identity, consistency, rule)?;
         let (metadata, local) = local_metadata()?;
         // `poll_wire_request` refused a group poll above, so this poll has no
@@ -1522,6 +1523,7 @@ pub(in crate::http) async fn get_consumer_offset(
             .context(state.shard.plane.metadata().applied_frontier().get()),
     };
     let serve_locally = async || {
+        check_partition_freshness(&state).map_err(ReadError::Rejected)?;
         authorize_read(&state, &identity, consistency, rule)?;
         let (namespace, partition_id, read) =
             resolve_primary_consumer_offset_request(&state.shard, &wire, context)
