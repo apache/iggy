@@ -3164,3 +3164,39 @@ TEST_F(E2E_Client, CreatePersonalAccessTokenWithoutPermissionsSucceeds) {
     ASSERT_NO_THROW(pat_client.Connect());
     ASSERT_NO_THROW({ EXPECT_EQ(pat_client.GetMe().UserId(), user_id); });
 }
+
+TEST_F(E2E_Client, CreatePersonalAccessTokenWithNeverExpireExpirySucceeds) {
+    RecordProperty("description", "Creates and authenticates with a token using NeverExpire expiry.");
+    auto root_client           = GetLoggedInHighLevelClient();
+    const std::string username = GetRandomName(30);
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", iggy::UserStatus::Active); });
+    auto client = GetLoggedInHighLevelClient(username, "secret123");
+
+    std::string token;
+    ASSERT_NO_THROW({ token = client.CreatePersonalAccessToken("never-expire-token", iggy::Expiry::NeverExpire()); });
+    EXPECT_FALSE(token.empty());
+
+    auto pat_client = iggy::IggyBlockingClient::Builder().WithPersonalAccessToken(token).Build();
+    ASSERT_NO_THROW(pat_client.Connect());
+    ASSERT_NO_THROW({ EXPECT_EQ(pat_client.GetMe().UserId(), client.GetMe().UserId()); });
+}
+
+TEST_F(E2E_Client, CreatePersonalAccessTokenWithBoundedDurationExpirySucceeds) {
+    RecordProperty("description", "Creates a token with bounded duration, authenticates, and waits for expiry.");
+    auto root_client           = GetLoggedInHighLevelClient();
+    const std::string username = GetRandomName(30);
+    ASSERT_NO_THROW({ CreateUser(root_client, username, "secret123", iggy::UserStatus::Active); });
+    auto client = GetLoggedInHighLevelClient(username, "secret123");
+
+    std::string token;
+    ASSERT_NO_THROW(
+        { token = client.CreatePersonalAccessToken("duration-token", iggy::Expiry::Duration(5ULL * 1000000ULL)); });
+    EXPECT_FALSE(token.empty());
+
+    auto pat_client = iggy::IggyBlockingClient::Builder().WithPersonalAccessToken(token).Build();
+    ASSERT_NO_THROW(pat_client.Connect());
+    ASSERT_NO_THROW({ EXPECT_EQ(pat_client.GetMe().UserId(), client.GetMe().UserId()); });
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    // TODO: get personal access token and check it has expired since GetPersonalAccessToken will be added later
+}
