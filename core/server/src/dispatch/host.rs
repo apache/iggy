@@ -153,8 +153,10 @@ where
     SB: SuperblockStore + 'static,
 {
     fn on_replica_message(&self, replica_id: u8, message: Message<GenericHeader>) {
-        if message.header().command == Command::PrimaryRebalance
-            && message.header().replica != replica_id
+        if matches!(
+            message.header().command,
+            Command::PrimaryRebalance | Command::SegmentDelete
+        ) && message.header().replica != replica_id
         {
             return;
         }
@@ -164,7 +166,10 @@ where
     }
 
     fn on_client_request(&self, client_id: u128, message: Message<GenericHeader>) {
-        if message.header().command == Command::PrimaryRebalance {
+        if matches!(
+            message.header().command,
+            Command::PrimaryRebalance | Command::SegmentDelete
+        ) {
             return;
         }
         enqueue_client_request(
@@ -225,6 +230,7 @@ mod tests {
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, test_shard};
     use iggy_binary_protocol::{
         CommitHeader, ConsensusHeader, HEADER_SIZE, PrimaryRebalanceHeader, PrimaryRebalanceKind,
+        SegmentDeleteHeader, SegmentDeleteKind,
     };
     use journal::prepare_journal::PrepareJournal;
     use metadata::impls::metadata::IggySnapshot;
@@ -315,6 +321,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn given_segment_resolution_ingress_when_received_should_require_the_authenticated_replica() {
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 3, FIRST_BOOT);
+        let (sender, inbox, _reply_inbox) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let host = ServerHost::new(&bus, &handle, Arc::new(ServerConfig::default()));
+        for kind in [
+            SegmentDeleteKind::Query,
+            SegmentDeleteKind::Resolved,
+            SegmentDeleteKind::Retry,
+        ] {
+            let frame = Message::<SegmentDeleteHeader>::new(HEADER_SIZE).transmute_header(
+                |_, header: &mut SegmentDeleteHeader| {
+                    header.command = Command::SegmentDelete;
+                    header.size = u32::try_from(HEADER_SIZE).unwrap();
+                    header.cluster = 1;
+                    header.replica = 2;
+                    header.nonce = 1;
+                    header.created_revision = 1;
+                    header.kind = kind;
+                    header.seal();
+                },
+            );
+            host.on_replica_message(1, frame.clone().into_generic());
+            assert!(inbox.try_recv().is_err());
+            host.on_client_request(7, frame.clone().into_generic());
+            assert!(host.queues.borrow().is_empty());
+            host.on_replica_message(2, frame.into_generic());
+            assert!(matches!(
+                inbox.try_recv(),
+                Ok(ShardFrame::Consensus {
+                    target_shard: 0,
+                    message: MessageBag::SegmentDelete(_),
+                })
+            ));
+        }
     }
 
     #[compio::test]

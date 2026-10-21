@@ -1421,8 +1421,8 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
 /// `request` number; `client_id` / `session` are the bound VSR identity the
 /// truncate commits under. A resolvable namespace with nothing sealed to delete
 /// still yields a `TruncatePartition(up_to_offset = 0)` so the metadata request
-/// sequence stays contiguous. Resolved no-ops retain their history guard; a
-/// missing owner reply or local partition yields a zero watermark without one.
+/// sequence stays contiguous. Both deletion and no-op resolution require a
+/// converged partition primary and retain their history guard.
 /// An UNRESOLVABLE namespace yields the truncate
 /// against the client's raw identifiers (the apply rejects it as a committed
 /// result). `Err` is only `InvalidCommand` for a malformed body and
@@ -1484,58 +1484,16 @@ where
         .streams()
         .consumer_offset_metadata(namespace, None, client_id)
         .ok_or(IggyError::TransientNotAccepted)?;
-    let (up_to_offset, expected_history) = match shard
-        .partition_read(
-            namespace,
-            PartitionRead::ResolveSegmentDeleteOffset {
-                count: parsed.segments_count,
-            },
-        )
-        .await
-    {
-        Some(PartitionReadReply::SegmentDeleteOffset {
-            created_revision, ..
-        }) if !committed_history.matches_partition(Some(created_revision)) => {
-            return Err(IggyError::TransientNotAccepted);
-        }
-        Some(PartitionReadReply::SegmentDeleteOffset {
-            up_to_offset: Some(offset),
-            created_revision,
-            ..
-        }) => (offset, Some(created_revision)),
-        // Nothing sealed to delete on a replica that has not converged on the
-        // replicated log (a backup behind the commit frontier may be missing
-        // whole sealed segments). Answering now would commit a no-op truncate
-        // and silently drop the delete, so surface a transient and let the
-        // client replay once the partition catches up. A converged primary
-        // whose resident tail is merely unflushed settles as a no-op below.
-        Some(PartitionReadReply::SegmentDeleteOffset {
-            up_to_offset: None,
-            lagging: true,
-            ..
-        }) => {
-            debug!(
-                client_id,
-                namespace_raw, "delete_segments: partition not converged; transient"
-            );
-            return Err(IggyError::TransientNotAccepted);
-        }
-        Some(PartitionReadReply::Rejected(error)) => return Err(error),
-        Some(PartitionReadReply::SegmentDeleteOffset {
-            up_to_offset: None,
-            created_revision,
-            ..
-        }) => (0, Some(created_revision)),
-        other => {
-            debug!(
-                client_id,
-                namespace_raw,
-                reply = ?other,
-                "delete_segments: nothing to delete; committing no-op truncate"
-            );
-            (0, None)
-        }
-    };
+    let context = committed_history.context(current_metadata_commit(shard));
+    let up_to_offset = super::segment_delete::resolve(
+        shard,
+        namespace,
+        parsed.segments_count,
+        context.incarnation,
+        context.metadata_op,
+    )
+    .await?;
+    let expected_history = Some(context.incarnation);
     Ok(build_truncate_partition_client_message(
         template,
         client_id,
@@ -1582,8 +1540,8 @@ mod tests {
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command, GenericHeader, PrepareOkHeader, ReplyHeader, WireEncode, WireIdentifier, WireName,
-        WireOptions, WirePartitioning,
+        Command, ConsensusHeader, GenericHeader, PrepareOkHeader, ReplyHeader, SegmentDeleteHeader,
+        SegmentDeleteKind, WireEncode, WireIdentifier, WireName, WireOptions, WirePartitioning,
     };
     use iggy_common::Identifier;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
@@ -1627,8 +1585,14 @@ mod tests {
         .to_bytes();
         let request = request_message(Operation::DeleteSegments, CLIENT, 1, 1, &body);
         let stale_revision = created_revision.wrapping_sub(1);
-        for up_to_offset in [Some(7), None] {
+        for (up_to_offset, revision, lagging) in [
+            (Some(7), stale_revision, false),
+            (None, stale_revision, false),
+            (Some(7), created_revision, true),
+            (None, created_revision, true),
+        ] {
             let owner = async {
+                answer_segment_delete_primary(&owner_inbox, 0).await;
                 let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
                     namespace: resolved,
                     read: PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
@@ -1641,8 +1605,8 @@ mod tests {
                 reply
                     .try_send(PartitionReadReply::SegmentDeleteOffset {
                         up_to_offset,
-                        lagging: false,
-                        created_revision: stale_revision,
+                        lagging,
+                        created_revision: revision,
                     })
                     .unwrap();
             };
@@ -1655,6 +1619,61 @@ mod tests {
                 "offset {up_to_offset:?} from revision {stale_revision} must retry before submission"
             );
         }
+    }
+
+    #[compio::test]
+    async fn given_split_primaries_when_deleting_segments_should_resolve_on_partition_primary() {
+        let bus = SpyBus::default();
+        let mut shard = test_shard(&bus, 0, 3, 1);
+        let (namespace, created_revision) = create_segment_delete_topic(&shard);
+        let (sender, inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let body = DeleteSegmentsRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: 0,
+            segments_count: 2,
+        }
+        .to_bytes();
+        let request = request_message(Operation::DeleteSegments, 1, 1, 1, &body);
+        let peer = async {
+            answer_segment_delete_primary(&inbox, 1).await;
+            while bus.replica_sends.borrow().is_empty() {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let (target, query) = bus.sole_replica_send::<SegmentDeleteHeader>();
+            assert_eq!(target, 1);
+            assert_eq!(query.namespace, namespace.inner());
+            assert_eq!(query.created_revision, created_revision);
+            assert_eq!(query.segments_count, 2);
+            query.validate().unwrap();
+            query.verify_frame().unwrap();
+            for revision in [created_revision + 1, created_revision] {
+                let reply = Message::<SegmentDeleteHeader>::new(size_of::<SegmentDeleteHeader>())
+                    .transmute_header(|_, header| {
+                        *header = SegmentDeleteHeader {
+                            replica: 1,
+                            kind: SegmentDeleteKind::Resolved,
+                            created_revision: revision,
+                            up_to_offset: 17,
+                            ..query
+                        };
+                        header.seal();
+                    });
+                let reply = MessageBag::try_from(reply.into_generic()).unwrap();
+                assert_eq!(reply.routing().1, server_common::sharding::METADATA_GROUP);
+                shard.on_message(reply).await;
+            }
+        };
+        let (resolved, ()) = futures::join!(
+            resolve_delete_segments_truncate(&shard, request.header(), 1, 1, &body),
+            peer,
+        );
+        let resolved = resolved.unwrap();
+        let truncate = TruncatePartitionRequest::decode_from(request_body(&resolved)).unwrap();
+        assert_eq!(truncate.up_to_offset, 17);
+        assert_eq!(truncate.expected_history, Some(created_revision));
     }
 
     /// A segment delete resolves its offset on the owning shard before it
@@ -1688,6 +1707,7 @@ mod tests {
             .created_revision_for_namespace(namespace)
             .unwrap();
         let owner = async {
+            answer_segment_delete_primary(&owner_inbox, 0).await;
             let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
                 owner_inbox.recv().await.unwrap()
             else {
@@ -1754,6 +1774,7 @@ mod tests {
                 .created_revision_for_namespace(namespace)
                 .unwrap();
             let owner = async {
+                answer_segment_delete_primary(&owner_inbox, 0).await;
                 let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. }) =
                     owner_inbox.recv().await.unwrap()
                 else {
@@ -4110,6 +4131,20 @@ mod tests {
             "a discarded parked send must surface the retriable transient \
              status so the SDK replays it instead of timing out"
         );
+    }
+
+    async fn answer_segment_delete_primary(inbox: &Receiver<ShardFrame>, primary: u8) {
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            read: PartitionRead::Primary,
+            reply,
+            ..
+        }) = inbox.recv().await.unwrap()
+        else {
+            panic!("segment resolution must locate the partition primary");
+        };
+        reply
+            .try_send(PartitionReadReply::Primary { view: 0, primary })
+            .unwrap();
     }
 
     fn complete_segment_delete_lifecycle(shard: &TestShard) {

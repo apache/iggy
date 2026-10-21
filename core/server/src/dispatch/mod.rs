@@ -38,6 +38,7 @@ pub mod host;
 pub mod login_error;
 pub mod partition;
 pub mod reads;
+mod segment_delete;
 pub mod session_ops;
 pub mod submit;
 #[cfg(test)]

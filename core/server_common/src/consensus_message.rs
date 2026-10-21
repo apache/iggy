@@ -24,7 +24,7 @@ use iggy_binary_protocol::{
     ForwardRegisterHeader, ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation,
     PrepareHeader, PrepareOkHeader, PrimaryRebalanceHeader, RepairPrepareHeader,
     RepairRangeReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SegmentDeleteHeader,
     StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
     frame_checksum_bytes, prepare_identity_checksum_bytes,
 };
@@ -649,6 +649,7 @@ pub enum MessageBag {
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     /// Readiness exchanges pass through shard 0 before reaching a partition owner.
     PrimaryRebalance(Message<PrimaryRebalanceHeader>),
+    SegmentDelete(Message<SegmentDeleteHeader>),
     /// A backup relays a partition completion to the metadata primary without a reply.
     ForwardCompletion(Message<ForwardCompletionHeader>),
 }
@@ -738,6 +739,7 @@ impl MessageBag {
             Self::ForwardLogoutResult(message) => (message.header().operation(), METADATA_GROUP),
             Self::ForwardCompletion(message) => (message.header().operation(), METADATA_GROUP),
             Self::PrimaryRebalance(message) => (message.header().operation(), METADATA_GROUP),
+            Self::SegmentDelete(message) => (message.header().operation(), METADATA_GROUP),
         }
     }
 
@@ -772,6 +774,7 @@ impl MessageBag {
             Self::ForwardLogoutResult(message) => message.into_generic(),
             Self::ForwardCompletion(message) => message.into_generic(),
             Self::PrimaryRebalance(message) => message.into_generic(),
+            Self::SegmentDelete(message) => message.into_generic(),
         }
     }
 
@@ -800,6 +803,7 @@ impl MessageBag {
             Self::ForwardLogoutResult(message) => message.header().command,
             Self::ForwardCompletion(message) => message.header().command,
             Self::PrimaryRebalance(message) => message.header().command,
+            Self::SegmentDelete(message) => message.header().command,
         }
     }
 
@@ -828,6 +832,7 @@ impl MessageBag {
             Self::ForwardLogoutResult(message) => message.header().size(),
             Self::ForwardCompletion(message) => message.header().size(),
             Self::PrimaryRebalance(message) => message.header().size(),
+            Self::SegmentDelete(message) => message.header().size(),
         }
     }
 
@@ -856,6 +861,7 @@ impl MessageBag {
             Self::ForwardLogoutResult(message) => message.header().operation(),
             Self::ForwardCompletion(message) => message.header().operation(),
             Self::PrimaryRebalance(message) => message.header().operation(),
+            Self::SegmentDelete(message) => message.header().operation(),
         }
     }
 }
@@ -996,6 +1002,9 @@ where
             }
             Command::ForwardCompletion => Ok(Self::ForwardCompletion(
                 value.try_into_typed::<ForwardCompletionHeader>()?,
+            )),
+            Command::SegmentDelete => Ok(Self::SegmentDelete(
+                value.try_into_typed::<SegmentDeleteHeader>()?,
             )),
             Command::PrimaryRebalance => Ok(Self::PrimaryRebalance(
                 value.try_into_typed::<PrimaryRebalanceHeader>()?,

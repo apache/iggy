@@ -51,9 +51,9 @@ use iggy_binary_protocol::{
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
     ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
     RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
-    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
-    WireDecode,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SegmentDeleteHeader,
+    SegmentDeleteKind, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+    StateTransferTargetHeader, WireDecode,
 };
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
@@ -211,6 +211,14 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     crossfire::mpsc::bounded_blocking_async(capacity)
 }
 
+struct PendingSegmentDelete {
+    query: SegmentDeleteHeader,
+    target: u8,
+    reply: Sender<SegmentDeleteHeader>,
+}
+
+const MAX_SEGMENT_DELETE_FORWARDS: usize = 128;
+
 /// Cross-shard metadata consensus submit.
 ///
 /// The metadata consensus group lives only on shard 0. When a client
@@ -224,6 +232,14 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 /// Logout preserves them so its caller can distinguish an unknown outcome
 /// from a request that never entered the primary pipeline.
 pub enum MetadataSubmit {
+    ResolveSegmentDelete {
+        namespace: IggyNamespace,
+        count: u32,
+        created_revision: u64,
+        minimum_metadata_op: u64,
+        reply: Sender<Result<u64, IggyError>>,
+    },
+    ForwardedSegmentDelete(Message<SegmentDeleteHeader>),
     /// Replica-link liveness report routed to shard 0; no proposal or reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     BindSession {
@@ -430,6 +446,7 @@ impl PartitionRead {
                 | Self::UnboundPollOnPrimary { .. }
                 | Self::ConsumerOffsetOnPrimary { .. }
                 | Self::ExternalGroupOffsetOnPrimary { .. }
+                | Self::ResolveSegmentDeleteOffset { .. }
         )
     }
 
@@ -1578,6 +1595,7 @@ where
 
     /// Logouts this node forwarded to the primary and is still waiting on.
     logout_forwards: RefCell<HashMap<(u128, u128), Sender<ForwardLogoutResultHeader>>>,
+    segment_delete_forwards: RefCell<HashMap<u128, PendingSegmentDelete>>,
 
     /// Monotonic source of forwarding nonces. Node-local: the
     /// nonce only has to distinguish this node's own in-flight forwards, across
@@ -1968,6 +1986,7 @@ where
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             register_forwards: RefCell::new(HashMap::new()),
             logout_forwards: RefCell::new(HashMap::new()),
+            segment_delete_forwards: RefCell::new(HashMap::new()),
             forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
@@ -2101,6 +2120,33 @@ where
     /// Drop a parked logout after timeout or a failed send.
     pub fn cancel_logout_forward(&self, nonce: u128, client: u128) {
         self.logout_forwards.borrow_mut().remove(&(nonce, client));
+    }
+
+    /// Bound outstanding resolution requests, reclaiming canceled receivers.
+    pub fn park_segment_delete_forward(
+        &self,
+        query: SegmentDeleteHeader,
+        target: u8,
+        reply: Sender<SegmentDeleteHeader>,
+    ) -> bool {
+        let mut pending = self.segment_delete_forwards.borrow_mut();
+        pending.retain(|_, entry| !entry.reply.is_disconnected());
+        if pending.len() >= MAX_SEGMENT_DELETE_FORWARDS {
+            return false;
+        }
+        pending.insert(
+            query.nonce,
+            PendingSegmentDelete {
+                query,
+                target,
+                reply,
+            },
+        );
+        true
+    }
+
+    pub fn cancel_segment_delete_forward(&self, nonce: u128) {
+        self.segment_delete_forwards.borrow_mut().remove(&nonce);
     }
 
     /// Hand a metadata consensus submit (login/logout) to shard 0.
@@ -2548,6 +2594,7 @@ where
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             register_forwards: RefCell::new(HashMap::new()),
             logout_forwards: RefCell::new(HashMap::new()),
+            segment_delete_forwards: RefCell::new(HashMap::new()),
             forward_nonce: Cell::new(nonce_seed),
             served_segment_cache_bytes_max: Cell::new(SERVED_SEGMENT_CACHE_BYTES_DEFAULT),
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
@@ -3530,6 +3577,7 @@ where
                         .on_metadata_submit(MetadataSubmit::ConsumerSessionHeartbeat(msg));
                 }
             }
+            MessageBag::SegmentDelete(message) => self.on_segment_delete(message),
             MessageBag::ForwardLogout(ref msg) => self.on_forward_logout(*msg.header()),
             MessageBag::ForwardLogoutResult(ref msg) => {
                 self.on_forward_logout_result(*msg.header());
@@ -3589,6 +3637,38 @@ where
                 "dropping forward-register result with no parked login"
             );
         }
+    }
+
+    fn on_segment_delete(&self, message: Message<SegmentDeleteHeader>) {
+        let header = *message.header();
+        let Some(consensus) = self.plane.metadata().consensus.as_ref() else {
+            return;
+        };
+        if header.cluster != consensus.cluster()
+            || !self.peer_is_known(header.replica, "SegmentDelete")
+        {
+            return;
+        }
+        if header.kind == SegmentDeleteKind::Query {
+            self.host
+                .on_metadata_submit(MetadataSubmit::ForwardedSegmentDelete(message));
+            return;
+        }
+        let mut pending = self.segment_delete_forwards.borrow_mut();
+        let Some(entry) = pending.get(&header.nonce) else {
+            return;
+        };
+        if header.replica != entry.target
+            || header.namespace != entry.query.namespace
+            || header.created_revision != entry.query.created_revision
+            || header.minimum_metadata_op != entry.query.minimum_metadata_op
+            || header.segments_count != entry.query.segments_count
+            || header.view != entry.query.view
+        {
+            return;
+        }
+        let _ = entry.reply.try_send(header);
+        pending.remove(&header.nonce);
     }
 
     fn on_forward_logout(&self, header: ForwardLogoutHeader) {

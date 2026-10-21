@@ -749,7 +749,8 @@ where
     ) -> Option<(Option<u64>, bool, u64)> {
         self.with_partition(namespace, |partition| {
             let consensus = partition.consensus();
-            let lagging = consensus.is_follower()
+            let lagging = !consensus.applied_view_start()
+                || consensus.is_follower()
                 || !consensus.is_normal()
                 || consensus.is_transferring()
                 || consensus.commit_min() < consensus.commit_max();

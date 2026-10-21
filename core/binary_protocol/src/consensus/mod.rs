@@ -44,6 +44,7 @@ mod operation;
 mod primary_rebalance;
 mod reply_result;
 mod request;
+mod segment_delete;
 
 pub use command::Command;
 pub use consumer_session::{
@@ -69,3 +70,4 @@ pub use reply_result::{
     write_rejection_section,
 };
 pub use request::{NON_REPLICATED_CODE_RANGE, operation_for_code};
+pub use segment_delete::{SegmentDeleteHeader, SegmentDeleteKind};
