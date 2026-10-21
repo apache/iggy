@@ -33,12 +33,14 @@ use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
 
+mod cluster_id;
 mod fetch;
 mod group_offsets;
 mod offsets;
 mod produce;
 mod topics;
 
+pub use cluster_id::{CLUSTER_ID_TOPIC, ClusterIdCall, cluster_id_stream};
 use fetch::{FetchPool, LazyClient};
 pub(crate) use fetch::{FetchSlot, PartitionProbe, TopicProbe};
 use group_offsets::OffsetPool;
