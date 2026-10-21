@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict';
 import { once, type EventEmitter } from 'node:events';
-import { createServer, type AddressInfo, type Server, type Socket } from 'node:net';
+import { createServer, Socket, type AddressInfo, type Server } from 'node:net';
 import { setImmediate as nextTick } from 'node:timers/promises';
 import { describe, it } from 'node:test';
 import { Client, SimpleClient, SingleClient } from './client.js';
@@ -203,6 +203,21 @@ describe('Client lifecycle events', () => {
       await destroy();
       await server.close();
     }
+  });
+
+  it('accepts custom raw clients whose synchronous destroy returns a socket', async () => {
+    const socket = new Socket();
+    const client = new SimpleClient({
+      sendCommand: async () => { throw new Error('No command expected'); },
+      isAuthenticated: false,
+      authenticate: async () => false,
+      destroy: () => socket.destroy(),
+      on: () => undefined,
+      once: () => undefined,
+      getReadStream: () => socket
+    });
+    await client.destroy();
+    assert.ok(socket.destroyed);
   });
 
   it('exposes the socket closure promise from getRawClient', async () => {

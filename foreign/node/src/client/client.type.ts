@@ -115,7 +115,7 @@ export type RawClient = {
    */
   abandonOperation?: (operationId: bigint) => void,
   /** Destroys the connection; asynchronous clients resolve after socket closure. */
-  destroy: () => void | Promise<void>,
+  destroy: (() => void) | (() => Promise<void>),
   /** Tracks one facade operation across multiple command submissions. */
   hold?: () => () => void,
   /** Registers an event listener */
