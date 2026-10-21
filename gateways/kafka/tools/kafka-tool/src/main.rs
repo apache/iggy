@@ -573,6 +573,12 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
                 .encode(&mut buf, version)
                 .context("SaslAuthenticate")?;
         }
+        60 => {
+            DescribeClusterRequest::default()
+                .with_include_cluster_authorized_operations(false)
+                .encode(&mut buf, version)
+                .context("DescribeCluster")?;
+        }
         other => {
             warn!("api_key={other}: no explicit builder — empty payload (framing test)");
         }
