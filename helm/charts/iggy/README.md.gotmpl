@@ -91,6 +91,13 @@ helm install iggy ./helm/charts/iggy \
   --set server.persistence.size=50Gi
 ```
 
+With persistence on, the chart uses the `Recreate` strategy. A rolling update
+starts the replacement server while the outgoing one is still running on the
+same volume, which loses messages. Charts before 0.7.0 used a rolling update
+here, so an existing release moves from `RollingUpdate` to `Recreate` on its
+first upgrade. On Helm 4, run that one upgrade with
+`helm upgrade --server-side=false`, as described under [Upgrades](#upgrades).
+
 ### With Custom Values File
 
 ```bash
@@ -216,11 +223,11 @@ stored values.
   cluster: a node that authenticates cannot talk to one that does not.
 * **`server.encryption`** encrypts message payloads and state commands at rest
   with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
-  cannot read what its peers wrote. The chart selects the legacy configuration
-  for versioned images through `0.9.0-edge.7`, including its pinned image.
-  For newer builds with `[encryption]`, set `server.encryption.configVersion=flat`.
-  Custom tags require an explicit `flat` or `legacy` layout; `legacy` uses
-  `[system.encryption]`.
+  cannot read what its peers wrote. The chart selects the legacy
+  `[system.encryption]` configuration for versioned images through
+  `0.9.0-edge.7`, and the flat `[encryption]` configuration for later ones,
+  including its pinned image. Custom tags require an explicit `flat` or
+  `legacy` layout.
 * **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
   restart. With `cluster.auth` enabled the server already derives a cluster-wide
   key from the replica PSK, so setting the JWT secrets is an alternative to that
@@ -386,13 +393,10 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 
 A wildcard bind says which interfaces accept connections, not where clients
 reach the pod, so the server also needs the address to publish in cluster
-metadata. Server builds that carry the setting refuse to start without it.
-`{{ template "chart.appVersion" . }}`, the image this chart pins, predates it:
-that build logs `IGGY_NODE_ADVERTISED_ADDRESS` as an unknown variable and
-publishes the bind address, so the chart's default stays inert until the pinned
-image moves past it. Either way the chart sets `IGGY_NODE_ADVERTISED_ADDRESS` to
-the in-cluster Service DNS name; override it with `server.advertisedAddress`
-when clients arrive through a LoadBalancer or an Ingress.
+metadata, and refuses to start without it. The chart sets
+`IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name; override it
+with `server.advertisedAddress` when clients arrive through a LoadBalancer or an
+Ingress.
 
 In cluster mode the server ignores the variable altogether and publishes each
 node's roster `ip`, or its `advertisedAddress` when the entry carries one, so
