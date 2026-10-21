@@ -5572,6 +5572,7 @@ where
     #[must_use]
     pub fn read_history_is_changing(&self) -> bool {
         self.io_active.is_retiring()
+            || !self.deferred_views.is_empty()
             || matches!(
                 self.transition,
                 Some(

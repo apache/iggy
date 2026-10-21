@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake};
 
 use consensus::{
-    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle,
+    ClientTable, Consensus, LocalPipeline, MetadataHandle, PartitionsHandle,
     STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StateArtifact,
     StateTransferStage, VsrConsensus, artifact_kind, build_reply_message_with,
     encode_state_manifest,
@@ -35,7 +35,8 @@ use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
     AckLevel, ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, RoutedRequestHeader, StateTransferTargetHeader, WireConsumer,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader,
+    StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName,
@@ -69,6 +70,50 @@ use crate::{
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
+
+#[compio::test]
+async fn given_a_primary_with_a_deferred_view_change_when_reading_should_refuse_old_history() {
+    let (mut fixture, _) = BoundPoll::activated().await;
+    let partition = fixture.partition.as_mut().unwrap();
+    let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+        .transmute_header(|_, header: &mut StartViewChangeHeader| {
+            header.command = Command::StartViewChange;
+            header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+            header.view = 1;
+            header.replica = 1;
+        });
+    partition.defer_view_transition(server_common::MessageBag::StartViewChange(message));
+    assert!(partition.consensus().is_primary());
+    assert!(partition.consensus().is_normal());
+    assert!(matches!(
+        fixture.poll().await,
+        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+    ));
+    assert_eq!(fixture.group_offsets(), (None, None));
+    let (owner, ..) = fixture.served.as_ref().unwrap();
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(fixture.namespace, None, BOUND_CLIENT)
+        .unwrap();
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(
+            fixture.namespace,
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            reply,
+        )
+        .await;
+    assert!(matches!(
+        replies.try_recv().unwrap(),
+        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+    ));
+}
 
 #[compio::test]
 async fn given_deleted_history_when_retirement_read_names_old_incarnation_should_refuse_replacement()
