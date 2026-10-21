@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
@@ -46,17 +47,21 @@ import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import io.netty.util.concurrent.ScheduledFuture;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrHeaders;
+import org.apache.iggy.client.async.tcp.vsr.VsrOperation;
 import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrResponseHandler;
 import org.apache.iggy.exception.IggyClientException;
 import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyEmptyResponseException;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
+import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTimeoutException;
 import org.apache.iggy.exception.IggyTlsException;
@@ -76,11 +81,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
@@ -95,8 +102,7 @@ public class AsyncTcpConnection {
     // A not-committed outcome is unknown, so it replays for the whole budget.
     // A not-accepted deny was refused outright (typically a demoted primary),
     // so after a short same-node retry it is handed to the owning client for
-    // a leader recheck and safe replay; mirrors TRANSIENT_FAILOVER_CHECK_INTERVAL
-    // in core/sdk/src/tcp/tcp_client.rs.
+    // a leader recheck and safe replay.
     //
     // Package-private: the client classifies a failed sign-in by these codes,
     // and a transient one is not a rejected credential.
@@ -111,6 +117,8 @@ public class AsyncTcpConnection {
     private static final int UNAUTHENTICATED = 40;
     private static final int LIFECYCLE_BUSY = 88;
     private static final int REGISTER_RESPONSE_MIN_BYTES = 17;
+    // Flags the optional username of an UpdateUser body.
+    private static final int USERNAME_PRESENT = 1;
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
     private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
     // A missing reply must not hold the single VSR-pinned channel forever.
@@ -135,15 +143,17 @@ public class AsyncTcpConnection {
     private volatile boolean sharedSession;
     private final TransientFailoverHandler transientFailoverHandler;
     private final IntConsumer sessionResetListener;
-    private final Consumer<Throwable> connectionFailureListener;
+    private final BiConsumer<AsyncTcpConnection, Throwable> connectionFailureListener;
     private final long requestTimeoutNanos;
     private final long heartbeatIntervalNanos;
     private final Object heartbeatLock = new Object();
-    private ByteBuf loginPayload;
+    // Shared with the connections that bind this session, see bindSharedSession.
+    private volatile SessionLogin login = new SessionLogin();
     private ScheduledFuture<?> heartbeatTask;
     private boolean heartbeatRunning;
+    private volatile Runnable heartbeatListener = () -> {};
+    private volatile CredentialsListener credentialsListener = (source, previousUsername, username, password) -> {};
 
-    private volatile int loginCommandCode;
     private volatile boolean authenticated = false;
     private volatile long authenticatedUserId;
 
@@ -168,7 +178,7 @@ public class AsyncTcpConnection {
                 VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
                 null,
                 errorCode -> {},
-                ignored -> {});
+                (source, cause) -> {});
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -186,7 +196,7 @@ public class AsyncTcpConnection {
             int maxVsrFrameSize,
             TransientFailoverHandler transientFailoverHandler,
             IntConsumer sessionResetListener,
-            Consumer<Throwable> connectionFailureListener) {
+            BiConsumer<AsyncTcpConnection, Throwable> connectionFailureListener) {
         this.transientFailoverHandler = transientFailoverHandler;
         this.sessionResetListener = sessionResetListener;
         this.connectionFailureListener = connectionFailureListener;
@@ -206,10 +216,7 @@ public class AsyncTcpConnection {
         this.consensusSession = new ConsensusSession();
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
         this.ownsEventLoopGroup = sharedEventLoopGroup.isEmpty();
-        this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> new MultiThreadIoEventLoopGroup(
-                ioThreads,
-                new DefaultThreadFactory(EVENT_LOOP_THREAD_PREFIX, false, Thread.MAX_PRIORITY),
-                NioIoHandler.newFactory()));
+        this.eventLoopGroup = sharedEventLoopGroup.orElseGet(() -> newEventLoopGroup(ioThreads));
         this.eventLoop = eventLoopGroup.next();
 
         long dialTimeoutMillis =
@@ -222,9 +229,8 @@ public class AsyncTcpConnection {
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .remoteAddress(host, port);
 
-        // The VSR session (client id, fence epoch, request counter) is bound
-        // to one transport connection server-side; sharing it across channels
-        // would interleave request ids, so the pool holds a single channel.
+        // A replica link owns one multiplexed channel; the logical session
+        // supplies request IDs across every replica link.
         this.channelPool = new FixedChannelPool(
                 bootstrap,
                 new PoolChannelHandler(
@@ -243,7 +249,7 @@ public class AsyncTcpConnection {
                 1,
                 poolConfig.getMaxPendingAcquires());
 
-        log.info("Connection pool initialized with a single VSR-pinned connection");
+        log.info("Connection pool initialized with one multiplexed replica channel");
     }
 
     /**
@@ -307,7 +313,9 @@ public class AsyncTcpConnection {
         }
         CompletableFuture<ByteBuf> heartbeat;
         try {
-            heartbeat = send(CommandCode.System.PING.getValue(), Unpooled.EMPTY_BUFFER);
+            TransientFailoverState state = new TransientFailoverState();
+            state.heartbeat = true;
+            heartbeat = send(CommandCode.System.PING.getValue(), Unpooled.EMPTY_BUFFER, 0, state);
         } catch (RuntimeException error) {
             log.warn("Failed to send heartbeat: {}", error.getMessage());
             scheduleNextHeartbeat();
@@ -321,7 +329,48 @@ public class AsyncTcpConnection {
                 log.warn("Heartbeat failed: {}", error.getMessage());
             }
             scheduleNextHeartbeat();
+            if (error == null) {
+                heartbeatListener.run();
+            }
         });
+    }
+
+    /** Runs after each heartbeat that the server answered. */
+    void onHeartbeat(Runnable listener) {
+        heartbeatListener = listener;
+    }
+
+    /**
+     * Ends {@code signIn} while it still runs. On the event loop of this connection its channel closes first, so a
+     * Register that waits for its reply frees the channel at once, and that late reply cannot answer the next
+     * Register, which has the same request id. Requests that the channel still carries fail as not connected, not
+     * as a lost link, so they start no redial.
+     */
+    void abortSignIn(CompletableFuture<?> signIn) {
+        try {
+            eventLoop.execute(() -> {
+                if (signIn.isDone()) {
+                    return;
+                }
+                IggyNotConnectedException replaced = new IggyNotConnectedException("A new sign-in replaced this one");
+                for (Channel channel : channels) {
+                    VsrResponseHandler handler = channel.pipeline().get(VsrResponseHandler.class);
+                    if (handler != null) {
+                        handler.closeChannel(channel, replaced);
+                    } else {
+                        channel.close();
+                    }
+                }
+                signIn.cancel(false);
+            });
+        } catch (RejectedExecutionException loopGone) {
+            signIn.cancel(false);
+        }
+    }
+
+    /** Runs after a committed password change or rename of the signed-in user replaced the login of this connection. */
+    void onCredentialsRefreshed(CredentialsListener listener) {
+        credentialsListener = listener;
     }
 
     private void stopHeartbeat() {
@@ -348,6 +397,21 @@ public class AsyncTcpConnection {
         return eventLoopGroup;
     }
 
+    static IoEventLoopGroup newEventLoopGroup(int ioThreads) {
+        return new MultiThreadIoEventLoopGroup(
+                ioThreads,
+                new DefaultThreadFactory(EVENT_LOOP_THREAD_PREFIX, false, Thread.MAX_PRIORITY),
+                NioIoHandler.newFactory());
+    }
+
+    void followSession(ConsensusSession owner) {
+        consensusSession.follow(owner);
+    }
+
+    ConsensusSession sessionOwner() {
+        return consensusSession.owner();
+    }
+
     long metadataWatermark() {
         return consensusSession.metadataWatermark();
     }
@@ -371,6 +435,12 @@ public class AsyncTcpConnection {
     void bindSharedSession(AsyncTcpConnection parent, long clientLow, long clientHigh, long epoch, byte[] secret) {
         consensusSession.bindShared(parent.consensusSession, clientLow, clientHigh, epoch, secret);
         sharedSession = true;
+        login = parent.login;
+        parent.authenticationSnapshot().ifPresent(authentication -> {
+            authentication.payload().release();
+            authenticated = true;
+            authenticatedUserId = parent.authenticatedUserId;
+        });
     }
 
     boolean isAuthenticated() {
@@ -379,7 +449,7 @@ public class AsyncTcpConnection {
 
     public <T> CompletableFuture<T> exchangeForEntity(
             CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
-        return send(commandCode, payload).thenApply(response -> {
+        return mapResponse(send(commandCode, payload), response -> {
             try {
                 if (!response.isReadable()) {
                     throw new IggyEmptyResponseException(commandCode.toString());
@@ -393,7 +463,7 @@ public class AsyncTcpConnection {
 
     public <T> CompletableFuture<List<T>> exchangeForList(
             CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
-        return send(commandCode, payload).thenApply(response -> {
+        return mapResponse(send(commandCode, payload), response -> {
             try {
                 var result = new ArrayList<T>();
                 while (response.isReadable()) {
@@ -408,7 +478,7 @@ public class AsyncTcpConnection {
 
     public <T> CompletableFuture<Optional<T>> exchangeForOptional(
             CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
-        return send(commandCode, payload).thenApply(response -> {
+        return mapResponse(send(commandCode, payload), response -> {
             try {
                 if (response.isReadable()) {
                     return Optional.of(func.apply(response));
@@ -421,7 +491,33 @@ public class AsyncTcpConnection {
     }
 
     public CompletableFuture<Void> sendAndRelease(CommandCode commandCode, ByteBuf payload) {
-        return send(commandCode, payload).thenAccept(ByteBuf::release);
+        return mapResponse(send(commandCode, payload), response -> {
+            response.release();
+            return null;
+        });
+    }
+
+    static <T> CompletableFuture<T> mapResponse(CompletableFuture<ByteBuf> input, Function<ByteBuf, T> decode) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        result.whenComplete((response, error) -> {
+            if (result.isCancelled()) {
+                input.cancel(false);
+            }
+        });
+        input.whenComplete((response, error) -> {
+            if (error != null) {
+                result.completeExceptionally(error);
+            } else if (result.isDone()) {
+                response.release();
+            } else {
+                try {
+                    result.complete(decode.apply(response));
+                } catch (RuntimeException decodeError) {
+                    result.completeExceptionally(decodeError);
+                }
+            }
+        });
+        return result;
     }
 
     public CompletableFuture<ByteBuf> send(CommandCode commandCode, ByteBuf payload) {
@@ -441,15 +537,18 @@ public class AsyncTcpConnection {
         return send(commandCode, payload, requestDeadlineNanos, failoverState, 0);
     }
 
-    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private CompletableFuture<ByteBuf> send(
             int commandCode,
             ByteBuf payload,
             long requestDeadlineNanos,
             TransientFailoverState failoverState,
             long requiredSessionGeneration) {
+        failoverState.linkFailed = false;
+        failoverState.detachedSession = false;
+        long deadline = requestDeadlineNanos == 0 ? System.nanoTime() + requestTimeoutNanos : requestDeadlineNanos;
         if (isLoginCode(commandCode) && authenticated) {
-            return logoutThenLogin(commandCode, payload);
+            return logoutThenLogin(commandCode, payload, deadline);
         }
         captureLoginPayloadIfNeeded(commandCode, payload);
         CompletableFuture<ByteBuf> responseFuture = new CompletableFuture<>();
@@ -461,7 +560,24 @@ public class AsyncTcpConnection {
                 ? payload.retainedDuplicate()
                 : null;
 
-        channelPool.acquire().addListener((FutureListener<Channel>) f -> {
+        var acquiring = channelPool.acquire();
+        var acquisitionTimeout = eventLoop.schedule(
+                () -> {
+                    Throwable failure = failoverState.ticket != null && failoverState.uncertain
+                            ? failoverState.retainTicket()
+                            : responseTimeout(commandCode);
+                    callerFuture.completeExceptionally(failure);
+                    acquiring.cancel(false);
+                },
+                Math.max(0, deadline - System.nanoTime()),
+                TimeUnit.NANOSECONDS);
+        callerFuture.whenComplete((response, error) -> {
+            if (callerFuture.isCancelled()) {
+                acquiring.cancel(false);
+            }
+        });
+        acquiring.addListener((FutureListener<Channel>) f -> {
+            acquisitionTimeout.cancel(false);
             if (!f.isSuccess()) {
                 payload.release();
                 releaseIfPresent(failoverPayload);
@@ -469,18 +585,11 @@ public class AsyncTcpConnection {
                 callerFuture.completeExceptionally(mapAcquireException(f.cause()));
                 return;
             }
-            if (callerFuture.isCancelled()) {
+            if (callerFuture.isDone()) {
                 payload.release();
                 releaseIfPresent(failoverPayload);
                 releaseChannel(f.getNow());
                 return;
-            }
-            if (isPollRoutingCode(commandCode)) {
-                callerFuture.whenComplete((response, error) -> {
-                    if (callerFuture.isCancelled()) {
-                        f.getNow().close();
-                    }
-                });
             }
             dispatchAcquiredChannel(
                     f.getNow(),
@@ -489,7 +598,7 @@ public class AsyncTcpConnection {
                     failoverPayload,
                     responseFuture,
                     callerFuture,
-                    requestDeadlineNanos,
+                    deadline,
                     failoverState,
                     requiredSessionGeneration);
         });
@@ -584,19 +693,16 @@ public class AsyncTcpConnection {
         if (isLoginCode(commandCode) || !requiresAuthentication(commandCode)) {
             return CompletableFuture.completedFuture(null);
         }
-        if (!authenticated) {
+        Optional<AuthenticationSnapshot> authentication = authenticationSnapshot();
+        if (authentication.isEmpty()) {
             return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
         }
-        ByteBuf loginPayloadCopy = getLoginPayloadCopy();
-        if (loginPayloadCopy == null) {
-            return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
-        }
+        int loginCode = authentication.get().commandCode();
         return IggyAuthenticator.ensureAuthenticated(
                 channel,
-                loginPayloadCopy,
+                authentication.get().payload(),
                 authGeneration,
-                payloadToLogin ->
-                        sendAuthenticationFrame(channel, payloadToLogin, loginCommandCode, requestDeadlineNanos));
+                payloadToLogin -> sendAuthenticationFrame(channel, payloadToLogin, loginCode, requestDeadlineNanos));
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -612,9 +718,9 @@ public class AsyncTcpConnection {
             TransientFailoverState failoverState,
             Throwable authError) {
         try {
-            if (authError != null) {
+            if (authError != null || callerFuture.isDone()) {
                 payload.release();
-                responseFuture.completeExceptionally(authError);
+                responseFuture.completeExceptionally(authError == null ? responseTimeout(commandCode) : authError);
                 return;
             }
             if (requiredSessionGeneration != 0 && requiredSessionGeneration != sessionGeneration()) {
@@ -676,16 +782,25 @@ public class AsyncTcpConnection {
         try {
             handlePostResponse(channel, commandCode, isLoginCommand, response, error);
         } catch (RuntimeException bookkeepingError) {
-            log.error("Post-response bookkeeping failed: {}", bookkeepingError.getMessage());
+            releaseIfPresent(response);
+            releaseIfPresent(failoverPayload);
+            callerFuture.completeExceptionally(bookkeepingError);
+            return;
         }
         if (error == null) {
             releaseIfPresent(failoverPayload);
             completeWithResponse(callerFuture, response);
             return;
         }
+        Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+        if (failoverState.heartbeat && cause instanceof IggyTimeoutException) {
+            channel.close();
+            notifyConnectionFailure(new IggyConnectionException("The heartbeat reply timed out", cause));
+        }
         completeFailedRequest(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, failoverState, error);
     }
 
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void completeFailedRequest(
             int commandCode,
             ByteBuf failoverPayload,
@@ -693,18 +808,49 @@ public class AsyncTcpConnection {
             CompletableFuture<ByteBuf> callerFuture,
             TransientFailoverState failoverState,
             Throwable error) {
-        IggyTimeoutException timeout = findResponseTimeout(error);
-        if (timeout != null) {
-            notifyConnectionFailure(timeout);
+        Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+        if (cause instanceof IggyConnectionException || cause instanceof java.io.IOException) {
+            notifyConnectionFailure(cause);
+        }
+        if (failoverState.routed) {
+            releaseIfPresent(failoverPayload);
+            callerFuture.completeExceptionally(failoverState.linkFailed ? new LinkFailure(error) : error);
+            return;
         }
         IggyServerException serverError = findServerError(error);
-        if (shouldRecheckLeader(serverError, failoverPayload, requestDeadlineNanos)) {
+        if (canReplayLostLink(failoverState, cause, failoverPayload, requestDeadlineNanos)
+                || shouldRecheckLeader(serverError, failoverPayload, requestDeadlineNanos)) {
             retryAfterLeaderRecheck(
-                    commandCode, failoverPayload, requestDeadlineNanos, serverError, callerFuture, failoverState);
+                    commandCode, failoverPayload, requestDeadlineNanos, cause, callerFuture, failoverState);
             return;
         }
         releaseIfPresent(failoverPayload);
+        if (failoverState.ticket != null) {
+            if (failoverState.uncertain || callerFuture.isCancelled()) {
+                error = failoverState.retainTicket();
+            } else {
+                failoverState.ticket.complete();
+                failoverState.ticket = null;
+            }
+        }
         callerFuture.completeExceptionally(error);
+    }
+
+    private static boolean canReplayLostLink(
+            TransientFailoverState state, Throwable error, ByteBuf payload, long deadline) {
+        return state.uncertain && lostLink(state, error) && payload != null && deadline - System.nanoTime() > 0;
+    }
+
+    /**
+     * Whether the request lost the link that carried it. A detached-session
+     * eviction counts too: the server can drop the link but keep the session,
+     * so an attempt it admitted before can still commit. A reply with that
+     * code answered the attempt, so it is no lost link.
+     */
+    private static boolean lostLink(TransientFailoverState state, Throwable error) {
+        return error instanceof IggyConnectionException
+                || error instanceof java.io.IOException
+                || (state.linkFailed && state.detachedSession);
     }
 
     private static boolean shouldRecheckLeader(
@@ -720,7 +866,7 @@ public class AsyncTcpConnection {
             int commandCode,
             ByteBuf payload,
             long requestDeadlineNanos,
-            IggyServerException rejection,
+            Throwable rejection,
             CompletableFuture<ByteBuf> callerFuture,
             TransientFailoverState failoverState) {
         CompletableFuture<ByteBuf> retry;
@@ -729,18 +875,31 @@ public class AsyncTcpConnection {
                     this, commandCode, payload, requestDeadlineNanos, rejection, failoverState);
         } catch (RuntimeException retryError) {
             payload.release();
-            callerFuture.completeExceptionally(retryError);
+            completeFailedRequest(commandCode, null, requestDeadlineNanos, callerFuture, failoverState, retryError);
             return;
         }
-        retry.whenComplete((response, error) -> completeWithResponse(callerFuture, response, error));
+        callerFuture.whenComplete((response, error) -> {
+            if (callerFuture.isCancelled()) {
+                retry.cancel(false);
+            }
+        });
+        retry.whenComplete((response, error) -> {
+            if (error == null) {
+                completeWithResponse(callerFuture, response);
+            } else {
+                completeFailedRequest(commandCode, null, requestDeadlineNanos, callerFuture, failoverState, error);
+            }
+        });
     }
 
     private CompletableFuture<ByteBuf> sendAuthenticationFrame(
             Channel channel, ByteBuf payload, int commandCode, long requestDeadlineNanos) {
         if (consensusSession.isBound()) {
-            long expectedSession = consensusSession.boundSession();
+            long[] identity = consensusSession.identity();
+            long expectedSession = identity[2];
             ByteBuf binding = vsrEncoder.bindSession(channel.alloc());
             CompletableFuture<ByteBuf> bindingFuture = new CompletableFuture<>();
+            TransientFailoverState bindState = new TransientFailoverState();
             sendFrame(
                     channel,
                     binding,
@@ -748,7 +907,7 @@ public class AsyncTcpConnection {
                     bindingFuture,
                     bindingFuture,
                     requestDeadlineNanos,
-                    new TransientFailoverState());
+                    bindState);
             return bindingFuture
                     .handle((response, error) -> {
                         if (error == null) {
@@ -761,12 +920,19 @@ public class AsyncTcpConnection {
                             return CompletableFuture.completedFuture(response);
                         }
                         IggyServerException serverError = findServerError(error);
-                        if (serverError != null
-                                && (serverError.getRawErrorCode() == UNAUTHENTICATED
-                                        || serverError.getRawErrorCode() == STALE_CLIENT)) {
-                            consensusSession.reset();
-                            onSessionEvicted(serverError.getRawErrorCode());
-                            return sendAuthenticationFrame(channel, payload, commandCode, requestDeadlineNanos);
+                        if (serverError != null) {
+                            // A stale client eviction drops the link and keeps the session, so the request
+                            // binds it again on a new link.
+                            if (serverError.getRawErrorCode() == STALE_CLIENT && lostLink(bindState, serverError)) {
+                                payload.release();
+                                return CompletableFuture.<ByteBuf>failedFuture(new IggyConnectionException(
+                                        "The server dropped the link during BindSession", serverError));
+                            }
+                            if (serverError.getRawErrorCode() == UNAUTHENTICATED
+                                    || serverError.getRawErrorCode() == STALE_CLIENT) {
+                                resetRefusedSession(identity[0], identity[1], serverError.getRawErrorCode());
+                                return sendAuthenticationFrame(channel, payload, commandCode, requestDeadlineNanos);
+                            }
                         }
                         payload.release();
                         return CompletableFuture.<ByteBuf>failedFuture(error);
@@ -792,7 +958,7 @@ public class AsyncTcpConnection {
      */
     private void notifyConnectionFailure(Throwable cause) {
         try {
-            connectionFailureListener.accept(cause);
+            connectionFailureListener.accept(this, cause);
         } catch (RuntimeException listenerError) {
             log.warn("Connection failure listener threw: {}", listenerError.getMessage());
         }
@@ -809,21 +975,20 @@ public class AsyncTcpConnection {
     }
 
     /**
-     * A Register on an already-bound VSR connection is answered with a replay
-     * of the original register reply, while the client has re-armed a fresh
-     * identity; its reset request counter would then collide with the
-     * server's dedup table and mutations would be silently swallowed. Unbind
-     * first, then login fresh.
+     * An already-bound connection replays its original Register response.
+     * Logout first so explicit login can establish the requested identity.
      */
-    private CompletableFuture<ByteBuf> logoutThenLogin(int commandCode, ByteBuf payload) {
-        return send(CommandCode.User.LOGOUT.getValue(), Unpooled.EMPTY_BUFFER)
+    private CompletableFuture<ByteBuf> logoutThenLogin(int commandCode, ByteBuf payload, long deadline) {
+        return send(CommandCode.User.LOGOUT.getValue(), Unpooled.EMPTY_BUFFER, deadline)
                 .handle((logoutResponse, logoutError) -> {
-                    if (logoutResponse != null) {
-                        logoutResponse.release();
+                    if (logoutError != null) {
+                        payload.release();
+                        throw new CompletionException(logoutError);
                     }
+                    logoutResponse.release();
                     return null;
                 })
-                .thenCompose(ignored -> send(commandCode, payload));
+                .thenCompose(ignored -> send(commandCode, payload, deadline));
     }
 
     private static boolean isLoginCode(int commandCode) {
@@ -877,7 +1042,49 @@ public class AsyncTcpConnection {
      * Writes the first attempt of a request. {@code callerFuture} is the future its caller holds,
      * and an authentication step holds the response future itself.
      */
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private void sendFrame(
+            Channel channel,
+            ByteBuf payload,
+            int commandCode,
+            CompletableFuture<ByteBuf> responseFuture,
+            CompletableFuture<ByteBuf> callerFuture,
+            long deadline,
+            TransientFailoverState state) {
+        int operation = VsrOperation.operationForCode(commandCode);
+        boolean mutation = operation != VsrOperation.NON_REPLICATED && !mutatesSessionState(commandCode);
+        if (state.ticket == null && (mutation || state.lane != null)) {
+            ConsensusSession.LaneKey lane = state.lane == null ? ConsensusSession.LaneKey.METADATA : state.lane;
+            CompletableFuture<ConsensusSession.Ticket> admission = consensusSession.acquire(
+                    lane,
+                    mutation,
+                    (long) VsrHeaders.HEADER_SIZE + payload.readableBytes(),
+                    deadline,
+                    channel.eventLoop());
+            callerFuture.whenComplete((response, error) -> {
+                if (callerFuture.isCancelled()) {
+                    admission.cancel(false);
+                }
+            });
+            admission.whenComplete((ticket, error) -> {
+                if (error != null || callerFuture.isDone()) {
+                    payload.release();
+                    if (ticket != null) {
+                        ticket.complete();
+                    }
+                    responseFuture.completeExceptionally(error == null ? responseTimeout(commandCode) : error);
+                    return;
+                }
+                state.ticket = ticket;
+                sendAdmittedFrame(channel, payload, commandCode, responseFuture, callerFuture, deadline, state);
+            });
+            return;
+        }
+        sendAdmittedFrame(channel, payload, commandCode, responseFuture, callerFuture, deadline, state);
+    }
+
+    @SuppressWarnings("checkstyle:CyclomaticComplexity")
+    private void sendAdmittedFrame(
             Channel channel,
             ByteBuf payload,
             int commandCode,
@@ -891,8 +1098,30 @@ public class AsyncTcpConnection {
                 throw new IggyClientException("Channel missing VsrResponseHandler");
             }
 
-            ByteBuf frame = vsrEncoder.encode(
-                    channel.alloc(), commandCode, payload, failoverState.context, failoverState.requestId);
+            ByteBuf frame;
+            if (failoverState.ticket != null && failoverState.ticket.hasFrame()) {
+                frame = failoverState.ticket.frame();
+                try {
+                    if (failoverState.requestId == 0 && !failoverState.ticket.renewRequestId(frame)) {
+                        throw new IggyServerException(TRANSIENT_NOT_ACCEPTED);
+                    }
+                } catch (RuntimeException error) {
+                    frame.release();
+                    failoverState.ticket.finishWrite();
+                    throw error;
+                }
+            } else {
+                frame = vsrEncoder.encode(
+                        channel.alloc(), commandCode, payload, failoverState.context, failoverState.requestId);
+                if (failoverState.ticket != null) {
+                    try {
+                        failoverState.ticket.freeze(frame, commandCode, failoverState.routingBody);
+                    } catch (RuntimeException error) {
+                        frame.release();
+                        throw error;
+                    }
+                }
+            }
             failoverState.requestId = VsrHeaders.readRequestId(frame);
             long nowNanos = System.nanoTime();
             long deadlineNanos =
@@ -927,27 +1156,50 @@ public class AsyncTcpConnection {
      * id, so it is retried as a new request; everything else resolves the
      * caller.
      */
+    @SuppressWarnings("checkstyle:NPathComplexity")
     private void writeVsrFrame(VsrExchange exchange, ByteBuf frame, boolean uncertain, long lifecycleRetryIntervalMs) {
         Channel channel = exchange.channel();
         VsrResponseHandler handler = exchange.handler();
         CompletableFuture<ByteBuf> responseFuture = exchange.responseFuture();
         if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0) {
             IggyTimeoutException timeout = responseTimeout(exchange.commandCode());
-            handler.closeChannel(channel, timeout);
-            frame.release();
+            releaseFrame(exchange, frame);
             responseFuture.completeExceptionally(preserveUncertainOutcome(timeout, uncertain));
             return;
         }
         CompletableFuture<ByteBuf> attempt = new CompletableFuture<>();
+        VsrResponseHandler.PendingRequest pending;
         try {
-            handler.registerRequest(channel, frame, attempt, exchange.requestDeadlineNanos(), exchange.commandCode());
+            pending = handler.registerRequest(
+                    channel, frame, attempt, exchange.requestDeadlineNanos(), exchange.commandCode());
         } catch (RuntimeException error) {
-            handler.closeChannel(channel, error);
-            frame.release();
+            releaseFrame(exchange, frame);
             responseFuture.completeExceptionally(error);
             return;
         }
+        attempt.whenComplete((response, error) ->
+                completeAttempt(exchange, frame, uncertain, pending, lifecycleRetryIntervalMs, response, error));
+        exchange.callerFuture().whenComplete((response, error) -> {
+            if (exchange.callerFuture().isCancelled()) {
+                attempt.cancel(false);
+            }
+        });
+        if (attempt.isDone()) {
+            return;
+        }
+        ConsensusSession.Ticket writerTicket = exchange.failoverState().ticket;
+        if (writerTicket != null) {
+            try {
+                writerTicket.startWrite();
+            } catch (RuntimeException error) {
+                attempt.completeExceptionally(error);
+                return;
+            }
+        }
         channel.writeAndFlush(frame.retainedDuplicate()).addListener((ChannelFutureListener) future -> {
+            if (writerTicket != null) {
+                writerTicket.finishWrite();
+            }
             if (!future.isSuccess()) {
                 log.error("Failed to send frame: {}", future.cause().getMessage());
                 // A failed write leaves framing undefined. Closing removes and
@@ -955,26 +1207,49 @@ public class AsyncTcpConnection {
                 handler.closeChannel(channel, future.cause());
             }
         });
-        attempt.whenComplete((response, error) ->
-                completeAttempt(exchange, frame, uncertain, lifecycleRetryIntervalMs, response, error));
     }
 
+    private static void releaseFrame(VsrExchange exchange, ByteBuf frame) {
+        frame.release();
+        if (exchange.failoverState().ticket != null) {
+            exchange.failoverState().ticket.finishWrite();
+        }
+    }
+
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
     private void completeAttempt(
             VsrExchange exchange,
             ByteBuf frame,
             boolean uncertain,
+            VsrResponseHandler.PendingRequest pending,
             long lifecycleRetryIntervalMs,
             ByteBuf response,
             Throwable error) {
         Channel channel = exchange.channel();
         IggyServerException serverError = findServerError(error);
-        boolean nextUncertain = uncertain || isUncertainOutcome(serverError);
+        // A cancel can end an attempt after its reply was marked committed, and then nothing holds the outcome.
+        // The operation stays uncertain, as in Rust, so a resolve can still prove it.
+        boolean committed = pending.isCommitted() && (error == null || serverError != null);
+        exchange.failoverState().committed = committed;
+        exchange.failoverState().linkFailed = pending.isFailedByLink();
+        exchange.failoverState().detachedSession = pending.isSessionDetached();
+        closeIfDetached(exchange, pending, serverError);
+        boolean wasUncertain = uncertain || exchange.failoverState().uncertain;
+        // An eviction fails every request on its link and names none of them, so the server can have admitted
+        // this one, unlike a reply that refuses it with the same code.
+        boolean nextUncertain = !committed
+                && (wasUncertain
+                        || isUncertainOutcome(serverError)
+                        || (error != null
+                                && (serverError == null || pending.isFailedByLink())
+                                && exchange.failoverState().ticket != null));
+        exchange.failoverState().uncertain = nextUncertain;
+        exchange.failoverState().everUncertain |= wasUncertain || nextUncertain;
         if (shouldRetryTransient(
                         exchange.commandCode(),
                         error,
                         exchange.deadlineNanos(),
                         exchange.notAcceptedDeadlineNanos(),
-                        nextUncertain,
                         exchange.failoverState().routed)
                 && channel.isActive()) {
             try {
@@ -985,7 +1260,7 @@ public class AsyncTcpConnection {
                                 TimeUnit.MILLISECONDS)
                         .addListener(retry -> {
                             if (retry.isCancelled()) {
-                                frame.release();
+                                releaseFrame(exchange, frame);
                                 exchange.responseFuture()
                                         .completeExceptionally(preserveUncertainOutcome(error, nextUncertain));
                             }
@@ -995,15 +1270,57 @@ public class AsyncTcpConnection {
                 log.warn("Event loop rejected a VSR retry, failing the request: {}", retryRejected.getMessage());
             }
         }
-        if (!exchange.failoverState().routed
+        if (!wasUncertain
+                && !exchange.failoverState().routed
                 && scheduleLifecycleRetry(exchange, frame, serverError, nextUncertain, lifecycleRetryIntervalMs)) {
             return;
         }
-        frame.release();
-        if (error != null) {
-            exchange.responseFuture().completeExceptionally(preserveUncertainOutcome(error, nextUncertain));
+        if (error == null && !nextUncertain) {
+            refreshCredentials(exchange.commandCode(), frame);
+        }
+        releaseFrame(exchange, frame);
+        ConsensusSession.Ticket ticket = exchange.failoverState().ticket;
+        if (ticket != null && nextUncertain) {
+            releaseIfPresent(response);
+            exchange.responseFuture()
+                    .completeExceptionally(
+                            error != null ? error : exchange.failoverState().retainTicket());
         } else {
-            exchange.responseFuture().complete(response);
+            // Recorded while the reply is alive: a routed replay completes its ticket after the callbacks of its
+            // caller, which release the reply.
+            if (ticket != null && committed) {
+                ticket.recordOutcome(response, serverError);
+            }
+            if (ticket != null && !exchange.failoverState().routed && (committed || error == null)) {
+                ticket.complete();
+                exchange.failoverState().ticket = null;
+            }
+            if (error != null) {
+                exchange.responseFuture().completeExceptionally(preserveUncertainOutcome(error, nextUncertain));
+            } else {
+                completeWithResponse(exchange.responseFuture(), response);
+            }
+        }
+    }
+
+    /**
+     * A reply with a stale client means that the server no longer attaches
+     * the link to the session, for example because the session ended. The
+     * link closes before the caller sees the reply, so the next request binds
+     * again on a new link. That bind resumes a session the server still knows
+     * and is refused for an ended one, which signs in again. A refused bind
+     * already resets the session on its own link.
+     */
+    private static void closeIfDetached(
+            VsrExchange exchange, VsrResponseHandler.PendingRequest pending, IggyServerException serverError) {
+        if (serverError != null
+                && serverError.getRawErrorCode() == STALE_CLIENT
+                && !pending.isFailedByLink()
+                && exchange.commandCode() != CommandCode.System.BIND_SESSION.getValue()) {
+            exchange.handler()
+                    .closeChannel(
+                            exchange.channel(),
+                            new IggyConnectionException("The server detached this connection from its session"));
         }
     }
 
@@ -1042,7 +1359,7 @@ public class AsyncTcpConnection {
                     .addListener(retry -> {
                         // Shutting down the event loop drops the pending retry unrun.
                         if (retry.isCancelled()) {
-                            refusedFrame.release();
+                            releaseFrame(exchange, refusedFrame);
                             exchange.responseFuture().completeExceptionally(refusal);
                         }
                     });
@@ -1066,30 +1383,52 @@ public class AsyncTcpConnection {
             boolean uncertain,
             long lifecycleRetryIntervalMs) {
         Channel channel = exchange.channel();
-        ByteBuf frame;
+        if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0
+                || !channel.isActive()
+                || exchange.callerFuture().isDone()) {
+            releaseFrame(exchange, refusedFrame);
+            exchange.responseFuture().completeExceptionally(refusal);
+            return;
+        }
+        ByteBuf nextFrame = refusedFrame;
         try {
-            // A late timer or a lost channel keeps the refusal, rather than a
-            // timeout that would close the channel under other requests. A
-            // caller that gave up must not see the request applied later.
-            if (exchange.requestDeadlineNanos() - System.nanoTime() <= 0
-                    || !channel.isActive()
-                    || exchange.callerFuture().isDone()) {
-                exchange.responseFuture().completeExceptionally(refusal);
+            ConsensusSession.Ticket ticket = exchange.failoverState().ticket;
+            if (ticket == null) {
+                ByteBuf body = refusedFrame.slice(
+                        refusedFrame.readerIndex() + VsrHeaders.HEADER_SIZE,
+                        refusedFrame.readableBytes() - VsrHeaders.HEADER_SIZE);
+                nextFrame = vsrEncoder.encode(
+                        channel.alloc(),
+                        exchange.commandCode(),
+                        body,
+                        exchange.failoverState().context());
+                refusedFrame.release();
+            } else if (!ticket.renewRequestId(refusedFrame)) {
+                channel.eventLoop()
+                        .schedule(
+                                () -> retryLifecycleBusy(
+                                        exchange, refusedFrame, refusal, uncertain, lifecycleRetryIntervalMs),
+                                TRANSIENT_RETRY_INTERVAL_MS,
+                                TimeUnit.MILLISECONDS)
+                        .addListener(retry -> {
+                            if (retry.isCancelled()) {
+                                releaseFrame(exchange, refusedFrame);
+                                exchange.responseFuture().completeExceptionally(refusal);
+                            }
+                        });
                 return;
             }
-            ByteBuf payload = refusedFrame.slice(
-                    refusedFrame.readerIndex() + VsrHeaders.HEADER_SIZE,
-                    refusedFrame.readableBytes() - VsrHeaders.HEADER_SIZE);
-            frame = vsrEncoder.encode(
-                    channel.alloc(), exchange.commandCode(), payload, exchange.failoverState().context);
-        } catch (RuntimeException encodeError) {
-            exchange.responseFuture().completeExceptionally(encodeError);
-            return;
-        } finally {
-            refusedFrame.release();
+            exchange.failoverState().requestId = VsrHeaders.readRequestId(nextFrame);
+            exchange.failoverState().committed = false;
+            writeVsrFrame(
+                    exchange,
+                    nextFrame,
+                    false,
+                    Math.min(lifecycleRetryIntervalMs * 2, LIFECYCLE_RETRY_MAX_INTERVAL_MS));
+        } catch (RuntimeException error) {
+            releaseFrame(exchange, nextFrame);
+            exchange.responseFuture().completeExceptionally(error);
         }
-        writeVsrFrame(
-                exchange, frame, uncertain, Math.min(lifecycleRetryIntervalMs * 2, LIFECYCLE_RETRY_MAX_INTERVAL_MS));
     }
 
     private static boolean isUncertainOutcome(IggyServerException error) {
@@ -1105,17 +1444,6 @@ public class AsyncTcpConnection {
 
     private static IggyTimeoutException responseTimeout(int commandCode) {
         return new IggyTimeoutException("Timed out waiting for a response to command code " + commandCode);
-    }
-
-    private static IggyTimeoutException findResponseTimeout(Throwable error) {
-        Throwable cause = error;
-        while (cause != null) {
-            if (cause instanceof IggyTimeoutException timeout) {
-                return timeout;
-            }
-            cause = cause.getCause();
-        }
-        return null;
     }
 
     static IggyServerException findServerError(Throwable error) {
@@ -1170,12 +1498,7 @@ public class AsyncTcpConnection {
 
     @SuppressWarnings("checkstyle:CyclomaticComplexity")
     private boolean shouldRetryTransient(
-            int commandCode,
-            Throwable error,
-            long deadlineNanos,
-            long notAcceptedDeadlineNanos,
-            boolean uncertain,
-            boolean routed) {
+            int commandCode, Throwable error, long deadlineNanos, long notAcceptedDeadlineNanos, boolean routed) {
         if (!(error instanceof IggyServerException serverError)) {
             return false;
         }
@@ -1185,7 +1508,7 @@ public class AsyncTcpConnection {
                                 || commandCode == CommandCode.ConsumerOffset.GET.getValue()))) {
             return false;
         }
-        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED || uncertain) {
+        if (serverError.getRawErrorCode() == TRANSIENT_NOT_COMMITTED) {
             return System.nanoTime() < deadlineNanos;
         }
         if (serverError.getRawErrorCode() == TRANSIENT_NOT_ACCEPTED) {
@@ -1203,14 +1526,32 @@ public class AsyncTcpConnection {
                 long generation = authGeneration.incrementAndGet();
                 IggyAuthenticator.setAuthGeneration(channel, generation);
             } else {
-                releaseLoginPayload();
+                login.clear();
             }
         }
-        if (commandCode == CommandCode.User.LOGOUT.getValue()) {
+        if (commandCode == CommandCode.System.BIND_SESSION.getValue() && ex == null) {
+            if (response.readableBytes() < REGISTER_RESPONSE_MIN_BYTES
+                    || response.getLongLE(response.readerIndex() + Integer.BYTES) != consensusSession.boundSession()) {
+                throw new IggyNotConnectedException("BindSession returned a different session epoch");
+            }
+            IggyAuthenticator.setAuthGeneration(channel, authGeneration.get());
+        }
+        if (commandCode == CommandCode.User.LOGOUT.getValue() && ex == null) {
             authenticated = false;
             authGeneration.incrementAndGet();
             IggyAuthenticator.clearAuthGeneration(channel);
-            releaseLoginPayload();
+            login.clear();
+        }
+    }
+
+    /**
+     * Ends the session that a bind refused, unless a reset already replaced it.
+     * The next request on this connection signs in again with the remembered
+     * sign-in, or fails without one.
+     */
+    void resetRefusedSession(long clientLow, long clientHigh, int errorCode) {
+        if (consensusSession.resetIfCurrent(clientLow, clientHigh)) {
+            onSessionEvicted(errorCode);
         }
     }
 
@@ -1231,60 +1572,91 @@ public class AsyncTcpConnection {
 
     private void captureLoginPayloadIfNeeded(int commandCode, ByteBuf payload) {
         if (isLoginCode(commandCode)) {
-            updateLoginPayload(commandCode, payload);
+            login.set(commandCode, ByteBufUtil.getBytes(payload));
         }
     }
 
-    private synchronized void updateLoginPayload(int commandCode, ByteBuf payload) {
-        if (this.loginPayload != null) {
-            loginPayload.release();
-        }
-        this.loginPayload = payload.retainedSlice();
-        this.loginCommandCode = commandCode;
+    Optional<AuthenticationSnapshot> authenticationSnapshot() {
+        return authenticated ? login.snapshot() : Optional.empty();
     }
 
-    private synchronized ByteBuf getLoginPayloadCopy() {
-        if (this.loginPayload != null) {
-            return loginPayload.retainedDuplicate();
+    /**
+     * Applies a committed password change or rename of the signed-in user to the login that this connection
+     * shares, see {@link SessionLogin}, and then tells the credentials listener. Typed, raw and resolved calls all
+     * succeed here, and only the frozen request carries the new credentials. A body that does not decode changes
+     * nothing.
+     */
+    @SuppressWarnings({"checkstyle:CyclomaticComplexity", "checkstyle:NPathComplexity"})
+    private void refreshCredentials(int commandCode, ByteBuf frame) {
+        boolean passwordChange = commandCode == CommandCode.User.CHANGE_PASSWORD.getValue();
+        if (!passwordChange && commandCode != CommandCode.User.UPDATE.getValue()) {
+            return;
         }
-        return null;
+        ByteBuf change = frame.slice(
+                frame.readerIndex() + VsrHeaders.HEADER_SIZE, frame.readableBytes() - VsrHeaders.HEADER_SIZE);
+        String oldUsername;
+        Optional<String> username = Optional.empty();
+        Optional<String> password = Optional.empty();
+        SessionLogin shared = login;
+        synchronized (shared) {
+            if (!authenticated || shared.payload == null || shared.commandCode != CommandCode.User.LOGIN.getValue()) {
+                return;
+            }
+            ByteBuf current = Unpooled.wrappedBuffer(shared.payload);
+            oldUsername = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
+                    .toString();
+            if (!skipUser(change, UserId.of(authenticatedUserId))
+                    // UserId refuses a blank name, and no request can name one.
+                    && (StringUtils.isBlank(oldUsername) || !skipUser(change, UserId.of(oldUsername)))) {
+                return;
+            }
+            if (passwordChange) {
+                password = readField(change).flatMap(currentPassword -> readField(change));
+            } else if (change.isReadable() && change.readUnsignedByte() == USERNAME_PRESENT) {
+                username = readField(change);
+            }
+            if (username.isEmpty() && password.isEmpty()) {
+                return;
+            }
+            String oldPassword = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
+                    .toString();
+            byte[] nextUsername = username.orElse(oldUsername).getBytes(StandardCharsets.UTF_8);
+            byte[] nextPassword = password.orElse(oldPassword).getBytes(StandardCharsets.UTF_8);
+            byte[] next = new byte[2 + nextUsername.length + nextPassword.length];
+            Unpooled.wrappedBuffer(next)
+                    .clear()
+                    .writeByte(nextUsername.length)
+                    .writeBytes(nextUsername)
+                    .writeByte(nextPassword.length)
+                    .writeBytes(nextPassword);
+            shared.payload = next;
+        }
+        credentialsListener.refreshed(this, oldUsername, username, password);
     }
 
-    synchronized Optional<AuthenticationSnapshot> authenticationSnapshot() {
-        if (!authenticated || loginPayload == null) {
+    /** Skips the user identifier at the start of {@code change} when it names {@code user}. */
+    private static boolean skipUser(ByteBuf change, UserId user) {
+        ByteBuf encoded = user.toBytes();
+        try {
+            int length = encoded.readableBytes();
+            if (change.readableBytes() < length
+                    || !ByteBufUtil.equals(change, change.readerIndex(), encoded, 0, length)) {
+                return false;
+            }
+            change.skipBytes(length);
+            return true;
+        } finally {
+            encoded.release();
+        }
+    }
+
+    /** Reads a u8-length-prefixed UTF-8 field, or nothing when the body ends first. */
+    private static Optional<String> readField(ByteBuf body) {
+        if (!body.isReadable() || body.readableBytes() <= body.getUnsignedByte(body.readerIndex())) {
             return Optional.empty();
         }
-        return Optional.of(new AuthenticationSnapshot(loginCommandCode, loginPayload.retainedDuplicate()));
-    }
-
-    synchronized Optional<String> refreshCredentials(
-            UserId user, Optional<String> username, Optional<String> password) {
-        if (!authenticated || loginPayload == null || loginCommandCode != CommandCode.User.LOGIN.getValue()) {
-            return Optional.empty();
-        }
-        ByteBuf current = loginPayload.duplicate();
-        String oldUsername = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
-                .toString();
-        if (!(user.getId() != null ? user.getId() == authenticatedUserId : oldUsername.equals(user.getName()))) {
-            return Optional.empty();
-        }
-        String oldPassword = current.readCharSequence(current.readUnsignedByte(), StandardCharsets.UTF_8)
-                .toString();
-        byte[] nextUsername = username.orElse(oldUsername).getBytes(StandardCharsets.UTF_8);
-        byte[] nextPassword = password.orElse(oldPassword).getBytes(StandardCharsets.UTF_8);
-        ByteBuf next = Unpooled.buffer(2 + nextUsername.length + nextPassword.length);
-        next.writeByte(nextUsername.length).writeBytes(nextUsername);
-        next.writeByte(nextPassword.length).writeBytes(nextPassword);
-        loginPayload.release();
-        loginPayload = next;
-        return Optional.of(oldUsername);
-    }
-
-    private synchronized void releaseLoginPayload() {
-        if (this.loginPayload != null) {
-            loginPayload.release();
-            this.loginPayload = null;
-        }
+        return Optional.of(body.readCharSequence(body.readUnsignedByte(), StandardCharsets.UTF_8)
+                .toString());
     }
 
     public CompletableFuture<Void> close() {
@@ -1292,9 +1664,15 @@ public class AsyncTcpConnection {
             return CompletableFuture.completedFuture(null);
         }
         stopHeartbeat();
-        releaseLoginPayload();
+        if (consensusSession.owner() == consensusSession) {
+            consensusSession.reset();
+        }
         CompletableFuture<Void> shutdownFuture = new CompletableFuture<>();
-        channels.close().addListener(channelsClosed -> closePool(shutdownFuture));
+        try {
+            eventLoop.execute(() -> channels.close().addListener(channelsClosed -> closePool(shutdownFuture)));
+        } catch (RejectedExecutionException loopGone) {
+            closePool(shutdownFuture);
+        }
         return shutdownFuture;
     }
 
@@ -1386,6 +1764,31 @@ public class AsyncTcpConnection {
 
     record AuthenticationSnapshot(int commandCode, ByteBuf payload) {}
 
+    /**
+     * The login that registers a session again. A connection that binds the session of another connection holds
+     * the instance of that connection, so a committed credential change on any of them reaches all of them, and
+     * none of them signs in with an old copy.
+     */
+    private static final class SessionLogin {
+        private int commandCode;
+        private byte[] payload;
+
+        synchronized void set(int commandCode, byte[] payload) {
+            this.commandCode = commandCode;
+            this.payload = payload;
+        }
+
+        synchronized void clear() {
+            payload = null;
+        }
+
+        synchronized Optional<AuthenticationSnapshot> snapshot() {
+            return payload == null
+                    ? Optional.empty()
+                    : Optional.of(new AuthenticationSnapshot(commandCode, Unpooled.wrappedBuffer(payload)));
+        }
+    }
+
     /** What every write attempt of one request on one channel shares. */
     private record VsrExchange(
             Channel channel,
@@ -1398,10 +1801,31 @@ public class AsyncTcpConnection {
             long deadlineNanos,
             long notAcceptedDeadlineNanos) {}
 
+    /**
+     * Fails a routed exchange that its link failed, by an eviction or a lost
+     * connection. An eviction carries the code of a reply, and only this tells
+     * the router to try the exchange again where a reply ends the call.
+     */
+    static final class LinkFailure extends CompletionException {
+        LinkFailure(Throwable cause) {
+            super(cause);
+        }
+    }
+
     static final class TransientFailoverState {
         private PartitionContext context;
         private boolean routed;
+        private boolean heartbeat;
         private long requestId;
+        private boolean committed;
+        private boolean linkFailed;
+        private boolean detachedSession;
+        private boolean uncertain;
+        private boolean everUncertain;
+        private ConsensusSession.LaneKey lane;
+        private ConsensusSession.Ticket ticket;
+        private RuntimeException retainedError;
+        private byte[] routingBody;
         private final Set<ConnectionInfo> visitedTargets = new HashSet<>();
 
         TransientFailoverState() {
@@ -1412,8 +1836,55 @@ public class AsyncTcpConnection {
             this.context = context;
         }
 
+        void restore(ConsensusSession.Ticket retained) {
+            ticket = retained;
+            requestId = retained.operationId();
+            uncertain = true;
+            everUncertain = true;
+        }
+
+        ConsensusSession.Ticket ticket() {
+            return ticket;
+        }
+
+        RuntimeException retainTicket() {
+            return retainTicket(ticket);
+        }
+
+        RuntimeException retainTicket(ConsensusSession.Ticket retained) {
+            synchronized (this) {
+                if (retainedError != null) {
+                    return retainedError;
+                }
+                // Retaining wakes resolvers inline, so publish the guard before invoking callbacks without this lock.
+                retainedError = new IggyOperationException(IggyErrorCode.OPERATION_UNCERTAIN, retained.operationId());
+            }
+            RuntimeException error = retained.retain();
+            synchronized (this) {
+                retainedError = error;
+            }
+            return error;
+        }
+
+        boolean wasUncertain() {
+            return everUncertain;
+        }
+
+        boolean committed() {
+            return committed;
+        }
+
+        void setLane(ConsensusSession.LaneKey lane) {
+            this.lane = lane;
+        }
+
+        void setRoutingBody(byte[] routingBody) {
+            this.routingBody = routingBody;
+        }
+
         void renewRequestId() {
             requestId = 0;
+            committed = false;
         }
 
         PartitionContext context() {
@@ -1430,13 +1901,22 @@ public class AsyncTcpConnection {
     }
 
     @FunctionalInterface
+    interface CredentialsListener {
+        void refreshed(
+                AsyncTcpConnection source,
+                String previousUsername,
+                Optional<String> username,
+                Optional<String> password);
+    }
+
+    @FunctionalInterface
     interface TransientFailoverHandler {
         CompletableFuture<ByteBuf> retry(
                 AsyncTcpConnection source,
                 int commandCode,
                 ByteBuf payload,
                 long requestDeadlineNanos,
-                IggyServerException rejection,
+                Throwable rejection,
                 TransientFailoverState failoverState);
     }
 

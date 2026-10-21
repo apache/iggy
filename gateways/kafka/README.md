@@ -11,11 +11,16 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > user**: with the bridge on and
 > `IGGY_KAFKA_SASL_ENABLED` off (the default), any client that can reach this port can create
 > topics (up to 1000 partitions each), delete topics and their data, or shorten a topic's
-> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With SASL on,
-> `DeleteTopics`, `AlterConfigs` and `IncrementalAlterConfigs` additionally require the authenticated principal to hold
-> `manage_topics`; without it every resource/name in the request fails
-> `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written or deleted. `CreateTopics` has no such
-> gate yet - SASL on does not protect it. Every client reads and writes as the bridge's Iggy user.
+> `retention.ms` low enough that the cleaner drops sealed segments, deleting data. With
+> `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
+> that reaches this port can also create topics just by naming them in a `Metadata` request. When
+> the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
+> `DeleteTopics`, `AlterConfigs`, `IncrementalAlterConfigs` and `Metadata` auto-creation
+> additionally require it to hold a global `manage_topics` or `manage_streams`; without it every
+> resource of a `DeleteTopics`, `AlterConfigs` or `IncrementalAlterConfigs` request, and every
+> missing topic a `Metadata` request would create, fails `TOPIC_AUTHORIZATION_FAILED` (29) and
+> nothing is written, created or deleted. `CreateTopics` has no such gate yet - SASL on does not
+> protect it. Every client reads and writes as the bridge's Iggy user.
 > See [docs/SCOPE.md](docs/SCOPE.md).
 >
 > InitProducerId does real work too, with or without the bridge: it allocates a producer id, so a stock idempotent producer starts instead of failing at startup.
@@ -68,6 +73,8 @@ Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 | `IGGY_KAFKA_SASL_ENABLED` | `false` | Single-listener form: require SASL/PLAIN before serving any other API (`true` or `false`, nothing else). With `IGGY_KAFKA_LISTENERS`, a `SASL_PLAINTEXT` or `SASL_SSL` listener says the same |
 | `IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS` | `15` | Seconds an unauthenticated connection may sit between frames. Waiting for an authentication slot and the verification itself each get this budget, the verification's starting once it holds a slot. Separate from the 10-minute idle timeout that applies once authenticated |
 | `IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS` | `4` | Credential verifications the gateway runs at once, across all connections. Each costs a password hash on an Iggy shard thread. This bounds the gateway's side only: a check that times out frees its slot while its hash keeps running inside Iggy. Size it below the Iggy node's shard count |
+| `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` | `false` | Kafka's `auto.create.topics.enable`: a `Metadata` lookup of a missing topic creates it ([Auto topic creation](#auto-topic-creation)). Needs `IGGY_KAFKA_BRIDGE_ENABLED=true`. Off by default, unlike Kafka |
+| `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` | `1` | Partitions of an auto-created topic, at most 1000. Only read while auto-creation is on, and refused otherwise |
 
 ## Quick start (Docker Compose)
 
@@ -102,8 +109,8 @@ health check before it starts. From another terminal:
 kcat -b 127.0.0.1:9093 -L
 ```
 
-A full create-topic-then-produce flow needs a client that can send `CreateTopics` (there is no
-auto-create on Produce). With Python's `kafka-python` (illustrative - not exercised by an
+A full create-topic-then-produce flow needs a client that can send `CreateTopics`, unless
+`IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` (see [Auto topic creation](#auto-topic-creation)). With Python's `kafka-python` (illustrative - not exercised by an
 automated test, so adjust if the library's API has moved since this was written):
 
 ```python
@@ -304,8 +311,8 @@ With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` p
 holds no permissions. Once any listener names principals (a SASL listener, or an `SSL` listener
 with client authentication), every connection that proved no identity is `ANONYMOUS`, on a
 `PLAINTEXT` listener beside it too. The requests the gateway checks against a principal,
-`DeleteTopics` and `AlterConfigs`, need `manage_topics` and are refused for it; everything else is
-served as the bridge's user. A gateway whose listeners name nobody serves every request as the
+`DeleteTopics`, `AlterConfigs` and the auto-creation a `Metadata` request asks for, need
+`manage_topics` and are refused for it; everything else is served as the bridge's user. A gateway whose listeners name nobody serves every request as the
 bridge's user.
 
 The rules are Kafka's syntax, tried in order: `RULE:pattern/replacement/[LU]` applies when the
@@ -533,7 +540,7 @@ Limits:
 | --- | --- | --- |
 | `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to |
 | `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Iggy username |
-| `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only); otherwise it generates a random password, so a hardcoded default here could never be right and would invite running as root unnoticed |
+| `IGGY_KAFKA_IGGY_PASSWORD` | none - **required** | Iggy password. No default: `iggy-server` only uses the well-known `iggy`/`iggy` root credentials when started with `--with-default-root-credentials` (dev-only). Otherwise the operator sets the root password, so a hardcoded default here could never be right and would invite running as root unnoticed |
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
 | `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
 | `IGGY_KAFKA_IGGY_MAX_MESSAGE_SIZE` | `64MiB` | Iggy's `message_bus.max_message_size`. Set both together. Larger partitions answer 10 |
@@ -611,6 +618,60 @@ messages or 1 MiB of unflushed data, whichever comes first). Kafka's own default
 posture, so this isn't a wrong choice, but on a single node both can lose an acked write to a power
 cut before that threshold is reached - worth knowing rather than discovering later.
 
+### Auto topic creation
+
+With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, the gateway behaves like a Kafka broker with
+`auto.create.topics.enable=true`. Producers, Connect source tasks, Debezium and dead-letter
+topics that rely on creation by first use then work without a `CreateTopics` call.
+
+- A `Metadata` request that names a missing topic and allows auto-creation (always below v4, the
+  request's `allow_auto_topic_creation` from v4) starts creating it with
+  `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` partitions and answers `UNKNOWN_TOPIC_OR_PARTITION`
+  (3), as Kafka does. The client finds the topic on its next refresh.
+- A `Metadata` request for all topics never creates anything, and neither does Produce or Fetch.
+- An invalid topic name is answered `INVALID_TOPIC_EXCEPTION` (17). Kafka's internal topics,
+  `__consumer_offsets`, `__transaction_state` and `__share_group_state`, are answered
+  `UNKNOWN_TOPIC_OR_PARTITION` and never created. Any other name starting with `__`, such as a
+  Debezium heartbeat topic, is created like any other.
+- When the connection has a principal (a SASL login, a client certificate mapped to an Iggy user,
+  or `ANONYMOUS` beside either), it needs a global `manage_topics` or `manage_streams`. Only global
+  grants count: `manage_topics` granted on one stream does not, even where Iggy would let the
+  principal create the topic. A principal without it is answered `TOPIC_AUTHORIZATION_FAILED` (29)
+  for each missing topic it names, and nothing is created; topics that exist are answered as usual.
+  Kafka clients treat 29 as fatal, so a consumer whose principal may not create topics should set
+  `allow.auto.create.topics=false`, which keeps its lookups of a missing topic answered
+  `UNKNOWN_TOPIC_OR_PARTITION` (3). A principal whose permissions could not be read is answered 3
+  and nothing is created, since 29 is fatal to Java producers, consumers and Streams while Produce
+  and Fetch still work for it. An explicit `CreateTopics` is not checked against `manage_topics`
+  today, so a principal refused auto-creation can still create the same topic with `CreateTopics`.
+- A topic already being created is not started twice. At most 100 creations run at once; a name
+  past that is started by a later refresh. A creation Iggy refuses, for example at
+  `metadata.partitions_max`, is not retried for 1 second. One Iggy refuses for the bridge user's
+  permissions is not retried for a minute: Iggy refuses those only after journaling the create, so
+  each attempt costs a replicated metadata write. A name waiting out either still counts toward the
+  100. Its first failure is logged at `warn`, and repeats within a minute at `debug`.
+- Creations run as the bridge's Iggy user, like `CreateTopics`, on an Iggy client of their own.
+  Both create the topic first, and the backing Iggy stream, which the topic mapping names and the
+  client never does, only when Iggy reports it missing. The bridge user needs `manage_topics` on
+  that stream, or globally, to create a topic in a stream that exists, and the global
+  `manage_streams` to create a missing stream. A principal with `manage_topics` but no stream
+  rights still gets a new stream when the mapping names one that does not exist yet.
+- Like every topic the gateway creates, an auto-created topic has no message expiry (see
+  [Provisioning and idempotency](#provisioning-and-idempotency)): its messages are kept until a
+  client sets `retention.ms` with `AlterConfigs`.
+- Shutdown cancels the creations still running before the bridge signs out, and drops their
+  client if any was running, so the sign-out does not wait behind it. An embedder that builds its
+  own `GatewayState` calls `shutdown_auto_topic_creation` before closing the bridge.
+- `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` applies to auto-creation only. A `CreateTopics` with
+  `num_partitions=-1` still creates 1 partition.
+
+As in Kafka, a producer or consumer still running recreates a topic right after `DeleteTopics`
+removes it, on its next `Metadata` refresh. A Java consumer with `allow.auto.create.topics=true`
+creates whatever topic it subscribes to, including one whose name is a typo.
+
+With auto-creation off, the default, nothing changes: a missing topic is answered
+`UNKNOWN_TOPIC_OR_PARTITION` and a client waits until something else creates it.
+
 ### Concurrency ceiling
 
 - Each producer sends on an `IggyClient` of its own, one request at a time, so its batches land
@@ -633,7 +694,7 @@ cut before that threshold is reached - worth knowing rather than discovering lat
 - Metadata, CreateTopics, DeleteTopics, DescribeConfigs, AlterConfigs and IncrementalAlterConfigs
   share 1 more client, one Iggy request at a time. Fetch polls use 4 more, one per read slot, and
   a `ListOffsets` lookup by time borrows one of those slots for its request. Topic probes use 1
-  more.
+  more. With auto topic creation on, creations use 1 more, opened at the first one.
   Offset calls use 8 more: a commit client and a read client per offset slot.
 - OffsetCommit and OffsetFetch cost one Iggy call per partition, spread over the offset slots. In a
   cluster, an offset commit client can also open one connection per node for stores.

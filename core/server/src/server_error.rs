@@ -17,12 +17,16 @@
 
 use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
+use iggy_binary_protocol::Operation;
 use metadata::impls::recovery::RecoveryError;
 use partitions::PartitionRecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
+use std::error::Error as _;
 use std::path::PathBuf;
 use thiserror::Error;
+
+const ROOT_BOOTSTRAP_RECOVERY: &str = "Restore a compatible data directory containing metadata/snapshot.bin, or use --fresh to delete local data. In multi-node clusters, use --fresh on at most one replica at a time while the others hold quorum.";
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -323,12 +327,30 @@ pub enum ServerError {
         replica_id: u8,
     },
     #[error(
-        "cluster bootstrap with empty metadata requires both {username_env} and {password_env} to be set before server can create the root user deterministically"
+        "Root credentials are required. Set both {username_env} and {password_env}, or use --with-default-root-credentials for local development only."
     )]
-    ClusterRootCredentialsRequired {
+    RootCredentialsRequired {
         username_env: &'static str,
         password_env: &'static str,
     },
+    #[error("Root initialization was rejected with status {status}")]
+    RootInitializationRejected { status: u32 },
+    #[error(
+        "Metadata journal at {path} has op {op}, operation {operation:?}, client {client}, user_id {user_id}. Expected root CreateUser at op 1 from client 0 and user_id 0. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapNotPersisted {
+        path: PathBuf,
+        op: u64,
+        operation: Operation,
+        client: u128,
+        user_id: u32,
+    },
+    #[error(
+        "Metadata journal at {path} contains complete prepares but no validated op 1. {recovery}",
+        recovery = ROOT_BOOTSTRAP_RECOVERY
+    )]
+    RootBootstrapMissing { path: PathBuf },
     #[error(
         "{provided_env} is set but {missing_env} is not; the root user credentials must be \
          provided as a pair"
@@ -407,7 +429,14 @@ fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
         }
         match &failure.kind {
             ShardJoinFailureKind::Error(err) => {
+                // The process prints only this error's own source chain, so each
+                // shard's cause has to be inlined or the operator never sees it.
                 let _ = write!(out, "shard {} -> {err}", failure.shard_id);
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    let _ = write!(out, ": {cause}");
+                    source = cause.source();
+                }
             }
             ShardJoinFailureKind::Panic { message } => {
                 let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
@@ -460,6 +489,25 @@ mod tests {
         assert!(
             rendered.contains("shard 2 panicked: boom"),
             "shard 2 panic entry missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn given_shard_error_with_a_source_when_rendering_join_failures_should_inline_the_cause() {
+        let failures = vec![ShardJoinFailure {
+            shard_id: 0,
+            kind: ShardJoinFailureKind::Error(Box::new(ServerError::ListConfigEnvVars(
+                std::io::Error::other("refusing to truncate"),
+            ))),
+        }];
+
+        let rendered = ServerError::ShardJoinFailures { failures }.to_string();
+
+        assert!(
+            rendered.contains(
+                "shard 0 -> Failed to list config environment variables: refusing to truncate"
+            ),
+            "source chain missing: {rendered}"
         );
     }
 }

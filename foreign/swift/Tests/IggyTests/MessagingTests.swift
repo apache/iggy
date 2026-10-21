@@ -211,12 +211,12 @@ struct MessagingTests {
         let continued = PollingStrategy.offset(3, context: otherContext)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 1, consumer: .consumer(5), strategy: continued, count: 10, autoCommit: true)
 
-        let lookups = await requests(server, .getPollRouting)
+        let lookups = await requests(server, .getPartitionRoute)
         #expect(lookups.count == 1)
+        #expect(lookups.first?.payload == (try Requests.partitionRoute(streamID: 1, topicID: 2, partitionID: 1)))
         let payload = try Requests.pollMessages(
             consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1, strategy: .next, count: 10, autoCommit: true)
-        #expect(lookups.first?.payload == payload)
-        let polls = await requests(server, .pollMessagesOnPrimary)
+        let polls = await requests(server, .pollMessages)
         #expect(polls.map(\.context) == [FakeVSRServer.routeContext, otherContext])
         #expect(polls.first?.payload == payload)
         // Every request went over the one coordinator connection.
@@ -229,7 +229,7 @@ struct MessagingTests {
         defer { Task { await server.stop() } }
         let refused = Locked(false)
         await server.respond { request in
-            if request.code == CommandCode.pollMessagesOnPrimary.rawValue,
+            if request.code == CommandCode.pollMessages.rawValue,
                 !refused.exchange(true)
             {
                 return .status(IggyErrorCode.transientNotAccepted.rawValue)
@@ -238,8 +238,8 @@ struct MessagingTests {
         }
         let client = try await connectedClient(server)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
-        #expect(await requests(server, .getPollRouting).count == 2)
-        #expect(await requests(server, .pollMessagesOnPrimary).count == 2)
+        #expect(await requests(server, .getPartitionRoute).count == 2)
+        #expect(await requests(server, .pollMessages).count == 2)
         await client.shutdown()
     }
 
@@ -250,7 +250,7 @@ struct MessagingTests {
         defer { Task { await server.stop() } }
         let dropped = Locked(false)
         await server.respond { request in
-            if request.code == CommandCode.pollMessagesOnPrimary.rawValue, !dropped.exchange(true) {
+            if request.code == CommandCode.pollMessages.rawValue, !dropped.exchange(true) {
                 return .close
             }
             return FakeVSRServer.defaultReply(request, address: server.address)
@@ -265,23 +265,59 @@ struct MessagingTests {
     @Test func aNewerMetadataCommitReadsTheRouteAgain() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
+        let committed = PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: 50)
+        let applied = Locked(FakeVSRServer.routeContext)
         await server.respond { request in
-            if request.operation == .deleteStream {
-                return .committed([], commit: 50)
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .deleteStream:
+                applied.withLock { $0 = committed }
+                return .committed([], commit: committed.metadataOp)
+            case .getPartitionRoute:
+                return .ok(FakeVSRServer.partitionRouteBody(applied.withLock { $0 }))
+            default:
+                return FakeVSRServer.defaultReply(request, address: server.address)
             }
-            return FakeVSRServer.defaultReply(request, address: server.address)
         }
         let client = try await connectedClient(server)
         let poll = { _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false) }
         try await poll()
         try await poll()
-        #expect(await requests(server, .getPollRouting).count == 1)
+        #expect(await requests(server, .getPartitionRoute).count == 1)
         try await client.deleteStream(9)
         #expect(await client.core.metadataWatermark == 50)
         try await poll()
         try await poll()
         // The route read after the commit is as new as the commit.
-        #expect(await requests(server, .getPollRouting).count == 2)
+        #expect(await requests(server, .getPartitionRoute).count == 2)
+        #expect(await requests(server, .pollMessages).map(\.context) == [FakeVSRServer.routeContext, FakeVSRServer.routeContext, committed, committed])
+        await client.shutdown()
+    }
+
+    /// A route older than a metadata commit the client saw is never used: it
+    /// is read again until the coordinator applied the commit.
+    @Test func aRouteOlderThanTheWatermarkIsReadAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let lagging = Locked(1)
+        await server.respond { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .deleteStream:
+                return .committed([], commit: 50)
+            case .getPartitionRoute:
+                let behind = lagging.withLock {
+                    $0 -= 1; return $0 >= 0
+                }
+                let metadataOp: UInt64 = behind ? 49 : 50
+                return .ok(FakeVSRServer.partitionRouteBody(PartitionContext(incarnation: 7, ownerGeneration: 0, metadataOp: metadataOp)))
+            default:
+                return FakeVSRServer.defaultReply(request, address: server.address)
+            }
+        }
+        let client = try await connectedClient(server)
+        try await client.deleteStream(9)
+        _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+        #expect(await requests(server, .getPartitionRoute).count == 2)
+        #expect(await requests(server, .pollMessages).map(\.context.metadataOp) == [50])
         await client.shutdown()
     }
 
@@ -301,7 +337,7 @@ struct MessagingTests {
         _ = try await client.login(username: "iggy", password: "iggy")
         #expect(!client.core.groupState.isRegistered(.init(stream: 1, topic: 2, group: 3)))
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
-        let lookups = await requests(server, .getPollRouting)
+        let lookups = await requests(server, .getPartitionRoute)
         #expect(lookups.count == 2)
         #expect(lookups[0].clientID != lookups[1].clientID)
         await client.shutdown()
@@ -333,7 +369,7 @@ struct MessagingTests {
         #expect(await server.requests.filter { $0.operation == .register }.count == 1)
         let binds = await requests(server, .bindSession)
         #expect(binds.count == 1)
-        let polls = await requests(server, .pollMessagesOnPrimary)
+        let polls = await requests(server, .pollMessages)
         #expect(polls.count == 2)
         #expect(Set(polls.map(\.clientID)).count == 1)
         #expect(polls.allSatisfy { $0.clientID == binds[0].clientID })
@@ -414,7 +450,7 @@ struct MessagingTests {
             switch request.code.flatMap(CommandCode.init(rawValue:)) {
             case .syncConsumerGroup:
                 return .ok(FakeVSRServer.assignmentBody(generation: 1, partitions: [1, 2]))
-            case .pollMessagesOnPrimary:
+            case .pollMessages:
                 return .ok(FakeVSRServer.polledBody(partitionID: polledPartition(request)))
             default:
                 return FakeVSRServer.defaultReply(request, address: server.address)
@@ -430,7 +466,10 @@ struct MessagingTests {
         #expect(polled == [1, 2, 1])
         #expect(await requests(server, .syncConsumerGroup).count == 1)
         // Each partition has its own route.
-        #expect(await requests(server, .getPollRouting).count == 2)
+        #expect(
+            await requests(server, .getPartitionRoute).map(\.payload) == [
+                try Requests.partitionRoute(streamID: 1, topicID: 2, partitionID: 1), try Requests.partitionRoute(streamID: 1, topicID: 2, partitionID: 2),
+            ])
         await client.shutdown()
     }
 
@@ -442,7 +481,7 @@ struct MessagingTests {
             switch request.code.flatMap(CommandCode.init(rawValue:)) {
             case .syncConsumerGroup:
                 return .ok(FakeVSRServer.assignmentBody(generation: fenced.withLock { $0 } ? 2 : 1, partitions: [1]))
-            case .pollMessagesOnPrimary:
+            case .pollMessages:
                 let first = !fenced.exchange(true)
                 return .ok(FakeVSRServer.polledBody(partitionID: first ? PolledMessages.resyncRequiredPartition : 1))
             default:
@@ -453,7 +492,7 @@ struct MessagingTests {
         let polled = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: nil, consumer: .group(3), strategy: .next, count: 1, autoCommit: true)
         #expect(polled.partitionID == 1)
         #expect(await requests(server, .syncConsumerGroup).count == 2)
-        #expect(await requests(server, .pollMessagesOnPrimary).count == 2)
+        #expect(await requests(server, .pollMessages).count == 2)
         await client.shutdown()
     }
 
@@ -477,7 +516,7 @@ struct MessagingTests {
         member.withLock { $0 = false }
         await expectCode(.consumerGroupMemberNotFound) { _ = try await poll() }
         #expect(await requests(server, .syncConsumerGroup).count == 2)
-        #expect(await requests(server, .pollMessagesOnPrimary).isEmpty)
+        #expect(await requests(server, .pollMessages).isEmpty)
         await client.shutdown()
     }
 
@@ -492,9 +531,9 @@ struct MessagingTests {
                     $0 += 1; return $0
                 }
                 return .ok(FakeVSRServer.assignmentBody(generation: UInt64(count), partitions: count == 1 ? [1] : [2]))
-            case .pollMessagesOnPrimary where polledPartition(request) == 1:
+            case .pollMessages where polledPartition(request) == 1:
                 return .status(IggyErrorCode.consumerGroupPartitionNotOwned.rawValue)
-            case .pollMessagesOnPrimary:
+            case .pollMessages:
                 return .ok(FakeVSRServer.polledBody(partitionID: polledPartition(request)))
             default:
                 return FakeVSRServer.defaultReply(request, address: server.address)
@@ -534,24 +573,47 @@ struct MessagingTests {
 
     // MARK: Offsets
 
-    @Test func offsetWritesTakeTheOffsetRoute() async throws {
+    @Test func offsetRequestsTakeThePartitionRoute() async throws {
         let server = try await FakeVSRServer.started()
         defer { Task { await server.stop() } }
         let client = try await connectedClient(server)
         try await client.storeConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3, offset: 40)
         let position = ConsumerPosition(partitionID: 3, offset: 41, context: otherContext)
         try await client.storeConsumerPosition(consumer: .consumer(5), streamID: 1, topicID: 2, position: position)
+        #expect(try await client.getConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3) == nil)
         try await client.deleteConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3)
 
-        let lookups = await requests(server, .getConsumerOffsetRouting)
+        let lookups = await requests(server, .getPartitionRoute)
         #expect(lookups.count == 1)
-        #expect(lookups.first?.payload == (try Requests.getConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3)))
+        #expect(lookups.first?.payload == (try Requests.partitionRoute(streamID: 1, topicID: 2, partitionID: 3)))
         let stores = await requests(server, .storeConsumerOffset)
         #expect(stores.map(\.context) == [FakeVSRServer.routeContext, otherContext])
         #expect(
             stores.first?.payload
                 == (try Requests.storeConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 3, offset: 40, ack: .quorum)))
+        #expect(await requests(server, .getConsumerOffset).map(\.context) == [FakeVSRServer.routeContext])
         #expect(await requests(server, .deleteConsumerOffset).map(\.context) == [FakeVSRServer.routeContext])
+        await client.shutdown()
+    }
+
+    /// An offset read without a partition reads partition 0, as the server
+    /// does. A write without one names no partition to route.
+    @Test func offsetRequestsWithoutAPartition() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = try await connectedClient(server)
+        _ = try await client.getConsumerOffset(consumer: .group(3), streamID: 1, topicID: 2, partitionID: nil)
+        #expect(await requests(server, .getPartitionRoute).map(\.payload) == [try Requests.partitionRoute(streamID: 1, topicID: 2, partitionID: 0)])
+        #expect(
+            await requests(server, .getConsumerOffset).map(\.payload)
+                == [try Requests.getConsumerOffset(consumer: .group(3), streamID: 1, topicID: 2, partitionID: nil)])
+
+        let before = await server.requests.count
+        await expectCode(.invalidIdentifier) {
+            try await client.storeConsumerOffset(consumer: .group(3), streamID: 1, topicID: 2, partitionID: nil, offset: 1)
+        }
+        await expectCode(.invalidIdentifier) { try await client.deleteConsumerOffset(consumer: .group(3), streamID: 1, topicID: 2, partitionID: nil) }
+        #expect(await server.requests.count == before)
         await client.shutdown()
     }
 
@@ -569,13 +631,19 @@ struct MessagingTests {
 
         let poll = try Requests.pollMessages(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1, strategy: .first, count: 1, autoCommit: false)
         _ = try await client.sendRawRequest(code: CommandCode.pollMessages.rawValue, payload: poll)
-        #expect(await requests(server, .pollMessagesOnPrimary).map(\.context) == [FakeVSRServer.routeContext])
+        #expect(await requests(server, .pollMessages).map(\.context) == [FakeVSRServer.routeContext])
 
+        // The offset requests take the route the poll read.
         let store = try Requests.storeConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1, offset: 9, ack: .quorum)
         _ = try await client.sendRawRequest(code: CommandCode.storeConsumerOffset.rawValue, payload: store)
-        #expect(
-            await requests(server, .getConsumerOffsetRouting).map(\.payload)
-                == [try Requests.getConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1)])
+        let read = try Requests.getConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1)
+        _ = try await client.sendRawRequest(code: CommandCode.getConsumerOffset.rawValue, payload: read)
+        let delete = try Requests.deleteConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1, ack: .quorum)
+        _ = try await client.sendRawRequest(code: CommandCode.deleteConsumerOffset.rawValue, payload: delete)
+        for code in [CommandCode.storeConsumerOffset, .getConsumerOffset, .deleteConsumerOffset] {
+            #expect(await requests(server, code).map(\.context) == [FakeVSRServer.routeContext])
+        }
+        #expect(await requests(server, .getPartitionRoute).count == 2)
 
         let before = await server.requests.count
         let balanced = try Batch.encodeSend(streamID: 1, topicID: 2, partitioning: .balanced, messages: outgoing)
@@ -592,43 +660,29 @@ struct MessagingTests {
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.pollMessages.rawValue, payload: Array(poll.dropLast())) }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.storeConsumerOffset.rawValue, payload: [1, 9]) }
         await expectCode(.invalidCommand) { _ = try await client.sendRawRequest(code: CommandCode.bindSession.rawValue, payload: []) }
-        #expect(await server.requests.count == before)
-        await client.shutdown()
-    }
-
-    /// The routing protocol goes once on the current connection, as the Rust
-    /// client sends it: a replay after a reconnect would run under another
-    /// connection's binding.
-    @Test func rawRoutingRequestsAreSentOnce() async throws {
-        let server = try await FakeVSRServer.started()
-        defer { Task { await server.stop() } }
-        let dropped = Locked(false)
-        await server.respond { request in
-            if request.code == CommandCode.getPollRouting.rawValue, !dropped.exchange(true) {
-                return .close
-            }
-            return FakeVSRServer.defaultReply(request, address: server.address)
+        // A group poll and an offset write must name their partition.
+        let groupPoll = try Requests.pollMessages(consumer: .group(3), streamID: 1, topicID: 2, partitionID: nil, strategy: .next, count: 1, autoCommit: true)
+        let unnamedStore = try Requests.storeConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: nil, offset: 9, ack: .quorum)
+        let unnamedDelete = try Requests.deleteConsumerOffset(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: nil, ack: .quorum)
+        for (code, payload) in [(CommandCode.pollMessages, groupPoll), (.storeConsumerOffset, unnamedStore), (.deleteConsumerOffset, unnamedDelete)] {
+            await expectCode(.invalidIdentifier) { _ = try await client.sendRawRequest(code: code.rawValue, payload: payload) }
         }
-        let client = try await connectedClient(server)
-        let poll = try Requests.pollMessages(consumer: .consumer(5), streamID: 1, topicID: 2, partitionID: 1, strategy: .first, count: 1, autoCommit: false)
-        await expectCode(.disconnected) { _ = try await client.sendRawRequest(code: CommandCode.getPollRouting.rawValue, payload: poll) }
-        #expect(await requests(server, .getPollRouting).count == 1)
-        let body = try await client.sendRawRequest(code: CommandCode.getPollRouting.rawValue, payload: poll)
-        #expect(try Responses.pollRoute(body[...]).context == FakeVSRServer.routeContext)
+        #expect(await server.requests.count == before)
         await client.shutdown()
     }
 
     // MARK: Clusters
 
-    /// A coordinator that routes every poll and offset write to `primary`.
+    /// A coordinator, replica 0, that routes every partition to `primary`,
+    /// replica 1.
     private static func coordinator(routingTo primary: FakeVSRServer) async throws -> FakeVSRServer {
         let coordinator = try await FakeVSRServer.started()
         await coordinator.respond { request in
             switch request.code.flatMap(CommandCode.init(rawValue:)) {
             case .getClusterMetadata:
                 return .ok(FakeVSRServer.rosterBody([coordinator.address, primary.address]))
-            case .getPollRouting, .getConsumerOffsetRouting:
-                return .ok(FakeVSRServer.pollRouteBody(for: request, context: FakeVSRServer.routeContext, primary: primary.address, watermark: 3))
+            case .getPartitionRoute:
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: 1))
             default:
                 return FakeVSRServer.defaultReply(request, address: coordinator.address)
             }
@@ -653,15 +707,17 @@ struct MessagingTests {
         let session = await coordinator.requests.last!
         let binds = await requests(primary, .bindSession)
         #expect(binds.count == 1)
+        // The data connection binds at the metadata op of the route.
         #expect(
             binds.first?.payload
                 == (try Requests.bindSession(
-                    clientID: session.clientID, session: session.session, metadataWatermark: 3, bindSecret: await client.core.bindSecret)))
-        let polls = await requests(primary, .pollMessagesOnPrimary)
+                    clientID: session.clientID, session: session.session, metadataWatermark: FakeVSRServer.routeContext.metadataOp,
+                    bindSecret: await client.core.bindSecret)))
+        let polls = await requests(primary, .pollMessages)
         #expect(polls.count == 2)
         #expect(polls.allSatisfy { $0.context == FakeVSRServer.routeContext && $0.clientID == session.clientID && $0.session == session.session })
         #expect(await requests(primary, .storeConsumerOffset).count == 1)
-        #expect(await requests(coordinator, .pollMessagesOnPrimary).isEmpty)
+        #expect(await requests(coordinator, .pollMessages).isEmpty)
         #expect(await primary.connectionCount == 1)
         await client.shutdown()
     }
@@ -677,7 +733,7 @@ struct MessagingTests {
         }
         let dropped = Locked(false)
         await primary.respond { request in
-            if request.code == CommandCode.pollMessagesOnPrimary.rawValue,
+            if request.code == CommandCode.pollMessages.rawValue,
                 !dropped.exchange(true)
             {
                 return .close
@@ -707,15 +763,15 @@ struct MessagingTests {
         }
         let refused = Locked(false)
         await primary.respond { request in
-            if request.code == CommandCode.pollMessagesOnPrimary.rawValue, !refused.exchange(true) {
+            if request.code == CommandCode.pollMessages.rawValue, !refused.exchange(true) {
                 return .status(IggyErrorCode.notPrimary.rawValue)
             }
             return FakeVSRServer.defaultReply(request, address: primary.address)
         }
         let client = try await connectedClient(coordinator)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
-        #expect(await requests(coordinator, .getPollRouting).count == 2)
-        #expect(await requests(primary, .pollMessagesOnPrimary).count == 2)
+        #expect(await requests(coordinator, .getPartitionRoute).count == 2)
+        #expect(await requests(primary, .pollMessages).count == 2)
         // The refusal left the data connection at a frame boundary.
         #expect(await primary.connectionCount == 1)
         await client.shutdown()
@@ -737,12 +793,12 @@ struct MessagingTests {
         await coordinator.respond { request in
             switch request.code.flatMap(CommandCode.init(rawValue:)) {
             case .getClusterMetadata:
-                return .ok(FakeVSRServer.rosterBody([coordinator.address, primary.address]))
-            case .getPollRouting:
+                return .ok(FakeVSRServer.rosterBody([coordinator.address, goneAddress, primary.address]))
+            case .getPartitionRoute:
                 let first = lookups.withLock {
                     $0 += 1; return $0 == 1
                 }
-                return .ok(FakeVSRServer.pollRouteBody(for: request, context: FakeVSRServer.routeContext, primary: first ? goneAddress : primary.address))
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: first ? 1 : 2))
             default:
                 return FakeVSRServer.defaultReply(request, address: coordinator.address)
             }
@@ -750,7 +806,43 @@ struct MessagingTests {
         let client = try await connectedClient(coordinator)
         _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
         #expect(lookups.withLock { $0 } == 2)
-        #expect(await requests(primary, .pollMessagesOnPrimary).count == 1)
+        #expect(await requests(primary, .pollMessages).count == 1)
+        await client.shutdown()
+    }
+
+    /// A route can name a replica that the roster the client holds does not
+    /// list. The roster is read again before the route is refused.
+    @Test func aPrimaryMissingFromTheRosterReadsTheRosterAgain() async throws {
+        let primary = try await FakeVSRServer.started()
+        let other = try await FakeVSRServer.started()
+        let coordinator = try await FakeVSRServer.started()
+        defer {
+            Task {
+                await coordinator.stop()
+                await other.stop()
+                await primary.stop()
+            }
+        }
+        let routed = Locked(false)
+        await coordinator.respond { request in
+            switch request.code.flatMap(CommandCode.init(rawValue:)) {
+            case .getClusterMetadata:
+                let addresses = [coordinator.address, other.address] + (routed.withLock { $0 } ? [primary.address] : [])
+                return .ok(FakeVSRServer.rosterBody(addresses))
+            case .getPartitionRoute:
+                routed.withLock { $0 = true }
+                return .ok(FakeVSRServer.partitionRouteBody(FakeVSRServer.routeContext, primaryReplica: 2))
+            default:
+                return FakeVSRServer.defaultReply(request, address: coordinator.address)
+            }
+        }
+        let client = try await connectedClient(coordinator)
+        let rosterReads = await requests(coordinator, .getClusterMetadata).count
+        _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+        #expect(await requests(coordinator, .getClusterMetadata).count == rosterReads + 1)
+        #expect(await requests(coordinator, .getPartitionRoute).count == 1)
+        #expect(await requests(primary, .pollMessages).count == 1)
+        #expect(await other.connectionCount == 0)
         await client.shutdown()
     }
 }

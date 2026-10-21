@@ -82,7 +82,7 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
 
 # Run things
-cargo run --bin iggy-server
+cargo run --bin iggy-server -- --with-default-root-credentials
 cargo run --bin iggy -- <subcommand>
 IGGY_CONNECTORS_CONFIG_PATH=... cargo run --bin iggy-connectors
 ./scripts/run-bdd-tests.sh

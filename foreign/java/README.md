@@ -86,14 +86,43 @@ session's private bind secret. Auxiliary poll connections reuse that session
 instead of logging in independently.
 
 Transport loss retains the logical identity and reconnect uses `BindSession`.
-A definitive stale or unauthenticated bind response permits a fresh Register;
-transient responses retain the identity. The bind proof is an independent
-session credential: password/PAT changes or expiry do not end an established
-session. Logout, lease expiry and user deactivation end session access.
+A definitive stale or unauthenticated bind reply permits a fresh Register, and
+transient replies retain the identity. A stale-client eviction during the bind
+is a lost connection, so the next connection binds the same session again. An
+unauthenticated eviction during the bind ends the session. The bind proof is an
+independent session credential: password/PAT changes or expiry do not end an
+established session. Logout, lease expiry and user deactivation end session
+access.
+
+A reply with status 30 (`STALE_CLIENT`) means that the server no longer attaches
+the connection to the session. The client closes that connection, and the next
+one binds the session again. A live session keeps its retained operations and
+its group membership. An ended session gets a refused bind, and the client signs
+in again with the remembered sign-in or stays signed out.
+
+`RetryPolicy` limits one burst of redials after a connection loss, not the life
+of the client. A heartbeat that fails starts a new burst with a fresh budget. If
+the client lost its session and every sign-in of a burst lost its link, the
+burst ends with the client signed out. A heartbeat that the server answers then
+signs in again with a fresh budget. A logout, a rejected sign-in and `close()`
+end the automatic sign-in. With `RetryPolicy.noRetry()`, the client stays signed
+out until the caller signs in.
+
+An explicit sign-in ends the automatic sign-in as soon as it starts. It does not
+wait for an automatic Register whose reply is late, and that reply cannot
+replace the new session. If the explicit sign-in succeeds, it becomes the
+automatic sign-in. If it fails, the client does not sign in again as the
+previous user.
+
+A committed password change or rename of the signed-in user updates the
+credentials of the automatic sign-in. It also updates the builder credentials
+that `login()` uses when they name that user. This holds for typed calls,
+`sendBinaryRequest` and `resolveOperation`. A rejected change leaves the
+credentials unchanged.
 
 ## Quick Start
 
-`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It polls each partition through a separate connection to the primary of that partition.
+`Iggy.tcpClientBuilder()` handles the routing and the session for you. Over TCP and TCP/TLS, the client keeps the consumer group membership on the coordinator. It maintains one shared-session connection per advertised replica and multiplexes partition requests on those connections. With a one-node roster, the client dials the configured endpoint instead of the advertised one. This keeps a single node behind a port map or a port-forward reachable.
 
 Start the server with the [example prerequisites](../../examples/java/#running-examples) and matching credentials. The following snippets show alternative clients. Close a blocking client with `close()` or an async client with `close().join()` when finished.
 
@@ -230,8 +259,8 @@ var client = Iggy.tcpClientBuilder()
 
 ### Event Loop Threads
 
-Each TCP client drives a single connection, so by default it creates an event loop group
-with one thread. An application that opens many clients can instead register them all on
+Each TCP client shares one event loop group across its replica connections. By default
+the group has one thread. An application that opens many clients can instead register them all on
 one caller-owned group. The clients never shut that group down. Close the clients first,
 then shut the group down:
 
@@ -275,6 +304,52 @@ info.getUserAgent();   // User-Agent string for HTTP
 ## Exception Handling
 
 The SDK's custom exception types inherit from `IggyException`. When you join a failed future, the cause can come back inside a `CompletionException`. The HTTP client's `close()` method declares `IOException`. Handle these two boundaries as well as the specific SDK errors.
+
+### Retained TCP operations
+
+Replicated mutations serialize within their metadata or partition lane. If a sent mutation's
+outcome cannot be established, `IggyOperationException` carries
+`IggyErrorCode.OPERATION_UNCERTAIN` and its exact operation ID. A later mutation in the same
+lane returns `LANE_BLOCKED` with that ID. Unrelated partitions and pure reads continue.
+
+Only a reply that refuses a sent mutation, or a committed result for it, settles it. A lost
+connection, an eviction or a malformed reply leaves it uncertain. After a lost connection, a
+stale-client eviction or a malformed reply, the call replays the same request on a new
+connection within its deadline. If the server refuses to bind the session again, the client
+registers a new session and drops the operation.
+
+An eviction and a reply can carry the same status, for example 30 (`STALE_CLIENT`) or 40
+(`UNAUTHENTICATED`). Only the eviction is a lost connection, so the call does not replay a
+request that a reply refused. A refused first attempt ends with that error. After an earlier
+sent attempt without a proved reply, the call ends with `OPERATION_UNCERTAIN`.
+
+Both blocking and async TCP clients expose `resolveOperation(operationId, timeout)` and
+`abandonOperation(operationId)`. Resolve reuses the original request bytes and returns the
+response body, or the proved business error. A resolve that finds a replay of the same operation
+running waits for it within its own timeout. If that wait runs out, the resolve fails with
+`OPERATION_UNCERTAIN`. Java `long` preserves all 64 operation-ID bits, including negative values.
+When you display an ID, use `Long.toUnsignedString(operationId)`.
+
+The client keeps the proved outcomes of its last replays, up to the operation count of
+`.pendingOperations`. A later resolve returns the same outcome without a request, also after a
+session reset. Abandon releases local retention and frees the pending operation slot at once. It
+does not cancel or undo server work. A running replay keeps the lane until the replay ends, so a
+later mutation in that lane waits for it. That replay still keeps the outcome that it proves.
+`OPERATION_NOT_RETAINED` provides no evidence that the original mutation was uncommitted. It
+means that a session reset or an abandon came before a proved outcome, or that the proved outcome
+aged out. Do not resend it automatically.
+
+The TCP builders accept `.pendingOperations(count, bytes)`, defaulting to 256 mutations
+and 64 MiB across active and retained frames. Admission waits within the call's existing
+deadline; an oversized frame fails locally. Cancellation removes only the caller's waiter.
+A mutation already sent may remain retained. The byte limit counts admitted frozen frames and
+writer references; API input snapshots and queued serialization buffers are outside this limit.
+
+Auto-commit and `Next` polls use a temporary partition ordering barrier. Their success
+acknowledges local admission, not replicated offset durability. Code 57, a lost or malformed
+reply, or an eviction ends the call with code 57. Progress is unknown, and the call
+releases the barrier. These polls are never retained or replayed after uncertainty. Explicit non-admission
+(58 or 89) may retry within the same deadline.
 
 ## Examples
 

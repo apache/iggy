@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::BinaryClient;
-use crate::BinaryTransport;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{
     consumer_to_wire, identifier_to_wire, partitioning_to_wire, polling_strategy_to_wire,
@@ -25,20 +24,21 @@ use crate::{
     Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
     PollingStrategy, SendMessagesResponse,
 };
-use crate::{ConsumerKind, PartitioningKind, TopicClient, calculate_32};
+use crate::{
+    ConsumerKind, PartitioningKind, TopicClient, binary_operation_deadline, calculate_32,
+    with_binary_deadline,
+};
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::SEND_MESSAGES_CODE;
 use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
-use iggy_binary_protocol::codes::{GET_PARTITION_ROUTE_CODE, SEND_MESSAGES_CODE};
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
-    GetPartitionRouteRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
-    SendMessagesHeader,
+    PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
-use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
-use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
+use std::borrow::Cow;
 
 /// Max attempts to resolve a fenced consumer-group poll: one re-sync after the
 /// coordinator rejects a stale assignment, then retry once.
@@ -112,10 +112,7 @@ async fn topic_partition_count<B: BinaryClient>(
     stream_id: &Identifier,
     topic_id: &Identifier,
 ) -> Result<u32, IggyError> {
-    if let Some(count) = client
-        .consumer_group_state()
-        .partition_count(stream_id, topic_id)
-    {
+    if let Some(count) = client.routed_partition_count(stream_id, topic_id) {
         return Ok(count);
     }
     let details = TopicClient::get_topic(client, stream_id, topic_id)
@@ -124,40 +121,118 @@ async fn topic_partition_count<B: BinaryClient>(
     Ok(details.partitions_count)
 }
 
-/// Resolve `Balanced` / `MessagesKey` locally using the SDK's partition cache and cursor.
-async fn resolve_partitioning<B: BinaryClient>(
+/// A chunk keeps its selected partition while an earlier lane blocker resolves.
+/// Only a definitive missing-partition result permits one fresh selection.
+#[doc(hidden)]
+pub struct BinarySendPartitioning<'a> {
+    original: &'a Partitioning,
+    selected: Option<Cow<'a, Partitioning>>,
+    refreshed: bool,
+}
+
+impl<'a> BinarySendPartitioning<'a> {
+    pub fn new(original: &'a Partitioning) -> Self {
+        Self {
+            original,
+            selected: None,
+            refreshed: false,
+        }
+    }
+
+    pub fn original(&self) -> &Partitioning {
+        self.original
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.selected.is_some()
+    }
+}
+
+#[doc(hidden)]
+pub async fn send_binary_messages<B: BinaryClient>(
+    client: &B,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partitioning: &mut BinarySendPartitioning<'_>,
+    messages: &mut [IggyMessage],
+) -> Result<SendMessagesResponse, IggyError> {
+    with_binary_deadline(binary_operation_deadline(), async {
+        fail_if_not_authenticated(client).await?;
+        if partitioning.selected.is_none() {
+            partitioning.selected = Some(match partitioning.original.kind {
+                PartitioningKind::PartitionId => Cow::Borrowed(partitioning.original),
+                _ => {
+                    let count = topic_partition_count(client, stream_id, topic_id).await?;
+                    Cow::Owned(select_partition(
+                        client,
+                        stream_id,
+                        topic_id,
+                        partitioning.original,
+                        count,
+                    )?)
+                }
+            });
+        }
+        loop {
+            let selected = partitioning
+                .selected
+                .as_deref()
+                .ok_or(IggyError::InvalidCommand)?;
+            let payload = encode_messages(stream_id, topic_id, selected, messages)?;
+            match client
+                .send_raw_with_context(
+                    SEND_MESSAGES_CODE,
+                    payload,
+                    crate::PartitionContext::default(),
+                )
+                .await
+            {
+                Err(IggyError::PartitionNotFound(..))
+                    if !partitioning.refreshed
+                        && partitioning.original.kind != PartitioningKind::PartitionId =>
+                {
+                    partitioning.refreshed = true;
+                    let details = TopicClient::get_topic(client, stream_id, topic_id)
+                        .await?
+                        .ok_or_else(|| {
+                            IggyError::TopicIdNotFound(topic_id.clone(), stream_id.clone())
+                        })?;
+                    partitioning.selected = Some(Cow::Owned(select_partition(
+                        client,
+                        stream_id,
+                        topic_id,
+                        partitioning.original,
+                        details.partitions_count,
+                    )?));
+                }
+                result => return result.map(|response| committed_send_confirmations(&response)),
+            }
+        }
+    })
+    .await
+}
+
+fn select_partition<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
     partitioning: &Partitioning,
+    count: u32,
 ) -> Result<Partitioning, IggyError> {
-    match partitioning.kind {
-        PartitioningKind::PartitionId => Ok(partitioning.clone()),
-        PartitioningKind::Balanced => {
-            let count = topic_partition_count(client, stream_id, topic_id).await?;
-            if count == 0 {
-                return Err(IggyError::TopicIdNotFound(
-                    topic_id.clone(),
-                    stream_id.clone(),
-                ));
-            }
-            let partition = client
-                .consumer_group_state()
-                .next_balanced_partition(stream_id, topic_id, count);
-            Ok(Partitioning::partition_id(partition))
-        }
-        PartitioningKind::MessagesKey => {
-            let count = topic_partition_count(client, stream_id, topic_id).await?;
-            if count == 0 {
-                return Err(IggyError::TopicIdNotFound(
-                    topic_id.clone(),
-                    stream_id.clone(),
-                ));
-            }
-            let partition = calculate_32(&partitioning.value) % count;
-            Ok(Partitioning::partition_id(partition))
-        }
+    if count == 0 {
+        return Err(IggyError::TopicIdNotFound(
+            topic_id.clone(),
+            stream_id.clone(),
+        ));
     }
+    let partition = match partitioning.kind {
+        PartitioningKind::Balanced => client
+            .consumer_group_state()
+            .next_balanced_partition(stream_id, topic_id, count),
+        PartitioningKind::MessagesKey => calculate_32(&partitioning.value) % count,
+        PartitioningKind::PartitionId => return Err(IggyError::InvalidCommand),
+    };
+    Ok(Partitioning::partition_id(partition))
 }
 
 /// Poll a consumer group: select one of the member's assigned partitions
@@ -275,87 +350,6 @@ fn committed_send_confirmations(response: &[u8]) -> SendMessagesResponse {
     })
 }
 
-/// Raw `SendMessages` body, sent the way the typed send sends an explicit
-/// partition. `Balanced` and `MessagesKey` are resolved by the typed send from
-/// its partition cache and cursor, so a raw body with them names no partition
-/// to capture a context for.
-pub(crate) async fn send_raw_messages<B: BinaryTransport + Sync + ?Sized>(
-    client: &B,
-    payload: Bytes,
-) -> Result<Bytes, IggyError> {
-    let (metadata_length, body) = payload
-        .split_first_chunk()
-        .ok_or(IggyError::InvalidCommand)?;
-    let header = body
-        .get(..u32::from_le_bytes(*metadata_length) as usize)
-        .and_then(|metadata| SendMessagesHeader::decode_from(metadata).ok())
-        .ok_or(IggyError::InvalidCommand)?;
-    let WirePartitioning::PartitionId(partition_id) = header.partitioning else {
-        tracing::error!(
-            "Raw SendMessages needs an explicit partition id. Use MessageClient::send_messages for Balanced or MessagesKey partitioning."
-        );
-        return Err(IggyError::FeatureUnavailable);
-    };
-    let stream_id = identifier_from_wire(&header.stream_id)?;
-    let topic_id = identifier_from_wire(&header.topic_id)?;
-    let capture = GetPartitionRouteRequest {
-        stream_id: header.stream_id,
-        topic_id: header.topic_id,
-        partition_id,
-    };
-    send_with_partition_context(client, &stream_id, &topic_id, &capture, payload).await
-}
-
-/// Send under the cached send context, or one captured from a `GetPartitionRoute` reply.
-/// A history refusal means the context is stale: the topic's contexts are
-/// dropped and one fresh capture is tried.
-async fn send_with_partition_context<B: BinaryTransport + Sync + ?Sized>(
-    client: &B,
-    stream_id: &Identifier,
-    topic_id: &Identifier,
-    capture: &GetPartitionRouteRequest,
-    payload: Bytes,
-) -> Result<Bytes, IggyError> {
-    let state = client.consumer_group_state();
-    let mut context = state.partition_context(stream_id, topic_id, capture.partition_id);
-    let mut refresh_available = true;
-    loop {
-        let captured = if let Some(context) = context {
-            context
-        } else {
-            let response = client
-                .send_raw_with_response(GET_PARTITION_ROUTE_CODE, capture.to_bytes())
-                .await?;
-            let context = super::decode_response::<PartitionRouteResponse>(&response)?.context();
-            state.set_partition_context(stream_id, topic_id, capture.partition_id, context);
-            context
-        };
-        match client
-            .send_raw_with_context(SEND_MESSAGES_CODE, payload.clone(), captured)
-            .await
-        {
-            Err(IggyError::HistoryUnavailable) => {
-                state.invalidate_topic(stream_id, topic_id);
-                if refresh_available {
-                    refresh_available = false;
-                    context = None;
-                    continue;
-                }
-                return Err(IggyError::HistoryUnavailable);
-            }
-            result => return result,
-        }
-    }
-}
-
-/// Inverse of `identifier_to_wire`, so raw and typed sends share cache keys.
-fn identifier_from_wire(id: &WireIdentifier) -> Result<Identifier, IggyError> {
-    match id {
-        WireIdentifier::Numeric(id) => Identifier::numeric(*id),
-        WireIdentifier::String(name) => Identifier::named(name),
-    }
-}
-
 #[async_trait::async_trait]
 impl<B: BinaryClient> MessageClient for B {
     async fn poll_messages(
@@ -390,34 +384,37 @@ impl<B: BinaryClient> MessageClient for B {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
-        fail_if_not_authenticated(self).await?;
-        // VSR: a consumer-group poll without an explicit partition is resolved
-        // client-side from the member's cached assignment (the broker routes
-        // explicit partitions only).
-        if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
-            return poll_group_messages(
-                self,
-                stream_id,
-                topic_id,
-                consumer,
-                strategy_for,
+        with_binary_deadline(binary_operation_deadline(), async {
+            fail_if_not_authenticated(self).await?;
+            // VSR: a consumer-group poll without an explicit partition is resolved
+            // client-side from the member's cached assignment (the broker routes
+            // explicit partitions only).
+            if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
+                return poll_group_messages(
+                    self,
+                    stream_id,
+                    topic_id,
+                    consumer,
+                    strategy_for,
+                    count,
+                    auto_commit,
+                )
+                .await;
+            }
+            let strategy = strategy_for(partition_id.unwrap_or(0));
+            let req = PollMessagesRequest {
+                consumer: consumer_to_wire(consumer)?,
+                stream_id: identifier_to_wire(stream_id)?,
+                topic_id: identifier_to_wire(topic_id)?,
+                partition_id,
+                strategy: polling_strategy_to_wire(&strategy),
                 count,
                 auto_commit,
-            )
-            .await;
-        }
-        let strategy = strategy_for(partition_id.unwrap_or(0));
-        let req = PollMessagesRequest {
-            consumer: consumer_to_wire(consumer)?,
-            stream_id: identifier_to_wire(stream_id)?,
-            topic_id: identifier_to_wire(topic_id)?,
-            partition_id,
-            strategy: polling_strategy_to_wire(&strategy),
-            count,
-            auto_commit,
-        };
-        let response = self.send_poll_with_response(&req, strategy.context).await?;
-        PolledMessages::from_bytes(response)
+            };
+            let response = self.send_poll_with_response(&req, strategy.context).await?;
+            PolledMessages::from_bytes(response)
+        })
+        .await
     }
 
     async fn send_messages(
@@ -427,74 +424,64 @@ impl<B: BinaryClient> MessageClient for B {
         partitioning: &Partitioning,
         messages: &mut [IggyMessage],
     ) -> Result<SendMessagesResponse, IggyError> {
-        fail_if_not_authenticated(self).await?;
-        // VSR: resolve Balanced/MessagesKey to an explicit partition client-side.
-        // An explicit `PartitionId` needs no resolution, so borrow the input
-        // directly on that fast path instead of cloning its `value: Vec<u8>`.
-        let resolved_partitioning;
-        let partitioning = if partitioning.kind == PartitioningKind::PartitionId {
-            partitioning
-        } else {
-            resolved_partitioning =
-                resolve_partitioning(self, stream_id, topic_id, partitioning).await?;
-            &resolved_partitioning
-        };
-        let wire_stream_id = identifier_to_wire(stream_id)?;
-        let wire_topic_id = identifier_to_wire(topic_id)?;
-        let wire_partitioning = partitioning_to_wire(partitioning)?;
-        let partition_id = u32::from_le_bytes(
-            partitioning
-                .value
-                .as_slice()
-                .try_into()
-                .map_err(|_| IggyError::InvalidCommand)?,
-        );
-        // The producer owns message ids now that batches ride the wire
-        // verbatim: a zero id is minted here, before the frame checksum
-        // covers it.
-        for message in messages.iter_mut() {
-            if message.header.id == 0 {
-                message.header.id = crate::utils::random_id::get_uuid();
-            }
-        }
-        let raw_messages: Vec<RawMessage<'_>> = messages
-            .iter()
-            .map(|m| RawMessage {
-                id: m.header.id,
-                origin_timestamp: m.header.origin_timestamp,
-                headers: m.user_headers.as_deref(),
-                payload: &m.payload,
-            })
-            .collect();
-        let size = SendMessagesEncoder::encoded_size(
-            &wire_stream_id,
-            &wire_topic_id,
-            &wire_partitioning,
-            &raw_messages,
-        );
-        let mut buf = BytesMut::with_capacity(size);
-        SendMessagesEncoder::encode(
-            &mut buf,
-            &wire_stream_id,
-            &wire_topic_id,
-            &wire_partitioning,
-            &raw_messages,
+        send_binary_messages(
+            self,
+            stream_id,
+            topic_id,
+            &mut BinarySendPartitioning::new(partitioning),
+            messages,
         )
-        .map_err(|error| match error {
-            iggy_binary_protocol::WireError::InvalidMessageTimestampDelta(delta) => {
-                IggyError::InvalidMessageTimestampDelta(delta)
-            }
-            _ => IggyError::InvalidCommand,
-        })?;
-        let capture = GetPartitionRouteRequest {
-            stream_id: wire_stream_id,
-            topic_id: wire_topic_id,
-            partition_id,
-        };
-        let response =
-            send_with_partition_context(self, stream_id, topic_id, &capture, buf.freeze()).await?;
-        Ok(committed_send_confirmations(&response))
+        .await
     }
+}
+
+fn encode_messages(
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partitioning: &Partitioning,
+    messages: &mut [IggyMessage],
+) -> Result<Bytes, IggyError> {
+    let wire_stream_id = identifier_to_wire(stream_id)?;
+    let wire_topic_id = identifier_to_wire(topic_id)?;
+    let wire_partitioning = partitioning_to_wire(partitioning)?;
+    // The producer owns message ids now that batches ride the wire
+    // verbatim: a zero id is minted here, before the frame checksum
+    // covers it.
+    for message in messages.iter_mut() {
+        if message.header.id == 0 {
+            message.header.id = crate::utils::random_id::get_uuid();
+        }
+    }
+    let raw_messages: Vec<RawMessage<'_>> = messages
+        .iter()
+        .map(|m| RawMessage {
+            id: m.header.id,
+            origin_timestamp: m.header.origin_timestamp,
+            headers: m.user_headers.as_deref(),
+            payload: &m.payload,
+        })
+        .collect();
+    let size = SendMessagesEncoder::encoded_size(
+        &wire_stream_id,
+        &wire_topic_id,
+        &wire_partitioning,
+        &raw_messages,
+    );
+    let mut buf = BytesMut::with_capacity(size);
+    SendMessagesEncoder::encode(
+        &mut buf,
+        &wire_stream_id,
+        &wire_topic_id,
+        &wire_partitioning,
+        &raw_messages,
+    )
+    .map_err(|error| match error {
+        iggy_binary_protocol::WireError::InvalidMessageTimestampDelta(delta) => {
+            IggyError::InvalidMessageTimestampDelta(delta)
+        }
+        _ => IggyError::InvalidCommand,
+    })?;
+    Ok(buf.freeze())
 }
 
 #[cfg(test)]
