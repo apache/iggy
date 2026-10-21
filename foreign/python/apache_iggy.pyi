@@ -1266,12 +1266,16 @@ class IggyClient:
         r"""
         Capture a diagnostic snapshot of the server as a compressed ZIP archive.
 
+        Requires an authenticated session whose user holds the `manage_servers`
+        global permission.
+
         Args:
             compression: Archive compression method. One of `"stored"`,
                 `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
             snapshot_types: Data to include in the snapshot. Each entry is one
                 of `"filesystem_overview"`, `"process_list"`, `"resource_usage"`,
-                `"test"`, `"server_logs"`, `"server_config"`, `"all"`.
+                `"test"`, `"server_logs"`, `"server_config"`, `"all"`. `"all"`
+                cannot be combined with any other snapshot type.
 
         Returns:
             An awaitable that resolves to the ZIP archive `bytes`.
@@ -1280,7 +1284,8 @@ class IggyClient:
             ValueError: If `compression` is empty or unknown, `snapshot_types`
                 is empty, or any entry in `snapshot_types` is unknown.
             RuntimeError: If the client is not connected, the session is not
-                authenticated, or the request fails.
+                authenticated, the user lacks the permission, `"all"` is
+                combined with another snapshot type, or the request fails.
         """
     def describe_options(
         self, scope: builtins.str

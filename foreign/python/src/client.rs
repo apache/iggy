@@ -30,7 +30,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -317,12 +317,16 @@ impl IggyClient {
 
     /// Capture a diagnostic snapshot of the server as a compressed ZIP archive.
     ///
+    /// Requires an authenticated session whose user holds the `manage_servers`
+    /// global permission.
+    ///
     /// Args:
     ///     compression: Archive compression method. One of `"stored"`,
     ///         `"deflated"`, `"bzip2"`, `"zstd"`, `"lzma"`, `"xz"`.
     ///     snapshot_types: Data to include in the snapshot. Each entry is one
     ///         of `"filesystem_overview"`, `"process_list"`, `"resource_usage"`,
-    ///         `"test"`, `"server_logs"`, `"server_config"`, `"all"`.
+    ///         `"test"`, `"server_logs"`, `"server_config"`, `"all"`. `"all"`
+    ///         cannot be combined with any other snapshot type.
     ///
     /// Returns:
     ///     An awaitable that resolves to the ZIP archive `bytes`.
@@ -331,7 +335,8 @@ impl IggyClient {
     ///     ValueError: If `compression` is empty or unknown, `snapshot_types`
     ///         is empty, or any entry in `snapshot_types` is unknown.
     ///     RuntimeError: If the client is not connected, the session is not
-    ///         authenticated, or the request fails.
+    ///         authenticated, the user lacks the permission, `"all"` is
+    ///         combined with another snapshot type, or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
     fn snapshot<'a>(
         &self,
@@ -347,19 +352,18 @@ impl IggyClient {
             return Err(PyValueError::new_err("snapshot_types must not be empty"));
         }
 
-        let mut seen_snapshot_types = HashSet::new();
-        let snapshot_types = snapshot_types
-            .into_iter()
-            .filter(|snapshot_type| seen_snapshot_types.insert(snapshot_type.clone()))
-            .map(|snapshot_type| {
-                SystemSnapshotType::from_str(&snapshot_type).map_err(to_value_error)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let mut parsed_types = Vec::with_capacity(snapshot_types.len());
+        for snapshot_type in snapshot_types {
+            let parsed = SystemSnapshotType::from_str(&snapshot_type).map_err(to_value_error)?;
+            if !parsed_types.contains(&parsed) {
+                parsed_types.push(parsed);
+            }
+        }
 
         let inner = self.inner.clone();
         future_into_py(py, async move {
             let snapshot = inner
-                .snapshot(compression, snapshot_types)
+                .snapshot(compression, parsed_types)
                 .await
                 .map_err(to_runtime_error)?;
             Ok(Python::attach(|py| PyBytes::new(py, &snapshot.0).unbind()))
