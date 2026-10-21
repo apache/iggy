@@ -128,7 +128,8 @@ public class IggyTypedConsumerTests
             1u);
 
         offset.ShouldNotBeNull();
-        offset.StoredOffset.ShouldBe(3ul);
+        count.ShouldBe(5);
+        offset.StoredOffset.ShouldBe(4ul);
     }
 
     [Test]
