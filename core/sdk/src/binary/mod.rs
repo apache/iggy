@@ -44,9 +44,10 @@ macro_rules! impl_binary_client {
             }
 
             async fn disconnect(&self) -> Result<(), iggy_common::IggyError> {
-                self.driver.links().disconnect();
                 self.driver.session().forget();
-                self.driver.session().reset().map(|_| ())
+                let result = self.driver.session().reset().map(|_| ());
+                self.driver.links().disconnect();
+                result
             }
 
             async fn shutdown(&self) -> Result<(), iggy_common::IggyError> {

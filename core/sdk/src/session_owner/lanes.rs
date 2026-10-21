@@ -312,7 +312,7 @@ impl LaneTicket {
         {
             return Ok(());
         }
-        if self.sent && self.operation.is_some() {
+        if (self.sent || self.resumed) && self.operation.is_some() {
             return Err(IggyError::Unauthenticated);
         }
         self.operation = None;
@@ -1185,6 +1185,24 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_resumed_write_when_reset_during_routing_should_preserve_its_unknown_outcome() {
+        let owner = bound_owner();
+        let op = retain_write(&owner, partition_lane()).await;
+        let (mut replay, _retained) = owner.resume(op, deadline()).await.unwrap();
+        owner.reset().unwrap();
+
+        assert_eq!(
+            replay.reserve(SEND_MESSAGES_CODE, 0, deadline()).await,
+            Err(IggyError::Unauthenticated)
+        );
+        assert_eq!(replay.retain(), IggyError::OperationUncertain(op));
+        assert!(matches!(
+            owner.resume(op, deadline()).await,
+            Err(IggyError::OperationNotRetained(missing)) if missing == op
+        ));
     }
 
     #[tokio::test(start_paused = true)]
